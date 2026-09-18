@@ -1,0 +1,12 @@
+[package]
+name = "hs-bridge-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "hs-bridge-conformance: see docs/workstreams for the owning track"
+
+[dependencies]
+
+[dev-dependencies]

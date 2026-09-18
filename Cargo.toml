@@ -1,0 +1,44 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.91"
+repository = ""
+publish = false
+
+# Shared dependency versions. Tracks add entries here only when missing, and record the addition in their status file.
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+thiserror = "2"
+anyhow = "1"
+bytes = "1"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+async-trait = "0.1"
+ruma = { version = "0.15", features = ["server-util", "signatures", "state-res", "client-api", "federation-api", "appservice-api", "push-gateway-api", "identity-service-api", "rand", "unstable-msc4186"] }
+axum = "0.8"
+hyper = { version = "1", features = ["full"] }
+http = "1"
+tower = "0.5"
+rand = "0.9"
+sha2 = "0.10"
+ed25519-dalek = "2"
+base64 = "0.22"
+hex = "0.4"
+proptest = "1"
+criterion = "0.5"
+
+[profile.dev]
+opt-level = 0
+debug = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

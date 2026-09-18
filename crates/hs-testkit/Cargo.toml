@@ -1,0 +1,12 @@
+[package]
+name = "hs-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "hs-testkit: see docs/workstreams for the owning track"
+
+[dependencies]
+
+[dev-dependencies]

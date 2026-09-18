@@ -1,0 +1,8 @@
+/target/
+/refs/
+node_modules/
+/web/dist/
+/web/storybook-static/
+.env
+*.log
+.DS_Store
