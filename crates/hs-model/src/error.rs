@@ -50,6 +50,40 @@ pub enum PowerLevelsError {
     InvalidUserId(String),
 }
 
+/// Errors from signing or verifying a JSON object's `signatures`.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum SigningError {
+    /// Canonicalizing the object to sign or verify failed.
+    #[error(transparent)]
+    Canonical(#[from] CanonicalJsonError),
+    /// The object's `signatures` field is missing or not an object.
+    #[error("object has no `signatures` object")]
+    MissingSignatures,
+    /// No signature was found for the given server.
+    #[error("no signature from server `{0}`")]
+    MissingServerSignature(String),
+    /// No signature was found for the given server and key ID.
+    #[error("no signature from server `{server}` with key ID `{key_id}`")]
+    MissingKeySignature {
+        /// The server name.
+        server: String,
+        /// The key ID.
+        key_id: String,
+    },
+    /// The signature value was not a valid base64 string.
+    #[error("signature is not valid base64: {0}")]
+    InvalidEncoding(String),
+    /// The decoded signature was not 64 bytes.
+    #[error("signature has the wrong length")]
+    InvalidSignatureLength,
+    /// The verifying key was not 32 bytes.
+    #[error("verifying key has the wrong length")]
+    InvalidKeyLength,
+    /// Signature verification failed.
+    #[error("signature verification failed")]
+    VerificationFailed,
+}
+
 /// Errors from parsing an event out of JSON.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum EventError {

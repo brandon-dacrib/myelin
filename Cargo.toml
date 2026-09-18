@@ -80,6 +80,11 @@ rustls-pemfile = "2"
 async-stream = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# Added by track 12 (platform and Kubernetes): the `hs` CLI's subcommand parsing and its
+# interactive/non-echoed password prompts (`hs register`, `hs hash-password`).
+clap = { version = "4", features = ["derive", "env"] }
+rpassword = "7"
+
 [profile.dev]
 opt-level = 0
 debug = 1

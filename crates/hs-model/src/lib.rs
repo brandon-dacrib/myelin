@@ -14,20 +14,20 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-// TODO(track owner): not yet written -- pub mod canonical;
+pub mod canonical;
 pub mod error;
-// TODO(track owner): not yet written -- pub mod event;
-// TODO(track owner): not yet written -- pub mod hash;
+pub mod event;
+pub mod hash;
 pub mod ids;
-// TODO(track owner): not yet written -- pub mod power_levels;
-// TODO(track owner): not yet written -- pub mod redaction;
-// TODO(track owner): not yet written -- pub mod room_version;
-// TODO(track owner): not yet written -- pub mod signing;
+pub mod power_levels;
+pub mod redaction;
+pub mod room_version;
+pub mod signing;
 
-pub use error::{CanonicalJsonError, EventError, PowerLevelsError, RedactionError};
-// TODO(track owner): re-export blocked until the module exists -- pub use event::{Event, EventFlags, EventHeader};
+pub use error::{CanonicalJsonError, EventError, PowerLevelsError, RedactionError, SigningError};
+pub use event::{Event, EventFlags, EventHeader};
 pub use ids::{EventSn, RoomSn, ServerSn, StateKeyId, TypeId, UserSn};
-// TODO(track owner): re-export blocked until the module exists -- pub use room_version::{RoomVersion, RoomVersionRules};
+pub use room_version::{RoomVersion, RoomVersionRules};
 
 /// Ruma re-export so consumers pin the same version this crate was built against.
 pub use ruma;
