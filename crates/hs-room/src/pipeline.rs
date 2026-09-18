@@ -28,7 +28,7 @@
 //!    construction (single-writer actor, no fork): the three-snapshot check the spec requires for
 //!    an *inbound* event (implied-by-`auth_events`, before-the-event, current-at-receipt) collapses
 //!    to one. Track 06 (federation) needs the general three-snapshot form for events it did not
-//!    originate; that is the documented seam this module leaves (`docs/rfcs/0008-room-actor-state-store-seam.md`).
+//!    originate; that is the documented seam this module leaves (`docs/rfcs/0010-room-actor-state-store-seam.md`).
 //!
 //! Persisting the built [`Event`] (step 6 of the brief) is `crate::actor::RoomActor`'s job, not
 //! this module's: this module only builds and authorizes.

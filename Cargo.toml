@@ -86,6 +86,14 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # `docs/status/11-appservices-and-bridges.md` for which patterns actually need it.
 fancy-regex = "0.19"
 
+# Added by track 09 (media): a tokio-based RFC 3507 ICAP/1.0 client/server library, adopted
+# rather than hand-rolled per `docs/decisions/0007-build-less-reuse-more.md` after evaluating it
+# against `docs/rfcs/0008-content-scanning.md` section 3.3 (see
+# `docs/status/09-media.md`'s "Reuse considered" for the evaluation) — OPTIONS negotiation with an
+# Options-TTL-aware cache, preview/100-continue, ISTag reconciliation, and Transfer-Preview/
+# -Ignore/-Complete policy resolution all already implemented and unit-tested upstream.
+icap-rs = "0.3"
+
 # Added by track 12 (platform and Kubernetes): the `hs` CLI's subcommand parsing and its
 # interactive/non-echoed password prompts (`hs register`, `hs hash-password`), and hs-operator's
 # CRD schemas and reconcile loops.

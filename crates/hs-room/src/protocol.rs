@@ -21,7 +21,7 @@
 //!   [`RoomActorHandle::membership`], [`RoomActorHandle::redact`]. [`Command::PersistInbound`] is
 //!   the seam track 06 (federation) calls into once inbound `/send` transactions land; it is
 //!   wired into the protocol today but returns [`RoomError::Internal`] ("not implemented") --
-//!   see `docs/rfcs/0008-room-actor-state-store-seam.md`.
+//!   see `docs/rfcs/0010-room-actor-state-store-seam.md`.
 //! - **Queries** (state, timeline, members, relations, aliases), exposed as plain async methods
 //!   on [`RoomActorHandle`] rather than `Command` variants. This is a deliberate scope
 //!   simplification: reads do not need write-serialization (many can run concurrently against a

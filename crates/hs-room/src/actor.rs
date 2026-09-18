@@ -112,7 +112,7 @@ impl<B: KvBackend> RoomActor<B> {
     /// # Errors
     /// Returns [`RoomError::UnsupportedRoomVersion`] if `room_version` is unknown, or if it uses
     /// hash-based room IDs (room version 12 and later, MSC4291) -- not implemented in this pass;
-    /// see `docs/rfcs/0008-room-actor-state-store-seam.md`. Otherwise, any error
+    /// see `docs/rfcs/0010-room-actor-state-store-seam.md`. Otherwise, any error
     /// [`RoomActor::send_event`] can return.
     #[allow(clippy::too_many_arguments)]
     pub fn create(

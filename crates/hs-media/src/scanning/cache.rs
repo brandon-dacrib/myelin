@@ -4,10 +4,11 @@
 //! part of the key, so prior verdicts are invalidated for free — no explicit purge needed (see
 //! `tests::signature_version_change_invalidates_the_cache`).
 //!
-//! Only terminal verdicts ([`Verdict::Clean`], [`Verdict::Infected`], [`Verdict::Unscannable`])
-//! are ever cached; [`Verdict::Pending`] is never stored (a ticket is meaningless once a real
-//! verdict lands, and the same content may resolve differently across two separate uploads if a
-//! provider's judgment is unstable, so keeping a stale ticket around serves no purpose).
+//! Only [`Verdict::Clean`], [`Verdict::Infected`] and [`Verdict::Unscannable`] are ever cached.
+//! [`Verdict::Pending`] is never stored (a ticket is meaningless once a real verdict lands, and
+//! the same content may resolve differently across two separate uploads if a provider's judgment
+//! is unstable, so keeping a stale ticket around serves no purpose). [`Verdict::Replaced`] is
+//! also never stored (see [`CachedVerdict::from_verdict`]'s doc).
 //!
 //! # A hit must never count as a scan
 //!
@@ -99,6 +100,11 @@ impl CachedVerdict {
                 reason: reason.into(),
             }),
             Verdict::Pending { .. } => None,
+            // Replacement bytes can be large (a whole rewritten image or document) and belong in
+            // the object store, not this small-record verdict cache; re-adapting identical bytes
+            // on a second upload is also rare enough not to be worth a blob-shaped cache entry.
+            // See `crate::scanning::engine`'s replacement handling for where the actual bytes go.
+            Verdict::Replaced { .. } => None,
         }
     }
 

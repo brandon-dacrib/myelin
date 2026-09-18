@@ -1,15 +1,23 @@
-//! Configuration for pluggable content scanning (`docs/rfcs/0008-content-scanning.md`).
+//! Configuration for pluggable content adaptation (`docs/rfcs/0008-content-scanning.md`).
 //!
 //! This type deliberately does **not** live in `hs_config::MediaConfig` (track 13's crate, which
 //! this track may not edit — see `docs/status/09-media.md`'s ownership rule). Instead it is a
 //! self-contained, independently deserializable section (`media.scanning` in the operator's YAML)
-//! that whoever assembles the real `hs_config::Config` document merges in — see this module's doc
-//! on `ScanningConfig::from_media_section` for exactly how. This mirrors how RFC 0006 (URL
-//! previews) already left new `MediaConfig` fields as a proposal rather than an edit.
+//! that whoever assembles the real `hs_config::Config` document merges in. This mirrors how RFC
+//! 0006 (URL previews) already left new `MediaConfig` fields as a proposal rather than an edit.
 //!
 //! Reuses `hs_config::{Duration, ByteSize}` for parse compatibility with the rest of the config
 //! system (`"30s"`, `"100MiB"`, ...) and `hs_config::Validate` for the same
 //! `path -> message` validation-error shape every other config section uses.
+//!
+//! # Scope cut: only `icap`, `http` and `none` (decision 0007)
+//!
+//! An earlier draft of this module also had `ProviderKind::ClamAv` (a direct clamd client) and
+//! `ProviderKind::Command` (spawn-a-binary). Both were deleted before any client code was written
+//! for either, per `docs/decisions/0007-build-less-reuse-more.md`: c-icap's `virus_scan` service
+//! already drives ClamAV, with packaged container images, so a second, homegrown path to the same
+//! engine is exactly the duplicated-maintenance-forever the decision rules out. An operator who
+//! wants ClamAV runs c-icap in front of it (see `deploy/`) and configures `provider: icap`.
 
 use hs_config::error::{Validate, ValidationErrors};
 use hs_config::{ByteSize, Duration};
@@ -19,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::MediaError;
 
 /// When scanning happens relative to the upload becoming servable (RFC section 5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ScanMode {
     /// The upload fails until a verdict arrives. Safest; adds upload latency.
@@ -30,13 +38,8 @@ pub enum ScanMode {
     /// The media is served immediately; quarantined after the fact if the verdict is bad.
     Quarantine,
     /// No scanning. The default.
+    #[default]
     Off,
-}
-
-impl Default for ScanMode {
-    fn default() -> Self {
-        ScanMode::Off
-    }
 }
 
 /// What happens when the scanner cannot produce a verdict in time (timeout, connection refused,
@@ -64,75 +67,65 @@ pub enum Action {
 }
 
 /// Which provider adapter to use. See `crate::scanning::providers`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     /// No scanning (the default). `mode` is ignored if set to anything but `off` — see
     /// [`ScanningConfig::validate`].
+    #[default]
     None,
-    /// clamd `INSTREAM` over TCP or a Unix socket.
-    ClamAv,
-    /// The JSON submit-and-poll HTTP contract, e.g. CrowdStrike Falcon or any cloud/local HTTP
-    /// scanner speaking this crate's protocol (`crate::scanning::providers::http`).
-    Http,
-    /// ICAP RESPMOD (RFC 3507): Symantec, McAfee, Sophos, Trend Micro, most vendor appliances.
+    /// ICAP RESPMOD (RFC 3507). The provider: c-icap (fronting ClamAV or anything else),
+    /// commercial engines with native ICAP interfaces, and cloud gateways such as ICAPeg all
+    /// reach us through this one adapter. See `crate::scanning::providers::icap`.
     Icap,
-    /// Spawn a local binary and feed it content on stdin.
-    Command,
+    /// The JSON submit-and-poll HTTP contract, for cloud APIs with no ICAP fronting (notably
+    /// CrowdStrike Falcon). See `crate::scanning::providers::http`.
+    Http,
 }
 
-impl Default for ProviderKind {
+/// How the client negotiates ICAP preview mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", tag = "mode", content = "bytes")]
+pub enum PreviewMode {
+    /// Follow the server's `OPTIONS`-advertised `Transfer-Preview`/`Transfer-Ignore`/
+    /// `Transfer-Complete` policy (the default, and what real ICAP services such as c-icap
+    /// expect an operator to rely on).
+    Negotiate,
+    /// Force a specific preview size regardless of what `OPTIONS` advertises.
+    Bytes(usize),
+    /// Never preview; always send the complete body.
+    Off,
+}
+
+impl Default for PreviewMode {
     fn default() -> Self {
-        ProviderKind::None
+        PreviewMode::Negotiate
     }
 }
 
-/// How the `clamav` provider reaches clamd.
+/// `icap` provider settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "transport", rename_all = "snake_case")]
-pub enum ClamAvAddress {
-    /// `host:port` over TCP.
-    Tcp {
-        /// clamd's host.
-        host: String,
-        /// clamd's port.
-        port: u16,
-    },
-    /// A Unix domain socket path (clamd's `LocalSocket`).
-    Unix {
-        /// Path to the socket, e.g. `/var/run/clamav/clamd.ctl`.
-        path: String,
-    },
-}
-
-impl Default for ClamAvAddress {
-    fn default() -> Self {
-        ClamAvAddress::Unix {
-            path: "/var/run/clamav/clamd.ctl".to_string(),
-        }
-    }
-}
-
-/// `clamav` provider settings.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ClamAvConfig {
-    /// How to reach clamd.
+pub struct IcapConfig {
+    /// ICAP server host.
+    pub host: String,
+    /// ICAP server port (default 1344).
+    #[serde(default = "default_icap_port")]
+    pub port: u16,
+    /// The ICAP service name, e.g. `virus_scan` (c-icap's ClamAV service alias) or `avscan`.
+    pub service: String,
+    /// Preview negotiation.
     #[serde(default)]
-    pub address: ClamAvAddress,
-    /// Bytes per `INSTREAM` chunk (clamd's `StreamMaxLength` interacts with this; the default,
-    /// 64 KiB, is comfortably under clamd's own default chunk ceiling).
-    #[serde(default = "default_clamav_chunk_size")]
-    pub chunk_size: usize,
+    pub preview: PreviewMode,
 }
 
-fn default_clamav_chunk_size() -> usize {
-    64 * 1024
+fn default_icap_port() -> u16 {
+    1344
 }
 
 /// `http` provider settings: the submit endpoint, and an optional separate poll endpoint for
-/// providers that answer asynchronously (RFC section 3, "CrowdStrike is reachable ... through the
-/// HTTP provider against the Falcon API, which is submit-then-poll").
+/// providers that answer asynchronously (RFC section 3, CrowdStrike Falcon's submit-then-poll
+/// API).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HttpConfig {
@@ -146,49 +139,6 @@ pub struct HttpConfig {
     /// A bearer token or API key sent as `Authorization: Bearer <token>`, if set.
     #[serde(default)]
     pub auth_token: Option<String>,
-}
-
-/// `icap` provider settings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct IcapConfig {
-    /// ICAP server host.
-    pub host: String,
-    /// ICAP server port (default 1344).
-    #[serde(default = "default_icap_port")]
-    pub port: u16,
-    /// The ICAP service name, e.g. `avscan` (used in the request line
-    /// `icap://<host>:<port>/<service>`).
-    pub service: String,
-}
-
-fn default_icap_port() -> u16 {
-    1344
-}
-
-/// `command` provider settings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CommandConfig {
-    /// The binary to spawn, e.g. `/usr/bin/clamscan`.
-    pub path: String,
-    /// Extra arguments, before the implicit `-` (read from stdin) most scanners expect.
-    #[serde(default)]
-    pub args: Vec<String>,
-    /// Exit codes meaning "clean". Defaults to `[0]` (clamscan's convention).
-    #[serde(default = "default_clean_codes")]
-    pub clean_exit_codes: Vec<i32>,
-    /// Exit codes meaning "infected". Defaults to `[1]` (clamscan's convention).
-    #[serde(default = "default_infected_codes")]
-    pub infected_exit_codes: Vec<i32>,
-}
-
-fn default_clean_codes() -> Vec<i32> {
-    vec![0]
-}
-
-fn default_infected_codes() -> Vec<i32> {
-    vec![1]
 }
 
 /// The verdict cache's knobs (RFC section 6).
@@ -277,7 +227,7 @@ pub struct AppserviceBypass {
     pub exempt_appservice_ids: Vec<String>,
 }
 
-/// Top-level scanning configuration (`media.scanning` in the operator's YAML).
+/// Top-level scanning/adaptation configuration (`media.scanning` in the operator's YAML).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScanningConfig {
@@ -293,6 +243,12 @@ pub struct ScanningConfig {
     /// value the operator never chose.
     #[serde(default)]
     pub fail: Option<FailPolicy>,
+    /// Whether a service may return a modified body (RFC section 3.4). Off by default: an
+    /// operator who has not asked for content rewriting must never silently get it. When
+    /// `false`, a provider that returns adapted content is treated as a scanner error under
+    /// `fail` (see `crate::scanning::engine`).
+    #[serde(default)]
+    pub allow_replacement: bool,
     /// Per-scan deadline.
     #[serde(default = "default_timeout")]
     pub timeout: Duration,
@@ -311,18 +267,12 @@ pub struct ScanningConfig {
     /// Appservice scanning bypass.
     #[serde(default)]
     pub appservice_bypass: AppserviceBypass,
-    /// `clamav` provider settings. Required (and validated) when `provider == ClamAv`.
+    /// `icap` provider settings. Required (and validated) when `provider == Icap`.
     #[serde(default)]
-    pub clamav: Option<ClamAvConfig>,
+    pub icap: Option<IcapConfig>,
     /// `http` provider settings. Required when `provider == Http`.
     #[serde(default)]
     pub http: Option<HttpConfig>,
-    /// `icap` provider settings. Required when `provider == Icap`.
-    #[serde(default)]
-    pub icap: Option<IcapConfig>,
-    /// `command` provider settings. Required when `provider == Command`.
-    #[serde(default)]
-    pub command: Option<CommandConfig>,
 }
 
 fn default_timeout() -> Duration {
@@ -343,16 +293,15 @@ impl Default for ScanningConfig {
             mode: ScanMode::default(),
             provider: ProviderKind::default(),
             fail: None,
+            allow_replacement: false,
             timeout: default_timeout(),
             max_size: default_max_size(),
             oversize: default_oversize(),
             cache: CacheConfig::default(),
             unscannable: UnscannablePolicy::default(),
             appservice_bypass: AppserviceBypass::default(),
-            clamav: None,
-            http: None,
             icap: None,
-            command: None,
+            http: None,
         }
     }
 }
@@ -375,17 +324,11 @@ impl Validate for ScanningConfig {
             );
         }
         match self.provider {
-            ProviderKind::ClamAv if self.clamav.is_none() => {
-                errors.push(format!("{prefix}.clamav"), "provider is `clamav` but no `clamav` settings were given");
-            }
-            ProviderKind::Http if self.http.is_none() => {
-                errors.push(format!("{prefix}.http"), "provider is `http` but no `http` settings were given");
-            }
             ProviderKind::Icap if self.icap.is_none() => {
                 errors.push(format!("{prefix}.icap"), "provider is `icap` but no `icap` settings were given");
             }
-            ProviderKind::Command if self.command.is_none() => {
-                errors.push(format!("{prefix}.command"), "provider is `command` but no `command` settings were given");
+            ProviderKind::Http if self.http.is_none() => {
+                errors.push(format!("{prefix}.http"), "provider is `http` but no `http` settings were given");
             }
             _ => {}
         }
@@ -453,8 +396,13 @@ mod tests {
     fn enabling_scanning_without_a_fail_policy_is_a_config_error() {
         let cfg = ScanningConfig {
             mode: ScanMode::Block,
-            provider: ProviderKind::ClamAv,
-            clamav: Some(ClamAvConfig::default()),
+            provider: ProviderKind::Icap,
+            icap: Some(IcapConfig {
+                host: "c-icap".into(),
+                port: 1344,
+                service: "virus_scan".into(),
+                preview: PreviewMode::Negotiate,
+            }),
             fail: None,
             ..ScanningConfig::default()
         };
@@ -467,8 +415,13 @@ mod tests {
     fn enabling_scanning_with_a_fail_policy_and_provider_is_valid() {
         let cfg = ScanningConfig {
             mode: ScanMode::Block,
-            provider: ProviderKind::ClamAv,
-            clamav: Some(ClamAvConfig::default()),
+            provider: ProviderKind::Icap,
+            icap: Some(IcapConfig {
+                host: "c-icap".into(),
+                port: 1344,
+                service: "virus_scan".into(),
+                preview: PreviewMode::Negotiate,
+            }),
             fail: Some(FailPolicy::Closed),
             ..ScanningConfig::default()
         };
@@ -504,7 +457,8 @@ mod tests {
     fn parses_the_rfcs_example_yaml() {
         let yaml = r#"
 mode: block
-provider: clamav
+provider: icap
+allow_replacement: false
 fail: closed
 timeout: 30s
 max_size: 100MiB
@@ -513,17 +467,19 @@ cache:
   ttl: 7d
   unversioned_ttl: 1h
   capacity: 100000
-clamav:
-  address:
-    transport: unix
-    path: /var/run/clamav/clamd.ctl
+icap:
+  host: c-icap
+  port: 1344
+  service: virus_scan
+  preview: negotiate
 "#;
         let cfg = ScanningConfig::from_yaml(yaml).unwrap();
         assert_eq!(cfg.mode, ScanMode::Block);
-        assert_eq!(cfg.provider, ProviderKind::ClamAv);
+        assert_eq!(cfg.provider, ProviderKind::Icap);
         assert_eq!(cfg.fail, Some(FailPolicy::Closed));
         assert_eq!(cfg.timeout, Duration::from_secs(30));
         assert_eq!(cfg.max_size, ByteSize::mib(100));
+        assert!(!cfg.allow_replacement);
         cfg.validated().unwrap();
     }
 
@@ -533,11 +489,21 @@ clamav:
         // than deleting the provider block) must not be blocked by validation.
         let cfg = ScanningConfig {
             mode: ScanMode::Off,
-            provider: ProviderKind::ClamAv,
-            clamav: Some(ClamAvConfig::default()),
+            provider: ProviderKind::Icap,
+            icap: Some(IcapConfig {
+                host: "c-icap".into(),
+                port: 1344,
+                service: "virus_scan".into(),
+                preview: PreviewMode::Negotiate,
+            }),
             fail: None,
             ..ScanningConfig::default()
         };
         cfg.validated().unwrap();
+    }
+
+    #[test]
+    fn replacement_is_off_by_default() {
+        assert!(!ScanningConfig::default().allow_replacement);
     }
 }

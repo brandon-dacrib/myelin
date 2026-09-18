@@ -1797,13 +1797,17 @@ dependencies = [
  "hs-kv",
  "hs-tables",
  "http",
+ "icap-rs",
  "image",
  "object_store",
  "proptest",
  "rand 0.9.5",
+ "reqwest 0.12.28",
  "ruma",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "sha2 0.10.9",
  "tempfile",
  "thiserror",
@@ -2167,6 +2171,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "icap-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7591b3add454b8e01330639c663d0be0b3b0d2cd2639b9cf4c3a2f7bcb7460e"
+dependencies = [
+ "async-trait",
+ "http",
+ "memchr",
+ "pin-project-lite",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -5088,6 +5108,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "slab",

@@ -229,6 +229,34 @@ pub enum Verdict {
         /// How long to wait before polling.
         retry_after: Duration,
     },
+    /// The service returned **modified content** instead of a pass/fail verdict (RFC section
+    /// 3.4). ICAP is a content-adaptation protocol, not only an antivirus one: a RESPMOD service
+    /// may strip EXIF/GPS from a photograph, redact a document, transcode a format, or substitute
+    /// a block page — all of these come back as `Replaced`, distinguished from
+    /// [`Verdict::Infected`] because the content is not rejected, it is rewritten.
+    ///
+    /// Applying a `Replaced` verdict has hard limits the caller (`crate::scanning::engine`) must
+    /// enforce, not this type: upload-only (never at download time), never for encrypted media,
+    /// and only when the operator has explicitly opted in
+    /// (`crate::scanning::config::ScanningConfig::allow_replacement`).
+    Replaced {
+        /// The adapted content.
+        content: AdaptedContent,
+        /// Which service performed the adaptation (this crate's provider id, e.g. `"icap"`).
+        by: String,
+        /// A human-readable reason, if the service supplied one.
+        reason: Option<String>,
+    },
+}
+
+/// The replacement bytes a [`Verdict::Replaced`] carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdaptedContent {
+    /// The adapted content bytes.
+    pub bytes: Bytes,
+    /// The adapted content's `Content-Type`, if the service changed it (a transcoding service
+    /// might; an EXIF-stripping one usually would not). `None` means "unchanged".
+    pub content_type: Option<String>,
 }
 
 impl Verdict {

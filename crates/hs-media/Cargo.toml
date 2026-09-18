@@ -43,6 +43,10 @@ hs-tables = { path = "../hs-tables" }
 hs-auth = { path = "../hs-auth" }
 hs-http = { path = "../hs-http" }
 hs-config = { path = "../hs-config" }
+icap-rs.workspace = true
+reqwest.workspace = true
+serde_yaml_ng.workspace = true
+schemars.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
