@@ -1,0 +1,27 @@
+<!doctype html>
+<!--
+  Placeholder for web/dist (track 16's built management interface), embedded here so hs-admin
+  compiles and serves *something* at /admin/ before a real build exists (RFC 0004 section 13).
+
+  web/dist is gitignored (it is a build artifact: `cd web && npm run build`), so hs-admin cannot
+  embed it directly without breaking a clean checkout that has not run that build yet. This folder
+  (crates/hs-admin/web-dist-placeholder/) is checked in and always present; crate::assets embeds
+  it today. Swapping to the real assets is a one-line change once the release pipeline runs
+  `npm run build` before `cargo build`: point rust-embed's `folder` attribute in
+  crates/hs-admin/src/assets.rs at `../../web/dist` (or copy the build output over this
+  directory as part of that pipeline step).
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>hs-admin</title>
+  </head>
+  <body>
+    <p>
+      The management interface has not been built into this binary yet. Build
+      <code>web/</code> (<code>npm run build</code>) and wire its output into
+      <code>crates/hs-admin/src/assets.rs</code> to replace this placeholder.
+    </p>
+  </body>
+</html>

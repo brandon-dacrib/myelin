@@ -1582,6 +1582,20 @@ dependencies = [
 [[package]]
 name = "hs-testkit"
 version = "0.0.1"
+dependencies = [
+ "axum",
+ "bytes",
+ "hs-auth",
+ "hs-kv",
+ "http",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tracing",
+]
 
 [[package]]
 name = "hs-user"

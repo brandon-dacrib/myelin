@@ -5,8 +5,33 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "hs-admin: see docs/workstreams for the owning track"
+description = "The native admin API under /api/v1: OpenAPI 3.1 contract, router skeleton, scope enforcement, audit log, event stream, and the hs-admin-mock fixture server for track 16. See docs/rfcs/0004-admin-api.md and docs/workstreams/15-admin-api-and-modules.md."
 
 [dependencies]
+hs-http = { path = "../hs-http" }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+time = { workspace = true }
+ulid = { workspace = true }
+rand = { workspace = true }
+rust-embed = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+async-stream = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+http-body-util = { workspace = true }
+
+[[bin]]
+name = "hs-admin-mock"
+path = "src/bin/hs-admin-mock/main.rs"

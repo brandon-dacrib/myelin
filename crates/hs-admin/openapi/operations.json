@@ -1,0 +1,1282 @@
+{
+  "operations": [
+    {
+      "method": "GET",
+      "path": "/appservices",
+      "operation_id": "appservices.list",
+      "scope": "bridges:read",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/appservices",
+      "operation_id": "appservices.create",
+      "scope": "bridges:write",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/appservices/{id}",
+      "operation_id": "appservices.delete",
+      "scope": "bridges:write",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/appservices/{id}",
+      "operation_id": "appservices.get",
+      "scope": "bridges:read",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
+    },
+    {
+      "method": "PATCH",
+      "path": "/appservices/{id}",
+      "operation_id": "appservices.update",
+      "scope": "bridges:write",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/appservices/{id}/backlog",
+      "operation_id": "appservices.backlog",
+      "scope": "bridges:read",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/appservices/{id}/health",
+      "operation_id": "appservices.health",
+      "scope": "bridges:read",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/appservices/{id}/pause",
+      "operation_id": "appservices.pause",
+      "scope": "bridges:write",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": true
+    },
+    {
+      "method": "POST",
+      "path": "/appservices/{id}/ping",
+      "operation_id": "appservices.ping",
+      "scope": "bridges:write",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": true
+    },
+    {
+      "method": "GET",
+      "path": "/appservices/{id}/registration",
+      "operation_id": "appservices.registration",
+      "scope": "bridges:write",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/appservices/{id}/replay",
+      "operation_id": "appservices.replay",
+      "scope": "bridges:write",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": true
+    },
+    {
+      "method": "POST",
+      "path": "/appservices/{id}/resume",
+      "operation_id": "appservices.resume",
+      "scope": "bridges:write",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": true
+    },
+    {
+      "method": "POST",
+      "path": "/appservices/{id}/rotate-tokens",
+      "operation_id": "appservices.rotate_tokens",
+      "scope": "bridges:write",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": true
+    },
+    {
+      "method": "GET",
+      "path": "/audit-log",
+      "operation_id": "audit_log.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "AuditLog",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/audit-log/export",
+      "operation_id": "audit_log.export",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "AuditLog",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/audit-log/{id}",
+      "operation_id": "audit_log.get",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "AuditLog",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/bridge-types",
+      "operation_id": "bridge_types.list",
+      "scope": "bridges:read",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/bridge-types/{type}",
+      "operation_id": "bridge_types.get",
+      "scope": "bridges:read",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/bridge-types/{type}/render",
+      "operation_id": "bridge_types.render",
+      "scope": "bridges:write",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/cluster",
+      "operation_id": "cluster.get",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Cluster",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/cluster/replicas",
+      "operation_id": "cluster.replicas.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Cluster",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/cluster/replicas/{id}",
+      "operation_id": "cluster.replicas.get",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Cluster",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/cluster/replicas/{id}/drain",
+      "operation_id": "cluster.replicas.drain",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Cluster",
+      "idempotent_post": true
+    },
+    {
+      "method": "POST",
+      "path": "/cluster/replicas/{id}/undrain",
+      "operation_id": "cluster.replicas.undrain",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Cluster",
+      "idempotent_post": true
+    },
+    {
+      "method": "GET",
+      "path": "/cluster/shards",
+      "operation_id": "cluster.shards.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Cluster",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/config",
+      "operation_id": "config.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Config",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/config/reload",
+      "operation_id": "config.reload",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Config",
+      "idempotent_post": true
+    },
+    {
+      "method": "POST",
+      "path": "/config/validate",
+      "operation_id": "config.validate",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Config",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/config/{section}",
+      "operation_id": "config.get",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Config",
+      "idempotent_post": false
+    },
+    {
+      "method": "PATCH",
+      "path": "/config/{section}",
+      "operation_id": "config.update",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Config",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/events",
+      "operation_id": "events.stream",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Events",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/events/{event_id}",
+      "operation_id": "events.get",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/federation/destinations",
+      "operation_id": "federation.destinations.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Federation",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/federation/destinations/{server_name}",
+      "operation_id": "federation.destinations.get",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Federation",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/federation/destinations/{server_name}/reset",
+      "operation_id": "federation.destinations.reset",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Federation",
+      "idempotent_post": true
+    },
+    {
+      "method": "GET",
+      "path": "/federation/destinations/{server_name}/rooms",
+      "operation_id": "federation.destinations.rooms",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Federation",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/federation/keys",
+      "operation_id": "federation.keys.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Federation",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/federation/keys/{server_name}",
+      "operation_id": "federation.keys.get",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Federation",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/federation/keys/{server_name}/refresh",
+      "operation_id": "federation.keys.refresh",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Federation",
+      "idempotent_post": true
+    },
+    {
+      "method": "GET",
+      "path": "/me",
+      "operation_id": "me.get",
+      "scope": null,
+      "public": false,
+      "tag": "Server",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/media",
+      "operation_id": "media.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Media",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/media/delete",
+      "operation_id": "media.delete_bulk",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "Media",
+      "idempotent_post": true
+    },
+    {
+      "method": "POST",
+      "path": "/media/purge-remote-cache",
+      "operation_id": "media.purge_remote_cache",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Media",
+      "idempotent_post": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/media/{server_name}/{media_id}",
+      "operation_id": "media.delete_one",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "Media",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/media/{server_name}/{media_id}",
+      "operation_id": "media.get",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Media",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/media/{server_name}/{media_id}/protect",
+      "operation_id": "media.protect",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "Media",
+      "idempotent_post": true
+    },
+    {
+      "method": "POST",
+      "path": "/media/{server_name}/{media_id}/quarantine",
+      "operation_id": "media.quarantine",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "Media",
+      "idempotent_post": true
+    },
+    {
+      "method": "POST",
+      "path": "/media/{server_name}/{media_id}/unprotect",
+      "operation_id": "media.unprotect",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "Media",
+      "idempotent_post": true
+    },
+    {
+      "method": "POST",
+      "path": "/media/{server_name}/{media_id}/unquarantine",
+      "operation_id": "media.unquarantine",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "Media",
+      "idempotent_post": true
+    },
+    {
+      "method": "GET",
+      "path": "/migration",
+      "operation_id": "migration.get",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Migration",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/migration/abort",
+      "operation_id": "migration.abort",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Migration",
+      "idempotent_post": true
+    },
+    {
+      "method": "POST",
+      "path": "/migration/cutover",
+      "operation_id": "migration.cutover",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Migration",
+      "idempotent_post": true
+    },
+    {
+      "method": "GET",
+      "path": "/migration/log",
+      "operation_id": "migration.log",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Migration",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/migration/pause",
+      "operation_id": "migration.pause",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Migration",
+      "idempotent_post": true
+    },
+    {
+      "method": "POST",
+      "path": "/migration/resume",
+      "operation_id": "migration.resume",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Migration",
+      "idempotent_post": true
+    },
+    {
+      "method": "POST",
+      "path": "/migration/start",
+      "operation_id": "migration.start",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Migration",
+      "idempotent_post": true
+    },
+    {
+      "method": "POST",
+      "path": "/migration/verify",
+      "operation_id": "migration.verify",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Migration",
+      "idempotent_post": true
+    },
+    {
+      "method": "GET",
+      "path": "/openapi.json",
+      "operation_id": "openapi.json",
+      "scope": null,
+      "public": true,
+      "tag": "Server",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/openapi.yaml",
+      "operation_id": "openapi.yaml",
+      "scope": null,
+      "public": true,
+      "tag": "Server",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/registration-tokens",
+      "operation_id": "registration_tokens.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "RegistrationTokens",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/registration-tokens",
+      "operation_id": "registration_tokens.create",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "RegistrationTokens",
+      "idempotent_post": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/registration-tokens/{token}",
+      "operation_id": "registration_tokens.delete",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "RegistrationTokens",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/registration-tokens/{token}",
+      "operation_id": "registration_tokens.get",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "RegistrationTokens",
+      "idempotent_post": false
+    },
+    {
+      "method": "PATCH",
+      "path": "/registration-tokens/{token}",
+      "operation_id": "registration_tokens.update",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "RegistrationTokens",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/reports",
+      "operation_id": "reports.list",
+      "scope": "moderation:read",
+      "public": false,
+      "tag": "Reports",
+      "idempotent_post": false
+    },
+    {
+      "method": "DELETE",
+      "path": "/reports/{id}",
+      "operation_id": "reports.delete",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "Reports",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/reports/{id}",
+      "operation_id": "reports.get",
+      "scope": "moderation:read",
+      "public": false,
+      "tag": "Reports",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/reports/{id}/resolve",
+      "operation_id": "reports.resolve",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "Reports",
+      "idempotent_post": true
+    },
+    {
+      "method": "GET",
+      "path": "/rooms",
+      "operation_id": "rooms.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/rooms/{room_id}",
+      "operation_id": "rooms.get",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/rooms/{room_id}/aliases",
+      "operation_id": "rooms.aliases.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/rooms/{room_id}/aliases",
+      "operation_id": "rooms.aliases.add",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/rooms/{room_id}/aliases/{alias}",
+      "operation_id": "rooms.aliases.remove",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/rooms/{room_id}/block",
+      "operation_id": "rooms.block",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": true
+    },
+    {
+      "method": "POST",
+      "path": "/rooms/{room_id}/delete",
+      "operation_id": "rooms.delete",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": true
+    },
+    {
+      "method": "GET",
+      "path": "/rooms/{room_id}/events/at",
+      "operation_id": "rooms.events.at",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/rooms/{room_id}/events/{event_id}",
+      "operation_id": "rooms.events.get",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/rooms/{room_id}/events/{event_id}/context",
+      "operation_id": "rooms.events.context",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": false
+    },
+    {
+      "method": "DELETE",
+      "path": "/rooms/{room_id}/forward-extremities",
+      "operation_id": "rooms.forward_extremities.delete",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/rooms/{room_id}/forward-extremities",
+      "operation_id": "rooms.forward_extremities.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/rooms/{room_id}/hierarchy",
+      "operation_id": "rooms.hierarchy.get",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/rooms/{room_id}/join",
+      "operation_id": "rooms.join",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": true
+    },
+    {
+      "method": "POST",
+      "path": "/rooms/{room_id}/make-admin",
+      "operation_id": "rooms.make_admin",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": true
+    },
+    {
+      "method": "GET",
+      "path": "/rooms/{room_id}/media",
+      "operation_id": "rooms.media.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/rooms/{room_id}/media/quarantine",
+      "operation_id": "rooms.media.quarantine",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": true
+    },
+    {
+      "method": "GET",
+      "path": "/rooms/{room_id}/members",
+      "operation_id": "rooms.members.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/rooms/{room_id}/messages",
+      "operation_id": "rooms.messages.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/rooms/{room_id}/purge-history",
+      "operation_id": "rooms.purge_history",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": true
+    },
+    {
+      "method": "GET",
+      "path": "/rooms/{room_id}/state",
+      "operation_id": "rooms.state.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/rooms/{room_id}/unblock",
+      "operation_id": "rooms.unblock",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "Rooms",
+      "idempotent_post": true
+    },
+    {
+      "method": "GET",
+      "path": "/server",
+      "operation_id": "server.get",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Server",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/server-notices",
+      "operation_id": "server_notices.list",
+      "scope": "moderation:read",
+      "public": false,
+      "tag": "ServerNotices",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/server-notices",
+      "operation_id": "server_notices.send",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "ServerNotices",
+      "idempotent_post": true
+    },
+    {
+      "method": "GET",
+      "path": "/server/health",
+      "operation_id": "server.health",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Server",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/statistics/overview",
+      "operation_id": "statistics.overview",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Statistics",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/statistics/rooms",
+      "operation_id": "statistics.rooms",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Statistics",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/statistics/timeseries",
+      "operation_id": "statistics.timeseries",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Statistics",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/statistics/users/media",
+      "operation_id": "statistics.users_media",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Statistics",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/tasks",
+      "operation_id": "tasks.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Tasks",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/tasks/{id}",
+      "operation_id": "tasks.get",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Tasks",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/tasks/{id}/cancel",
+      "operation_id": "tasks.cancel",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Tasks",
+      "idempotent_post": true
+    },
+    {
+      "method": "GET",
+      "path": "/users",
+      "operation_id": "users.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/users",
+      "operation_id": "users.create",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": true
+    },
+    {
+      "method": "GET",
+      "path": "/users/availability",
+      "operation_id": "users.availability",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/users/lookup",
+      "operation_id": "users.lookup",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/users/{user_id}",
+      "operation_id": "users.get",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "PATCH",
+      "path": "/users/{user_id}",
+      "operation_id": "users.update",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/users/{user_id}/account-data",
+      "operation_id": "users.account_data.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/users/{user_id}/deactivate",
+      "operation_id": "users.deactivate",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": true
+    },
+    {
+      "method": "GET",
+      "path": "/users/{user_id}/devices",
+      "operation_id": "users.devices.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/users/{user_id}/devices/bulk-delete",
+      "operation_id": "users.devices.bulk_delete",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/users/{user_id}/devices/{device_id}",
+      "operation_id": "users.devices.delete",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/users/{user_id}/devices/{device_id}",
+      "operation_id": "users.devices.get",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "PATCH",
+      "path": "/users/{user_id}/devices/{device_id}",
+      "operation_id": "users.devices.update",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/users/{user_id}/experimental-features",
+      "operation_id": "users.experimental_features.get",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "PUT",
+      "path": "/users/{user_id}/experimental-features",
+      "operation_id": "users.experimental_features.put",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/users/{user_id}/external-ids",
+      "operation_id": "users.external_ids.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/users/{user_id}/external-ids",
+      "operation_id": "users.external_ids.add",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/users/{user_id}/external-ids/{provider}/{external_id}",
+      "operation_id": "users.external_ids.remove",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/users/{user_id}/lock",
+      "operation_id": "users.lock",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": true
+    },
+    {
+      "method": "POST",
+      "path": "/users/{user_id}/login-as",
+      "operation_id": "users.login_as",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": true
+    },
+    {
+      "method": "POST",
+      "path": "/users/{user_id}/logout",
+      "operation_id": "users.logout",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/users/{user_id}/media",
+      "operation_id": "users.media.delete",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/users/{user_id}/media",
+      "operation_id": "users.media.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/users/{user_id}/memberships",
+      "operation_id": "users.memberships.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/users/{user_id}/pushers",
+      "operation_id": "users.pushers.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "DELETE",
+      "path": "/users/{user_id}/rate-limit",
+      "operation_id": "users.rate_limit.delete",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/users/{user_id}/rate-limit",
+      "operation_id": "users.rate_limit.get",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "PUT",
+      "path": "/users/{user_id}/rate-limit",
+      "operation_id": "users.rate_limit.put",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/users/{user_id}/reactivate",
+      "operation_id": "users.reactivate",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": true
+    },
+    {
+      "method": "POST",
+      "path": "/users/{user_id}/redact-events",
+      "operation_id": "users.redact_events",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": true
+    },
+    {
+      "method": "POST",
+      "path": "/users/{user_id}/reset-password",
+      "operation_id": "users.reset_password",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": true
+    },
+    {
+      "method": "GET",
+      "path": "/users/{user_id}/sessions",
+      "operation_id": "users.sessions.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/users/{user_id}/shadow-ban",
+      "operation_id": "users.shadow_ban",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": true
+    },
+    {
+      "method": "GET",
+      "path": "/users/{user_id}/statistics",
+      "operation_id": "users.statistics.get",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/users/{user_id}/suspend",
+      "operation_id": "users.suspend",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": true
+    },
+    {
+      "method": "GET",
+      "path": "/users/{user_id}/threepids",
+      "operation_id": "users.threepids.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/users/{user_id}/threepids",
+      "operation_id": "users.threepids.add",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/users/{user_id}/threepids/{medium}/{address}",
+      "operation_id": "users.threepids.remove",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/users/{user_id}/unlock",
+      "operation_id": "users.unlock",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": true
+    },
+    {
+      "method": "POST",
+      "path": "/users/{user_id}/unshadow-ban",
+      "operation_id": "users.unshadow_ban",
+      "scope": "moderation:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": true
+    },
+    {
+      "method": "POST",
+      "path": "/users/{user_id}/unsuspend",
+      "operation_id": "users.unsuspend",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Users",
+      "idempotent_post": true
+    }
+  ]
+}

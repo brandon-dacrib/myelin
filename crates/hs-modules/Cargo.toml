@@ -5,8 +5,18 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "hs-modules: see docs/workstreams for the owning track"
+description = "The module hook trait (Synapse's eleven callback categories without Python), a no-op implementation, and the versioned JSON HTTP-callback protocol with a reference client. See docs/workstreams/15-admin-api-and-modules.md and docs/design/wasmtime-feasibility.md."
 
 [dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true }

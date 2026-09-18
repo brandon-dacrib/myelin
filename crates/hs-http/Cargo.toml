@@ -5,8 +5,31 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "hs-http: see docs/workstreams for the owning track"
+description = "Shared HTTP conventions: router construction and the routes.json manifest, the Matrix and RFC 9457 error shapes, permissive JSON parsing, CORS, body-size limits, listener configuration (TCP, TLS, unix socket), and a rate-limiter trait. Owned jointly by tracks 07, 14 and 15; see docs/workstreams/15-admin-api-and-modules.md and docs/rfcs/0005-routes-json-manifest.md."
 
 [dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+time = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+tokio-rustls = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+rustls-pemfile = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }
+rcgen = { workspace = true }
