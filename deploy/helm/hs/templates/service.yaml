@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hs.fullname" . }}
+  labels:
+    {{- include "hs.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "hs.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: client
+      port: {{ .Values.service.clientPort }}
+      targetPort: client
+      protocol: TCP
+    - name: federation
+      port: {{ .Values.service.federationPort }}
+      targetPort: federation
+      protocol: TCP
+    - name: metrics
+      port: {{ .Values.service.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+---
+# Headless service backing the StatefulSet's stable network identity
+# (pod-0.<fullname>-headless.<namespace>.svc.cluster.local, ...), used by `spec.serviceName`
+# above, not intended for client traffic.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hs.fullname" . }}-headless
+  labels:
+    {{- include "hs.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "hs.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: client
+      port: {{ .Values.service.clientPort }}
+      targetPort: client
+      protocol: TCP

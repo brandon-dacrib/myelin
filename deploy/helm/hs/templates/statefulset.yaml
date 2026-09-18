@@ -1,0 +1,243 @@
+{{- $backend := include "hs.storageBackend" . }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "hs.fullname" . }}
+  labels:
+    {{- include "hs.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "hs.fullname" . }}-headless
+  replicas: {{ include "hs.replicaCount" . }}
+  selector:
+    matchLabels:
+      {{- include "hs.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "hs.labels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "hs.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if and (eq .Values.mode "cluster") .Values.affinity.podAntiAffinity.enabled }}
+      affinity:
+        podAntiAffinity:
+          {{- if eq .Values.affinity.podAntiAffinity.style "hard" }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "hs.selectorLabels" . | nindent 18 }}
+              topologyKey: {{ .Values.affinity.podAntiAffinity.topologyKey }}
+          {{- else }}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "hs.selectorLabels" . | nindent 20 }}
+                topologyKey: {{ .Values.affinity.podAntiAffinity.topologyKey }}
+          {{- end }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: hs
+          image: {{ include "hs.image" . }}
+          imagePullPolicy: {{ include "hs.imagePullPolicy" . }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          args: ["serve", "-c", "/etc/hs/config/homeserver.yaml"]
+          ports:
+            - name: client
+              containerPort: {{ .Values.service.clientPort }}
+              protocol: TCP
+            - name: federation
+              containerPort: {{ .Values.service.federationPort }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.service.metricsPort }}
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.telemetry.logging.level | quote }}
+            {{- if eq $backend "postgres" }}
+            {{- if .Values.cloudNativePG.enabled }}
+            - name: HS__STORAGE__BACKEND
+              value: postgres
+            - name: HS__STORAGE__HOST
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.cloudNativePG.existingSecret | default (printf "%s-app" .Values.cloudNativePG.clusterName) }}
+                  key: host
+            - name: HS__STORAGE__PORT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.cloudNativePG.existingSecret | default (printf "%s-app" .Values.cloudNativePG.clusterName) }}
+                  key: port
+            - name: HS__STORAGE__DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.cloudNativePG.existingSecret | default (printf "%s-app" .Values.cloudNativePG.clusterName) }}
+                  key: dbname
+            - name: HS__STORAGE__USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.cloudNativePG.existingSecret | default (printf "%s-app" .Values.cloudNativePG.clusterName) }}
+                  key: user
+            - name: HS__STORAGE__PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.cloudNativePG.existingSecret | default (printf "%s-app" .Values.cloudNativePG.clusterName) }}
+                  key: password
+            {{- else if .Values.storage.postgres.password.secret }}
+            - name: HS__STORAGE__PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.storage.postgres.password.secret }}
+                  key: {{ .Values.storage.postgres.password.secretKey | default "password" }}
+            {{- else if .Values.storage.postgres.password.value }}
+            - name: HS__STORAGE__PASSWORD
+              value: {{ .Values.storage.postgres.password.value | quote }}
+            {{- end }}
+            {{- end }}
+            - name: HS__AUTH__REGISTRATION_SHARED_SECRET_FILE
+              value: /etc/hs/secrets/registration-shared-secret
+            - name: HS__AUTH__SESSION_SECRET_FILE
+              value: /etc/hs/secrets/session-secret
+            {{- if and .Values.telemetry.sentry.enabled .Values.telemetry.sentry.dsn.secret }}
+            - name: HS__TELEMETRY__SENTRY__DSN_FILE
+              value: /etc/hs/secrets/sentry-dsn
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/hs/config
+              readOnly: true
+            - name: secrets-signing-key
+              mountPath: /etc/hs/secrets/signing.key
+              subPath: {{ .Values.secrets.signingKey.key }}
+              readOnly: true
+            {{- if .Values.secrets.registrationSharedSecret.existingSecret }}
+            - name: secrets-registration-shared-secret
+              mountPath: /etc/hs/secrets/registration-shared-secret
+              subPath: {{ .Values.secrets.registrationSharedSecret.key }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.secrets.sessionSecret.existingSecret }}
+            - name: secrets-session-secret
+              mountPath: /etc/hs/secrets/session-secret
+              subPath: {{ .Values.secrets.sessionSecret.key }}
+              readOnly: true
+            {{- end }}
+            {{- if and .Values.telemetry.sentry.enabled .Values.telemetry.sentry.dsn.secret }}
+            - name: secrets-sentry-dsn
+              mountPath: /etc/hs/secrets/sentry-dsn
+              subPath: {{ .Values.telemetry.sentry.dsn.secretKey | default "dsn" }}
+              readOnly: true
+            {{- end }}
+            {{- if eq $backend "embedded" }}
+            - name: data
+              mountPath: /var/lib/hs/data
+            {{- end }}
+            ## `containerSecurityContext.readOnlyRootFilesystem: true` needs a writable /tmp;
+            ## nothing else on this image writes outside the mounts above.
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: client
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: client
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: client
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Values.existingConfigMap | default (printf "%s-config" (include "hs.fullname" .)) }}
+        - name: secrets-signing-key
+          secret:
+            secretName: {{ .Values.secrets.signingKey.existingSecret }}
+        {{- if .Values.secrets.registrationSharedSecret.existingSecret }}
+        - name: secrets-registration-shared-secret
+          secret:
+            secretName: {{ .Values.secrets.registrationSharedSecret.existingSecret }}
+        {{- end }}
+        {{- if .Values.secrets.sessionSecret.existingSecret }}
+        - name: secrets-session-secret
+          secret:
+            secretName: {{ .Values.secrets.sessionSecret.existingSecret }}
+        {{- end }}
+        {{- if and .Values.telemetry.sentry.enabled .Values.telemetry.sentry.dsn.secret }}
+        - name: secrets-sentry-dsn
+          secret:
+            secretName: {{ .Values.telemetry.sentry.dsn.secret }}
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+        {{- if and (eq $backend "embedded") .Values.storage.embedded.existingClaim }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ .Values.storage.embedded.existingClaim }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+  {{- if and (eq $backend "embedded") (not .Values.storage.embedded.existingClaim) }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "hs.labels" . | nindent 10 }}
+        {{- if eq (.Values.storage.embedded.resourcePolicy | default .Values.storagePolicy.resourcePolicy) "keep" }}
+        annotations:
+          helm.sh/resource-policy: keep
+        {{- end }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.storage.embedded.storageClassName }}
+        storageClassName: {{ .Values.storage.embedded.storageClassName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.storage.embedded.size }}
+  {{- end }}

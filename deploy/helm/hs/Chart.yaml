@@ -1,0 +1,22 @@
+apiVersion: v2
+name: hs
+description: >-
+  A modern Matrix homeserver written in Rust. Values are modeled so this chart can replace the
+  Synapse component of an Element Server Suite Community (element-hq/ess-helm) deployment:
+  single-node and cluster modes, CloudNativePG integration, object storage, probes, a
+  PodDisruptionBudget, anti-affinity, an HPA on custom metrics, a ServiceMonitor, and
+  Ingress/Gateway API routing. See docs/status/12-platform-and-kubernetes.md for what has
+  actually been validated against a live cluster (nothing yet — no kind/cluster access in this
+  environment; validated so far only via `helm template`/`helm lint`).
+type: application
+version: 0.1.0
+appVersion: "0.0.1"
+keywords:
+  - matrix
+  - homeserver
+  - chat
+home: https://github.com/element-hq/ess-helm
+sources:
+  - https://github.com/element-hq/ess-helm
+maintainers:
+  - name: track-12-platform-and-kubernetes

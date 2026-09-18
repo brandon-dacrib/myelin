@@ -11,6 +11,36 @@ description = "The `hs` binary: serve, single-node, import, appservice, cluster 
 name = "hs"
 path = "src/main.rs"
 
+[lib]
+name = "hs_cli"
+path = "src/lib.rs"
+
 [dependencies]
+hs-config = { path = "../hs-config" }
+hs-compat = { path = "../hs-compat" }
+hs-auth = { path = "../hs-auth" }
+hs-kv = { path = "../hs-kv" }
+hs-telemetry = { path = "../hs-telemetry" }
+
+clap = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+http = { workspace = true }
+tower = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+rand_core = { workspace = true }
+rpassword = { workspace = true }
+reqwest = { workspace = true }
+ruma = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }

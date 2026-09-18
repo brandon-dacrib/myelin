@@ -1,0 +1,68 @@
+{{- include "hs.validate" . -}}
+{{- if not .Values.existingConfigMap }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "hs.fullname" . }}-config
+  labels:
+    {{- include "hs.labels" . | nindent 4 }}
+data:
+  homeserver.yaml: |
+    {{- $backend := include "hs.storageBackend" . }}
+    server:
+      server_name: {{ .Values.serverName | quote }}
+      {{- if .Values.publicBaseUrl }}
+      public_baseurl: {{ .Values.publicBaseUrl | quote }}
+      {{- end }}
+      signing_key_path: /etc/hs/secrets/signing.key
+    listeners:
+      listeners:
+        - port: {{ .Values.service.clientPort }}
+          bind_addresses: ["::"]
+          resources: [client, federation, health]
+        - port: {{ .Values.service.metricsPort }}
+          bind_addresses: ["::"]
+          resources: [metrics]
+    storage:
+      backend: {{ $backend }}
+      {{- if eq $backend "embedded" }}
+      data_dir: /var/lib/hs/data
+      {{- else if eq $backend "postgres" }}
+      {{- if .Values.cloudNativePG.enabled }}
+      # host/port/database/user/password are supplied via HS__STORAGE__* environment variables
+      # sourced from the CloudNativePG-generated Secret (see templates/deployment.yaml /
+      # statefulset.yaml's envFrom); nothing to render inline here.
+      host: PLACEHOLDER_SET_VIA_HS__STORAGE__HOST_ENV
+      database: PLACEHOLDER_SET_VIA_HS__STORAGE__DATABASE_ENV
+      user: PLACEHOLDER_SET_VIA_HS__STORAGE__USER_ENV
+      {{- else }}
+      host: {{ .Values.storage.postgres.host | quote }}
+      port: {{ .Values.storage.postgres.port }}
+      database: {{ .Values.storage.postgres.database | quote }}
+      user: {{ .Values.storage.postgres.user | quote }}
+      {{- end }}
+      {{- else if eq $backend "slatedb" }}
+      bucket_url: {{ .Values.storage.objectStorage.bucketUrl | quote }}
+      shard_count: {{ .Values.storage.objectStorage.shardCount }}
+      {{- end }}
+    telemetry:
+      metrics:
+        enabled: {{ .Values.telemetry.metrics.enabled }}
+        synapse_compat_names: {{ .Values.telemetry.metrics.synapseCompatNames }}
+      logging:
+        level: {{ .Values.telemetry.logging.level }}
+        json: {{ eq .Values.telemetry.logging.format "json" }}
+      tracing:
+        enabled: {{ .Values.telemetry.tracing.enabled }}
+        {{- if .Values.telemetry.tracing.otlpEndpoint }}
+        otlp_endpoint: {{ .Values.telemetry.tracing.otlpEndpoint | quote }}
+        {{- end }}
+        sample_ratio: {{ .Values.telemetry.tracing.sampleRatio }}
+      {{- if .Values.telemetry.sentry.enabled }}
+      sentry:
+        environment: {{ .Values.telemetry.sentry.environment | quote }}
+      {{- end }}
+    {{- if .Values.extraConfig }}
+    {{- toYaml .Values.extraConfig | nindent 4 }}
+    {{- end }}
+{{- end }}

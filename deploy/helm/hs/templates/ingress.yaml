@@ -1,0 +1,66 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "hs.fullname" . }}
+  labels:
+    {{- include "hs.labels" . | nindent 4 }}
+  annotations:
+    {{- toYaml .Values.ingress.annotations | nindent 4 }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  {{- if .Values.ingress.tlsEnabled }}
+  tls:
+    - hosts:
+        {{- if .Values.ingress.clientHost }}
+        - {{ .Values.ingress.clientHost }}
+        {{- end }}
+        {{- if .Values.ingress.federationHost }}
+        - {{ .Values.ingress.federationHost }}
+        {{- end }}
+      {{- if .Values.ingress.tlsSecret }}
+      secretName: {{ .Values.ingress.tlsSecret }}
+      {{- end }}
+  {{- end }}
+  rules:
+    {{- if .Values.ingress.clientHost }}
+    - host: {{ .Values.ingress.clientHost }}
+      http:
+        paths:
+          - path: /_matrix
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "hs.fullname" . }}
+                port:
+                  number: {{ .Values.service.clientPort }}
+          - path: /.well-known/matrix
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "hs.fullname" . }}
+                port:
+                  number: {{ .Values.service.clientPort }}
+    {{- end }}
+    {{- if and .Values.ingress.federationHost (ne .Values.ingress.federationHost .Values.ingress.clientHost) }}
+    - host: {{ .Values.ingress.federationHost }}
+      http:
+        paths:
+          - path: /_matrix/federation
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "hs.fullname" . }}
+                port:
+                  number: {{ .Values.service.federationPort }}
+          - path: /_matrix/key
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "hs.fullname" . }}
+                port:
+                  number: {{ .Values.service.federationPort }}
+    {{- end }}
+{{- end }}

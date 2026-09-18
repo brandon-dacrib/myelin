@@ -32,6 +32,7 @@ tower = { workspace = true }
 pin-project-lite = "0.2"
 prometheus-client = { workspace = true }
 rand = { workspace = true }
+hex = { workspace = true }
 time = { version = "0.3", features = ["formatting", "macros"] }
 
 opentelemetry = { version = "0.32", optional = true }

@@ -1,0 +1,152 @@
+{
+  "title": "hs: Homeserver overview",
+  "description": "Skeleton dashboard for the `hs` Matrix homeserver. Built against the metric and span naming conventions in docs/decisions/0004-telemetry-conventions.md (crates/hs-telemetry/src/metrics.rs is normative). Only the process-wide hs_http_* metrics hs-telemetry itself registers exist today; panels for hs_room_*, hs_federation_*, hs_cluster_*, hs_storage_* etc. are stubbed as TODO rows below for the tracks that own those subsystems to fill in as their metrics land (docs/status/12-platform-and-kubernetes.md). Not yet rendered against live metrics in this environment (no Grafana/Prometheus instance available); review before relying on it.",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "tags": ["hs", "matrix", "homeserver"],
+  "timezone": "utc",
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {}
+      },
+      {
+        "name": "namespace",
+        "type": "query",
+        "datasource": "${datasource}",
+        "query": "label_values(hs_http_requests_total, namespace)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true
+      },
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": "${datasource}",
+        "query": "label_values(hs_http_requests_total{namespace=~\"$namespace\"}, instance)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request rate by route and status class",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": "${datasource}",
+      "targets": [
+        {
+          "expr": "sum by (route, status_class) (rate(hs_http_requests_total{namespace=~\"$namespace\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{route}} {{status_class}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" } }
+    },
+    {
+      "id": 2,
+      "title": "Error rate (5xx / total)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": "${datasource}",
+      "targets": [
+        {
+          "expr": "sum(rate(hs_http_requests_total{namespace=~\"$namespace\", instance=~\"$instance\", status_class=\"5xx\"}[5m])) / sum(rate(hs_http_requests_total{namespace=~\"$namespace\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "5xx ratio"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "min": 0 } }
+    },
+    {
+      "id": 3,
+      "title": "Request latency (p50 / p95 / p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": "${datasource}",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, route) (rate(hs_http_request_duration_seconds_bucket{namespace=~\"$namespace\", instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p50 {{route}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, route) (rate(hs_http_request_duration_seconds_bucket{namespace=~\"$namespace\", instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p95 {{route}}"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, route) (rate(hs_http_request_duration_seconds_bucket{namespace=~\"$namespace\", instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p99 {{route}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 4,
+      "title": "Replicas ready (from kube-state-metrics)",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": "${datasource}",
+      "targets": [
+        {
+          "expr": "sum(kube_statefulset_status_replicas_ready{namespace=~\"$namespace\", statefulset=~\"hs.*\"})"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Process resources (CPU / memory, from cAdvisor)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "datasource": "${datasource}",
+      "targets": [
+        {
+          "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=~\"$namespace\", pod=~\"hs-.*\"}[5m]))",
+          "legendFormat": "cpu {{pod}}"
+        },
+        {
+          "expr": "sum by (pod) (container_memory_working_set_bytes{namespace=~\"$namespace\", pod=~\"hs-.*\"})",
+          "legendFormat": "mem {{pod}}"
+        }
+      ]
+    },
+    {
+      "id": 100,
+      "title": "TODO: room subsystem (track 04) — hs_room_events_applied_total, hs_room_state_resolution_duration_seconds",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 },
+      "collapsed": true,
+      "panels": []
+    },
+    {
+      "id": 101,
+      "title": "TODO: federation subsystem (track 05/06) — hs_federation_requests_total, hs_federation_transaction_queue_depth",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 25 },
+      "collapsed": true,
+      "panels": []
+    },
+    {
+      "id": 102,
+      "title": "TODO: storage subsystem (track 01) — hs_kv_commit_duration_seconds, hs_kv_conflict_total",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 },
+      "collapsed": true,
+      "panels": []
+    },
+    {
+      "id": 103,
+      "title": "TODO: cluster subsystem (track 03) — hs_cluster_shards_owned, hs_cluster_lease_renewals_total",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 27 },
+      "collapsed": true,
+      "panels": []
+    }
+  ]
+}

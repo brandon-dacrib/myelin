@@ -1,16 +1,101 @@
 name: ci
+
 on: [push, pull_request]
+
+# Cancel superseded runs on the same ref so the shared amd64/arm64 runner pool (and the shared
+# target/ this project's contributors are warned to be careful with locally) is not doing
+# redundant work for a branch that already has a newer push.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail fast and loud rather than silently retrying/backing off, matching the workspace's own
+  # "do not move on with failing checks" convention (docs/workstreams/12-platform-and-kubernetes.md
+  # agent instructions).
+  CARGO_NET_RETRY: 2
+
 jobs:
-  rust:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm]
+  fmt:
+    name: fmt
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt
       - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clippy-${{ matrix.arch }}
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+
+  test:
+    name: test (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ matrix.arch }}
+      - run: cargo test --workspace --all-targets
+      - run: cargo test --workspace --doc
+
+  # cargo-audit rather than cargo-deny: it checks Cargo.lock against the RustSec advisory
+  # database with no extra config file needed. A cargo-deny pass (license/bans/sources policy)
+  # is a reasonable follow-up once this track has somewhere in its own ownership
+  # (crates/hs-telemetry, crates/hs-operator, .github/, deploy/) to put a deny.toml without
+  # reaching into repo-root territory another track might also want to configure.
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # A single job that must pass for a PR to merge, independent of how the matrix jobs above are
+  # split or renamed later (a GitHub required-status-check list has to name jobs individually
+  # otherwise, which silently stops blocking merges when a job is renamed or the matrix changes).
+  ci-ok:
+    name: ci-ok
+    runs-on: ubuntu-24.04
+    needs: [fmt, clippy, test, audit]
+    if: always()
+    steps:
+      - name: Check all required jobs succeeded
+        run: |
+          for result in "${{ needs.fmt.result }}" "${{ needs.clippy.result }}" "${{ needs.test.result }}" "${{ needs.audit.result }}"; do
+            if [ "$result" != "success" ]; then
+              echo "a required job did not succeed: $result"
+              exit 1
+            fi
+          done

@@ -1,0 +1,124 @@
+# Skeleton alert rules for `hs`, in the Prometheus Operator's `PrometheusRule` CRD shape (the
+# same operator whose ServiceMonitor CRD deploy/helm/hs/templates/servicemonitor.yaml targets —
+# `kube-prometheus-stack` or a standalone `prometheus-operator` install). Apply with
+# `kubectl apply -f deploy/observability/alerts/hs-rules.yaml` once that CRD is installed and a
+# `Prometheus` resource is configured to pick up `PrometheusRule`s matching these labels (adjust
+# `metadata.labels` to whatever selector that `Prometheus` resource uses if it does not default to
+# "any PrometheusRule in the release namespace").
+#
+# Not evaluated against live metrics in this environment (no Prometheus instance available) —
+# reviewed by eye against the metric names crates/hs-telemetry/src/metrics.rs actually registers
+# and docs/decisions/0004-telemetry-conventions.md's naming rules, not fired in anger. Thresholds
+# below are starting points, not tuned budgets; PLAN.md section 7.4's arm64 benchmark numbers
+# (once .github/workflows/nightly-bench.yml produces them for real) should inform the latency
+# thresholds specifically.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hs-rules
+  labels:
+    app.kubernetes.io/name: hs
+    app.kubernetes.io/component: alerts
+spec:
+  groups:
+    - name: hs.availability
+      rules:
+        - alert: HsDown
+          expr: up{job=~"hs.*"} == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "hs instance {{ $labels.instance }} is down"
+            description: >-
+              Prometheus has failed to scrape {{ $labels.instance }} for 2 minutes. Check
+              `kubectl get pods -l app.kubernetes.io/name=hs` and the pod's /health/live and
+              /health/ready endpoints.
+
+        - alert: HsReplicasNotReady
+          expr: kube_statefulset_status_replicas_ready{statefulset=~"hs.*"} < kube_statefulset_status_replicas{statefulset=~"hs.*"}
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "hs StatefulSet {{ $labels.statefulset }} has fewer ready replicas than desired"
+            description: >-
+              {{ $value }} replicas are not ready for more than 10 minutes. Check pod events and
+              /health/ready for the affected replicas.
+
+    - name: hs.errors
+      rules:
+        - alert: HsHighErrorRate
+          expr: |
+            sum(rate(hs_http_requests_total{status_class="5xx"}[5m]))
+            /
+            sum(rate(hs_http_requests_total[5m]))
+            > 0.05
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "hs 5xx error rate above 5% for 5 minutes"
+            description: >-
+              {{ $value | humanizePercentage }} of requests are failing with a 5xx status.
+              Check recent deploys and logs (structured JSON logs, see
+              docs/decisions/0004-telemetry-conventions.md for the request_id field to correlate
+              a failing request across logs and traces).
+
+    - name: hs.latency
+      rules:
+        - alert: HsHighRequestLatencyP99
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le, route) (rate(hs_http_request_duration_seconds_bucket[5m]))
+            ) > 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "hs p99 request latency for {{ $labels.route }} above 1s"
+            description: >-
+              p99 latency has been above 1 second for 10 minutes on {{ $labels.route }}. Starting
+              threshold, not a PLAN.md section 7.4 budget yet — see this file's header comment.
+
+    - name: hs.resources
+      rules:
+        - alert: HsContainerRestartingFrequently
+          expr: increase(kube_pod_container_status_restarts_total{pod=~"hs-.*"}[1h]) > 3
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: "hs container {{ $labels.pod }}/{{ $labels.container }} restarted more than 3 times in 1h"
+            description: >-
+              Check `kubectl logs --previous` for the crashing container and the liveness probe
+              configuration (deploy/helm/hs/values.yaml `probes.liveness`).
+
+        - alert: HsMemoryNearLimit
+          expr: |
+            container_memory_working_set_bytes{pod=~"hs-.*"}
+            /
+            kube_pod_container_resource_limits{pod=~"hs-.*", resource="memory"}
+            > 0.9
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "hs container {{ $labels.pod }}/{{ $labels.container }} using over 90% of its memory limit"
+            description: >-
+              Sustained high memory usage risks an OOMKill. Review deploy/helm/hs/values.yaml
+              `resources.limits.memory` and whether traffic genuinely grew or this is a leak.
+
+    - name: hs.storage
+      rules:
+        # Placeholder: hs-kv (track 01) does not register hs_kv_* metrics yet
+        # (docs/status/12-platform-and-kubernetes.md notes the same gap for the Grafana
+        # dashboard). Uncomment and tune once they land.
+        # - alert: HsStorageConflictRateHigh
+        #   expr: sum(rate(hs_kv_conflict_total[5m])) / sum(rate(hs_kv_commit_total[5m])) > 0.1
+        #   for: 10m
+        #   labels:
+        #     severity: warning
+        #   annotations:
+        #     summary: "hs-kv transaction conflict rate above 10%"
+        []

@@ -1,0 +1,21 @@
+hs ({{ .Values.mode }} mode) has been installed as {{ include "hs.fullname" . }} in namespace {{ .Release.Namespace }}.
+
+Server name: {{ .Values.serverName | default "(not set! set .Values.serverName)" }}
+
+Check rollout status:
+  kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "hs.fullname" . }}
+
+Check readiness:
+  kubectl -n {{ .Release.Namespace }} get pods -l {{ include "hs.selectorLabels" . | replace "\n" "," }}
+
+Port-forward the client API for a local check:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "hs.fullname" . }} {{ .Values.service.clientPort }}:{{ .Values.service.clientPort }}
+  curl http://127.0.0.1:{{ .Values.service.clientPort }}/health/ready
+
+{{- if not .Values.secrets.signingKey.existingSecret }}
+
+WARNING: secrets.signingKey.existingSecret is not set. The workload will fail to start (see
+templates/_helpers.tpl's hs.validate check). Generate a key and create the Secret first:
+  hs generate-signing-key -o signing.key
+  kubectl -n {{ .Release.Namespace }} create secret generic my-hs-signing-key --from-file=signing.key
+{{- end }}

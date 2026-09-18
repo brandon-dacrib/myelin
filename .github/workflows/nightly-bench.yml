@@ -1,0 +1,66 @@
+name: nightly-bench
+
+# Skeleton for the arm64 benchmark rig (PLAN.md section 7.4, docs/workstreams/12-platform-and-kubernetes.md
+# Phase 0 deliverable: "the arm64 benchmark rig producing numbers"). Runs on a schedule rather
+# than every push: criterion benchmarks are slow and their results are only meaningful compared
+# against yesterday's run on the same (ideally dedicated, non-shared) hardware, not against every
+# commit's transient CI runner.
+#
+# Not yet wired to real budgets: this workflow runs `cargo bench` for any crate that has a
+# `benches/` target (today, only crates/hs-kv) and uploads the raw criterion output as an
+# artifact. Turning that into a pass/fail budget check against PLAN.md section 7.4's small-ARM-host
+# numbers, and publishing a trend, is tracked in docs/status/12-platform-and-kubernetes.md as
+# follow-up work, not implemented here.
+
+on:
+  schedule:
+    # 03:00 UTC daily.
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench-arm64:
+    name: bench (arm64)
+    # ubuntu-24.04-arm is a GitHub-hosted arm64 runner, shared with everyone else on the plan —
+    # fine for "does this still run and produce numbers", not a substitute for the dedicated
+    # small-ARM-host rig (a Raspberry Pi class device or equivalent) PLAN.md section 7.4 actually
+    # budgets against. Wiring up a self-hosted arm64 runner for that hardware is tracked as a
+    # follow-up (docs/status/12-platform-and-kubernetes.md, "Next").
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench-arm64
+      - name: Run benchmarks
+        run: cargo bench --workspace 2>&1 | tee bench-output.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-arm64-${{ github.sha }}
+          path: |
+            bench-output.txt
+            target/criterion/
+          retention-days: 30
+
+  bench-amd64:
+    name: bench (amd64, baseline for comparison)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench-amd64
+      - name: Run benchmarks
+        run: cargo bench --workspace 2>&1 | tee bench-output.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-amd64-${{ github.sha }}
+          path: |
+            bench-output.txt
+            target/criterion/
+          retention-days: 30

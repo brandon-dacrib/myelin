@@ -5,8 +5,28 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "hs-operator: see docs/workstreams for the owning track"
+description = "kube-rs CRD schemas (Homeserver, AppService, Bridge, PushGateway, IdentityService) and reconcile loops (track 12)"
+
+[[bin]]
+name = "gen-crds"
+path = "src/bin/gen_crds.rs"
 
 [dependencies]
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+# Pinned separately from the workspace's schemars "1" (used by hs-config and others): kube-core
+# 1.1.0's `#[derive(CustomResource)]` macro is built against schemars 0.8 internally (see the note
+# on the root Cargo.toml's `k8s-openapi` entry), so the `JsonSchema` impls this crate's CRD structs
+# need must come from the same 0.8 line for kube_derive's generated code to find them. Noted here
+# per docs/workstreams/12-platform-and-kubernetes.md's brief ("record the addition in your status
+# file"); see docs/status/12-platform-and-kubernetes.md.
+schemars = { version = "0.8", features = ["preserve_order"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
