@@ -15,9 +15,9 @@
 //! [`REBASE_INTERVAL`] hops, `apply` writes a "base" frame containing the full materialized
 //! state instead of another layer.
 
-use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use hs_kv::{KvBackend, KvError, KvRead, KvWrite};
 use hs_model::ids::{EventSn, StateKeyId};
@@ -167,9 +167,9 @@ fn content_hash(
 pub struct FrameRepr<KV: KvBackend> {
     backend: KV,
     frames: KV::Keyspace,
-    bytes_written: Rc<Cell<u64>>,
-    rebase_count: Rc<Cell<u64>>,
-    dedup_hits: Rc<Cell<u64>>,
+    bytes_written: Arc<AtomicU64>,
+    rebase_count: Arc<AtomicU64>,
+    dedup_hits: Arc<AtomicU64>,
 }
 
 impl<KV: KvBackend> FrameRepr<KV> {
@@ -182,29 +182,29 @@ impl<KV: KvBackend> FrameRepr<KV> {
         Ok(Self {
             backend,
             frames,
-            bytes_written: Rc::new(Cell::new(0)),
-            rebase_count: Rc::new(Cell::new(0)),
-            dedup_hits: Rc::new(Cell::new(0)),
+            bytes_written: Arc::new(AtomicU64::new(0)),
+            rebase_count: Arc::new(AtomicU64::new(0)),
+            dedup_hits: Arc::new(AtomicU64::new(0)),
         })
     }
 
     /// Total bytes ever passed to `KvWrite::put` for this representation's keyspace.
     #[must_use]
     pub fn bytes_written(&self) -> u64 {
-        self.bytes_written.get()
+        self.bytes_written.load(Ordering::Relaxed)
     }
 
     /// How many `apply` calls wrote a full "base" frame rather than a delta layer.
     #[must_use]
     pub fn rebase_count(&self) -> u64 {
-        self.rebase_count.get()
+        self.rebase_count.load(Ordering::Relaxed)
     }
 
     /// How many `apply` calls produced a frame whose content hash already existed (the delta was
     /// identical to one already stored from the same parent) and therefore wrote nothing.
     #[must_use]
     pub fn dedup_hits(&self) -> u64 {
-        self.dedup_hits.get()
+        self.dedup_hits.load(Ordering::Relaxed)
     }
 
     /// Sums key and value bytes resident in this representation's keyspace.
@@ -249,13 +249,13 @@ impl<KV: KvBackend> FrameRepr<KV> {
         );
 
         if self.exists(hash)? {
-            self.dedup_hits.set(self.dedup_hits.get() + 1);
+            self.dedup_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(hash);
         }
 
         let encoded = encode_frame(rec);
         self.bytes_written
-            .set(self.bytes_written.get() + encoded.len() as u64 + 16);
+            .fetch_add(encoded.len() as u64 + 16, Ordering::Relaxed);
         let mut txn = self.backend.begin()?;
         txn.put(&self.frames, &hash, &encoded)?;
         self.backend.commit(txn)?.map_err(|_conflict| {
@@ -422,7 +422,7 @@ impl<KV: KvBackend> StateRepr for FrameRepr<KV> {
                 appended,
                 disposed: Vec::new(),
             })?;
-            self.rebase_count.set(self.rebase_count.get() + 1);
+            self.rebase_count.fetch_add(1, Ordering::Relaxed);
             Ok(RootB(hash))
         } else {
             let mut appended: Vec<_> = changes.added.iter().map(|(k, v)| (*k, *v)).collect();

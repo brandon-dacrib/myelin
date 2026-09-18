@@ -28,24 +28,23 @@ fn parse_room_id(raw: &str) -> Result<ruma::OwnedRoomId, RoomError> {
 
 /// `PUT /rooms/{roomId}/send/{eventType}/{txnId}`.
 ///
-/// Transaction-ID deduplication (the spec requires replaying the same `txnId` to return the same
-/// `event_id` rather than sending a second event) is not implemented in this pass -- each call
-/// sends a new event. Recorded in `docs/status/04-room-and-events.md`.
+/// Deduplicated on `(sender, device, txnId)`: replaying the same transaction ID returns the same
+/// `event_id` rather than sending a second event (`RoomActor::send_event_txn`).
 pub async fn put_send<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
-    Path((room_id, event_type, _txn_id)): Path<(String, String, String)>,
+    Path((room_id, event_type, txn_id)): Path<(String, String, String)>,
     RoomRequester(requester): RoomRequester,
     Json(content): Json<Value>,
 ) -> Result<Response, RoomError> {
     let room_id = parse_room_id(&room_id)?;
     let handle = state.rooms.get_or_load(&room_id).await?;
     let event = handle
-        .send_event(
+        .send_event_txn(
             requester.user_id.clone(),
+            requester.device_id.clone(),
+            txn_id,
             event_type,
-            None,
             content,
-            None,
             now_ms(),
         )
         .await?;

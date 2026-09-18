@@ -22,11 +22,11 @@ fn now_ms() -> i64 {
 
 /// `PUT /rooms/{roomId}/redact/{eventId}/{txnId}`.
 ///
-/// Like `crate::routes::send_state::put_send`, transaction-ID deduplication is not implemented
-/// in this pass.
+/// Deduplicated on `(sender, device, txnId)`, like `crate::routes::send_state::put_send`
+/// (`RoomActor::redact_txn`).
 pub async fn put_redact<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
-    Path((room_id, event_id, _txn_id)): Path<(String, String, String)>,
+    Path((room_id, event_id, txn_id)): Path<(String, String, String)>,
     RoomRequester(requester): RoomRequester,
     Json(body): Json<Value>,
 ) -> Result<Response, RoomError> {
@@ -43,7 +43,14 @@ pub async fn put_redact<B: KvBackend + 'static>(
 
     let handle = state.rooms.get_or_load(&room_id).await?;
     let event = handle
-        .redact(requester.user_id.clone(), target, reason, now_ms())
+        .redact(
+            requester.user_id.clone(),
+            requester.device_id.clone(),
+            txn_id,
+            target,
+            reason,
+            now_ms(),
+        )
         .await?;
     Ok(Json(json!({"event_id": event.event_id().to_string()})).into_response())
 }
