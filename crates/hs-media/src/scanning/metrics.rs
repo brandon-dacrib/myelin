@@ -157,7 +157,9 @@ mod tests {
         metrics.record_scan("icap", "clean", "local", 0.01);
         metrics.record_cache_hit("icap");
 
-        let text = hs_telemetry::metrics::Metrics::new().encode_to_string().unwrap();
+        let text = hs_telemetry::metrics::Metrics::new()
+            .encode_to_string()
+            .unwrap();
         // (This standalone registry is separate from the one above; the real assertion is that
         // the two families are independent counters, checked directly below.)
         let _ = text;

@@ -82,13 +82,17 @@ impl From<WireVerdict> for Result<Verdict, ScanError> {
     fn from(w: WireVerdict) -> Self {
         Ok(match w {
             WireVerdict::Clean => Verdict::Clean,
-            WireVerdict::Infected { signature, details } => Verdict::Infected { signature, details },
+            WireVerdict::Infected { signature, details } => {
+                Verdict::Infected { signature, details }
+            }
             WireVerdict::Unscannable { reason } => Verdict::Unscannable {
                 reason: match reason {
                     WireUnscannableReason::Encrypted => UnscannableReason::Encrypted,
                     WireUnscannableReason::TooLarge => UnscannableReason::TooLarge,
                     WireUnscannableReason::TooDeep => UnscannableReason::TooDeep,
-                    WireUnscannableReason::UnsupportedFormat => UnscannableReason::UnsupportedFormat,
+                    WireUnscannableReason::UnsupportedFormat => {
+                        UnscannableReason::UnsupportedFormat
+                    }
                     WireUnscannableReason::Other(s) => UnscannableReason::Other(s),
                 },
             },
@@ -144,7 +148,10 @@ impl HttpScanner {
     }
 
     fn poll_url(&self) -> &str {
-        self.config.poll_url.as_deref().unwrap_or(&self.config.submit_url)
+        self.config
+            .poll_url
+            .as_deref()
+            .unwrap_or(&self.config.submit_url)
     }
 
     fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -209,10 +216,7 @@ impl ContentScanner for HttpScanner {
             .body(body.to_vec());
         builder = self.apply_auth(builder);
 
-        let resp = builder
-            .send()
-            .await
-            .map_err(classify_reqwest_error)?;
+        let resp = builder.send().await.map_err(classify_reqwest_error)?;
         Self::parse_response(resp).await
     }
 
@@ -302,7 +306,8 @@ mod tests {
             poll_url: None,
             auth_token: None,
         });
-        let source = ScanSource::from_bytes("application/octet-stream", Bytes::from_static(b"X5O!"), 16);
+        let source =
+            ScanSource::from_bytes("application/octet-stream", Bytes::from_static(b"X5O!"), 16);
         let verdict = scanner.scan(source, &ctx()).await.unwrap();
         assert_eq!(
             verdict,
@@ -334,10 +339,14 @@ mod tests {
             )
             .route(
                 "/poll",
-                get(|axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
-                    assert_eq!(q.get("ticket").map(String::as_str), Some("job-1"));
-                    Json(serde_json::json!({"status": "clean"}))
-                }),
+                get(
+                    |axum::extract::Query(q): axum::extract::Query<
+                        std::collections::HashMap<String, String>,
+                    >| async move {
+                        assert_eq!(q.get("ticket").map(String::as_str), Some("job-1"));
+                        Json(serde_json::json!({"status": "clean"}))
+                    },
+                ),
             );
         let base = start_mock(router).await;
         let scanner = HttpScanner::new(HttpConfig {
@@ -410,7 +419,11 @@ mod tests {
             poll_url: None,
             auth_token: None,
         });
-        let source = ScanSource::from_bytes("application/octet-stream", Bytes::from_static(b"ciphertext"), 16);
+        let source = ScanSource::from_bytes(
+            "application/octet-stream",
+            Bytes::from_static(b"ciphertext"),
+            16,
+        );
         let verdict = scanner.scan(source, &ctx()).await.unwrap();
         assert_eq!(
             verdict,
@@ -450,7 +463,11 @@ mod tests {
         let source = ScanSource::from_bytes("image/png", Bytes::from_static(b"original-bytes"), 16);
         let verdict = scanner.scan(source, &ctx()).await.unwrap();
         match verdict {
-            Verdict::Replaced { content, by, reason } => {
+            Verdict::Replaced {
+                content,
+                by,
+                reason,
+            } => {
                 assert_eq!(content.bytes.as_ref(), b"stripped-bytes");
                 assert_eq!(content.content_type.as_deref(), Some("image/png"));
                 assert_eq!(by, "cloud-scanner");
@@ -476,15 +493,13 @@ mod tests {
     async fn auth_token_is_sent_as_bearer() {
         let router = Router::new().route(
             "/submit",
-            post(
-                |headers: axum::http::HeaderMap| async move {
-                    assert_eq!(
-                        headers.get(axum::http::header::AUTHORIZATION).unwrap(),
-                        "Bearer secret-token"
-                    );
-                    Json(serde_json::json!({"status": "clean"}))
-                },
-            ),
+            post(|headers: axum::http::HeaderMap| async move {
+                assert_eq!(
+                    headers.get(axum::http::header::AUTHORIZATION).unwrap(),
+                    "Bearer secret-token"
+                );
+                Json(serde_json::json!({"status": "clean"}))
+            }),
         );
         let base = start_mock(router).await;
         let scanner = HttpScanner::new(HttpConfig {

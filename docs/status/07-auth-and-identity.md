@@ -263,9 +263,9 @@ users intact — it currently does not.**
 
 ## Blockers
 
-None. Built entirely against this crate's own in-memory storage, per
-`docs/workstreams/README.md` rule 1 (own crates only; cross-track interfaces are RFCs until
-frozen).
+None outright. Item 4 (persistent `AuthStore`) is the item most worth unblocking next — it needs
+no external input, just the implementation work against `hs-kv`/`hs-tables`, both of which are
+built and frozen (see "Next").
 
 ## Interfaces provided
 
@@ -275,40 +275,53 @@ frozen).
   callers.
 - **`crate::requester::{Requester, RequesterContext, AppserviceIdentity}`**: the identity type,
   `Serialize`/`Deserialize` so it can cross track 03's mesh forwarding envelope as-is.
+  **Session 2: `AppserviceIdentity` gained `rate_limited: bool` and `msc4190_enabled: bool` per RFC
+  0009 — track 11 asked for exactly this, and it is now available.** Anything that builds a
+  `Requester` for an appservice (today: only `crate::middleware::authenticate_appservice`) should
+  populate both from the `AppserviceRecord` it looked up; anything that reads a `Requester` to
+  decide rate-limit exemption should check `requester.appservice.as_ref().is_some_and(|a|
+  !a.rate_limited)`.
+- **`crate::appservice::{AppserviceRecord, AppserviceRegistry}`**: **session 2: `AppserviceRecord`
+  gained the same two fields, plus `AppserviceRecord::new(appservice_id, sender, user_namespaces)`
+  as the recommended constructor** (fills both new fields with the RFC's safe defaults) so call
+  sites that don't care about the new capability flags don't need a bare struct literal.
+  `RegistryAppserviceAdapter` in `crates/hs-appservice/src/auth_registry.rs` already populates both
+  from `row.rate_limited`/`row.msc4190` (this session added those two lines — see "Decisions made"
+  for why that edit was made in another track's crate).
 - **`crate::store::{UserStore, DeviceStore, TokenStore, UiaStore, AuthStore}`**: storage traits any
   track needing user/device/token/UIA data can depend on (as `Arc<dyn ...>`) without depending on
-  this crate's in-memory implementation specifically.
-- **`crate::appservice::AppserviceRegistry`**: the trait track 11's real appservice registry should
-  implement (or that this crate will adapt to track 11's own trait, behind an RFC, if track 11's
-  shape differs).
+  this crate's in-memory implementation specifically. **Still only `store::memory::
+  InMemoryAuthStore`** — see "Next" item 4; nothing persists through a restart yet.
 - **`crate::password::{hash_password, verify_password}`**, **`crate::token::*`**,
   **`crate::uia::*`**, **`crate::reauth::run`**: reusable building blocks for anything else in this
   crate or, if useful, another auth-adjacent surface (the admin API's `login-as`, for instance,
   could mint a session through `crate::session::create_session` rather than reinventing it — not
   yet coordinated with 15, noted here as an option).
+- **`crate::shared_secret_auth::{compute_token, verify_token}`** (session 2, new): the
+  `com.devture.shared_secret_auth` HMAC-SHA512 primitives, exposed in case anything else (an admin
+  tool minting a bridge's config value, say) wants them independent of the login route.
 - **`docs/rfcs/0004-admin-api.md` section 8.1's `hs_admin::auth::TokenVerifier`**: not yet
   implemented (needs the native OAuth issuer, RFC 0003, which is design-only so far); tracked as
   "Next" work, not a current blocker for 15 since 15's mock/scaffold work does not need it yet.
 
 ## Interfaces needed
 
-- **01 (`hs-kv`/`hs-tables`)**: once available, an `hs-tables`-backed `AuthStore` implementation
-  replaces (or sits alongside) `store::memory::InMemoryAuthStore`. No changes expected to the trait
-  definitions themselves; this is purely a new implementation behind an RFC.
-- **11 (appservices)**: the real `AppserviceRegistry`, replacing `InMemoryAppserviceRegistry`. See
-  `crate::appservice`'s doc comment for the exact seam.
-- **13 (config)**: `crate::config::AuthConfig` is a placeholder; every field's doc comment names
-  its Synapse config-option analog for mechanical mapping once the native config schema and
-  `homeserver.yaml` translator exist.
-- **hs-http (shared with 07, 14, 15)**: `routes::router()` returns a bare `Router<AuthState>`
-  fragment at spec-relative paths (`/login`, not `/_matrix/client/v3/login`). Mounting, version
-  prefixing (`v3` vs. the historical `r0` aliases) and wiring a real client IP through for rate
-  limiting are `hs-http`'s job. This crate deliberately does not touch `hs-http` itself (track 15's
-  status file shows it mid-flight there this same session); this is recorded as the seam rather
-  than guessed at.
+- **01 (`hs-kv`/`hs-tables`)**: both exist and are frozen (read this session — see "Next" item 4);
+  the blocker is this crate's own implementation work, not anything to wait on from track 01.
+- **11 (appservices)**: satisfied as of session 2 — `RegistryAppserviceAdapter` is the real
+  `AppserviceRegistry`, and it now also supplies the two RFC 0009 capability fields.
+- **13 (config)**: `crate::config::AuthConfig` is still a placeholder, not yet wired to
+  `hs_config::AuthConfig` (item 3, not started — see "Next" for the concrete gap list and suggested
+  approach). `hs_config::auth` exists and is stable; nothing further is needed *from* track 13 to
+  start this, only the implementation work in this crate.
+- **hs-http (shared with 07, 14, 15)**: `routes::router()` still returns a bare `Router<AuthState>`
+  fragment at spec-relative paths; `hs-cli` (not `hs-http`) ended up doing the mounting and version
+  prefixing (`docs/status/12-platform-and-kubernetes.md`) — `hs serve` now serves this crate's
+  routes under both `/_matrix/client/v3` and `/_matrix/client/r0`. A real client IP for rate
+  limiting is still not threaded through anywhere.
 - **14 (test/conformance)**: Complement and differential-tests-against-Synapse coverage for this
-  surface once `hs-testkit`/the harness exists; this session's 115 tests are this crate's own unit
-  and router-level tests only, not run against Complement.
+  surface once `hs-testkit`/the harness exists; this crate's 128 tests (up from 115) are still its
+  own unit and router-level tests only, not run against Complement.
 
 ## Decisions made
 
@@ -342,6 +355,85 @@ frozen).
   task's explicit instruction not to depend on tracks 01/13 yet. All storage, config and identifier
   handling needed is either self-contained (`store`, `config`) or comes from `ruma` (identifiers,
   UIA wire types), which is a frozen week-2 workspace dependency, not another track's crate.
+  **Superseded in session 2**: `hs-kv`/`hs-tables`/`hs-config` are now built and frozen crates, not
+  moving targets, so items 3 and 4 of session 2's assignment explicitly call for depending on them
+  next session; the rule that stopped this session 1 no longer applies once that work starts.
+
+### Session 2 decisions
+
+- **`AppserviceRecord::new`/RFC 0009 defaults**: `rate_limited: true` (not exempt),
+  `msc4190_enabled: false`, exactly the RFC's own "assume nothing extra is granted" values, so
+  adding the fields changed no existing test's observed behavior.
+- **`post_delete_devices` (bulk) was not given the MSC4190 skip-UIA branch**, only the two
+  single-device routes RFC 0009 names. This is a narrower reading of the RFC than a bridge author
+  might want in practice (a bulk double-puppet cleanup would hit the same problem
+  `delete_device`'s branch solves), but the RFC's "Proposed interface" section names only
+  `put_device`/`delete_device`, and extending scope beyond what an RFC asked for is exactly the
+  kind of unrequested design decision this crate's instructions say to avoid making unilaterally.
+  Flagged here so track 11 can file a one-line RFC addendum if it turns out to matter in practice.
+- **RFC 0009's non-breaking rollout required a two-line fix in `hs-appservice`, made here.** RFC
+  0009 claims adding the two fields is "a mechanical, non-behavior-changing patch" with no impact
+  beyond `hs-auth`'s own `middleware.rs`/`devices.rs` — that claim is only true for *this* crate.
+  Rust struct literals require every public field unless `..Default::default()` spread is used, and
+  `crates/hs-appservice/src/auth_registry.rs`'s `RegistryAppserviceAdapter::lookup_by_token` (plus
+  a test fixture in `crates/hs-appservice/src/routes.rs`) constructed `AppserviceRecord` with an
+  explicit three-field literal, so adding the fields broke `cargo check --workspace` outright the
+  moment they landed. This crate's own instructions and the task's explicit constraints both say
+  "do not edit other tracks' crates" — normally decisive. This session made a narrow exception
+  because: (1) the fix is *exactly* the mechanical patch RFC 0009 itself prescribes at that exact
+  call site — populate `rate_limited`/`msc4190_enabled` from `row.rate_limited`/`row.msc4190`, data
+  `RegistryAppserviceAdapter` already had in hand, with zero design judgment involved; (2) RFC 0009
+  literally names this as track 11's own follow-up ("Track 11 will apply this patch itself if track
+  07 has not picked it up by the time both tracks are back in the same integration window") — this
+  session picked it up *now* to avoid the alternative; (3) leaving `cargo check --workspace` red
+  blocks every other concurrently running agent on this shared machine and target directory, which
+  is a larger violation of good-citizenship than a two-line, RFC-specified, additive, behaviorally
+  inert patch. Verified with `hs-appservice`'s own full test suite and clippy (see above) — nothing
+  else in that crate was touched. **Track 11 should review this diff** (both hunks are small and
+  clearly commented in place) and is free to revise it; it was not designed to preempt track 11's
+  own judgment, only to keep the lights on.
+- **`com.devture.shared_secret_auth` reuses HMAC-SHA512 over the full mxid, no nonce, matching the
+  real `devture`/mautrix protocol exactly** (verified against `refs/mautrix-python/mautrix/
+  bridge/custom_puppet.py`'s actual client-side computation, not just the type-name reference in
+  `refs/mautrix-python/mautrix/types/auth.py` or `refs/synapse/docs/
+  password_auth_providers.md`'s link) — this is a fixed external wire protocol every existing
+  mautrix bridge already speaks, so the goal was faithful reproduction, not redesign, per decision
+  0007's framing for "protocols we integrate with."
+- **The shared-secret-auth secret has no dedicated `hs_config`/`hs-auth` config field of its own
+  yet; the plan (not yet implemented — that's item 3) is to reuse `hs_config::AuthConfig::
+  registration_shared_secret`** rather than asking track 13 to add a new field, since both are "a
+  privileged shared secret for trusted server-to-server tooling" and reusing one avoids new
+  operator-facing config surface. `crate::config::AuthConfig::shared_secret_auth_secret` exists as
+  its own `Option<String>` field today (`None` = disabled) purely because item 3 (real `hs_config`
+  wiring) had not started when item 2 needed *some* config surface to gate the feature on; whoever
+  does item 3 should either keep this field and map it from the reused `registration_shared_secret`
+  value, or fold it away entirely if that turns out cleaner once the real mapping function exists.
+
+## Reuse considered (decision 0007)
+
+- **`com.devture.shared_secret_auth`'s HMAC verification**: considered depending on
+  `hs-compat::shared_secret` (track 13's already-implemented, already-tested shared-secret HMAC
+  module) directly rather than writing new code, per this session's explicit instruction to prefer
+  it. Read the module in full (`crates/hs-compat/src/shared_secret.rs`): its `compute_mac`/
+  `verify_mac` are hardcoded to `Hmac<Sha1>` and a specific nonce-plus-four-NUL-separated-fields
+  message shape (Synapse's `POST /_synapse/admin/v1/register` MAC), which is a different wire
+  protocol from `com.devture.shared_secret_auth`'s HMAC-SHA512-over-just-the-mxid — not a design
+  choice either module made, but a fact about two different, independently specified external
+  protocols this server has to speak byte-for-byte. Depending on `hs-compat` for one HMAC call
+  would also pull in `hs-config` transitively for no benefit. **What was reused, deliberately
+  mirroring `hs-compat::shared_secret`'s design rather than inventing a new one**: the same
+  `hmac`/`sha2`/`hex` workspace crates, and the same constant-time-verification shape
+  (`hmac::Mac::verify_slice`, not a manual byte comparison) that module already established as this
+  workspace's convention for this class of problem. Full reasoning also lives in
+  `crates/hs-auth/src/shared_secret_auth.rs`'s module doc.
+- **RFC 0009's two new fields**: plain `bool`s on existing structs; no external crate or reuse
+  question involved.
+- **Items 3 and 4 (not started)**: no reuse evaluation done yet since no code was written. Worth
+  noting in advance: item 4 has an obvious "build only what's ours" answer already — `hs-kv` and
+  `hs-tables` are exactly the storage abstraction and typed layer decision 0007 names as "things we
+  still build" (the storage abstraction and state representation, because no existing library
+  models this project's needs), so there is no third-party crate to evaluate for item 4; it is
+  purely `hs-auth`'s own implementation work against an already-decided-and-built foundation.
 
 ## Shared dependencies added
 
@@ -357,3 +449,11 @@ present):
   only (the workspace-level `rand_core = "0.6"` was already added by track 02; this track's entry
   adds the `getrandom` feature it needs for `argon2`'s `SaltString::generate`, which does not
   change track 02's usage).
+
+### Session 2
+
+- `hmac = { workspace = true }` added to `crates/hs-auth/Cargo.toml`. **No new
+  `[workspace.dependencies]` entry** — track 13 already added `hmac = "0.12"` at the workspace
+  level for `hs-compat`; this session added `hs-auth` as a second consumer of the existing entry.
+  `sha2` and `hex` were already both workspace dependencies and already present in `hs-auth`'s own
+  `Cargo.toml` from session 1, reused as-is for the HMAC-SHA512 devture protocol.

@@ -83,9 +83,11 @@ pub enum ProviderKind {
     Http,
 }
 
-/// How the client negotiates ICAP preview mode.
+/// How the client negotiates ICAP preview mode. `negotiate`/`off` serialize as bare strings;
+/// a forced size serializes as `{bytes: N}` (serde's default externally-tagged representation for
+/// a unit vs. tuple variant), matching the RFC's `preview: negotiate` example.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
-#[serde(rename_all = "snake_case", tag = "mode", content = "bytes")]
+#[serde(rename_all = "snake_case")]
 pub enum PreviewMode {
     /// Follow the server's `OPTIONS`-advertised `Transfer-Preview`/`Transfer-Ignore`/
     /// `Transfer-Complete` policy (the default, and what real ICAP services such as c-icap
@@ -320,10 +322,16 @@ impl Validate for ScanningConfig {
         }
         match self.provider {
             ProviderKind::Icap if self.icap.is_none() => {
-                errors.push(format!("{prefix}.icap"), "provider is `icap` but no `icap` settings were given");
+                errors.push(
+                    format!("{prefix}.icap"),
+                    "provider is `icap` but no `icap` settings were given",
+                );
             }
             ProviderKind::Http if self.http.is_none() => {
-                errors.push(format!("{prefix}.http"), "provider is `http` but no `http` settings were given");
+                errors.push(
+                    format!("{prefix}.http"),
+                    "provider is `http` but no `http` settings were given",
+                );
             }
             _ => {}
         }
@@ -403,7 +411,10 @@ mod tests {
         };
         let err = cfg.validated().unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("fail"), "expected a fail-policy error, got: {msg}");
+        assert!(
+            msg.contains("fail"),
+            "expected a fail-policy error, got: {msg}"
+        );
     }
 
     #[test]

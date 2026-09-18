@@ -81,7 +81,9 @@ impl IcapScanner {
             .user_agent("hs-media")
             // `icap-rs` caches OPTIONS per RFC 3507 §4.10.2/§5 and reconciles the ISTag
             // automatically; a 5-minute fallback covers a server that omits `Options-TTL`.
-            .with_options_cache(OptionsCacheConfig::new().with_default_ttl(Duration::from_secs(300)))
+            .with_options_cache(
+                OptionsCacheConfig::new().with_default_ttl(Duration::from_secs(300)),
+            )
             .build();
         Self { client, config }
     }
@@ -225,7 +227,11 @@ fn parse_infection_header(name: &str, value: &str) -> (String, Option<String>) {
 /// AV services echo the body back rather than answering `204`); any other `200` is a genuine
 /// [`Verdict::Replaced`] (RFC section 3.4) — applying it is `crate::scanning::engine`'s job, not
 /// this function's, which only reports what the service said.
-fn to_verdict(resp: &icap_rs::response::Response<icap_rs::response::Parsed>, sent_body: &[u8], service: &str) -> Verdict {
+fn to_verdict(
+    resp: &icap_rs::response::Response<icap_rs::response::Parsed>,
+    sent_body: &[u8],
+    service: &str,
+) -> Verdict {
     if resp.status_code() == icap_rs::StatusCode::NO_CONTENT {
         return Verdict::Clean;
     }
@@ -303,7 +309,8 @@ mod tests {
 
     #[test]
     fn no_content_is_clean() {
-        let resp = IcapResponse::from_raw(b"ICAP/1.0 204 No Content\r\n\r\n").unwrap();
+        let resp =
+            IcapResponse::from_raw(b"ICAP/1.0 204 No Content\r\nISTag: \"v1\"\r\n\r\n").unwrap();
         assert_eq!(to_verdict(&resp, b"anything", "virus_scan"), Verdict::Clean);
     }
 
@@ -323,7 +330,8 @@ mod tests {
 
     #[test]
     fn x_virus_id_on_the_embedded_http_response_is_infected() {
-        let http_hdr = "HTTP/1.1 200 OK\r\nX-Virus-ID: Eicar-Test-Signature\r\nContent-Length: 4\r\n\r\n";
+        let http_hdr =
+            "HTTP/1.1 200 OK\r\nX-Virus-ID: Eicar-Test-Signature\r\nContent-Length: 4\r\n\r\n";
         let raw = format!(
             "ICAP/1.0 200 OK\r\nISTag: \"v1\"\r\nEncapsulated: res-hdr=0, res-body={}\r\n\r\n{http_hdr}4\r\ntest\r\n0\r\n\r\n",
             http_hdr.len()
@@ -424,9 +432,10 @@ mod tests {
 
         #[tokio::test]
         async fn clean_content_gets_204() {
-            let port =
-                start_server("\"v1\"", |_req| OutResponse::no_content_with_istag("\"v1\"").unwrap())
-                    .await;
+            let port = start_server("\"v1\"", |_req| {
+                OutResponse::no_content_with_istag("\"v1\"").unwrap()
+            })
+            .await;
             let scanner = IcapScanner::new(test_config(port));
             let source =
                 ScanSource::from_bytes("text/plain", Bytes::from_static(b"hello world"), 4096);
@@ -447,10 +456,20 @@ mod tests {
 
         #[tokio::test]
         async fn infected_content_is_reported() {
+            // A realistic AV-over-ICAP vendor response for an infected file: `200 OK` (not
+            // `204`, which means "no modification, pass through" and is `to_verdict`'s
+            // unconditional-clean fast path) carrying the vendor's infection header, with a
+            // (possibly empty) embedded HTTP response so the ICAP framing is well-formed.
             let port = start_server("\"v1\"", |_req| {
-                OutResponse::no_content_with_istag("\"v1\"")
+                let embedded = http::Response::builder()
+                    .status(200)
+                    .body(Vec::new())
+                    .unwrap();
+                OutResponse::ok_with_istag("\"v1\"")
                     .unwrap()
                     .try_add_header("X-Virus-ID", "Eicar-Test-Signature")
+                    .unwrap()
+                    .with_http_response(&embedded)
                     .unwrap()
             })
             .await;
@@ -509,7 +528,9 @@ mod tests {
                 let called = Arc::clone(&called_for_handler);
                 async move {
                     called.fetch_add(1, Ordering::SeqCst);
-                    Ok::<OutResponse, icap_rs::HandlerError>(OutResponse::no_content())
+                    Ok::<OutResponse, icap_rs::HandlerError>(
+                        OutResponse::no_content_with_istag("\"v1\"").unwrap(),
+                    )
                 }
             };
             let server = Server::builder()
@@ -523,7 +544,8 @@ mod tests {
                             .with_service("test")
                             .allow_204()
                             .with_preview(4)
-                            .add_transfer_rule("gif", icap_rs::TransferBehavior::Ignore),
+                            .add_transfer_rule("gif", icap_rs::TransferBehavior::Ignore)
+                            .with_default_transfer_behavior(icap_rs::TransferBehavior::Preview),
                     ),
                 )
                 .build()
@@ -535,7 +557,8 @@ mod tests {
             tokio::time::sleep(StdDuration::from_millis(80)).await;
 
             let scanner = IcapScanner::new(test_config(port));
-            let source = ScanSource::from_bytes("image/gif", Bytes::from_static(b"GIF89a..."), 4096);
+            let source =
+                ScanSource::from_bytes("image/gif", Bytes::from_static(b"GIF89a..."), 4096);
             let verdict = scanner.scan(source, &ctx()).await.unwrap();
             assert_eq!(verdict, Verdict::Clean);
             assert_eq!(
@@ -550,7 +573,10 @@ mod tests {
             let scanner = IcapScanner::new(test_config(1));
             let source = ScanSource::from_bytes("text/plain", Bytes::from_static(b"x"), 16);
             let err = scanner.scan(source, &ctx()).await.unwrap_err();
-            assert!(matches!(err, ScanError::Unavailable(_) | ScanError::Protocol(_)));
+            assert!(matches!(
+                err,
+                ScanError::Unavailable(_) | ScanError::Protocol(_)
+            ));
         }
     }
 }

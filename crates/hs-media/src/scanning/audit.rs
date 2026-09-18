@@ -136,7 +136,10 @@ impl InMemoryAuditSink {
     /// The most recent `limit` entries, newest first.
     #[must_use]
     pub fn recent(&self, limit: usize) -> Vec<AuditEntry> {
-        #[allow(clippy::unwrap_used, reason = "see crate::policy::InMemoryQuotaPolicy::current")]
+        #[allow(
+            clippy::unwrap_used,
+            reason = "see crate::policy::InMemoryQuotaPolicy::current"
+        )]
         let entries = self.entries.lock().unwrap();
         entries.iter().rev().take(limit).cloned().collect()
     }
@@ -145,7 +148,10 @@ impl InMemoryAuditSink {
 #[async_trait]
 impl AuditSink for InMemoryAuditSink {
     async fn record(&self, entry: AuditEntry) {
-        #[allow(clippy::unwrap_used, reason = "see crate::policy::InMemoryQuotaPolicy::current")]
+        #[allow(
+            clippy::unwrap_used,
+            reason = "see crate::policy::InMemoryQuotaPolicy::current"
+        )]
         let mut entries = self.entries.lock().unwrap();
         entries.push_back(entry);
         while entries.len() > self.capacity {

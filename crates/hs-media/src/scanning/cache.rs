@@ -395,7 +395,9 @@ mod tests {
             .unwrap();
         // ttl is 3600s = 3_600_000ms; ask at exactly the expiry instant, and past it.
         assert_eq!(
-            cache.get(1000 + 3_600_000, "abc", "clamav", Some("v1")).unwrap(),
+            cache
+                .get(1000 + 3_600_000, "abc", "clamav", Some("v1"))
+                .unwrap(),
             None
         );
         assert!(
@@ -413,7 +415,12 @@ mod tests {
             .put(1000, "abc", "http", None, &Verdict::Clean)
             .unwrap();
         // unversioned_ttl is 60s = 60_000ms.
-        assert!(cache.get(1000 + 59_999, "abc", "http", None).unwrap().is_some());
+        assert!(
+            cache
+                .get(1000 + 59_999, "abc", "http", None)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(cache.get(1000 + 60_000, "abc", "http", None).unwrap(), None);
     }
 

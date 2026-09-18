@@ -43,8 +43,7 @@ use crate::scanning::cache::VerdictCache;
 use crate::scanning::config::{Action, FailPolicy, ScanMode, ScanningConfig};
 use crate::scanning::metrics::ScanMetrics;
 use crate::scanning::types::{
-    AdaptedContent, ContentScanner, ScanContext, ScanSource, UnscannableReason, Verdict,
-    sha256_hex,
+    AdaptedContent, ContentScanner, ScanContext, ScanSource, UnscannableReason, Verdict, sha256_hex,
 };
 
 /// Bytes per chunk handed to the provider's [`ScanSource`] (see that type's doc for why the
@@ -217,7 +216,8 @@ impl<B: hs_kv::KvBackend> ScanEngine<B> {
         // short-circuited above so a provider could not have been asked in the first place — kept
         // so the refusal is independently true even if that ordering ever changes, and so it has
         // its own direct unit test (`tests::replacement_is_refused_for_encrypted_media_regardless`).
-        let raw = refuse_disallowed_replacement(raw, allow_replacement_here, is_encrypted, &self.config);
+        let raw =
+            refuse_disallowed_replacement(raw, allow_replacement_here, is_encrypted, &self.config);
 
         let verdict_label = verdict_label(&raw);
         self.metrics.record_scan(
@@ -230,7 +230,8 @@ impl<B: hs_kv::KvBackend> ScanEngine<B> {
         self.audit_if_needed(&raw, &provider_id, &ctx, now_ms).await;
 
         let action = self.action_for(&raw);
-        self.decision_for(action, raw, &provider_id, &ctx, now_ms).await
+        self.decision_for(action, raw, &provider_id, &ctx, now_ms)
+            .await
     }
 
     async fn raw_outcome(
@@ -261,13 +262,21 @@ impl<B: hs_kv::KvBackend> ScanEngine<B> {
         let source = ScanSource::from_bytes(content_type, bytes.clone(), SCAN_CHUNK_SIZE);
         let mut verdict = match self.scanner.scan(source, ctx).await {
             Ok(v) => v,
-            Err(e) => return RawOutcome::ScannerError { message: e.to_string() },
+            Err(e) => {
+                return RawOutcome::ScannerError {
+                    message: e.to_string(),
+                };
+            }
         };
 
         loop {
             match verdict {
-                Verdict::Pending { ticket, retry_after } => {
-                    let Some(remaining) = ctx.deadline.checked_duration_since(Instant::now()) else {
+                Verdict::Pending {
+                    ticket,
+                    retry_after,
+                } => {
+                    let Some(remaining) = ctx.deadline.checked_duration_since(Instant::now())
+                    else {
                         break RawOutcome::ScannerError {
                             message: "scan did not complete before the deadline (still pending)"
                                 .to_string(),
@@ -283,11 +292,15 @@ impl<B: hs_kv::KvBackend> ScanEngine<B> {
                     verdict = match self.scanner.poll(&ticket).await {
                         Ok(v) => v,
                         Err(e) => {
-                            break RawOutcome::ScannerError { message: e.to_string() };
+                            break RawOutcome::ScannerError {
+                                message: e.to_string(),
+                            };
                         }
                     };
                 }
-                other => break self.finish_terminal(other, &sha256, engine_version.as_deref(), now_ms),
+                other => {
+                    break self.finish_terminal(other, &sha256, engine_version.as_deref(), now_ms);
+                }
             }
         }
     }
@@ -373,7 +386,14 @@ impl<B: hs_kv::KvBackend> ScanEngine<B> {
         now_ms: u64,
     ) -> EngineDecision {
         match (action, raw) {
-            (Action::Allow, RawOutcome::Replaced { content, by, reason }) => {
+            (
+                Action::Allow,
+                RawOutcome::Replaced {
+                    content,
+                    by,
+                    reason,
+                },
+            ) => {
                 let original_sha256 = String::new(); // filled in by the caller, which has the original bytes
                 let adapted_sha256 = sha256_hex(&content.bytes);
                 self.audit
@@ -414,7 +434,15 @@ fn raw_from_verdict(v: Verdict) -> RawOutcome {
         Verdict::Clean => RawOutcome::Clean,
         Verdict::Infected { signature, details } => RawOutcome::Infected { signature, details },
         Verdict::Unscannable { reason } => RawOutcome::Unscannable { reason },
-        Verdict::Replaced { content, by, reason } => RawOutcome::Replaced { content, by, reason },
+        Verdict::Replaced {
+            content,
+            by,
+            reason,
+        } => RawOutcome::Replaced {
+            content,
+            by,
+            reason,
+        },
         // `ScanEngine::raw_outcome`'s poll loop never lets `Pending` reach here; kept exhaustive
         // (rather than `unreachable!()`) so a future change to that loop fails a test, not a panic
         // in production.
@@ -531,7 +559,10 @@ mod tests {
     fn engine_with(
         config: ScanningConfig,
         scanner: Arc<dyn ContentScanner>,
-    ) -> (ScanEngine<MemoryBackend>, Arc<crate::scanning::audit::InMemoryAuditSink>) {
+    ) -> (
+        ScanEngine<MemoryBackend>,
+        Arc<crate::scanning::audit::InMemoryAuditSink>,
+    ) {
         let audit = Arc::new(crate::scanning::audit::InMemoryAuditSink::new(100));
         let cache = VerdictCache::open(MemoryBackend::new(), &config.cache).unwrap();
         let engine = ScanEngine::from_parts(
@@ -557,7 +588,13 @@ mod tests {
         let scanner = Arc::new(FakeScanner::always("fake", Verdict::Clean));
         let (engine, _audit) = engine_with(block_closed_config(), scanner);
         let decision = engine
-            .evaluate("image/png", Bytes::from_static(b"png-bytes"), ctx(), 0, false)
+            .evaluate(
+                "image/png",
+                Bytes::from_static(b"png-bytes"),
+                ctx(),
+                0,
+                false,
+            )
             .await;
         assert_eq!(decision, EngineDecision::Allow);
     }
@@ -573,7 +610,7 @@ mod tests {
         ));
         let (engine, audit) = engine_with(block_closed_config(), scanner);
         let decision = engine
-            .evaluate("application/octet-stream", Bytes::from_static(b"X5O!"), ctx(), 0, false)
+            .evaluate("text/plain", Bytes::from_static(b"X5O!"), ctx(), 0, false)
             .await;
         assert!(matches!(decision, EngineDecision::Reject(_)));
         assert_eq!(audit.recent(10).len(), 1);
@@ -595,7 +632,7 @@ mod tests {
         };
         let (engine, _audit) = engine_with(config, scanner);
         let decision = engine
-            .evaluate("application/octet-stream", Bytes::from_static(b"X5O!"), ctx(), 0, false)
+            .evaluate("text/plain", Bytes::from_static(b"X5O!"), ctx(), 0, false)
             .await;
         assert!(matches!(decision, EngineDecision::StoreQuarantined(_)));
     }
@@ -662,7 +699,11 @@ mod tests {
         async fn engine_version(&self) -> Option<String> {
             None
         }
-        async fn scan(&self, _content: ScanSource<'_>, _ctx: &ScanContext) -> Result<Verdict, ScanError> {
+        async fn scan(
+            &self,
+            _content: ScanSource<'_>,
+            _ctx: &ScanContext,
+        ) -> Result<Verdict, ScanError> {
             Err(ScanError::Unavailable("connection refused".into()))
         }
     }
@@ -709,7 +750,11 @@ mod tests {
             async fn engine_version(&self) -> Option<String> {
                 None
             }
-            async fn scan(&self, _content: ScanSource<'_>, ctx: &ScanContext) -> Result<Verdict, ScanError> {
+            async fn scan(
+                &self,
+                _content: ScanSource<'_>,
+                ctx: &ScanContext,
+            ) -> Result<Verdict, ScanError> {
                 // Simulate a provider that respects the deadline itself and reports a timeout,
                 // rather than actually sleeping in the test.
                 let _ = ctx;
@@ -739,7 +784,11 @@ mod tests {
             async fn engine_version(&self) -> Option<String> {
                 None
             }
-            async fn scan(&self, _content: ScanSource<'_>, _ctx: &ScanContext) -> Result<Verdict, ScanError> {
+            async fn scan(
+                &self,
+                _content: ScanSource<'_>,
+                _ctx: &ScanContext,
+            ) -> Result<Verdict, ScanError> {
                 Err(ScanError::Protocol("unexpected byte".into()))
             }
         }
@@ -785,7 +834,13 @@ mod tests {
         config.allow_replacement = true;
         let (engine, audit) = engine_with(config, scanner);
         let decision = engine
-            .evaluate("image/jpeg", Bytes::from_static(b"original-bytes"), ctx(), 0, true)
+            .evaluate(
+                "image/jpeg",
+                Bytes::from_static(b"original-bytes"),
+                ctx(),
+                0,
+                true,
+            )
             .await;
         match decision {
             EngineDecision::AllowReplaced(content) => {
@@ -795,7 +850,10 @@ mod tests {
         }
         let entries = audit.recent(10);
         assert_eq!(entries.len(), 1);
-        assert!(matches!(entries[0].kind, AuditKind::ReplacementApplied { .. }));
+        assert!(matches!(
+            entries[0].kind,
+            AuditKind::ReplacementApplied { .. }
+        ));
     }
 
     #[tokio::test]
@@ -804,7 +862,13 @@ mod tests {
         let config = block_closed_config(); // allow_replacement: false (default)
         let (engine, _audit) = engine_with(config, scanner);
         let decision = engine
-            .evaluate("image/jpeg", Bytes::from_static(b"original-bytes"), ctx(), 0, true)
+            .evaluate(
+                "image/jpeg",
+                Bytes::from_static(b"original-bytes"),
+                ctx(),
+                0,
+                true,
+            )
             .await;
         // Refused -> treated as a scanner error -> fail: closed -> reject.
         assert!(matches!(decision, EngineDecision::Reject(_)));
@@ -839,7 +903,13 @@ mod tests {
         let (engine, _audit) = engine_with(config, scanner);
         // allow_replacement_here=false, as a federation-fetch caller would pass.
         let decision = engine
-            .evaluate("image/jpeg", Bytes::from_static(b"original-bytes"), ctx(), 0, false)
+            .evaluate(
+                "image/jpeg",
+                Bytes::from_static(b"original-bytes"),
+                ctx(),
+                0,
+                false,
+            )
             .await;
         assert!(matches!(decision, EngineDecision::Reject(_)));
     }
@@ -847,7 +917,9 @@ mod tests {
     #[test]
     fn looks_like_encrypted_matches_the_octet_stream_convention() {
         assert!(looks_like_encrypted("application/octet-stream"));
-        assert!(looks_like_encrypted("application/octet-stream; charset=binary"));
+        assert!(looks_like_encrypted(
+            "application/octet-stream; charset=binary"
+        ));
         assert!(!looks_like_encrypted("image/png"));
         assert!(!looks_like_encrypted("text/plain"));
     }

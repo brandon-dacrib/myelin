@@ -37,13 +37,17 @@ pub fn build(config: &ScanningConfig) -> Result<Arc<dyn ContentScanner>, MediaEr
         ProviderKind::None => Ok(Arc::new(none::NoneScanner)),
         ProviderKind::Icap => {
             let icap_config = config.icap.as_ref().ok_or_else(|| {
-                MediaError::InvalidInput("provider is `icap` but no `icap` settings were given".into())
+                MediaError::InvalidInput(
+                    "provider is `icap` but no `icap` settings were given".into(),
+                )
             })?;
             Ok(Arc::new(icap::IcapScanner::new(icap_config.clone())))
         }
         ProviderKind::Http => {
             let http_config = config.http.as_ref().ok_or_else(|| {
-                MediaError::InvalidInput("provider is `http` but no `http` settings were given".into())
+                MediaError::InvalidInput(
+                    "provider is `http` but no `http` settings were given".into(),
+                )
             })?;
             Ok(Arc::new(http::HttpScanner::new(http_config.clone())))
         }
