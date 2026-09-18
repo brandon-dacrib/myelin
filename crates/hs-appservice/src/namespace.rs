@@ -1,6 +1,8 @@
 //! One namespace declaration (`namespaces.{users,aliases,rooms}[]`) from an appservice
 //! registration, and the three-category [`Namespaces`] container.
 
+use serde::{Deserialize, Serialize};
+
 use crate::regexp::{NamespacePattern, NamespacePatternError};
 
 /// Which of the three namespace categories a registration declares. Mirrors the spec's
@@ -110,6 +112,75 @@ impl Namespaces {
     }
 }
 
+/// The serializable, uncompiled form of [`NamespaceRule`] — what actually gets written to the
+/// store, since a compiled [`NamespacePattern`] holds engine-specific state that does not
+/// (de)serialize. Recompiled back into a [`NamespaceRule`] with [`NamespaceRuleSpec::compile`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceRuleSpec {
+    /// The pattern's original source text.
+    pub regex: String,
+    /// Whether this namespace is exclusive.
+    #[serde(default)]
+    pub exclusive: bool,
+}
+
+impl NamespaceRuleSpec {
+    /// Compiles this spec into a live [`NamespaceRule`].
+    ///
+    /// # Errors
+    /// Returns [`NamespacePatternError`] if `regex` does not compile.
+    pub fn compile(&self) -> Result<NamespaceRule, NamespacePatternError> {
+        NamespaceRule::compile(&self.regex, self.exclusive)
+    }
+}
+
+impl From<&NamespaceRule> for NamespaceRuleSpec {
+    fn from(rule: &NamespaceRule) -> Self {
+        Self {
+            regex: rule.pattern.source().to_string(),
+            exclusive: rule.exclusive,
+        }
+    }
+}
+
+/// The serializable, uncompiled form of [`Namespaces`]. See [`NamespaceRuleSpec`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespacesSpec {
+    /// `namespaces.users`.
+    #[serde(default)]
+    pub users: Vec<NamespaceRuleSpec>,
+    /// `namespaces.aliases`.
+    #[serde(default)]
+    pub aliases: Vec<NamespaceRuleSpec>,
+    /// `namespaces.rooms`.
+    #[serde(default)]
+    pub rooms: Vec<NamespaceRuleSpec>,
+}
+
+impl NamespacesSpec {
+    /// Compiles every rule in every category.
+    ///
+    /// # Errors
+    /// Returns the first [`NamespacePatternError`] encountered.
+    pub fn compile(&self) -> Result<Namespaces, NamespacePatternError> {
+        Ok(Namespaces {
+            users: self.users.iter().map(NamespaceRuleSpec::compile).collect::<Result<_, _>>()?,
+            aliases: self.aliases.iter().map(NamespaceRuleSpec::compile).collect::<Result<_, _>>()?,
+            rooms: self.rooms.iter().map(NamespaceRuleSpec::compile).collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+impl From<&Namespaces> for NamespacesSpec {
+    fn from(ns: &Namespaces) -> Self {
+        Self {
+            users: ns.users.iter().map(NamespaceRuleSpec::from).collect(),
+            aliases: ns.aliases.iter().map(NamespaceRuleSpec::from).collect(),
+            rooms: ns.rooms.iter().map(NamespaceRuleSpec::from).collect(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,5 +207,18 @@ mod tests {
         };
         assert!(ns.exclusive_match(NamespaceKind::Users, "@irc_bob:example.org"));
         assert!(!ns.exclusive_match(NamespaceKind::Users, "@other:example.org"));
+    }
+
+    #[test]
+    fn spec_round_trips_through_json_and_recompiles() {
+        let ns = Namespaces {
+            users: vec![rule(r"^@irc_.*:example\.org$", true)],
+            ..Default::default()
+        };
+        let spec = NamespacesSpec::from(&ns);
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: NamespacesSpec = serde_json::from_str(&json).unwrap();
+        let recompiled = back.compile().unwrap();
+        assert!(recompiled.exclusive_match(NamespaceKind::Users, "@irc_bob:example.org"));
     }
 }
