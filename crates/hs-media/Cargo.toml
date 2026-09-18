@@ -8,19 +8,25 @@ publish.workspace = true
 description = "Media repository: object-store backed uploads, downloads, thumbnails and the security rules around them (track 09)"
 
 [features]
-default = []
+# `test-fixtures` defaults on: it is dev/test-only *code* (gated behind the feature, not
+# `#[cfg(test)]`, because the separate `hs-media-fuzz` crate also needs it as an ordinary
+# path-dependency feature, outside `cargo test`'s dev-dependency graph) but has no runtime cost
+# for a production binary that never calls into `crate::test_fixtures`, so defaulting it on keeps
+# `cargo check -p hs-media` / `cargo test -p hs-media` working with no extra flags.
+default = ["test-fixtures"]
 # Extra object_store backends. Off by default to keep the dependency tree lean.
 gcp = ["object_store/gcp"]
 azure = ["object_store/azure"]
+# Synthetic/adversarial test image generation (`crate::test_fixtures`), used by this crate's own
+# tests, the `gen_fixtures` example that writes `tests/fixtures/`, and the `hs-media-fuzz` crate's
+# seed corpus.
+test-fixtures = ["dep:crc32fast"]
 
 [dependencies]
 async-trait.workspace = true
 axum.workspace = true
 bytes.workspace = true
-futures.workspace = true
-hex.workspace = true
 http.workspace = true
-http-body-util.workspace = true
 image.workspace = true
 object_store.workspace = true
 rand.workspace = true
@@ -30,6 +36,13 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+ruma.workspace = true
+crc32fast = { workspace = true, optional = true }
+hs-kv = { path = "../hs-kv" }
+hs-tables = { path = "../hs-tables" }
+hs-auth = { path = "../hs-auth" }
+hs-http = { path = "../hs-http" }
+hs-config = { path = "../hs-config" }
 
 [dev-dependencies]
 criterion.workspace = true

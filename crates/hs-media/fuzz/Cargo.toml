@@ -1,0 +1,42 @@
+[package]
+name = "hs-media-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.hs-media]
+path = ".."
+default-features = false
+features = ["test-fixtures"]
+
+[[bin]]
+name = "decode_image"
+path = "fuzz_targets/decode_image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "multipart_parse"
+path = "fuzz_targets/multipart_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "thumbnail_generate"
+path = "fuzz_targets/thumbnail_generate.rs"
+test = false
+doc = false
+bench = false
+
+# Deliberately its own workspace (the standard `cargo fuzz init` shape): the root workspace's
+# `members = ["crates/*"]` glob does not reach a nested `fuzz/` directory, and a fuzz crate
+# should not share the parent's dependency resolution/lockfile churn anyway.
+[workspace]
