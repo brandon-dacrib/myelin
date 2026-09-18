@@ -62,9 +62,9 @@ Its 142 operations are mounted and answer not-implemented by design, and its tok
 | `/state` refuses any event but the newest | `hs-cli` federation adapter | a remote cannot resolve a gap it hit; see item 1 above |
 | `GET /.well-known/matrix/server` not served | `hs-cli` | a deployment that delegates its server name cannot be found |
 | 15 media test artifacts committed under `crates/hs-cli/media-store/` | `hs-media` tests | a test writes into the working directory; now gitignored, but the committed copies remain and the test still needs fixing |
-| No Docker, no nightly compiler on the build machine | everywhere | Complement, Sytest, fuzzing, real scanners and real bridges have never run |
+| No nightly compiler on the build machine | `cargo fuzz` | fuzz targets type-check but have never been run |
 
-That last row is the biggest caveat on everything else. Complement is the industry's conformance suite for Matrix homeservers and it has never been run against this code. The harness is written and waiting.
+**Docker became available on 2026-09-18** and that retires the caveat that used to sit here. Complement -- the industry's conformance suite for Matrix homeservers, and the only externally-graded measure of whether this is a homeserver -- had never been run against this code; the harness in `tests/complement/` was written against a placeholder crate name and had never built an image. Track 14 is running it now. Until its number lands in `docs/status/14-test-and-conformance.md`, treat every coverage percentage in this file as a measure of surface area, not of correctness. Sytest, real malware scanners and real bridges (`mautrix-irc` against a local IRC server, with Synapse as the control) are now possible too, and are not yet done.
 
 ## Conventions worth keeping
 
