@@ -5,8 +5,32 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "hs-user: see docs/workstreams for the owning track"
+description = "hs-user: the user session actor, /sync v2, account data, joined_rooms and publicRooms (track 05)"
 
 [dependencies]
+async-trait = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+ruma = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+hs-model = { path = "../hs-model" }
+hs-kv = { path = "../hs-kv" }
+hs-tables = { path = "../hs-tables" }
+hs-auth = { path = "../hs-auth" }
+hs-http = { path = "../hs-http" }
+hs-room = { path = "../hs-room" }
 
 [dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+hs-testkit = { path = "../hs-testkit" }
+# See crates/hs-room/Cargo.toml's identical note: hs-testkit's FakeClock needs tokio's
+# `test-util` feature, which hs-testkit's own Cargo.toml deliberately does not request.
+tokio = { workspace = true, features = ["test-util"] }
