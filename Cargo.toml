@@ -80,6 +80,12 @@ rustls-pemfile = "2"
 async-stream = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# Added by track 11 (appservices and bridges): Python-`re`-compatible regex (lookaround,
+# backreferences) for appservice registration namespace patterns that the `regex` crate's
+# linear-time engine cannot express (`PLAN.md` Appendix B); see
+# `docs/status/11-appservices-and-bridges.md` for which patterns actually need it.
+fancy-regex = "0.19"
+
 # Added by track 12 (platform and Kubernetes): the `hs` CLI's subcommand parsing and its
 # interactive/non-echoed password prompts (`hs register`, `hs hash-password`), and hs-operator's
 # CRD schemas and reconcile loops.

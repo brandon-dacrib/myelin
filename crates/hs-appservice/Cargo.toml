@@ -5,8 +5,30 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "hs-appservice: see docs/workstreams for the owning track"
+description = "The appservice registry, registration parser and transaction scheduler. Track 11: see docs/workstreams/11-appservices-and-bridges.md"
 
 [dependencies]
+ruma = { workspace = true }
+hs-auth = { path = "../hs-auth" }
+hs-kv = { path = "../hs-kv" }
+hs-tables = { path = "../hs-tables" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+regex = { workspace = true }
+fancy-regex = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+axum = { workspace = true }
+http = { workspace = true }
+reqwest = { workspace = true }
+ulid = { workspace = true }
+time = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+hs-kv = { path = "../hs-kv" }

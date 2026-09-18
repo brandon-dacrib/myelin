@@ -18,7 +18,10 @@
 
 pub mod api;
 pub mod auth;
+pub mod bakeoff;
 pub mod chain_cover;
+#[path = "../corpus/generators.rs"]
+pub mod corpus;
 pub mod error;
 pub mod state_fetch;
 pub mod state_res;

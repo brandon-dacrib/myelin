@@ -31,6 +31,9 @@ pub enum Command {
     GenerateSigningKey(GenerateSigningKeyArgs),
     /// Registers a user against a running server via the shared-secret admin protocol.
     Register(RegisterArgs),
+    /// Writes the `routes.json` manifest (`docs/rfcs/0005-routes-json-manifest.md`) without
+    /// booting a server — routes are static, independent of runtime config.
+    RoutesManifest(RoutesManifestArgs),
     /// Prints the `hs` version.
     Version,
 }
@@ -57,6 +60,26 @@ pub struct ServeArgs {
     /// Write the translation report to this file instead of stderr.
     #[arg(long = "translation-report-out")]
     pub translation_report_out: Option<PathBuf>,
+
+    /// An optional YAML file overriding the `unstable_features` advertised by
+    /// `GET /_matrix/client/versions` (see `crate::versions`'s module doc for the file shape and
+    /// why this cannot live in `-c`/`--config`'s native `hs-config` file).
+    #[arg(long = "capabilities-config")]
+    pub capabilities_config: Option<PathBuf>,
+
+    /// Write the `routes.json` manifest here at startup, before binding any listener. Omit to
+    /// skip writing it (use the `hs routes-manifest` subcommand instead, which needs no config
+    /// and does not bind a socket).
+    #[arg(long = "routes-manifest")]
+    pub routes_manifest: Option<PathBuf>,
+}
+
+/// `hs routes-manifest` arguments.
+#[derive(Debug, Args)]
+pub struct RoutesManifestArgs {
+    /// Write the manifest here instead of stdout.
+    #[arg(short = 'o', long = "output")]
+    pub output: Option<PathBuf>,
 }
 
 /// `hs generate-config` arguments.
@@ -158,8 +181,30 @@ pub async fn dispatch(cli: Cli) -> i32 {
         Command::HashPassword(args) => run_hash_password(&args),
         Command::GenerateSigningKey(args) => run_generate_signing_key(&args),
         Command::Register(args) => run_register(&args).await,
+        Command::RoutesManifest(args) => run_routes_manifest(&args),
         Command::Serve(args) => run_serve(&args).await,
     }
+}
+
+fn run_routes_manifest(args: &RoutesManifestArgs) -> i32 {
+    let manifest = crate::serve::route_manifest();
+    let json = match manifest.to_json_pretty() {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("hs routes-manifest: {e}");
+            return 1;
+        }
+    };
+    match &args.output {
+        Some(path) => {
+            if let Err(e) = std::fs::write(path, &json) {
+                eprintln!("hs routes-manifest: failed to write {path:?}: {e}");
+                return 1;
+            }
+        }
+        None => println!("{json}"),
+    }
+    0
 }
 
 fn run_generate_config(args: &GenerateConfigArgs) -> i32 {
@@ -333,7 +378,11 @@ async fn run_serve(args: &ServeArgs) -> i32 {
         }
     };
 
-    let handle = match crate::serve::spawn_serve(config).await {
+    let options = crate::serve::ServeOptions {
+        capabilities_config: args.capabilities_config.clone(),
+        routes_manifest_path: args.routes_manifest.clone(),
+    };
+    let handle = match crate::serve::spawn_serve(config, options).await {
         Ok(h) => h,
         Err(e) => {
             eprintln!("hs serve: {e}");
@@ -473,5 +522,37 @@ mod tests {
     fn version_subcommand_parses() {
         let cli = Cli::parse_from(["hs", "version"]);
         assert!(matches!(cli.command, Command::Version));
+    }
+
+    #[test]
+    fn routes_manifest_subcommand_parses_with_optional_output() {
+        let cli = Cli::parse_from(["hs", "routes-manifest", "-o", "routes.json"]);
+        match cli.command {
+            Command::RoutesManifest(args) => {
+                assert_eq!(args.output, Some(PathBuf::from("routes.json")));
+            }
+            _ => panic!("expected RoutesManifest"),
+        }
+    }
+
+    #[test]
+    fn serve_parses_capabilities_config_and_routes_manifest_flags() {
+        let cli = Cli::parse_from([
+            "hs",
+            "serve",
+            "-c",
+            "config.yaml",
+            "--capabilities-config",
+            "caps.yaml",
+            "--routes-manifest",
+            "routes.json",
+        ]);
+        match cli.command {
+            Command::Serve(args) => {
+                assert_eq!(args.capabilities_config, Some(PathBuf::from("caps.yaml")));
+                assert_eq!(args.routes_manifest, Some(PathBuf::from("routes.json")));
+            }
+            _ => panic!("expected Serve"),
+        }
     }
 }

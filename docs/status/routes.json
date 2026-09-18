@@ -1,0 +1,309 @@
+{
+  "generated_at": "2026-09-18T13:19:50.52Z",
+  "routes": [
+    {
+      "method": "POST",
+      "path": "/_matrix/client/r0/account/deactivate",
+      "surface": "matrix-client",
+      "operation_id": "deactivateAccount",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/r0/account/password",
+      "surface": "matrix-client",
+      "operation_id": "changePassword",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/r0/account/whoami",
+      "surface": "matrix-client",
+      "operation_id": "whoami",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/r0/capabilities",
+      "surface": "matrix-client",
+      "operation_id": "getCapabilities",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/r0/delete_devices",
+      "surface": "matrix-client",
+      "operation_id": "deleteDevices",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/r0/devices",
+      "surface": "matrix-client",
+      "operation_id": "getDevices",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "DELETE",
+      "path": "/_matrix/client/r0/devices/{deviceId}",
+      "surface": "matrix-client",
+      "operation_id": "deleteDevice",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/r0/devices/{deviceId}",
+      "surface": "matrix-client",
+      "operation_id": "getDevice",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/r0/devices/{deviceId}",
+      "surface": "matrix-client",
+      "operation_id": "updateDevice",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/r0/login",
+      "surface": "matrix-client",
+      "operation_id": "getLoginFlows",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/r0/login",
+      "surface": "matrix-client",
+      "operation_id": "login",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/r0/logout",
+      "surface": "matrix-client",
+      "operation_id": "logout",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/r0/logout/all",
+      "surface": "matrix-client",
+      "operation_id": "logoutAll",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/r0/password_policy",
+      "surface": "matrix-client",
+      "operation_id": "passwordPolicy",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/r0/refresh",
+      "surface": "matrix-client",
+      "operation_id": "refresh",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/r0/register",
+      "surface": "matrix-client",
+      "operation_id": "register",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/r0/register/available",
+      "surface": "matrix-client",
+      "operation_id": "registerAvailable",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v3/account/deactivate",
+      "surface": "matrix-client",
+      "operation_id": "deactivateAccount",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v3/account/password",
+      "surface": "matrix-client",
+      "operation_id": "changePassword",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v3/account/whoami",
+      "surface": "matrix-client",
+      "operation_id": "whoami",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v3/capabilities",
+      "surface": "matrix-client",
+      "operation_id": "getCapabilities",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v3/delete_devices",
+      "surface": "matrix-client",
+      "operation_id": "deleteDevices",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v3/devices",
+      "surface": "matrix-client",
+      "operation_id": "getDevices",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "DELETE",
+      "path": "/_matrix/client/v3/devices/{deviceId}",
+      "surface": "matrix-client",
+      "operation_id": "deleteDevice",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v3/devices/{deviceId}",
+      "surface": "matrix-client",
+      "operation_id": "getDevice",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/v3/devices/{deviceId}",
+      "surface": "matrix-client",
+      "operation_id": "updateDevice",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v3/login",
+      "surface": "matrix-client",
+      "operation_id": "getLoginFlows",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v3/login",
+      "surface": "matrix-client",
+      "operation_id": "login",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v3/logout",
+      "surface": "matrix-client",
+      "operation_id": "logout",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v3/logout/all",
+      "surface": "matrix-client",
+      "operation_id": "logoutAll",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v3/password_policy",
+      "surface": "matrix-client",
+      "operation_id": "passwordPolicy",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v3/refresh",
+      "surface": "matrix-client",
+      "operation_id": "refresh",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v3/register",
+      "surface": "matrix-client",
+      "operation_id": "register",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v3/register/available",
+      "surface": "matrix-client",
+      "operation_id": "registerAvailable",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/versions",
+      "surface": "matrix-client",
+      "operation_id": "getVersions",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/health/live",
+      "surface": "admin",
+      "operation_id": "healthLive",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/health/ready",
+      "surface": "admin",
+      "operation_id": "healthReady",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/metrics",
+      "surface": "admin",
+      "operation_id": "metrics",
+      "auth": "none",
+      "rate_limited": false
+    }
+  ]
+}

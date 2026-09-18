@@ -14,6 +14,8 @@ import {
   federationDestinations,
   recentAuditEntries,
 } from "./data/dashboard";
+import { users, userDevices, findUser } from "./data/users";
+import { rooms, roomMembers, findRoom } from "./data/rooms";
 import { ALL_SCOPES, type Scope } from "@/lib/auth";
 import type { AppService } from "@/api/bridges";
 
@@ -342,4 +344,160 @@ export const handlers = [
   // ---- Appservice id availability (probed via GET /appservices/{id} 404) ----
   // No dedicated check/validate endpoint exists on the real API; see
   // api/bridges.ts's checkAppserviceIdAvailable.
+
+  // ---- Users (flows.md flow 2) ----
+  http.get(`${API}/users`, ({ request }) => {
+    const url = new URL(request.url);
+    const q = url.searchParams.get("q");
+    const filtered = q
+      ? users.filter(
+          (u) =>
+            u.user_id.includes(q) || (u.display_name ?? "").toLowerCase().includes(q.toLowerCase()),
+        )
+      : users;
+    const { items, next_cursor, prev_cursor } = paginate(filtered, url);
+    return HttpResponse.json({ items, next_cursor, prev_cursor });
+  }),
+
+  http.get(`${API}/users/:user_id`, ({ params }) => {
+    const user = findUser(decodeURIComponent(String(params.user_id)));
+    if (!user)
+      return HttpResponse.json(
+        { type: "urn:hs:problem:not-found", title: "User not found", status: 404 },
+        { status: 404 },
+      );
+    return HttpResponse.json(user);
+  }),
+
+  http.get(`${API}/users/:user_id/devices`, ({ params, request }) => {
+    const devices = userDevices[decodeURIComponent(String(params.user_id))] ?? [];
+    const url = new URL(request.url);
+    const { items, next_cursor, prev_cursor } = paginate(devices, url);
+    return HttpResponse.json({ items, next_cursor, prev_cursor });
+  }),
+
+  ...(
+    [
+      ["lock", { locked: true }],
+      ["unlock", { locked: false }],
+      ["suspend", { suspended: true }],
+      ["unsuspend", { suspended: false }],
+      ["logout", {}],
+    ] as const
+  ).map(([action, patch]) =>
+    http.post(`${API}/users/:user_id/${action}`, ({ params }) => {
+      const user = findUser(decodeURIComponent(String(params.user_id)));
+      if (!user)
+        return HttpResponse.json(
+          { type: "urn:hs:problem:not-found", title: "Not found" },
+          { status: 404 },
+        );
+      Object.assign(user, patch);
+      return HttpResponse.json(user);
+    }),
+  ),
+
+  http.post(`${API}/users/:user_id/deactivate`, ({ params }) => {
+    const user = findUser(decodeURIComponent(String(params.user_id)));
+    if (!user)
+      return HttpResponse.json(
+        { type: "urn:hs:problem:not-found", title: "Not found" },
+        { status: 404 },
+      );
+    user.deactivated = true;
+    return HttpResponse.json(user);
+  }),
+
+  // ---- Rooms (flows.md flow 3) ----
+  http.get(`${API}/rooms`, ({ request }) => {
+    const url = new URL(request.url);
+    const q = url.searchParams.get("q");
+    const filtered = q
+      ? rooms.filter(
+          (r) =>
+            r.room_id.includes(q) ||
+            (r.name ?? "").toLowerCase().includes(q.toLowerCase()) ||
+            (r.canonical_alias ?? "").includes(q),
+        )
+      : rooms;
+    const { items, next_cursor, prev_cursor } = paginate(filtered, url);
+    return HttpResponse.json({ items, next_cursor, prev_cursor });
+  }),
+
+  http.get(`${API}/rooms/:room_id`, ({ params }) => {
+    const room = findRoom(decodeURIComponent(String(params.room_id)));
+    if (!room)
+      return HttpResponse.json(
+        { type: "urn:hs:problem:not-found", title: "Room not found", status: 404 },
+        { status: 404 },
+      );
+    return HttpResponse.json(room);
+  }),
+
+  http.get(`${API}/rooms/:room_id/members`, ({ params, request }) => {
+    const members = roomMembers[decodeURIComponent(String(params.room_id))] ?? [];
+    const url = new URL(request.url);
+    const { items, next_cursor, prev_cursor } = paginate(members, url);
+    return HttpResponse.json({ items, next_cursor, prev_cursor });
+  }),
+
+  http.post(`${API}/rooms/:room_id/block`, ({ params }) => {
+    const room = findRoom(decodeURIComponent(String(params.room_id)));
+    if (!room)
+      return HttpResponse.json(
+        { type: "urn:hs:problem:not-found", title: "Not found" },
+        { status: 404 },
+      );
+    room.blocked = true;
+    return HttpResponse.json(room);
+  }),
+
+  http.post(`${API}/rooms/:room_id/unblock`, ({ params }) => {
+    const room = findRoom(decodeURIComponent(String(params.room_id)));
+    if (!room)
+      return HttpResponse.json(
+        { type: "urn:hs:problem:not-found", title: "Not found" },
+        { status: 404 },
+      );
+    room.blocked = false;
+    return HttpResponse.json(room);
+  }),
+
+  http.post(`${API}/rooms/:room_id/make-admin`, ({ params }) => {
+    const room = findRoom(decodeURIComponent(String(params.room_id)));
+    if (!room)
+      return HttpResponse.json(
+        { type: "urn:hs:problem:not-found", title: "Not found" },
+        { status: 404 },
+      );
+    return HttpResponse.json(room);
+  }),
+
+  // ---- Federation destination detail (list is above, under Dashboard) ----
+  http.get(`${API}/federation/destinations/:server_name`, ({ params }) => {
+    const destination = federationDestinations.find(
+      (d) => d.server_name === decodeURIComponent(String(params.server_name)),
+    );
+    if (!destination)
+      return HttpResponse.json(
+        { type: "urn:hs:problem:not-found", title: "Destination not found", status: 404 },
+        { status: 404 },
+      );
+    return HttpResponse.json(destination);
+  }),
+
+  http.post(`${API}/federation/destinations/:server_name/reset`, ({ params }) => {
+    const destination = federationDestinations.find(
+      (d) => d.server_name === decodeURIComponent(String(params.server_name)),
+    );
+    if (!destination)
+      return HttpResponse.json(
+        { type: "urn:hs:problem:not-found", title: "Not found" },
+        { status: 404 },
+      );
+    destination.failing_since = null;
+    destination.retry_interval_ms = null;
+    destination.retry_last_at = null;
+    return HttpResponse.json(destination);
+  }),
 ];

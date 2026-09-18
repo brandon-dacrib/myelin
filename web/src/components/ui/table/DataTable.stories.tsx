@@ -1,8 +1,9 @@
 import { useState } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { Cable } from "lucide-react";
+import { Cable, Pause, Play } from "lucide-react";
 import { DataTable, type Column, type SortState } from "./DataTable";
 import { Badge } from "../badge/Badge";
+import { Button } from "../button/Button";
 import { EmptyState } from "../empty-state/EmptyState";
 
 interface Row {
@@ -150,4 +151,49 @@ export const Compact: StoryObj = {
       density="compact"
     />
   ),
+};
+
+/**
+ * A row with its own real controls (a link-equivalent name and action
+ * buttons), marked `interactive: true` so the <768px card fallback keeps
+ * them outside its tap-target button instead of nesting interactive
+ * elements inside one another — invalid HTML that is unreliable for
+ * keyboard and assistive-technology users. Resize the preview below 768px
+ * to see the card layout keep the actions row separate from the tap
+ * target. (Automated regression coverage for this — a console guard that
+ * fails on React's "invalid DOM nesting" warning, plus an axe pass at a
+ * phone viewport — lives in `e2e/add-bridge.spec.ts`, since Storybook's
+ * own preview iframe does not resize.)
+ */
+export const WithInteractiveColumns: StoryObj = {
+  render: () => {
+    const interactiveColumns: Column<Row>[] = [
+      ...columns.slice(0, -1),
+      {
+        key: "actions",
+        header: "Actions",
+        priority: 1,
+        interactive: true,
+        render: (r) => (
+          <div className="flex justify-end gap-1">
+            <Button variant="ghost" size="icon" aria-label={`Pause ${r.name}`}>
+              <Pause size={14} aria-hidden="true" />
+            </Button>
+            <Button variant="ghost" size="icon" aria-label={`Resume ${r.name}`}>
+              <Play size={14} aria-hidden="true" />
+            </Button>
+          </div>
+        ),
+      },
+    ];
+    return (
+      <DataTable
+        columns={interactiveColumns}
+        rows={rows}
+        getRowId={(r) => r.id}
+        caption="Bridges"
+        onRowClick={() => {}}
+      />
+    );
+  },
 };

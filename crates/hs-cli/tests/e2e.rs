@@ -42,11 +42,42 @@ async fn boots_registers_logs_in_and_reports_ready() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(reserve_ephemeral_port(), dir.path());
 
-    let handle = hs_cli::serve::spawn_serve(config)
+    let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
         .await
         .expect("server should boot");
     let base = handle.base_url();
     let client = reqwest::Client::new();
+
+    // 0. GET /_matrix/client/versions: the single most important endpoint, per the integration
+    //    review that flagged it missing — every client and bridge calls this first, and
+    //    Complement's image contract requires it to answer 200 before any test runs.
+    let versions_response = client
+        .get(format!("{base}/_matrix/client/versions"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(versions_response.status(), reqwest::StatusCode::OK);
+    let versions_json: serde_json::Value = versions_response.json().await.unwrap();
+    assert!(
+        versions_json["versions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("v1.1"))
+    );
+    assert!(versions_json["unstable_features"].is_object());
+
+    // 0b. GET /_matrix/client/v3/capabilities, also called by every client right after login.
+    let capabilities_response = client
+        .get(format!("{base}/_matrix/client/v3/capabilities"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(capabilities_response.status(), reqwest::StatusCode::OK);
+    let capabilities_json: serde_json::Value = capabilities_response.json().await.unwrap();
+    assert_eq!(
+        capabilities_json["capabilities"]["m.change_password"]["enabled"],
+        true
+    );
 
     // 1. /health/ready is already OK right after boot.
     let ready = client
@@ -127,9 +158,24 @@ async fn boots_registers_logs_in_and_reports_ready() {
     let whoami_json: serde_json::Value = whoami_response.json().await.unwrap();
     assert_eq!(whoami_json["user_id"], "@e2euser:example.org");
 
-    // 6. /metrics is reachable and mentions the metric families hs-telemetry registers.
+    // 6. /metrics is reachable, and after the traffic above actually has data in it (this was
+    //    the second gap the integration review found: the registry existed and was served, but
+    //    nothing ever incremented it, so every scrape came back empty).
     let metrics_response = client.get(format!("{base}/metrics")).send().await.unwrap();
     assert_eq!(metrics_response.status(), reqwest::StatusCode::OK);
+    let metrics_body = metrics_response.text().await.unwrap();
+    assert!(
+        metrics_body.contains("hs_http_requests_total"),
+        "{metrics_body}"
+    );
+    assert!(
+        metrics_body.contains("route=\"/_matrix/client/versions\""),
+        "{metrics_body}"
+    );
+    assert!(
+        metrics_body.contains("route=\"/_matrix/client/v3/register\""),
+        "{metrics_body}"
+    );
 
     // 7. Still ready after real traffic.
     let ready_after = client
@@ -146,7 +192,9 @@ async fn boots_registers_logs_in_and_reports_ready() {
 async fn wrong_password_login_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(reserve_ephemeral_port(), dir.path());
-    let handle = hs_cli::serve::spawn_serve(config).await.unwrap();
+    let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
+        .await
+        .unwrap();
     let base = handle.base_url();
     let client = reqwest::Client::new();
 
@@ -191,6 +239,19 @@ async fn generate_config_then_hash_password_round_trip() {
     let hash = hs_cli::hash_password::hash_password("a-test-password").unwrap();
     assert!(hs_auth::password::verify_password("a-test-password", &hash, "").unwrap());
     assert!(!hs_auth::password::verify_password("wrong", &hash, "").unwrap());
+}
+
+#[test]
+fn routes_manifest_covers_versions_and_the_auth_surface() {
+    // The third gap the integration review found: track 14's spec-coverage tool reported 0 of
+    // 235 routes purely because nothing wrote routes.json. `hs_cli::serve::route_manifest()`
+    // needs no config, no server, no network at all.
+    let manifest = hs_cli::serve::route_manifest();
+    let paths: Vec<&str> = manifest.routes.iter().map(|r| r.path.as_str()).collect();
+    assert!(paths.contains(&"/_matrix/client/versions"));
+    assert!(paths.contains(&"/_matrix/client/v3/capabilities"));
+    assert!(paths.contains(&"/_matrix/client/v3/register"));
+    assert!(paths.contains(&"/_matrix/client/r0/login"));
 }
 
 #[test]

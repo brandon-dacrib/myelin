@@ -16,6 +16,16 @@ export interface Column<T> {
   priority?: 1 | 2 | 3;
   align?: "start" | "end";
   widthClassName?: string;
+  /**
+   * Set this when `render`'s output contains its own focusable control
+   * (a link, a button, a select...). The <768px card fallback needs to know,
+   * because it wraps priority-1 columns in a single tap target: nesting a
+   * real `<button>`/`<a>` inside that would be invalid HTML (interactive
+   * content is not permitted inside `<button>`) and unreliable for
+   * assistive technology and keyboard users. Interactive columns render
+   * outside that tap target instead. See DataTable.test.tsx.
+   */
+  interactive?: boolean;
 }
 
 export interface SortState {
@@ -30,6 +40,18 @@ export interface DataTableProps<T> {
   caption: string;
   sort?: SortState;
   onSortChange?: (sort: SortState) => void;
+  /**
+   * Drives the <768px card fallback's whole-card tap target (a real
+   * `<button>`). The desktop table does *not* attach this to the `<tr>`:
+   * an element made clickable and focusable only via a `<tr onClick>` /
+   * `tabIndex` / `onKeyDown="Enter"` combination is a link pretending to be
+   * one — it does not respond to Space, exposes no role to assistive
+   * technology, and cannot be opened in a new tab. Give the row a real
+   * link or button in one of its columns (mark that column
+   * `interactive: true`) for desktop row activation instead; `onRowClick`
+   * is there for the card view and for callers that want it purely as a
+   * convenience alongside a real link, not as a replacement for one.
+   */
   onRowClick?: (row: T) => void;
   loading?: boolean;
   empty?: ReactNode;
@@ -175,13 +197,12 @@ export function DataTable<T>({
                   className={cn(
                     "group border-b border-border last:border-b-0",
                     "[height:var(--row-height)] text-[var(--row-text)] leading-[var(--row-text-line-height)]",
-                    onRowClick && "cursor-pointer hover:bg-surface-sunken",
+                    // Hover affordance only: the row itself is not a control
+                    // (see the onRowClick doc comment above). Activation is
+                    // whatever real link/button an `interactive` column
+                    // renders.
+                    onRowClick && "hover:bg-surface-sunken",
                   )}
-                  onClick={() => onRowClick?.(row)}
-                  tabIndex={onRowClick ? 0 : undefined}
-                  onKeyDown={(e) => {
-                    if (onRowClick && e.key === "Enter") onRowClick(row);
-                  }}
                 >
                   {hiddenAtTablet.length > 0 && (
                     <td className="px-2 lg:hidden">
@@ -244,20 +265,38 @@ export function DataTable<T>({
         {rows.map((row) => {
           const id = getRowId(row);
           const primary = columns.filter((c) => (c.priority ?? 1) === 1);
+          // Interactive columns (links, buttons: e.g. an actions column)
+          // render outside the tap-target button below, never inside it —
+          // a <button> cannot legally contain another <button> or an <a>,
+          // and doing so leaves the inner control unreliable for assistive
+          // technology and keyboard users (the defect this fixed).
+          const staticCols = primary.filter((c) => !c.interactive);
+          const interactiveCols = primary.filter((c) => c.interactive);
+          const fields = (cols: Column<T>[]) =>
+            cols.map((col) => (
+              <div key={col.key} className="flex items-center justify-between gap-2 text-sm">
+                <span className="text-text-muted">{col.header}</span>
+                <span className="text-text">{(col.renderCompact ?? col.render)(row)}</span>
+              </div>
+            ));
           return (
-            <li key={id}>
-              <button
-                type="button"
-                onClick={() => onRowClick?.(row)}
-                className="flex w-full flex-col gap-1 px-4 py-3 text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus)]"
-              >
-                {primary.map((col) => (
-                  <div key={col.key} className="flex items-center justify-between gap-2 text-sm">
-                    <span className="text-text-muted">{col.header}</span>
-                    <span className="text-text">{(col.renderCompact ?? col.render)(row)}</span>
-                  </div>
-                ))}
-              </button>
+            <li key={id} className="px-4 py-3">
+              {onRowClick ? (
+                <button
+                  type="button"
+                  onClick={() => onRowClick(row)}
+                  className="flex w-full flex-col gap-1 text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus)]"
+                >
+                  {fields(staticCols)}
+                </button>
+              ) : (
+                <div className="flex flex-col gap-1">{fields(staticCols)}</div>
+              )}
+              {interactiveCols.length > 0 && (
+                <div className="mt-2 flex flex-col gap-1 border-t border-border pt-2">
+                  {fields(interactiveCols)}
+                </div>
+              )}
             </li>
           );
         })}

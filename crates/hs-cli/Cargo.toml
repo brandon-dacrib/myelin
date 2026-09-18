@@ -21,6 +21,7 @@ hs-compat = { path = "../hs-compat" }
 hs-auth = { path = "../hs-auth" }
 hs-kv = { path = "../hs-kv" }
 hs-telemetry = { path = "../hs-telemetry" }
+hs-http = { path = "../hs-http" }
 
 clap = { workspace = true }
 tokio = { workspace = true }

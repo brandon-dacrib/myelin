@@ -73,12 +73,15 @@ export function BridgesListPage() {
       header: "Name",
       sortable: true,
       priority: 1,
+      // Renders a real link: this is the row's desktop activation control
+      // (DataTable's onRowClick doc comment explains why the row itself
+      // isn't one).
+      interactive: true,
       render: (b) => (
         <Link
           to="/bridges/$bridgeId"
           params={{ bridgeId: b.id ?? "" }}
           className="font-medium text-text hover:text-accent hover:underline"
-          onClick={(e) => e.stopPropagation()}
         >
           {deriveDisplayName(b)}
         </Link>
@@ -111,6 +114,9 @@ export function BridgesListPage() {
       key: "actions",
       header: "Actions",
       priority: 1,
+      // Renders real buttons: must stay outside the card fallback's tap
+      // target (see the `interactive` doc comment on Column).
+      interactive: true,
       render: (b) => (
         <div className="flex justify-end gap-1">
           {b.paused ? (
@@ -120,8 +126,7 @@ export function BridgesListPage() {
               aria-label={`Resume ${deriveDisplayName(b)}`}
               disabled={!hasScope("bridges:write")}
               title={!hasScope("bridges:write") ? "Needs bridges:write" : undefined}
-              onClick={(e) => {
-                e.stopPropagation();
+              onClick={() => {
                 resume.mutate(b.id ?? "", {
                   onSuccess: () => toast({ title: `Bridge ${deriveDisplayName(b)} resumed` }),
                   onError: () =>
@@ -138,8 +143,7 @@ export function BridgesListPage() {
               aria-label={`Pause ${deriveDisplayName(b)}`}
               disabled={!hasScope("bridges:write")}
               title={!hasScope("bridges:write") ? "Needs bridges:write" : undefined}
-              onClick={(e) => {
-                e.stopPropagation();
+              onClick={() => {
                 pause.mutate(b.id ?? "", {
                   onSuccess: () => toast({ title: `Bridge ${deriveDisplayName(b)} paused` }),
                   onError: () =>

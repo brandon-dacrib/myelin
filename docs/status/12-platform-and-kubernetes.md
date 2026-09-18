@@ -3,6 +3,82 @@
 Last updated 2026-09-18, by the integration lead's extension of track 12 (added `crates/hs-cli`
 ownership; see `.claude/agents/hs-12-platform.md` and the integration lead's assignment message).
 
+## Integration review follow-up (same day)
+
+The integration lead booted the built binary and found two real gaps plus one smaller one. All
+three are fixed; verified by booting the binary and curling it (not just running the test suite
+— see the transcript below, reproducible with the commands in "How to verify everything").
+
+1. **Blocking: `GET /_matrix/client/versions` 404'd.** Nothing served it at all. Added
+   `crates/hs-cli/src/versions.rs` (`GET /_matrix/client/versions`, config-driven
+   `unstable_features`) and `crates/hs-cli/src/capabilities.rs` (`GET
+   /_matrix/client/v3/capabilities` + `r0` alias), mounted in `crates/hs-cli/src/serve.rs`.
+   `unstable_features` defaults to **empty**, deliberately: every flag `docs/synapse-inventory.md`
+   and `PLAN.md` Appendix B list gates a feature this server does not implement yet (`hs serve`
+   still only mounts `hs-auth`'s legacy routes plus these two). Advertising an unimplemented flag
+   would send a bridge down a code path we cannot serve — see `versions.rs`'s module doc for the
+   full reasoning. `unstable_features` is driven by an optional `hs serve
+   --capabilities-config <path>` YAML file (cannot live in the main `hs-config` file: that schema
+   denies unknown top-level keys, and this track does not own it — see "Interfaces needed").
+   `capabilities` similarly reports honestly against what is actually mounted (`m.change_password:
+   true`, everything else `false`, `m.room_versions` omitted).
+2. **`GET /metrics` returned `# EOF` with no series.** `Metrics` existed and was served, but
+   nothing ever called `record_http_request`. Added `crates/hs-cli/src/metrics_layer.rs`
+   (`axum::middleware::from_fn_with_state` timing every request, labeled by the *matched* route
+   template via `MatchedPath`) and wired it into the router. Verifying this by hand also caught a
+   **second, real bug in `hs-telemetry` itself** (not something the integration review flagged
+   directly — found while curling `/metrics` to confirm the fix): the `hs_http_requests_total`
+   counter was registered *with* the `_total` suffix already in its name, but
+   `prometheus_client`'s text encoder appends a literal `_total` to every `Counter` it renders
+   unconditionally, so the wire output was `hs_http_requests_total_total`. Fixed in
+   `crates/hs-telemetry/src/metrics.rs` (register as `"hs_http_requests"`, let the encoder add the
+   suffix) and in `docs/decisions/0004-telemetry-conventions.md`; the existing unit test only
+   checked `.contains("hs_http_requests_total")`, which the doubled name still satisfied as a
+   prefix, so it passed right through the bug — tightened to check the exact metric name and
+   assert the doubled form is absent.
+3. **`routes.json` was never written**, so track 14's spec-coverage tool reported 0/235 routes.
+   Rewrote `crates/hs-cli/src/serve.rs::build_router` to build through `hs_http::router::Builder`
+   (already used by `hs-media` and `hs-admin`, per the coordinator's suggestion) instead of a bare
+   `axum::Router`, added `crates/hs-cli/src/auth_manifest.rs` (a hand-mirrored, tested `Vec<Route>`
+   for `hs-auth`'s pre-built router fragment, which does not itself go through `Builder`), and
+   exposed `hs_cli::serve::route_manifest()` plus two ways to get it out: `hs serve
+   --routes-manifest <path>` (written at startup) and the new `hs routes-manifest [-o <path>]`
+   subcommand (no config, no server, no sockets — just the static route list).
+
+**Verification transcript** (`hs serve -c config.yaml --routes-manifest routes.json`, then curled
+by hand):
+
+```
+GET /_matrix/client/versions
+{"versions":["r0.0.1",...,"v1.12"],"unstable_features":{}}
+
+GET /_matrix/client/v3/capabilities
+{"capabilities":{"m.change_password":{"enabled":true},"m.set_displayname":{"enabled":false},
+"m.set_avatar_url":{"enabled":false},"m.3pid_changes":{"enabled":false}}}
+
+(register + login, then:)
+
+GET /metrics
+hs_http_requests_total{method="POST",route="/_matrix/client/v3/register",status_class="2xx"} 1
+hs_http_requests_total{method="POST",route="/_matrix/client/v3/login",status_class="2xx"} 1
+hs_http_requests_total{method="GET",route="/_matrix/client/v3/capabilities",status_class="2xx"} 1
+hs_http_requests_total{method="GET",route="/_matrix/client/versions",status_class="2xx"} 1
+hs_http_request_duration_seconds_bucket{le="...",...} ...
+# EOF
+
+GET /health/live -> 200 "ok"
+GET /health/ready -> 200 "ready"
+
+routes.json: 38 routes written, e.g. {"method":"GET","path":"/_matrix/client/r0/capabilities",
+"surface":"matrix-client","operation_id":"getCapabilities","auth":"none","rate_limited":false}
+
+SIGTERM -> "shutdown signal received, draining connections", clean exit (144 = 128+SIGTERM).
+```
+
+Full command reproduction is in "How to verify everything" at the bottom of this file. 33 new/
+changed tests across `hs-cli` (28 -> 47 unit, 4 -> 5 e2e) and `hs-telemetry` (tightened 1
+existing test) — all passing; `cargo clippy ... -- -D warnings` clean on both crates.
+
 ## Done
 
 - **`crates/hs-telemetry`** (full crate, not a skeleton):
@@ -28,11 +104,14 @@ ownership; see `.claude/agents/hs-12-platform.md` and the integration lead's ass
 
 - **`crates/hs-cli`** (full crate; new ownership per the integration lead's assignment message,
   not in the original track-12 brief):
-  - `hs serve [-c CONFIG]`: loads native config (`hs_config::Config::load`), initializes
-    telemetry, opens the configured storage backend, mounts `hs-auth`'s router under both
-    `/_matrix/client/v3` and `/_matrix/client/r0`, serves `/health/live`, `/health/ready`,
-    `/metrics`, binds every configured listener, handles SIGTERM (and Ctrl+C) with graceful
-    shutdown (`axum::serve(...).with_graceful_shutdown`).
+  - `hs serve [-c CONFIG] [--capabilities-config <path>] [--routes-manifest <path>]`: loads native
+    config (`hs_config::Config::load`), initializes telemetry, opens the configured storage
+    backend, serves `GET /_matrix/client/versions` and `GET /_matrix/client/v3(+r0)/capabilities`,
+    mounts `hs-auth`'s router under both `/_matrix/client/v3` and `/_matrix/client/r0`, serves
+    `/health/live`, `/health/ready`, `/metrics` (now with real data — see "Integration review
+    follow-up"), binds every configured listener, handles SIGTERM (and Ctrl+C) with graceful
+    shutdown (`axum::serve(...).with_graceful_shutdown`). `hs routes-manifest [-o <path>]` writes
+    the same `routes.json` `hs serve --routes-manifest` would, without booting a server.
   - `hs serve --synapse-config <path> [--allow-unsupported-synapse-config]
     [--translation-report markdown|json] [--translation-report-out <path>]`: implements
     `docs/compat/cli-shims.md`'s spec exactly, including re-applying `HS__` environment overrides
@@ -153,6 +232,11 @@ ownership; see `.claude/agents/hs-12-platform.md` and the integration lead's ass
 
 ## Interfaces needed
 
+- **From track 13 (`hs-config`)**: no `capabilities`/`unstable_features` section exists in the
+  native config schema, and it cannot be bolted onto the main file today (`hs_config::Config`
+  denies unknown top-level keys). `hs-cli` works around this with its own `--capabilities-config`
+  file (`crates/hs-cli/src/versions.rs`) as a stopgap. A real `hs_config::CapabilitiesConfig`
+  section would let this move into the main config file and drop the separate flag.
 - **From track 07 (`hs-auth`) or whoever ends up owning that rewiring**: `hs-auth::config::AuthConfig`
   is not the same type as `hs_config::AuthConfig` — it's `hs-auth`'s own pre-`hs-config` stand-in
   (per that crate's own module doc, built before `hs-config` existed, per
@@ -271,6 +355,32 @@ cargo clippy -p hs-telemetry --all-targets --all-features -- -D warnings
 cargo test -p hs-cli
 cargo clippy -p hs-cli --all-targets -- -D warnings
 cargo build -p hs-cli && ./target/debug/hs version
+./target/debug/hs routes-manifest | head -20  # no config, no server needed
+
+# hs-cli manual boot + curl (what the integration review actually ran)
+cat > /tmp/hs-verify-config.yaml <<'YAML'
+server:
+  server_name: verify.example
+listeners:
+  listeners:
+    - port: 18124
+      bind_addresses: ["127.0.0.1"]
+      resources: [client, health, metrics]
+storage:
+  backend: embedded
+  data_dir: /tmp/hs-verify-data
+auth:
+  enable_registration: true
+YAML
+./target/debug/hs serve -c /tmp/hs-verify-config.yaml --routes-manifest /tmp/routes.json &
+sleep 1
+curl -s http://127.0.0.1:18124/_matrix/client/versions
+curl -s http://127.0.0.1:18124/_matrix/client/v3/capabilities
+curl -s -X POST http://127.0.0.1:18124/_matrix/client/v3/register \
+  -H 'content-type: application/json' \
+  -d '{"username":"x","password":"correct horse battery staple","auth":{"type":"m.login.dummy"}}'
+curl -s http://127.0.0.1:18124/metrics | grep hs_http_requests_total
+kill -TERM %1
 
 # hs-operator (CRD schema + reconcile-stub tests, and regenerating deploy/crds/)
 cargo test -p hs-operator

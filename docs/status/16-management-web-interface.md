@@ -2,7 +2,18 @@
 
 Track brief: `docs/workstreams/16-management-web-interface.md`. Owner directories: `web/`, `docs/design/`.
 
-Last updated: 2026-09-18 (day one, single session: Phase 0 scaffold and design system, the bridges marquee, then a full reconciliation against track 15's real OpenAPI document once it appeared mid-session).
+Last updated: 2026-09-18 (day one, single session: Phase 0 scaffold and design system, the bridges marquee, a full reconciliation against track 15's real OpenAPI document once it appeared mid-session, then an integration-review response: a real accessibility defect fix, route-level code splitting, and the Users/Rooms/Federation pages).
+
+## Integration review response (2026-09-18, same day)
+
+The integration reviewer ran the app (not just read about it) and found one real defect plus two lower-priority items. All addressed:
+
+- **Defect — nested `<button>` on the bridges list, fixed.** Root cause: `DataTable`'s <768px card fallback (`web/src/components/ui/table/DataTable.tsx`) wrapped every priority-1 column's rendered output in one tap-target `<button>`, including the bridges list's "actions" column (real `<button>`s) and "name" column (a real `<a>` via `Link`) — a `<button>` cannot legally contain another `<button>` or an `<a>`. Axe's default desktop-viewport run never saw it: that markup is `display:none` above 768px, and axe (correctly) only audits what's perceivable, while React's own DOM-nesting console warning fires regardless of visibility because it validates the actual DOM tree. Fixed by adding `Column.interactive?: boolean`: columns that render their own controls now render _outside_ the card's tap-target button as a sibling group, never inside it. The desktop `<tr>` was also simplified to drop its `onClick`/`tabIndex`/`onKeyDown="Enter"` pseudo-button behavior entirely (see the second item below) — with that gone, activation is always through a column's own real link/button, which cannot double-nest by construction. `BridgesListPage`'s "name" and "actions" columns are marked `interactive: true`.
+  - **New regression coverage** (the ask: "add coverage that would" have caught it): `e2e/utils.ts`'s `installDomNestingGuard(page)` fails a test if React logs an invalid-DOM-nesting warning, at _any_ viewport — this is what should have existed already and is now wired into every e2e test. `e2e/bridges-list.spec.ts` adds a dedicated phone-viewport (`devices["iPhone 13"]`) axe pass, closing the gap for anyone who trusts axe alone at desktop width. `DataTable.test.tsx` adds a fast Vitest-level check (spies on `console.error`, asserts the action button is not a DOM descendant of the card's tap-target button) so this class of regression fails in `npm run test`, not just in e2e. `DataTable.stories.tsx` adds a `WithInteractiveColumns` story documenting the pattern.
+  - Verified by loading every built page (Sign-in, Dashboard, Bridges list at desktop and phone width, five bridge detail pages across all tabs, every add-bridge wizard step, the Created page, Users/Rooms/Federation list and detail, and all five remaining placeholder routes) with the console open: all clean. Also found and fixed one unrelated, harmless console 404 (the browser's implicit `/favicon.ico` request against the origin root, outside the app's `/admin/` base path — `web/index.html` now has an inline data-URI favicon).
+- **Lower-priority: the desktop table row's fake-button semantics.** Fixed as part of the same change: `DataTable`'s `<tr>` no longer carries `onClick`/`tabIndex`/`onKeyDown`. Row activation on desktop is now always a real link or button in one of the row's own columns (marked `interactive: true`), which natively supports Space, has a correct role, and can be opened in a new tab — properties a `tr` pretending to be a link never had. `onRowClick` still exists and still drives the mobile card's real `<button>`.
+- **Bundle size.** `web/src/routes.tsx` now lazy-loads every page component via TanStack Router's `lazyRouteComponent` (route-level code splitting); `AppShell` stays a static import since it's needed on first paint regardless of route. The single 573 KB (178 KB gzip) chunk is gone: the main bundle is now 386 KB (124 KB gzip) and every page (2-18 KB) loads only when its route is visited. `npm run build` no longer warns about chunk size.
+- **Users, Rooms, Federation pages built** (in the requested order), replacing their placeholder routes, against the real API (`/users`, `/rooms`, `/federation/destinations/{server_name}`): list pages with search (`q`, real server-side filtering — unlike appservices, these resources support it) and cursor pagination; detail pages with the primary actions from `flows.md` flows 2-4 (lock/unlock, suspend/unsuspend, sign out everywhere, deactivate for users; block/unblock, make-admin for rooms; reset backoff for federation destinations). Scoped narrower than the bridges marquee by design: no Sessions-tab-per-se depth beyond one device list, no reset-password flow (needs a password-entry UI this session didn't build), no redact-events. New: `web/src/api/{users,rooms,federation}.ts`, `web/src/pages/{UsersPage,UserDetailPage,RoomsPage,RoomDetailPage,FederationPage,FederationDestinationPage}.tsx`, mock fixtures/handlers for all three, `e2e/users-rooms-federation.spec.ts` (list → detail → one action per section, axe- and DOM-nesting-guard-checked). `npm run check` and the full Playwright suite (9 tests) are green.
 
 ## Done
 
@@ -20,13 +31,13 @@ Design system as code, all in `web/src/components/ui/`, each with a Storybook st
 
 Application shell (`web/src/components/shell/`): `AppShell`, `Sidebar` (full/rail/drawer per breakpoint, scope-filtered, live error count on Bridges), `TopBar` (search trigger, live/polling indicator, theme cycling, operator menu), `CommandPalette` (⌘K / `/`, nav + bridge jump, arrow-key + Enter), `SignIn` (mock issuer), `g`-chord navigation (`g o/b/u/r/f`), focus-to-main on route change.
 
-Pages: `DashboardPage`, `BridgesListPage`, `BridgeDetailPage`, the add-bridge wizard (`pages/bridges/wizard/`), and `PlaceholderPage` for every other information-architecture route (Users, Rooms, Reports, Federation, Media, Cluster, Migration, Audit, Settings) so navigation matches the full IA even though those pages are not built. **All of these were rewritten mid-session against the real API — see "Reconciliation" below; do not assume the shapes described in `flows.md`'s example paths are current.**
+Pages: `DashboardPage`, `BridgesListPage`, `BridgeDetailPage`, the add-bridge wizard (`pages/bridges/wizard/`), `UsersPage`/`UserDetailPage`, `RoomsPage`/`RoomDetailPage`, `FederationPage`/`FederationDestinationPage` (all three added in the integration-review response, see that section below), and `PlaceholderPage` for the remaining information-architecture routes (Reports, Media, Cluster, Migration, Audit, Settings) so navigation matches the full IA even though those pages are not built. Every route is lazy-loaded (`web/src/routes.tsx`, `lazyRouteComponent`). **The bridges/dashboard pages were rewritten mid-session against the real API — see "Reconciliation" below; do not assume the shapes described in `flows.md`'s example paths are current.**
 
 Testing:
 
-- Vitest: 28 tests across 7 files. `npm run test` passes.
+- Vitest: 30 tests across 7 files. `npm run test` passes.
 - Storybook: every primitive has a story; `@storybook/addon-a11y` runs axe (`wcag2a/2aa/21aa/22aa`) on every story in both themes via a theme-toolbar decorator. `npm run build:storybook` succeeds.
-- Playwright: `e2e/add-bridge.spec.ts` covers flows.md flow 1 in full — happy path self-managed, happy path Kubernetes, the namespace-conflict branch, and the forbidden branch — with an `@axe-core/playwright` check at every step. **Run and passing** (Chromium downloaded successfully over the network in this environment: `npx playwright install chromium`; all 4 tests green).
+- Playwright: `e2e/add-bridge.spec.ts` (flows.md flow 1 in full), `e2e/bridges-list.spec.ts` (nested-interactive-element regression, desktop + phone viewport), `e2e/users-rooms-federation.spec.ts` (flows 2-4 smoke). Every test runs `@axe-core/playwright` and `installDomNestingGuard` (see the integration-review response above). **Run and passing**: 9/9.
 - `npm run build` and `npm run build:mock` both succeed; `dist/` is the production artifact for track 15 to embed. `npm run check` (lint + typecheck + test + build) is clean.
 
 A real accessibility bug was found and fixed via axe coverage, not left for later: an unlayered `button { color: inherit }` in `base.css` was silently beating every Tailwind `text-*` utility applied to a `<button>` (unlayered CSS always outranks `@layer`-wrapped rules regardless of specificity), making the primary "Add bridge" button render dark text on its indigo fill (2.83:1 contrast). Fixed by deleting the duplicate rule. Separately, several status-badge colour pairs (`success`, `warning`, `--color-text-faint` in both themes, `muted-status` in dark) were too light for 4.5:1 at 12-13px; retuned and verified with a new `scripts/check-contrast.mjs`. See `docs/design/design-system.md` §2.3.
@@ -53,15 +64,16 @@ New mock fixtures/handlers matching the real shapes: `web/src/mocks/data/{appser
 
 ## Next
 
-1. Users, Rooms, Reports, Federation pages (flows 2-4 in `flows.md`), now with a real API to build against for most of them (`/users`? not yet inspected in this session — only the resources this session's pages needed were read in full; a fresh pass over the full `openapi.yaml` is worthwhile before starting each page).
-2. Real OAuth: swap `src/lib/auth.ts`'s mock issuer client for `oauth4webapi` against 07's issuer (07's brief; not yet started as of this session, per its own status file's dependency chain — check again, since 07 was also active this session).
-3. SSE live updates (`GET /events`, referenced in 15's status file) once wired up; `TopBar`'s "Polling every 30s" indicator and each page's `refetchInterval` are the seam to replace.
-4. Poll `GET /tasks/{id}` after `POST /appservices/{id}/replay` (currently fire-and-forget with a toast naming the task id).
-5. Code-split the route bundle (currently one ~575 kB / 179 kB gzip chunk) via `React.lazy` per route before this grows further with Phase 1/2 pages.
+1. Reports page (flow not yet built; still a `PlaceholderPage`). Media, Cluster, Migration, Audit log, Settings remain placeholders too — Phase 1/2 per the brief.
+2. Reset-password for users (`POST /users/{user_id}/reset-password`) needs a password-entry/generate UI this session deliberately deferred; redact-events, media tab, pushers, external IDs, 3PIDs are also unbuilt on the User detail page.
+3. Real OAuth: swap `src/lib/auth.ts`'s mock issuer client for `oauth4webapi` against 07's issuer (check 07's status file — it was also active this session).
+4. SSE live updates (`GET /events`, referenced in 15's status file) once wired up; `TopBar`'s "Polling every 30s" indicator and each page's `refetchInterval` are the seam to replace.
+5. Poll `GET /tasks/{id}` after `POST /appservices/{id}/replay` (currently fire-and-forget with a toast naming the task id).
 6. i18n scaffolding (`web/src/i18n/`) — not started; all copy is inline English.
 7. Wire up `GET /statistics/timeseries` for the dropped Activity sparklines, once the metric-name vocabulary is confirmed (ask 15, or read `hs-admin`'s statistics handler implementation once it exists beyond the mock).
 8. Lighthouse scores and a three-operator usability pass (definition of done) are unstarted; need real users/a running instance.
 9. Update `flows.md`'s path citations to match the real API (see the reconciliation note above); currently only this status file and `web/src/api/bridges.ts`'s doc comment carry the corrected paths.
+10. Room detail is missing the State/Timeline/Federation tabs from `flows.md` flow 3 and the room delete/purge action; User detail is missing Reports-about-them and Audit tabs.
 
 ## Blockers
 
@@ -102,11 +114,11 @@ From `web/`:
 ```
 npm run lint         # eslint (jsx-a11y strict) + prettier --check
 npm run typecheck    # tsc -b
-npm run test         # vitest run (28 tests)
+npm run test         # vitest run (30 tests)
 npm run build        # generate:client (from crates/hs-admin/openapi/openapi.yaml) + tsc -b + vite build -> dist/
 npm run build:storybook   # storybook build -> storybook-static/
 npm run test:e2e     # playwright test (builds+serves dist-mock, runs e2e/add-bridge.spec.ts with axe)
 node scripts/check-contrast.mjs   # offline contrast check for the status tokens
 ```
 
-`npm run check` runs the first four in sequence and is clean. `npm run test:e2e` needs Chromium (`npx playwright install chromium` if not already cached); it downloaded successfully over the network in this session, and all 4 tests pass. `npm run dev:mock` for interactive use; sign in with either button on the landing screen.
+`npm run check` runs the first four in sequence and is clean. `npm run test:e2e` needs Chromium (`npx playwright install chromium` if not already cached); it downloaded successfully over the network in this session, and all 9 tests pass. `npm run dev:mock` for interactive use; sign in with either button on the landing screen.

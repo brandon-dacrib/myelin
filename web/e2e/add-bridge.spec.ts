@@ -1,12 +1,20 @@
 import { test, expect } from "@playwright/test";
-import { signInAsOperator, signInReadOnly, expectNoAxeViolations } from "./utils";
+import {
+  signInAsOperator,
+  signInReadOnly,
+  expectNoAxeViolations,
+  installDomNestingGuard,
+} from "./utils";
 
 // flows.md flow 1: add a bridge. Covers the happy paths (self-managed and
 // Kubernetes), the namespace-conflict branch, and the forbidden branch, with
-// an axe pass at every step (accessibility.md).
+// an axe pass at every step (accessibility.md) and a React DOM-nesting guard
+// (see installDomNestingGuard's doc comment for why axe alone missed the
+// bridges-list nested-button defect).
 
 test.describe("Add a bridge", () => {
   test("happy path: self-managed", async ({ page }) => {
+    const domGuard = installDomNestingGuard(page);
     await signInAsOperator(page);
     await expectNoAxeViolations(page, "overview");
 
@@ -55,9 +63,11 @@ test.describe("Add a bridge", () => {
     await expect(page.getByRole("heading", { name: "Zulip" })).toBeVisible();
     await expect(page.getByText("Unknown")).toBeVisible();
     await expectNoAxeViolations(page, "bridge detail");
+    domGuard.assertClean();
   });
 
   test("happy path: kubernetes", async ({ page }) => {
+    const domGuard = installDomNestingGuard(page);
     await signInAsOperator(page);
     // Kubernetes is only offered in cluster mode (flows.md flow 1 step 4);
     // override the mock overview response for this test to exercise it (see
@@ -91,9 +101,11 @@ test.describe("Add a bridge", () => {
     await expect(page.getByRole("heading", { name: /created/ })).toBeVisible();
     // Kubernetes deployments do not get a Compose snippet.
     await expect(page.getByText("docker-compose.yaml")).toHaveCount(0);
+    domGuard.assertClean();
   });
 
   test("namespace conflict is shown on the Identity step with a link", async ({ page }) => {
+    const domGuard = installDomNestingGuard(page);
     await signInAsOperator(page);
     await page.goto("/admin/bridges/new");
 
@@ -109,9 +121,11 @@ test.describe("Add a bridge", () => {
     const conflict = page.getByRole("alert");
     await expect(conflict).toContainText("already registered");
     await expectNoAxeViolations(page, "wizard: namespace conflict");
+    domGuard.assertClean();
   });
 
   test("forbidden without bridges:write", async ({ page }) => {
+    const domGuard = installDomNestingGuard(page);
     await signInReadOnly(page);
 
     // The Bridges list itself is readable...
@@ -123,5 +137,6 @@ test.describe("Add a bridge", () => {
     await expect(page.getByText("bridges:write")).toBeVisible();
     await expect(page.getByText("Ask an administrator to grant it.")).toBeVisible();
     await expectNoAxeViolations(page, "wizard: forbidden");
+    domGuard.assertClean();
   });
 });

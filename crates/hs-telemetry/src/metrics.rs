@@ -11,10 +11,20 @@
 //!   exceptions. `<subsystem>` is the owning crate's short name without the `hs-` prefix (`room`,
 //!   `federation`, `cluster`, `media`, `auth`, ...). A metric with no natural subsystem
 //!   (process-wide ones this crate itself registers) uses `hs_process_*` or `hs_http_*`.
-//! - **Suffixes.** Counters end in `_total` (`hs_http_requests_total`). Values with a unit end in
-//!   that unit, spelled out and always base-SI (`_seconds`, not `_ms`; `_bytes`, not `_kb`):
-//!   `hs_http_request_duration_seconds`. Gauges have no mandated suffix beyond the noun itself
-//!   (`hs_cluster_shards_owned`).
+//! - **Suffixes.** Counters end in `_total` (`hs_http_requests_total`) *on the wire* — but
+//!   `registry.register(name, help, counter)` must be called with `name` **without** that
+//!   suffix (`"hs_http_requests"`, not `"hs_http_requests_total"`):
+//!   `prometheus_client`'s text encoder appends a literal `_total` to every [`Counter`] it
+//!   renders unconditionally, so a name that already ends in `_total` comes out doubled
+//!   (`hs_http_requests_total_total`) — a real bug this crate shipped once (caught by curling a
+//!   running server, not by a unit test that only checked `.contains("hs_http_requests_total")`,
+//!   which a doubled name still satisfies as a prefix). If you are registering a `Counter` and
+//!   typing `_total` into the string you pass to `register`, stop — that suffix is the encoder's
+//!   job. Values with a unit end in that unit, spelled out and always base-SI (`_seconds`, not
+//!   `_ms`; `_bytes`, not `_kb`): `hs_http_request_duration_seconds`, registered exactly as
+//!   written (histograms get their `_bucket`/`_sum`/`_count` suffixes from the metric *type*, not
+//!   from a name convention, so there is no equivalent doubling risk there). Gauges have no
+//!   mandated suffix beyond the noun itself (`hs_cluster_shards_owned`).
 //! - **Labels.** Keep the label cardinality bounded: `method`, `route` (the *templated* path, for
 //!   example `/rooms/{roomId}/state`, never the raw path with real room IDs interpolated —
 //!   interpolating identifiers into a label defeats Prometheus's storage model), `status_class`
@@ -91,8 +101,18 @@ impl Metrics {
         let mut registry = Registry::default();
 
         let http_requests_total = Family::<HttpLabels, Counter>::default();
+        // Registered as `hs_http_requests`, not `hs_http_requests_total`: `prometheus_client`'s
+        // text encoder always appends a literal `_total` suffix to every `Counter` it renders
+        // (the OpenMetrics convention for counters), regardless of what the registered name
+        // already ends in. Registering the name with `_total` already on it therefore rendered
+        // as `hs_http_requests_total_total` on the wire — caught by curling a running server
+        // during integration review, not by the unit test below (which only checked the
+        // substring `"hs_http_requests_total"` was present, which it was, just as a *prefix* of
+        // the doubled name). The histogram below has no equivalent bug: its `_bucket`/`_sum`/
+        // `_count` suffixes come from the metric *type*, not from a name convention the given
+        // name could already satisfy.
         registry.register(
-            "hs_http_requests_total",
+            "hs_http_requests",
             "Total HTTP requests handled, by method, templated route and status class",
             http_requests_total.clone(),
         );
@@ -174,7 +194,19 @@ mod tests {
         let metrics = Metrics::new();
         metrics.record_http_request("GET", "/health/live", 200, 0.005);
         let text = metrics.encode_to_string().unwrap();
-        assert!(text.contains("hs_http_requests_total"));
+        // Exact metric name, not a substring check: `prometheus_client` appends a literal
+        // `_total` to every `Counter` it renders, so a name already ending in `_total` would
+        // render as `..._total_total` and still (wrongly) satisfy a bare `.contains("..._total")`
+        // check, since that's a prefix of the doubled name. This caught exactly that bug once
+        // (see the comment on this family's `registry.register` call in `Metrics::new`).
+        assert!(
+            text.contains("hs_http_requests_total{"),
+            "expected the exact metric name `hs_http_requests_total`, got:\n{text}"
+        );
+        assert!(
+            !text.contains("hs_http_requests_total_total"),
+            "metric name was doubled:\n{text}"
+        );
         assert!(text.contains("hs_http_request_duration_seconds"));
         assert!(text.contains("method=\"GET\""));
         assert!(text.contains("status_class=\"2xx\""));
@@ -192,16 +224,17 @@ mod tests {
         let metrics = Metrics::new();
         let family = Family::<Vec<(String, String)>, Counter>::default();
         metrics.with_registry(|registry| {
-            registry.register(
-                "hs_room_events_total",
-                "Room events applied",
-                family.clone(),
-            );
+            // Registered as `hs_room_events` (no `_total`), for the same reason
+            // `Metrics::new`'s own `hs_http_requests` family is: `prometheus_client` appends the
+            // `_total` suffix to every `Counter` itself. A subsystem copying this test as a
+            // template should copy the naming, not just the shape.
+            registry.register("hs_room_events", "Room events applied", family.clone());
         });
         family
             .get_or_create(&vec![("kind".to_string(), "m.room.message".to_string())])
             .inc();
         let text = metrics.encode_to_string().unwrap();
-        assert!(text.contains("hs_room_events_total"));
+        assert!(text.contains("hs_room_events_total{"));
+        assert!(!text.contains("hs_room_events_total_total"));
     }
 }

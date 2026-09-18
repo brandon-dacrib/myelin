@@ -17,11 +17,21 @@ and what compiles), and this file should be corrected to match.
   without the `hs-` prefix (`room`, `federation`, `cluster`, `media`,
   `auth`, ...). A metric with no natural subsystem (process-wide ones
   `hs-telemetry` itself registers) uses `hs_process_*` or `hs_http_*`.
-- **Suffixes.** Counters end in `_total` (`hs_http_requests_total`).
-  Values with a unit end in that unit, spelled out and always base-SI
-  (`_seconds`, not `_ms`; `_bytes`, not `_kb`):
-  `hs_http_request_duration_seconds`. Gauges have no mandated suffix
-  beyond the noun itself (`hs_cluster_shards_owned`).
+- **Suffixes.** Counters end in `_total` (`hs_http_requests_total`) **on
+  the wire** — but call `registry.register(name, help, counter)` with
+  `name` **without** that suffix (`"hs_http_requests"`, not
+  `"hs_http_requests_total"`). `prometheus_client`'s text encoder appends
+  a literal `_total` to every counter it renders unconditionally, so a
+  name that already ends in `_total` renders doubled
+  (`hs_http_requests_total_total`) — a real bug this project shipped once,
+  caught by curling a running server rather than by a unit test that only
+  checked `.contains("hs_http_requests_total")` (still true of the doubled
+  name, as a prefix). Values with a unit end in that unit, spelled out and
+  always base-SI (`_seconds`, not `_ms`; `_bytes`, not `_kb`):
+  `hs_http_request_duration_seconds`, registered exactly as written
+  (histograms get `_bucket`/`_sum`/`_count` from the metric type, not from
+  a name convention, so they have no equivalent doubling risk). Gauges
+  have no mandated suffix beyond the noun itself (`hs_cluster_shards_owned`).
 - **Labels.** Keep label cardinality bounded: `method`, `route` (the
   *templated* path, e.g. `/rooms/{roomId}/state`, never a raw path with
   real room IDs interpolated), `status_class` (`"2xx"`, `"4xx"`, ...), and

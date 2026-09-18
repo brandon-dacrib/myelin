@@ -48,14 +48,20 @@ src/
   components/shell/  app shell: Sidebar, TopBar, CommandPalette, SignIn, nav model
   components/        shared app-level pieces (CopyableId, CopyBlock, RelativeTime, Sparkline)
   api/               generated schema (schema.d.ts), the typed fetch client, query/mutation
-                     hooks per resource (dashboard.ts, bridges.ts — see bridges.ts's doc
-                     comment for the reconciliation against the real AppService/BridgeType model)
+                     hooks per resource (dashboard.ts, bridges.ts, users.ts, rooms.ts,
+                     federation.ts — see bridges.ts's doc comment for the reconciliation
+                     against the real AppService/BridgeType model)
   lib/               auth (mock issuer client), theme, cn(), query client, small helpers
   mocks/             MSW handlers + fixture data (browser.ts for the app, node.ts for tests)
   pages/             route components: DashboardPage, bridges/ (list, detail, add-bridge
-                     wizard), PlaceholderPage for information-architecture sections not yet built
-  routes.tsx          the route tree (TanStack Router, code-based)
-e2e/                 Playwright specs (add-bridge.spec.ts covers flows.md flow 1 end to end)
+                     wizard), UsersPage/UserDetailPage, RoomsPage/RoomDetailPage,
+                     FederationPage/FederationDestinationPage, PlaceholderPage for the
+                     remaining information-architecture sections not yet built
+  routes.tsx          the route tree (TanStack Router, code-based, every page lazy-loaded
+                     via lazyRouteComponent for route-level code splitting)
+e2e/                 Playwright specs: add-bridge.spec.ts (flows.md flow 1 end to end),
+                     bridges-list.spec.ts (nested-interactive-element regression coverage,
+                     desktop and phone viewport), users-rooms-federation.spec.ts
 mocks/openapi.yaml   this track's own OpenAPI draft; fallback only, see Requirements above
 scripts/             generate-client.mjs, check-openapi.mjs, check-contrast.mjs
 ```
@@ -64,11 +70,13 @@ scripts/             generate-client.mjs, check-openapi.mjs, check-contrast.mjs
 
 Built: the scaffold, the design system and every Phase-0 primitive component, the application
 shell (navigation, theme switching including a curated accent set, command palette, responsive
-down to tablet width, keyboard navigation), the dashboard, and the bridges list/detail/add-bridge
+down to tablet width, keyboard navigation), the dashboard, the bridges list/detail/add-bridge
 wizard pages (flows.md flow 1 in full, including the Kubernetes and self-managed deployment
-paths, the namespace-conflict branch, and the forbidden branch).
+paths, the namespace-conflict branch, and the forbidden branch), and the Users, Rooms and
+Federation list/detail pages (flows.md flows 2-4: search, understand, and the primary actions
+— lock/suspend/deactivate a user, block a room, reset a federation destination's backoff).
 
 Not built (routes exist as `PlaceholderPage` so navigation matches the full information
-architecture, but the pages themselves are Phase 1/2 per the brief): Users, Rooms, Reports,
-Federation, Media, Cluster, Migration, Audit log, Settings. See
-`docs/status/16-management-web-interface.md` for what is next.
+architecture, but the pages themselves are Phase 1/2 per the brief): Reports, Media, Cluster,
+Migration, Audit log, Settings. See `docs/status/16-management-web-interface.md` for what is
+next, including narrower gaps on the pages that are built (e.g. no reset-password flow yet).

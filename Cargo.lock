@@ -1142,6 +1142,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fancy-regex"
+version = "0.19.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d301f5bf187b3c295fce6468d3875037a0bccc5f6b151c63cac2f85babf21912"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1562,6 +1573,28 @@ dependencies = [
 [[package]]
 name = "hs-appservice"
 version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "fancy-regex",
+ "hex",
+ "hs-auth",
+ "hs-kv",
+ "hs-tables",
+ "http",
+ "rand 0.9.5",
+ "regex",
+ "reqwest 0.12.28",
+ "ruma",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "thiserror",
+ "time",
+ "tokio",
+ "tracing",
+ "ulid",
+]
 
 [[package]]
 name = "hs-auth"
@@ -1826,6 +1859,25 @@ version = "0.0.1"
 [[package]]
 name = "hs-room"
 version = "0.0.1"
+dependencies = [
+ "axum",
+ "bytes",
+ "hs-auth",
+ "hs-http",
+ "hs-kv",
+ "hs-model",
+ "hs-state",
+ "hs-tables",
+ "hs-testkit",
+ "proptest",
+ "ruma",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tracing",
+]
 
 [[package]]
 name = "hs-search"
