@@ -1,0 +1,1 @@
+{"server_name":"example.org","verify_keys":{"ed25519:1":{"key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}},"old_verify_keys":{},"valid_until_ts":99999999999999,"signatures":{"example.org":{"ed25519:1":"AAAA"}}}

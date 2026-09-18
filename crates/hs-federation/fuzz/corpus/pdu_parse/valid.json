@@ -1,0 +1,1 @@
+{"type":"m.room.message","sender":"@alice:example.org","room_id":"!abc:example.org","origin_server_ts":1000,"depth":1,"content":{"body":"hi"},"auth_events":[],"prev_events":[]}

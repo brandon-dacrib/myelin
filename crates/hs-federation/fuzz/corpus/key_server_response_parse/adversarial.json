@@ -1,0 +1,1 @@
+{"server_name":123,"verify_keys":"not-an-object","old_verify_keys":{"ed25519:x":{"key":123,"expired_ts":"nope"}},"valid_until_ts":"nope","signatures":{}}

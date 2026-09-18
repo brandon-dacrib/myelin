@@ -21,7 +21,6 @@ mod seams;
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use hs_http::router::{AuthKind, Builder, RouteManifest, RouteMeta, Surface};
 
 use crate::room_source::RoomDataSource;
@@ -50,18 +49,14 @@ fn matrix_federation(operation_id: &str) -> RouteMeta {
 ///
 /// # Panics
 /// Never during normal construction; this function only builds route tables and applies layers.
-#[must_use]
 pub fn router(
     state: FederationState,
     x_matrix_ctx: Arc<XMatrixContext>,
 ) -> (axum::Router, RouteManifest) {
-    let (read_router, read_routes) = read_routes::router();
-    let (seam_router, seam_routes) = seams::router();
-
-    let (merged, manifest) = Builder::new()
-        .merge_router("", read_router, read_routes)
-        .merge_router("", seam_router, seam_routes)
-        .build();
+    let builder = Builder::<FederationState>::new();
+    let builder = read_routes::add_routes(builder);
+    let builder = seams::add_routes(builder);
+    let (merged, manifest) = builder.build();
 
     let router = merged
         .with_state(state)
@@ -82,6 +77,7 @@ mod tests {
         build_server_key_response,
     };
     use crate::room_source::InMemoryRoomSource;
+    use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
@@ -105,8 +101,9 @@ mod tests {
     }
 
     fn test_ctx() -> Arc<XMatrixContext> {
-        let key_cache: Arc<DynRemoteKeyCache> =
-            Arc::new(RemoteKeyCache::new(Box::new(EmptyFetcher) as Box<dyn KeyServerFetcher>));
+        let key_cache: Arc<DynRemoteKeyCache> = Arc::new(RemoteKeyCache::new(
+            Box::new(EmptyFetcher) as Box<dyn KeyServerFetcher>,
+        ));
         Arc::new(XMatrixContext {
             own_server_name: "us.example.org".to_string(),
             key_cache,
@@ -174,7 +171,7 @@ mod tests {
         }
         let doc = build_server_key_response("origin.example.org", &keys, &[], 3600).unwrap();
         let key_cache: Arc<DynRemoteKeyCache> = Arc::new(RemoteKeyCache::new(
-            Box::new(FixedFetcher(doc)) as Box<dyn KeyServerFetcher>
+            Box::new(FixedFetcher(doc)) as Box<dyn KeyServerFetcher>,
         ));
         let ctx = Arc::new(XMatrixContext {
             own_server_name: "us.example.org".to_string(),

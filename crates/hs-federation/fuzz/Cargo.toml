@@ -1,0 +1,60 @@
+[package]
+name = "hs-federation-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+async-trait = "0.1"
+axum = "0.8"
+
+[dependencies.hs-federation]
+path = ".."
+
+[dependencies.hs-model]
+path = "../../hs-model"
+
+[[bin]]
+name = "pdu_parse"
+path = "fuzz_targets/pdu_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "edu_parse"
+path = "fuzz_targets/edu_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xmatrix_header_parse"
+path = "fuzz_targets/xmatrix_header_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "well_known_body_parse"
+path = "fuzz_targets/well_known_body_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "key_server_response_parse"
+path = "fuzz_targets/key_server_response_parse.rs"
+test = false
+doc = false
+bench = false
+
+# Deliberately its own workspace — see `crates/hs-media/fuzz/Cargo.toml`'s identical note (the
+# root workspace's `members = ["crates/*"]` glob does not reach a nested `fuzz/` directory, and a
+# fuzz crate should not share the parent's dependency resolution/lockfile churn anyway).
+[workspace]

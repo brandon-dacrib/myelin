@@ -205,6 +205,22 @@ impl RoomDataSource for InMemoryRoomSource {
             .ok_or(RoomSourceError::NotFound)
     }
 
+    async fn get_event_by_id(
+        &self,
+        event_id: &str,
+        requesting_server: &str,
+    ) -> Result<(String, EventJson), RoomSourceError> {
+        for (room_id, room) in &self.rooms {
+            if let Some(event) = room.events.get(event_id) {
+                if !self.is_visible_to(room_id, requesting_server).await {
+                    return Err(RoomSourceError::NotVisible);
+                }
+                return Ok((room_id.clone(), event.clone()));
+            }
+        }
+        Err(RoomSourceError::NotFound)
+    }
+
     async fn state_at(
         &self,
         room_id: &str,

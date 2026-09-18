@@ -454,7 +454,14 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
     /// Verifies a fetched key response is validly self-signed by a key it itself claims, then
     /// caches every key it lists — scoped strictly to `expected_server_name`, so a response
     /// cannot inject keys under any other server's name (the "no key substitution" defence).
-    fn ingest_response(
+    ///
+    /// `pub` (not just called internally from [`RemoteKeyCache::refresh`]) so it is directly
+    /// fuzzable against arbitrary, hostile JSON without needing a live fetcher to drive it — see
+    /// `fuzz/fuzz_targets/key_server_response_parse.rs`.
+    ///
+    /// # Errors
+    /// See [`KeyLookupError`].
+    pub fn ingest_response(
         &self,
         expected_server_name: &str,
         doc: &serde_json::Value,

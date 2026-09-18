@@ -171,6 +171,21 @@ struct WellKnownServer {
     m_server: String,
 }
 
+/// Parses and structurally validates a `.well-known/matrix/server` response body the same way
+/// [`HttpWellKnownFetcher::fetch`] does: valid JSON, an object, a non-empty `m.server` string.
+/// Exposed standalone (not just inline in the fetcher) so it is directly fuzzable without needing
+/// a real HTTP response to drive it — see `fuzz/fuzz_targets/well_known_body_parse.rs`.
+#[must_use]
+pub fn parse_well_known_body(bytes: &[u8]) -> Option<String> {
+    if bytes.len() > MAX_WELL_KNOWN_BODY_BYTES {
+        return None;
+    }
+    match serde_json::from_slice::<WellKnownServer>(bytes) {
+        Ok(doc) if !doc.m_server.trim().is_empty() => Some(doc.m_server),
+        _ => None,
+    }
+}
+
 /// The outcome of a well-known fetch: either a parsed delegation with a cache TTL, or "no
 /// delegation" (absent/malformed/error) with a (shorter) negative-cache TTL.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -520,12 +535,12 @@ impl WellKnownFetcher for HttpWellKnownFetcher {
             }
         }
 
-        match serde_json::from_slice::<WellKnownServer>(&body) {
-            Ok(doc) if !doc.m_server.trim().is_empty() => WellKnownOutcome::Delegated {
-                delegated_to: doc.m_server,
+        match parse_well_known_body(&body) {
+            Some(delegated_to) => WellKnownOutcome::Delegated {
+                delegated_to,
                 cache_for: clamp_cache_control(max_age),
             },
-            _ => WellKnownOutcome::Absent {
+            None => WellKnownOutcome::Absent {
                 cache_for: Duration::from_secs(FAILED_WELL_KNOWN_CACHE_SECS),
             },
         }

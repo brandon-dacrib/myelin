@@ -37,7 +37,10 @@ pub struct InMemoryQuerySource {
 
 impl InMemoryQuerySource {
     pub fn insert_profile(&self, user_id: &str, profile: Value) {
-        self.profiles.lock().unwrap().insert(user_id.to_string(), profile);
+        self.profiles
+            .lock()
+            .unwrap()
+            .insert(user_id.to_string(), profile);
     }
     pub fn insert_alias(&self, alias: &str, room_id: &str, servers: Vec<String>) {
         self.aliases
@@ -46,7 +49,10 @@ impl InMemoryQuerySource {
             .insert(alias.to_string(), (room_id.to_string(), servers));
     }
     pub fn insert_devices(&self, user_id: &str, devices: Value) {
-        self.devices.lock().unwrap().insert(user_id.to_string(), devices);
+        self.devices
+            .lock()
+            .unwrap()
+            .insert(user_id.to_string(), devices);
     }
     pub fn insert_openid_token(&self, token: &str, user_id: &str) {
         self.openid_tokens
@@ -75,6 +81,10 @@ impl FederationQuerySource for InMemoryQuerySource {
     }
 
     async fn openid_userinfo(&self, access_token: &str) -> Option<String> {
-        self.openid_tokens.lock().unwrap().get(access_token).cloned()
+        self.openid_tokens
+            .lock()
+            .unwrap()
+            .get(access_token)
+            .cloned()
     }
 }

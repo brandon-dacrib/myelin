@@ -9,6 +9,7 @@ pub mod acl;
 pub mod client;
 pub mod destination_store;
 pub mod discovery;
+pub mod edu;
 pub mod error;
 pub mod keys;
 pub mod room_source;

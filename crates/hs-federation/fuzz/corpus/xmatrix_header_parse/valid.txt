@@ -1,0 +1,1 @@
+X-Matrix origin="example.org",destination="us.example.org",key="ed25519:1",sig="AAAA"
