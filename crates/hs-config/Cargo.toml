@@ -5,8 +5,13 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "hs-config: see docs/workstreams for the owning track"
+description = "Native homeserver configuration: schema, defaults, validation, environment and file-secret overrides, reload boundary, reference docs"
 
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]

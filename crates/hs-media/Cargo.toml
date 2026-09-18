@@ -5,8 +5,38 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "hs-media: see docs/workstreams for the owning track"
+description = "Media repository: object-store backed uploads, downloads, thumbnails and the security rules around them (track 09)"
+
+[features]
+default = []
+# Extra object_store backends. Off by default to keep the dependency tree lean.
+gcp = ["object_store/gcp"]
+azure = ["object_store/azure"]
 
 [dependencies]
+async-trait.workspace = true
+axum.workspace = true
+bytes.workspace = true
+futures.workspace = true
+hex.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+image.workspace = true
+object_store.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+tower = { workspace = true, features = ["util"] }
+
+[[bench]]
+name = "thumbnails"
+harness = false

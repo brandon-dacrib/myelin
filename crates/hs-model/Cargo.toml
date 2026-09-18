@@ -5,8 +5,16 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "hs-model: see docs/workstreams for the owning track"
+description = "Domain types over Ruma: events with cached canonical bytes and hashes, room-version capability table, redaction per version, canonical JSON. Track 02 (docs/workstreams/02-state-and-model.md)."
 
 [dependencies]
+ruma = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
 
 [dev-dependencies]
+proptest = { workspace = true }

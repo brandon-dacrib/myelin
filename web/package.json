@@ -1,0 +1,82 @@
+{
+  "name": "hs-admin-web",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Management web interface for the hs Matrix homeserver (track 16). Built on the public admin API and served by the homeserver at /admin/.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "dev:mock": "VITE_HS_MOCK=1 vite",
+    "build": "npm run generate:client && tsc -b && vite build",
+    "build:mock": "npm run generate:client && tsc -b && VITE_HS_MOCK=1 vite build --outDir dist-mock",
+    "preview": "vite preview",
+    "preview:mock": "VITE_HS_MOCK=1 vite build --outDir dist-mock && vite preview --outDir dist-mock",
+    "generate:client": "node scripts/generate-client.mjs",
+    "check": "npm run lint && npm run typecheck && npm run test && npm run build",
+    "lint": "eslint . && prettier --check .",
+    "lint:fix": "eslint . --fix && prettier --write .",
+    "typecheck": "tsc -b",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "storybook": "storybook dev -p 6006",
+    "build:storybook": "storybook build -o storybook-static",
+    "mock:openapi": "node scripts/check-openapi.mjs"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "5.103.1",
+    "@tanstack/react-router": "1.170.38",
+    "class-variance-authority": "0.7.1",
+    "clsx": "2.1.1",
+    "lucide-react": "1.47.0",
+    "oauth4webapi": "3.8.8",
+    "openapi-fetch": "0.17.0",
+    "radix-ui": "1.6.7",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "tailwind-merge": "3.7.0"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.13.0",
+    "@eslint/js": "9.39.5",
+    "@playwright/test": "1.63.0",
+    "@storybook/addon-a11y": "10.6.0",
+    "@storybook/react-vite": "10.6.0",
+    "@tailwindcss/vite": "4.3.3",
+    "@tanstack/router-plugin": "1.168.40",
+    "@testing-library/dom": "10.4.2",
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.3",
+    "@testing-library/user-event": "14.6.7",
+    "@types/node": "26.6.1",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.1",
+    "eslint": "9.39.5",
+    "eslint-plugin-jsx-a11y": "6.10.2",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "eslint-plugin-react-refresh": "0.5.7",
+    "globals": "17.12.0",
+    "jsdom": "30.1.0",
+    "msw": "2.15.0",
+    "openapi-typescript": "7.13.0",
+    "prettier": "3.9.8",
+    "storybook": "10.6.0",
+    "tailwindcss": "4.3.3",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.70.0",
+    "vite": "8.3.0",
+    "vitest": "5.0.1",
+    "yaml": "2.9.1"
+  },
+  "msw": {
+    "workerDirectory": [
+      "public"
+    ]
+  }
+}
