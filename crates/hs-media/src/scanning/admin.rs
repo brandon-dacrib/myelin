@@ -5,7 +5,7 @@
 //! (`crates/hs-admin/openapi/openapi.yaml`) belongs to track 15 and is not edited here. This
 //! module is this crate's side of that seam: a trait track 15's HTTP handlers can call, plus the
 //! plain data types those handlers would serialize. The wire-shape proposal for track 15's
-//! endpoints is `docs/rfcs/0009-admin-scanning-endpoints.md`.
+//! endpoints is `docs/rfcs/0011-admin-scanning-endpoints.md (not yet written)`.
 //!
 //! **Not implemented in this session**: a concrete `impl ScanAdmin`. The natural home is
 //! `crate::repository::MediaRepository<B>` once it holds a `crate::scanning::engine::ScanEngine<B>`

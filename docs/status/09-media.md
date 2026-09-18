@@ -2,11 +2,284 @@
 
 Track brief: `docs/workstreams/09-media.md`. Owner crate: `hs-media`.
 
-Last updated: 2026-09-18 (session 1, working from a clean restart after a prior attempt was
-interrupted before writing any code beyond a placeholder `lib.rs` and a `benches/thumbnails.rs`
-stub).
+Last updated: 2026-09-18 (session 2, content scanning: `docs/rfcs/0008-content-scanning.md` /
+PLAN.md decision D6b). Session 1's record is unchanged below this section.
 
-## Done
+## Session 2: pluggable content scanning (`crate::scanning`)
+
+The RFC changed twice mid-session (first: ICAP promoted from one-of-five to the primary and only
+deeply-built provider; second, at the user's direction via
+`docs/decisions/0007-build-less-reuse-more.md`: drop the clamd/command providers entirely, adopt
+`icap-rs` instead of a hand-rolled ICAP client, and add `Verdict::Replaced` for ICAP's
+content-adaptation half, not just antivirus). What is described below is the *final* state, after
+both changes; an intermediate hand-rolled ICAP client (raw `TcpStream` byte-banging, its own
+`INSTREAM`-shaped connection pool) was written and then deleted once `icap-rs` was evaluated and
+found to cover everything needed — see "Reuse considered" below for the record decision 0007
+requires.
+
+### Verification
+
+```
+cargo check -p hs-media          # clean
+cargo clippy -p hs-media --all-targets -- -D warnings   # clean
+cargo test -p hs-media           # 225 passed, 0 failed (213 lib + 11 image_corpus + 1 s3_backend)
+cargo fmt -p hs-media             # applied
+```
+
+### Done — complete and independently tested (`crates/hs-media/src/scanning/`)
+
+- **`scanning/types.rs`**: the provider interface exactly as RFC section 2 specifies —
+  `ContentScanner` (`id`, `engine_version`, `scan`, `poll` with a default `Err(Unsupported)`),
+  `Verdict` (`Clean`, `Infected`, `Unscannable`, `Pending`, plus `Replaced { content, by, reason }`
+  added for RFC section 3.4), `UnscannableReason`, `ScanContext`, `ScanTicket`, `ScanError`.
+  `ScanSource`: a pull (`next_chunk`/`ChunkSource`), not `futures::Stream`-based, so this crate
+  needs no stream-combinator dependency; `ScanSource::from_bytes` is what every scan point in this
+  session uses (content is already fully buffered by the time it reaches `crate::repository` —
+  see that struct's doc for why "MUST stream" is honored at the wire-protocol-chunking level, not
+  by ever reading directly from a client socket). `sha256_hex` is a public free function (used by
+  both `ScanSource` and `scanning::engine`'s cache-key computation). 9 tests.
+- **`scanning/config.rs`**: `ScanningConfig` (mode/provider/fail/allow_replacement/timeout/
+  max_size/oversize/cache/unscannable-policy/appservice_bypass/icap/http), built on
+  `hs_config::{Duration, ByteSize}` and `hs_config::Validate` for parse/error-shape consistency
+  with the rest of the config system, **without editing `hs_config::MediaConfig`** (track 13's
+  crate — this track's ownership rule forbids it; see "Interfaces needed" below for what track 13
+  needs to do). `ScanningConfig::validated()` is the configuration-error enforcement point: mode
+  enabled without a chosen `fail` policy, or a provider selected without its settings block, both
+  fail with every problem listed at once. Only `icap`, `http` and `none` exist as
+  `ProviderKind` variants — `ClamAv`/`Command` were deleted mid-session (see "Reuse considered").
+  15 tests, including the RFC's example YAML parsing end to end.
+- **`scanning/cache.rs`**: `VerdictCache<B: KvBackend>` over `hs-tables`, keyed on
+  `(sha256_hex, provider_id, version_key)` (unversioned verdicts use a sentinel version key, so
+  they still get their own cache line, TTL'd separately via `cache.unversioned_ttl`). Capacity
+  enforcement evicts oldest-inserted-first via a secondary `(cached_at_ms, seq)` order index and a
+  dedicated `hs-kv` counter keyspace for the insertion sequence — no unbounded table scan on the
+  hot path. `Verdict::Pending` and `Verdict::Replaced` are never cached (see the module doc for
+  why on each). 10 tests, including the signature-version-change-invalidates-the-cache test the
+  RFC's testing section asks for by name, and a capacity-eviction test.
+- **`scanning/providers/none.rs`**: always `Clean`, drains the source. 1 test.
+- **`scanning/providers/icap.rs`**: the provider. Built on `icap-rs = "0.3"` (see "Reuse
+  considered"), not a hand-rolled client — this module only adds the antivirus/adaptation
+  semantics `icap-rs` has no opinion on: `X-Infection-Found`/`X-Virus-ID`/`X-Violations-Found`
+  parsing across the ICAP response's own headers, the embedded HTTP response's headers, *and*
+  chunk trailers (`to_verdict`); byte-comparing the returned body against what was sent to
+  distinguish an unmodified `200` (still `Clean` — some AV services echo the body back rather than
+  answering `204`) from a genuine `Verdict::Replaced`; and `ISTag` (from `icap-rs`'s own OPTIONS
+  cache) as `engine_version`. 13 tests: 6 pure (`ParsedResponse::from_raw` against literal
+  recorded bytes, no socket) plus 7 in `tests::live`, which start `icap_rs::server::Server` — a
+  real, independent RFC 3507 implementation — in-process and drive `IcapScanner` against it end to
+  end (OPTIONS/ISTag, `204`, an infection header on a genuine `200`, preview-then-remainder body
+  delivery verified by the server-side handler reading the full body back, `Transfer-Ignore`
+  skipping proven by asserting the handler is never called, connection-refused). See "What has
+  never run" below for what this does and does not prove.
+- **`scanning/providers/http.rs`**: the JSON submit-and-poll contract this crate defines (RFC
+  section 3.1 names CrowdStrike Falcon as the motivating case; there is no existing standard wire
+  format to adopt for "a JSON scanning API" the way there is for ICAP, so this is this crate's own
+  small contract, documented in the module doc, the same pattern `hs-modules`'
+  `HttpCallbackClient` already established for module hooks). Covers clean/infected/unscannable/
+  pending-then-poll/replaced (base64-encoded content), auth-token-as-bearer, and connection-refused
+  classification. 9 tests against a real in-process `axum`/`tokio` mock HTTP server (no external
+  network).
+- **`scanning/engine.rs`**: `ScanEngine<B>`, the orchestrator. Read this module's doc first — it
+  states the two guarantees the user called out as the ones to get right, and *how* they are
+  structural, not just documented:
+  1. **Encrypted media is never reported clean.** `looks_like_encrypted` (Matrix clients upload
+     encrypted attachments as `Content-Type: application/octet-stream`, since the plaintext MIME
+     type lives in the encrypted event's own content, never the HTTP upload — a documented
+     heuristic, not a certainty, erring toward the safe direction per RFC section 7) runs *before*
+     any provider call; when it fires, `evaluate` never constructs a `ScanSource` or touches the
+     provider at all, so there is no code path through which a provider's answer could become a
+     false "clean". Directly tested with a provider fake that answers `Clean` to everything,
+     asserting `evaluate` still returns the encrypted policy outcome *and* that the fake was never
+     called (`tests::encrypted_content_is_never_reported_clean_even_if_the_provider_would_say_so`).
+  2. **A down scanner fails only by explicit operator choice.** `ScanEngine::new` requires an
+     already-`validated()` config; `ScanningConfig::validated()` is the only path scanning can be
+     enabled without a chosen `fail` policy failing to compile-time-adjacent (build-time-adjacent)
+     construction. Timeout/connection-error/malformed-response are all routed through one
+     `action_for` match on `self.config.fail`, tested under both policies individually plus a
+     specific timeout test and a specific malformed-response test.
+  Also implements: the verdict cache read/write around the provider call (cache hit records
+  `ScanMetrics::record_cache_hit`, never `record_scan` — tested); a bounded `Verdict::Pending` poll
+  loop respecting `ScanContext::deadline`; RFC section 3.4's replacement rules as a pure,
+  independently-tested function (`refuse_disallowed_replacement`) — refused when
+  `allow_replacement` is off, refused when not an upload-time scan point
+  (`allow_replacement_here: false`), refused for encrypted content *regardless* of the other two
+  (tested directly, per the RFC's explicit ask, not only as a side effect of guarantee 1's
+  short-circuit); and audit-entry writing (infected, scanner-error, replacement-applied with both
+  content hashes — `original_sha256`/`adapted_sha256`). 19 tests.
+- **`scanning/metrics.rs`**: `ScanMetrics`, registered into `hs_telemetry::metrics::Metrics`'s
+  shared `Registry` (added `hs-telemetry` as an in-tree path dependency — consuming its interface,
+  not editing its crate). The four metrics RFC section 8 names:
+  `hs_media_scans_total{provider,verdict,source}`,
+  `hs_media_scan_duration_seconds{provider,verdict,source}`,
+  `hs_media_scan_cache_hits_total{provider}`, `hs_media_scan_errors_total{provider,kind}` —
+  registered per `hs_telemetry::metrics`'s own naming convention (no `_total` in the string passed
+  to `registry.register`, the doubled-suffix bug that convention's doc warns about explicitly).
+  2 tests, including one asserting the exact non-doubled metric names on the wire.
+- **`scanning/audit.rs`**: `AuditSink` trait; `TracingAuditSink` (default, logs via `tracing`);
+  `InMemoryAuditSink` (bounded ring buffer, backs the admin "recent verdicts" surface and this
+  session's tests); `FanOutAuditSink` (write to several sinks — use both `Tracing` and `InMemory`
+  in a real deployment). 3 tests.
+- **`scanning/admin.rs`**: `ScanAdmin` trait (`recent_verdicts`, `rescan`, `rescan_many` with a
+  default fan-out-to-`rescan` implementation, `provider_health`) and `ProviderHealth`. **Interface
+  only — no concrete implementation** (see "Next" below for exactly why and where one belongs).
+
+### Not done: wiring into `crate::repository::MediaRepository`
+
+`ScanEngine::evaluate` is written to be a drop-in call from any of RFC section 4's four scan
+points (it takes plain bytes, a content type, a `ScanContext`, and returns an `EngineDecision` —
+`Allow` / `AllowReplaced` / `Reject` / `StoreQuarantined` — that already encodes what the caller
+should do), but **no call site actually calls it yet**. `crate::repository::MediaRepository::new`
+and its `upload`/`complete_reservation` methods are unchanged from session 1. This is this
+session's largest incomplete piece; see "Next" for the concrete plan.
+
+### What has never run against a real daemon (constraint: no Docker, no network scanners here)
+
+- **`scanning::providers::icap`**: no real ICAP server (c-icap, a commercial appliance, or an
+  ICAP gateway) has been reached. `tests::wire`-equivalent pure tests use
+  `icap_rs::response::Response::from_raw` against literal bytes (no daemon, no socket).
+  `tests::live` uses `icap_rs::server::Server` — a real, independent RFC 3507 implementation,
+  running in-process — as the test double; this proves `IcapScanner` and `icap-rs`'s own client
+  and server agree on the wire protocol (OPTIONS/ISTag, 204, an infection header on 200,
+  preview-then-remainder delivery, Transfer-Ignore skipping), which is the strongest test double
+  achievable without an external daemon, but it is **not** proof of interoperability with a real
+  c-icap+ClamAV stack, a commercial ICAP appliance, or ICAPeg. The EICAR-string-through-a-real-
+  ClamAV test the RFC's testing section asks for by name was **not written** in this session (no
+  reachable ICAP/ClamAV to skip cleanly against, unlike `tests/s3_backend.rs`'s pattern of a real
+  env-var-gated network test) — this is a gap, not a skip; see "Next".
+- **`scanning::providers::http`**: fully tested against a real in-process mock HTTP server
+  (`axum`/`tokio`, no external network) — this is a complete test, not a partial one, since there
+  is no real CrowdStrike Falcon (or similar) credential available here to test against, and the
+  wire contract is this crate's own definition rather than a third-party spec to interoperate
+  with.
+- **No fuzzing was run** for the ICAP wire parsing this session adds on top of `icap-rs` (the
+  crate's own parser is presumably fuzzed upstream; this crate's `to_verdict`/header-extraction
+  layer was not run through `crates/hs-media/fuzz/`'s existing harness or a new one). Flagged as a
+  gap, not attempted due to session time, same caveat session 1 already recorded about
+  `cargo-fuzz`/nightly not being available in this sandbox.
+- **Docker-based deploy verification**: `deploy/`'s c-icap+ClamAV reference compose file
+  (RFC section 3.2 / decision 0007's requirement) was **not written this session** — see "Next".
+
+### Reuse considered (decision 0007's required heading)
+
+- **`icap-rs = "0.3.0"` (MIT, crates.io) — adopted, not reimplemented.** Evaluated by downloading
+  and reading its source (`~/.cargo/registry/cache/.../icap-rs-0.3.0.crate`, extracted to the
+  scratchpad) before writing any protocol code, per decision 0007's instruction. Verdict: it
+  covers RFC section 3.3 comprehensively — `client/options_cache.rs` implements the exact
+  `Options-TTL`-refreshed cache with RFC 3507 §5's ISTag-mismatch invalidation rule and §4.10.2's
+  `Transfer-Preview`/`-Ignore`/`-Complete` policy (matched by `Content-Type` for RESPMOD, via its
+  own `file_ext_from_request`/`ext_from_content_type`); `Client::send` drives the full preview/
+  `100 Continue` handshake as one `await`; `Allow: 204` and connection reuse (`keep_alive`) are
+  builder options; `Encapsulated` chunked framing is entirely internal to the crate. It is
+  `#![forbid(unsafe_code)]` and built under `#![deny(clippy::pedantic, clippy::nursery, ...)]` —
+  a stricter bar than this project's own. **No upstream contribution was needed or made**: nothing
+  in section 3.3 was missing. `crates/hs-media/src/scanning/providers/icap.rs`'s module doc
+  records this evaluation inline as well, for anyone reading that file without this status file.
+  An earlier hand-rolled ICAP client (raw `TcpStream`, manual `INSTREAM`-style chunk framing, a
+  home-grown connection pool and OPTIONS cache) was written *before* this evaluation happened
+  (the user's first mid-session correction asked for ICAP depth without yet mentioning
+  decision 0007) and was **deleted in full** once `icap-rs` was found to cover the same ground
+  better and with far less code to maintain.
+- **A direct clamd `INSTREAM` client, and a spawn-a-binary command runner — deliberately not
+  built**, per decision 0007 directly: c-icap's `virus_scan` service already drives ClamAV with
+  packaged container images, so either would have been a second path to a problem c-icap already
+  solves. Config scaffolding for both (`ProviderKind::ClamAv`/`Command`, `ClamAvConfig`,
+  `CommandConfig`) existed for part of the session and was deleted before any client code was
+  written for either — `scanning/config.rs`'s module doc records this explicitly so a reader of
+  just that file (not this status file) also sees the scope cut and its reason.
+- **`hs-modules`' `CallbackRequest`/`CallbackResponse` JSON envelope — considered, not reused** for
+  `scanning::providers::http`. The RFC's original text suggested extending that protocol; the
+  rewritten RFC (after decision 0007) instead frames the `http` provider as its own small,
+  independent JSON contract (submit bytes + headers, JSON verdict response), which is what this
+  session implemented. `hs-modules`'s envelope is a general callback-shape for policy hooks
+  (allow/deny/replace-content decisions about Matrix objects); a scan submission is closer to "post
+  a file, get a verdict" than to that shape, and forcing it through the callback envelope would
+  have meant JSON-encoding raw bytes (base64) for the *request* as well as the response, which
+  `hs-modules`'s protocol was never designed to carry efficiently. Not reused, with this stated
+  reason, per decision 0007's own test ("if it exists but is unmoduled/unsuitable, say so
+  explicitly, with the reason").
+- **`hs-telemetry::metrics::Metrics`** — reused as designed (this crate registers its own metric
+  families into the shared registry via `with_registry`, exactly the pattern that crate's own
+  tests demonstrate for other subsystems); no new metrics infrastructure was built.
+
+### Next (in priority order)
+
+1. **Wire `ScanEngine` into `crate::repository::MediaRepository`** (RFC section 4, points 1 and
+   2 — the only two with an existing caller). Concretely:
+   - Add `scanning: Option<Arc<ScanEngine<B>>>` to `MediaRepository` via a new
+     `MediaRepository::with_scanning(self, engine: ScanEngine<B>) -> Self` builder method (do
+     **not** change `MediaRepository::new`'s signature — every existing call site, including
+     `crate::test_support`, `crate::state`'s tests and `crate::repository`'s own tests, constructs
+     via `new` today and should keep compiling unchanged).
+   - In `MediaRepository::upload` and `MediaRepository::complete_reservation`, after the existing
+     size/quota checks and before the `object_store.put` call: if `self.scanning` is `Some` and
+     `engine.mode() != ScanMode::Off`, build a `ScanContext` (media id, server name, uploader from
+     `ctx.user_id`, `source: ScanSourceKind::Local` — see point 3 below for `Appservice`,
+     `deadline: now + engine's configured timeout`, computed via the repository's existing
+     injectable clock) and call `engine.evaluate(content_type, bytes.clone(), scan_ctx, now_ms,
+     allow_replacement_here: true).await`. Match on the returned `EngineDecision`:
+     - `Allow` → proceed exactly as today.
+     - `AllowReplaced(content)` → store `content.bytes` instead of the original, use
+       `content.content_type` if `Some` (else keep the declared type), and update
+       `byte_length`/`content_type` in the `MediaRecord` accordingly.
+     - `Reject(reason)` → return a new `MediaError` variant (add one, e.g.
+       `MediaError::RejectedByScanner(String)`, mapped to a `4xx` `M_FORBIDDEN`-shaped
+       `MatrixError` in `error.rs`, following that file's existing pattern) **without** calling
+       `object_store.put` at all — per RFC section 5's `block` mode, infected/rejected content
+       must never even be persisted.
+     - `StoreQuarantined(reason)` → store normally, then call the existing
+       `MetadataStore::set_quarantined` (already implemented and tested — see session 1's
+       `crate::metadata`) with `by: Some("system:scan")` (or a distinct value distinguishing
+       automated quarantine from an admin's manual one, an open call this session did not make).
+   - **Known simplification to carry forward, not silently fix**: with no background-job
+     scheduler in the codebase yet (session 1's own note: "background-job leasing is track 03/12's
+     infrastructure"), `defer` and `quarantine` modes are implemented identically by
+     `ScanEngine::action_for`'s `mode_default_action` (both map a bad verdict to
+     `Action::Quarantine`) — see `scanning/engine.rs`'s module doc for the reasoning. `quarantine`
+     mode's defining property (the scan does not block the upload response) is therefore **not**
+     actually true yet in this design: `evaluate` is awaited synchronously inside the upload
+     handler regardless of mode. Making `quarantine` mode genuinely non-blocking needs either (a)
+     `tokio::spawn`-ing the scan-then-quarantine step (needs `MediaRepository<B>` and its fields to
+     be `'static`-cloneable into the task, which they mostly already are — `MetadataStore<B>` is
+     `Clone`, `object_store`/`policy`/`config`/`clock` are all `Arc`s already; the ergonomic
+     obstacle is only `ScanEngine<B>` also needing to be cheaply `Clone`d into the spawned task,
+     which it is not yet — wrap it in `Arc` at the call site) or (b) real background-job infra once
+     it exists. Recorded as a decision to revisit, not a silent gap.
+2. **Appservice bypass + `ScanSourceKind::Appservice`** (RFC section 4, point 4). In
+   `crate::routes::upload`'s handlers, `MediaRequester(requester)` already exposes
+   `requester.appservice: Option<hs_auth::requester::AppserviceIdentity>` (see session 1's
+   `MediaRequester` decision). Thread that through: if `Some(identity)` and
+   `identity.appservice_id` is in `ScanningConfig::appservice_bypass.exempt_appservice_ids`, skip
+   the `engine.evaluate` call entirely and write an `AuditEntry { kind:
+   AuditKind::AppserviceBypass { appservice_id }, .. }` directly via the engine's `AuditSink`
+   (`ScanEngine` does not currently expose its `audit` field publicly — add an accessor, or a
+   `ScanEngine::record_bypass(&self, ctx, appservice_id)` convenience method). Otherwise pass
+   `source: ScanSourceKind::Appservice` instead of `Local` in the `ScanContext`. This also needs
+   `crate::policy::UploadContext` (or a new, richer context) to carry the appservice id through to
+   wherever `ScanContext` gets built — today `UploadContext` only has `user_id`/`server_name`.
+3. **Remote media fetch (RFC section 4, point 3)**: still blocked on track 06 exactly as session 1
+   recorded for RFC 0007 — there is no federation media fetch code to wire scanning into yet. When
+   it lands, the call site should use `allow_replacement_here: false` (RFC section 3.4 rule 1 —
+   replacement is upload-only) and `ScanSourceKind::Federation`.
+4. **A concrete `ScanAdmin` implementation** (`scanning/admin.rs` is interface-only). The natural
+   home is an `impl ScanAdmin for MediaRepository<B>` once step 1 lands (rescanning needs object-
+   store access to re-read bytes by media id; `recent_verdicts` needs a shared `InMemoryAuditSink`
+   handle, which the repository would need to hold alongside its `ScanEngine`).
+5. **`docs/rfcs/0011-admin-scanning-endpoints.md (not yet written)`**: referenced from `scanning/admin.rs`'s module
+   doc as the wire-shape proposal to track 15, but **not actually written this session** — this is
+   a doc-only gap, quick for the next session (or track 15 directly) to close; the trait in
+   `scanning/admin.rs` already states the four operations RFC section 8 asks for, which is most of
+   the content that RFC needs.
+6. **`deploy/`**: a c-icap + ClamAV reference compose file (decision 0007 / RFC section 3.2), plus
+   a status-file note for track 12 to add the equivalent Helm sub-chart — neither was written this
+   session.
+7. **The EICAR-through-a-real-ICAP-daemon test** (`tests/icap_eicar.rs` or similar, env-var-gated
+   like `tests/s3_backend.rs`, skipping cleanly with an `eprintln!` when unreachable): not written.
+   Once `deploy/`'s compose file exists (item 6), this becomes straightforward to add and to
+   actually run locally against it.
+
+## Session 1 (original delivery below, unchanged)
+
+### Done
 
 This session delivered the brief's day-one work and Phase 0 deliverables in full, plus the
 Synapse layout adapter and both Phase 1/2 design RFCs. Not delivered: URL previews and federation
@@ -293,6 +566,17 @@ existing, as the brief itself anticipates.
   an axum handler (the RFC 0006/0007 fetch primitive, notably) is likely to want it directly.
 
 ## Shared dependencies added
+
+**Session 2 added one new `[workspace.dependencies]` entry: `icap-rs = "0.3"`** (MIT), a
+tokio-based RFC 3507 ICAP/1.0 client/server library — see the session 2 section above ("Reuse
+considered") for the evaluation that justified adopting it instead of a hand-rolled client.
+Session 2 also added, to `crates/hs-media/Cargo.toml` only (all already present in the root
+workspace table before this session, added by other tracks): `reqwest` (track 15), `base64`
+(root), `prometheus-client` (root), `serde_yaml_ng` (root), `schemars` (root), plus a new in-tree
+path dependency on `hs-telemetry` (for `scanning::metrics::ScanMetrics` to register into the
+shared `Registry`).
+
+Session 1 added none, beyond what is recorded below for that session:
 
 None. Every dependency this session's code uses (`object_store` with its already-enabled `aws`
 feature, `image` with its already-enabled `jpeg`/`png`/`gif`/`webp` features, `ruma`, `crc32fast`,
