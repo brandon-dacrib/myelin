@@ -1,0 +1,53 @@
+# Complement image template (docs/workstreams/14-test-and-conformance.md, PLAN.md section 12
+# layer L3). Untested: no `hs-server` binary exists in this workspace yet (as of this writing the
+# per-track HTTP surfaces -- hs-http's listener, hs-auth's router fragment, ... -- are library
+# crates with no assembled listening process to `cargo build --release` here). This file is the
+# structural scaffold the Complement image contract requires
+# (refs/complement/README.md, "Image requirements"); update the `TODO` markers once a server
+# binary exists, then validate with `./build.sh` and `./run_single_node.sh` (see README.md).
+#
+# Complement's image contract, this file must satisfy:
+#   - EXPOSE 8008 (plain HTTP client-server traffic) and 8448 (HTTPS federation traffic).
+#   - Accept the server name via the `SERVER_NAME` environment variable at container start.
+#   - 200 OK on GET /_matrix/client/versions once healthy.
+#   - Trust /complement/ca/ca.crt (mounted by Complement) for its own federation TLS certificate,
+#     signed at each container start (the server name -- and so the cert -- is not known at
+#     image-build time). `startup.sh` does the signing, following the exact openssl invocation
+#     refs/complement/README.md's "Complement PKI" section documents.
+#   - Use `complement` as the shared secret for Synapse-compatible admin registration
+#     (`/_synapse/admin/v1/register`), matching `docs/rfcs/0004-admin-api.md`'s Synapse
+#     compatibility surface once that endpoint exists.
+#   - Manage its own storage inside the image/container (the embedded `hs-kv` backend, per
+#     PLAN.md section 7: single-binary, embedded-store mode is exactly what Complement's
+#     single-node contract wants).
+#   - Tolerate CMD/ENTRYPOINT being invoked more than once per container lifetime.
+
+# ---- build stage -----------------------------------------------------------------------------
+FROM rust:1.98-slim AS build
+WORKDIR /workspace
+COPY . .
+# TODO: replace `hs-server` with the real workspace-root binary crate once track assembly lands
+# one (see docs/status/14-test-and-conformance.md's "Interfaces needed" for who owns it).
+RUN cargo build --release -p hs-server
+
+# ---- runtime stage ----------------------------------------------------------------------------
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# TODO: replace with the real binary's output path once it exists.
+COPY --from=build /workspace/target/release/hs-server /usr/local/bin/hs-server
+COPY tests/complement/startup.sh /startup.sh
+RUN chmod +x /startup.sh
+
+# Embedded storage lives here; Complement gives each container a fresh filesystem per run, so no
+# volume is declared (matches the "manage its own storage within the image" requirement).
+VOLUME /data
+WORKDIR /data
+
+EXPOSE 8008 8448
+
+HEALTHCHECK --interval=1s --timeout=1s --start-period=30s --retries=30 \
+    CMD curl -sf http://localhost:8008/_matrix/client/versions || exit 1
+
+ENTRYPOINT ["/startup.sh"]

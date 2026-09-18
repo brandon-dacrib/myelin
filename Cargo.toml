@@ -81,9 +81,20 @@ async-stream = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Added by track 12 (platform and Kubernetes): the `hs` CLI's subcommand parsing and its
-# interactive/non-echoed password prompts (`hs register`, `hs hash-password`).
+# interactive/non-echoed password prompts (`hs register`, `hs hash-password`), and hs-operator's
+# CRD schemas and reconcile loops.
 clap = { version = "4", features = ["derive", "env"] }
 rpassword = "7"
+kube = { version = "1", default-features = false, features = ["derive", "client", "runtime", "rustls-tls"] }
+# Pinned to 0.25 (not 0.26) because kube-core 1.1.0 itself depends on `k8s-openapi = "0.25.0"`
+# with no floating upper bound; a workspace pin of 0.26 resolves *both* versions into the
+# dependency graph (one used by kube-core's own public types, one by anything depending on our
+# pinned 0.26 directly), which fails to build (k8s-openapi's build script requires exactly one
+# `v1_*` feature to be enabled, and Cargo unifies features per resolved version, not per crate).
+# hs-operator's Cargo.toml has the matching note about `schemars` needing a separate 0.8 pin for
+# the same reason (kube-core 1.1.0's `CustomResource` derive is still built against schemars 0.8,
+# not the workspace's schemars "1").
+k8s-openapi = { version = "0.25", features = ["latest", "schemars"] }
 
 [profile.dev]
 opt-level = 0

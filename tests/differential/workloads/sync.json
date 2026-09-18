@@ -1,0 +1,38 @@
+{
+  "name": "sync",
+  "description": "Register, create a room, send a message, confirm an initial /sync surfaces it.",
+  "steps": [
+    {
+      "name": "register",
+      "method": "POST",
+      "path": "/_matrix/client/v3/register",
+      "body": {
+        "username": "differential_sync_user",
+        "password": "correct horse battery staple",
+        "auth": {"type": "m.login.dummy"}
+      },
+      "extract": {"access_token": "$.access_token"}
+    },
+    {
+      "name": "create_room",
+      "method": "POST",
+      "path": "/_matrix/client/v3/createRoom",
+      "auth_token": "{{access_token}}",
+      "body": {"preset": "private_chat"},
+      "extract": {"room_id": "$.room_id"}
+    },
+    {
+      "name": "send_message",
+      "method": "PUT",
+      "path": "/_matrix/client/v3/rooms/{{room_id}}/send/m.room.message/differential-sync-txn-1",
+      "auth_token": "{{access_token}}",
+      "body": {"msgtype": "m.text", "body": "hello sync"}
+    },
+    {
+      "name": "initial_sync",
+      "method": "GET",
+      "path": "/_matrix/client/v3/sync?timeout=0",
+      "auth_token": "{{access_token}}"
+    }
+  ]
+}

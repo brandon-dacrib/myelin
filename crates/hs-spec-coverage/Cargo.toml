@@ -5,8 +5,17 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "hs-spec-coverage: see docs/workstreams for the owning track"
+description = "hs-spec-coverage: parses the Matrix spec's five OpenAPI trees, compares them to a routes.json router manifest (RFC 0005), and reports registered/missing/extra routes. Track 14 (docs/workstreams/14-test-and-conformance.md)."
+
+[[bin]]
+name = "hs-spec-coverage"
+path = "src/bin/hs-spec-coverage.rs"
 
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }

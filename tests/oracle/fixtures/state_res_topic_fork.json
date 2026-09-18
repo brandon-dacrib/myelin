@@ -1,0 +1,90 @@
+{
+  "_comment": "Illustrative fixture, never run against a real Synapse (see tests/oracle/README.md) -- treat as a starting point to validate, not verified ground truth. Room version 2 (explicit event IDs, state resolution v2) is used deliberately to decouple this from event-ID hash computation, which is a separate concern. Two branches both extend the same power-levels event with a different m.room.topic, a minimal conflict state resolution v2 must resolve deterministically.",
+  "room_version": "2",
+  "room_id": "!oracle:example.org",
+  "events": [
+    {
+      "event_id": "$create:example.org",
+      "type": "m.room.create",
+      "room_id": "!oracle:example.org",
+      "sender": "@creator:example.org",
+      "state_key": "",
+      "content": {"creator": "@creator:example.org", "room_version": "2"},
+      "auth_events": [],
+      "prev_events": [],
+      "depth": 1,
+      "origin_server_ts": 1700000000000
+    },
+    {
+      "event_id": "$creator_join:example.org",
+      "type": "m.room.member",
+      "room_id": "!oracle:example.org",
+      "sender": "@creator:example.org",
+      "state_key": "@creator:example.org",
+      "content": {"membership": "join"},
+      "auth_events": ["$create:example.org"],
+      "prev_events": ["$create:example.org"],
+      "depth": 2,
+      "origin_server_ts": 1700000001000
+    },
+    {
+      "event_id": "$power_levels:example.org",
+      "type": "m.room.power_levels",
+      "room_id": "!oracle:example.org",
+      "sender": "@creator:example.org",
+      "state_key": "",
+      "content": {
+        "users": {"@creator:example.org": 100},
+        "users_default": 0,
+        "state_default": 50,
+        "events_default": 0,
+        "ban": 50,
+        "kick": 50,
+        "redact": 50,
+        "invite": 0
+      },
+      "auth_events": ["$create:example.org", "$creator_join:example.org"],
+      "prev_events": ["$creator_join:example.org"],
+      "depth": 3,
+      "origin_server_ts": 1700000002000
+    },
+    {
+      "event_id": "$topic_a:example.org",
+      "type": "m.room.topic",
+      "room_id": "!oracle:example.org",
+      "sender": "@creator:example.org",
+      "state_key": "",
+      "content": {"topic": "Branch A"},
+      "auth_events": ["$create:example.org", "$creator_join:example.org", "$power_levels:example.org"],
+      "prev_events": ["$power_levels:example.org"],
+      "depth": 4,
+      "origin_server_ts": 1700000003000
+    },
+    {
+      "event_id": "$topic_b:example.org",
+      "type": "m.room.topic",
+      "room_id": "!oracle:example.org",
+      "sender": "@creator:example.org",
+      "state_key": "",
+      "content": {"topic": "Branch B"},
+      "auth_events": ["$create:example.org", "$creator_join:example.org", "$power_levels:example.org"],
+      "prev_events": ["$power_levels:example.org"],
+      "depth": 4,
+      "origin_server_ts": 1700000003500
+    }
+  ],
+  "state_sets": [
+    {
+      "m.room.create|": "$create:example.org",
+      "m.room.member|@creator:example.org": "$creator_join:example.org",
+      "m.room.power_levels|": "$power_levels:example.org",
+      "m.room.topic|": "$topic_a:example.org"
+    },
+    {
+      "m.room.create|": "$create:example.org",
+      "m.room.member|@creator:example.org": "$creator_join:example.org",
+      "m.room.power_levels|": "$power_levels:example.org",
+      "m.room.topic|": "$topic_b:example.org"
+    }
+  ]
+}

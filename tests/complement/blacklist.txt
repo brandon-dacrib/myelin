@@ -1,0 +1,19 @@
+# Complement test blacklist for this server.
+#
+# One Go test-name regex per line (matched against `go test -run`'s `TestName/SubtestName` shape
+# via `-skip`); blank lines and lines starting with `#` are ignored. `run.sh` reads this file and
+# builds a combined `-skip` regex, rather than using Complement's per-implementation build-tag
+# convention (`synapse_blacklist`, `dendrite_blacklist`, ...:
+# refs/complement/README.md, "Build tags (test blacklisting)") -- build tags require a tag
+# registered in every test file upstream ahead of time, which only exists for the four
+# implementations Complement already knows about. A runtime `-skip` regex needs no upstream
+# changes and works for a brand new implementation from day one.
+#
+# Status as of this writing: no `hs-server` binary exists to build an image from
+# (tests/complement/Dockerfile.template), so this file has never been exercised against a real
+# run. It is seeded with nothing blacklisted -- once a server exists, the first real run's
+# failures populate this list (with a one-line reason each), the same way Synapse's own blacklist
+# is grown incrementally rather than guessed at up front.
+#
+# Example entry once real failures are known:
+# TestOutboundFederationProfile  # not yet implemented: federation profile queries (track 06)

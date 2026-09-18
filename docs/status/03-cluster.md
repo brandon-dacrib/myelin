@@ -1,6 +1,43 @@
 # 03 Cluster: status
 
-Updated: 2026-09-18.
+Updated: 2026-09-18 (integration-review follow-up: strengthened the chaos suite's headline test,
+verified by mutation testing; added mesh connection pooling and its own tests; assessed and
+deferred Kubernetes `Lease` membership).
+
+## Integration review follow-up (this update)
+
+An integration pass mutation-tested `Fence::check` by making it unconditionally return `Ok` (i.e.
+disabling fencing entirely) and ran the chaos suite. Only `a_partitioned_replica_cannot_write_after_being_fenced`
+failed; `no_two_replicas_ever_commit_the_same_shard_epoch` -- the test whose name claims to guard
+that exact property -- passed, because its replica kill was a graceful removal from the harness's
+own bookkeeping: nothing ever attempted a write with a stale fence after ownership moved on, so
+the fence was never adversarially exercised.
+
+Fixed: `no_two_replicas_ever_commit_the_same_shard_epoch` now captures the doomed replica's fence
+for every shard it owns *before* killing it, and keeps retrying writes with that stale, pre-kill
+fence (as a would-be caller retrying against a last-known fence would) on every round for the rest
+of the test, gated on the store actually showing a new epoch (so it never asserts before a real
+new owner exists). Every such attempt must fail. Re-running the same mutation afterward:
+
+- **Before the fix**: 4 of 5 chaos tests passed under the mutation (only the partition test
+  failed) -- the headline test gave false confidence.
+- **After the fix**: 2 of 5 chaos tests fail under the mutation
+  (`no_two_replicas_ever_commit_the_same_shard_epoch` and
+  `a_partitioned_replica_cannot_write_after_being_fenced`), plus a third failure in the lib suite
+  (`fence::tests::fence_fails_after_another_replica_acquires`) -- 3 tests total across the crate
+  now catch a disabled fence, exceeding the "at least two" bar. The mutation was applied, verified
+  to produce these failures, then reverted; `cargo test -p hs-cluster` is green again post-revert.
+
+Also strengthened `a_partitioned_replica_cannot_write_after_being_fenced` to cover the second
+requested shape ("a stalled store on one replica while the others make progress"): the surviving
+replica now makes five further successful commits while the partitioned one stays cut, and the
+partitioned replica's stale fence is re-checked as still-rejected after that progress, not just at
+the moment of takeover.
+
+Also implemented mesh connection pooling (previously listed under "Next") and added end-to-end
+tests for it that exercise the real mesh transport over a socket for the first time in this
+crate's test suite. Kubernetes `Lease` membership was assessed and deliberately left out as more
+than a contained change; see Decisions below for why.
 
 ## Done
 
@@ -52,9 +89,11 @@ Updated: 2026-09-18.
     `POST /mesh/v1/forward` (auth, ownership/fencing check, idempotency cache, bounded in-flight
     semaphore, dispatch to `ShardHandler`) and `POST /mesh/v1/released` (nudges the local
     convergence loop).
-  - `forwarder.rs`: `Forwarder` -- opens a fresh HTTP/2 connection per forward (connection pooling
-    is *not* implemented yet, see Decisions), retries on connection failure / `421` (ownership
-    refresh) / `503` (bounded backoff), enforces the hop limit and deadline, records metrics.
+  - `forwarder.rs`: `Forwarder` -- pools one persistent, multiplexed HTTP/2 connection per peer
+    address (`hyper`'s `SendRequest` handles are `Clone`, safe to share concurrently across
+    forwards), evicting and redialing inline when a pooled connection turns out to be dead before
+    surfacing a failure to its own retry loop, which separately retries on connection failure /
+    `421` (ownership refresh) / `503` (bounded backoff) and enforces the hop limit and deadline.
 - `crates/hs-cluster/src/cluster.rs`: `Cluster` facade -- `single_node`, `start`, `ownership`,
   `ready`, `drain` -- matching RFC section 13's documented lifecycle surface. 2 tests.
 - `crates/hs-cluster/src/metrics.rs`: `ClusterMetrics` / `MetricsSnapshot` with the fields RFC
@@ -76,8 +115,21 @@ Updated: 2026-09-18.
     convergence loop runs concurrently, asserts a nonzero handoff count and that ownership fully
     converges onto the survivor.
   - `a_partitioned_replica_cannot_write_after_being_fenced`: cuts one replica's store connection,
-    waits for takeover, asserts a write using the partitioned replica's stale fence is rejected
-    and a write using the new owner's fresh fence succeeds.
+    waits for takeover, asserts a write using the partitioned replica's stale fence is rejected,
+    asserts the new owner keeps successfully committing (five further writes) while the
+    partitioned replica stays cut, and asserts the stale fence is still rejected after that.
+  - `no_two_replicas_ever_commit_the_same_shard_epoch` additionally captures the killed replica's
+    fence for every shard it owned and keeps retrying writes with that stale fence for the rest of
+    the test once the store shows a new epoch for the shard, asserting every such attempt is
+    rejected -- see "Integration review follow-up" above for why this was necessary.
+- `crates/hs-cluster/tests/mesh_pool.rs`: end-to-end tests of `Forwarder` against a real socket (a
+  minimal raw HTTP/2 peer, not `MeshServer`, so what is measured is unambiguously `Forwarder`'s own
+  behavior). 2 tests: `forwarder_reuses_one_connection_across_many_forwards` (5 forwards to the
+  same peer accept exactly 1 TCP connection) and
+  `forwarder_redials_after_the_pooled_connection_is_gone` (the peer silently drops the first
+  connection; the next forward still succeeds, having dialed exactly one fresh connection). This
+  is also the first test in the crate to exercise the mesh transport over a real socket at all --
+  every other test calls `Ownership`/`ChaosLog` directly.
 - `deploy/chaos/`: Kubernetes chaos manifests and scripts, **UNTESTED** (Docker is not running on
   this machine; see `deploy/chaos/README.md` for exactly what that means and what still depends on
   `hs-cli`'s not-yet-built `hs chaos-actor` subcommand). Manifests for a disposable namespace,
@@ -87,8 +139,9 @@ Updated: 2026-09-18.
   rolling-update scenarios plus a `checker.py` linearizability checker mirroring the in-process
   harness's invariant.
 - Quality bar: `cargo fmt -p hs-cluster` clean, `cargo clippy -p hs-cluster --all-targets -- -D
-  warnings` clean, `cargo test -p hs-cluster` (45 unit/integration tests) and `cargo test -p
-  hs-cluster --test chaos` (5 tests) all green, run repeatedly with no observed flakiness.
+  warnings` clean, `cargo test -p hs-cluster` (47 tests: 40 lib + 5 chaos + 2 mesh-pool
+  integration, 0 doctests) all green, run repeatedly (chaos and mesh-pool suites specifically, 5x
+  each) with no observed flakiness.
 
 ## In progress
 
@@ -96,12 +149,12 @@ Updated: 2026-09-18.
 
 ## Next (not done; for whoever picks this up next)
 
-- Mesh connection pooling: `Forwarder` opens a fresh HTTP/2 connection per forward today. The RFC
-  calls for one persistent, multiplexed HTTP/2 connection per peer; this is a real gap for
-  forward-latency and connection-count at scale, just not a correctness one.
 - Kubernetes `Lease` membership (RFC section 4: "the store may be the data store ... or, in Phase
   1, Kubernetes `coordination.k8s.io/v1` Leases via `kube-rs`"). Only the store-based path is
   implemented; it works everywhere including single-node and is what `deploy/chaos/` exercises.
+  Assessed during this update and deliberately deferred rather than attempted as a "cheap fix":
+  see Decisions below for the specific reasons (new heavy dependency, a pluggable-membership-source
+  abstraction, and zero ability to test it in this environment).
 - Weighted rendezvous hashing (zone spread, capacity) and the per-shard pin row for moving a hot
   room's shard -- both explicitly Phase 1 in the RFC.
 - SlateDB per-shard open taking the epoch for manifest fencing -- blocked on the SlateDB backend
@@ -183,9 +236,23 @@ Updated: 2026-09-18.
   will work against Fjall or PostgreSQL without any change to this crate once those backends'
   `Txn`/`Snapshot` types exist and implement `KvRead`/`KvWrite` (they already must, per `hs-kv`'s
   own contract).
-- `Forwarder` does not pool connections in this Phase 0 implementation (see "Next"); this was a
-  deliberate scope cut to ship a correct, simple client first rather than a persistent-connection
-  pool with its own lifecycle and error-recovery surface.
+- `Forwarder` now pools one persistent HTTP/2 connection per peer (`std::sync::Mutex<HashMap<String,
+  SendRequest<...>>>`, evict-and-redial-once-inline on a dead pooled connection). The initial
+  Phase 0 cut of shipping a per-forward-fresh-connection client first was reasonable to get
+  something correct out the door, but the pooled version is not meaningfully more complex and
+  removes a real gap (a fresh TCP + TLS + HTTP/2 handshake per forward is expensive at scale), so
+  it was worth doing in the same pass rather than leaving it for later.
+- Kubernetes `Lease` membership was assessed and deliberately **not** attempted in this pass, even
+  though asked to fix it "if cheap": it requires a new, heavy dependency (`kube-rs` plus
+  `k8s-openapi`, neither in the workspace today), a new pluggable-membership-source abstraction
+  (RFC section 4 is explicit that only membership can move to Leases -- shard rows must stay in the
+  data store, so this isn't a drop-in swap of the existing registry, it's a second code path
+  alongside it), and -- unlike everything else in this pass -- there is no way to test it at all in
+  this environment (no Kubernetes API reachable, Docker not running), so it would ship as far
+  less-verified code than the rest of this crate. That combination made it not a contained change
+  by this track's own quality bar (RFC 0001 section 2's "day-one" scope, and the workspace
+  convention of tests for everything claimed to work), so it is left for whoever has a cluster to
+  test against.
 - Test timing pattern: background work parked behind `tokio::task::spawn_blocking` (used for every
   store operation, since `hs_kv`'s API is synchronous) needs real executor polls to be noticed, not
   just virtual-clock advancement. Tests use a `settle()` helper that interleaves
@@ -212,9 +279,17 @@ Updated: 2026-09-18.
 ```sh
 cargo fmt -p hs-cluster -- --check
 cargo clippy -p hs-cluster --all-targets -- -D warnings
-cargo test -p hs-cluster            # 40 unit tests + 5 chaos tests + 0 doctests
-cargo test -p hs-cluster --test chaos   # just the chaos harness, if iterating on it alone
+cargo test -p hs-cluster                # 40 lib tests + 5 chaos tests + 2 mesh-pool tests + 0 doctests
+cargo test -p hs-cluster --test chaos      # just the chaos harness, if iterating on it alone
+cargo test -p hs-cluster --test mesh_pool  # just the connection-pooling tests
 ```
+
+To re-verify the chaos suite's fencing coverage by mutation (as this update's integration review
+did): in `crates/hs-cluster/src/fence.rs`, make `Fence::check` `{ return Ok(()); }` unconditionally,
+run `cargo test -p hs-cluster`, confirm `fence::tests::fence_fails_after_another_replica_acquires`
+and the chaos tests `no_two_replicas_ever_commit_the_same_shard_epoch` and
+`a_partitioned_replica_cannot_write_after_being_fenced` fail (3 tests), then revert and confirm
+everything is green again.
 
 `deploy/chaos/` is not runnable in this environment (no Docker); see its README for what running
 it for real requires.

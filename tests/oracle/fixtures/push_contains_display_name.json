@@ -1,0 +1,38 @@
+{
+  "_comment": "Illustrative fixture, never run against a real Synapse (see tests/oracle/README.md) -- treat as a starting point to validate, not verified ground truth.",
+  "room_version": "2",
+  "event": {
+    "event_id": "$msg1:example.org",
+    "type": "m.room.message",
+    "room_id": "!oracle:example.org",
+    "sender": "@bob:example.org",
+    "content": {"msgtype": "m.text", "body": "Hey Alice, are you free later?"},
+    "auth_events": [],
+    "prev_events": [],
+    "depth": 1,
+    "origin_server_ts": 1700000000000
+  },
+  "user_id": "@alice:example.org",
+  "display_name": "Alice",
+  "room_member_count": 2,
+  "sender_power_level": 0,
+  "notification_power_levels": {"room": 50},
+  "has_mentions": false,
+  "related_events": {},
+  "rules": [
+    {
+      "rule_id": ".m.rule.contains_display_name",
+      "default": true,
+      "enabled": true,
+      "conditions": [{"kind": "contains_display_name"}],
+      "actions": ["notify", {"set_tweak": "sound", "value": "default"}, {"set_tweak": "highlight"}]
+    },
+    {
+      "rule_id": ".m.rule.message",
+      "default": true,
+      "enabled": true,
+      "conditions": [],
+      "actions": ["notify", {"set_tweak": "highlight", "value": false}]
+    }
+  ]
+}

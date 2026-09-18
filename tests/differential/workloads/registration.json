@@ -1,0 +1,33 @@
+{
+  "name": "registration",
+  "description": "Register a new user with the dummy UIA stage, confirm whoami, and check registration-available for a taken and a free localpart.",
+  "steps": [
+    {
+      "name": "register",
+      "method": "POST",
+      "path": "/_matrix/client/v3/register",
+      "body": {
+        "username": "differential_reg_user",
+        "password": "correct horse battery staple",
+        "auth": {"type": "m.login.dummy"}
+      },
+      "extract": {"access_token": "$.access_token", "user_id": "$.user_id", "device_id": "$.device_id"}
+    },
+    {
+      "name": "whoami",
+      "method": "GET",
+      "path": "/_matrix/client/v3/account/whoami",
+      "auth_token": "{{access_token}}"
+    },
+    {
+      "name": "register_available_taken",
+      "method": "GET",
+      "path": "/_matrix/client/v3/register/available?username=differential_reg_user"
+    },
+    {
+      "name": "register_available_free",
+      "method": "GET",
+      "path": "/_matrix/client/v3/register/available?username=differential_reg_user_free_check"
+    }
+  ]
+}

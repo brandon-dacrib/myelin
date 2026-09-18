@@ -1,0 +1,3 @@
+# Recorded baselines are large, environment-specific, and reproducible from README.md's procedure.
+*.jsonl
+!.gitignore
