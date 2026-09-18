@@ -1,0 +1,8 @@
+# UNTESTED (see deploy/chaos/README.md). Isolated namespace for the chaos suite so it can be torn
+# down with a single `kubectl delete namespace hs-chaos` between runs.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hs-chaos
+  labels:
+    app.kubernetes.io/part-of: hs-cluster-chaos

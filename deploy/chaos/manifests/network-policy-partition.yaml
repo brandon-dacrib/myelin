@@ -1,0 +1,28 @@
+# UNTESTED (see deploy/chaos/README.md). Applied by scenario-partition.sh with the target pod's
+# ordinal substituted for POD_ORDINAL (via `envsubst` or `sed`, see the script). Isolates that one
+# pod from the mesh and from postgres/toxiproxy while leaving port 9090 (health/metrics) open, so
+# the pod looks alive to its own readiness probe and to `kubectl get pods` but cannot heartbeat
+# the store or be forwarded to -- exactly the "store stalls masquerading as owner death" scenario
+# RFC 0001 names as a risk, and the Kubernetes analogue of the in-process
+# `a_partitioned_replica_cannot_write_after_being_fenced` test.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hs-chaos-partition-${POD_ORDINAL}
+  namespace: hs-chaos
+spec:
+  podSelector:
+    matchLabels:
+      app: hs-chaos-actor
+      apps.kubernetes.io/pod-index: "${POD_ORDINAL}"
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - ports:
+        - port: 9090
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+    - to: []
+      ports:
+        - port: 9090

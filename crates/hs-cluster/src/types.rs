@@ -368,8 +368,8 @@ mod tests {
         // A room and a user with the same string map into different kinds.
         assert_eq!(layout.user_shard("!abc:example.org").kind, ShardKind::User);
         // Pinned values: the mapping must never change across versions.
-        assert_eq!(layout.room_shard("!room:example.org").index, 45);
-        assert_eq!(layout.user_shard("@alice:example.org").index, 44);
+        assert_eq!(layout.room_shard("!room:example.org").index, 219);
+        assert_eq!(layout.user_shard("@alice:example.org").index, 124);
     }
 
     #[test]

@@ -1,0 +1,95 @@
+# UNTESTED (see deploy/chaos/README.md). N replicas of the chaos actor. `hs chaos-actor` does not
+# exist yet (track 15 owns `hs-cli`); the container command below is the intended shape once it
+# does. Mesh auth is the shared-secret mode (RFC 0001 section 11) rather than mTLS, so this suite
+# does not also depend on cert-manager being installed -- swap in `HS_CLUSTER_MESH_AUTH=mtls` plus
+# a `Certificate` resource per pod once mTLS is what is being tested.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hs-chaos-actor
+  namespace: hs-chaos
+spec:
+  serviceName: hs-mesh
+  replicas: 4
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: hs-chaos-actor
+  template:
+    metadata:
+      labels:
+        app: hs-chaos-actor
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: hs-chaos-actor
+          # Built from this repo; not published yet. `hs chaos-actor` is the subcommand this
+          # directory depends on (see README.md).
+          image: hs-chaos-actor:dev
+          imagePullPolicy: IfNotPresent
+          command: ["hs", "serve", "--chaos-actor"]
+          env:
+            - name: HS_SERVER_NAME
+              value: chaos.invalid
+            - name: HS_CLUSTER_MODE
+              value: cluster
+            - name: HS_CLUSTER_SHARDS_ROOMS
+              value: "16"
+            - name: HS_CLUSTER_SHARDS_USERS
+              value: "16"
+            - name: HS_CLUSTER_HEARTBEAT_INTERVAL_MS
+              value: "1000"
+            - name: HS_CLUSTER_LEASE_TTL_MS
+              value: "3000"
+            - name: HS_CLUSTER_MESH_LISTEN
+              value: "0.0.0.0:8449"
+            - name: HS_CLUSTER_MESH_ADVERTISE
+              value: "$(POD_NAME).hs-mesh.hs-chaos.svc.cluster.local:8449"
+            - name: HS_CLUSTER_MESH_AUTH
+              value: shared-secret
+            - name: HS_CLUSTER_MESH_SHARED_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: hs-chaos-mesh-secret
+                  key: secret
+            - name: HS_STORAGE_POSTGRES_URL
+              value: "postgres://hs_chaos:hs_chaos_dev_only@toxiproxy:5433/hs_chaos"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - containerPort: 8449
+              name: mesh
+            - containerPort: 9090
+              name: metrics
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 9090
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 9090
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hs-chaos-mesh-secret
+  namespace: hs-chaos
+type: Opaque
+stringData:
+  # Development-only value; never used outside this disposable namespace (RFC 0001 section 11:
+  # the shared-secret mode is explicitly "not for production over an untrusted network").
+  secret: hs-chaos-dev-only-shared-secret

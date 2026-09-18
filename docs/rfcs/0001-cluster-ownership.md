@@ -1,8 +1,47 @@
 # RFC 0001. Cluster ownership: shards, leases, fencing, mesh, handoff
 
-Date: 2026-09-17. Owner: track 03 (Cluster). Status: draft, day-one design; the reference for `hs-cluster`, for track 12's probes and rollout settings, and for the storage hooks track 01 provides.
+Date: 2026-09-17. Updated: 2026-09-18 (reconciled with the landed `hs-kv`; implementation caught up
+to the design, see section 18). Owner: track 03 (Cluster). Status: implemented for Phase 0 --
+the reference for `hs-cluster`, for track 12's probes and rollout settings, and for the storage
+hooks track 01 provides.
 
 Consumers: 04 Room, 05 Sync, 06 Federation, 11 Appservices (ownership API and forwarding), 12 Platform (probes, leases, rollout timings, mesh certificates), 01 Storage (epoch key inside transactions, SlateDB per-shard fencing), 13 Config (the `cluster` config section), 14 Test (chaos suite).
+
+## 0. Reconciliation with the landed `hs-kv` (2026-09-18)
+
+This RFC was written before track 01's `hs-kv` landed, on the assumption (section 6, section 12's
+draft interface) that `hs-cluster` would need its own `LeaseStore` trait plus an `EpochReader`
+trait implemented later for `hs-kv`'s transaction type. `hs-kv` has now landed
+(`crates/hs-kv/src/lib.rs`) and its crate-level documentation states the guarantee section 6 of
+this RFC predicted almost exactly: full serializable snapshot isolation on every backend, where a
+transaction that reads a key and later commits successfully is a guarantee the key did not change
+out from under it, and where the crate's own docs name this exact pattern ("Track 03's lease and
+epoch fencing is exactly this pattern ... No separate fencing primitive exists in this trait
+because none is needed").
+
+Consequence: **the day-one `LeaseStore` / `EpochReader` split described in the original section 12
+was never implemented and is superseded.** `hs-cluster` has no store trait of its own. Every design
+decision below (virtual shard count, rendezvous hashing, the registry, the fencing epoch, the
+convergence loop, forwarding, backpressure, mesh auth, single-node mode, handoff) is unchanged; only
+the plumbing in section 12 and the storage-hooks paragraph of section 17 are replaced with what is
+actually implemented, directly against [`hs_kv::KvBackend`](../../crates/hs-kv/src/lib.rs):
+
+- `crates/hs-cluster/src/store.rs`: `ClusterStore<B: KvBackend>` -- the replica registry, shard
+  rows and shard layout, each operation an ordinary `hs_kv::transact` closure (read-modify-write).
+  There is no `cas_shard` primitive distinct from "read the row, decide, write the row": `hs-kv`'s
+  SSI conflict check *is* the compare-and-swap, and `transact`'s retry (re-running the closure from
+  scratch on a conflict) is exactly the acquire/release state machine of section 6.
+- `crates/hs-cluster/src/fence.rs`: `Fence::check` takes any `T: hs_kv::KvRead` and the shard
+  keyspace handle, reads the shard row inside the caller's own transaction, and compares epochs.
+  Nothing needs to be implemented per backend: `KvRead` is already implemented by every backend's
+  transaction and snapshot type, so this one function works unchanged against the in-memory
+  backend, Fjall, and (when they land) PostgreSQL and SlateDB.
+- `crates/hs-cluster/src/ownership.rs`: `KvOwnership<B: KvBackend>` is the clustered
+  `Ownership`/`Drainable` implementation, generic over the backend, running the heartbeat and
+  convergence loop from section 4/5/7 against `ClusterStore<B>`. `SingleNode` is the inert
+  implementation from section 12.
+
+Everything else in this document is normative as originally written.
 
 ## 1. Motivation and scope
 
@@ -176,17 +215,17 @@ Discovery is the registry (`mesh_addr` per replica); 12's headless Service suppl
 
 Selected at runtime by `hs serve --single-node` (or `cluster.mode: single`), not at compile time, so the same binary and image serve both cases. In single-node mode `Cluster::single_node()` returns an ownership manager that is inert: `owner_of` is always me, `is_mine` is always true, `Fence::check` is a no-op (there is no other writer; the embedded store is single-process), there is no registry, no heartbeat task and no mesh listener, and `forward` is never reached (an attempt returns `NotClustered`). Actors are written once against the same API. A cargo feature to compile the mesh dependencies (`hyper`, `rustls`) out of the ARM binary is a later size optimisation; it does not change behaviour.
 
-## 13. Interfaces `hs-cluster` provides (frozen at week 6; this is the day-one draft)
+## 13. Interfaces `hs-cluster` provides (frozen at week 6; as implemented -- see section 0)
 
 ```rust
-// Identity
+// Identity (crates/hs-cluster/src/types.rs)
 pub struct ReplicaId(String);           pub struct Generation(u64);
 pub enum ShardKind { Room, User, Federation, Appservice, Global }
 pub struct ShardId { kind: ShardKind, index: u32 }
 pub struct ShardLayout { rooms: u32, users: u32, federation: u32, appservice: u32 }
 impl ShardLayout { fn room_shard(&self, room_id: &str) -> ShardId; fn user_shard(&self, user_id: &str) -> ShardId; ... }
 
-// Ownership (object-safe; the same trait for single-node and clustered)
+// Ownership (object-safe; the same trait for single-node and clustered) -- src/ownership.rs
 pub trait Ownership: Send + Sync {
     fn me(&self) -> &ReplicaId;
     fn owner_of(&self, shard: ShardId) -> Option<ReplicaId>;   // row owner, else desired owner
@@ -195,37 +234,61 @@ pub trait Ownership: Send + Sync {
     fn subscribe(&self) -> broadcast::Receiver<OwnershipEvent>; // Acquired, Released, Lost, MembershipChanged
     fn shard_map(&self) -> watch::Receiver<Arc<ShardMap>>;
 }
-
-// Fencing
-pub struct Fence { shard: ShardId, epoch: Option<Epoch> }       // None in single-node mode
-pub trait EpochReader { fn read_epoch(&mut self, shard: ShardId) -> Result<Option<Epoch>, StoreError>; }
-impl Fence { pub fn check<T: EpochReader>(&self, txn: &mut T) -> Result<(), FenceError>; }
-
-// Store hooks (01 implements `LeaseStore` over hs-kv in Phase 0 week 2+; the in-memory one ships now)
-#[async_trait] pub trait LeaseStore {
-    async fn put_replica(&self, rec: &ReplicaRecord) -> Result<(), StoreError>;
-    async fn list_replicas(&self) -> Result<Vec<ReplicaRecord>, StoreError>;
-    async fn remove_replica(&self, id: &ReplicaId, generation: Generation) -> Result<(), StoreError>;
-    async fn get_shard(&self, shard: ShardId) -> Result<Option<ShardRecord>, StoreError>;
-    async fn list_shards(&self) -> Result<Vec<(ShardId, ShardRecord)>, StoreError>;
-    async fn cas_shard(&self, shard: ShardId, expected: Option<&ShardRecord>, new: &ShardRecord) -> Result<CasOutcome, StoreError>;
-    async fn get_layout(&self) -> ...; async fn init_layout(&self, ...) -> ...;
+// Lifecycle is a separate trait so actor code (which only ever needs the read side above) cannot
+// accidentally drain the cluster it runs in:
+#[async_trait] pub trait Drainable: Send + Sync {
+    fn ready(&self) -> Readiness;
+    async fn drain(&self, deadline: Duration) -> DrainReport;
 }
 
-// Mesh
-pub struct Envelope { shard, route, idempotency_key, requester, deadline, origin, hops, traceparent, payload }
-pub struct Reply { status: u16, payload: Bytes }
-#[async_trait] pub trait ShardHandler { async fn handle(&self, env: Envelope, fence: Fence) -> Reply; }
-pub trait Authenticator { fn authenticate(&self, conn: &ConnInfo, headers: &HeaderMap) -> Result<PeerIdentity, AuthError>; }
-impl Forwarder { pub async fn forward(&self, env: Envelope) -> Result<Reply, ForwardError>; }
+// Fencing -- src/fence.rs. Built directly on `hs_kv::KvRead`, not a crate-local `EpochReader`
+// trait: any backend's transaction or snapshot type already implements `KvRead`, so this one
+// function works unchanged against every backend (section 0).
+pub struct Fence { shard: ShardId, epoch: Option<Epoch> }       // None in single-node mode
+impl Fence {
+    pub fn check<K, T: hs_kv::KvRead<Keyspace = K>>(&self, txn: &T, keyspace: &K) -> Result<(), FenceError>;
+}
 
-// Lifecycle (hs-cli wires SIGTERM → drain)
-impl Cluster { pub async fn start(cfg, store, transport, handlers) -> Result<Cluster>; pub async fn drain(&self, deadline: Duration) -> DrainReport; pub fn ready(&self) -> Readiness; }
+// Store -- src/store.rs. Not a trait: one generic struct over `hs_kv::KvBackend`, so 01 never has
+// to implement anything for this crate to work (section 0 explains why the originally planned
+// `LeaseStore` trait was dropped).
+pub struct ClusterStore<B: hs_kv::KvBackend> { /* ... */ }
+impl<B: hs_kv::KvBackend> ClusterStore<B> {
+    pub fn open(backend: B) -> Result<Self, ClusterError>;
+    pub fn shard_keyspace(&self) -> &B::Keyspace; // for actors calling `Fence::check` in their own txns
+    pub fn init_layout(&self, wanted: ShardLayout) -> Result<ShardLayout, ClusterError>;
+    pub fn heartbeat(&self, rec: &ReplicaRecord) -> Result<(), ClusterError>;
+    pub fn list_replicas(&self) -> Result<Vec<ReplicaRecord>, ClusterError>;
+    pub fn remove_replica(&self, id: &ReplicaId, generation: Generation) -> Result<(), ClusterError>;
+    pub fn get_shard(&self, shard: ShardId) -> Result<ShardRecord, ClusterError>;
+    pub fn list_shards(&self) -> Result<Vec<(ShardId, ShardRecord)>, ClusterError>;
+    pub fn acquire_shard(&self, shard: ShardId, me: &ReplicaId, gen: Generation, owner_is_dead: impl Fn(&ReplicaId) -> bool) -> Result<Option<ShardRecord>, ClusterError>;
+    pub fn release_shard(&self, shard: ShardId, me: &ReplicaId, gen: Generation) -> Result<(), ClusterError>;
+}
+
+// Mesh -- src/mesh/
+pub struct Envelope { shard, route, idempotency_key, requester, deadline, origin, origin_generation, hops, traceparent, payload }
+pub struct Reply { status: u16, payload: Bytes }
+#[async_trait] pub trait ShardHandler: Send + Sync { async fn handle(&self, env: Envelope, fence: Fence) -> Reply; }
+pub trait Authenticator: Send + Sync { fn authenticate(&self, headers: &HeaderMap, tls: Option<&TlsPeerInfo>) -> Result<PeerIdentity, AuthError>; }
+pub struct SharedSecretAuthenticator { /* constant-time Bearer comparison */ }
+pub struct MutualTlsAuthenticator { /* SAN-suffix check; chain-to-CA is verified by rustls beneath it */ }
+impl Forwarder { pub async fn forward(&self, env: Envelope) -> Result<Reply, ForwardError>; }
+impl MeshServer { pub fn new(listen_addr, tls: Option<&TlsMaterial>) -> Result<Self, TlsError>; pub async fn serve(self, deps: Arc<MeshDeps>, shutdown: watch::Receiver<bool>) -> io::Result<()>; }
+
+// Lifecycle facade (hs-cli wires SIGTERM → drain) -- src/cluster.rs
+impl Cluster {
+    pub fn single_node(me: ReplicaId) -> Self;
+    pub async fn start<B: KvBackend>(cfg: ClusterConfig, backend: B) -> Result<(Self, Arc<KvOwnership<B>>), ClusterError>;
+    pub fn ownership(&self) -> &Arc<dyn Ownership>;
+    pub fn ready(&self) -> Readiness;
+    pub async fn drain(&self, deadline: Duration) -> DrainReport;
+}
 ```
 
 ## 14. Chaos and verification
 
-In-process harness (`crates/hs-cluster/tests/chaos.rs`): N replicas in one process over an in-memory `LeaseStore` with fault injection (per-replica stall and latency), an in-process mesh fabric with partitions, the tokio paused clock for deterministic timings, and a toy replicated-log actor whose every commit records `(shard, epoch, writer)`. Checks: for each shard the sequence of committed writes has non-decreasing epochs and each epoch has exactly one writer (no two replicas ever write the same shard); every append acknowledged to a client is present exactly once and every append not acknowledged is present at most once (no lost or duplicated writes under retries with idempotency keys); after a replica death the shard has a new owner within `lease_ttl + heartbeat_interval` plus one tick; on `drain` every shard is released before the replica stops and the drained replica writes nothing afterwards; a stalled store never causes a second writer.
+In-process harness (`crates/hs-cluster/tests/chaos.rs`): N replicas in one process, each a real `KvOwnership<MemoryBackend>` sharing one `hs_kv::memory::MemoryBackend`, with fault injection (per-replica "stop heartbeating" to simulate death, and the tokio paused clock for deterministic timings), and a toy replicated-log actor (`ChaosLog`) whose every commit records `(shard, epoch, writer, seq)` through a real `hs_kv` transaction that calls `Fence::check` before committing, exactly as a production actor must. Checks: for each shard the sequence of committed writes has non-decreasing epochs and each epoch has exactly one writer (no two replicas ever write the same shard -- the epoch makes a stale owner's commit conflict and abort, per section 6); every append acknowledged to a client is present exactly once and every append not acknowledged is present at most once (no lost or duplicated writes under retries with idempotency keys, persisted in the same transaction as the effect per section 8); after a replica death the shard has a new owner within `lease_ttl + heartbeat_interval` plus one tick; on `drain` every shard is released before the replica stops and the drained replica writes nothing afterwards.
 
 Kubernetes harness (`deploy/chaos/`, `kind`): the same toy actor as an `hs chaos-actor` subcommand, pod kills, partitions by NetworkPolicy, slow store via a `toxiproxy` sidecar in front of PostgreSQL, rolling updates, and the recorded-write checker. Written now, untested until Docker is available; runs in CI with 12's `kind` skeleton.
 
@@ -247,8 +310,8 @@ Kubernetes harness (`deploy/chaos/`, `kind`): the same toy actor as an `hs chaos
 
 ## 17. What other tracks need to do
 
-- **01 Storage**: expose a transaction type on which `hs-cluster` can implement `EpochReader` (a plain `get` inside the transaction is enough); an `hs-kv`-backed `LeaseStore` (the six operations above, `cas_shard` as a single-key serializable transaction); SlateDB per-shard open takes the epoch for its manifest fencing.
-- **04, 05, 06, 11**: actors receive `Fence` on `Acquired`, call `fence.check(&mut txn)` in every transaction, drop state on `Lost`, quiesce on release, and persist idempotency keys for non-idempotent effects.
+- **01 Storage**: nothing further needed for Fjall/PostgreSQL -- `hs-cluster` already builds on `hs_kv::KvBackend` directly and needs no crate-specific hook (section 0). The one open item is the SlateDB backend, when it lands: per-shard open must take the epoch `ClusterStore::acquire_shard` returns so it composes with SlateDB's own manifest fencing, per section 6's last paragraph.
+- **04, 05, 06, 11**: actors receive `Fence` on `OwnershipEvent::Acquired`, call `fence.check(&txn, cluster_store.shard_keyspace())` as the last read before every commit against the shard's data, drop state on `Lost`, quiesce on release, and persist idempotency keys for non-idempotent effects in the same transaction as the effect.
 - **07**: define `RequesterContext` as a serialisable type; until then the envelope carries it as JSON.
 - **12**: readiness maps to `Cluster::ready()`; `terminationGracePeriodSeconds` ≥ `cluster.handoff.deadline` + margin; cert-manager issues per-pod certificates with the headless Service SAN; the `kind` chaos job runs `deploy/chaos/`.
 - **13**: the `cluster` config section (`mode`, `shards`, `heartbeat_interval`, `lease_ttl`, `mesh.listen`, `mesh.advertise`, `mesh.auth`, `mesh.tls.*`, `handoff.*`).

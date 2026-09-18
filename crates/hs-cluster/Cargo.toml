@@ -8,6 +8,7 @@ publish.workspace = true
 description = "Replica registry, leases, rendezvous hashing over virtual shards, fencing epochs, mesh RPC, forwarding, failover and graceful handoff (track 03)"
 
 [dependencies]
+hs-kv = { path = "../hs-kv" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
@@ -23,6 +24,7 @@ http-body-util = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
+rustls-pemfile = { workspace = true }
 xxhash-rust = { workspace = true }
 rand = { workspace = true }
 subtle = { workspace = true }

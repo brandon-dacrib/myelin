@@ -1,0 +1,20 @@
+# UNTESTED (see deploy/chaos/README.md). Headless Service for mesh peer discovery (RFC 0001
+# section 11: "Discovery is the registry (mesh_addr per replica); 12's headless Service supplies
+# DNS for the mTLS SANs, not the peer list."). Each pod's mesh address becomes
+# `hs-chaos-actor-<ordinal>.hs-mesh.hs-chaos.svc.cluster.local:8449`.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hs-mesh
+  namespace: hs-chaos
+spec:
+  clusterIP: None
+  selector:
+    app: hs-chaos-actor
+  ports:
+    - name: mesh
+      port: 8449
+      targetPort: 8449
+    - name: metrics
+      port: 9090
+      targetPort: 9090

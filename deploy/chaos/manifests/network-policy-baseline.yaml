@@ -1,0 +1,41 @@
+# UNTESTED (see deploy/chaos/README.md). Default connectivity: every chaos-actor pod can reach
+# every other one on the mesh port, and postgres/toxiproxy. Applied at the start of every
+# scenario; `network-policy-partition.yaml` replaces it (for one pod) during the partition
+# scenario, and `scenario-partition.sh` re-applies this file to heal it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hs-chaos-baseline
+  namespace: hs-chaos
+spec:
+  podSelector:
+    matchLabels:
+      app: hs-chaos-actor
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: hs-chaos-actor
+      ports:
+        - port: 8449
+    - from: []
+      ports:
+        - port: 9090 # metrics/health, scraped from outside the mesh
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: hs-chaos-actor
+      ports:
+        - port: 8449
+    - to:
+        - podSelector:
+            matchLabels:
+              app: toxiproxy
+      ports:
+        - port: 5433
+    - to: [] # DNS
+      ports:
+        - port: 53
+          protocol: UDP

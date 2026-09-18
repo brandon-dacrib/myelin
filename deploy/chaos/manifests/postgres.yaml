@@ -1,0 +1,54 @@
+# UNTESTED (see deploy/chaos/README.md). A single, non-HA PostgreSQL instance: this suite is
+# exercising hs-cluster's ownership and fencing, not PostgreSQL's own HA story (CloudNativePG is
+# track 01/12's concern for production). Traffic to it is routed through the toxiproxy sidecar
+# defined in toxiproxy.yaml so the slow-store scenario can inject latency without touching this
+# manifest.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: hs-chaos
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          env:
+            - name: POSTGRES_DB
+              value: hs_chaos
+            - name: POSTGRES_USER
+              value: hs_chaos
+            - name: POSTGRES_PASSWORD
+              value: hs_chaos_dev_only
+          ports:
+            - containerPort: 5432
+              name: postgres
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "hs_chaos"]
+            initialDelaySeconds: 3
+            periodSeconds: 2
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: hs-chaos
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432

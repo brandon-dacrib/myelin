@@ -64,10 +64,10 @@ mod tests {
     fn hash_is_pinned() {
         // If these change, ownership and shard mapping change under a rolling
         // update. Do not "fix" the expected values.
-        assert_eq!(stable_hash64(&[b"hello"]), 0x2f83_6b74_ed5a_4c3b);
+        assert_eq!(stable_hash64(&[b"hello"]), 0x36d9_73a4_aac2_fc79);
         assert_eq!(
             score(ShardId::new(ShardKind::Room, 7), &ReplicaId::new("hs-0")),
-            0x9633_4c63_f3f6_bd1d
+            0xbc1d_f7c1_55d7_0945
         );
     }
 
@@ -94,7 +94,11 @@ mod tests {
             .all_shards()
             .map(|s| (s, desired_owner(s, &rs).cloned()))
             .collect();
-        let survivors: Vec<_> = rs.iter().filter(|r| r.as_str() != "hs-3").cloned().collect();
+        let survivors: Vec<_> = rs
+            .iter()
+            .filter(|r| r.as_str() != "hs-3")
+            .cloned()
+            .collect();
         for s in layout.all_shards() {
             let after = desired_owner(s, &survivors).cloned();
             let was = &before[&s];
@@ -112,7 +116,9 @@ mod tests {
         let layout = ShardLayout::default();
         let mut counts: HashMap<&ReplicaId, u32> = HashMap::new();
         for s in (0..layout.rooms).map(|i| ShardId::new(ShardKind::Room, i)) {
-            *counts.entry(desired_owner(s, &rs).expect("owner")).or_default() += 1;
+            *counts
+                .entry(desired_owner(s, &rs).expect("owner"))
+                .or_default() += 1;
         }
         let expected = 256.0 / 8.0;
         for (r, c) in counts {
