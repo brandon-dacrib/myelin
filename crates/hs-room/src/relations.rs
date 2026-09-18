@@ -105,7 +105,9 @@ pub fn bundle(children: &[ChildEvent], requesting_user: &ruma::UserId) -> Bundle
     if !annotations.is_empty() {
         let mut counts: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
         for a in &annotations {
-            *counts.entry(a.relation.key.clone().unwrap_or_default()).or_insert(0) += 1;
+            *counts
+                .entry(a.relation.key.clone().unwrap_or_default())
+                .or_insert(0) += 1;
         }
         let chunk: Vec<serde_json::Value> = counts
             .into_iter()

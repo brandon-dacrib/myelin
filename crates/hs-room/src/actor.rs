@@ -114,6 +114,7 @@ impl<B: KvBackend> RoomActor<B> {
     /// hash-based room IDs (room version 12 and later, MSC4291) -- not implemented in this pass;
     /// see `docs/rfcs/0008-room-actor-state-store-seam.md`. Otherwise, any error
     /// [`RoomActor::send_event`] can return.
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         backend: B,
         tables: Tables<B>,
@@ -211,7 +212,10 @@ impl<B: KvBackend> RoomActor<B> {
             publish,
         };
 
-        let range_spec = hs_tables::keyspace::TypedKeyspace::<B::Keyspace, crate::persist::TimelineKey>::prefix(&(room_sn,));
+        let range_spec = hs_tables::keyspace::TypedKeyspace::<
+            B::Keyspace,
+            crate::persist::TimelineKey,
+        >::prefix(&(room_sn,));
         let mut entries: Vec<(i64, EventSn)> = Vec::new();
         for item in actor.tables.timeline.range(&snapshot, range_spec) {
             let ((_, room_pos), value) = item?;
@@ -246,9 +250,11 @@ impl<B: KvBackend> RoomActor<B> {
             .get("content")
             .and_then(hs_model::canonical::CanonicalJsonValue::as_object)
         {
-            let content_value: serde_json::Value =
-                serde_json::from_slice(&hs_model::canonical::CanonicalJsonValue::Object(content.clone()).to_canonical_bytes())
-                    .unwrap_or(serde_json::Value::Null);
+            let content_value: serde_json::Value = serde_json::from_slice(
+                &hs_model::canonical::CanonicalJsonValue::Object(content.clone())
+                    .to_canonical_bytes(),
+            )
+            .unwrap_or(serde_json::Value::Null);
             if let Some(rel) = relations::relation_of(&content_value) {
                 self.relations_by_target
                     .entry(rel.target)
@@ -256,7 +262,8 @@ impl<B: KvBackend> RoomActor<B> {
                     .push(event_sn);
             }
         }
-        self.event_id_index.insert(event.event_id().to_owned(), event_sn);
+        self.event_id_index
+            .insert(event.event_id().to_owned(), event_sn);
         self.timeline.insert(room_pos, event_sn);
         self.next_room_pos = self.next_room_pos.max(room_pos + 1);
         self.forward_extremity = Some(event_sn);
@@ -274,10 +281,9 @@ impl<B: KvBackend> RoomActor<B> {
         match self.forward_extremity {
             None => Ok(Vec::new()),
             Some(sn) => {
-                let event = self
-                    .events
-                    .get(&sn)
-                    .ok_or_else(|| RoomError::Internal("forward extremity not in hot cache".into()))?;
+                let event = self.events.get(&sn).ok_or_else(|| {
+                    RoomError::Internal("forward extremity not in hot cache".into())
+                })?;
                 Ok(vec![pipeline::event_ref(event, &self.rules)?])
             }
         }
@@ -380,7 +386,10 @@ impl<B: KvBackend> RoomActor<B> {
     fn persist(&mut self, event: Event) -> Result<EventSn, RoomError> {
         let full_json: serde_json::Value = serde_json::from_slice(event.canonical_bytes())
             .map_err(|e| RoomError::Internal(e.to_string()))?;
-        let content = full_json.get("content").cloned().unwrap_or(serde_json::Value::Null);
+        let content = full_json
+            .get("content")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let relation = relations::relation_of(&content);
 
         let is_first = self.events.is_empty();
@@ -438,7 +447,10 @@ impl<B: KvBackend> RoomActor<B> {
                 .put(txn, &(room_sn, event_sn), b"")
                 .map_err(to_kv)?;
             if let Some(rel) = &relation {
-                let target_sn = self.tables.event_sn.get_or_create(txn, rel.target.as_bytes())?;
+                let target_sn = self
+                    .tables
+                    .event_sn
+                    .get_or_create(txn, rel.target.as_bytes())?;
                 self.tables
                     .relations
                     .put(
@@ -485,7 +497,8 @@ impl<B: KvBackend> RoomActor<B> {
         self.forward_extremity = Some(event_sn);
         self.timeline.insert(room_pos, event_sn);
         self.next_room_pos += 1;
-        self.event_id_index.insert(event.event_id().to_owned(), event_sn);
+        self.event_id_index
+            .insert(event.event_id().to_owned(), event_sn);
 
         let update = RoomUpdate {
             room_sn: self.room_sn,
@@ -577,16 +590,20 @@ impl<B: KvBackend> RoomActor<B> {
             _ => ("invite", "shared", "can_join"),
         };
 
-        let power_levels_content = request.power_level_content_override.clone().unwrap_or_else(|| {
-            let mut users = serde_json::Map::new();
-            users.insert(creator.to_string(), serde_json::Value::from(100));
-            if preset == "trusted_private_chat" {
-                for user in &request.invite {
-                    users.insert(user.to_string(), serde_json::Value::from(100));
-                }
-            }
-            serde_json::json!({ "users": users })
-        });
+        let power_levels_content =
+            request
+                .power_level_content_override
+                .clone()
+                .unwrap_or_else(|| {
+                    let mut users = serde_json::Map::new();
+                    users.insert(creator.to_string(), serde_json::Value::from(100));
+                    if preset == "trusted_private_chat" {
+                        for user in &request.invite {
+                            users.insert(user.to_string(), serde_json::Value::from(100));
+                        }
+                    }
+                    serde_json::json!({ "users": users })
+                });
         actor.send_event(
             creator.clone(),
             "m.room.power_levels".to_owned(),
@@ -690,7 +707,13 @@ impl<B: KvBackend> RoomActor<B> {
         let room_sn = self.room_sn;
         let alias_key = (alias.to_string(),);
         transact(&self.backend, TransactConfig::default(), |txn| {
-            if self.tables.aliases.get(txn, &alias_key).map_err(to_kv)?.is_some() {
+            if self
+                .tables
+                .aliases
+                .get(txn, &alias_key)
+                .map_err(to_kv)?
+                .is_some()
+            {
                 return Err(hs_kv::KvError::backend(AliasInUse));
             }
             self.tables
@@ -736,7 +759,10 @@ impl<B: KvBackend> RoomActor<B> {
     /// Returns [`RoomError::Store`] on a storage failure.
     pub fn list_aliases(&self) -> Result<Vec<String>, RoomError> {
         let snapshot = self.backend.snapshot();
-        let spec = hs_tables::keyspace::TypedKeyspace::<B::Keyspace, crate::persist::RoomAliasKey>::prefix(&(self.room_sn,));
+        let spec =
+            hs_tables::keyspace::TypedKeyspace::<B::Keyspace, crate::persist::RoomAliasKey>::prefix(
+                &(self.room_sn,),
+            );
         let mut out = Vec::new();
         for item in self.tables.room_aliases.range(&snapshot, spec) {
             let ((_, alias), _) = item?;
@@ -768,7 +794,10 @@ impl<B: KvBackend> RoomActor<B> {
     /// Every current-state event.
     #[must_use]
     pub fn full_state(&self) -> Vec<&Event> {
-        self.current_state.values().filter_map(|sn| self.events.get(sn)).collect()
+        self.current_state
+            .values()
+            .filter_map(|sn| self.events.get(sn))
+            .collect()
     }
 
     /// One event by ID, if this actor holds it (its own room's events only).
@@ -821,7 +850,10 @@ impl<B: KvBackend> RoomActor<B> {
             |t| t.room_pos,
         );
 
-        let mut positions: Vec<i64> = match direction {
+        // Backward: collected newest-first (descending `room_pos`), which is exactly the order
+        // the spec wants `chunk` in for `dir=b` -- no re-sort needed. Forward: collected
+        // oldest-first (ascending), already the order `dir=f` wants.
+        let positions: Vec<i64> = match direction {
             Direction::Backward => self
                 .timeline
                 .range(..start)
@@ -836,9 +868,6 @@ impl<B: KvBackend> RoomActor<B> {
                 .map(|(pos, _)| *pos)
                 .collect(),
         };
-        if direction == Direction::Backward {
-            positions.reverse();
-        }
 
         let events: Vec<&Event> = positions
             .iter()
@@ -846,10 +875,12 @@ impl<B: KvBackend> RoomActor<B> {
             .filter_map(|sn| self.events.get(sn))
             .collect();
 
-        let next = match direction {
-            Direction::Backward => positions.first().map(|p| PaginationToken::new(*p, Direction::Backward)),
-            Direction::Forward => positions.last().map(|p| PaginationToken::new(*p, Direction::Forward)),
-        };
+        // The continuation token is always the *last* position returned (oldest of the page for
+        // backward, newest of the page for forward): the boundary the next page's `range` call
+        // should exclude up to/from.
+        let next = positions
+            .last()
+            .map(|p| PaginationToken::new(*p, direction));
 
         (events, next)
     }
@@ -942,7 +973,8 @@ pub fn resolve_alias<B: KvBackend>(
     let Some(room_id_bytes) = tables.room_sn.resolve(&snapshot, room_sn)? else {
         return Ok(None);
     };
-    let room_id = String::from_utf8(room_id_bytes).map_err(|e| RoomError::Internal(e.to_string()))?;
+    let room_id =
+        String::from_utf8(room_id_bytes).map_err(|e| RoomError::Internal(e.to_string()))?;
     Ok(Some(
         OwnedRoomId::try_from(room_id).map_err(|e| RoomError::Internal(e.to_string()))?,
     ))
@@ -1070,5 +1102,233 @@ impl<B: KvBackend> RoomActorHandle<B> {
         F: FnOnce(&RoomActor<B>) -> T + Send + 'static,
     {
         self.with_actor(move |actor| f(actor)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hs_kv::memory::MemoryBackend;
+    use proptest::prelude::*;
+    use ruma::{RoomVersionId, user_id};
+
+    fn room(preset: &str) -> RoomActor<MemoryBackend> {
+        let backend = MemoryBackend::new();
+        let tables = Tables::open(&backend).unwrap();
+        let identity = HomeserverIdentity::for_tests("hs1");
+        RoomActor::create_room(
+            backend,
+            tables,
+            identity,
+            user_id!("@alice:hs1").to_owned(),
+            CreateRoomRequest {
+                preset: Some(preset.to_owned()),
+                ..Default::default()
+            },
+            1,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn create_room_bootstraps_creator_as_the_sole_joined_member() {
+        let actor = room("public_chat");
+        let joined = actor.joined_members();
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].header().state_key.as_deref(), Some("@alice:hs1"));
+    }
+
+    #[test]
+    fn send_event_and_query_round_trip() {
+        let mut actor = room("public_chat");
+        let event = actor
+            .send_event(
+                user_id!("@alice:hs1").to_owned(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"msgtype": "m.text", "body": "hi"}),
+                None,
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            actor.event_by_id(event.event_id()).unwrap().event_id(),
+            event.event_id()
+        );
+    }
+
+    #[test]
+    fn reload_from_the_store_reproduces_the_same_state() {
+        let backend = MemoryBackend::new();
+        let tables = Tables::open(&backend).unwrap();
+        let identity = HomeserverIdentity::for_tests("hs1");
+        let mut actor = RoomActor::create_room(
+            backend.clone(),
+            tables.clone(),
+            identity.clone(),
+            user_id!("@alice:hs1").to_owned(),
+            CreateRoomRequest {
+                preset: Some("public_chat".to_owned()),
+                name: Some("Reload me".to_owned()),
+                ..Default::default()
+            },
+            1,
+        )
+        .unwrap();
+        actor
+            .send_event(
+                user_id!("@alice:hs1").to_owned(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"body": "before reload"}),
+                None,
+                2,
+            )
+            .unwrap();
+        let room_id = actor.room_id().to_owned();
+        let original_state_count = actor.full_state().len();
+        drop(actor);
+
+        let reloaded = RoomActor::load(backend, tables, identity, &room_id)
+            .unwrap()
+            .expect("room was persisted, load must find it");
+        assert_eq!(reloaded.room_id(), &*room_id);
+        assert_eq!(reloaded.full_state().len(), original_state_count);
+        assert_eq!(
+            reloaded
+                .state_event("m.room.name", "")
+                .unwrap()
+                .json()
+                .get("content")
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .get("name")
+                .unwrap()
+                .as_str(),
+            Some("Reload me")
+        );
+        let (events, _) = reloaded.paginate(None, Direction::Backward, usize::MAX);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.header().event_type == "m.room.message")
+        );
+    }
+
+    #[test]
+    fn unsupported_room_version_is_rejected() {
+        let backend = MemoryBackend::new();
+        let tables = Tables::open(&backend).unwrap();
+        let identity = HomeserverIdentity::for_tests("hs1");
+        let result = RoomActor::create(
+            backend,
+            tables,
+            identity,
+            ruma::RoomId::new_v1(ruma::ServerName::parse("hs1").unwrap().as_ref()),
+            RoomVersionId::try_from("not-a-version").unwrap(),
+            user_id!("@alice:hs1").to_owned(),
+            serde_json::json!({}),
+            1,
+        );
+        match result {
+            Err(RoomError::UnsupportedRoomVersion(_)) => {}
+            Ok(_) => panic!("expected UnsupportedRoomVersion, got Ok"),
+            Err(other) => panic!("expected UnsupportedRoomVersion, got {other}"),
+        }
+    }
+
+    #[test]
+    fn room_version_12_hash_based_room_ids_are_a_documented_gap() {
+        let backend = MemoryBackend::new();
+        let tables = Tables::open(&backend).unwrap();
+        let identity = HomeserverIdentity::for_tests("hs1");
+        let result = RoomActor::create_room(
+            backend,
+            tables,
+            identity,
+            user_id!("@alice:hs1").to_owned(),
+            CreateRoomRequest {
+                room_version: Some(RoomVersionId::V12),
+                ..Default::default()
+            },
+            1,
+        );
+        match result {
+            Err(RoomError::UnsupportedRoomVersion(_)) => {}
+            Ok(_) => panic!("expected UnsupportedRoomVersion, got Ok"),
+            Err(other) => panic!("expected UnsupportedRoomVersion, got {other}"),
+        }
+    }
+
+    proptest! {
+        /// Across every stable room version this crate supports (skipping v12, the documented
+        /// gap), a fresh room's creator is always the sole joined member, and a second user can
+        /// never join a `private_chat` room without first being invited -- the same property
+        /// `crate::membership`'s own tests check in isolation, exercised here end to end through
+        /// the real actor and `hs-state`'s real authorization, per room version.
+        #[test]
+        fn private_room_membership_invariant_holds_across_room_versions(
+            version_idx in 0..8usize,
+        ) {
+            let versions = [
+                RoomVersionId::V1,
+                RoomVersionId::V4,
+                RoomVersionId::V6,
+                RoomVersionId::V7,
+                RoomVersionId::V8,
+                RoomVersionId::V9,
+                RoomVersionId::V10,
+                RoomVersionId::V11,
+            ];
+            let version = versions[version_idx].clone();
+
+            let backend = MemoryBackend::new();
+            let tables = Tables::open(&backend).unwrap();
+            let identity = HomeserverIdentity::for_tests("hs1");
+            let mut actor = RoomActor::create_room(
+                backend,
+                tables,
+                identity,
+                user_id!("@alice:hs1").to_owned(),
+                CreateRoomRequest {
+                    room_version: Some(version),
+                    preset: Some("private_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .unwrap();
+
+            prop_assert_eq!(actor.joined_members().len(), 1);
+
+            let denied = actor.membership_action(
+                user_id!("@carol:hs1").to_owned(),
+                Action::Join,
+                user_id!("@carol:hs1").to_owned(),
+                serde_json::json!({}),
+                2,
+            );
+            prop_assert!(matches!(denied, Err(RoomError::Forbidden(_))));
+
+            actor
+                .membership_action(
+                    user_id!("@alice:hs1").to_owned(),
+                    Action::Invite,
+                    user_id!("@carol:hs1").to_owned(),
+                    serde_json::json!({}),
+                    3,
+                )
+                .unwrap();
+            let joined = actor.membership_action(
+                user_id!("@carol:hs1").to_owned(),
+                Action::Join,
+                user_id!("@carol:hs1").to_owned(),
+                serde_json::json!({}),
+                4,
+            );
+            prop_assert!(joined.is_ok());
+            prop_assert_eq!(actor.joined_members().len(), 2);
+        }
     }
 }

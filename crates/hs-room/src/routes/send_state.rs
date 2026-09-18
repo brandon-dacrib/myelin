@@ -21,7 +21,9 @@ fn now_ms() -> i64 {
 }
 
 fn parse_room_id(raw: &str) -> Result<ruma::OwnedRoomId, RoomError> {
-    RoomId::parse(raw).map(|r| r.to_owned()).map_err(|e| RoomError::BadRequest(e.to_string()))
+    RoomId::parse(raw)
+        .map(|r| r.to_owned())
+        .map_err(|e| RoomError::BadRequest(e.to_string()))
 }
 
 /// `PUT /rooms/{roomId}/send/{eventType}/{txnId}`.
@@ -79,5 +81,11 @@ pub async fn put_state_no_key<B: KvBackend + 'static>(
     requester: RoomRequester,
     body: Json<Value>,
 ) -> Result<Response, RoomError> {
-    put_state(state, Path((room_id, event_type, String::new())), requester, body).await
+    put_state(
+        state,
+        Path((room_id, event_type, String::new())),
+        requester,
+        body,
+    )
+    .await
 }

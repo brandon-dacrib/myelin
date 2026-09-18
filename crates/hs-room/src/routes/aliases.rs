@@ -11,11 +11,15 @@ use crate::error::RoomError;
 use crate::state::{RoomRequester, RoomState};
 
 fn parse_room_id(raw: &str) -> Result<ruma::OwnedRoomId, RoomError> {
-    RoomId::parse(raw).map(|r| r.to_owned()).map_err(|e| RoomError::BadRequest(e.to_string()))
+    RoomId::parse(raw)
+        .map(|r| r.to_owned())
+        .map_err(|e| RoomError::BadRequest(e.to_string()))
 }
 
 fn parse_alias(raw: &str) -> Result<ruma::OwnedRoomAliasId, RoomError> {
-    RoomAliasId::parse(raw).map(|a| a.to_owned()).map_err(|e| RoomError::BadRequest(e.to_string()))
+    RoomAliasId::parse(raw)
+        .map(|a| a.to_owned())
+        .map_err(|e| RoomError::BadRequest(e.to_string()))
 }
 
 /// `GET /rooms/{roomId}/aliases`.
@@ -44,7 +48,9 @@ pub async fn put_alias<B: KvBackend + 'static>(
         .ok_or_else(|| RoomError::BadRequest("missing room_id".into()))?;
     let room_id = parse_room_id(room_id_str)?;
     let handle = state.rooms.get_or_load(&room_id).await?;
-    handle.query(move |actor| actor.create_alias(&alias)).await?;
+    handle
+        .query(move |actor| actor.create_alias(&alias))
+        .await?;
     Ok(Json(json!({})).into_response())
 }
 
@@ -73,6 +79,8 @@ pub async fn delete_alias<B: KvBackend + 'static>(
         .resolve_alias(&alias)?
         .ok_or_else(|| RoomError::RoomNotFound(room_alias.clone()))?;
     let handle = state.rooms.get_or_load(&room_id).await?;
-    handle.query(move |actor| actor.remove_alias(&alias)).await?;
+    handle
+        .query(move |actor| actor.remove_alias(&alias))
+        .await?;
     Ok(Json(json!({})).into_response())
 }

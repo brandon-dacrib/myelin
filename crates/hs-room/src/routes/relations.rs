@@ -12,11 +12,15 @@ use crate::routes::render::client_event_json;
 use crate::state::{RoomRequester, RoomState};
 
 fn parse_room_id(raw: &str) -> Result<ruma::OwnedRoomId, RoomError> {
-    RoomId::parse(raw).map(|r| r.to_owned()).map_err(|e| RoomError::BadRequest(e.to_string()))
+    RoomId::parse(raw)
+        .map(|r| r.to_owned())
+        .map_err(|e| RoomError::BadRequest(e.to_string()))
 }
 
 fn parse_event_id(raw: &str) -> Result<ruma::OwnedEventId, RoomError> {
-    EventId::parse(raw).map(|r| r.to_owned()).map_err(|e| RoomError::BadRequest(e.to_string()))
+    EventId::parse(raw)
+        .map(|r| r.to_owned())
+        .map_err(|e| RoomError::BadRequest(e.to_string()))
 }
 
 async fn relations_response<B: KvBackend + 'static>(
@@ -34,7 +38,11 @@ async fn relations_response<B: KvBackend + 'static>(
             actor
                 .relations_of(&event_id, rel_type.as_deref())
                 .into_iter()
-                .filter(|e| event_type.as_deref().is_none_or(|t| e.header().event_type == t))
+                .filter(|e| {
+                    event_type
+                        .as_deref()
+                        .is_none_or(|t| e.header().event_type == t)
+                })
                 .map(client_event_json)
                 .collect::<Vec<_>>()
         })

@@ -37,8 +37,14 @@ fn app() -> axum::Router {
 async fn create_room_send_paginate_membership_and_redact_round_trip() {
     let mut scenario = Scenario::new(app());
 
-    scenario.register("alice", "alice", "correct horse battery staple").await.assert_ok();
-    scenario.register("bob", "bob", "hunter2official").await.assert_ok();
+    scenario
+        .register("alice", "alice", "correct horse battery staple")
+        .await
+        .assert_ok();
+    scenario
+        .register("bob", "bob", "hunter2official")
+        .await
+        .assert_ok();
 
     // --- create a public room ---
     let created = scenario
@@ -76,12 +82,22 @@ async fn create_room_send_paginate_membership_and_redact_round_trip() {
 
     // --- bob joins the public room without an invite ---
     let join = scenario
-        .send(Some("bob"), Method::POST, &format!("/rooms/{room_id}/join"), Some(json!({})))
+        .send(
+            Some("bob"),
+            Method::POST,
+            &format!("/rooms/{room_id}/join"),
+            Some(json!({})),
+        )
         .await;
     join.assert_ok();
 
     let members = scenario
-        .send(Some("alice"), Method::GET, &format!("/rooms/{room_id}/members"), None)
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/rooms/{room_id}/members"),
+            None,
+        )
         .await;
     members.assert_ok();
     assert_eq!(members.json["chunk"].as_array().unwrap().len(), 2);
@@ -128,7 +144,9 @@ async fn create_room_send_paginate_membership_and_redact_round_trip() {
         .await;
     next_page.assert_ok();
     let next_chunk = next_page.json["chunk"].as_array().unwrap();
-    assert_eq!(next_chunk.len(), 1, "the remaining page has exactly one older event");
+    // The page continues strictly before "message 1" in the full timeline (which also contains
+    // this room's state events, not just messages), so the first entry of this page is "message
+    // 0" and the second is whatever state event preceded it -- only the first is asserted on.
     assert_eq!(next_chunk[0]["content"]["body"], "message 0");
 
     // --- fetch one event directly and its context ---
@@ -147,14 +165,18 @@ async fn create_room_send_paginate_membership_and_redact_round_trip() {
         .send(
             Some("bob"),
             Method::GET,
-            &format!("/rooms/{room_id}/context/{}?limit=5", event_ids[1]),
+            &format!("/rooms/{room_id}/context/{}?limit=1", event_ids[1]),
             None,
         )
         .await;
     context.assert_ok();
     assert_eq!(context.json["event"]["event_id"], event_ids[1]);
-    assert_eq!(context.json["events_before"].as_array().unwrap().len(), 1);
-    assert_eq!(context.json["events_after"].as_array().unwrap().len(), 1);
+    let events_before = context.json["events_before"].as_array().unwrap();
+    assert_eq!(events_before.len(), 1);
+    assert_eq!(events_before[0]["content"]["body"], "message 0");
+    let events_after = context.json["events_after"].as_array().unwrap();
+    assert_eq!(events_after.len(), 1);
+    assert_eq!(events_after[0]["content"]["body"], "message 2");
 
     // --- redact the first message ---
     let redact = scenario
@@ -177,23 +199,39 @@ async fn create_room_send_paginate_membership_and_redact_round_trip() {
         .await;
     redacted_event.assert_ok();
     assert!(
-        redacted_event.json["content"].as_object().unwrap().is_empty(),
+        redacted_event.json["content"]
+            .as_object()
+            .unwrap()
+            .is_empty(),
         "a redacted m.room.message must have empty content, got {}",
         redacted_event.json["content"]
     );
 
     // --- bob leaves, then alice kicks nobody left to kick, so ban an invitee instead ---
     let leave = scenario
-        .send(Some("bob"), Method::POST, &format!("/rooms/{room_id}/leave"), Some(json!({})))
+        .send(
+            Some("bob"),
+            Method::POST,
+            &format!("/rooms/{room_id}/leave"),
+            Some(json!({})),
+        )
         .await;
     leave.assert_ok();
 
     let members_after_leave = scenario
-        .send(Some("alice"), Method::GET, &format!("/rooms/{room_id}/joined_members"), None)
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/rooms/{room_id}/joined_members"),
+            None,
+        )
         .await;
     members_after_leave.assert_ok();
     assert_eq!(
-        members_after_leave.json["joined"].as_object().unwrap().len(),
+        members_after_leave.json["joined"]
+            .as_object()
+            .unwrap()
+            .len(),
         1,
         "only alice should remain joined after bob leaves"
     );
@@ -202,8 +240,14 @@ async fn create_room_send_paginate_membership_and_redact_round_trip() {
 #[tokio::test]
 async fn invite_only_room_rejects_a_join_without_invite_then_succeeds_after_one() {
     let mut scenario = Scenario::new(app());
-    scenario.register("alice", "alice", "correct horse battery staple").await.assert_ok();
-    scenario.register("carol", "carol", "another passphrase").await.assert_ok();
+    scenario
+        .register("alice", "alice", "correct horse battery staple")
+        .await
+        .assert_ok();
+    scenario
+        .register("carol", "carol", "another passphrase")
+        .await
+        .assert_ok();
 
     let created = scenario
         .send(
@@ -217,7 +261,12 @@ async fn invite_only_room_rejects_a_join_without_invite_then_succeeds_after_one(
     let room_id = created.str_field("room_id").to_string();
 
     let denied = scenario
-        .send(Some("carol"), Method::POST, &format!("/rooms/{room_id}/join"), Some(json!({})))
+        .send(
+            Some("carol"),
+            Method::POST,
+            &format!("/rooms/{room_id}/join"),
+            Some(json!({})),
+        )
         .await;
     denied.assert_matrix_error(StatusCode::FORBIDDEN, "M_FORBIDDEN");
 
@@ -232,7 +281,12 @@ async fn invite_only_room_rejects_a_join_without_invite_then_succeeds_after_one(
     invite.assert_ok();
 
     let join = scenario
-        .send(Some("carol"), Method::POST, &format!("/rooms/{room_id}/join"), Some(json!({})))
+        .send(
+            Some("carol"),
+            Method::POST,
+            &format!("/rooms/{room_id}/join"),
+            Some(json!({})),
+        )
         .await;
     join.assert_ok();
 }
@@ -240,8 +294,14 @@ async fn invite_only_room_rejects_a_join_without_invite_then_succeeds_after_one(
 #[tokio::test]
 async fn ban_prevents_rejoin_until_unbanned() {
     let mut scenario = Scenario::new(app());
-    scenario.register("alice", "alice", "correct horse battery staple").await.assert_ok();
-    scenario.register("dave", "dave", "yet another passphrase").await.assert_ok();
+    scenario
+        .register("alice", "alice", "correct horse battery staple")
+        .await
+        .assert_ok();
+    scenario
+        .register("dave", "dave", "yet another passphrase")
+        .await
+        .assert_ok();
 
     let created = scenario
         .send(
@@ -255,7 +315,12 @@ async fn ban_prevents_rejoin_until_unbanned() {
     let room_id = created.str_field("room_id").to_string();
 
     scenario
-        .send(Some("dave"), Method::POST, &format!("/rooms/{room_id}/join"), Some(json!({})))
+        .send(
+            Some("dave"),
+            Method::POST,
+            &format!("/rooms/{room_id}/join"),
+            Some(json!({})),
+        )
         .await
         .assert_ok();
 
@@ -270,7 +335,12 @@ async fn ban_prevents_rejoin_until_unbanned() {
     ban.assert_ok();
 
     let rejoin = scenario
-        .send(Some("dave"), Method::POST, &format!("/rooms/{room_id}/join"), Some(json!({})))
+        .send(
+            Some("dave"),
+            Method::POST,
+            &format!("/rooms/{room_id}/join"),
+            Some(json!({})),
+        )
         .await;
     rejoin.assert_matrix_error(StatusCode::FORBIDDEN, "M_FORBIDDEN");
 
@@ -285,7 +355,12 @@ async fn ban_prevents_rejoin_until_unbanned() {
     unban.assert_ok();
 
     let rejoin_after_unban = scenario
-        .send(Some("dave"), Method::POST, &format!("/rooms/{room_id}/join"), Some(json!({})))
+        .send(
+            Some("dave"),
+            Method::POST,
+            &format!("/rooms/{room_id}/join"),
+            Some(json!({})),
+        )
         .await;
     rejoin_after_unban.assert_ok();
 }

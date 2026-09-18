@@ -139,7 +139,11 @@ pub const TRANSITIONS: &[(Action, &[PriorState])] = &[
 /// # Errors
 /// Returns [`PrecheckError`] if the transition is not in the table, or if `action` is
 /// [`Action::Knock`] and `rules.knocking` is `false`.
-pub fn precheck(rules: &RoomVersionRules, action: Action, prior: PriorState) -> Result<(), PrecheckError> {
+pub fn precheck(
+    rules: &RoomVersionRules,
+    action: Action,
+    prior: PriorState,
+) -> Result<(), PrecheckError> {
     if action == Action::Knock && !rules.knocking {
         return Err(PrecheckError::KnockingUnsupported);
     }

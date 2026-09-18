@@ -18,20 +18,29 @@ pub fn canonical_to_json(obj: &CanonicalJsonObject) -> serde_json::Value {
 #[must_use]
 pub fn client_event_json(event: &Event) -> serde_json::Value {
     let source = if event.header().flags.is_redacted() {
-        event.redacted_json().unwrap_or_else(|_| event.json().clone())
+        event
+            .redacted_json()
+            .unwrap_or_else(|_| event.json().clone())
     } else {
         event.json().clone()
     };
     let mut value = canonical_to_json(&source);
     if let Some(obj) = value.as_object_mut() {
-        for key in ["signatures", "hashes", "auth_events", "prev_events", "depth"] {
+        for key in [
+            "signatures",
+            "hashes",
+            "auth_events",
+            "prev_events",
+            "depth",
+        ] {
             obj.remove(key);
         }
         obj.insert(
             "event_id".to_owned(),
             serde_json::Value::String(event.event_id().to_string()),
         );
-        obj.entry("unsigned").or_insert_with(|| serde_json::json!({}));
+        obj.entry("unsigned")
+            .or_insert_with(|| serde_json::json!({}));
     }
     value
 }

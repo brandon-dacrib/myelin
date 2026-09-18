@@ -16,11 +16,15 @@ use crate::state::{RoomRequester, RoomState};
 use crate::timeline::{Direction, PaginationToken};
 
 fn parse_room_id(raw: &str) -> Result<ruma::OwnedRoomId, RoomError> {
-    RoomId::parse(raw).map(|r| r.to_owned()).map_err(|e| RoomError::BadRequest(e.to_string()))
+    RoomId::parse(raw)
+        .map(|r| r.to_owned())
+        .map_err(|e| RoomError::BadRequest(e.to_string()))
 }
 
 fn parse_event_id(raw: &str) -> Result<ruma::OwnedEventId, RoomError> {
-    EventId::parse(raw).map(|r| r.to_owned()).map_err(|e| RoomError::BadRequest(e.to_string()))
+    EventId::parse(raw)
+        .map(|r| r.to_owned())
+        .map_err(|e| RoomError::BadRequest(e.to_string()))
 }
 
 /// `GET /rooms/{roomId}/state/{eventType}/{stateKey}`.
@@ -116,12 +120,30 @@ pub async fn get_context<B: KvBackend + 'static>(
             // 0's in-memory timeline (no store round trip either way, and the whole room's
             // history is already resident -- see `RoomActor`'s doc comment on its `events`
             // field); a real position index is the documented next step.
+            //
+            // `all` is newest-first (descending `room_pos`): index `pos - 1` is the event
+            // immediately *newer* than the target, index `pos + 1` immediately *older*.
             let (all, _) = actor.paginate(None, Direction::Backward, usize::MAX);
             let pos = all.iter().position(|e| e.event_id() == target.event_id())?;
-            let start = pos.saturating_sub(limit);
-            let events_before: Vec<_> = all[start..pos].iter().copied().map(client_event_json).collect();
+            // "events_before" (older than target) in reverse-chronological order (nearest to the
+            // target first): that is exactly ascending-index order over `all[pos+1..end]`, since
+            // `all` is already newest-first.
             let end = (pos + 1 + limit).min(all.len());
-            let events_after: Vec<_> = all[pos + 1..end].iter().copied().map(client_event_json).collect();
+            let events_before: Vec<_> = all[pos + 1..end]
+                .iter()
+                .copied()
+                .map(client_event_json)
+                .collect();
+            // "events_after" (newer than target) in chronological order (nearest to the target
+            // first, i.e. oldest of the "after" set first): `all[start..pos]` is newest-first, so
+            // reverse it.
+            let start = pos.saturating_sub(limit);
+            let events_after: Vec<_> = all[start..pos]
+                .iter()
+                .rev()
+                .copied()
+                .map(client_event_json)
+                .collect();
             let state_json = actor
                 .full_state()
                 .into_iter()
@@ -229,7 +251,10 @@ pub async fn get_messages<B: KvBackend + 'static>(
         .query(move |actor| {
             let (events, next) = actor.paginate(from, direction, limit);
             let start_token = from.unwrap_or_else(|| PaginationToken::new(0, direction));
-            let chunk = events.into_iter().map(client_event_json).collect::<Vec<_>>();
+            let chunk = events
+                .into_iter()
+                .map(client_event_json)
+                .collect::<Vec<_>>();
             (start_token.to_string(), chunk, next.map(|t| t.to_string()))
         })
         .await;

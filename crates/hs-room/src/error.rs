@@ -78,7 +78,9 @@ impl RoomError {
     #[must_use]
     pub fn to_matrix_error(&self) -> MatrixError {
         match self {
-            Self::RoomNotFound(_) | Self::EventNotFound(_) => MatrixError::not_found(self.to_string()),
+            Self::RoomNotFound(_) | Self::EventNotFound(_) => {
+                MatrixError::not_found(self.to_string())
+            }
             Self::UnsupportedRoomVersion(v) => MatrixError::custom(
                 axum::http::StatusCode::BAD_REQUEST,
                 MatrixErrorCode::UnsupportedRoomVersion,
@@ -89,9 +91,7 @@ impl RoomError {
                 MatrixErrorCode::RoomInUse,
                 self.to_string(),
             ),
-            Self::InvalidEvent(_) | Self::BadRequest(_) => {
-                MatrixError::bad_json(self.to_string())
-            }
+            Self::InvalidEvent(_) | Self::BadRequest(_) => MatrixError::bad_json(self.to_string()),
             Self::Forbidden(msg) => MatrixError::forbidden(msg.clone()),
             Self::InvalidPaginationToken => MatrixError::custom(
                 axum::http::StatusCode::BAD_REQUEST,

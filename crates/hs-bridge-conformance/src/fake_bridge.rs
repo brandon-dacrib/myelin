@@ -121,10 +121,7 @@ impl FakeBridge {
 
     fn router(&self) -> Router {
         Router::new()
-            .route(
-                "/_matrix/app/v1/transactions/{txnId}",
-                put(put_transaction),
-            )
+            .route("/_matrix/app/v1/transactions/{txnId}", put(put_transaction))
             .route("/_matrix/app/v1/ping", post(ping))
             .route("/_matrix/app/v1/users/{userId}", get(query_user))
             .route("/_matrix/app/v1/rooms/{roomAlias}", get(query_room_alias))
@@ -179,8 +176,11 @@ async fn ping(
     if let Some(status) = maybe_fail(&state) {
         return (status, Json(serde_json::json!({"errcode": "M_UNKNOWN"})));
     }
-    let transaction_id = body
-        .and_then(|Json(m)| m.get("transaction_id").and_then(Value::as_str).map(str::to_string));
+    let transaction_id = body.and_then(|Json(m)| {
+        m.get("transaction_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
     state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

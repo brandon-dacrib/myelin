@@ -34,9 +34,9 @@ fn parse_user_list(body: &Value, key: &str) -> Result<Vec<OwnedUserId>, RoomErro
             v.as_str()
                 .ok_or_else(|| RoomError::BadRequest(format!("{key} entries must be strings")))
                 .and_then(|s| {
-                    UserId::parse(s)
-                        .map(|u| u.to_owned())
-                        .map_err(|e| RoomError::BadRequest(format!("invalid user ID in {key}: {e}")))
+                    UserId::parse(s).map(|u| u.to_owned()).map_err(|e| {
+                        RoomError::BadRequest(format!("invalid user ID in {key}: {e}"))
+                    })
                 })
         })
         .collect()
@@ -88,13 +88,19 @@ pub async fn post_create_room<B: KvBackend + 'static>(
 
     let request = CreateRoomRequest {
         room_version,
-        preset: body.get("preset").and_then(Value::as_str).map(str::to_owned),
+        preset: body
+            .get("preset")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         name: body.get("name").and_then(Value::as_str).map(str::to_owned),
         topic: body.get("topic").and_then(Value::as_str).map(str::to_owned),
         invite: parse_user_list(&body, "invite")?,
         initial_state: parse_initial_state(&body)?,
         power_level_content_override: body.get("power_level_content_override").cloned(),
-        creation_content: body.get("creation_content").cloned().unwrap_or_else(|| json!({})),
+        creation_content: body
+            .get("creation_content")
+            .cloned()
+            .unwrap_or_else(|| json!({})),
         room_alias_name: body
             .get("room_alias_name")
             .and_then(Value::as_str)

@@ -36,7 +36,10 @@ pub async fn put_redact<B: KvBackend + 'static>(
     let target = EventId::parse(&event_id)
         .map(|e| e.to_owned())
         .map_err(|e| RoomError::BadRequest(e.to_string()))?;
-    let reason = body.get("reason").and_then(Value::as_str).map(str::to_owned);
+    let reason = body
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
 
     let handle = state.rooms.get_or_load(&room_id).await?;
     let event = handle

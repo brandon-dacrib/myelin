@@ -48,7 +48,10 @@ impl PaginationToken {
     /// A token at `room_pos`, continuing in `direction`.
     #[must_use]
     pub fn new(room_pos: i64, direction: Direction) -> Self {
-        Self { room_pos, direction }
+        Self {
+            room_pos,
+            direction,
+        }
     }
 }
 
@@ -77,7 +80,10 @@ impl FromStr for PaginationToken {
         let room_pos = rest
             .parse::<i64>()
             .map_err(|_| crate::error::RoomError::InvalidPaginationToken)?;
-        Ok(Self { room_pos, direction })
+        Ok(Self {
+            room_pos,
+            direction,
+        })
     }
 }
 

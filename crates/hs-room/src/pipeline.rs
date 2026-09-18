@@ -76,9 +76,14 @@ impl<'a> CurrentState<'a> {
 impl<'a> StateFetch for CurrentState<'a> {
     fn get(&self, event_type: &str, state_key: &str) -> Option<StateEntry<'a>> {
         let event = self.event_for(event_type, state_key)?;
+        // `StateEntry::content` is the event's `content` sub-object, not the whole event JSON
+        // (`event.json()`) -- every auth check reads fields like `membership` or `join_rule`
+        // directly off `StateEntry::content`, so handing back the outer object silently makes
+        // every one of those lookups fail as "missing field".
+        let content = event.json().get("content")?.as_object()?;
         Some(StateEntry {
             sender: AsRef::<UserId>::as_ref(&event.header().sender),
-            content: event.json(),
+            content,
         })
     }
 }
@@ -192,14 +197,21 @@ pub fn build_and_authorize(
     let is_create = new_event.event_type == "m.room.create";
 
     let mut object = serde_json::Map::new();
-    object.insert("type".into(), serde_json::Value::String(new_event.event_type.clone()));
+    object.insert(
+        "type".into(),
+        serde_json::Value::String(new_event.event_type.clone()),
+    );
     object.insert(
         "sender".into(),
         serde_json::Value::String(new_event.sender.to_string()),
     );
     object.insert("origin_server_ts".into(), serde_json::Value::from(now_ms));
 
-    let depth = prev_events.iter().map(|p| p.depth).max().map_or(1, |d| d + 1);
+    let depth = prev_events
+        .iter()
+        .map(|p| p.depth)
+        .max()
+        .map_or(1, |d| d + 1);
     object.insert("depth".into(), serde_json::Value::from(depth));
 
     if let Some(state_key) = &new_event.state_key {
@@ -239,20 +251,26 @@ pub fn build_and_authorize(
 
     let prev_events_json: Vec<serde_json::Value> =
         prev_events.iter().map(|r| encode_ref(r, rules)).collect();
-    object.insert("prev_events".into(), serde_json::Value::Array(prev_events_json));
+    object.insert(
+        "prev_events".into(),
+        serde_json::Value::Array(prev_events_json),
+    );
 
     let incoming = IncomingEvent {
         event_type: &new_event.event_type,
         sender: AsRef::<UserId>::as_ref(&new_event.sender),
         room_id: Some(room_id),
         state_key: new_event.state_key.as_deref(),
-        content: &to_canonical_object(&object.get("content").cloned().unwrap_or_default(), rules.strict_canonical_json)
-            .map_err(hs_model::EventError::from)?,
+        content: &to_canonical_object(
+            &object.get("content").cloned().unwrap_or_default(),
+            rules.strict_canonical_json,
+        )
+        .map_err(hs_model::EventError::from)?,
         prev_event_count: prev_events.len(),
         only_prev_event_is_room_create: prev_events.len() == 1
-            && state
-                .event_for("m.room.create", "")
-                .is_some_and(|c| Some(c.event_id().to_owned()) == prev_events.first().map(|p| p.event_id.clone())),
+            && state.event_for("m.room.create", "").is_some_and(|c| {
+                Some(c.event_id().to_owned()) == prev_events.first().map(|p| p.event_id.clone())
+            }),
         event_id: None,
         redacts: new_event.redacts.as_deref(),
     };
@@ -264,7 +282,10 @@ pub fn build_and_authorize(
     };
     let auth_events_json: Vec<serde_json::Value> =
         auth_refs.iter().map(|r| encode_ref(r, rules)).collect();
-    object.insert("auth_events".into(), serde_json::Value::Array(auth_events_json));
+    object.insert(
+        "auth_events".into(),
+        serde_json::Value::Array(auth_events_json),
+    );
 
     if rules.event_format_requires_event_id {
         let generated = EventId::new_v1(server_name);
@@ -275,8 +296,11 @@ pub fn build_and_authorize(
     }
 
     // --- hash and sign ---
-    let mut canonical = to_canonical_object(&serde_json::Value::Object(object), rules.strict_canonical_json)
-        .map_err(hs_model::EventError::from)?;
+    let mut canonical = to_canonical_object(
+        &serde_json::Value::Object(object),
+        rules.strict_canonical_json,
+    )
+    .map_err(hs_model::EventError::from)?;
     let content_hash = hash::content_hash_base64(&canonical);
     canonical.insert(
         "hashes".to_owned(),

@@ -55,7 +55,10 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     /// # Errors
     /// Returns [`RoomError::RoomNotFound`] if the room does not exist, or any error
     /// [`RoomActor::load`] can return.
-    pub async fn get_or_load(&self, room_id: &ruma::RoomId) -> Result<RoomActorHandle<B>, RoomError> {
+    pub async fn get_or_load(
+        &self,
+        room_id: &ruma::RoomId,
+    ) -> Result<RoomActorHandle<B>, RoomError> {
         {
             let mut rooms = self.rooms.lock().await;
             if let Some(entry) = rooms.get_mut(room_id) {

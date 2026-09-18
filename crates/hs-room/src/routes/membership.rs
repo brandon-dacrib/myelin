@@ -22,7 +22,9 @@ fn now_ms() -> i64 {
 }
 
 fn parse_room_id(raw: &str) -> Result<ruma::OwnedRoomId, RoomError> {
-    RoomId::parse(raw).map(|r| r.to_owned()).map_err(|e| RoomError::BadRequest(e.to_string()))
+    RoomId::parse(raw)
+        .map(|r| r.to_owned())
+        .map_err(|e| RoomError::BadRequest(e.to_string()))
 }
 
 fn target_user(body: &Value, requester: &ruma::UserId) -> Result<ruma::OwnedUserId, RoomError> {
@@ -90,7 +92,15 @@ pub async fn post_join_by_id_or_alias<B: KvBackend + 'static>(
             .ok_or_else(|| RoomError::RoomNotFound(room_id_or_alias.clone()))?
     };
     let user = requester.user_id.clone();
-    act(&state, room_id.as_str(), user.clone(), Action::Join, user, &body).await
+    act(
+        &state,
+        room_id.as_str(),
+        user.clone(),
+        Action::Join,
+        user,
+        &body,
+    )
+    .await
 }
 
 /// `POST /rooms/{roomId}/leave`.
@@ -124,7 +134,15 @@ pub async fn post_invite<B: KvBackend + 'static>(
     Json(body): Json<Value>,
 ) -> Result<Response, RoomError> {
     let target = target_user(&body, &requester.user_id)?;
-    act(&state, &room_id, requester.user_id.clone(), Action::Invite, target, &body).await
+    act(
+        &state,
+        &room_id,
+        requester.user_id.clone(),
+        Action::Invite,
+        target,
+        &body,
+    )
+    .await
 }
 
 /// `POST /rooms/{roomId}/kick`.
@@ -135,7 +153,15 @@ pub async fn post_kick<B: KvBackend + 'static>(
     Json(body): Json<Value>,
 ) -> Result<Response, RoomError> {
     let target = target_user(&body, &requester.user_id)?;
-    act(&state, &room_id, requester.user_id.clone(), Action::Kick, target, &body).await
+    act(
+        &state,
+        &room_id,
+        requester.user_id.clone(),
+        Action::Kick,
+        target,
+        &body,
+    )
+    .await
 }
 
 /// `POST /rooms/{roomId}/ban`.
@@ -146,7 +172,15 @@ pub async fn post_ban<B: KvBackend + 'static>(
     Json(body): Json<Value>,
 ) -> Result<Response, RoomError> {
     let target = target_user(&body, &requester.user_id)?;
-    act(&state, &room_id, requester.user_id.clone(), Action::Ban, target, &body).await
+    act(
+        &state,
+        &room_id,
+        requester.user_id.clone(),
+        Action::Ban,
+        target,
+        &body,
+    )
+    .await
 }
 
 /// `POST /rooms/{roomId}/unban`.
@@ -157,7 +191,15 @@ pub async fn post_unban<B: KvBackend + 'static>(
     Json(body): Json<Value>,
 ) -> Result<Response, RoomError> {
     let target = target_user(&body, &requester.user_id)?;
-    act(&state, &room_id, requester.user_id.clone(), Action::Unban, target, &body).await
+    act(
+        &state,
+        &room_id,
+        requester.user_id.clone(),
+        Action::Unban,
+        target,
+        &body,
+    )
+    .await
 }
 
 /// `POST /rooms/{roomId}/knock`.
@@ -189,5 +231,13 @@ pub async fn post_knock_by_id_or_alias<B: KvBackend + 'static>(
             .ok_or_else(|| RoomError::RoomNotFound(room_id_or_alias.clone()))?
     };
     let user = requester.user_id.clone();
-    act(&state, room_id.as_str(), user.clone(), Action::Knock, user, &body).await
+    act(
+        &state,
+        room_id.as_str(),
+        user.clone(),
+        Action::Knock,
+        user,
+        &body,
+    )
+    .await
 }
