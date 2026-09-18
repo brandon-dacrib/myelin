@@ -25,7 +25,9 @@ pub enum DurationParseError {
     #[error("empty duration")]
     Empty,
     /// A group did not have the form `<number><unit>`.
-    #[error("invalid duration syntax in {0:?}: expected groups like 30s, 5m, 1h, 7d, 1w, 1y or 500ms")]
+    #[error(
+        "invalid duration syntax in {0:?}: expected groups like 30s, 5m, 1h, 7d, 1w, 1y or 500ms"
+    )]
     Syntax(String),
     /// The unit suffix is not one of the supported ones.
     #[error("unknown duration unit {0:?}")]
@@ -116,6 +118,13 @@ impl FromStr for Duration {
         if let Ok(ms) = s.parse::<u64>() {
             return Ok(Self::from_millis(ms));
         }
+        if s.chars().all(|c| c.is_ascii_digit()) {
+            // All-digit strings only fail the parse above by overflowing
+            // u64; falling through to the unit-group parser below would
+            // misreport that as a syntax error (no unit follows the
+            // digits), so it is reported precisely here instead.
+            return Err(DurationParseError::Overflow);
+        }
         let mut total: u64 = 0;
         let mut rest = s;
         while !rest.is_empty() {
@@ -133,10 +142,9 @@ impl FromStr for Duration {
                 return Err(DurationParseError::Syntax(s.to_owned()));
             }
             let (unit, tail) = tail.split_at(unit_end);
-            let n: u64 = num
-                .parse()
-                .map_err(|_| DurationParseError::Overflow)?;
-            let mult = unit_millis(unit).ok_or_else(|| DurationParseError::Unit(unit.to_owned()))?;
+            let n: u64 = num.parse().map_err(|_| DurationParseError::Overflow)?;
+            let mult =
+                unit_millis(unit).ok_or_else(|| DurationParseError::Unit(unit.to_owned()))?;
             total = n
                 .checked_mul(mult)
                 .and_then(|v| total.checked_add(v))
@@ -161,7 +169,7 @@ impl fmt::Display for Duration {
             ("m", 60_000),
             ("s", 1_000),
         ] {
-            if ms % mult == 0 {
+            if ms.is_multiple_of(mult) {
                 return write!(f, "{}{unit}", ms / mult);
             }
         }
@@ -233,24 +241,45 @@ mod tests {
 
     #[test]
     fn parses_units_and_compounds() {
-        assert_eq!("500ms".parse::<Duration>().unwrap(), Duration::from_millis(500));
+        assert_eq!(
+            "500ms".parse::<Duration>().unwrap(),
+            Duration::from_millis(500)
+        );
         assert_eq!("30s".parse::<Duration>().unwrap(), Duration::from_secs(30));
         assert_eq!("5m".parse::<Duration>().unwrap(), Duration::from_mins(5));
         assert_eq!("1h".parse::<Duration>().unwrap(), Duration::from_hours(1));
         assert_eq!("7d".parse::<Duration>().unwrap(), Duration::from_days(7));
         assert_eq!("1w".parse::<Duration>().unwrap(), Duration::from_days(7));
         assert_eq!("1y".parse::<Duration>().unwrap(), Duration::from_days(365));
-        assert_eq!("1h30m".parse::<Duration>().unwrap(), Duration::from_mins(90));
-        assert_eq!("1h 30m".parse::<Duration>().unwrap(), Duration::from_mins(90));
-        assert_eq!("86400000".parse::<Duration>().unwrap(), Duration::from_days(1));
+        assert_eq!(
+            "1h30m".parse::<Duration>().unwrap(),
+            Duration::from_mins(90)
+        );
+        assert_eq!(
+            "1h 30m".parse::<Duration>().unwrap(),
+            Duration::from_mins(90)
+        );
+        assert_eq!(
+            "86400000".parse::<Duration>().unwrap(),
+            Duration::from_days(1)
+        );
     }
 
     #[test]
     fn rejects_garbage() {
         assert_eq!("".parse::<Duration>(), Err(DurationParseError::Empty));
-        assert!(matches!("abc".parse::<Duration>(), Err(DurationParseError::Syntax(_))));
-        assert!(matches!("5x".parse::<Duration>(), Err(DurationParseError::Unit(_))));
-        assert!(matches!("5".repeat(30).parse::<Duration>(), Err(DurationParseError::Overflow)));
+        assert!(matches!(
+            "abc".parse::<Duration>(),
+            Err(DurationParseError::Syntax(_))
+        ));
+        assert!(matches!(
+            "5x".parse::<Duration>(),
+            Err(DurationParseError::Unit(_))
+        ));
+        assert!(matches!(
+            "5".repeat(30).parse::<Duration>(),
+            Err(DurationParseError::Overflow)
+        ));
     }
 
     #[test]

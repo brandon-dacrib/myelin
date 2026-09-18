@@ -24,7 +24,9 @@ pub enum ByteSizeParseError {
     #[error("empty size")]
     Empty,
     /// Not `<number>[unit]`.
-    #[error("invalid size syntax in {0:?}: expected a number with an optional unit (K, M, G, T, KiB, MB, ...)")]
+    #[error(
+        "invalid size syntax in {0:?}: expected a number with an optional unit (K, M, G, T, KiB, MB, ...)"
+    )]
     Syntax(String),
     /// Unknown unit suffix.
     #[error("unknown size unit {0:?}")]
@@ -92,8 +94,11 @@ impl FromStr for ByteSize {
         let (num, unit) = s.split_at(digits_end);
         let unit = unit.trim();
         let n: u64 = num.parse().map_err(|_| ByteSizeParseError::Overflow)?;
-        let mult = unit_multiplier(unit).ok_or_else(|| ByteSizeParseError::Unit(unit.to_owned()))?;
-        n.checked_mul(mult).map(Self).ok_or(ByteSizeParseError::Overflow)
+        let mult =
+            unit_multiplier(unit).ok_or_else(|| ByteSizeParseError::Unit(unit.to_owned()))?;
+        n.checked_mul(mult)
+            .map(Self)
+            .ok_or(ByteSizeParseError::Overflow)
     }
 }
 
@@ -105,7 +110,7 @@ impl fmt::Display for ByteSize {
         }
         for (unit, shift) in [("T", 40u32), ("G", 30), ("M", 20), ("K", 10)] {
             let mult = 1u64 << shift;
-            if n % mult == 0 {
+            if n.is_multiple_of(mult) {
                 return write!(f, "{}{unit}", n / mult);
             }
         }
@@ -137,7 +142,9 @@ impl<'de> Deserialize<'de> for ByteSize {
                 Ok(ByteSize(v))
             }
             fn visit_i64<E: de::Error>(self, v: i64) -> Result<ByteSize, E> {
-                u64::try_from(v).map(ByteSize).map_err(|_| E::custom("negative size"))
+                u64::try_from(v)
+                    .map(ByteSize)
+                    .map_err(|_| E::custom("negative size"))
             }
             fn visit_str<E: de::Error>(self, v: &str) -> Result<ByteSize, E> {
                 v.parse().map_err(E::custom)
@@ -172,16 +179,28 @@ mod tests {
         assert_eq!("1G".parse::<ByteSize>().unwrap(), ByteSize::gib(1));
         assert_eq!("512".parse::<ByteSize>().unwrap(), ByteSize::bytes(512));
         assert_eq!("20MiB".parse::<ByteSize>().unwrap(), ByteSize::mib(20));
-        assert_eq!("20 MB".parse::<ByteSize>().unwrap(), ByteSize::bytes(20_000_000));
+        assert_eq!(
+            "20 MB".parse::<ByteSize>().unwrap(),
+            ByteSize::bytes(20_000_000)
+        );
         assert_eq!("32m".parse::<ByteSize>().unwrap(), ByteSize::mib(32));
     }
 
     #[test]
     fn rejects_garbage() {
         assert_eq!("".parse::<ByteSize>(), Err(ByteSizeParseError::Empty));
-        assert!(matches!("M".parse::<ByteSize>(), Err(ByteSizeParseError::Syntax(_))));
-        assert!(matches!("5X".parse::<ByteSize>(), Err(ByteSizeParseError::Unit(_))));
-        assert!(matches!("99999999999999999999T".parse::<ByteSize>(), Err(ByteSizeParseError::Overflow)));
+        assert!(matches!(
+            "M".parse::<ByteSize>(),
+            Err(ByteSizeParseError::Syntax(_))
+        ));
+        assert!(matches!(
+            "5X".parse::<ByteSize>(),
+            Err(ByteSizeParseError::Unit(_))
+        ));
+        assert!(matches!(
+            "99999999999999999999T".parse::<ByteSize>(),
+            Err(ByteSizeParseError::Overflow)
+        ));
     }
 
     #[test]

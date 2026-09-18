@@ -1,0 +1,68 @@
+# Representative of the element-hq/ess-helm chart's rendered
+# `homeserver.yaml` ConfigMap: Postgres, S3 media storage provider, MAS
+# delegation, Redis-backed worker coordination, metrics and tracing wired
+# for a Kubernetes-native deployment. Includes unsupported keys real Helm
+# output sets (`redis`, `instance_map`, `federation_metrics_domains`);
+# tests run this one with `--allow-unsupported-synapse-config`.
+
+server_name: "helm.example.org"
+public_baseurl: "https://matrix.helm.example.org/"
+
+listeners:
+  - port: 8008
+    tls: false
+    type: http
+    x_forwarded: true
+    resources:
+      - names: [client, federation]
+  - port: 9000
+    tls: false
+    type: http
+    resources:
+      - names: [metrics]
+
+database:
+  name: psycopg2
+  args:
+    host: helm-postgresql.matrix.svc.cluster.local
+    port: 5432
+    database: synapse
+    user: synapse
+    password: helm-generated-db-password
+    cp_max: 15
+
+media_store_path: /media-unused-when-s3-provider-active
+media_storage_providers:
+  - module: "s3_storage_provider.S3StorageProviderBackend"
+    store_local: true
+    store_remote: true
+    store_synchronous: true
+    config:
+      bucket: helm-matrix-media
+      region_name: eu-west-1
+
+matrix_authentication_service:
+  enabled: true
+  endpoint: "http://mas.matrix.svc.cluster.local:8080"
+  secret: "helm-generated-mas-shared-secret"
+
+redis:
+  enabled: true
+  host: helm-redis-master.matrix.svc.cluster.local
+  port: 6379
+
+instance_map:
+  main:
+    host: synapse-main.matrix.svc.cluster.local
+    port: 9093
+
+federation_metrics_domains:
+  - "matrix.org"
+
+enable_metrics: true
+sentry:
+  dsn: "https://helmkey@sentry.example.org/2"
+opentracing:
+  enabled: true
+
+report_stats: false

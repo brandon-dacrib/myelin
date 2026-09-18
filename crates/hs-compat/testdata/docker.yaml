@@ -1,0 +1,32 @@
+# Representative of `python -m synapse.app.homeserver --generate-config`
+# output as written by the matrixdotorg/synapse Docker image's entrypoint
+# (`SYNAPSE_SERVER_NAME` / `SYNAPSE_REPORT_STATS` driven). Deliberately
+# includes a few keys this translator does not support (`pid_file`,
+# `form_secret`, `trusted_key_servers`) because real generated output does;
+# tests run this one with `--allow-unsupported-synapse-config`.
+
+server_name: "docker.example.org"
+pid_file: /data/homeserver.pid
+listeners:
+  - port: 8008
+    tls: false
+    type: http
+    x_forwarded: true
+    resources:
+      - names: [client, federation]
+        compress: false
+
+database:
+  name: sqlite3
+  args:
+    database: /data/homeserver.db
+
+log_config: "/data/docker.example.org.log.config"
+media_store_path: /data/media_store
+registration_shared_secret: "generated-docker-shared-secret"
+report_stats: true
+macaroon_secret_key: "generated-docker-macaroon-key"
+form_secret: "generated-docker-form-secret"
+signing_key_path: "/data/docker.example.org.signing.key"
+trusted_key_servers:
+  - server_name: "matrix.org"

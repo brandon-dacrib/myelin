@@ -1,0 +1,73 @@
+# Representative of the community "matrix-docker-ansible-deploy"-style
+# role output: full-featured, Postgres-backed, many rate limits and
+# registration/retention knobs tuned explicitly. Includes several
+# unsupported keys real Ansible-role output sets (`retention`,
+# `turn_uris`, `user_directory`, `allowed_local_3pids`); tests run this
+# one with `--allow-unsupported-synapse-config`.
+
+server_name: "ansible.example.org"
+public_baseurl: "https://matrix.ansible.example.org/"
+pid_file: /matrix/synapse/homeserver.pid
+
+listeners:
+  - port: 8008
+    tls: false
+    type: http
+    x_forwarded: true
+    resources:
+      - names: [client, federation]
+
+database:
+  name: psycopg2
+  args:
+    host: matrix-postgres
+    port: 5432
+    database: synapse
+    user: synapse
+    password: ansible-generated-db-password
+    cp_max: 10
+
+media_store_path: /matrix/synapse/media-store
+max_upload_size: "100M"
+url_preview_enabled: true
+url_preview_ip_range_blacklist:
+  - "127.0.0.0/8"
+  - "10.0.0.0/8"
+
+enable_registration: false
+registration_shared_secret: "ansible-generated-registration-secret"
+macaroon_secret_key: "ansible-generated-macaroon-secret"
+form_secret: "ansible-generated-form-secret"
+signing_key_path: "/matrix/synapse/homeserver.signing.key"
+
+rc_message:
+  per_second: 0.2
+  burst_count: 10
+rc_login:
+  address:
+    per_second: 0.17
+    burst_count: 3
+rc_registration:
+  per_second: 0.17
+  burst_count: 3
+
+allowed_local_3pids:
+  - medium: email
+    pattern: "*@example.org"
+
+retention:
+  enabled: true
+  default_policy:
+    min_lifetime: 1d
+    max_lifetime: 1y
+
+turn_uris:
+  - "turn:turn.example.org?transport=udp"
+turn_shared_secret: "ansible-generated-turn-secret"
+
+user_directory:
+  enabled: true
+  search_all_users: false
+
+report_stats: false
+enable_metrics: true

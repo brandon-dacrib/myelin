@@ -1,0 +1,6 @@
+# The smallest file Synapse itself would call valid: just a server name and
+# a registration secret. Every key here is `Mapped`, so this translates
+# cleanly with no `--allow-unsupported-synapse-config` override — the
+# baseline "the translator doesn't get in a small operator's way" case.
+server_name: minimal.example.org
+registration_shared_secret: "minimal-shared-secret"

@@ -1,0 +1,163 @@
+# Kitchen-sink fixture: every Synapse config key classified `Mapped` or
+# `Mapped (diff)` in docs/compat/synapse-config-table.md that can coexist in
+# one valid file, each set to a value distinct enough to assert on.
+#
+# Deliberately excluded (mutually exclusive with something else here, or
+# with each other, either by the translator's own logic or by hs-config's
+# validation) — covered instead by dedicated unit tests in
+# crates/hs-compat/src/translate.rs:
+#   - `registration_shared_secret` (inline form; this file uses the
+#     `_path` form) and `macaroon_secret_key` (inline form; this file uses
+#     `macaroon_secret_key_path`).
+#   - `matrix_authentication_service` and `experimental_features.msc3861`
+#     (both target `auth.mas_delegation`, which `hs-config` also refuses to
+#     combine with `oidc_providers`, used below).
+# No `experimental_features` block: every flag in it except `msc3861` is
+# Unsupported, and this file is meant to translate cleanly without
+# `--allow-unsupported-synapse-config`.
+
+server_name: kitchen-sink.example.org
+public_baseurl: "https://ks.example.org/"
+admin_contact: "mailto:admin@example.org"
+report_stats: true
+
+signing_key_path: /etc/hs/signing.key
+
+tls_certificate_path: /etc/hs/tls/cert.pem
+tls_private_key_path: /etc/hs/tls/key.pem
+
+listeners:
+  - port: 8448
+    type: http
+    tls: true
+    x_forwarded: false
+    bind_addresses: ["0.0.0.0"]
+    resources:
+      - names: [client, federation, media]
+  - port: 8008
+    type: http
+    tls: false
+    x_forwarded: true
+    resources:
+      - names: [client, metrics]
+
+# Strips `media` from every listener's resources above, demonstrating the
+# listeners/enable_media_repo interaction.
+enable_media_repo: false
+
+database:
+  name: psycopg2
+  args:
+    host: db.internal
+    port: 5432
+    database: synapse
+    user: synapse
+    password: db-password-from-kitchen-sink
+    cp_max: 15
+
+log_config: /etc/hs/log.yaml
+
+federation_domain_whitelist:
+  - a.example.org
+  - b.example.org
+federation_verify_certificates: false
+allow_public_rooms_over_federation: true
+allow_device_name_lookup_over_federation: true
+ip_range_blacklist:
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+ip_range_whitelist:
+  - 10.1.2.0/24
+federation:
+  client_timeout: 45s
+  max_short_retry_delay: 3s
+  max_long_retry_delay: 90s
+
+rc_message:
+  per_second: 0.3
+  burst_count: 12
+rc_registration:
+  per_second: 0.2
+  burst_count: 4
+rc_login:
+  address:
+    per_second: 0.4
+    burst_count: 5
+rc_admin_redaction:
+  per_second: 2.0
+  burst_count: 60
+rc_joins:
+  local:
+    per_second: 0.2
+    burst_count: 20
+  remote:
+    per_second: 0.02
+    burst_count: 20
+rc_3pid_validation:
+  per_second: 0.005
+  burst_count: 8
+rc_federation:
+  window_size: 2000
+  sleep_limit: 20
+  sleep_delay: 500
+  reject_limit: 80
+  concurrent: 5
+
+media_store_path: /srv/media
+media_storage_providers:
+  - module: "s3_storage_provider.S3StorageProviderBackend"
+    store_local: true
+    store_remote: true
+    store_synchronous: true
+    config:
+      bucket: kitchen-sink-media
+max_upload_size: 75M
+thumbnail_sizes:
+  - width: 48
+    height: 48
+    method: crop
+  - width: 400
+    height: 300
+    method: scale
+media_retention:
+  remote_media_lifetime: 14d
+url_preview_enabled: true
+url_preview_ip_range_blacklist:
+  - 192.168.0.0/16
+enable_authenticated_media: true
+
+enable_registration: true
+# Relative to the crate root (`cargo test`'s working directory), so the
+# translator's secret-file resolution succeeds without extra test setup.
+registration_shared_secret_path: testdata/secrets/registration_shared_secret
+macaroon_secret_key_path: testdata/secrets/macaroon_secret_key
+refresh_token_lifetime: 365d
+refreshable_access_token_lifetime: 12h
+
+password_config:
+  enabled: true
+  pepper: kitchen-sink-pepper
+  policy:
+    minimum_length: 10
+    require_digit: true
+    require_symbol: true
+    require_uppercase: true
+    require_lowercase: true
+
+oidc_providers:
+  - idp_id: kitchen-idp
+    idp_name: "Kitchen IdP"
+    issuer: "https://idp.example.org/"
+    client_id: kitchen-client
+    client_secret: kitchen-client-secret
+    scopes: ["openid", "profile", "email"]
+
+app_service_config_files:
+  - /etc/hs/appservices/irc.yaml
+  - /etc/hs/appservices/telegram.yaml
+
+enable_metrics: true
+sentry:
+  dsn: "https://examplekey@sentry.example.org/1"
+opentracing:
+  enabled: true

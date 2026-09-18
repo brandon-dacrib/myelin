@@ -1,0 +1,50 @@
+# Representative of NixOS's `services.matrix-synapse.settings` module
+# output: declarative, single-host, often paired with a local Postgres
+# managed by the same `configuration.nix`. Includes unsupported keys real
+# NixOS output sets (`enable_registration_without_verification`,
+# `turn_uris`); tests run this one with `--allow-unsupported-synapse-config`.
+
+server_name: "nixos.example.org"
+
+listeners:
+  - port: 8448
+    tls: false
+    type: http
+    bind_addresses: ["127.0.0.1"]
+    resources:
+      - names: [client, federation]
+
+database:
+  name: psycopg2
+  args:
+    host: /run/postgresql
+    database: matrix-synapse
+    user: matrix-synapse
+    cp_max: 5
+
+media_store_path: /var/lib/matrix-synapse/media
+signing_key_path: "/var/lib/matrix-synapse/homeserver.signing.key"
+
+enable_registration: true
+enable_registration_without_verification: true
+registration_shared_secret: "nixos-generated-registration-secret"
+
+federation_domain_whitelist:
+  - trusted-partner.example.org
+ip_range_blacklist:
+  - "127.0.0.0/8"
+  - "::1/128"
+
+turn_uris:
+  - "turns:turn.nixos.example.org?transport=tcp"
+turn_shared_secret: "nixos-generated-turn-secret"
+
+oidc_providers:
+  - idp_id: keycloak
+    idp_name: "Keycloak"
+    issuer: "https://auth.nixos.example.org/realms/matrix"
+    client_id: synapse
+    client_secret: nixos-generated-oidc-secret
+    scopes: ["openid", "profile"]
+
+report_stats: false
