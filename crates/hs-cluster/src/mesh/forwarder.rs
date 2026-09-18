@@ -1,17 +1,22 @@
 //! The forwarding client: sends an [`Envelope`] to a shard's owner over the mesh, with retries
 //! and ownership refresh (`docs/rfcs/0001-cluster-ownership.md` section 8).
 //!
-//! Connections are not pooled in this Phase 0 implementation: each forward opens a fresh HTTP/2
-//! connection to the target replica and closes it after the reply. That is the honest, simple
-//! thing to ship first; pooling one persistent HTTP/2 connection per peer (multiplexed, per the
-//! RFC) is noted as follow-up work in `docs/status/03-cluster.md`.
+//! One persistent, multiplexed HTTP/2 connection is kept per peer address (RFC 0001 section 8/11:
+//! "one HTTP/2 connection (multiplexed)"), reused across forwards via [`hyper`]'s
+//! `SendRequest::clone` (a cheap handle to the same multiplexer, safe to use concurrently). A
+//! pooled connection that turns out to be dead (the peer restarted, an idle timeout fired) is
+//! evicted and redialed once, inline, before the failure is reported up to [`Forwarder::forward`]'s
+//! own retry loop.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
+use http::{HeaderMap, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
+use hyper::client::conn::http2::SendRequest;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpStream;
@@ -35,6 +40,10 @@ pub struct Forwarder {
     base_backoff: Duration,
     ownership: Arc<dyn Ownership>,
     metrics: Arc<ClusterMetrics>,
+    /// One pooled, multiplexed HTTP/2 connection handle per peer address. A plain
+    /// `std::sync::Mutex` is enough: every critical section is a map lookup/insert/remove with
+    /// no `.await` inside it.
+    pool: Mutex<HashMap<String, SendRequest<Full<Bytes>>>>,
 }
 
 impl Forwarder {
@@ -65,6 +74,7 @@ impl Forwarder {
             base_backoff,
             ownership,
             metrics,
+            pool: Mutex::new(HashMap::new()),
         })
     }
 
@@ -169,50 +179,39 @@ impl Forwarder {
         &self,
         owner: &ReplicaId,
         env: &Envelope,
-    ) -> Result<(http::StatusCode, http::HeaderMap, Bytes), ForwardError> {
+    ) -> Result<(StatusCode, HeaderMap, Bytes), ForwardError> {
         let addr = self.resolve_addr(owner)?;
-        let tcp = TcpStream::connect(&addr)
-            .await
-            .map_err(|e| ForwardError::Transport(format!("connect {addr}: {e}")))?;
-        tcp.set_nodelay(true).ok();
+
+        let mut send_request = match self.pooled(&addr) {
+            Some(sr) => sr,
+            None => self.connect(&addr).await?,
+        };
 
         let request = self.build_request(env)?;
-
-        let (status, hdrs, body) = if let Some(tls_cfg) = &self.client_tls {
-            let server_name = rustls_pki_types::ServerName::try_from(addr_host(&addr))
-                .map_err(|e| ForwardError::Transport(format!("invalid TLS server name: {e}")))?
-                .to_owned();
-            let connector = tokio_rustls::TlsConnector::from(tls_cfg.clone());
-            let tls_stream = connector
-                .connect(server_name, tcp)
-                .await
-                .map_err(|e| ForwardError::Transport(format!("TLS handshake: {e}")))?;
-            self.send_over(tls_stream, request).await?
-        } else {
-            self.send_over(tcp, request).await?
-        };
-        Ok((status, hdrs, body))
+        match send_request.send_request(request).await {
+            Ok(response) => Self::read_response(response).await,
+            Err(e) => {
+                // The pooled connection may have gone stale (the peer restarted, an idle
+                // timeout fired, a prior request's error poisoned the multiplexer). Evict it
+                // and retry once against a freshly dialed connection before surfacing a
+                // failure -- `forward`'s own retry loop still covers everything else (421, 503,
+                // repeated connect failures) on top of this one inline redial.
+                self.evict_pooled(&addr);
+                tracing::debug!(%addr, error = %e, "pooled mesh connection failed, redialing");
+                let mut fresh = self.connect(&addr).await?;
+                let request = self.build_request(env)?;
+                let response = fresh
+                    .send_request(request)
+                    .await
+                    .map_err(|e| ForwardError::Transport(format!("send request: {e}")))?;
+                Self::read_response(response).await
+            }
+        }
     }
 
-    async fn send_over<IO>(
-        &self,
-        io: IO,
-        request: Request<Full<Bytes>>,
-    ) -> Result<(http::StatusCode, http::HeaderMap, Bytes), ForwardError>
-    where
-        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    {
-        let (mut send_request, connection) =
-            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io))
-                .await
-                .map_err(|e| ForwardError::Transport(format!("HTTP/2 handshake: {e}")))?;
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        let response: Response<Incoming> = send_request
-            .send_request(request)
-            .await
-            .map_err(|e| ForwardError::Transport(format!("send request: {e}")))?;
+    async fn read_response(
+        response: Response<Incoming>,
+    ) -> Result<(StatusCode, HeaderMap, Bytes), ForwardError> {
         let status = response.status();
         let hdrs = response.headers().clone();
         let body = response
@@ -222,6 +221,68 @@ impl Forwarder {
             .map_err(|e| ForwardError::Transport(format!("read body: {e}")))?
             .to_bytes();
         Ok((status, hdrs, body))
+    }
+
+    /// A pooled connection handle for `addr`, if one is live. `SendRequest::clone` is a cheap
+    /// handle to the same underlying multiplexer (safe to use concurrently from multiple
+    /// forwards at once), so the original stays in the pool for the next caller.
+    fn pooled(&self, addr: &str) -> Option<SendRequest<Full<Bytes>>> {
+        self.pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(addr)
+            .cloned()
+    }
+
+    fn evict_pooled(&self, addr: &str) {
+        self.pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(addr);
+    }
+
+    /// Dials `addr` (TCP, plus TLS when configured for mutual TLS), performs the HTTP/2
+    /// handshake, spawns the connection's background driver task, and stores the resulting
+    /// handle in the pool for reuse by later forwards to the same peer.
+    async fn connect(&self, addr: &str) -> Result<SendRequest<Full<Bytes>>, ForwardError> {
+        let tcp = TcpStream::connect(addr)
+            .await
+            .map_err(|e| ForwardError::Transport(format!("connect {addr}: {e}")))?;
+        tcp.set_nodelay(true).ok();
+
+        let send_request = if let Some(tls_cfg) = &self.client_tls {
+            let server_name = rustls_pki_types::ServerName::try_from(addr_host(addr))
+                .map_err(|e| ForwardError::Transport(format!("invalid TLS server name: {e}")))?
+                .to_owned();
+            let connector = tokio_rustls::TlsConnector::from(tls_cfg.clone());
+            let tls_stream = connector
+                .connect(server_name, tcp)
+                .await
+                .map_err(|e| ForwardError::Transport(format!("TLS handshake: {e}")))?;
+            self.handshake(tls_stream).await?
+        } else {
+            self.handshake(tcp).await?
+        };
+
+        self.pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(addr.to_owned(), send_request.clone());
+        Ok(send_request)
+    }
+
+    async fn handshake<IO>(&self, io: IO) -> Result<SendRequest<Full<Bytes>>, ForwardError>
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let (send_request, connection) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io))
+                .await
+                .map_err(|e| ForwardError::Transport(format!("HTTP/2 handshake: {e}")))?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok(send_request)
     }
 
     fn build_request(&self, env: &Envelope) -> Result<Request<Full<Bytes>>, ForwardError> {

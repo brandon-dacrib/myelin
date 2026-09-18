@@ -22,7 +22,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use hs_cluster::ownership::{Drainable, KvOwnership, Ownership};
-use hs_cluster::{ClusterConfig, ReplicaId, ShardId, ShardKind, ShardLayout};
+use hs_cluster::store::ClusterStore;
+use hs_cluster::{ClusterConfig, Fence, ReplicaId, ShardId, ShardKind, ShardLayout};
 use hs_kv::memory::MemoryBackend;
 use hs_kv::{Conflict, KvBackend, KvError, KvRead, KvWrite, TransactConfig, transact};
 use serde::{Deserialize, Serialize};
@@ -217,6 +218,9 @@ async fn no_two_replicas_ever_commit_the_same_shard_epoch() {
     let backend = MemoryBackend::new();
     let layout = ShardLayout::small(6);
     let log = ChaosLog::open(backend.clone());
+    // An observer store, independent of any replica's ownership, used only to fetch the shard
+    // keyspace handle for the adversarial stale-fence writes below.
+    let observer_store = ClusterStore::open(backend.clone()).unwrap();
 
     let mut replicas = Vec::new();
     let mut handles = Vec::new();
@@ -234,19 +238,79 @@ async fn no_two_replicas_ever_commit_the_same_shard_epoch() {
     // crash) and letting the survivors converge, across many rounds.
     let shards: Vec<ShardId> = layout.all_shards().collect();
     let mut idem = 0u128;
+
+    // Captured at the moment of the kill below: the doomed replica's identity and its fence for
+    // every shard it owned at that instant. A *graceful* kill (abort the task, stop using it, as
+    // this test did before) never exercises the fence adversarially, because nothing ever
+    // attempts another write with a stale fence once the replica is out of rotation -- so a
+    // mutation that disabled `Fence::check` entirely would sail through undetected here, even
+    // though this is the test whose name claims to guard exactly that property. Keeping the
+    // stale fence around and retrying writes with it after ownership has moved on (an
+    // *ungraceful* loss: the process is gone, but a caller who was mid-retry with its last-known
+    // fence is not) is what actually exercises the guarantee.
+    let mut stale_writer: Option<ReplicaId> = None;
+    let mut stale_fences: Vec<(ShardId, Fence)> = Vec::new();
+    let mut adversarial_checks = 0u32;
+
     for round in 0..40u32 {
         for &shard in &shards {
             idem += 1;
             let _ = append_via_current_owner(&replicas, &log, shard, idem);
         }
+
         if round == 15 && !replicas.is_empty() {
-            // Kill one replica outright: abort its background task so it stops heartbeating.
+            let doomed = &replicas[0];
+            stale_fences = shards
+                .iter()
+                .filter_map(|&s| doomed.fence(s).map(|f| (s, f)))
+                .collect();
+            assert!(
+                !stale_fences.is_empty(),
+                "the doomed replica should own at least one shard for this test to be meaningful"
+            );
+            stale_writer = Some(doomed.me().clone());
+            // Ungraceful loss: abort the task so it can never heartbeat or re-converge (there is
+            // no drain, no release), but keep its captured identity and fences and keep using
+            // them below.
             handles.remove(0).abort();
             replicas.remove(0);
         }
+
+        // Once the doomed replica is gone, keep attacking every shard it used to own with its
+        // stale, pre-kill fence on every remaining round. A fence is only "stale" once some
+        // other replica has actually re-acquired the shard (bumping its epoch) -- until then the
+        // captured fence is still the current one and a write with it is legitimate, not
+        // adversarial, so the check below only fires once the store shows the epoch has moved
+        // past what the doomed replica held. Every attempt made *after* that point must be
+        // rejected; since `ChaosLog::append` only mutates the store on success, this also proves
+        // no entry from the stale writer's post-failover attempts ever reaches the log.
+        if let Some(writer) = &stale_writer {
+            for (shard, fence) in &stale_fences {
+                let Some(held) = fence.epoch else { continue };
+                let current = observer_store.get_shard(*shard).expect("read shard row");
+                if current.epoch <= held {
+                    continue; // not fenced yet: no other replica has taken this shard over
+                }
+                idem += 1;
+                let result =
+                    log.append(fence, observer_store.shard_keyspace(), *shard, writer, idem);
+                assert!(
+                    result.is_err(),
+                    "shard {shard}: a write using the stale, pre-failover fence must be rejected once a new owner has taken over, got {result:?}"
+                );
+                adversarial_checks += 1;
+            }
+        }
+
         settle(Duration::from_millis(40), 1).await;
     }
     settle(Duration::from_millis(200), 6).await;
+
+    assert!(
+        adversarial_checks > 0,
+        "the stale-fence check never actually fired (no shard the doomed replica owned was ever \
+         re-acquired by a survivor) -- this test would pass vacuously without checking anything"
+    );
 
     // Safety invariant: for every shard, every committed epoch has exactly one writer, and
     // epochs are non-decreasing in commit order. This is the property the fencing epoch exists
@@ -454,8 +518,33 @@ async fn a_partitioned_replica_cannot_write_after_being_fenced() {
         "a write fenced against the old epoch must not commit"
     );
 
-    // And a write from the new owner, with its own fresh fence, must succeed.
-    let fence_b = b.fence(shard).expect("hs-1 should hold a fresh fence");
-    let ok = log.append(&fence_b, b.store().shard_keyspace(), shard, b.me(), 1000);
-    assert!(ok.is_ok(), "the new owner's write should succeed: {ok:?}");
+    // And the new owner keeps making progress for as long as hs-0 stays stalled -- a partition
+    // of one replica must not stall the shard, only move it (RFC 0001's risk paragraph again:
+    // fencing makes the stall safe, but the rest of the cluster is not supposed to wait on it).
+    // hs-0 remains cut for every one of these; each write re-derives hs-1's current fence rather
+    // than reusing one value, since a real caller would too.
+    for i in 0..5u128 {
+        let fence_b = b
+            .fence(shard)
+            .expect("hs-1 should hold a fresh fence while hs-0 stays partitioned");
+        let ok = log.append(
+            &fence_b,
+            b.store().shard_keyspace(),
+            shard,
+            b.me(),
+            1000 + i,
+        );
+        assert!(
+            ok.is_ok(),
+            "hs-1 should keep committing while hs-0 is partitioned: {ok:?}"
+        );
+    }
+
+    // hs-0's stale fence is still rejected after hs-1 has made further progress, not just at the
+    // moment of takeover -- the rejection is a property of the epoch, not a one-shot check.
+    let still_rejected = log.append(&fence_a, a.store().shard_keyspace(), shard, a.me(), 2000);
+    assert!(
+        still_rejected.is_err(),
+        "hs-0's stale fence must remain rejected even after hs-1 has committed further writes"
+    );
 }
