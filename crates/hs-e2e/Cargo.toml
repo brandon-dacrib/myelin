@@ -5,8 +5,30 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "hs-e2e: see docs/workstreams for the owning track"
+description = "hs-e2e: device keys, one-time/fallback keys, cross-signing, key backups, to-device messaging, device-list tracking, appservice key proxies (track 08)"
 
 [dependencies]
+axum = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+ruma = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+hs-kv = { path = "../hs-kv" }
+hs-tables = { path = "../hs-tables" }
+hs-auth = { path = "../hs-auth" }
+hs-http = { path = "../hs-http" }
+hs-appservice = { path = "../hs-appservice" }
 
 [dev-dependencies]
+proptest = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tempfile = { workspace = true }
+futures = { workspace = true }
+hs-testkit = { path = "../hs-testkit" }
+tokio = { workspace = true, features = ["full", "test-util"] }
