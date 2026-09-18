@@ -1,21 +1,20 @@
 //! Provider adapters (`docs/rfcs/0008-content-scanning.md`, section 3).
 //!
-//! Build order and relative depth follow the RFC's own priority, set by the integration lead
-//! after this session had already started on a five-way-equal plan: **ICAP is the primary
-//! adapter** (nearly every scanner an operator might want — ClamAV via `c-icap`, the commercial
-//! engines natively, cloud APIs via an ICAP gateway — is reachable through it), so
-//! [`icap`] is the deep, protocol-complete implementation (OPTIONS negotiation, preview mode,
-//! `204`, `Transfer-Ignore`, connection reuse, `ISTag`-as-`engine_version`). [`clamav`] is kept as
-//! a one-hop optimization for operators who would rather not also run `c-icap`, not a peer in
-//! effort. [`http`] and [`command`] cover what ICAP cannot (CrowdStrike Falcon's submit-and-poll
-//! API; a local binary). [`none`] is the default.
+//! Only three: [`icap`] (the provider — everything reaches us through it), [`http`] (only for
+//! cloud APIs with no ICAP fronting, notably CrowdStrike Falcon's submit-then-poll API), and
+//! [`none`] (the default). A direct clamd client and a spawn-a-binary command runner were both
+//! considered and deliberately **not** built, per
+//! `docs/decisions/0007-build-less-reuse-more.md`: c-icap's `virus_scan` service already drives
+//! ClamAV with packaged container images, so a second path to the same engine would be duplicated
+//! maintenance forever rather than a saving. See `docs/status/09-media.md`'s "Reuse considered"
+//! for the fuller record, including that this was a mid-session scope cut (the crate briefly had
+//! `clamav`/`command` config scaffolding, which was removed before any client code existed for
+//! either).
 //!
 //! [`build`] turns a [`crate::scanning::config::ScanningConfig`] into a boxed
 //! [`crate::scanning::types::ContentScanner`], the one place that knows which provider module a
 //! given [`crate::scanning::config::ProviderKind`] maps to.
 
-pub mod clamav;
-pub mod command;
 pub mod http;
 pub mod icap;
 pub mod none;
@@ -42,27 +41,11 @@ pub fn build(config: &ScanningConfig) -> Result<Arc<dyn ContentScanner>, MediaEr
             })?;
             Ok(Arc::new(icap::IcapScanner::new(icap_config.clone())))
         }
-        ProviderKind::ClamAv => {
-            let clamav_config = config.clamav.as_ref().ok_or_else(|| {
-                MediaError::InvalidInput(
-                    "provider is `clamav` but no `clamav` settings were given".into(),
-                )
-            })?;
-            Ok(Arc::new(clamav::ClamAvScanner::new(clamav_config.clone())))
-        }
         ProviderKind::Http => {
             let http_config = config.http.as_ref().ok_or_else(|| {
                 MediaError::InvalidInput("provider is `http` but no `http` settings were given".into())
             })?;
             Ok(Arc::new(http::HttpScanner::new(http_config.clone())))
-        }
-        ProviderKind::Command => {
-            let command_config = config.command.as_ref().ok_or_else(|| {
-                MediaError::InvalidInput(
-                    "provider is `command` but no `command` settings were given".into(),
-                )
-            })?;
-            Ok(Arc::new(command::CommandScanner::new(command_config.clone())))
         }
     }
 }
@@ -70,7 +53,7 @@ pub fn build(config: &ScanningConfig) -> Result<Arc<dyn ContentScanner>, MediaEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scanning::config::{ClamAvConfig, FailPolicy, ScanMode};
+    use crate::scanning::config::{FailPolicy, IcapConfig, PreviewMode, ScanMode};
 
     #[test]
     fn builds_none_by_default() {
@@ -79,16 +62,21 @@ mod tests {
     }
 
     #[test]
-    fn builds_clamav_when_configured() {
+    fn builds_icap_when_configured() {
         let cfg = ScanningConfig {
             mode: ScanMode::Block,
-            provider: ProviderKind::ClamAv,
+            provider: ProviderKind::Icap,
             fail: Some(FailPolicy::Closed),
-            clamav: Some(ClamAvConfig::default()),
+            icap: Some(IcapConfig {
+                host: "c-icap".into(),
+                port: 1344,
+                service: "virus_scan".into(),
+                preview: PreviewMode::Negotiate,
+            }),
             ..ScanningConfig::default()
         };
         let scanner = build(&cfg).unwrap();
-        assert_eq!(scanner.id(), "clamav");
+        assert_eq!(scanner.id(), "icap");
     }
 
     #[test]

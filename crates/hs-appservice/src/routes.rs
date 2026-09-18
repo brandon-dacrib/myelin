@@ -169,11 +169,7 @@ mod tests {
         let as_registry = InMemoryAppserviceRegistry::new();
         as_registry.insert(
             "as_irc",
-            AppserviceRecord {
-                appservice_id: "irc".to_string(),
-                sender: user_id!("@ircbot:example.org").to_owned(),
-                user_namespaces: vec![],
-            },
+            AppserviceRecord::new("irc", user_id!("@ircbot:example.org").to_owned(), vec![]),
         );
         let auth_state = hs_auth::state::AuthState {
             appservices: Arc::new(as_registry),

@@ -1,29 +1,40 @@
-//! [`GenericStore`]: a full [`crate::api::StateStore`] for any [`super::repr::StateRepr`].
+//! [`KvStateStore`]: the production [`crate::api::StateStore`], generic over one
+//! [`StateRepr`] implementation.
 //!
 //! This is [`crate::store::InMemoryStateStore`]'s ingestion and resolution logic, unchanged in
-//! substance, made generic over the state representation so all three bake-off candidates share
-//! one tested implementation of "ingest an event, resolve its predecessor state, run state
-//! resolution on a fork" and differ only in `R: StateRepr`.
+//! substance, made generic over the state representation so it is not duplicated across the
+//! production representation (`crate::frames::FrameRepr`, the bake-off's winning candidate B --
+//! `docs/decisions/0006-state-bakeoff-results.md`) and the two benchmark-only representations kept
+//! under `crate::bakeoff` for that decision's own "what would change this decision" re-runs.
+//! [`ProductionStateStore`] is this type instantiated with the production representation; that is
+//! what tracks 04 and 06 should hold.
+//!
+//! `InMemoryStateStore` itself is deliberately *not* rebuilt on top of this module (it stays a
+//! hand-written, dependency-light reference implementation for tests -- see its own module docs);
+//! this module and `crate::store` therefore still look similar to each other by construction, not
+//! by accident.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
+use hs_kv::KvBackend;
 use hs_model::canonical::CanonicalJsonObject;
 use hs_model::ids::{EventSn, StateKeyId};
 use hs_model::room_version::{self, RoomVersionRules, StateResolutionVersion};
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomVersionId};
 use thiserror::Error;
 
-use super::repr::StateRepr;
 use crate::api::{StateDiff, StateStore};
 use crate::chain_cover::{ChainCoverIndex, ChainPosition};
 use crate::error::StateResError;
+use crate::frames::FrameRepr;
+use crate::repr::StateRepr;
 use crate::state_res::{self, EventStore, ResolutionEvent};
 
-/// Errors from [`GenericStore`]: the representation's own errors, plus the same ingestion-level
+/// Errors from [`KvStateStore`]: the representation's own errors, plus the same ingestion-level
 /// errors [`crate::store::InMemoryStateStore`]'s `StoreError` defines.
 #[derive(Debug, Error)]
-pub enum BakeoffError<E: std::error::Error + Send + Sync + 'static> {
+pub enum KvStoreError<E: std::error::Error + Send + Sync + 'static> {
     /// The representation itself failed (storage I/O, an unknown root).
     #[error(transparent)]
     Repr(E),
@@ -71,23 +82,30 @@ impl<Root> Default for CommonInner<Root> {
     }
 }
 
-/// A [`StateStore`] for any bake-off candidate `R`.
-pub struct GenericStore<R: StateRepr> {
+/// A [`StateStore`] backed by any [`StateRepr`] implementation `R`. See the module docs; the
+/// concrete type production callers want is [`ProductionStateStore`].
+pub struct KvStateStore<R: StateRepr> {
     room_version: RoomVersionId,
     rules: RoomVersionRules,
     repr: R,
     common: RefCell<CommonInner<R::Root>>,
 }
 
-impl<R: StateRepr> GenericStore<R> {
+/// The production [`StateStore`]: [`KvStateStore`] instantiated with the bake-off's winning
+/// representation (`crate::frames::FrameRepr`) over a caller-chosen `hs_kv::KvBackend`. This is
+/// what tracks 04 and 06 should hold one of per room -- see
+/// `docs/status/02-state-and-model.md`'s "Interfaces provided" for the call patterns.
+pub type ProductionStateStore<KV> = KvStateStore<FrameRepr<KV>>;
+
+impl<R: StateRepr> KvStateStore<R> {
     /// Wraps `repr` (freshly created, empty) as a `StateStore` for a room of `room_version`.
     ///
     /// # Errors
-    /// Returns [`BakeoffError::UnsupportedRoomVersion`] if `room_version` is not in
+    /// Returns [`KvStoreError::UnsupportedRoomVersion`] if `room_version` is not in
     /// [`hs_model::room_version`]'s table.
-    pub fn new(room_version: RoomVersionId, repr: R) -> Result<Self, BakeoffError<R::Error>> {
+    pub fn new(room_version: RoomVersionId, repr: R) -> Result<Self, KvStoreError<R::Error>> {
         let rules = room_version::rules_for(&room_version).ok_or_else(|| {
-            BakeoffError::UnsupportedRoomVersion(room_version.as_str().to_owned())
+            KvStoreError::UnsupportedRoomVersion(room_version.as_str().to_owned())
         })?;
         Ok(Self {
             room_version,
@@ -144,7 +162,7 @@ impl<R: StateRepr> GenericStore<R> {
         auth_events: &[EventSn],
         prev_events: &[EventSn],
         only_prev_event_is_room_create: bool,
-    ) -> Result<R::Root, BakeoffError<R::Error>> {
+    ) -> Result<R::Root, KvStoreError<R::Error>> {
         let mut inner = self.common.borrow_mut();
 
         inner.sn_of_event_id.insert(event_id.clone(), event);
@@ -190,7 +208,7 @@ impl<R: StateRepr> GenericStore<R> {
             let key_id = Self::intern_key(&mut inner, event_type, state_key);
             self.repr
                 .apply(state_before, &StateDiff::set(key_id, event))
-                .map_err(BakeoffError::Repr)?
+                .map_err(KvStoreError::Repr)?
         } else {
             state_before
         };
@@ -209,14 +227,14 @@ impl<R: StateRepr> GenericStore<R> {
         &self,
         inner: &mut CommonInner<R::Root>,
         forks: &[R::Root],
-    ) -> Result<R::Root, BakeoffError<R::Error>> {
+    ) -> Result<R::Root, KvStoreError<R::Error>> {
         if forks.iter().all(|r| *r == forks[0]) {
             return Ok(forks[0]);
         }
 
         let mut state_maps: Vec<state_res::StateMap> = Vec::with_capacity(forks.len());
         for root in forks {
-            let full = self.repr.full_state(*root).map_err(BakeoffError::Repr)?;
+            let full = self.repr.full_state(*root).map_err(KvStoreError::Repr)?;
             let map = full
                 .iter()
                 .filter_map(|(key, sn)| {
@@ -252,7 +270,7 @@ impl<R: StateRepr> GenericStore<R> {
         // has, not as "every key, from scratch," which would defeat the whole point of measuring
         // structural sharing under "resolution time on forks."
         let base = forks[0];
-        let base_map = self.repr.full_state(base).map_err(BakeoffError::Repr)?;
+        let base_map = self.repr.full_state(base).map_err(KvStoreError::Repr)?;
         let mut added = BTreeMap::new();
         for (key, sn) in &resolved_map {
             if base_map.get(key) != Some(sn) {
@@ -265,13 +283,39 @@ impl<R: StateRepr> GenericStore<R> {
             .copied()
             .collect();
         let diff = StateDiff { added, removed };
-        self.repr.apply(base, &diff).map_err(BakeoffError::Repr)
+        self.repr.apply(base, &diff).map_err(KvStoreError::Repr)
     }
 }
 
-impl<R: StateRepr> StateStore for GenericStore<R> {
+impl<KV: KvBackend> KvStateStore<FrameRepr<KV>> {
+    /// Opens the production state store for a room of `room_version` over `backend`: the
+    /// convenience constructor tracks 04 and 06 should use instead of building a `FrameRepr` and
+    /// wrapping it by hand.
+    ///
+    /// # Errors
+    /// Returns [`KvStoreError::UnsupportedRoomVersion`] if `room_version` is not in
+    /// [`hs_model::room_version`]'s table, or [`KvStoreError::Repr`] if `backend` could not open
+    /// the frames keyspace.
+    pub fn open(
+        room_version: RoomVersionId,
+        backend: KV,
+    ) -> Result<Self, KvStoreError<crate::frames::Error>> {
+        let repr = FrameRepr::new(backend).map_err(KvStoreError::Repr)?;
+        Self::new(room_version, repr)
+    }
+}
+
+impl<R: StateRepr> StateStore for KvStateStore<R> {
     type Root = R::Root;
-    type Error = BakeoffError<R::Error>;
+    type Error = KvStoreError<R::Error>;
+
+    fn intern_state_key(
+        &self,
+        event_type: &str,
+        state_key: &str,
+    ) -> Result<StateKeyId, Self::Error> {
+        Ok(self.intern(event_type, state_key))
+    }
 
     fn state_at(&self, event: EventSn) -> Result<R::Root, Self::Error> {
         self.common
@@ -279,19 +323,19 @@ impl<R: StateRepr> StateStore for GenericStore<R> {
             .state_at
             .get(&event)
             .copied()
-            .ok_or(BakeoffError::UnknownEvent(event))
+            .ok_or(KvStoreError::UnknownEvent(event))
     }
 
     fn get(&self, root: R::Root, key: StateKeyId) -> Result<Option<EventSn>, Self::Error> {
-        self.repr.get(root, key).map_err(BakeoffError::Repr)
+        self.repr.get(root, key).map_err(KvStoreError::Repr)
     }
 
     fn diff(&self, from: R::Root, to: R::Root) -> Result<StateDiff, Self::Error> {
-        self.repr.diff(from, to).map_err(BakeoffError::Repr)
+        self.repr.diff(from, to).map_err(KvStoreError::Repr)
     }
 
     fn apply(&self, root: R::Root, changes: &StateDiff) -> Result<R::Root, Self::Error> {
-        self.repr.apply(root, changes).map_err(BakeoffError::Repr)
+        self.repr.apply(root, changes).map_err(KvStoreError::Repr)
     }
 
     fn resolve(
@@ -300,10 +344,10 @@ impl<R: StateRepr> StateStore for GenericStore<R> {
         forks: &[R::Root],
     ) -> Result<R::Root, Self::Error> {
         if forks.is_empty() {
-            return Err(BakeoffError::EmptyForks);
+            return Err(KvStoreError::EmptyForks);
         }
         if *room_version != self.room_version {
-            return Err(BakeoffError::WrongRoomVersion);
+            return Err(KvStoreError::WrongRoomVersion);
         }
         let mut inner = self.common.borrow_mut();
         self.resolve_locked(&mut inner, forks)
@@ -327,7 +371,7 @@ impl<R: StateRepr> StateStore for GenericStore<R> {
 }
 
 /// The same fork-and-merge scenario `crate::store::InMemoryStateStore`'s tests exercise, run
-/// through `GenericStore` for every bake-off candidate, over `hs_kv::memory::MemoryBackend`. This
+/// through `KvStateStore` for every bake-off candidate, over `hs_kv::memory::MemoryBackend`. This
 /// is the correctness gate the bake-off's numbers depend on: a candidate that is fast but resolves
 /// forks incorrectly would invalidate every other measurement, so this runs the full
 /// ingest-then-resolve path (not just `StateRepr::get`/`diff`/`apply` in isolation, which each
@@ -340,7 +384,8 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::bakeoff::{FrameRepr, PersistentMapRepr, SnapshotDeltaRepr};
+    use crate::bakeoff::{PersistentMapRepr, SnapshotDeltaRepr};
+    use crate::frames::FrameRepr;
 
     fn obj(v: serde_json::Value) -> CanonicalJsonObject {
         to_canonical_object(&v, true).unwrap()
@@ -349,7 +394,7 @@ mod tests {
     /// Builds `create -> join -> power_levels -> (topic "a" | topic "b") -> merge` and asserts
     /// the merge event's resolved state carries the higher-depth topic, exactly like
     /// `crate::store::InMemoryStateStore`'s `fork_and_merge_resolves_through_the_trait`.
-    fn fork_and_merge_resolves<R: StateRepr>(store: GenericStore<R>) {
+    fn fork_and_merge_resolves<R: StateRepr>(store: KvStateStore<R>) {
         let room_id = RoomId::parse("!r:hs1").unwrap();
         let creator = UserId::parse("@c:hs1").unwrap();
 
@@ -479,21 +524,21 @@ mod tests {
     #[test]
     fn candidate_a_snapshot_delta() {
         let repr = SnapshotDeltaRepr::new(MemoryBackend::default()).unwrap();
-        let store = GenericStore::new(RoomVersionId::V11, repr).unwrap();
+        let store = KvStateStore::new(RoomVersionId::V11, repr).unwrap();
         fork_and_merge_resolves(store);
     }
 
     #[test]
     fn candidate_b_frames() {
         let repr = FrameRepr::new(MemoryBackend::default()).unwrap();
-        let store = GenericStore::new(RoomVersionId::V11, repr).unwrap();
+        let store = KvStateStore::new(RoomVersionId::V11, repr).unwrap();
         fork_and_merge_resolves(store);
     }
 
     #[test]
     fn candidate_c_persistent_map() {
         let repr = PersistentMapRepr::new(MemoryBackend::default()).unwrap();
-        let store = GenericStore::new(RoomVersionId::V11, repr).unwrap();
+        let store = KvStateStore::new(RoomVersionId::V11, repr).unwrap();
         fork_and_merge_resolves(store);
     }
 }

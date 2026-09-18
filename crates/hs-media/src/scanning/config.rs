@@ -84,23 +84,18 @@ pub enum ProviderKind {
 }
 
 /// How the client negotiates ICAP preview mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "snake_case", tag = "mode", content = "bytes")]
 pub enum PreviewMode {
     /// Follow the server's `OPTIONS`-advertised `Transfer-Preview`/`Transfer-Ignore`/
     /// `Transfer-Complete` policy (the default, and what real ICAP services such as c-icap
     /// expect an operator to rely on).
+    #[default]
     Negotiate,
     /// Force a specific preview size regardless of what `OPTIONS` advertises.
     Bytes(usize),
     /// Never preview; always send the complete body.
     Off,
-}
-
-impl Default for PreviewMode {
-    fn default() -> Self {
-        PreviewMode::Negotiate
-    }
 }
 
 /// `icap` provider settings.

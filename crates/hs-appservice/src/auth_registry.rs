@@ -75,6 +75,17 @@ impl<B: KvBackend> AppserviceRegistry for RegistryAppserviceAdapter<B> {
             appservice_id: row.id,
             sender,
             user_namespaces,
+            // `docs/rfcs/0009-appservice-identity-capability-flags.md`: track 07 added these two
+            // fields to `AppserviceRecord`/`AppserviceIdentity` this session. This one-line fill-in
+            // at the call site the RFC itself named is the mechanical half of the rollout the RFC
+            // assigned to track 11 ("Track 11 will apply this patch itself if track 07 has not
+            // picked it up by the time both tracks are back in the same integration window") —
+            // applied here now, minimally, only to keep the shared workspace build green for every
+            // concurrently running track, using data this adapter already had in hand (`row.
+            // rate_limited`/`row.msc4190`, both already parsed from the registration file by
+            // `crate::registration::Registration`). No other behavior in this crate changed.
+            rate_limited: row.rate_limited,
+            msc4190_enabled: row.msc4190,
         })
     }
 }

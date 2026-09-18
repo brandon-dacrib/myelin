@@ -39,6 +39,7 @@ pub mod policy;
 pub mod repository;
 pub mod router;
 pub mod routes;
+pub mod scanning;
 pub mod security;
 pub mod sniff;
 pub mod state;

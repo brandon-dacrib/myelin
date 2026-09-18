@@ -1,12 +1,17 @@
-//! Candidate B: deduplicated frames with layered diffs, `PLAN.md` section 6.3's model of
-//! Conduit's and Palpo's state frames.
+//! Deduplicated frames with layered diffs: the production [`StateRepr`] implementation, modeled
+//! on Conduit's and Palpo's state frames (`PLAN.md` section 6.3).
+//!
+//! This is the bake-off's winning candidate (candidate B,
+//! `docs/decisions/0006-state-bakeoff-results.md`), promoted here out of `crate::bakeoff` per that
+//! decision's "next-owner work" note; see `crate::kv_store` for the [`crate::api::StateStore`]
+//! built on top of it. The two losing candidates remain benchmark-only under `crate::bakeoff`.
 //!
 //! A frame is a sorted set of `(StateKeyId, EventSn)` pairs expressed as a delta from a parent
 //! frame: an `appended` list and a `disposed` list, both delta-varint compressed
-//! (`super::varint`). A frame's storage key is the content hash of `(parent, appended,
+//! (`crate::varint`). A frame's storage key is the content hash of `(parent, appended,
 //! disposed)`, so two applications that happen to produce the identical delta from the identical
 //! parent are automatically deduplicated -- no extra bookkeeping, just a `get`-before-`put`.
-//! Layer depth is bounded the same way candidate A bounds delta-chain depth: every
+//! Layer depth is bounded the same way candidate A bounded delta-chain depth: every
 //! [`REBASE_INTERVAL`] hops, `apply` writes a "base" frame containing the full materialized
 //! state instead of another layer.
 
@@ -19,13 +24,16 @@ use hs_model::ids::{EventSn, StateKeyId};
 use sha1::{Digest, Sha1};
 use thiserror::Error;
 
-use super::repr::{BakeoffStats, StateRepr, set_diff};
-use super::varint::{read_uvarint, write_uvarint};
 use crate::api::StateDiff;
+use crate::repr::{ReprStats, StateRepr, set_diff};
+use crate::varint::{read_uvarint, write_uvarint};
 
 /// How many layers may stack before `apply` writes a full "base" frame instead of another delta
-/// layer. Bake-off scale, matching `SNAPSHOT_INTERVAL` in `super::snapshot_delta`; see
-/// `docs/decisions/0005-state-bakeoff-methodology.md`.
+/// layer. Bake-off scale (50), matching `SNAPSHOT_INTERVAL` in `crate::bakeoff::snapshot_delta`;
+/// see `docs/decisions/0005-state-bakeoff-methodology.md`. A real deployment should probably tune
+/// this per room size (`docs/status/02-state-and-model.md`'s "Implications for tracks 04 and 06"
+/// makes the same point) rather than leave it at the bake-off's default -- not changed here since
+/// no real-room-size data exists yet to tune it against.
 pub const REBASE_INTERVAL: u32 = 50;
 
 const EMPTY: [u8; 16] = [0; 16];
@@ -328,7 +336,7 @@ impl<KV: KvBackend> FrameRepr<KV> {
     }
 }
 
-impl<KV: KvBackend> BakeoffStats for FrameRepr<KV> {
+impl<KV: KvBackend> ReprStats for FrameRepr<KV> {
     fn bytes_on_disk(&self) -> Result<u64, Error> {
         FrameRepr::bytes_on_disk(self)
     }

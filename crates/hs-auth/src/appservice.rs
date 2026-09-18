@@ -26,8 +26,17 @@ pub struct NamespaceRule {
 }
 
 /// One application service's identity, as far as this crate's authentication path needs to know.
-/// A real registry (track 11) carries much more (transaction URLs, protocols, rate-limit
-/// exemption flags); this is the projection [`crate::middleware`] actually consumes.
+/// A real registry (track 11) carries much more (transaction URLs, protocols); this is the
+/// projection [`crate::middleware`] actually consumes.
+///
+/// `rate_limited` and `msc4190_enabled` were added per
+/// `docs/rfcs/0009-appservice-identity-capability-flags.md` (authored by track 11, applied by
+/// track 07): they let a real registry's per-registration capability flags reach
+/// [`crate::requester::AppserviceIdentity`] and, from there, rate-limiting code and
+/// `crate::routes::devices`'s MSC4190 branch. Both default to the RFC's "assume nothing extra is
+/// granted" values (`rate_limited: true` meaning *not* exempt, `msc4190_enabled: false`) via
+/// [`AppserviceRecord::new`], so existing callers that only set `appservice_id`/`sender`/
+/// `user_namespaces` and don't know about these fields keep their prior behavior unchanged.
 #[derive(Debug, Clone)]
 pub struct AppserviceRecord {
     /// The registration's `id` field.
@@ -36,9 +45,38 @@ pub struct AppserviceRecord {
     pub sender: OwnedUserId,
     /// The `namespaces.users` rules, used to validate a `user_id` masquerade parameter.
     pub user_namespaces: Vec<NamespaceRule>,
+    /// `false` if this registration's `rate_limited: false` was set, meaning every request from
+    /// this appservice (its own sender and every masqueraded user) is exempt from rate limiting.
+    /// `true` (the default) means ordinary rate limiting still applies.
+    /// `docs/rfcs/0009-appservice-identity-capability-flags.md` point 1.
+    pub rate_limited: bool,
+    /// `true` if this registration set `io.element.msc4190: true`: `PUT /devices/{deviceId}`
+    /// creates the device instead of 404ing, and `DELETE /devices/{deviceId}` skips UIA
+    /// re-authentication, for this appservice's requests.
+    /// `docs/rfcs/0009-appservice-identity-capability-flags.md` point 2.
+    pub msc4190_enabled: bool,
 }
 
 impl AppserviceRecord {
+    /// Convenience constructor for the common case (no extra capability flags), matching the
+    /// three-field shape every fixture in this workspace used before RFC 0009. Prefer this over a
+    /// bare struct literal so a future capability flag addition doesn't require touching every
+    /// call site again.
+    #[must_use]
+    pub fn new(
+        appservice_id: impl Into<String>,
+        sender: OwnedUserId,
+        user_namespaces: Vec<NamespaceRule>,
+    ) -> Self {
+        Self {
+            appservice_id: appservice_id.into(),
+            sender,
+            user_namespaces,
+            rate_limited: true,
+            msc4190_enabled: false,
+        }
+    }
+
     /// True if this appservice is allowed to masquerade as `user_id` — either it *is* the sender,
     /// or `user_id` matches one of its registered user namespaces. Matches Synapse's
     /// `ApplicationService.is_interested_in_user`/`is_exclusive_user` used from
@@ -102,14 +140,14 @@ mod tests {
     use ruma::user_id;
 
     fn bridge() -> AppserviceRecord {
-        AppserviceRecord {
-            appservice_id: "irc-bridge".to_string(),
-            sender: user_id!("@irc-bridge:example.org").to_owned(),
-            user_namespaces: vec![NamespaceRule {
+        AppserviceRecord::new(
+            "irc-bridge",
+            user_id!("@irc-bridge:example.org").to_owned(),
+            vec![NamespaceRule {
                 regex: Regex::new(r"^@irc_.*:example\.org$").unwrap(),
                 exclusive: true,
             }],
-        }
+        )
     }
 
     #[test]

@@ -22,10 +22,11 @@ use hs_kv::memory::MemoryBackend;
 use hs_model::canonical::to_canonical_object;
 use hs_model::ids::EventSn;
 use hs_state::api::StateStore;
-use hs_state::bakeoff::{
-    BakeoffStats, FrameRepr, GenericStore, PersistentMapRepr, SnapshotDeltaRepr, StateRepr,
-};
+use hs_state::bakeoff::{PersistentMapRepr, SnapshotDeltaRepr};
 use hs_state::corpus::{self, Scenario};
+use hs_state::frames::FrameRepr;
+use hs_state::kv_store::KvStateStore as GenericStore;
+use hs_state::repr::{ReprStats as BakeoffStats, StateRepr};
 use ruma::{EventId, RoomId, RoomVersionId, UserId};
 use serde::Serialize;
 

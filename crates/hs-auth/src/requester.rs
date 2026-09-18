@@ -79,6 +79,16 @@ pub struct AppserviceIdentity {
     /// validated to exist for `Requester::user_id` (Synapse rejects unknown devices here with
     /// `M_UNKNOWN_DEVICE` before a requester is built; see `crate::middleware`).
     pub masqueraded_device_id: Option<OwnedDeviceId>,
+
+    /// Copied from `AppserviceRecord::rate_limited` at authentication time. `false` means every
+    /// request from this appservice is exempt from rate limiting.
+    /// `docs/rfcs/0009-appservice-identity-capability-flags.md` point 1.
+    pub rate_limited: bool,
+
+    /// Copied from `AppserviceRecord::msc4190_enabled` at authentication time. `true` enables the
+    /// MSC4190 device-management branch in `crate::routes::devices`.
+    /// `docs/rfcs/0009-appservice-identity-capability-flags.md` point 2.
+    pub msc4190_enabled: bool,
 }
 
 impl Requester {
@@ -148,6 +158,8 @@ mod tests {
             sender: user_id!("@irc-bridge:example.org").to_owned(),
             masqueraded_user: true,
             masqueraded_device_id: None,
+            rate_limited: true,
+            msc4190_enabled: false,
         });
         assert_eq!(r.authenticated_entity(), "irc-bridge");
         assert_eq!(r.user_id, user_id!("@bot_bob:example.org"));

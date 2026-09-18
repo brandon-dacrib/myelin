@@ -32,8 +32,8 @@ use hs_model::ids::{EventSn, StateKeyId};
 use sha1::{Digest, Sha1};
 use thiserror::Error;
 
-use super::repr::{BakeoffStats, StateRepr};
 use crate::api::StateDiff;
+use crate::repr::{ReprStats, StateRepr};
 
 const EMPTY: [u8; 16] = [0; 16];
 
@@ -612,7 +612,7 @@ impl<KV: KvBackend> PersistentMapRepr<KV> {
     }
 }
 
-impl<KV: KvBackend> BakeoffStats for PersistentMapRepr<KV> {
+impl<KV: KvBackend> ReprStats for PersistentMapRepr<KV> {
     fn bytes_on_disk(&self) -> Result<u64, Error> {
         PersistentMapRepr::bytes_on_disk(self)
     }

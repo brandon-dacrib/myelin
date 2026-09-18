@@ -22,6 +22,7 @@ use crate::appservice::AppserviceRecord;
 use crate::error::{ErrCode, MatrixError};
 use crate::password;
 use crate::session::{self, NewSession};
+use crate::shared_secret_auth;
 use crate::state::AuthState;
 use crate::token::TokenHash;
 
@@ -29,16 +30,27 @@ use crate::token::TokenHash;
 /// so a failed login never tells an attacker which half was wrong.
 const INVALID_USERNAME_OR_PASSWORD: &str = "Invalid username or password";
 
+/// The wire login type for `crate::shared_secret_auth` (legacy mautrix bridge double puppeting).
+const SHARED_SECRET_AUTH_LOGIN_TYPE: &str = "com.devture.shared_secret_auth";
+
 /// `GET /login`: the login flows this server offers. `m.login.application_service` is
 /// deliberately not advertised here — appservices know to use it implicitly from their
 /// registration, the same way Synapse omits it from `get_login_types`.
-pub async fn get_login_types() -> Json<Value> {
-    Json(json!({
-        "flows": [
-            {"type": "m.login.password"},
-            {"type": "m.login.token"},
-        ]
-    }))
+/// `com.devture.shared_secret_auth` is advertised only when a secret is configured for it
+/// (`crate::shared_secret_auth`), matching how mautrix bridges probe for it
+/// (`refs/mautrix-python/mautrix/bridge/custom_puppet.py`'s
+/// `flows.get_first_of_type(LoginType.DEVTURE_SHARED_SECRET, LoginType.PASSWORD)`, read for
+/// behavior only): a bridge falls back to `m.login.password` when the flow isn't offered, so a
+/// server that never enabled the feature should not pretend to.
+pub async fn get_login_types(State(state): State<AuthState>) -> Json<Value> {
+    let mut flows = vec![
+        json!({"type": "m.login.password"}),
+        json!({"type": "m.login.token"}),
+    ];
+    if state.config.shared_secret_auth_secret.is_some() {
+        flows.push(json!({"type": SHARED_SECRET_AUTH_LOGIN_TYPE}));
+    }
+    Json(json!({ "flows": flows }))
 }
 
 /// `POST /login`.
@@ -69,18 +81,23 @@ pub async fn post_login(
         )
     })?;
 
-    let user_id = match login_info {
-        LoginInfo::Password(p) => resolve_password_login(&state, &p).await?,
-        LoginInfo::Token(t) => resolve_token_login(&state, &t.token).await?,
-        LoginInfo::ApplicationService(as_info) => {
-            resolve_appservice_login(&state, &headers, &query, as_info.identifier.as_ref()).await?
-        }
-        _ => {
-            return Err(MatrixError::new(
-                StatusCode::BAD_REQUEST,
-                ErrCode::Unrecognized,
-                "Unsupported login type",
-            ));
+    let user_id = if login_info.login_type() == SHARED_SECRET_AUTH_LOGIN_TYPE {
+        resolve_shared_secret_auth_login(&state, &login_info.data()).await?
+    } else {
+        match login_info {
+            LoginInfo::Password(p) => resolve_password_login(&state, &p).await?,
+            LoginInfo::Token(t) => resolve_token_login(&state, &t.token).await?,
+            LoginInfo::ApplicationService(as_info) => {
+                resolve_appservice_login(&state, &headers, &query, as_info.identifier.as_ref())
+                    .await?
+            }
+            _ => {
+                return Err(MatrixError::new(
+                    StatusCode::BAD_REQUEST,
+                    ErrCode::Unrecognized,
+                    "Unsupported login type",
+                ));
+            }
         }
     };
 
@@ -189,6 +206,52 @@ async fn resolve_token_login(state: &AuthState, token: &str) -> Result<OwnedUser
     record
         .map(|r| r.user_id)
         .ok_or_else(|| MatrixError::forbidden("Invalid login token"))
+}
+
+/// Resolves a `com.devture.shared_secret_auth` login (`crate::shared_secret_auth`). `data` is
+/// `LoginInfo::data()`'s view of the request body with `type` removed: `{"identifier": {"type":
+/// "m.id.user", "user": "..."}, "token": "<hex hmac-sha512>"}`. Returns
+/// [`MatrixError::forbidden`] with the same generic wording as a failed password login on any
+/// failure (unknown/malformed token, wrong secret, non-`m.id.user` identifier), so a probing
+/// client cannot distinguish "this feature is disabled" from "you got the token wrong" — the only
+/// case advertised differently is the feature being entirely unconfigured, which
+/// [`get_login_types`] simply does not list.
+async fn resolve_shared_secret_auth_login(
+    state: &AuthState,
+    data: &serde_json::Map<String, Value>,
+) -> Result<OwnedUserId, MatrixError> {
+    let Some(secret) = state.config.shared_secret_auth_secret.as_deref() else {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            ErrCode::Unrecognized,
+            "com.devture.shared_secret_auth is not enabled on this server",
+        ));
+    };
+
+    let identifier: UserIdentifier = data
+        .get("identifier")
+        .cloned()
+        .ok_or_else(|| MatrixError::missing_param("Missing identifier"))
+        .and_then(|v| {
+            serde_json::from_value(v).map_err(|_| MatrixError::invalid_param("invalid identifier"))
+        })?;
+    let UserIdentifier::Matrix(m) = identifier else {
+        return Err(MatrixError::invalid_param(
+            "com.devture.shared_secret_auth only supports m.id.user identifiers",
+        ));
+    };
+    let user_id = UserId::parse_with_server_name(m.user.as_str(), state.server_name())
+        .map_err(|_| MatrixError::invalid_param("invalid user identifier"))?;
+
+    let token = data
+        .get("token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| MatrixError::missing_param("Missing token"))?;
+
+    shared_secret_auth::verify_token(secret.as_bytes(), &user_id, token)
+        .map_err(|_| MatrixError::forbidden(INVALID_USERNAME_OR_PASSWORD))?;
+
+    Ok(user_id)
 }
 
 async fn resolve_appservice_login(
@@ -404,7 +467,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_login_types_lists_password_and_token() {
-        let Json(body) = get_login_types().await;
+        let Json(body) = get_login_types(State(AuthState::in_memory())).await;
         let types: Vec<String> = body["flows"]
             .as_array()
             .unwrap()
@@ -413,5 +476,117 @@ mod tests {
             .collect();
         assert!(types.contains(&"m.login.password".to_string()));
         assert!(types.contains(&"m.login.token".to_string()));
+    }
+
+    #[tokio::test]
+    async fn shared_secret_auth_is_not_advertised_when_unconfigured() {
+        let Json(body) = get_login_types(State(AuthState::in_memory())).await;
+        let types: Vec<String> = body["flows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["type"].as_str().unwrap().to_string())
+            .collect();
+        assert!(!types.contains(&SHARED_SECRET_AUTH_LOGIN_TYPE.to_string()));
+    }
+
+    #[tokio::test]
+    async fn shared_secret_auth_is_advertised_when_configured() {
+        let config = crate::config::AuthConfig {
+            shared_secret_auth_secret: Some("sekrit".to_string()),
+            ..crate::config::AuthConfig::default()
+        };
+        let Json(body) = get_login_types(State(AuthState::in_memory_with_config(config))).await;
+        let types: Vec<String> = body["flows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["type"].as_str().unwrap().to_string())
+            .collect();
+        assert!(types.contains(&SHARED_SECRET_AUTH_LOGIN_TYPE.to_string()));
+    }
+
+    #[tokio::test]
+    async fn shared_secret_auth_login_succeeds_with_a_valid_token() {
+        let config = crate::config::AuthConfig {
+            shared_secret_auth_secret: Some("sekrit".to_string()),
+            ..crate::config::AuthConfig::default()
+        };
+        let state = AuthState::in_memory_with_config(config);
+        let uid = user_id!("@puppet:example.org").to_owned();
+        state
+            .store
+            .create_user(UserRecord::new(uid.clone(), 0))
+            .await
+            .unwrap();
+        let token = shared_secret_auth::compute_token(b"sekrit", &uid);
+        let body = json!({
+            "type": SHARED_SECRET_AUTH_LOGIN_TYPE,
+            "identifier": {"type": "m.id.user", "user": "puppet"},
+            "token": token,
+        });
+        let response = post_login(
+            State(state),
+            HeaderMap::new(),
+            Query(HashMap::new()),
+            Json(body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn shared_secret_auth_login_rejects_a_wrong_token() {
+        let config = crate::config::AuthConfig {
+            shared_secret_auth_secret: Some("sekrit".to_string()),
+            ..crate::config::AuthConfig::default()
+        };
+        let state = AuthState::in_memory_with_config(config);
+        let uid = user_id!("@puppet2:example.org").to_owned();
+        state
+            .store
+            .create_user(UserRecord::new(uid.clone(), 0))
+            .await
+            .unwrap();
+        let body = json!({
+            "type": SHARED_SECRET_AUTH_LOGIN_TYPE,
+            "identifier": {"type": "m.id.user", "user": "puppet2"},
+            "token": "not the right token",
+        });
+        let err = post_login(
+            State(state),
+            HeaderMap::new(),
+            Query(HashMap::new()),
+            Json(body),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn shared_secret_auth_login_fails_cleanly_when_disabled() {
+        let state = AuthState::in_memory();
+        let uid = user_id!("@puppet3:example.org").to_owned();
+        state
+            .store
+            .create_user(UserRecord::new(uid.clone(), 0))
+            .await
+            .unwrap();
+        let body = json!({
+            "type": SHARED_SECRET_AUTH_LOGIN_TYPE,
+            "identifier": {"type": "m.id.user", "user": "puppet3"},
+            "token": "whatever",
+        });
+        let err = post_login(
+            State(state),
+            HeaderMap::new(),
+            Query(HashMap::new()),
+            Json(body),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.errcode().as_str(), "M_UNRECOGNIZED");
     }
 }

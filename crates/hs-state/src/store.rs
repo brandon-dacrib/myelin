@@ -267,6 +267,15 @@ impl StateStore for InMemoryStateStore {
     type Root = Root;
     type Error = StoreError;
 
+    fn intern_state_key(
+        &self,
+        event_type: &str,
+        state_key: &str,
+    ) -> Result<StateKeyId, StoreError> {
+        let mut inner = self.inner.borrow_mut();
+        Ok(self.intern_key(&mut inner, event_type, state_key))
+    }
+
     fn state_at(&self, event: EventSn) -> Result<Root, StoreError> {
         self.inner
             .borrow()

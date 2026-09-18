@@ -116,6 +116,33 @@ pub trait StateStore {
     /// The error type every method returns. See the module docs, "Errors".
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// The [`StateKeyId`] for `(event_type, state_key)`, interning a fresh one if this store has
+    /// never seen that pair before.
+    ///
+    /// This closes the gap `docs/rfcs/0010-room-actor-state-store-seam.md` section 2 named: every
+    /// other method on this trait that takes a `StateKeyId` (`get`, `apply`'s diffs) requires the
+    /// caller to already hold one, and the only way to get one used to be
+    /// [`StateStore::chain_position`]-adjacent bookkeeping inside `add_event`-style ingestion --
+    /// there was no way to ask "what id would `("m.room.member", "@alice:example.org")` have"
+    /// without already holding an event that set it. A caller that knows the string form of a key
+    /// it wants (every auth check does: `m.room.create`, `m.room.power_levels`, one specific
+    /// user's `m.room.member`) can now get a `StateKeyId` for it directly, before or independent
+    /// of ingesting the event that sets it.
+    ///
+    /// Interning is idempotent and stable for the lifetime of one store: calling this twice with
+    /// the same pair returns the same id, and the id this returns is the same one event ingestion
+    /// (`add_event`-style methods on concrete stores) assigns internally when it later sees an
+    /// event with this `(event_type, state_key)` -- both paths go through the same table.
+    ///
+    /// # Errors
+    /// Returns `Self::Error` only for a storage-layer failure; interning a key never fails for
+    /// "the key doesn't exist yet" (that is the whole point -- it creates it).
+    fn intern_state_key(
+        &self,
+        event_type: &str,
+        state_key: &str,
+    ) -> Result<StateKeyId, Self::Error>;
+
     /// The room's state immediately after `event` (*S′(event)* in the spec's notation -- see the
     /// module docs).
     ///
@@ -178,6 +205,41 @@ pub trait StateStore {
         room_version: &RoomVersionId,
         forks: &[Self::Root],
     ) -> Result<Self::Root, Self::Error>;
+
+    /// The room's current resolved state, given its current forward extremities.
+    ///
+    /// This is exactly what a room actor calls after persisting any event that changes forward
+    /// extremities (a local send, or an inbound federation event, per
+    /// `docs/rfcs/0010-room-actor-state-store-seam.md`): `state_at` of every forward extremity,
+    /// then `resolve` over the results. With one extremity (the single-writer, no-fork case that
+    /// is all a room actor without federation ever sees) this is exactly `state_at` of that one
+    /// event -- [`StateStore::resolve`] already documents that resolving a single-element slice
+    /// is a no-op, so callers do not need to special-case "no fork" themselves. With more than one
+    /// extremity (an inbound federation event citing `prev_events` that do not include the
+    /// server's current extremity, or several forward extremities accumulated from concurrent
+    /// writers), this is exactly the fork detection and resolution this trait exists for.
+    ///
+    /// A default implementation is provided so this is additive, not a breaking change to
+    /// existing implementations of this trait; concrete stores are free to override it if they
+    /// can compute it more cheaply than `state_at` per extremity plus `resolve`.
+    ///
+    /// # Errors
+    /// Returns `Self::Error` if `forward_extremities` is empty (a room always has at least one
+    /// forward extremity once created -- its `m.room.create` event, if nothing else -- so an empty
+    /// slice is a caller error, not "the state before the room existed"; use
+    /// [`StateStore::resolve`] directly with an explicit empty-state root for that case), if any
+    /// extremity is not known to this store, or if resolution itself fails.
+    fn current_state(
+        &self,
+        room_version: &RoomVersionId,
+        forward_extremities: &[EventSn],
+    ) -> Result<Self::Root, Self::Error> {
+        let roots: Vec<Self::Root> = forward_extremities
+            .iter()
+            .map(|event| self.state_at(*event))
+            .collect::<Result<_, _>>()?;
+        self.resolve(room_version, &roots)
+    }
 
     /// This event's position in the room's chain-cover index (`crate::chain_cover`), if the event
     /// has been indexed.

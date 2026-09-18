@@ -2,7 +2,53 @@
 
 Track brief: `docs/workstreams/07-auth-and-identity.md`. Owner crate: `hs-auth`.
 
-Last updated: 2026-09-18 (day one, session 1).
+Last updated: 2026-09-18 (session 2, interrupted mid-assignment — see "Session 2" below for exactly
+where it stopped and what to do first).
+
+## Session 2 summary (read this first)
+
+Assignment was, in priority order: (1) apply RFC 0009's appservice capability flags, (2) implement
+`com.devture.shared_secret_auth` natively, (3) rewire `hs-auth` to consume `hs_config::AuthConfig`
+directly, (4) replace `InMemoryAuthStore` with a persistent `hs-kv`/`hs-tables`-backed store, (5) if
+budget remains, begin the native OAuth issuer. The session was told to wrap up before reaching (3).
+
+- **Item 1 (RFC 0009) — done and verified.** `AppserviceRecord`/`AppserviceIdentity` now carry
+  `rate_limited`/`msc4190_enabled`; `crate::middleware` copies them; `crate::routes::devices`
+  consumes `msc4190_enabled`. **Track 11 is unblocked**: see "Interfaces provided" below.
+- **Item 2 (`com.devture.shared_secret_auth`) — done and verified.** New `crate::shared_secret_auth`
+  module plus wiring in `crate::routes::login`. See "Done" below for files and exact behavior.
+- **Item 3 (consume `hs_config::AuthConfig` directly) — not started.** `hs-auth::config::AuthConfig`
+  is still its own type; `crates/hs-cli/src/config_bridge.rs` still hand-bridges it. See "Next" for
+  a concrete starting point (this session read `hs_config::auth` and knows the gaps).
+- **Item 4 (persistent `AuthStore`) — not started. The auth store is still `InMemoryAuthStore`
+  only: a restart of `hs serve` still loses every user, device and token.** This is the most
+  operationally important open item; see "Next" for keyspace design notes gathered this session.
+- **Item 5 (native OAuth issuer) — not started**, as expected given the above; RFC 0003 from
+  session 1 is still the design.
+
+Everything committed compiles and passes: `cargo check -p hs-auth`, `cargo test -p hs-auth` (128
+tests, up from 115 — see "Done"), `cargo clippy -p hs-auth --all-targets -- -D warnings`,
+`cargo fmt --all -- --check`, `cargo check --workspace --all-targets` (whole workspace, including
+every crate's tests) all clean. One narrow, deliberate exception to "own crate only" was made to
+keep the shared workspace compiling — see "Decisions made", "RFC 0009's non-breaking rollout
+required a two-line fix in `hs-appservice`" below; flagging prominently since it is a compile-time
+edit to another track's crate, made only because leaving the shared build red blocks every other
+concurrently running agent.
+
+### What to do first
+
+1. Read this file's "Next" section for items 3 and 4 — both have concrete starting points recorded
+   below (which `hs-config` fields exist and don't, which keyspace shape `hs-tables` wants).
+2. Item 4 (persistence) matters more operationally than item 3 (config plumbing is a real but
+   contained annoyance; losing all data on restart is not shippable). If picking just one, do 4
+   first, unless track 12 reports the config bridge is now actively blocking something.
+3. Re-run the verification commands at the bottom of "Session 2 summary" before starting new work,
+   to confirm nothing else moved under you since this was written.
+
+---
+
+Original session 1 material follows below, unedited except where session 2 explicitly updated a
+section (each such section says so).
 
 ## Done
 

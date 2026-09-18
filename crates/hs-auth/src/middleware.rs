@@ -150,6 +150,8 @@ async fn authenticate_appservice(
             sender: record.sender.clone(),
             masqueraded_user: effective_user_id != record.sender,
             masqueraded_device_id,
+            rate_limited: record.rate_limited,
+            msc4190_enabled: record.msc4190_enabled,
         }),
         access_token_id: Some(TokenHash::of(token)),
     }))
@@ -520,14 +522,14 @@ mod tests {
     async fn appservice_token_authenticates_as_sender_by_default() {
         let state = AuthState::in_memory();
         let sender = user_id!("@bridge:example.org").to_owned();
-        let record = AppserviceRecord {
-            appservice_id: "bridge1".to_string(),
-            sender: sender.clone(),
-            user_namespaces: vec![NamespaceRule {
+        let record = AppserviceRecord::new(
+            "bridge1",
+            sender.clone(),
+            vec![NamespaceRule {
                 regex: regex::Regex::new(r"^@bridge_.*:example\.org$").unwrap(),
                 exclusive: true,
             }],
-        };
+        );
         let registry = crate::appservice::InMemoryAppserviceRegistry::new();
         registry.insert("as_token", record);
         let state = AuthState {
@@ -555,14 +557,14 @@ mod tests {
     async fn appservice_can_masquerade_as_namespaced_user() {
         let state = AuthState::in_memory();
         let sender = user_id!("@bridge:example.org").to_owned();
-        let record = AppserviceRecord {
-            appservice_id: "bridge1".to_string(),
-            sender: sender.clone(),
-            user_namespaces: vec![NamespaceRule {
+        let record = AppserviceRecord::new(
+            "bridge1",
+            sender.clone(),
+            vec![NamespaceRule {
                 regex: regex::Regex::new(r"^@bridge_.*:example\.org$").unwrap(),
                 exclusive: true,
             }],
-        };
+        );
         let registry = crate::appservice::InMemoryAppserviceRegistry::new();
         registry.insert("as_token", record);
         let state = AuthState {
@@ -589,14 +591,14 @@ mod tests {
     async fn appservice_cannot_masquerade_outside_namespace() {
         let state = AuthState::in_memory();
         let sender = user_id!("@bridge:example.org").to_owned();
-        let record = AppserviceRecord {
-            appservice_id: "bridge1".to_string(),
-            sender: sender.clone(),
-            user_namespaces: vec![NamespaceRule {
+        let record = AppserviceRecord::new(
+            "bridge1",
+            sender.clone(),
+            vec![NamespaceRule {
                 regex: regex::Regex::new(r"^@bridge_.*:example\.org$").unwrap(),
                 exclusive: true,
             }],
-        };
+        );
         let registry = crate::appservice::InMemoryAppserviceRegistry::new();
         registry.insert("as_token", record);
         let state = AuthState {
@@ -638,11 +640,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let record = AppserviceRecord {
-            appservice_id: "bridge1".to_string(),
-            sender: sender.clone(),
-            user_namespaces: vec![],
-        };
+        let record = AppserviceRecord::new("bridge1", sender.clone(), vec![]);
         let registry = crate::appservice::InMemoryAppserviceRegistry::new();
         registry.insert("as_token", record);
         let state = AuthState {
@@ -673,11 +671,7 @@ mod tests {
             .create_user(UserRecord::new(sender.clone(), 0))
             .await
             .unwrap();
-        let record = AppserviceRecord {
-            appservice_id: "bridge1".to_string(),
-            sender: sender.clone(),
-            user_namespaces: vec![],
-        };
+        let record = AppserviceRecord::new("bridge1", sender.clone(), vec![]);
         let registry = crate::appservice::InMemoryAppserviceRegistry::new();
         registry.insert("as_token", record);
         let state = AuthState {

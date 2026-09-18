@@ -1,6 +1,6 @@
-//! Minimal unsigned LEB128 varint encode/decode, used by candidate B
-//! (`bakeoff::frames`) for its "delta-varint compressed" appended/disposed lists
-//! (`PLAN.md` section 6.3).
+//! Minimal unsigned LEB128 varint encode/decode, used by the production state representation
+//! (`crate::frames`, formerly bake-off candidate B) for its "delta-varint compressed"
+//! appended/disposed lists (`PLAN.md` section 6.3).
 
 /// Appends `v`'s LEB128 encoding to `out`.
 pub fn write_uvarint(out: &mut Vec<u8>, mut v: u64) {

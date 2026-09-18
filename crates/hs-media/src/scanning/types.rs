@@ -106,10 +106,7 @@ impl<'a> ScanSource<'a> {
     /// socket.
     #[must_use]
     pub fn from_bytes(content_type: impl Into<String>, bytes: Bytes, chunk_size: usize) -> Self {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        let sha256_hex = hex_encode(&hasher.finalize());
+        let sha256_hex = sha256_hex(&bytes);
         let size = Some(bytes.len() as u64);
         Self::new(
             content_type,
@@ -173,6 +170,17 @@ impl ChunkSource for BytesChunkSource {
         self.offset = end;
         Ok(Some(chunk))
     }
+}
+
+/// Lower-case hex-encoded SHA-256 of `bytes`. Public because `crate::scanning::engine` needs the
+/// same hash independently of building a [`ScanSource`] (for the verdict cache key, computed
+/// before the source is consumed by [`ContentScanner::scan`]).
+#[must_use]
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex_encode(&hasher.finalize())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

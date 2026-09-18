@@ -1,14 +1,16 @@
-//! [`StateRepr`]: the narrow interface each bake-off candidate implements.
+//! [`StateRepr`]: the narrow interface a resolved-state storage representation implements.
 //!
-//! `PLAN.md` section 6.3's three candidates differ only in how a resolved state map is stored,
-//! looked up, diffed and updated. Everything else a `StateStore` needs -- ingesting events,
-//! calling `state_res::v1`/`v2`, the chain-cover index -- is identical code, already proven by
-//! `crate::store::InMemoryStateStore`. [`GenericStore`] (`bakeoff::generic_store`) is that shared
-//! code, generic over one [`StateRepr`] implementation per candidate
-//! (`bakeoff::snapshot_delta`, `bakeoff::frames`, `bakeoff::persistent_map`); this keeps the
-//! bake-off honest about what it measures (state *storage*, see
+//! `PLAN.md` section 6.3's bake-off (`docs/decisions/0006-state-bakeoff-results.md`) picked
+//! candidate B (`crate::frames::FrameRepr`) as the production representation; candidates A and C
+//! (`crate::bakeoff::snapshot_delta`, `crate::bakeoff::persistent_map`) remain in the crate as
+//! benchmark-only implementations of this same trait, kept for the results document's "What would
+//! change this decision" re-run scenarios, not for production use. [`KvStateStore`]
+//! (`crate::kv_store`) is the shared code generic over one `StateRepr` implementation -- ingesting
+//! events, calling `state_res::v1`/`v2`, the chain-cover index -- so the winning representation and
+//! the two benchmark-only ones (and `InMemoryStateStore`'s hand-written equivalent) do not each
+//! reimplement it. This keeps the bake-off honest about what it measured (state *storage*, see
 //! `docs/decisions/0005-state-bakeoff-methodology.md`, "What is and is not varied") and avoids
-//! three near-duplicate copies of resolution glue.
+//! three near-duplicate copies of resolution glue now that one of the three is production code.
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -19,8 +21,8 @@ use crate::api::StateDiff;
 
 /// One candidate's storage representation of resolved room state.
 ///
-/// A `Root` here is exactly [`crate::api::StateStore::Root`] for whichever candidate implements
-/// this trait; [`crate::bakeoff::generic_store::GenericStore`] is the adapter that makes any
+/// A `Root` here is exactly [`crate::api::StateStore::Root`] for whichever representation
+/// implements this trait; [`crate::kv_store::KvStateStore`] is the adapter that makes any
 /// `StateRepr` into a full `StateStore`.
 pub trait StateRepr {
     /// Opaque handle to one resolved state, as stored by this representation.
@@ -66,10 +68,11 @@ pub trait StateRepr {
     fn apply(&self, root: Self::Root, changes: &StateDiff) -> Result<Self::Root, Self::Error>;
 }
 
-/// Instrumentation every bake-off candidate exposes, beyond the storage operations
-/// [`StateRepr`] itself needs, so the harness (`src/bin/bakeoff.rs`) can read bytes-on-disk,
-/// write amplification and compaction/dedup counters generically across all three.
-pub trait BakeoffStats: StateRepr {
+/// Instrumentation a [`StateRepr`] exposes, beyond the storage operations that trait itself
+/// needs, so the bake-off harness (`src/bin/bakeoff.rs`) can read bytes-on-disk, write
+/// amplification and compaction/dedup counters generically across every representation
+/// (including the production one, `crate::frames::FrameRepr`, which implements this too).
+pub trait ReprStats: StateRepr {
     /// Sums key and value bytes resident in this representation's own keyspace(s).
     ///
     /// # Errors

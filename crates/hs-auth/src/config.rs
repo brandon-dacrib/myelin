@@ -85,6 +85,19 @@ pub struct AuthConfig {
 
     /// The password policy enforced at registration and password change.
     pub password_policy: PasswordPolicy,
+
+    /// The shared secret for the `com.devture.shared_secret_auth` login provider (legacy mautrix
+    /// bridge double puppeting; `crate::shared_secret_auth`), if enabled. `None` (the default)
+    /// means the login type is not offered and any attempt at it fails with `M_UNRECOGNIZED`,
+    /// the same as any other unsupported login type. No dedicated `hs_config::AuthConfig` field
+    /// exists for this yet (see `crate::shared_secret_auth`'s module doc and this crate's status
+    /// file "Decisions made"); until track 13 adds one, `hs-config`'s
+    /// `auth.registration_shared_secret` is reused for this purpose when wiring a native
+    /// [`AuthConfig`] from it, on the reasoning that both are "a privileged shared secret an
+    /// operator configures for trusted server-to-server tooling" and Synapse operators running
+    /// the reference `devture` module already had to provision a *second* secret anyway — reusing
+    /// the registration one here is strictly less new configuration surface, not more.
+    pub shared_secret_auth_secret: Option<String>,
 }
 
 impl Default for AuthConfig {
@@ -108,6 +121,7 @@ impl Default for AuthConfig {
             recaptcha_enabled: false,
             terms_enabled: false,
             password_policy: PasswordPolicy::default(),
+            shared_secret_auth_secret: None,
         }
     }
 }

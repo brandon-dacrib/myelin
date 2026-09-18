@@ -51,7 +51,12 @@ pub async fn get_device(
     Ok(Json(device_json(&device)))
 }
 
-/// `PUT /devices/{deviceId}`: currently only `display_name` is settable, matching the spec.
+/// `PUT /devices/{deviceId}`: sets `display_name`, matching the spec. When the requester is an
+/// appservice whose registration set `io.element.msc4190: true`
+/// (`requester.appservice.msc4190_enabled`, per
+/// `docs/rfcs/0009-appservice-identity-capability-flags.md`), an unknown device id creates the
+/// device instead of 404ing — MSC4190's whole point is letting a bridge manage devices for its
+/// masqueraded users without a `/login`-shaped handshake.
 pub async fn put_device(
     State(state): State<AuthState>,
     requester: Requester,
@@ -59,18 +64,35 @@ pub async fn put_device(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, MatrixError> {
     let device_id: ruma::OwnedDeviceId = device_id.into();
-    if state
-        .store
-        .get_device(&requester.user_id, &device_id)
-        .await?
-        .is_none()
-    {
-        return Err(MatrixError::not_found("Unknown device"));
-    }
     let display_name = body
         .get("display_name")
         .and_then(Value::as_str)
         .map(String::from);
+    let exists = state
+        .store
+        .get_device(&requester.user_id, &device_id)
+        .await?
+        .is_some();
+    if !exists {
+        let msc4190 = requester
+            .appservice
+            .as_ref()
+            .is_some_and(|a| a.msc4190_enabled);
+        if !msc4190 {
+            return Err(MatrixError::not_found("Unknown device"));
+        }
+        state
+            .store
+            .upsert_device(DeviceRecord {
+                user_id: requester.user_id.clone(),
+                device_id,
+                display_name,
+                last_seen_ms: Some(state.now_ms()),
+                last_seen_ip: None,
+            })
+            .await?;
+        return Ok(Json(json!({})));
+    }
     state
         .store
         .set_display_name(&requester.user_id, &device_id, display_name)
@@ -78,14 +100,21 @@ pub async fn put_device(
     Ok(Json(json!({})))
 }
 
-/// `DELETE /devices/{deviceId}`: requires UIA re-authentication (the body carries `auth`).
+/// `DELETE /devices/{deviceId}`: requires UIA re-authentication (the body carries `auth`), unless
+/// the requester is an MSC4190-enabled appservice (`requester.appservice.msc4190_enabled`, per
+/// `docs/rfcs/0009-appservice-identity-capability-flags.md`), which skips it — a masqueraded
+/// appservice user has no credentials of its own to re-authenticate with.
 pub async fn delete_device(
     State(state): State<AuthState>,
     requester: Requester,
     Path(device_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Response, MatrixError> {
-    if let Some(response) = reauth::run(&state, &requester, &body).await? {
+    let msc4190 = requester
+        .appservice
+        .as_ref()
+        .is_some_and(|a| a.msc4190_enabled);
+    if !msc4190 && let Some(response) = reauth::run(&state, &requester, &body).await? {
         return Ok(response);
     }
     let device_id: ruma::OwnedDeviceId = device_id.into();
@@ -238,6 +267,85 @@ mod tests {
             requester.clone(),
             Path(did.to_string()),
             Json(body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            state
+                .store
+                .get_device(&requester.user_id, &did)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn msc4190_appservice_requester(user_id: ruma::OwnedUserId) -> Requester {
+        let mut requester = Requester::for_user(user_id.clone());
+        requester.appservice = Some(crate::requester::AppserviceIdentity {
+            appservice_id: "bridge1".to_string(),
+            sender: user_id,
+            masqueraded_user: false,
+            masqueraded_device_id: None,
+            rate_limited: true,
+            msc4190_enabled: true,
+        });
+        requester
+    }
+
+    #[tokio::test]
+    async fn put_device_404s_on_unknown_device_for_ordinary_requester() {
+        let (state, requester, _) = state_with_device().await;
+        let err = put_device(
+            State(state),
+            requester,
+            Path("NOPE".to_string()),
+            Json(json!({})),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn put_device_creates_unknown_device_for_msc4190_appservice() {
+        let state = AuthState::in_memory();
+        let uid = user_id!("@bridge_alice:example.org").to_owned();
+        state
+            .store
+            .create_user(UserRecord::new(uid.clone(), 0))
+            .await
+            .unwrap();
+        let requester = msc4190_appservice_requester(uid.clone());
+        let body = json!({"display_name": "puppeted device"});
+        let Json(response) = put_device(
+            State(state.clone()),
+            requester,
+            Path("NEWDEV".to_string()),
+            Json(body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response, json!({}));
+        let device = state
+            .store
+            .get_device(&uid, ruma::device_id!("NEWDEV"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(device.display_name.as_deref(), Some("puppeted device"));
+    }
+
+    #[tokio::test]
+    async fn delete_device_skips_uia_for_msc4190_appservice() {
+        let (state, requester, did) = state_with_device().await;
+        let requester = msc4190_appservice_requester(requester.user_id.clone());
+        let response = delete_device(
+            State(state.clone()),
+            requester.clone(),
+            Path(did.to_string()),
+            Json(json!({})),
         )
         .await
         .unwrap();

@@ -18,8 +18,8 @@ use hs_model::ids::{EventSn, StateKeyId};
 use hs_tables::TupleKey;
 use thiserror::Error;
 
-use super::repr::{BakeoffStats, StateRepr, set_diff};
 use crate::api::StateDiff;
+use crate::repr::{ReprStats, StateRepr, set_diff};
 
 /// How many hops a delta chain may grow before the next `apply` writes a full snapshot instead
 /// of another delta. Bake-off scale (see `docs/decisions/0005-state-bakeoff-methodology.md`,
@@ -278,7 +278,7 @@ impl<KV: KvBackend> SnapshotDeltaRepr<KV> {
     }
 }
 
-impl<KV: KvBackend> BakeoffStats for SnapshotDeltaRepr<KV> {
+impl<KV: KvBackend> ReprStats for SnapshotDeltaRepr<KV> {
     fn bytes_on_disk(&self) -> Result<u64, Error> {
         SnapshotDeltaRepr::bytes_on_disk(self)
     }

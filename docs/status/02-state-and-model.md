@@ -1,6 +1,45 @@
 # 02 State and model: status
 
-Updated: 2026-09-18.
+Updated: 2026-09-18 (session 3).
+
+## Session 3 (this session): closing the room-actor/state-store seam
+
+Assignment: close the gap `docs/rfcs/0010-room-actor-state-store-seam.md` (written by track 04)
+named, promote the bake-off winner into production, and make the production store usable by the
+room actor. Summary of what landed, in the order the RFC asked for; full detail in the sections
+below (grep for "Session 3").
+
+1. **RFC gap 1, closed**: `StateStore::intern_state_key(&self, event_type: &str, state_key: &str)
+   -> Result<StateKeyId, Self::Error>` is now on the frozen trait (`crates/hs-state/src/api.rs`),
+   implemented by both `InMemoryStateStore` and the new production store. This is the RFC's
+   "preferred" option (option 1): a thin wrapper around each store's existing internal
+   get-or-create interning, made reachable from outside the module. Get-or-create is idempotent:
+   calling it before or after ingesting an event that sets that key returns the same id either
+   way, because both paths share one table.
+2. **Bake-off winner promoted to production**: candidate B moved out of `crate::bakeoff` into
+   `crate::frames` (`FrameRepr`) and `crate::kv_store` (`KvStateStore`, `ProductionStateStore<KV>`
+   type alias, `KvStateStore::open` convenience constructor). Candidates A and C stay under
+   `crate::bakeoff`, explicitly marked benchmark-only in that module's doc comment, kept (not
+   deleted) for `docs/decisions/0006-state-bakeoff-results.md`'s "What would change this decision"
+   re-runs. `InMemoryStateStore` (`crate::store`) is unchanged and still what tests use.
+3. **Partly done**: the production store's primitives (`intern_state_key`, `get`, `apply`,
+   `resolve`, and a new default `current_state` convenience method that resolves a room's forward
+   extremities) are all there and tested. **Not done**: an adapter from `(StateStore, Root)` to
+   `state_fetch::StateFetch` that would let track 04 delete its flat map entirely. See "Next".
+4. **Not done**: the fork-resolution integration test cross-checking the production store against
+   both `state_res::v2` and `state_res::oracle` on the same conflicting state maps. See "Next" --
+   recorded honestly as incomplete, not glossed over.
+5. This status file, updated (this pass).
+
+`cargo check -p hs-state`, `cargo test -p hs-state -p hs-model` (59 + 50 tests, including the
+`ruma_cross_check` property test and `state_res::cross_check_tests`'s oracle-vs-ruma property
+test), and `cargo clippy -p hs-model -p hs-state --all-targets -- -D warnings` are all clean as of
+this update. `cargo check -p hs-room` (the trait's only other consumer in the workspace) and
+`cargo check --workspace` were also run to confirm the trait change (`intern_state_key` is a new
+*required* method) does not break anything outside this crate -- nothing else in the workspace
+implements `StateStore`, so nothing else needed updating. (`cargo check --workspace` fails on an
+unrelated, pre-existing error in `hs-appservice`, another track's concurrent work, not touched by
+or related to this session.)
 
 ## Done
 
@@ -140,12 +179,25 @@ Updated: 2026-09-18.
   `state_res::oracle`'s own (currently brute-force) auth-chain computation; doing so is the actual
   performance win `PLAN.md` section 6.4 describes and belongs with whichever track next needs that
   performance (a Phase 1/2 concern per the brief, not Phase 0 correctness).
-- The bake-off's winner (candidate B) is not yet wired up as the *default* production
-  `StateStore` anywhere -- `InMemoryStateStore` remains what 04/06 build against today (see
-  "Interfaces provided" below on why that is a deliberate, non-blocking choice, not an oversight).
-  Whoever owns the room actor's real persistence layer should build a `StateStore` backed by
-  `bakeoff::FrameRepr` (renaming it out of the `bakeoff` module once it stops being one candidate
-  among three) rather than treating candidate B as bake-off-only scaffolding.
+- ~~The bake-off's winner (candidate B) is not yet wired up as the *default* production
+  `StateStore`~~ **Done this session** -- see "Session 3" below. `crate::kv_store::ProductionStateStore<KV>`
+  (`KvStateStore<FrameRepr<KV>>`) is now the production `StateStore`; `InMemoryStateStore` remains
+  for tests only.
+- **Not done this session, and the most important remaining gap**: `hs-state` still has no adapter
+  that turns a `(StateStore, Root)` pair plus an event-body source into
+  `state_fetch::StateFetch`, so track 04 cannot yet delete `crate::pipeline::CurrentState`'s flat
+  map and hand auth checks a `StateStore`-backed view directly. `intern_state_key` (below) plus
+  `get`/`apply`/`resolve`/`current_state` are the primitives; the glue that turns them into
+  something `hs_state::auth` can call still needs writing. See "Next" for the concrete shape.
+- **Not done this session**: the integration test proving a genuine fork (two events extending one
+  parent with conflicting state) resolves identically through the production store,
+  `state_res::v2` (ruma-state-res-backed) and `state_res::oracle` (the independent implementation)
+  all three. `crate::kv_store`'s own `tests` module exercises fork-and-merge through the production
+  representation already (see `kv_store::tests::candidate_b_frames`) and matches the same fixed
+  expected winner `store.rs`'s and `generic_store`'s tests always have, but nothing yet calls
+  `state_res::oracle::resolve` and `state_res::v2::resolve` directly on the *same* two conflicting
+  state maps used to drive the production store and asserts the three-way agreement explicitly.
+  This is real, not yet closed, evidence work -- flagged clearly rather than claimed done.
 - The results document's "What would change this decision" section names three concrete follow-ups
   if budget allows before this is treated as closed: (1) a real-room corpus once network access and
   a throwaway server are available, (2) a wider-fan-out or coarser-grain revision of candidate C
@@ -162,22 +214,56 @@ Updated: 2026-09-18.
 - Chain-cover rebuild-from-scratch (for an imported room) and background verification are Phase
   1/2 per the brief; not started.
 
+### Next, in detail: the two items session 3 left open (concrete, for whoever picks this up)
+
+1. **A `StateFetch` adapter over `StateStore`.** Add (likely in `crate::state_fetch`, since it
+   already owns the trait) a type like `StoreStateFetch<'a, S: StateStore, E>` that holds a
+   `&'a S`, an `S::Root`, and something that maps `EventSn -> (&UserId, &CanonicalJsonObject)`
+   (event bodies -- the room actor already has these in memory; a small local trait, analogous to
+   `state_fetch::FlatState`'s shape, is probably the cleanest way to keep this generic instead of
+   depending on `hs_model::event::Event` directly). `get(event_type, state_key)` becomes
+   `self.store.intern_state_key(event_type, state_key)` then `self.store.get(self.root, key_id)`
+   then a body lookup. Once this exists, `crate::pipeline::CurrentState`
+   (`crates/hs-room/src/pipeline.rs`) can be replaced by this type plus a `ProductionStateStore`
+   held per room, and `RoomActor::current_state`'s flat `BTreeMap` can go away. This is track 04's
+   work once the adapter exists (do not edit `hs-room` from this track), but the adapter itself is
+   this track's to build.
+2. **The three-way fork integration test.** Build a small room (create, join, power_levels, two
+   branches setting the same key to conflicting values, e.g. `m.room.name`) as both (a) a sequence
+   of `ProductionStateStore::add_event` calls ending in a merge event that triggers `resolve()`
+   internally, and (b) two `state_res::StateMap`s over one shared `state_res::EventStore` built
+   from the same events by hand (`state_res::cross_check_tests::RoomBuilder` is the existing
+   pattern to reuse). Call `state_res::v2::resolve` and `state_res::oracle::resolve` on (b)
+   directly, call `ProductionStateStore::get` on (a)'s merge root for the conflicting key, and
+   assert all three name the same winning event. `state_res::oracle` is `#[cfg(test)] pub(crate)`
+   (deliberately, from session 1 -- see "Decisions made" further down), so this test must live
+   inside the crate (a `#[cfg(test)]` module, e.g. `crate::kv_store`'s existing `tests` module or a
+   new sibling), not under `crates/hs-state/tests/` where it would not compile against `oracle` at
+   all.
+3. Everything in the pre-session-3 "Next" list below this point that session 3 did not touch
+   (restricted/knock-restricted join property coverage, `state_res::v1`'s missing oracle partner,
+   chain-cover-index wiring into `state_res`'s auth-chain computation, MSC4242 edge tables, and
+   chain-cover rebuild-from-scratch) is all still open and still Phase 1/2 per the brief.
+
 ## Blockers
 
-- None. `hs-kv`/`hs-tables` (01) are now consumed by the three bake-off candidates
-  (`crates/hs-state/src/bakeoff/*.rs`, over `hs_kv::memory::MemoryBackend` and
-  `hs_kv::fjall_backend::FjallBackend`, with `hs_tables::TupleKey` for candidate A's group-id
-  keys); both crates were already stable and well-documented when this track needed them, so no
-  wait was involved. `InMemoryStateStore`'s own local interning is unchanged and still
-  self-contained by design (see `state_res/mod.rs` and `store.rs` module docs) -- it is a separate,
-  non-bake-off reference implementation, not something this pass touched.
+- None. `hs-kv`/`hs-tables` (01) are consumed by the production store (`crate::kv_store`,
+  `crate::frames`, over `hs_kv::memory::MemoryBackend` and `hs_kv::fjall_backend::FjallBackend`)
+  and by the two remaining benchmark-only candidates (`crates/hs-state/src/bakeoff/*.rs`, with
+  `hs_tables::TupleKey` for candidate A's group-id keys); both crates were already stable and
+  well-documented when this track needed them, so no wait was involved. `InMemoryStateStore`'s own
+  local interning is unchanged and still self-contained by design (see `state_res/mod.rs` and
+  `store.rs` module docs) -- it is a separate, test-only reference implementation, not something
+  this pass touched.
 
 ## Implications for tracks 04 and 06
 
-The bake-off's winner, candidate B (`crates/hs-state/src/bakeoff/frames.rs`), is a linked chain of
-content-addressed frames: `state_at(event)` is a 16-byte hash, `get` walks the chain from that hash
-towards a periodic full "base" frame, `apply` writes exactly one new frame per logical state
-change. What this means concretely for the two consumers of `StateStore`:
+The bake-off's winner, now the production representation (`crates/hs-state/src/frames.rs`,
+`FrameRepr`, wrapped as a `StateStore` by `crates/hs-state/src/kv_store.rs`'s
+`ProductionStateStore<KV>`), is a linked chain of content-addressed frames: `state_at(event)` is a
+16-byte hash, `get` walks the chain from that hash towards a periodic full "base" frame, `apply`
+writes exactly one new frame per logical state change. What this means concretely for the two
+consumers of `StateStore`:
 
 - **Track 04 (room actor).** The room actor's dominant access pattern -- authorize the next event
   against the current room state, then advance `state_at` by one -- is exactly candidate B's cheap
@@ -219,30 +305,62 @@ change. What this means concretely for the two consumers of `StateStore`:
 - **Week 2** (`hs-model`): event and identifier types, room-version capability table. Frozen; see
   `docs/status/02-state-and-model.md`'s "Done" above for what landed.
 - **Week 6** (`hs-state`): the `StateStore` trait (`crates/hs-state/src/api.rs`) -- `state_at`,
-  `diff`, `apply`, `resolve`, chain-cover queries. Frozen; tracks 04 and 06 build against it. A
-  reference implementation (`InMemoryStateStore`) exists today so 04/06 do not need to wait for
-  the bake-off decision to start integrating.
-- **Week 12** (`hs-state`): the bake-off decision itself. `crates/hs-state/src/bakeoff/frames.rs`
-  (`FrameRepr<KV>` over any `hs_kv::KvBackend`, wrapped as a full `StateStore` by
-  `bakeoff::GenericStore`) is the winning representation
-  (`docs/decisions/0006-state-bakeoff-results.md`) and is usable today behind the same frozen
-  trait; it currently lives under the `bakeoff` module alongside the two losing candidates because
-  this pass's scope was the decision, not standing up production persistence -- promoting it out
-  of `bakeoff` into this crate's main persistence story is next-owner work, tracked in "Next"
-  above.
+  `get`, `diff`, `apply`, `resolve`, `current_state` (new, session 3, see below), chain-cover
+  queries, and `intern_state_key` (new, session 3). Frozen; tracks 04 and 06 build against it. A
+  reference implementation (`InMemoryStateStore`) exists today for tests.
+- **Session 3, current** (`hs-state`): **the production `StateStore` to actually hold, as of this
+  update**: `hs_state::kv_store::ProductionStateStore<KV>` (`= KvStateStore<FrameRepr<KV>>`),
+  constructed with `ProductionStateStore::open(room_version, backend)` for any `hs_kv::KvBackend`
+  (`crates/hs-state/src/kv_store.rs`). This is the promoted bake-off winner
+  (`docs/decisions/0006-state-bakeoff-results.md`), no longer under `bakeoff`. Its representation
+  is `hs_state::frames::FrameRepr` (`crates/hs-state/src/frames.rs`) if you need the type directly
+  (e.g. for `KvStateStore::new` with a hand-built `repr`); most callers want `open`, not `new`.
+  `hs_state::bakeoff::{SnapshotDeltaRepr, PersistentMapRepr}` (candidates A and C) are
+  benchmark-only now -- do not build on them.
+  - **The exact call sequence a room actor should use** (replacing `CurrentState`'s flat map, once
+    the `StateFetch` adapter in "Next" item 1 exists -- until then, everything below except the
+    `StateFetch` step is usable as-is): on ingesting an event, call
+    `store.add_event(...)` (mirrors `InMemoryStateStore::add_event`'s parameter list exactly --
+    event id/sn, room id, event type, state key, sender, content, depth, timestamp, auth_events,
+    prev_events, `only_prev_event_is_room_create`); this returns the new `state_at` root directly.
+    To authorize the *next* event: if there is exactly one forward extremity, its `state_at` root
+    is the auth state, no `resolve()` call needed (matches `StateStore::resolve`'s own "single
+    fork is a no-op" documented behavior). If there is more than one forward extremity (the fork
+    case this whole assignment exists for), call `store.current_state(room_version,
+    &forward_extremity_event_sns)` -- the new default trait method that does `state_at` of each
+    plus `resolve()` in one call -- to get the merged root. To look up one state entry (a specific
+    user's membership, power levels, etc.) independent of already holding the event that set it:
+    `let key = store.intern_state_key(event_type, state_key)?;` then `store.get(root, key)?`.
+  - `intern_state_key`'s signature: `fn intern_state_key(&self, event_type: &str, state_key: &str)
+    -> Result<StateKeyId, Self::Error>`. Idempotent get-or-create; safe to call before or after any
+    event that sets that key exists in the store, and always returns the same id both times.
 - `hs_state::auth::{check_auth_events_selection, check_event_auth}` and the `StateFetch` trait
   (`crates/hs-state/src/state_fetch.rs`): usable independently of `StateStore` by anything that
   already has a state snapshot in some other form (e.g. a federation `send_join`/`send_leave`
-  handler validating a remote server's claimed state before trusting it).
+  handler validating a remote server's claimed state before trusting it). **No adapter from
+  `StateStore` to `StateFetch` exists yet** -- see "Next" item 1; today a caller must still bridge
+  the two by hand (look up via `intern_state_key`/`get`, then fetch the winning event's own
+  sender/content from wherever it keeps event bodies).
 
 ## Interfaces needed
 
 - 01 (`hs-kv`/`hs-tables`): the real interning API, once it lands, should replace
   `InMemoryStateStore`'s local `key_of`/`event_id_of` maps; no interface change to `StateStore`
   itself is expected.
-- 04 (room actor): tell track 02 which of `StateStore`'s methods the room actor calls in which
-  order (particularly whether it wants `state_at` of *S(E)* or *S′(E)* more often) so the trait's
-  ergonomics can be revisited before the interface freeze is final, if needed.
+- ~~04 (room actor): tell track 02 which of `StateStore`'s methods the room actor calls in which
+  order~~ **Answered this session**: `docs/rfcs/0010-room-actor-state-store-seam.md` supplied
+  exactly this, and "Interfaces provided" above now names the call sequence. What is still needed
+  *from* track 02, for track 04 to actually rewire `crate::pipeline::CurrentState`: the
+  `StateStore`-to-`StateFetch` adapter, "Next" item 1. Until it lands, track 04's flat map remains
+  the pragmatic choice for the single-writer case (per the RFC's own section 4-equivalent
+  reasoning), and this track is not asking track 04 to rewire early against half-finished plumbing.
+- 06 (federation): once inbound `/send` transactions exist, `Command::PersistInbound`
+  (`docs/design/04-room-actor-protocol.md` section 2) is where a fork first becomes real -- an
+  inbound event whose `prev_events` do not include the local forward extremity. The call is
+  `store.current_state(room_version, &all_current_forward_extremities)` after ingesting the new
+  event via `add_event` (which itself may need to resolve if the new event's own `prev_events`
+  already fork). No interface changes anticipated beyond the `StateFetch` adapter both 04 and 06
+  will want.
 - 14 (test and conformance): the brief's definition of done names "Synapse's own implementation
   driven through the Python harness that 14 provides" as a fourth cross-check partner for state
   resolution; that harness does not exist yet from this track's side.
@@ -312,6 +430,82 @@ change. What this means concretely for the two consumers of `StateStore`:
   backend's own known limitation, not of the three candidates; scoring it would have been
   scoring `hs-kv`, not `hs-state`.
 
+### Session 3 decisions
+
+- **`intern_state_key` is a required trait method, not a default/provided one.** Both existing
+  implementations (`InMemoryStateStore`, `KvStateStore`) already had a working get-or-create
+  interning table internally; making the trait method required (rather than, say, a default that
+  panics or returns "unsupported") costs nothing here and means a future third implementation
+  cannot silently ship without it, which the RFC's whole complaint was about.
+- **`current_state` (forward-extremity resolution) is a default-provided trait method, not
+  required.** Unlike `intern_state_key`, every implementation gets this for free from `state_at` +
+  `resolve`, both of which were already required; making it required too would only be a
+  compile-time nuisance with no behavioral benefit, and a future implementation with a cheaper way
+  to resolve straight from a set of extremities (skipping materializing each one's root first) can
+  still override it.
+- **Promoted names**: `bakeoff::generic_store::GenericStore` became `kv_store::KvStateStore`,
+  `bakeoff::generic_store::BakeoffError` became `kv_store::KvStoreError`, and
+  `bakeoff::repr::BakeoffStats` became `repr::ReprStats`. Reasoning: these three names are now
+  either the production `StateStore`/error type track 04 and 06 will actually name in their own
+  code, or (for `ReprStats`) a trait implemented by the production representation too, not just
+  the two benchmark candidates -- keeping "Bakeoff" in a name that production code now
+  instantiates would have been actively misleading to a reader who has never heard of the
+  bake-off. `StateRepr` itself, `SnapshotDeltaRepr`, `PersistentMapRepr`, `RootA`, `RootC` and
+  everything under `bakeoff::` were left alone: they are still exactly what they were, benchmark
+  infrastructure and the two losing candidates.
+- **Candidates A and C were kept, not deleted**, per this track's own call from session 2's "Next"
+  ("kept clearly marked as benchmark-only or removed, your call, recorded either way" from this
+  session's assignment). Both are still fully tested and wired into `crate::kv_store`'s own
+  correctness-gate tests (`candidate_a_snapshot_delta`, `candidate_c_persistent_map`) alongside the
+  production candidate, and `docs/decisions/0006-state-bakeoff-results.md`'s "What would change
+  this decision" section names concrete conditions (a real-room corpus, a re-run against
+  PostgreSQL/SlateDB) under which a re-run is plausible; deleting working, tested code that a
+  documented future re-run might need did not seem cheaper than keeping it, per
+  `docs/decisions/0007-build-less-reuse-more.md`'s framing of "reasonable" cutting both ways.
+- **`InMemoryStateStore` was left as a hand-written reference implementation, not rebuilt on top of
+  `KvStateStore`/`StateRepr`.** It predates this session, is fully tested, has no dependency on
+  `hs-kv`, and nothing in this assignment required touching it; rebuilding it on the generic
+  machinery would have been a pure refactor with no behavioral change and real risk of regressing
+  its existing tests for no benefit this assignment asked for.
+
+## Reuse considered
+
+Per `docs/decisions/0007-build-less-reuse-more.md`'s standing obligation. This track's substantial
+build decisions and why an existing project was not used instead:
+
+- **State resolution v2/v2.1**: not reimplemented; `ruma-state-res` does the work
+  (`crate::state_res::v2`), matching decision 0007's explicit list of what this project already
+  reuses ("Ruma for ... state resolution v2 and v2.1"). The independent oracle
+  (`crate::state_res::oracle`) is not a reimplementation-instead-of-reuse decision -- it is
+  intentional redundancy for correctness evidence, the same reason this project runs Complement
+  and Sytest instead of trusting one implementation's tests alone, and it stays test-only precisely
+  so it never becomes a second production code path competing with `ruma-state-res`.
+- **State resolution v1**: no maintained Rust implementation exists (`ruma-state-res` does not
+  implement it; v1 is obsolete enough -- room versions 1-2 only -- that no other Matrix Rust
+  project maintains one either, as far as this track found). Built in-house
+  (`crate::state_res::v1`), from the spec text, the smallest version of the algorithm the project
+  needs. This was decided in session 1 and is repeated here because decision 0007 asks every track
+  to record this, not just the track that first made the call.
+- **The state storage representation itself (`crate::frames::FrameRepr`, now production)**: decision
+  0007 names this explicitly as one of the two things this project builds rather than reuses
+  ("The storage abstraction and the state representation, because no existing library models
+  Matrix state the way the protocol needs"). Conduit's and Palpo's state-frame designs were read
+  for the general approach (not copied -- both are licensed permissively enough to adapt, and
+  `crates/hs-state/src/frames.rs`'s module doc already credits the model) rather than reused as
+  dependencies, because neither ships as a standalone, embeddable library; both are whole
+  homeservers. Building a thin frame representation over `hs-kv` (this project's own storage
+  abstraction, itself built for the same "nothing existing models this" reason) was the bake-off's
+  conclusion after measuring two real alternatives, not a first-instinct build.
+- **The chain-cover auth index** (`crate::chain_cover`): no dependency exists for this; it is
+  `PLAN.md` section 6.4's own design for making state resolution v2's auth-difference computation
+  fast, directly tied to this project's specific storage layer. Not evaluated against Synapse's
+  own auth-chain approach as a library because Synapse is AGPL-3.0 (behavioral reference only, per
+  decision 0007's own licensing test) and has no standalone extractable form regardless.
+- **This session specifically added no new dependency** (see "Shared dependencies added" below --
+  unchanged from session 2): closing the RFC's gap and promoting candidate B were both internal
+  reorganization plus one new trait method, not new functionality that could have reused an
+  external library.
+
 ## Shared dependencies added
 
 Noted in `[workspace.dependencies]` in the root `Cargo.toml` (added by this track):
@@ -336,9 +530,14 @@ cargo clippy -p hs-model -p hs-state --all-targets -- -D warnings
 cargo test -p hs-model -p hs-state
 ```
 
-All green as of this update: 50 tests in `hs-model`; 59 unit tests (27 of them new, in
-`bakeoff::*` and `corpus`) plus a 512-case property test plus a 1-test integration suite in
-`hs-state`.
+All green as of this update (also re-verified against `cargo check -p hs-room` and
+`cargo check --workspace`, since this session changed the frozen `StateStore` trait -- see
+"Session 3" above): 50 tests in `hs-model`; 59 unit tests in `hs-state` (module layout changed --
+`bakeoff::frames`/`bakeoff::generic_store`/`bakeoff::repr`/`bakeoff::varint` moved to top-level
+`frames`/`kv_store`/`repr`/`varint`, counts unchanged since nothing was added or removed, only
+moved and one method added to two existing trait impls) plus a 512-case property test
+(`ruma_cross_check`) plus the `state_res::cross_check_tests` oracle-vs-`ruma-state-res` property
+test.
 
 To reproduce the bake-off itself (roughly 10 minutes on the shared development host; the results
 already checked in at `crates/hs-state/corpus/results/bakeoff-results.jsonl` do not need
