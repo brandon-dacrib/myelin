@@ -6,12 +6,16 @@
 //! This crate is split into a library (this file and its modules) and a thin `main.rs` so the
 //! end-to-end test (`tests/e2e.rs`) can boot a real server in-process without a subprocess.
 
+pub mod appservice_manifest;
+pub mod appservices;
 pub mod auth_manifest;
 pub mod capabilities;
 pub mod cli;
 pub mod config_bridge;
 pub mod generate_config;
 pub mod hash_password;
+pub mod identity;
+pub mod media;
 pub mod metrics_layer;
 pub mod register;
 pub mod serve;

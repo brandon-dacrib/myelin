@@ -185,6 +185,123 @@ async fn boots_registers_logs_in_and_reports_ready() {
         .unwrap();
     assert_eq!(ready_after.status(), reqwest::StatusCode::OK);
 
+    // 8. Create a room (hs-room's router, mounted alongside hs-auth's under both /_matrix/client
+    //    prefixes -- see docs/status/12-platform-and-kubernetes.md, "mounting what already
+    //    exists"). This is the deliverable this test extension exists to prove: hs-room's router
+    //    is actually served, not just built and unit-tested in its own crate.
+    let create_room_response = client
+        .post(format!("{base}/_matrix/client/v3/createRoom"))
+        .bearer_auth(&access_token)
+        .json(&json!({"preset": "private_chat", "name": "e2e test room"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        create_room_response.status(),
+        reqwest::StatusCode::OK,
+        "createRoom should succeed: {}",
+        create_room_response.text().await.unwrap_or_default()
+    );
+    let create_room_json: serde_json::Value = create_room_response.json().await.unwrap();
+    let room_id = create_room_json["room_id"]
+        .as_str()
+        .expect("createRoom response should carry a room_id")
+        .to_owned();
+
+    // 9. Send a message into it.
+    let send_response = client
+        .put(format!(
+            "{base}/_matrix/client/v3/rooms/{room_id}/send/m.room.message/e2e-txn-1"
+        ))
+        .bearer_auth(&access_token)
+        .json(&json!({"msgtype": "m.text", "body": "hello from the e2e test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        send_response.status(),
+        reqwest::StatusCode::OK,
+        "sending a message should succeed: {}",
+        send_response.text().await.unwrap_or_default()
+    );
+    let send_json: serde_json::Value = send_response.json().await.unwrap();
+    let sent_event_id = send_json["event_id"]
+        .as_str()
+        .expect("send response should carry an event_id")
+        .to_owned();
+
+    // 10. Read it back through /context/{eventId}, proving the event that was actually
+    //     persisted (not just accepted) round-trips over the same HTTP surface.
+    let context_response = client
+        .get(format!(
+            "{base}/_matrix/client/v3/rooms/{room_id}/context/{sent_event_id}"
+        ))
+        .bearer_auth(&access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        context_response.status(),
+        reqwest::StatusCode::OK,
+        "reading the sent message back should succeed: {}",
+        context_response.text().await.unwrap_or_default()
+    );
+    let context_json: serde_json::Value = context_response.json().await.unwrap();
+    assert_eq!(context_json["event"]["event_id"], sent_event_id);
+    assert_eq!(
+        context_json["event"]["content"]["body"],
+        "hello from the e2e test"
+    );
+
+    // 11. Upload a media file (hs-media's authenticated router, mounted under
+    //     /_matrix/client/v1/media -- the other half of "mounting what already exists").
+    let upload_response = client
+        .post(format!(
+            "{base}/_matrix/client/v1/media/upload?filename=hello.txt"
+        ))
+        .bearer_auth(&access_token)
+        .header("content-type", "text/plain")
+        .body("hello from the e2e test's media upload")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        upload_response.status(),
+        reqwest::StatusCode::OK,
+        "media upload should succeed: {}",
+        upload_response.text().await.unwrap_or_default()
+    );
+    let upload_json: serde_json::Value = upload_response.json().await.unwrap();
+    let content_uri = upload_json["content_uri"]
+        .as_str()
+        .expect("upload response should carry a content_uri")
+        .to_owned();
+    assert!(content_uri.starts_with("mxc://example.org/"));
+    let media_id = content_uri
+        .rsplit('/')
+        .next()
+        .expect("content_uri has a media id after the last slash");
+
+    // 12. Download it back and check the bytes round-trip exactly.
+    let download_response = client
+        .get(format!(
+            "{base}/_matrix/client/v1/media/download/example.org/{media_id}"
+        ))
+        .bearer_auth(&access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        download_response.status(),
+        reqwest::StatusCode::OK,
+        "media download should succeed"
+    );
+    let downloaded_bytes = download_response.bytes().await.unwrap();
+    assert_eq!(
+        downloaded_bytes.as_ref(),
+        b"hello from the e2e test's media upload"
+    );
+
     handle.shutdown().await;
 }
 

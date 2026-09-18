@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-18T14:11:01.234Z",
+  "generated_at": "2026-09-18T18:27:02.179Z",
   "routes": [
     {
       "method": "POST",
@@ -31,6 +31,14 @@
       "surface": "matrix-client",
       "operation_id": "getCapabilities",
       "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/r0/createRoom",
+      "surface": "matrix-client",
+      "operation_id": "createRoom",
+      "auth": "matrix",
       "rate_limited": false
     },
     {
@@ -70,6 +78,46 @@
       "path": "/_matrix/client/r0/devices/{deviceId}",
       "surface": "matrix-client",
       "operation_id": "updateDevice",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "DELETE",
+      "path": "/_matrix/client/r0/directory/room/{roomAlias}",
+      "surface": "matrix-client",
+      "operation_id": "removeRoomAlias",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/r0/directory/room/{roomAlias}",
+      "surface": "matrix-client",
+      "operation_id": "getRoomIdByAlias",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/r0/directory/room/{roomAlias}",
+      "surface": "matrix-client",
+      "operation_id": "setRoomAlias",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/r0/join/{roomIdOrAlias}",
+      "surface": "matrix-client",
+      "operation_id": "joinRoom",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/r0/knock/{roomIdOrAlias}",
+      "surface": "matrix-client",
+      "operation_id": "knock",
       "auth": "matrix",
       "rate_limited": false
     },
@@ -138,6 +186,262 @@
       "rate_limited": false
     },
     {
+      "method": "GET",
+      "path": "/_matrix/client/r0/rooms/{roomId}/aliases",
+      "surface": "matrix-client",
+      "operation_id": "getRoomAliases",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/r0/rooms/{roomId}/ban",
+      "surface": "matrix-client",
+      "operation_id": "ban",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/r0/rooms/{roomId}/context/{eventId}",
+      "surface": "matrix-client",
+      "operation_id": "getEventContext",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/r0/rooms/{roomId}/event/{eventId}",
+      "surface": "matrix-client",
+      "operation_id": "getOneRoomEvent",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/r0/rooms/{roomId}/forget",
+      "surface": "matrix-client",
+      "operation_id": "forgetRoom",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/r0/rooms/{roomId}/invite",
+      "surface": "matrix-client",
+      "operation_id": "inviteUser",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/r0/rooms/{roomId}/join",
+      "surface": "matrix-client",
+      "operation_id": "joinRoomById",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/r0/rooms/{roomId}/joined_members",
+      "surface": "matrix-client",
+      "operation_id": "getJoinedMembersByRoom",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/r0/rooms/{roomId}/kick",
+      "surface": "matrix-client",
+      "operation_id": "kick",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/r0/rooms/{roomId}/knock",
+      "surface": "matrix-client",
+      "operation_id": "knockRoom",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/r0/rooms/{roomId}/leave",
+      "surface": "matrix-client",
+      "operation_id": "leaveRoom",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/r0/rooms/{roomId}/members",
+      "surface": "matrix-client",
+      "operation_id": "getMembersByRoom",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/r0/rooms/{roomId}/messages",
+      "surface": "matrix-client",
+      "operation_id": "getRoomEvents",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/r0/rooms/{roomId}/redact/{eventId}/{txnId}",
+      "surface": "matrix-client",
+      "operation_id": "redactEvent",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/r0/rooms/{roomId}/relations/{eventId}",
+      "surface": "matrix-client",
+      "operation_id": "getRelatingEvents",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/r0/rooms/{roomId}/relations/{eventId}/{relType}",
+      "surface": "matrix-client",
+      "operation_id": "getRelatingEventsWithRelType",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/r0/rooms/{roomId}/relations/{eventId}/{relType}/{eventType}",
+      "surface": "matrix-client",
+      "operation_id": "getRelatingEventsWithRelTypeAndEventType",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/r0/rooms/{roomId}/send/{eventType}/{txnId}",
+      "surface": "matrix-client",
+      "operation_id": "sendMessage",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/r0/rooms/{roomId}/state",
+      "surface": "matrix-client",
+      "operation_id": "getRoomState",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/r0/rooms/{roomId}/state/{eventType}",
+      "surface": "matrix-client",
+      "operation_id": "getStateEvent",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/r0/rooms/{roomId}/state/{eventType}",
+      "surface": "matrix-client",
+      "operation_id": "setStateEvent",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/r0/rooms/{roomId}/state/{eventType}/{stateKey}",
+      "surface": "matrix-client",
+      "operation_id": "getStateEventWithKey",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/r0/rooms/{roomId}/state/{eventType}/{stateKey}",
+      "surface": "matrix-client",
+      "operation_id": "setStateEventWithKey",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/r0/rooms/{roomId}/unban",
+      "surface": "matrix-client",
+      "operation_id": "unban",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v1/appservice/{appserviceId}/ping",
+      "surface": "matrix-client",
+      "operation_id": "appservicePing",
+      "auth": "appservice",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v1/media/config",
+      "surface": "matrix-client",
+      "operation_id": "mediaConfig",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v1/media/create",
+      "surface": "matrix-client",
+      "operation_id": "createMediaUpload",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v1/media/download/{serverName}/{mediaId}",
+      "surface": "matrix-client",
+      "operation_id": "downloadMedia",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v1/media/download/{serverName}/{mediaId}/{fileName}",
+      "surface": "matrix-client",
+      "operation_id": "downloadMediaWithFilename",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v1/media/thumbnail/{serverName}/{mediaId}",
+      "surface": "matrix-client",
+      "operation_id": "thumbnailMedia",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v1/media/upload",
+      "surface": "matrix-client",
+      "operation_id": "uploadMedia",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/v1/media/upload/{serverName}/{mediaId}",
+      "surface": "matrix-client",
+      "operation_id": "uploadAsyncMedia",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
       "method": "POST",
       "path": "/_matrix/client/v3/account/deactivate",
       "surface": "matrix-client",
@@ -167,6 +471,14 @@
       "surface": "matrix-client",
       "operation_id": "getCapabilities",
       "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v3/createRoom",
+      "surface": "matrix-client",
+      "operation_id": "createRoom",
+      "auth": "matrix",
       "rate_limited": false
     },
     {
@@ -206,6 +518,46 @@
       "path": "/_matrix/client/v3/devices/{deviceId}",
       "surface": "matrix-client",
       "operation_id": "updateDevice",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "DELETE",
+      "path": "/_matrix/client/v3/directory/room/{roomAlias}",
+      "surface": "matrix-client",
+      "operation_id": "removeRoomAlias",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v3/directory/room/{roomAlias}",
+      "surface": "matrix-client",
+      "operation_id": "getRoomIdByAlias",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/v3/directory/room/{roomAlias}",
+      "surface": "matrix-client",
+      "operation_id": "setRoomAlias",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v3/join/{roomIdOrAlias}",
+      "surface": "matrix-client",
+      "operation_id": "joinRoom",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v3/knock/{roomIdOrAlias}",
+      "surface": "matrix-client",
+      "operation_id": "knock",
       "auth": "matrix",
       "rate_limited": false
     },
@@ -275,11 +627,1532 @@
     },
     {
       "method": "GET",
+      "path": "/_matrix/client/v3/rooms/{roomId}/aliases",
+      "surface": "matrix-client",
+      "operation_id": "getRoomAliases",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v3/rooms/{roomId}/ban",
+      "surface": "matrix-client",
+      "operation_id": "ban",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v3/rooms/{roomId}/context/{eventId}",
+      "surface": "matrix-client",
+      "operation_id": "getEventContext",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v3/rooms/{roomId}/event/{eventId}",
+      "surface": "matrix-client",
+      "operation_id": "getOneRoomEvent",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v3/rooms/{roomId}/forget",
+      "surface": "matrix-client",
+      "operation_id": "forgetRoom",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v3/rooms/{roomId}/invite",
+      "surface": "matrix-client",
+      "operation_id": "inviteUser",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v3/rooms/{roomId}/join",
+      "surface": "matrix-client",
+      "operation_id": "joinRoomById",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v3/rooms/{roomId}/joined_members",
+      "surface": "matrix-client",
+      "operation_id": "getJoinedMembersByRoom",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v3/rooms/{roomId}/kick",
+      "surface": "matrix-client",
+      "operation_id": "kick",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v3/rooms/{roomId}/knock",
+      "surface": "matrix-client",
+      "operation_id": "knockRoom",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v3/rooms/{roomId}/leave",
+      "surface": "matrix-client",
+      "operation_id": "leaveRoom",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v3/rooms/{roomId}/members",
+      "surface": "matrix-client",
+      "operation_id": "getMembersByRoom",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v3/rooms/{roomId}/messages",
+      "surface": "matrix-client",
+      "operation_id": "getRoomEvents",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/v3/rooms/{roomId}/redact/{eventId}/{txnId}",
+      "surface": "matrix-client",
+      "operation_id": "redactEvent",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v3/rooms/{roomId}/relations/{eventId}",
+      "surface": "matrix-client",
+      "operation_id": "getRelatingEvents",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v3/rooms/{roomId}/relations/{eventId}/{relType}",
+      "surface": "matrix-client",
+      "operation_id": "getRelatingEventsWithRelType",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v3/rooms/{roomId}/relations/{eventId}/{relType}/{eventType}",
+      "surface": "matrix-client",
+      "operation_id": "getRelatingEventsWithRelTypeAndEventType",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/v3/rooms/{roomId}/send/{eventType}/{txnId}",
+      "surface": "matrix-client",
+      "operation_id": "sendMessage",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v3/rooms/{roomId}/state",
+      "surface": "matrix-client",
+      "operation_id": "getRoomState",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v3/rooms/{roomId}/state/{eventType}",
+      "surface": "matrix-client",
+      "operation_id": "getStateEvent",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/v3/rooms/{roomId}/state/{eventType}",
+      "surface": "matrix-client",
+      "operation_id": "setStateEvent",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v3/rooms/{roomId}/state/{eventType}/{stateKey}",
+      "surface": "matrix-client",
+      "operation_id": "getStateEventWithKey",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/v3/rooms/{roomId}/state/{eventType}/{stateKey}",
+      "surface": "matrix-client",
+      "operation_id": "setStateEventWithKey",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v3/rooms/{roomId}/unban",
+      "surface": "matrix-client",
+      "operation_id": "unban",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
       "path": "/_matrix/client/versions",
       "surface": "matrix-client",
       "operation_id": "getVersions",
       "auth": "none",
       "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/media/v3/config",
+      "surface": "matrix-client",
+      "operation_id": "legacyMediaConfig",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/media/v3/create",
+      "surface": "matrix-client",
+      "operation_id": "legacyCreateMediaUpload",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/media/v3/download/{serverName}/{mediaId}",
+      "surface": "matrix-client",
+      "operation_id": "legacyDownloadMedia",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/media/v3/download/{serverName}/{mediaId}/{fileName}",
+      "surface": "matrix-client",
+      "operation_id": "legacyDownloadMediaWithFilename",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/media/v3/thumbnail/{serverName}/{mediaId}",
+      "surface": "matrix-client",
+      "operation_id": "legacyThumbnailMedia",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/media/v3/upload",
+      "surface": "matrix-client",
+      "operation_id": "legacyUploadMedia",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/media/v3/upload/{serverName}/{mediaId}",
+      "surface": "matrix-client",
+      "operation_id": "legacyUploadAsyncMedia",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/appservices",
+      "surface": "admin",
+      "operation_id": "appservices.list",
+      "auth": "admin",
+      "required_scope": "bridges:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/appservices",
+      "surface": "admin",
+      "operation_id": "appservices.create",
+      "auth": "admin",
+      "required_scope": "bridges:write",
+      "rate_limited": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/appservices/{id}",
+      "surface": "admin",
+      "operation_id": "appservices.delete",
+      "auth": "admin",
+      "required_scope": "bridges:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/appservices/{id}",
+      "surface": "admin",
+      "operation_id": "appservices.get",
+      "auth": "admin",
+      "required_scope": "bridges:read",
+      "rate_limited": false
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/appservices/{id}",
+      "surface": "admin",
+      "operation_id": "appservices.update",
+      "auth": "admin",
+      "required_scope": "bridges:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/appservices/{id}/backlog",
+      "surface": "admin",
+      "operation_id": "appservices.backlog",
+      "auth": "admin",
+      "required_scope": "bridges:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/appservices/{id}/health",
+      "surface": "admin",
+      "operation_id": "appservices.health",
+      "auth": "admin",
+      "required_scope": "bridges:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/appservices/{id}/pause",
+      "surface": "admin",
+      "operation_id": "appservices.pause",
+      "auth": "admin",
+      "required_scope": "bridges:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/appservices/{id}/ping",
+      "surface": "admin",
+      "operation_id": "appservices.ping",
+      "auth": "admin",
+      "required_scope": "bridges:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/appservices/{id}/registration",
+      "surface": "admin",
+      "operation_id": "appservices.registration",
+      "auth": "admin",
+      "required_scope": "bridges:write",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/appservices/{id}/replay",
+      "surface": "admin",
+      "operation_id": "appservices.replay",
+      "auth": "admin",
+      "required_scope": "bridges:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/appservices/{id}/resume",
+      "surface": "admin",
+      "operation_id": "appservices.resume",
+      "auth": "admin",
+      "required_scope": "bridges:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/appservices/{id}/rotate-tokens",
+      "surface": "admin",
+      "operation_id": "appservices.rotate_tokens",
+      "auth": "admin",
+      "required_scope": "bridges:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/audit-log",
+      "surface": "admin",
+      "operation_id": "audit_log.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/audit-log/export",
+      "surface": "admin",
+      "operation_id": "audit_log.export",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/audit-log/{id}",
+      "surface": "admin",
+      "operation_id": "audit_log.get",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/bridge-types",
+      "surface": "admin",
+      "operation_id": "bridge_types.list",
+      "auth": "admin",
+      "required_scope": "bridges:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/bridge-types/{type}",
+      "surface": "admin",
+      "operation_id": "bridge_types.get",
+      "auth": "admin",
+      "required_scope": "bridges:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/bridge-types/{type}/render",
+      "surface": "admin",
+      "operation_id": "bridge_types.render",
+      "auth": "admin",
+      "required_scope": "bridges:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/cluster",
+      "surface": "admin",
+      "operation_id": "cluster.get",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/cluster/replicas",
+      "surface": "admin",
+      "operation_id": "cluster.replicas.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/cluster/replicas/{id}",
+      "surface": "admin",
+      "operation_id": "cluster.replicas.get",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/cluster/replicas/{id}/drain",
+      "surface": "admin",
+      "operation_id": "cluster.replicas.drain",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/cluster/replicas/{id}/undrain",
+      "surface": "admin",
+      "operation_id": "cluster.replicas.undrain",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/cluster/shards",
+      "surface": "admin",
+      "operation_id": "cluster.shards.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/config",
+      "surface": "admin",
+      "operation_id": "config.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/config/reload",
+      "surface": "admin",
+      "operation_id": "config.reload",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/config/validate",
+      "surface": "admin",
+      "operation_id": "config.validate",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/config/{section}",
+      "surface": "admin",
+      "operation_id": "config.get",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/config/{section}",
+      "surface": "admin",
+      "operation_id": "config.update",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/events",
+      "surface": "admin",
+      "operation_id": "events.stream",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/events/{event_id}",
+      "surface": "admin",
+      "operation_id": "events.get",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/federation/destinations",
+      "surface": "admin",
+      "operation_id": "federation.destinations.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/federation/destinations/{server_name}",
+      "surface": "admin",
+      "operation_id": "federation.destinations.get",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/federation/destinations/{server_name}/reset",
+      "surface": "admin",
+      "operation_id": "federation.destinations.reset",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/federation/destinations/{server_name}/rooms",
+      "surface": "admin",
+      "operation_id": "federation.destinations.rooms",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/federation/keys",
+      "surface": "admin",
+      "operation_id": "federation.keys.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/federation/keys/{server_name}",
+      "surface": "admin",
+      "operation_id": "federation.keys.get",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/federation/keys/{server_name}/refresh",
+      "surface": "admin",
+      "operation_id": "federation.keys.refresh",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/me",
+      "surface": "admin",
+      "operation_id": "me.get",
+      "auth": "admin",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/media",
+      "surface": "admin",
+      "operation_id": "media.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/media/delete",
+      "surface": "admin",
+      "operation_id": "media.delete_bulk",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/media/purge-remote-cache",
+      "surface": "admin",
+      "operation_id": "media.purge_remote_cache",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/media/{server_name}/{media_id}",
+      "surface": "admin",
+      "operation_id": "media.delete_one",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/media/{server_name}/{media_id}",
+      "surface": "admin",
+      "operation_id": "media.get",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/media/{server_name}/{media_id}/protect",
+      "surface": "admin",
+      "operation_id": "media.protect",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/media/{server_name}/{media_id}/quarantine",
+      "surface": "admin",
+      "operation_id": "media.quarantine",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/media/{server_name}/{media_id}/unprotect",
+      "surface": "admin",
+      "operation_id": "media.unprotect",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/media/{server_name}/{media_id}/unquarantine",
+      "surface": "admin",
+      "operation_id": "media.unquarantine",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/migration",
+      "surface": "admin",
+      "operation_id": "migration.get",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/migration/abort",
+      "surface": "admin",
+      "operation_id": "migration.abort",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/migration/cutover",
+      "surface": "admin",
+      "operation_id": "migration.cutover",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/migration/log",
+      "surface": "admin",
+      "operation_id": "migration.log",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/migration/pause",
+      "surface": "admin",
+      "operation_id": "migration.pause",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/migration/resume",
+      "surface": "admin",
+      "operation_id": "migration.resume",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/migration/start",
+      "surface": "admin",
+      "operation_id": "migration.start",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/migration/verify",
+      "surface": "admin",
+      "operation_id": "migration.verify",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/openapi.json",
+      "surface": "admin",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/openapi.yaml",
+      "surface": "admin",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/registration-tokens",
+      "surface": "admin",
+      "operation_id": "registration_tokens.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/registration-tokens",
+      "surface": "admin",
+      "operation_id": "registration_tokens.create",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/registration-tokens/{token}",
+      "surface": "admin",
+      "operation_id": "registration_tokens.delete",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/registration-tokens/{token}",
+      "surface": "admin",
+      "operation_id": "registration_tokens.get",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/registration-tokens/{token}",
+      "surface": "admin",
+      "operation_id": "registration_tokens.update",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/reports",
+      "surface": "admin",
+      "operation_id": "reports.list",
+      "auth": "admin",
+      "required_scope": "moderation:read",
+      "rate_limited": false
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/reports/{id}",
+      "surface": "admin",
+      "operation_id": "reports.delete",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/reports/{id}",
+      "surface": "admin",
+      "operation_id": "reports.get",
+      "auth": "admin",
+      "required_scope": "moderation:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/reports/{id}/resolve",
+      "surface": "admin",
+      "operation_id": "reports.resolve",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/rooms",
+      "surface": "admin",
+      "operation_id": "rooms.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/rooms/{room_id}",
+      "surface": "admin",
+      "operation_id": "rooms.get",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/rooms/{room_id}/aliases",
+      "surface": "admin",
+      "operation_id": "rooms.aliases.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/rooms/{room_id}/aliases",
+      "surface": "admin",
+      "operation_id": "rooms.aliases.add",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/rooms/{room_id}/aliases/{alias}",
+      "surface": "admin",
+      "operation_id": "rooms.aliases.remove",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/rooms/{room_id}/block",
+      "surface": "admin",
+      "operation_id": "rooms.block",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/rooms/{room_id}/delete",
+      "surface": "admin",
+      "operation_id": "rooms.delete",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/rooms/{room_id}/events/at",
+      "surface": "admin",
+      "operation_id": "rooms.events.at",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/rooms/{room_id}/events/{event_id}",
+      "surface": "admin",
+      "operation_id": "rooms.events.get",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/rooms/{room_id}/events/{event_id}/context",
+      "surface": "admin",
+      "operation_id": "rooms.events.context",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/rooms/{room_id}/forward-extremities",
+      "surface": "admin",
+      "operation_id": "rooms.forward_extremities.delete",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/rooms/{room_id}/forward-extremities",
+      "surface": "admin",
+      "operation_id": "rooms.forward_extremities.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/rooms/{room_id}/hierarchy",
+      "surface": "admin",
+      "operation_id": "rooms.hierarchy.get",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/rooms/{room_id}/join",
+      "surface": "admin",
+      "operation_id": "rooms.join",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/rooms/{room_id}/make-admin",
+      "surface": "admin",
+      "operation_id": "rooms.make_admin",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/rooms/{room_id}/media",
+      "surface": "admin",
+      "operation_id": "rooms.media.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/rooms/{room_id}/media/quarantine",
+      "surface": "admin",
+      "operation_id": "rooms.media.quarantine",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/rooms/{room_id}/members",
+      "surface": "admin",
+      "operation_id": "rooms.members.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/rooms/{room_id}/messages",
+      "surface": "admin",
+      "operation_id": "rooms.messages.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/rooms/{room_id}/purge-history",
+      "surface": "admin",
+      "operation_id": "rooms.purge_history",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/rooms/{room_id}/state",
+      "surface": "admin",
+      "operation_id": "rooms.state.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/rooms/{room_id}/unblock",
+      "surface": "admin",
+      "operation_id": "rooms.unblock",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/server",
+      "surface": "admin",
+      "operation_id": "server.get",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/server-notices",
+      "surface": "admin",
+      "operation_id": "server_notices.list",
+      "auth": "admin",
+      "required_scope": "moderation:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/server-notices",
+      "surface": "admin",
+      "operation_id": "server_notices.send",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/server/health",
+      "surface": "admin",
+      "operation_id": "server.health",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/statistics/overview",
+      "surface": "admin",
+      "operation_id": "statistics.overview",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/statistics/rooms",
+      "surface": "admin",
+      "operation_id": "statistics.rooms",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/statistics/timeseries",
+      "surface": "admin",
+      "operation_id": "statistics.timeseries",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/statistics/users/media",
+      "surface": "admin",
+      "operation_id": "statistics.users_media",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/tasks",
+      "surface": "admin",
+      "operation_id": "tasks.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/tasks/{id}",
+      "surface": "admin",
+      "operation_id": "tasks.get",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/tasks/{id}/cancel",
+      "surface": "admin",
+      "operation_id": "tasks.cancel",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/users",
+      "surface": "admin",
+      "operation_id": "users.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/users",
+      "surface": "admin",
+      "operation_id": "users.create",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/users/availability",
+      "surface": "admin",
+      "operation_id": "users.availability",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/users/lookup",
+      "surface": "admin",
+      "operation_id": "users.lookup",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/users/{user_id}",
+      "surface": "admin",
+      "operation_id": "users.get",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/users/{user_id}",
+      "surface": "admin",
+      "operation_id": "users.update",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/users/{user_id}/account-data",
+      "surface": "admin",
+      "operation_id": "users.account_data.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/users/{user_id}/deactivate",
+      "surface": "admin",
+      "operation_id": "users.deactivate",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/users/{user_id}/devices",
+      "surface": "admin",
+      "operation_id": "users.devices.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/users/{user_id}/devices/bulk-delete",
+      "surface": "admin",
+      "operation_id": "users.devices.bulk_delete",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/users/{user_id}/devices/{device_id}",
+      "surface": "admin",
+      "operation_id": "users.devices.delete",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/users/{user_id}/devices/{device_id}",
+      "surface": "admin",
+      "operation_id": "users.devices.get",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/users/{user_id}/devices/{device_id}",
+      "surface": "admin",
+      "operation_id": "users.devices.update",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/users/{user_id}/experimental-features",
+      "surface": "admin",
+      "operation_id": "users.experimental_features.get",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/users/{user_id}/experimental-features",
+      "surface": "admin",
+      "operation_id": "users.experimental_features.put",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/users/{user_id}/external-ids",
+      "surface": "admin",
+      "operation_id": "users.external_ids.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/users/{user_id}/external-ids",
+      "surface": "admin",
+      "operation_id": "users.external_ids.add",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/users/{user_id}/external-ids/{provider}/{external_id}",
+      "surface": "admin",
+      "operation_id": "users.external_ids.remove",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/users/{user_id}/lock",
+      "surface": "admin",
+      "operation_id": "users.lock",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/users/{user_id}/login-as",
+      "surface": "admin",
+      "operation_id": "users.login_as",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/users/{user_id}/logout",
+      "surface": "admin",
+      "operation_id": "users.logout",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/users/{user_id}/media",
+      "surface": "admin",
+      "operation_id": "users.media.delete",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/users/{user_id}/media",
+      "surface": "admin",
+      "operation_id": "users.media.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/users/{user_id}/memberships",
+      "surface": "admin",
+      "operation_id": "users.memberships.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/users/{user_id}/pushers",
+      "surface": "admin",
+      "operation_id": "users.pushers.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/users/{user_id}/rate-limit",
+      "surface": "admin",
+      "operation_id": "users.rate_limit.delete",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/users/{user_id}/rate-limit",
+      "surface": "admin",
+      "operation_id": "users.rate_limit.get",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/users/{user_id}/rate-limit",
+      "surface": "admin",
+      "operation_id": "users.rate_limit.put",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/users/{user_id}/reactivate",
+      "surface": "admin",
+      "operation_id": "users.reactivate",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/users/{user_id}/redact-events",
+      "surface": "admin",
+      "operation_id": "users.redact_events",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/users/{user_id}/reset-password",
+      "surface": "admin",
+      "operation_id": "users.reset_password",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/users/{user_id}/sessions",
+      "surface": "admin",
+      "operation_id": "users.sessions.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/users/{user_id}/shadow-ban",
+      "surface": "admin",
+      "operation_id": "users.shadow_ban",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/users/{user_id}/statistics",
+      "surface": "admin",
+      "operation_id": "users.statistics.get",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/users/{user_id}/suspend",
+      "surface": "admin",
+      "operation_id": "users.suspend",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/users/{user_id}/threepids",
+      "surface": "admin",
+      "operation_id": "users.threepids.list",
+      "auth": "admin",
+      "required_scope": "admin:read",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/users/{user_id}/threepids",
+      "surface": "admin",
+      "operation_id": "users.threepids.add",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/users/{user_id}/threepids/{medium}/{address}",
+      "surface": "admin",
+      "operation_id": "users.threepids.remove",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/users/{user_id}/unlock",
+      "surface": "admin",
+      "operation_id": "users.unlock",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/users/{user_id}/unshadow-ban",
+      "surface": "admin",
+      "operation_id": "users.unshadow_ban",
+      "auth": "admin",
+      "required_scope": "moderation:write",
+      "rate_limited": true
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/users/{user_id}/unsuspend",
+      "surface": "admin",
+      "operation_id": "users.unsuspend",
+      "auth": "admin",
+      "required_scope": "admin:write",
+      "rate_limited": true
     },
     {
       "method": "GET",

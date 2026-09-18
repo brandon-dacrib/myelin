@@ -22,6 +22,12 @@ hs-auth = { path = "../hs-auth" }
 hs-kv = { path = "../hs-kv" }
 hs-telemetry = { path = "../hs-telemetry" }
 hs-http = { path = "../hs-http" }
+hs-room = { path = "../hs-room" }
+hs-media = { path = "../hs-media" }
+hs-appservice = { path = "../hs-appservice" }
+hs-admin = { path = "../hs-admin" }
+hs-model = { path = "../hs-model" }
+object_store = { workspace = true }
 
 clap = { workspace = true }
 tokio = { workspace = true }

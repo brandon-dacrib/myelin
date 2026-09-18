@@ -1,11 +1,17 @@
 //! `hs serve`: builds the router (`GET /_matrix/client/versions`, `GET
-//! /_matrix/client/v3/capabilities`, `hs-auth`'s legacy client routes, health and metrics
-//! endpoints), binds every configured listener, and serves until asked to shut down.
+//! /_matrix/client/v3/capabilities`, `hs-auth`'s legacy client routes, `hs-room`'s room routes,
+//! `hs-media`'s authenticated and legacy media routes, `hs-appservice`'s inbound ping route,
+//! `hs-admin`'s `/api/v1` surface and management-interface assets, health and metrics endpoints),
+//! binds every configured listener, and serves until asked to shut down.
 //!
 //! Built via `hs_http::router::Builder` rather than a bare `axum::Router`, so every route
 //! registered here also produces a `routes.json` entry (`docs/rfcs/0005-routes-json-manifest.md`)
 //! — see [`route_manifest`] and `--routes-manifest` on `hs serve` / the `hs routes-manifest`
-//! subcommand.
+//! subcommand. `hs-auth`, `hs-room` and `hs-appservice` each hand over a pre-built router
+//! fragment rather than routing through `Builder` themselves, so their manifest entries are
+//! hand-mirrored (`crate::auth_manifest`, `hs_room::routes::router`'s own `Builder` usage, and
+//! `crate::appservice_manifest` respectively — see each for why). `hs-media` and `hs-admin`
+//! already build through `Builder` internally, so their manifests come back for free.
 //!
 //! Split out from [`crate::cli`] so the `hs-cli` end-to-end test
 //! (`tests/e2e.rs`) can boot a real server in-process — bind to an ephemeral port, register a
@@ -26,8 +32,12 @@ use http::StatusCode;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
+use hs_appservice::ping::PingService;
 use hs_auth::state::AuthState;
 use hs_http::router::{AuthKind, Builder, RouteManifest, RouteMeta, Surface};
+use hs_kv::KvBackend;
+use hs_media::state::MediaState;
+use hs_room::state::RoomState;
 use hs_telemetry::metrics::Metrics;
 
 use crate::config_bridge;
@@ -53,6 +63,20 @@ pub enum ServeError {
     /// Loading `--capabilities-config` failed.
     #[error(transparent)]
     Capabilities(#[from] versions::CapabilitiesConfigError),
+    /// `server.server_name` or `server.signing_key_path` could not be turned into this server's
+    /// room-actor identity.
+    #[error("failed to build this server's room identity: {0}")]
+    Identity(#[from] ruma::IdParseError),
+    /// Opening `hs-room`'s room registry over the configured storage backend failed.
+    #[error("failed to open the room registry: {0}")]
+    Room(#[from] hs_kv::KvError),
+    /// Building `hs-media`'s state (object store, metadata store, and — if
+    /// `--media-scanning-config` was given — the content scanning engine) failed.
+    #[error(transparent)]
+    Media(#[from] crate::media::MediaSetupError),
+    /// Loading `appservices.registration_files` failed.
+    #[error(transparent)]
+    Appservices(#[from] crate::appservices::LoadAppservicesError),
     /// Writing `--routes-manifest` failed.
     #[error("failed to write routes manifest to {path:?}: {source}")]
     RoutesManifest {
@@ -91,6 +115,12 @@ pub struct ServeOptions {
     /// but not written — use the `hs routes-manifest` subcommand to get it without booting a
     /// server at all.
     pub routes_manifest_path: Option<PathBuf>,
+    /// `--media-scanning-config`: an optional `media.scanning` YAML file
+    /// (`hs_media::scanning::ScanningConfig::from_yaml`'s shape — see `crate::media`'s module doc
+    /// for why this cannot live in `-c`/`--config`'s native config file yet). Omitted means no
+    /// content scanning is attached (`ScanningConfig::default()`'s `mode: off`, zero behavioral
+    /// change).
+    pub media_scanning_config: Option<PathBuf>,
 }
 
 /// Builds the full application router and its `routes.json` manifest:
@@ -105,20 +135,47 @@ pub struct ServeOptions {
 ///   and `PLAN.md`).
 /// - `/health/live`, `/health/ready`, `/metrics`.
 ///
+/// - `hs-room`'s room routes ([`hs_room::routes::router`]), mounted under both `/_matrix/client/v3`
+///   and `/_matrix/client/r0`, the same as `hs-auth`'s.
+/// - `hs-media`'s authenticated routes ([`hs_media::router::authenticated_router`]) under
+///   `/_matrix/client/v1/media`, and — when `media.allow_legacy_unauthenticated_media` is set —
+///   its legacy routes ([`hs_media::router::legacy_router`]) under `/_matrix/media/v3`.
+/// - `hs-appservice`'s inbound ping route ([`hs_appservice::routes::ping_router`]) under
+///   `/_matrix/client/v1`.
+/// - `hs-admin`'s `/api/v1` surface and `/admin/` management-interface assets
+///   ([`hs_admin::router::build_router`]) — merged directly rather than through this function's
+///   own `Builder`, since that function already builds through its own `Builder` internally and
+///   its paths are absolute, not spec-relative (see its own doc comment).
+/// - `/health/live`, `/health/ready`, `/metrics`.
+///
 /// Every configured listener serves this same router regardless of its declared `resources`
 /// list — per-listener resource filtering (splitting `client`/`federation`/`media`/`metrics`
 /// traffic onto different sockets, the way Synapse's `listeners[].resources` does) is not
 /// implemented yet; see `docs/status/12-platform-and-kubernetes.md`.
-fn build_router(
+fn build_router<B: KvBackend>(
     auth: AuthState,
+    mounts: Mounts<B>,
     metrics: Arc<Metrics>,
     ready: Arc<AtomicBool>,
     unstable_features: Arc<BTreeMap<String, bool>>,
 ) -> (Router, RouteManifest) {
-    let auth_router = hs_auth::routes::router().with_state(auth);
+    let auth_router = hs_auth::routes::router().with_state(auth.clone());
     let auth_routes = crate::auth_manifest::routes();
 
-    let (router, manifest) = Builder::<()>::new()
+    let (room_router, room_manifest) = hs_room::routes::router::<B>();
+    let room_router = room_router.with_state(mounts.room);
+    let room_routes = room_manifest.routes;
+
+    let legacy_media_enabled = mounts.media.legacy_media_enabled;
+    let (media_router, media_manifest) = hs_media::router::authenticated_router::<B>();
+    let media_router = media_router.with_state(mounts.media.clone());
+    let media_routes = media_manifest.routes;
+
+    let ping_router =
+        hs_appservice::routes::ping_router::<B>(mounts.appservice_ping).with_state(auth);
+    let ping_routes = crate::appservice_manifest::routes();
+
+    let mut builder = Builder::<()>::new()
         .get(
             "/_matrix/client/versions",
             versions::get_versions,
@@ -161,7 +218,32 @@ fn build_router(
             auth_routes.clone(),
         )
         .merge_router("/_matrix/client/r0", auth_router, auth_routes)
-        .build();
+        .merge_router(
+            "/_matrix/client/v3",
+            room_router.clone(),
+            room_routes.clone(),
+        )
+        .merge_router("/_matrix/client/r0", room_router, room_routes)
+        .merge_router("/_matrix/client/v1/media", media_router, media_routes)
+        .merge_router("/_matrix/client/v1", ping_router, ping_routes);
+
+    if legacy_media_enabled {
+        let (legacy_router, legacy_manifest) = hs_media::router::legacy_router::<B>();
+        let legacy_router = legacy_router.with_state(mounts.media);
+        builder = builder.merge_router("/_matrix/media/v3", legacy_router, legacy_manifest.routes);
+    }
+
+    let (router, mut manifest) = builder.build();
+
+    // `hs-admin`'s router already builds through its own `Builder` and already has
+    // `.with_state(...)` applied internally (`hs_admin::router::build_router`'s own doc: it
+    // "returns the manifest alongside so callers can write routes.json") — its paths
+    // (`/api/v1/...`, `/admin/...`) are absolute, so it merges directly onto the top-level router
+    // rather than through `merge_router`, which would (harmlessly, but confusingly) prepend an
+    // empty prefix.
+    let (admin_router, admin_manifest) = hs_admin::router::build_router(mounts.admin);
+    manifest.routes.extend(admin_manifest.routes);
+    let router = router.merge(admin_router);
 
     let router = router
         .layer(Extension(ready))
@@ -173,15 +255,96 @@ fn build_router(
     (router, manifest)
 }
 
+/// Everything [`build_router`] needs beyond the always-present auth state, metrics and readiness
+/// flag: one piece per crate it mounts. Bundled into a struct (rather than more bare parameters)
+/// since both [`spawn_serve`] and [`route_manifest`] need to build one of these, and a
+/// six-plus-argument generic function invites transposition bugs.
+struct Mounts<B: KvBackend> {
+    room: RoomState<B>,
+    media: MediaState<B>,
+    appservice_ping: Arc<PingService<B>>,
+    admin: hs_admin::router::AdminState,
+}
+
+fn dummy_admin_state() -> hs_admin::router::AdminState {
+    // No real `hs_admin::auth::TokenVerifier` exists yet (`docs/status/15-admin-api-and-modules.md`
+    // "Interfaces needed": track 07 owns that). An empty `StaticVerifier` is the honest stopgap —
+    // every `/api/v1` request is unauthenticated (`401`), which is a correct answer for a server
+    // with no admin tokens configured, not a placeholder pretending to work. See
+    // `docs/status/12-platform-and-kubernetes.md`.
+    hs_admin::router::AdminState::new(
+        Arc::new(hs_admin::auth::StaticVerifier::new()),
+        Arc::new(hs_admin::audit::InMemoryAuditSink::new()),
+        Arc::new(hs_admin::events::EventBus::new()),
+    )
+}
+
+/// A throwaway [`Mounts`] over an in-memory backend, for [`route_manifest`]: routes are static,
+/// independent of runtime configuration, so this exists purely to read off the manifest
+/// [`Builder::build`] records before the router itself is dropped.
+fn throwaway_mounts() -> Mounts<hs_kv::memory::MemoryBackend> {
+    use hs_kv::memory::MemoryBackend;
+
+    let identity = hs_room::identity::HomeserverIdentity::for_tests("routes-manifest.invalid");
+    let room = RoomState {
+        auth: AuthState::in_memory(),
+        rooms: Arc::new(
+            hs_room::registry::RoomRegistry::open(MemoryBackend::new(), identity.clone())
+                .expect("opening an in-memory room registry cannot fail"),
+        ),
+        identity,
+    };
+
+    let object_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let metadata = hs_media::metadata::MetadataStore::open(MemoryBackend::new())
+        .expect("opening in-memory media metadata cannot fail");
+    let repository = hs_media::repository::MediaRepository::new(
+        object_store,
+        metadata,
+        Arc::new(hs_config::MediaConfig::default()),
+        Arc::new(hs_media::policy::InMemoryQuotaPolicy::unlimited()),
+        hs_media::thumbnail::ThumbnailPolicy::default(),
+        "routes-manifest.invalid".to_owned(),
+        || 0,
+    );
+    let media = MediaState {
+        auth: AuthState::in_memory(),
+        repository: Arc::new(repository),
+        legacy_media_enabled: true,
+        legacy_freeze_ms: None,
+    };
+
+    let registry = Arc::new(
+        hs_appservice::registry::Registry::open(
+            MemoryBackend::new(),
+            ruma::server_name!("routes-manifest.invalid"),
+        )
+        .expect("opening an in-memory appservice registry cannot fail"),
+    );
+    let appservice_ping = Arc::new(hs_appservice::ping::PingService::new(
+        registry,
+        Arc::new(hs_appservice::ping::HttpPingTransport::new()),
+    ));
+
+    Mounts {
+        room,
+        media,
+        appservice_ping,
+        admin: dummy_admin_state(),
+    }
+}
+
 /// The `routes.json` manifest [`build_router`] would produce, without needing a real
-/// [`AuthState`] or config — routes are static, independent of runtime configuration, so this
-/// builds one with throwaway in-memory state purely to read off the manifest [`Builder::build`]
-/// records, then drops the router. Used by `hs serve --routes-manifest` and the standalone
-/// `hs routes-manifest` subcommand.
+/// [`AuthState`], config or storage backend — routes are static, independent of runtime
+/// configuration, so this builds one with throwaway in-memory state purely to read off the
+/// manifest [`Builder::build`] records, then drops the router. Used by `hs serve --routes-manifest`
+/// and the standalone `hs routes-manifest` subcommand.
 #[must_use]
 pub fn route_manifest() -> RouteManifest {
     let (_router, manifest) = build_router(
         AuthState::in_memory(),
+        throwaway_mounts(),
         Arc::new(Metrics::new()),
         Arc::new(AtomicBool::new(true)),
         Arc::new(BTreeMap::new()),
@@ -262,24 +425,65 @@ pub async fn spawn_serve(
     }
 
     let opened_storage = storage::open_storage(&config.storage)?;
+    let storage::OpenedStorage::Embedded(backend) = &opened_storage;
+    let backend = backend.clone();
 
     // Wired by the integration lead per docs/status/07-auth-and-identity.md "For track 12":
     // the persistent store replaces the in-memory one, so users, devices and tokens survive a
-    // restart. `backend.clone()` is a cheap Arc-backed handle sharing the same open database.
+    // restart. `backend.clone()` is a cheap Arc-backed handle sharing the same open database —
+    // every subsystem below (auth, rooms, media, appservices) gets its own clone of the same
+    // opened backend rather than a separate store, so they all see the same durable data.
     let auth_config = hs_auth::config::AuthConfig::try_from(&config)?;
-    let auth_store: Arc<dyn hs_auth::store::AuthStore> = match &opened_storage {
-        storage::OpenedStorage::Embedded(backend) => {
-            Arc::new(hs_auth::store::tables::TablesAuthStore::open(backend.clone())?)
-        }
-    };
-    let auth_state = AuthState::with_store(auth_store, auth_config);
+    let auth_store: Arc<dyn hs_auth::store::AuthStore> = Arc::new(
+        hs_auth::store::tables::TablesAuthStore::open(backend.clone())?,
+    );
+    let mut auth_state = AuthState::with_store(auth_store, auth_config);
+
+    let identity = crate::identity::load_or_generate(&config)?;
+    let server_name = identity.server_name.clone();
+
     let metrics = Arc::new(Metrics::new());
+
+    let appservices = crate::appservices::load(&config.appservices, backend.clone(), &server_name)?;
+    // Replaces `hs-auth`'s stub `InMemoryAppserviceRegistry` (empty by default) with
+    // `hs-appservice`'s real, store-backed registry, so an `as_token` a loaded registration
+    // declares actually authenticates through `Requester` — see
+    // `hs_appservice::auth_registry::RegistryAppserviceAdapter`'s own doc comment. Set before
+    // `room_state`/`media_state` are built below, since both embed a clone of `auth_state`.
+    auth_state.appservices = Arc::new(
+        hs_appservice::auth_registry::RegistryAppserviceAdapter::new(appservices.registry.clone()),
+    );
+
+    let room_state = RoomState {
+        auth: auth_state.clone(),
+        rooms: Arc::new(hs_room::registry::RoomRegistry::open(
+            backend.clone(),
+            identity.clone(),
+        )?),
+        identity,
+    };
+
+    let media_state = crate::media::build_media_state(
+        &config,
+        backend.clone(),
+        auth_state.clone(),
+        options.media_scanning_config.as_deref(),
+        &metrics,
+    )?;
+
+    let mounts = Mounts {
+        room: room_state,
+        media: media_state,
+        appservice_ping: appservices.ping_service,
+        admin: dummy_admin_state(),
+    };
+
     let ready = Arc::new(AtomicBool::new(true));
     let unstable_features = Arc::new(versions::load_unstable_features(
         options.capabilities_config.as_deref(),
     )?);
 
-    let (app, manifest) = build_router(auth_state, metrics, ready, unstable_features);
+    let (app, manifest) = build_router(auth_state, mounts, metrics, ready, unstable_features);
 
     if let Some(path) = &options.routes_manifest_path {
         manifest
@@ -495,6 +699,7 @@ mod tests {
             ServeOptions {
                 capabilities_config: Some(capabilities_path),
                 routes_manifest_path: None,
+                media_scanning_config: None,
             },
         )
         .await
@@ -540,6 +745,7 @@ mod tests {
             ServeOptions {
                 capabilities_config: None,
                 routes_manifest_path: Some(manifest_path.clone()),
+                media_scanning_config: None,
             },
         )
         .await

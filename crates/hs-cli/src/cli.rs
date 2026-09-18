@@ -72,6 +72,13 @@ pub struct ServeArgs {
     /// and does not bind a socket).
     #[arg(long = "routes-manifest")]
     pub routes_manifest: Option<PathBuf>,
+
+    /// An optional `media.scanning` YAML file (`hs_media::scanning::ScanningConfig::from_yaml`'s
+    /// shape, e.g. `deploy/media-scanning/media-scanning.yaml`) attaching content scanning to the
+    /// media repository. Omit for no scanning (`crate::media`'s module doc explains why this
+    /// cannot live in `-c`/`--config`'s native config file yet).
+    #[arg(long = "media-scanning-config")]
+    pub media_scanning_config: Option<PathBuf>,
 }
 
 /// `hs routes-manifest` arguments.
@@ -381,6 +388,7 @@ async fn run_serve(args: &ServeArgs) -> i32 {
     let options = crate::serve::ServeOptions {
         capabilities_config: args.capabilities_config.clone(),
         routes_manifest_path: args.routes_manifest.clone(),
+        media_scanning_config: args.media_scanning_config.clone(),
     };
     let handle = match crate::serve::spawn_serve(config, options).await {
         Ok(h) => h,
