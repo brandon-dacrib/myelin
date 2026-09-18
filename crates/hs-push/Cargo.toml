@@ -5,8 +5,31 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "hs-push: see docs/workstreams for the owning track"
+description = "hs-push: push rules engine on Ruma's push types, compiled per-user rule sets, notification/highlight counts, HTTP pushers against the Push Gateway API. Track 10: see docs/workstreams/10-push.md"
 
 [dependencies]
+hs-kv = { path = "../hs-kv" }
+hs-tables = { path = "../hs-tables" }
+hs-model = { path = "../hs-model" }
+hs-http = { path = "../hs-http" }
+hs-auth = { path = "../hs-auth" }
+ruma = { workspace = true }
+axum = { workspace = true }
+http = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
+hs-testkit = { path = "../hs-testkit" }
+tokio = { workspace = true, features = ["full", "test-util"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "evaluate"
+harness = false
