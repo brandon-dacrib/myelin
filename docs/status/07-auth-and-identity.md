@@ -118,21 +118,145 @@ section (each such section says so).
   router test (register → whoami round trip through real axum `oneshot` requests).
 - `cargo fmt --all` and `cargo clippy -p hs-auth --all-targets -- -D warnings` both clean.
 
+## Session 2 additions to "Done"
+
+- **RFC 0009 applied** (`docs/rfcs/0009-appservice-identity-capability-flags.md`, authored by
+  track 11):
+  - `crates/hs-auth/src/appservice.rs`: `AppserviceRecord` gained `rate_limited: bool` and
+    `msc4190_enabled: bool`. Added `AppserviceRecord::new(appservice_id, sender, user_namespaces)`
+    (defaults `rate_limited: true`, `msc4190_enabled: false` — the RFC's "assume nothing extra is
+    granted" values) so every existing three-field call site in this crate's own tests didn't need
+    a bare-struct-literal rewrite.
+  - `crates/hs-auth/src/requester.rs`: `AppserviceIdentity` gained the same two fields.
+  - `crates/hs-auth/src/middleware.rs`: `authenticate_appservice` copies both fields from the
+    looked-up `AppserviceRecord` onto the `AppserviceIdentity` it builds.
+  - `crates/hs-auth/src/routes/devices.rs`: `put_device` now creates an unknown device instead of
+    404ing when `requester.appservice.msc4190_enabled`; `delete_device` skips
+    `crate::reauth::run` under the same condition. `post_delete_devices` (bulk) was deliberately
+    **not** changed — RFC 0009 names only the single-device routes; extending the bulk endpoint the
+    same way is a reasonable follow-up but out of the RFC's stated scope, noted here rather than
+    done unasked.
+  - New tests: `appservice.rs` and `middleware.rs`'s existing appservice fixtures updated to the
+    new constructor; `routes/devices.rs` gained
+    `put_device_creates_unknown_device_for_msc4190_appservice`,
+    `delete_device_skips_uia_for_msc4190_appservice`, and
+    `put_device_404s_on_unknown_device_for_ordinary_requester` (the negative case, to prove the
+    branch is conditional, not that 404 stopped happening at all).
+  - **Cross-crate compile fix (see "Decisions made" for the full justification)**:
+    `crates/hs-appservice/src/auth_registry.rs`'s `RegistryAppserviceAdapter::lookup_by_token` now
+    populates the two new fields from `row.rate_limited`/`row.msc4190` (data it already had in
+    hand — exactly the seam RFC 0009 describes), and
+    `crates/hs-appservice/src/routes.rs`'s test fixture was switched to
+    `AppserviceRecord::new(...)`. Verified: `cargo test -p hs-appservice --all-targets` (74 tests,
+    all passing) and `cargo clippy -p hs-appservice --all-targets -- -D warnings` (clean) after the
+    fix.
+- **`com.devture.shared_secret_auth` native login provider**
+  (`docs/status/11-appservices-and-bridges.md`'s "Next" item 2; `PLAN.md` section 6 WS14):
+  - `crates/hs-auth/src/shared_secret_auth.rs` (new module, registered in `lib.rs`):
+    `compute_token`/`verify_token`, HMAC-SHA512 over the full mxid's UTF-8 bytes, hex-encoded,
+    keyed by a shared secret — the exact algorithm real mautrix bridges compute
+    (`refs/mautrix-python/mautrix/bridge/custom_puppet.py`: `hmac.new(secret,
+    mxid.encode("utf-8"), hashlib.sha512).hexdigest()`, read for behavior only). Constant-time
+    verification via `hmac::Mac::verify_slice`. See the module's own doc comment for the full
+    protocol writeup and why `hs_compat::shared_secret`'s existing HMAC code (SHA-1, a different
+    nonce+field message shape, built for Synapse's admin registration API) could not be reused
+    unchanged — also covered under "Reuse considered" below.
+  - `crates/hs-auth/src/config.rs`: `AuthConfig` gained `shared_secret_auth_secret: Option<String>`
+    (default `None` = feature disabled).
+  - `crates/hs-auth/src/routes/login.rs`: `get_login_types` now takes `State<AuthState>` and
+    advertises `com.devture.shared_secret_auth` in the `GET /login` flow list only when a secret is
+    configured (mirroring how mautrix bridges probe: they fall back to `m.login.password` if the
+    flow isn't listed). `post_login` dispatches to the new
+    `resolve_shared_secret_auth_login` when `login_info.login_type() ==
+    "com.devture.shared_secret_auth"` (matched via `ruma::api::client::session::login::v3::
+    LoginInfo`'s `_Custom`/`CustomLoginInfo` catch-all, since this is not a login type ruma has a
+    named variant for); on success it flows through the same
+    user-lookup/deactivated/locked/`session::create_session` path every other login type uses, so
+    it cannot drift from password/token login's session semantics. Disabled-feature and
+    wrong-token cases both return the same errors an unsupported/wrong-password login would
+    (`M_UNRECOGNIZED` and `M_FORBIDDEN` respectively) — no new information leaked about whether the
+    feature exists to an unauthenticated prober beyond what `GET /login`'s flow list already says.
+  - New tests: `shared_secret_auth.rs` (5 tests, including an independently-computed HMAC-SHA512
+    oracle vector, generated via `python3 -c 'import hmac, hashlib; ...'` in this session, not
+    round-tripped through this crate's own code — same convention as `token.rs`'s CRC-32 oracle and
+    `password.rs`'s bcrypt vectors); `routes/login.rs` gained 5 tests covering advertised-vs-not,
+    successful login, wrong token, and disabled-feature behavior.
+  - `hmac = { workspace = true }` added to `crates/hs-auth/Cargo.toml` (the workspace entry already
+    existed, added by track 13 for `hs-compat`; no new `[workspace.dependencies]` entry needed).
+- Total test count: **128 passing** (`cargo test -p hs-auth`), up from 115 at the end of session 1.
+  `cargo clippy -p hs-auth --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and
+  `cargo check --workspace --all-targets` (whole workspace) all clean as of this write-up.
+
 ## In progress
 
-Nothing mid-flight; Phase 0 legacy-auth scope for this session is complete and green.
+Nothing mid-flight in `hs-auth` itself. Items 3 (consume `hs_config::AuthConfig`) and 4 (persistent
+`AuthStore`) were not started this session — the session was told to wrap up before reaching them.
+See "Next" for exactly where to pick each one up.
 
 ## Next
 
+**Item 3 — consume `hs_config::AuthConfig` directly (not started).** Read
+`crates/hs-config/src/auth.rs` this session; it has `enable_registration`,
+`registration_shared_secret[_file]`, `enable_legacy_login`, `session_secret[_file]`,
+`access_token_lifetime`, `refresh_token_lifetime`, `password: PasswordConfig` (`enabled`, `pepper`,
+`policy: PasswordPolicy`), `oidc_providers: Vec<OidcProviderConfig>`, `mas_delegation:
+Option<MasDelegationConfig>`. Gaps versus `hs_auth::config::AuthConfig` that a straight mapping
+cannot fill (need a decision or an RFC to `hs-config`, not guessed at silently):
+`nonrefreshable_access_token_ttl_ms`, `session_lifetime_ms`, `login_token_ttl_ms`,
+`uia_session_timeout_ms`, `registration_requires_token`, `valid_registration_tokens`,
+`guest_registration_enabled`, `recaptcha_enabled`, `terms_enabled`,
+`accept_legacy_query_param_token`, and this session's new `shared_secret_auth_secret` (planned
+mapping: reuse `hs_config`'s `registration_shared_secret` — see `config.rs`'s doc comment on that
+field for the reasoning — but this has not been implemented, only decided). Suggested approach:
+add `hs-config = { path = "../hs-config" }` to `hs-auth`'s own `Cargo.toml` (allowed — it's my own
+crate's manifest, and `hs-config` is track 13's finished, frozen crate, not a moving target) and
+implement `impl From<&hs_config::Config> for AuthConfig` (or `TryFrom`, for the server-name parse
+that `crates/hs-cli/src/config_bridge.rs::auth_config_from` already has to handle) directly on
+`hs_auth::config::AuthConfig`, mirroring that bridge function's logic almost exactly. Once that
+lands, `hs-cli`'s `config_bridge.rs::auth_config_from` becomes a one-line call-through — but
+**do not edit `hs-cli` to make that change**; that edit belongs to track 12, note the availability
+in this file and let them pick it up (per this crate's own instructions: own-crate edits only,
+cross-track changes are interface handoffs, not unilateral rewrites — the one exception made this
+session, to `hs-appservice`, was strictly to un-break a shared compile, not a design change, and is
+explained under "Decisions made").
+
+**Item 4 — persistent `AuthStore` over `hs-kv`/`hs-tables` (not started, and this is the bigger
+gap).** Read `crates/hs-kv/src/lib.rs`'s module doc (the transaction contract: `KvBackend::begin`
+gives serializable snapshot isolation, `Conflict` is the expected retry signal, not a `KvError`)
+and `crates/hs-tables/src/lib.rs` (typed keyspaces over `hs-kv` via `TypedKeyspace`, `TupleKey`
+order-preserving encoding, `IndexDef`/`maintain_index` for declarative indexes, `InternTable` for
+short-ID interning) this session but wrote no code against them. Sketch for the next session: a new
+`crate::store::tables` module implementing `UserStore`/`DeviceStore`/`TokenStore`/`UiaStore` (i.e.
+`AuthStore`, since it's a blanket impl over the four) against a `TypedKeyspace`-based schema —
+keyspaces for `users` (keyed by user_id, needs a secondary index or scan for
+case-insensitive-localpart conflict checking — `is_localpart_available`/`create_user`'s conflict
+check), `devices` (keyed by `(user_id, device_id)`), `access_tokens`/`refresh_tokens`/
+`login_tokens` (keyed by token hash, needs an index or scan by `user_id` for the
+`delete_all_*_for_user`/`delete_other_*_for_user` family and by `(user_id, device_id)` for
+`delete_access_tokens_for_device`), `uia_sessions` (keyed by session id), `threepids` (keyed by
+`(medium, address)`). `InMemoryAuthStore` (`crates/hs-auth/src/store/memory.rs`) stays as-is for
+tests per the assignment; the new implementation is additive, selected by whatever constructs
+`AuthState` (today only `hs-cli`'s `crates/hs-cli/src/storage.rs` opens a real backend — see that
+file and `docs/status/12-platform-and-kubernetes.md`'s "Interfaces needed" for exactly how `hs
+serve` would wire a new `AuthStore` impl in once it exists; that wiring is `hs-cli`'s call to make,
+not mine to force). **This is the item that decides whether `hs serve` survives a restart with its
+users intact — it currently does not.**
+
+**Carried over from session 1, still true:**
 - Wire `hs-auth`'s router into whatever crate ends up owning the real listener and
-  `/_matrix/client/v3` prefixing (see "Interfaces needed" — likely `hs-http`/`hs-cli`, once those
-  exist beyond their own placeholders).
+  `/_matrix/client/v3` prefixing (**done since session 1 by track 12** — `hs-cli` mounts this
+  crate's router under both `/_matrix/client/v3` and `/_matrix/client/r0`, per
+  `docs/status/12-platform-and-kubernetes.md` — leaving this line struck through rather than
+  deleted so the history is legible: ~~Wire `hs-auth`'s router into whatever crate ends up owning
+  the real listener~~).
 - Registration-token usage limits/expiry (currently a flat always-valid set).
 - 3PID validation-session flow (`/register/email/requestToken` etc.) once an email-sending story
   exists elsewhere in the workspace; today 3PID login works only for already-bound addresses.
-- Rate limiting wired into handlers with real per-IP keys once `hs-http` can supply one.
-- Begin native OAuth issuer implementation per RFC 0003's ordering (section 10), once Phase 0
-  legacy auth has had a chance to be exercised by Complement/differential tests (track 14).
+- Rate limiting wired into handlers with real per-IP keys once `hs-http` can supply one — now that
+  `AppserviceIdentity.rate_limited` exists (this session), whoever wires this in has the signal to
+  check; it is still not consulted anywhere (no handler calls a rate limiter with a real key yet).
+- Begin native OAuth issuer implementation per RFC 0003's ordering (section 10) — item 5 of this
+  session's assignment, not reached.
 - SSO redirect/token handoff, upstream OIDC/SAML/LDAP, MAS delegation implementation, account
   lifecycle beyond lock/suspend/deactivate (erasure, consent, account validity) — all Phase 1/2 per
   the brief.

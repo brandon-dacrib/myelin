@@ -424,7 +424,9 @@ mod tests {
 
         #[tokio::test]
         async fn clean_content_gets_204() {
-            let port = start_server("\"v1\"", |_req| OutResponse::no_content()).await;
+            let port =
+                start_server("\"v1\"", |_req| OutResponse::no_content_with_istag("\"v1\"").unwrap())
+                    .await;
             let scanner = IcapScanner::new(test_config(port));
             let source =
                 ScanSource::from_bytes("text/plain", Bytes::from_static(b"hello world"), 4096);
@@ -435,7 +437,7 @@ mod tests {
         #[tokio::test]
         async fn engine_version_returns_the_istag() {
             let port = start_server("\"sigs-2026-09-01\"", |_req| {
-                OutResponse::no_content()
+                OutResponse::no_content_with_istag("\"sigs-2026-09-01\"").unwrap()
             })
             .await;
             let scanner = IcapScanner::new(test_config(port));
@@ -446,7 +448,8 @@ mod tests {
         #[tokio::test]
         async fn infected_content_is_reported() {
             let port = start_server("\"v1\"", |_req| {
-                OutResponse::no_content()
+                OutResponse::no_content_with_istag("\"v1\"")
+                    .unwrap()
                     .try_add_header("X-Virus-ID", "Eicar-Test-Signature")
                     .unwrap()
             })
@@ -484,7 +487,7 @@ mod tests {
                 {
                     received_len_for_handler.store(reader.len() as u64, Ordering::SeqCst);
                 }
-                OutResponse::no_content()
+                OutResponse::no_content_with_istag("\"v1\"").unwrap()
             })
             .await;
             let scanner = IcapScanner::new(test_config(port));
