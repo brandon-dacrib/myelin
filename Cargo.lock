@@ -1627,6 +1627,19 @@ dependencies = [
 [[package]]
 name = "hs-bridge-conformance"
 version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "hs-appservice",
+ "hs-auth",
+ "hs-http",
+ "hs-kv",
+ "ruma",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+]
 
 [[package]]
 name = "hs-cli"

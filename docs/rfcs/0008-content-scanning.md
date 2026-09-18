@@ -1,8 +1,10 @@
-# 0008. Pluggable content scanning for uploads
+# 0008. Pluggable content adaptation for media (scanning, filtering, transformation)
 
 Status: accepted, 2026-09-18. Author: integration lead. Owner: track 09 (media), with track 15 (modules) for the callback transport and track 15/16 for the admin surface.
 
 Operators must be able to choose their own malware scanner and swap it without changing the server: ClamAV today, an enterprise agent such as CrowdStrike tomorrow, both during a migration. This RFC specifies that seam.
+
+It specifies more than scanning, because ICAP is not an antivirus protocol. RFC 3507 defines *content adaptation*: an ICAP service may inspect content and return a verdict, or return **modified content**. Antivirus is the best-known service; content filtering, data-loss prevention, classification, transcoding and translation are all ordinary ICAP services too. Building one good ICAP client therefore buys a general content pipeline rather than a single-purpose scanner, which is the main reason this design bets everything on one client instead of many adapters.
 
 ## 1. Why the existing hook is not enough
 
@@ -94,7 +96,36 @@ Whether through that crate or otherwise, the client must do all of this, because
 
 **`ISTag` is the engine version.** RFC 3507 defines it as an opaque tag the service changes when its configuration or signature set changes, which is exactly what the verdict cache in section 6 keys on. Cache invalidation after a signature update is therefore spec-native and free. Return the current `ISTag` from `engine_version` rather than inventing a versioning scheme.
 
-## 4. Where scanning happens
+### 3.4 Adaptation, not only scanning
+
+An ICAP service in RESPMOD answers in one of three ways: `204` meaning unchanged, an error or block, or `200` carrying a **replacement body**. Our interface must carry that third case or we throw away most of the protocol.
+
+`Verdict` therefore includes:
+
+```rust
+Replaced { content: AdaptedContent, by: String, reason: Option<String> },
+```
+
+Uses this unlocks, all of which are ordinary ICAP deployments rather than things we would build:
+
+| Service | What it does to Matrix media |
+|---|---|
+| Antivirus | The verdict case above |
+| Metadata stripping | Removes EXIF and GPS from uploaded photographs, which is a real privacy exposure in a chat server |
+| Data-loss prevention | Redacts or blocks documents containing secrets or regulated data, which is why enterprises ask for ICAP in the first place |
+| Classification and filtering | Blocks content by policy, including illegal-material detection services |
+| Transcoding | Normalises formats, downsamples oversized images |
+
+**Replacement has protocol consequences, and the limits are not negotiable:**
+
+1. **Replacement applies at upload only**, before the media identifier is returned, so the client references the adapted bytes and never learns another version existed. Replacing at download time would mean serving bytes that do not match what other clients cached and what event content may attest to.
+2. **Encrypted media can never be replaced.** The uploader's event carries hashes of the ciphertext, and the server holds no key. A service that returns replacement bytes for encrypted content is misconfigured; we reject the response and apply the `Unscannable { Encrypted }` policy rather than corrupting the file.
+3. **Replacement is off unless enabled.** `allow_replacement: false` is the default. An operator who has not asked for content rewriting should never silently get it, and an ICAP service that returns a modified body while replacement is disabled is treated as a scanner error under the configured failure policy.
+4. **Every replacement is audited**, recording the service, the reason, and both content hashes, because "the server changed a user's file" must be answerable after the fact.
+
+REQMOD is not used. Our content arrives through our own upload path, not through a proxy, so response adaptation is the applicable mode.
+
+## 4. Where adaptation happens
 
 1. **Local upload**, synchronous or deferred per mode, before the media is retrievable.
 2. **Asynchronous upload completion**, at `complete_reservation`, same policy.
@@ -110,6 +141,7 @@ media:
   scanning:
     mode: block            # block | quarantine | defer | off
     provider: icap
+    allow_replacement: false   # permit services to rewrite content (never for encrypted media)
     fail: closed           # closed | open
     timeout: 30s
     max_size: 100MiB
@@ -159,3 +191,4 @@ Therefore:
 - Failure-mode tests: timeout, connection refused and malformed response, asserted under both `fail: open` and `fail: closed`.
 - A test that a signature version change invalidates the cache.
 - A test that encrypted media is reported unscannable rather than clean, since reporting it clean would be the dangerous failure.
+- Replacement tests: a recorded `200` with a modified body is applied at upload when enabled; the same response is refused when `allow_replacement` is false; the same response against encrypted media is refused regardless; and every applied replacement writes an audit entry carrying both content hashes.
