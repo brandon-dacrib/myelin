@@ -1758,12 +1758,15 @@ dependencies = [
  "hs-auth",
  "hs-compat",
  "hs-config",
+ "hs-e2e",
  "hs-http",
  "hs-kv",
  "hs-media",
  "hs-model",
+ "hs-push",
  "hs-room",
  "hs-telemetry",
+ "hs-user",
  "http",
  "object_store",
  "rand 0.9.5",
@@ -1841,6 +1844,29 @@ dependencies = [
 [[package]]
 name = "hs-e2e"
 version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "futures",
+ "hs-appservice",
+ "hs-auth",
+ "hs-http",
+ "hs-kv",
+ "hs-tables",
+ "hs-testkit",
+ "proptest",
+ "rand 0.9.5",
+ "ruma",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tracing",
+]
 
 [[package]]
 name = "hs-federation"
@@ -2009,6 +2035,26 @@ dependencies = [
 [[package]]
 name = "hs-push"
 version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "criterion",
+ "hs-auth",
+ "hs-http",
+ "hs-kv",
+ "hs-model",
+ "hs-tables",
+ "hs-testkit",
+ "http",
+ "rand 0.9.5",
+ "reqwest 0.12.28",
+ "ruma",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "hs-room"
@@ -2127,6 +2173,29 @@ dependencies = [
 [[package]]
 name = "hs-user"
 version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "hs-auth",
+ "hs-http",
+ "hs-kv",
+ "hs-model",
+ "hs-room",
+ "hs-tables",
+ "hs-testkit",
+ "proptest",
+ "rand 0.9.5",
+ "ruma",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tracing",
+]
 
 [[package]]
 name = "http"

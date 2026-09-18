@@ -1334,6 +1334,36 @@ impl<B: KvBackend> RoomActor<B> {
     }
 }
 
+/// Looks one event up by ID across every room this server stores, returning the room it belongs to
+/// alongside its persisted row. Not scoped to a room, and not scoped to rooms currently resident:
+/// it goes through the event-ID intern table and the shared `events` keyspace directly, the same
+/// way [`resolve_alias`] goes through the alias keyspace.
+///
+/// This exists for federation's `GET /_matrix/federation/v1/event/{eventId}`, which the spec does
+/// not scope by room in its path, so the server has to work out which room an event is in before it
+/// can apply that room's visibility rules. Every caller must still do exactly that: this function
+/// deliberately performs **no** visibility check, and its `room_id` is the input to one.
+///
+/// # Errors
+/// Returns [`RoomError::Store`] on a storage failure, or [`RoomError::Internal`] if a stored row
+/// cannot be decoded.
+pub fn find_event_globally<B: KvBackend>(
+    backend: &B,
+    tables: &Tables<B>,
+    event_id: &EventId,
+) -> Result<Option<PersistedEvent>, RoomError> {
+    let snapshot = backend.snapshot();
+    let Some(event_sn) = tables.event_sn.lookup(&snapshot, event_id.as_bytes())? else {
+        return Ok(None);
+    };
+    let Some(bytes) = tables.events.get(&snapshot, &(event_sn,))? else {
+        return Ok(None);
+    };
+    let row: PersistedEvent = serde_json::from_slice(&bytes)
+        .map_err(|e| RoomError::Internal(format!("corrupt event row for {event_id}: {e}")))?;
+    Ok(Some(row))
+}
+
 /// Resolves a local alias to its room ID, without needing that room's actor loaded.
 ///
 /// # Errors

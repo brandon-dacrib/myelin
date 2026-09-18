@@ -678,3 +678,101 @@ async fn a_room_created_over_http_reaches_its_creators_sync() {
 
     handle.shutdown().await;
 }
+
+/// An invite reaches its target's `/sync` even though that user has never created, joined or
+/// synced anything -- the case `docs/rfcs/0012-room-registry-global-updates.md` singles out as the
+/// reason the discovery hook has to catch a room at creation rather than on first use.
+#[tokio::test]
+async fn an_invite_reaches_a_user_who_has_never_synced() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(reserve_ephemeral_port(), dir.path());
+
+    let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
+        .await
+        .expect("server should boot");
+    let base = handle.base_url();
+    let client = reqwest::Client::new();
+
+    let register = |username: &'static str| {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            client
+                .post(format!("{base}/_matrix/client/v3/register"))
+                .json(&json!({
+                    "username": username,
+                    "password": "hunter2-invites",
+                    "auth": {"type": "m.login.dummy"},
+                }))
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
+    };
+
+    let inviter = register("inviter").await;
+    let invitee = register("invitee").await;
+    let inviter_token = inviter["access_token"].as_str().unwrap().to_owned();
+    let invitee_token = invitee["access_token"].as_str().unwrap().to_owned();
+    let invitee_id = invitee["user_id"].as_str().unwrap().to_owned();
+
+    let created: serde_json::Value = client
+        .post(format!("{base}/_matrix/client/v3/createRoom"))
+        .bearer_auth(&inviter_token)
+        .json(&json!({"preset": "private_chat", "name": "Invited"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let room_id = created["room_id"].as_str().expect("a room id").to_owned();
+
+    let invited = client
+        .post(format!(
+            "{base}/_matrix/client/v3/rooms/{room_id}/invite"
+        ))
+        .bearer_auth(&inviter_token)
+        .json(&json!({"user_id": invitee_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invited.status(), reqwest::StatusCode::OK);
+
+    // The invitee's very first sync: they have done nothing at all until this moment.
+    let mut sync = serde_json::Value::Null;
+    for _ in 0..40 {
+        sync = client
+            .get(format!("{base}/_matrix/client/v3/sync?timeout=0"))
+            .bearer_auth(&invitee_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if sync["rooms"]["invite"].get(&room_id).is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let invite = sync["rooms"]["invite"]
+        .get(&room_id)
+        .unwrap_or_else(|| panic!("the invite should reach the invitee's first sync: {sync}"));
+
+    // `invite_state` carries the stripped state a client needs to render the invite before joining.
+    let events = invite["invite_state"]["events"]
+        .as_array()
+        .expect("invite_state.events");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "m.room.name" && e["content"]["name"] == "Invited"),
+        "stripped state should let a client name the room: {events:?}"
+    );
+
+    handle.shutdown().await;
+}
