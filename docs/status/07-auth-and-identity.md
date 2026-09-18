@@ -2,10 +2,90 @@
 
 Track brief: `docs/workstreams/07-auth-and-identity.md`. Owner crate: `hs-auth`.
 
-Last updated: 2026-09-18 (session 2, interrupted mid-assignment — see "Session 2" below for exactly
-where it stopped and what to do first).
+Last updated: 2026-09-18 (session 3, completed its assignment — see "Session 3" below).
 
-## Session 2 summary (read this first)
+## Session 3 summary (read this first)
+
+Assignment: **replace `InMemoryAuthStore`-only storage with a persistent `hs-kv`/`hs-tables`-backed
+`AuthStore`** — the single most operationally important gap in the project, since until this landed
+a restart of `hs serve` lost every user, device and token. In priority order: (1) build
+`TablesAuthStore` over `hs-kv`/`hs-tables`, keeping `InMemoryAuthStore` for tests; (2) get the
+indexes right, property-tested for no orphaned rows; (3) run the entire existing test suite against
+both implementations; (4) prove persistence end to end over a real `FjallBackend` in a temp
+directory, across a drop-and-reopen; (5) make the store constructible from configuration and tell
+track 12 (who owns `hs-cli`/`hs serve`) exactly what to change, without editing their crate; (6) if
+budget remained, wire `hs-auth` to consume `hs_config::AuthConfig` directly (session 2's item 3).
+
+**All six items are done.** In order:
+
+- **Item 1 — done.** `crates/hs-auth/src/store/tables.rs` (new, ~1080 lines):
+  `TablesAuthStore<B: KvBackend>` implements `UserStore`, `DeviceStore`, `TokenStore`, `UiaStore`
+  (and therefore the blanket `AuthStore`) exactly as `InMemoryAuthStore` does — same trait, same
+  `Arc<dyn AuthStore>` seam, no caller changes needed. `InMemoryAuthStore` is untouched and remains
+  what every test defaults to.
+- **Item 2 — done.** Seven keyspaces, two of them with a declarative secondary index
+  (`hs_tables::index::IndexDef`/`maintain_index`, maintained inside the same write transaction as
+  the row): `users_by_localpart_lower` (unique, case-insensitive registration conflict checking) and
+  `access_tokens_by_user`/`refresh_tokens_by_user` (non-unique, the "all tokens for this user"
+  access path every bulk-revocation route needs). `devices` and `threepids` need no index at all —
+  see the module doc's keyspace table for why. Property-tested in `tables.rs`'s
+  `access_token_index_never_diverges_from_primary_rows`: 64 random sequences of put/delete across
+  two users, cross-checking after every operation that the index's `lookup` result exactly matches
+  which rows actually exist and who owns them — no orphan, no miss. Two more targeted tests
+  (`deleting_an_access_token_leaves_no_index_row`, `overwriting_a_token_with_a_different_owner_moves_the_index_entry`)
+  check the specific failure modes a hand-rolled index most often gets wrong.
+- **Item 3 — done.** `crates/hs-auth/src/store/shared_tests.rs` (new): every behavioral test that
+  used to live only in `memory.rs` (session 1/2), ported to plain `async fn`s generic over
+  `S: AuthStore`, plus several new cases (exact-duplicate user conflict, bulk access-token deletes
+  cross-checked across two users, missing-row error cases for every setter, device-list sort
+  order). `memory::tests::shared_behavior_suite` and `tables::tests::shared_behavior_suite` each run
+  the whole suite (`shared_tests::run_all`) against their own store — a behavioral difference
+  between the two implementations now fails a test, not a route handler discovering it later.
+- **Item 4 — done.** `tables::tests::fjall_backed_store_survives_reopen_from_the_same_directory`:
+  opens a real `hs_kv::fjall_backend::FjallBackend` in a `tempfile::tempdir()`, registers a user,
+  sets a password hash, creates a device and an access token, drops the store and the backend
+  handle (simulating process exit), reopens a **new** `FjallBackend`/`TablesAuthStore` from the same
+  path, and asserts the user, password hash, device and access token are all still there and the
+  case-insensitive-localpart index still rejects the taken name. This is the concrete claim the
+  project needed to be able to make, and now can.
+- **Item 5 — done, without editing `hs-cli`.** `TablesAuthStore::open(backend: B) -> Result<Self,
+  StoreError>` is generic over any `B: hs_kv::KvBackend`, so it is already constructible from
+  whatever backend a config selects. Added `AuthState::with_store(store: Arc<dyn AuthStore>, config:
+  AuthConfig) -> Self` (`crates/hs-auth/src/state.rs`) as the ergonomic entry point. **Exact lines
+  track 12 needs to change are below** under "Interfaces provided" / "for track 12" — mechanical,
+  not RFC-sized, so no RFC was written.
+- **Item 6 (session 2's item 3, reached because budget remained) — done.** `AuthConfig` now has
+  `impl TryFrom<&hs_config::Config> for AuthConfig` (`crates/hs-auth/src/config.rs`), mapping every
+  field that has a direct `hs_config::AuthConfig` counterpart (server name, bcrypt pepper, token
+  lifetimes, registration-enabled flag, password policy, and — deliberately, not left at default —
+  `shared_secret_auth_secret` reusing `registration_shared_secret`) and documenting, in the impl's
+  own doc comment, every field that still has no native counterpart. `crates/hs-cli/src/
+  config_bridge.rs::auth_config_from` can now become a one-line call-through; **not edited here**
+  (not my crate) — see "Interfaces provided" for the exact replacement.
+
+Verification, all clean as of this write-up: `cargo test -p hs-auth` (**134 tests**, up from 128),
+`cargo clippy -p hs-auth --all-targets -- -D warnings`, `cargo fmt -p hs-auth -- --check`,
+`cargo check --workspace --all-targets` (whole workspace, every crate's tests included).
+
+Net test *count* looks like it dropped from 128 (end of session 2) before rising to 134 — this is
+`shared_tests`' consolidation, not lost coverage: roughly two dozen individual `memory.rs` tests
+became one `shared_behavior_suite` test per store (so the same assertions now run twice, once per
+implementation, under two test names instead of ~24 running once each) plus several genuinely new
+cases. Total assertions executed increased; the previous session's 128 number and this session's 134
+are not apples-to-apples per-test, but both `cargo test -p hs-auth` runs are 100% green.
+
+### What to do first (for the next session, or for track 12)
+
+1. If you are track 12: read "Interfaces provided" below for the exact `serve.rs` diff to wire the
+   persistent store into `hs serve`, and the exact `config_bridge.rs` simplification now available.
+   Neither requires any change to `hs-auth`.
+2. If you are track 07 continuing this work: the native OAuth issuer (RFC 0003) is still fully
+   unstarted design-only work and is the largest remaining Phase 1/2 item. See "Next".
+3. Re-run the verification commands above before starting new work.
+
+---
+
+## Session 2 summary
 
 Assignment was, in priority order: (1) apply RFC 0009's appservice capability flags, (2) implement
 `com.devture.shared_secret_auth` natively, (3) rewire `hs-auth` to consume `hs_config::AuthConfig`
@@ -187,62 +267,44 @@ section (each such section says so).
   `cargo clippy -p hs-auth --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and
   `cargo check --workspace --all-targets` (whole workspace) all clean as of this write-up.
 
+## Session 3 additions to "Done"
+
+Session 3's assignment (persistent `AuthStore`, items 1–5, plus item 6 = session 2's item 3) is
+covered in full above under "Session 3 summary" — not repeated here to avoid drift between two
+descriptions of the same work. This subsection lists exactly what changed, file by file, for anyone
+diffing:
+
+- **New**: `crates/hs-auth/src/store/tables.rs` (`TablesAuthStore<B: KvBackend>`, ~1080 lines
+  including tests), `crates/hs-auth/src/store/shared_tests.rs` (generic behavioral suite, ~450
+  lines).
+- **Edited**: `crates/hs-auth/src/store/mod.rs` (added `Serialize`/`Deserialize` derives to
+  `UserRecord`/`DeviceRecord`/`AccessTokenRecord`/`RefreshTokenRecord`/`LoginTokenRecord` so
+  `TablesAuthStore` can store them as JSON values; registered the new `tables`/`shared_tests`
+  modules; updated the module doc), `crates/hs-auth/src/store/memory.rs` (test module slimmed to
+  call `shared_tests::run_all` instead of ~14 hand-written tests, preserving exactly the same
+  assertions), `crates/hs-auth/src/state.rs` (added `AuthState::with_store`),
+  `crates/hs-auth/src/config.rs` (added `impl TryFrom<&hs_config::Config> for AuthConfig`, plus six
+  new tests), `crates/hs-auth/src/lib.rs` (crate doc comment updated to mention the persistent
+  store), `crates/hs-auth/Cargo.toml` (`hs-config`, `hs-kv`, `hs-tables`, `bytes` as dependencies;
+  `proptest`, `tempfile` as dev-dependencies).
+- **Not touched**: no other track's crate. `hs-cli` needs a small change to actually use
+  `TablesAuthStore` in `hs serve` — see "Interfaces provided" below, not made here per this crate's
+  own-crate-only rule.
+
 ## In progress
 
-Nothing mid-flight in `hs-auth` itself. Items 3 (consume `hs_config::AuthConfig`) and 4 (persistent
-`AuthStore`) were not started this session — the session was told to wrap up before reaching them.
-See "Next" for exactly where to pick each one up.
+Nothing mid-flight in `hs-auth` itself. This session's full assignment (items 1–6) is done. The
+native OAuth issuer (RFC 0003) remains fully unstarted design-only work — see "Next".
 
 ## Next
 
-**Item 3 — consume `hs_config::AuthConfig` directly (not started).** Read
-`crates/hs-config/src/auth.rs` this session; it has `enable_registration`,
-`registration_shared_secret[_file]`, `enable_legacy_login`, `session_secret[_file]`,
-`access_token_lifetime`, `refresh_token_lifetime`, `password: PasswordConfig` (`enabled`, `pepper`,
-`policy: PasswordPolicy`), `oidc_providers: Vec<OidcProviderConfig>`, `mas_delegation:
-Option<MasDelegationConfig>`. Gaps versus `hs_auth::config::AuthConfig` that a straight mapping
-cannot fill (need a decision or an RFC to `hs-config`, not guessed at silently):
-`nonrefreshable_access_token_ttl_ms`, `session_lifetime_ms`, `login_token_ttl_ms`,
-`uia_session_timeout_ms`, `registration_requires_token`, `valid_registration_tokens`,
-`guest_registration_enabled`, `recaptcha_enabled`, `terms_enabled`,
-`accept_legacy_query_param_token`, and this session's new `shared_secret_auth_secret` (planned
-mapping: reuse `hs_config`'s `registration_shared_secret` — see `config.rs`'s doc comment on that
-field for the reasoning — but this has not been implemented, only decided). Suggested approach:
-add `hs-config = { path = "../hs-config" }` to `hs-auth`'s own `Cargo.toml` (allowed — it's my own
-crate's manifest, and `hs-config` is track 13's finished, frozen crate, not a moving target) and
-implement `impl From<&hs_config::Config> for AuthConfig` (or `TryFrom`, for the server-name parse
-that `crates/hs-cli/src/config_bridge.rs::auth_config_from` already has to handle) directly on
-`hs_auth::config::AuthConfig`, mirroring that bridge function's logic almost exactly. Once that
-lands, `hs-cli`'s `config_bridge.rs::auth_config_from` becomes a one-line call-through — but
-**do not edit `hs-cli` to make that change**; that edit belongs to track 12, note the availability
-in this file and let them pick it up (per this crate's own instructions: own-crate edits only,
-cross-track changes are interface handoffs, not unilateral rewrites — the one exception made this
-session, to `hs-appservice`, was strictly to un-break a shared compile, not a design change, and is
-explained under "Decisions made").
+**Native OAuth 2.0 issuer implementation (RFC 0003), still not started.** This is now the largest
+remaining Phase 1/2 item on this track. RFC 0003's section 10 has the proposed build order (grants,
+PKCE, device authorization grant, discovery, dynamic client registration, scopes, device semantics,
+account management, MAS delegation mode). In-house grant implementation over `oxide-auth`;
+`jsonwebtoken` over `josekit` — both already decided, not re-litigated.
 
-**Item 4 — persistent `AuthStore` over `hs-kv`/`hs-tables` (not started, and this is the bigger
-gap).** Read `crates/hs-kv/src/lib.rs`'s module doc (the transaction contract: `KvBackend::begin`
-gives serializable snapshot isolation, `Conflict` is the expected retry signal, not a `KvError`)
-and `crates/hs-tables/src/lib.rs` (typed keyspaces over `hs-kv` via `TypedKeyspace`, `TupleKey`
-order-preserving encoding, `IndexDef`/`maintain_index` for declarative indexes, `InternTable` for
-short-ID interning) this session but wrote no code against them. Sketch for the next session: a new
-`crate::store::tables` module implementing `UserStore`/`DeviceStore`/`TokenStore`/`UiaStore` (i.e.
-`AuthStore`, since it's a blanket impl over the four) against a `TypedKeyspace`-based schema —
-keyspaces for `users` (keyed by user_id, needs a secondary index or scan for
-case-insensitive-localpart conflict checking — `is_localpart_available`/`create_user`'s conflict
-check), `devices` (keyed by `(user_id, device_id)`), `access_tokens`/`refresh_tokens`/
-`login_tokens` (keyed by token hash, needs an index or scan by `user_id` for the
-`delete_all_*_for_user`/`delete_other_*_for_user` family and by `(user_id, device_id)` for
-`delete_access_tokens_for_device`), `uia_sessions` (keyed by session id), `threepids` (keyed by
-`(medium, address)`). `InMemoryAuthStore` (`crates/hs-auth/src/store/memory.rs`) stays as-is for
-tests per the assignment; the new implementation is additive, selected by whatever constructs
-`AuthState` (today only `hs-cli`'s `crates/hs-cli/src/storage.rs` opens a real backend — see that
-file and `docs/status/12-platform-and-kubernetes.md`'s "Interfaces needed" for exactly how `hs
-serve` would wire a new `AuthStore` impl in once it exists; that wiring is `hs-cli`'s call to make,
-not mine to force). **This is the item that decides whether `hs serve` survives a restart with its
-users intact — it currently does not.**
-
-**Carried over from session 1, still true:**
+**Smaller, still-open items from sessions 1/2, unaffected by this session:**
 - Wire `hs-auth`'s router into whatever crate ends up owning the real listener and
   `/_matrix/client/v3` prefixing (**done since session 1 by track 12** — `hs-cli` mounts this
   crate's router under both `/_matrix/client/v3` and `/_matrix/client/r0`, per
@@ -263,12 +325,53 @@ users intact — it currently does not.**
 
 ## Blockers
 
-None outright. Item 4 (persistent `AuthStore`) is the item most worth unblocking next — it needs
-no external input, just the implementation work against `hs-kv`/`hs-tables`, both of which are
-built and frozen (see "Next").
+None. The persistent `AuthStore` (this session's whole assignment) is done. The native OAuth issuer
+is the next largest item and needs no external input either — it is purely implementation work
+against RFC 0003's already-settled design.
 
 ## Interfaces provided
 
+- **For track 12, to wire the persistent store into `hs serve` (session 3, new — the reason this
+  section exists is operational, read this first if you are track 12):**
+  `crates/hs-cli/src/serve.rs`'s `spawn_serve` currently has:
+  ```rust
+  let opened_storage = storage::open_storage(&config.storage)?;
+
+  let auth_config = config_bridge::auth_config_from(&config)?;
+  let auth_state = AuthState::in_memory_with_config(auth_config);
+  ```
+  Change the last two lines to:
+  ```rust
+  let auth_config = hs_auth::config::AuthConfig::try_from(&config)?;
+  let auth_store: std::sync::Arc<dyn hs_auth::store::AuthStore> = match &opened_storage {
+      storage::OpenedStorage::Embedded(backend) => std::sync::Arc::new(
+          hs_auth::store::tables::TablesAuthStore::open(backend.clone())?,
+      ),
+  };
+  let auth_state = AuthState::with_store(auth_store, auth_config);
+  ```
+  Notes: `backend.clone()` is cheap and correct — `FjallBackend` is an `Arc`-backed handle (see
+  `hs-kv`'s crate docs, "A `KvBackend` is a cheap-to-clone handle"), so the clone given to
+  `TablesAuthStore` and the original kept alive in `opened_storage`/`ServeHandle` share the same
+  open database; nothing needs `Drop` ordering care beyond what already exists. `TablesAuthStore::
+  open` returns `hs_auth::store::StoreError` and `AuthConfig::try_from` returns
+  `hs_auth::config::ConfigConversionError` — both need a `#[from]` arm added to `hs-cli`'s
+  `ServeError` enum (mechanical: one line each, `#[error(transparent)] AuthStore(#[from]
+  hs_auth::store::StoreError)` and similarly for the config error — `config_bridge::BridgeError`
+  may become dead code and removable once `config_bridge::auth_config_from` is deleted in favor of
+  the direct `TryFrom` call, see the next bullet). This whole change is mechanical (no design
+  judgment beyond "use the type this track built"), which is why it is written out here rather than
+  filed as an RFC — but it is track 12's own crate, so it is not made here.
+- **For track 12, `config_bridge.rs` simplification (session 3, new):**
+  `crates/hs-cli/src/config_bridge.rs::auth_config_from` can be replaced with a one-line
+  call-through to the new `hs_auth::config::AuthConfig::try_from` (see this crate's `config.rs` for
+  exactly which fields it maps and which it leaves at their documented default).
+  `config_bridge::BridgeError::InvalidServerName` becomes redundant with `hs_auth::config::
+  ConfigConversionError::InvalidServerName` (same check, same message shape) once this is done —
+  worth deleting rather than keeping two copies of the same validation, but that is track 12's call.
+  `config_bridge.rs`'s other functions (`telemetry_options_from`, `looks_like_native_config`,
+  `read_shared_secret_from_config`, `read_pepper_from_config`) are unrelated to `AuthConfig` and are
+  untouched by this change.
 - **`crate::middleware::{Requester, AllowGuest}`**: the axum `FromRequestParts<AuthState>`
   extractors every HTTP handler in the workspace is meant to use, frozen at the week-6 seam per
   `docs/workstreams/README.md`. Add as a handler parameter; no header/query parsing needed by
@@ -289,9 +392,22 @@ built and frozen (see "Next").
   from `row.rate_limited`/`row.msc4190` (this session added those two lines — see "Decisions made"
   for why that edit was made in another track's crate).
 - **`crate::store::{UserStore, DeviceStore, TokenStore, UiaStore, AuthStore}`**: storage traits any
-  track needing user/device/token/UIA data can depend on (as `Arc<dyn ...>`) without depending on
-  this crate's in-memory implementation specifically. **Still only `store::memory::
-  InMemoryAuthStore`** — see "Next" item 4; nothing persists through a restart yet.
+  track needing user/device/token/UIA data can depend on (as `Arc<dyn ...>`) without depending on a
+  concrete implementation. **Session 3: two implementations now exist** —
+  `store::memory::InMemoryAuthStore` (unchanged, still what every test in this crate defaults to)
+  and `store::tables::TablesAuthStore<B: hs_kv::KvBackend>` (new, persistent — generic over any
+  `KvBackend`, in practice `hs_kv::fjall_backend::FjallBackend` for a real server). See "Interfaces
+  provided" above for the exact `hs-cli` change that wires the latter into `hs serve`.
+- **`crate::state::AuthState::with_store`** (session 3, new): builds an `AuthState` around an
+  already-open `Arc<dyn AuthStore>` and config, keeping every other piece
+  (`InMemoryAppserviceRegistry`, an unlimited rate limiter, the real system clock) the same as
+  `AuthState::in_memory`. This is what track 12 should call instead of
+  `AuthState::in_memory_with_config` once it opens a persistent store.
+- **`impl TryFrom<&hs_config::Config> for crate::config::AuthConfig`** (session 3, new, session 2's
+  deferred item 3): the real config bridge, replacing `hs-cli`'s hand-maintained
+  `config_bridge.rs::auth_config_from`. See "Interfaces provided" above for the exact simplification
+  this makes available to track 12, and `crate::config`'s doc comment on the `TryFrom` impl itself
+  for exactly which fields map and which don't yet (nothing was guessed silently).
 - **`crate::password::{hash_password, verify_password}`**, **`crate::token::*`**,
   **`crate::uia::*`**, **`crate::reauth::run`**: reusable building blocks for anything else in this
   crate or, if useful, another auth-adjacent surface (the admin API's `login-as`, for instance,
@@ -306,21 +422,23 @@ built and frozen (see "Next").
 
 ## Interfaces needed
 
-- **01 (`hs-kv`/`hs-tables`)**: both exist and are frozen (read this session — see "Next" item 4);
-  the blocker is this crate's own implementation work, not anything to wait on from track 01.
+- **01 (`hs-kv`/`hs-tables`)**: satisfied as of session 3 — both were already frozen, and this
+  session built `TablesAuthStore` against them; nothing further needed from track 01.
 - **11 (appservices)**: satisfied as of session 2 — `RegistryAppserviceAdapter` is the real
   `AppserviceRegistry`, and it now also supplies the two RFC 0009 capability fields.
-- **13 (config)**: `crate::config::AuthConfig` is still a placeholder, not yet wired to
-  `hs_config::AuthConfig` (item 3, not started — see "Next" for the concrete gap list and suggested
-  approach). `hs_config::auth` exists and is stable; nothing further is needed *from* track 13 to
-  start this, only the implementation work in this crate.
+- **13 (config)**: satisfied as of session 3 — `crate::config::AuthConfig` now has a real
+  `TryFrom<&hs_config::Config>` impl; nothing further needed from track 13.
+- **12 (platform/`hs-cli`)**: needs to make the two mechanical changes under "Interfaces provided"
+  above (wire `TablesAuthStore` into `spawn_serve`, simplify `config_bridge.rs`) to actually get a
+  persistent, correctly-configured server; both are ready and waiting on track 12's own crate, not
+  on anything further from track 07.
 - **hs-http (shared with 07, 14, 15)**: `routes::router()` still returns a bare `Router<AuthState>`
   fragment at spec-relative paths; `hs-cli` (not `hs-http`) ended up doing the mounting and version
   prefixing (`docs/status/12-platform-and-kubernetes.md`) — `hs serve` now serves this crate's
   routes under both `/_matrix/client/v3` and `/_matrix/client/r0`. A real client IP for rate
   limiting is still not threaded through anywhere.
 - **14 (test/conformance)**: Complement and differential-tests-against-Synapse coverage for this
-  surface once `hs-testkit`/the harness exists; this crate's 128 tests (up from 115) are still its
+  surface once `hs-testkit`/the harness exists; this crate's 134 tests (up from 128) are still its
   own unit and router-level tests only, not run against Complement.
 
 ## Decisions made
@@ -409,6 +527,62 @@ built and frozen (see "Next").
   does item 3 should either keep this field and map it from the reused `registration_shared_secret`
   value, or fold it away entirely if that turns out cleaner once the real mapping function exists.
 
+### Session 3 decisions
+
+- **Keyspace/index layout for `TablesAuthStore`**: see `crates/hs-auth/src/store/tables.rs`'s module
+  doc for the full table (seven keyspaces, three secondary indexes). The two load-bearing choices:
+  (1) `devices` is keyed `(user_id, device_id)` with **no** secondary index — `list_devices` is a
+  prefix scan on `(user_id,)`, which `hs-tables`' order-preserving key encoding makes exact (a
+  shorter tuple that is a prefix of a longer one always sorts immediately before it, so the scan
+  cannot pick up another user's rows) — adding an index here would have been redundant machinery
+  for an access path the primary key already serves. (2) `access_tokens`/`refresh_tokens` are each
+  indexed **only** by `user_id`, not by `(user_id, device_id)`, even though
+  `delete_access_tokens_for_device` needs the latter: the per-device filter is applied in memory
+  after the user-scoped index lookup (a handful of rows per user in practice), rather than
+  maintaining a second index whose only job would be to save that filter. This was a deliberate
+  trade — a second index is more machinery to keep correct for a query that already starts from a
+  small, index-narrowed candidate set — and is called out explicitly here in case a future session
+  disagrees once token counts per user get large.
+- **Case-insensitive localpart uniqueness is enforced by a real unique index
+  (`users_by_localpart_lower`), not a table scan**, matching `InMemoryAuthStore`'s O(n) scan
+  semantics exactly but making the tables-backed store's own conflict check O(log n). `create_user`
+  still does a direct primary-key existence check *before* the index write (not relying on the
+  index alone) so an exact-user-id re-registration is rejected with the same `StoreError::Conflict`
+  Synapse-parity callers expect, not silently treated as an update.
+- **Every write to an indexed keyspace reads the row's old value first, inside the same
+  transaction, and always calls `maintain_index` with both old and new values** — even for updates
+  that provably cannot change the indexed field (e.g. `mark_access_token_used`, which only touches
+  `last_used_ms`). This costs one extra read per write but means no call site can silently forget
+  index maintenance if the row's shape changes later to add a field the index derives from; `hs_
+  tables::index::maintain_index` itself is a no-op when the derived key is unchanged, so the cost is
+  one comparison, not a wasted write.
+- **`TablesAuthStore` stores every row as `serde_json::to_vec`, not a binary format.** Matches
+  `hs-appservice::store::AppserviceStore`'s established convention in this workspace (read before
+  writing this module) rather than introducing a second row-encoding scheme; `hs-tables` only
+  encodes keys, values are each table owner's choice, and JSON keeps rows human-inspectable in a
+  raw `hs-kv` dump during debugging, which was judged worth more than a marginal size/speed win for
+  auth's data volumes (users/devices/tokens, not events).
+- **The shared behavioral test suite (`store::shared_tests::run_all`) is invoked once per store as
+  a single `#[tokio::test]`, not as ~24 individually-named `#[tokio::test]` wrappers per store.**
+  The task's phrasing ("make the suite generic over the store and instantiate it twice") is
+  satisfied either way; the single-entry-point form was chosen because duplicating ~24 thin wrapper
+  functions per store (48 total) is exactly the kind of boilerplate decision 0007 would flag, and a
+  panic inside `run_all` still reports the specific `assert_eq!`/`assert!` call site and line that
+  failed — the granularity lost is "which named sub-test failed" at the `cargo test` summary level,
+  not "what failed and where."
+- **`AuthState::with_store` was added rather than requiring track 12 to hand-construct an
+  `AuthState` struct literal.** `AuthState`'s fields are already all `pub`, so a struct-update-syntax
+  construction would have worked without any change to this crate; the convenience constructor was
+  added anyway because it names the intended call precisely (`with_store(store, config)`) and keeps
+  `hs-cli`'s wiring one line instead of five, and because the equivalent `in_memory`/
+  `in_memory_with_config` pair already established "provide a named constructor for each common
+  shape" as this type's own convention.
+- **`AuthConfig::try_from`'s server-name validation duplicates `config_bridge::BridgeError::
+  InvalidServerName`'s check, on purpose.** Once track 12 deletes `config_bridge::auth_config_from`
+  in favor of this crate's `TryFrom`, the duplication resolves itself (there will be exactly one
+  check again); until then, both exist, which is a harmless transitional state, not a bug — noted
+  here so it doesn't look like something was missed.
+
 ## Reuse considered (decision 0007)
 
 - **`com.devture.shared_secret_auth`'s HMAC verification**: considered depending on
@@ -428,12 +602,37 @@ built and frozen (see "Next").
   `crates/hs-auth/src/shared_secret_auth.rs`'s module doc.
 - **RFC 0009's two new fields**: plain `bool`s on existing structs; no external crate or reuse
   question involved.
-- **Items 3 and 4 (not started)**: no reuse evaluation done yet since no code was written. Worth
-  noting in advance: item 4 has an obvious "build only what's ours" answer already — `hs-kv` and
-  `hs-tables` are exactly the storage abstraction and typed layer decision 0007 names as "things we
-  still build" (the storage abstraction and state representation, because no existing library
-  models this project's needs), so there is no third-party crate to evaluate for item 4; it is
-  purely `hs-auth`'s own implementation work against an already-decided-and-built foundation.
+- **Items 3 and 4 (not started as of session 2)**: superseded — see "Session 3 reuse considered"
+  immediately below; both are now done.
+
+### Session 3 reuse considered
+
+- **`TablesAuthStore`'s shape and conventions were copied from `hs-appservice::store::
+  AppserviceStore`** (`crates/hs-appservice/src/store.rs`), read in full before writing a line of
+  `tables.rs`: the `TypedKeyspace`/`IndexDef` field layout, the `transact`-wrapped write methods
+  with a snapshot-based read path, the `to_kv`/marker-error (`RowExists`/`RowMissing`)/downcast
+  pattern for turning a generic `hs_kv::KvError` back into this crate's own error enum, and the
+  JSON-value-encoding convention. This is exactly decision 0007's "reuse a pattern already
+  established in this workspace" case: `hs-appservice` had already solved "how does a `hs-kv`/
+  `hs-tables`-backed store in this codebase look" for a comparably-shaped problem (rows plus a
+  couple of unique/non-unique token-lookup indexes), so re-deriving a different shape from first
+  principles would have been pure risk with no benefit — a second, gratuitously different store
+  idiom in the same workspace is itself a maintenance cost. Nothing was copied byte-for-byte (Rust
+  code, not text); the *pattern* was reused, the schema and every method body are specific to this
+  crate's own four traits.
+- **`hs-kv`/`hs-tables` themselves**: no third-party crate to evaluate, as session 2 already noted
+  — this is exactly the storage/typed-layer decision 0007 names as something this project builds
+  itself, and track 01 had already built and frozen it by the time this session started.
+- **No new third-party crate was added for the persistence work.** `proptest` and `tempfile` (both
+  already `[workspace.dependencies]` entries, used by other crates including `hs-tables` itself for
+  `proptest` and `hs-cli` for `tempfile`) were added to `hs-auth`'s own `[dev-dependencies]` as a
+  second/third consumer of an existing workspace entry, not a new one.
+- **`AuthConfig::try_from`'s mapping logic was ported from `hs-cli`'s existing
+  `config_bridge::auth_config_from`** (read in full first — see "Decisions made") rather than
+  redesigned: the field-by-field mapping, the reasoning for which fields have no native
+  counterpart, and the server-name validation are all the same logic that function already had
+  proven correct (it has its own passing test suite in `hs-cli`), moved to the crate that should
+  have owned it from the start rather than reinvented.
 
 ## Shared dependencies added
 
@@ -457,3 +656,17 @@ present):
   level for `hs-compat`; this session added `hs-auth` as a second consumer of the existing entry.
   `sha2` and `hex` were already both workspace dependencies and already present in `hs-auth`'s own
   `Cargo.toml` from session 1, reused as-is for the HMAC-SHA512 devture protocol.
+
+### Session 3
+
+All additions are path dependencies on sibling crates already in the workspace, not new
+`[workspace.dependencies]` entries:
+
+- `hs-config = { path = "../hs-config" }` — for `AuthConfig::try_from`.
+- `hs-kv = { path = "../hs-kv" }`, `hs-tables = { path = "../hs-tables" }` — for `TablesAuthStore`.
+- `bytes = { workspace = true }` — already a workspace entry (used by `hs-kv`/`hs-tables`
+  themselves); added to `hs-auth`'s own `Cargo.toml` as a direct dependency because `tables.rs`
+  touches `hs_kv::Value`/`Bytes` at a couple of call sites, previously only reached transitively.
+- `proptest = { workspace = true }`, `tempfile = { workspace = true }` added to
+  `[dev-dependencies]` — both already workspace entries (used by `hs-tables` and `hs-cli`
+  respectively); `hs-auth` is a new consumer of each, not a new entry.

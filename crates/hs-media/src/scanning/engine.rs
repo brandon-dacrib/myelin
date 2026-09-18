@@ -179,6 +179,46 @@ impl<B: hs_kv::KvBackend> ScanEngine<B> {
         self.config.mode
     }
 
+    /// The configured per-scan timeout, for a caller building the [`ScanContext::deadline`] this
+    /// evaluation runs under (`crate::repository::MediaRepository` is the only caller today).
+    #[must_use]
+    pub fn timeout(&self) -> std::time::Duration {
+        self.config.timeout.into()
+    }
+
+    /// True if `appservice_id` is exempt from scanning under
+    /// [`ScanningConfig::appservice_bypass`] (RFC section 4, point 4). A caller that finds this
+    /// `true` must skip [`ScanEngine::evaluate`] entirely and call
+    /// [`ScanEngine::record_bypass`] instead, so the bypass itself — not a scan outcome — is what
+    /// reaches the audit log.
+    #[must_use]
+    pub fn appservice_bypassed(&self, appservice_id: &str) -> bool {
+        self.config
+            .appservice_bypass
+            .exempt_appservice_ids
+            .iter()
+            .any(|id| id == appservice_id)
+    }
+
+    /// Records that `appservice_id`'s upload bypassed scanning (RFC section 4: "a bridge may be
+    /// configured to bypass only by explicit per-appservice configuration, which is recorded in
+    /// the audit log"). The caller is responsible for having checked
+    /// [`ScanEngine::appservice_bypassed`] first; this method does not re-check it, so it can also
+    /// be used to record a bypass decided elsewhere.
+    pub async fn record_bypass(&self, appservice_id: &str, ctx: &ScanContext, now_ms: u64) {
+        self.audit
+            .record(AuditEntry {
+                timestamp_ms: now_ms,
+                kind: AuditKind::AppserviceBypass {
+                    appservice_id: appservice_id.to_string(),
+                },
+                provider: self.scanner.id().to_string(),
+                server_name: ctx.server_name.clone(),
+                media_id: ctx.media_id.clone(),
+            })
+            .await;
+    }
+
     /// Evaluates one piece of content and returns what the caller should do.
     ///
     /// `allow_replacement_here` is the caller's own statement of RFC section 3.4's rule 1
@@ -198,6 +238,13 @@ impl<B: hs_kv::KvBackend> ScanEngine<B> {
         let provider_id = self.scanner.id().to_string();
         let source_label = ctx.source.as_str().to_string();
         let started = Instant::now();
+        // Computed once, up front, and threaded through both the cache-key path (`raw_outcome`)
+        // and the replacement audit entry (`decision_for`) — see that method's doc for why this
+        // is also the fix for a bug this session found: the audit entry used to hard-code
+        // `original_sha256` as an empty string with a "filled in by the caller" comment that no
+        // caller ever honored, since `evaluate` is the only place that ever had the original
+        // bytes in hand.
+        let sha256 = sha256_hex(&bytes);
 
         let raw = if is_encrypted {
             // Guarantee 1 (see module doc): the provider is never called for content classified
@@ -207,7 +254,8 @@ impl<B: hs_kv::KvBackend> ScanEngine<B> {
                 reason: UnscannableReason::Encrypted,
             }
         } else {
-            self.raw_outcome(content_type, &bytes, &ctx, now_ms).await
+            self.raw_outcome(content_type, &bytes, &sha256, &ctx, now_ms)
+                .await
         };
 
         // RFC section 3.4, rules 2 and 3: a replacement is refused (demoted to a scanner error,
@@ -230,7 +278,7 @@ impl<B: hs_kv::KvBackend> ScanEngine<B> {
         self.audit_if_needed(&raw, &provider_id, &ctx, now_ms).await;
 
         let action = self.action_for(&raw);
-        self.decision_for(action, raw, &provider_id, &ctx, now_ms)
+        self.decision_for(action, raw, &provider_id, &ctx, now_ms, &sha256)
             .await
     }
 
@@ -238,6 +286,7 @@ impl<B: hs_kv::KvBackend> ScanEngine<B> {
         &self,
         content_type: &str,
         bytes: &Bytes,
+        sha256: &str,
         ctx: &ScanContext,
         now_ms: u64,
     ) -> RawOutcome {
@@ -247,14 +296,11 @@ impl<B: hs_kv::KvBackend> ScanEngine<B> {
             };
         }
 
-        let sha256 = sha256_hex(bytes);
         let engine_version = self.scanner.engine_version().await;
-        if let Ok(Some(cached)) = self.cache.get(
-            now_ms,
-            &sha256,
-            self.scanner.id(),
-            engine_version.as_deref(),
-        ) {
+        if let Ok(Some(cached)) =
+            self.cache
+                .get(now_ms, sha256, self.scanner.id(), engine_version.as_deref())
+        {
             self.metrics.record_cache_hit(self.scanner.id());
             return raw_from_verdict(cached);
         }
@@ -299,7 +345,7 @@ impl<B: hs_kv::KvBackend> ScanEngine<B> {
                     };
                 }
                 other => {
-                    break self.finish_terminal(other, &sha256, engine_version.as_deref(), now_ms);
+                    break self.finish_terminal(other, sha256, engine_version.as_deref(), now_ms);
                 }
             }
         }
@@ -384,6 +430,7 @@ impl<B: hs_kv::KvBackend> ScanEngine<B> {
         provider_id: &str,
         ctx: &ScanContext,
         now_ms: u64,
+        original_sha256: &str,
     ) -> EngineDecision {
         match (action, raw) {
             (
@@ -394,7 +441,7 @@ impl<B: hs_kv::KvBackend> ScanEngine<B> {
                     reason,
                 },
             ) => {
-                let original_sha256 = String::new(); // filled in by the caller, which has the original bytes
+                let original_sha256 = original_sha256.to_string();
                 let adapted_sha256 = sha256_hex(&content.bytes);
                 self.audit
                     .record(AuditEntry {

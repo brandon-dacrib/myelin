@@ -7,8 +7,10 @@
 //!   (`docs/rfcs/0002-auth-tokens-and-requester.md`).
 //! - The [`requester::Requester`] type and the [`middleware`] axum extractor every HTTP handler
 //!   in the workspace is meant to use.
-//! - Storage traits for users, devices, tokens and UIA sessions ([`store`]), with an in-memory
-//!   implementation; a real `hs-tables`-backed one lands later behind an RFC.
+//! - Storage traits for users, devices, tokens and UIA sessions ([`store`]), with two
+//!   implementations: an in-memory one for tests ([`store::memory::InMemoryAuthStore`]) and a
+//!   persistent one over `hs-kv`/`hs-tables` ([`store::tables::TablesAuthStore`]) for a real
+//!   `hs serve` process that must survive a restart.
 //! - Password hashing: Argon2id native, bcrypt verification for imported hashes ([`password`]).
 //! - The user-interactive-auth state machine ([`uia`]) and the shared re-auth check
 //!   ([`reauth`]) built on it.

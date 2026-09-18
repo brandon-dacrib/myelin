@@ -456,170 +456,17 @@ impl UiaStore for InMemoryAuthStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::AccessTokenRecord;
-    use ruma::{device_id, user_id};
 
     fn store() -> InMemoryAuthStore {
         InMemoryAuthStore::new()
     }
 
+    /// The entire behavioral test suite in `crate::store::shared_tests`, run against
+    /// `InMemoryAuthStore`. The same suite runs again in `tables::tests` against
+    /// `TablesAuthStore` — this is what proves the two implementations behave identically rather
+    /// than merely compiling against the same trait. See that module's doc comment.
     #[tokio::test]
-    async fn create_user_then_get_round_trips() {
-        let s = store();
-        let uid = user_id!("@alice:example.org").to_owned();
-        s.create_user(UserRecord::new(uid.clone(), 1000))
-            .await
-            .unwrap();
-        let got = s.get_user(&uid).await.unwrap().unwrap();
-        assert_eq!(got.user_id, uid);
-        assert!(!got.is_admin);
-    }
-
-    #[tokio::test]
-    async fn create_user_conflict_is_case_insensitive() {
-        let s = store();
-        s.create_user(UserRecord::new(
-            user_id!("@Alice:example.org").to_owned(),
-            1,
-        ))
-        .await
-        .unwrap();
-        let err = s
-            .create_user(UserRecord::new(
-                user_id!("@alice:example.org").to_owned(),
-                2,
-            ))
-            .await;
-        assert!(matches!(err, Err(StoreError::Conflict(_))));
-    }
-
-    #[tokio::test]
-    async fn is_localpart_available_reflects_existing_users() {
-        let s = store();
-        assert!(s.is_localpart_available("alice").await.unwrap());
-        s.create_user(UserRecord::new(
-            user_id!("@alice:example.org").to_owned(),
-            1,
-        ))
-        .await
-        .unwrap();
-        assert!(!s.is_localpart_available("alice").await.unwrap());
-        assert!(!s.is_localpart_available("ALICE").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn device_and_token_lifecycle() {
-        let s = store();
-        let uid = user_id!("@bob:example.org").to_owned();
-        let did = device_id!("DEV1").to_owned();
-        s.upsert_device(DeviceRecord {
-            user_id: uid.clone(),
-            device_id: did.clone(),
-            display_name: Some("phone".to_string()),
-            last_seen_ms: None,
-            last_seen_ip: None,
-        })
-        .await
-        .unwrap();
-        assert_eq!(s.list_devices(&uid).await.unwrap().len(), 1);
-
-        let hash = TokenHash::of("syt_whatever");
-        s.put_access_token(AccessTokenRecord {
-            hash,
-            user_id: uid.clone(),
-            device_id: Some(did.clone()),
-            expires_at_ms: None,
-            refresh_token_hash: None,
-            last_used_ms: None,
-        })
-        .await
-        .unwrap();
-        assert!(s.get_access_token(&hash).await.unwrap().is_some());
-
-        s.delete_access_tokens_for_device(&uid, &did).await.unwrap();
-        assert!(s.get_access_token(&hash).await.unwrap().is_none());
-
-        s.delete_device(&uid, &did).await.unwrap();
-        assert!(s.list_devices(&uid).await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn login_token_is_single_use() {
-        let s = store();
-        let uid = user_id!("@carol:example.org").to_owned();
-        let hash = TokenHash::of("syl_whatever");
-        s.put_login_token(LoginTokenRecord {
-            hash,
-            user_id: uid,
-            expires_at_ms: 10_000,
-            used: false,
-        })
-        .await
-        .unwrap();
-        let first = s.consume_login_token(&hash, 1_000).await.unwrap();
-        assert!(first.is_some());
-        let second = s.consume_login_token(&hash, 1_000).await.unwrap();
-        assert!(second.is_none());
-    }
-
-    #[tokio::test]
-    async fn login_token_expiry_is_enforced() {
-        let s = store();
-        let uid = user_id!("@dave:example.org").to_owned();
-        let hash = TokenHash::of("syl_whatever2");
-        s.put_login_token(LoginTokenRecord {
-            hash,
-            user_id: uid,
-            expires_at_ms: 1_000,
-            used: false,
-        })
-        .await
-        .unwrap();
-        let result = s.consume_login_token(&hash, 5_000).await.unwrap();
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn threepid_lookup_is_case_insensitive_on_address() {
-        let s = store();
-        let uid = user_id!("@eve:example.org").to_owned();
-        s.bind_threepid(&uid, "email", "Eve@Example.Org")
-            .await
-            .unwrap();
-        assert_eq!(
-            s.get_user_by_threepid("email", "eve@example.org")
-                .await
-                .unwrap(),
-            Some(uid)
-        );
-        assert!(
-            s.get_user_by_threepid("msisdn", "eve@example.org")
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn uia_session_tracks_completed_stages_and_data() {
-        let s = store();
-        let id = s.create_session(0).await.unwrap();
-        assert!(s.session_exists(&id, 100, 10_000).await.unwrap());
-        assert!(!s.session_exists(&id, 20_000, 10_000).await.unwrap());
-
-        s.mark_stage_complete(&id, "m.login.dummy").await.unwrap();
-        s.mark_stage_complete(&id, "m.login.dummy").await.unwrap(); // idempotent
-        assert_eq!(
-            s.completed_stages(&id).await.unwrap(),
-            vec!["m.login.dummy".to_string()]
-        );
-
-        s.set_session_data(&id, "username", serde_json::json!("alice"))
-            .await
-            .unwrap();
-        assert_eq!(
-            s.get_session_data(&id, "username").await.unwrap(),
-            Some(serde_json::json!("alice"))
-        );
+    async fn shared_behavior_suite() {
+        crate::store::shared_tests::run_all(store).await;
     }
 }

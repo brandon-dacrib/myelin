@@ -2,8 +2,203 @@
 
 Track brief: `docs/workstreams/09-media.md`. Owner crate: `hs-media`.
 
-Last updated: 2026-09-18 (session 2, content scanning: `docs/rfcs/0008-content-scanning.md` /
-PLAN.md decision D6b). Session 1's record is unchanged below this section.
+Last updated: 2026-09-18 (session 3: wired `crate::scanning::ScanEngine` into
+`crate::repository::MediaRepository`, closing session 2's largest gap). Sessions 1 and 2's records
+are unchanged below this section.
+
+## Session 3: wiring content scanning into the upload path
+
+Session 2 built the entire `crate::scanning` subsystem (provider interface, verdict cache, ICAP
+and HTTP providers, metrics, audit, `ScanEngine`) but never called it from anywhere —
+`MediaRepository::upload`/`complete_reservation` were unchanged from session 1. This session closes
+that gap: every RFC 0008 section 4 scan point that has a caller today is wired, `block`/`defer`/
+`quarantine`/`off` are four genuinely different behaviors (not two of them collapsing into one),
+the section 3.4 replacement rules apply at the real call sites, and a reference c-icap+ClamAV
+deployment exists under `deploy/media-scanning/`.
+
+### Verification
+
+```
+cargo check -p hs-media                                  # clean
+cargo clippy -p hs-media --all-targets -- -D warnings     # clean
+cargo test -p hs-media                                    # 241 passed, 0 failed (229 lib + 11 image_corpus + 1 s3_backend)
+cargo fmt -p hs-media                                     # applied, no diff on re-run
+```
+
+### Done
+
+1. **`MediaRepository<B>::with_scanning`** (`crates/hs-media/src/repository.rs`): a new builder
+   method taking an already-built `ScanEngine<B>`, storing it as `Option<Arc<ScanEngine<B>>>`.
+   `MediaRepository::new`'s signature is unchanged, exactly as session 2's "Next" asked — every
+   existing caller (this crate's own tests, `crate::test_support`, `crate::state`'s doctest-style
+   fixture) still compiles unchanged and behaves as `mode: off` (no engine attached).
+2. **Two scan points wired for real** (RFC 0008 section 4, points 1 and 2 — the only two with an
+   existing caller): `MediaRepository::upload` and `MediaRepository::complete_reservation` both
+   call a new private `decide_scan` before `object_store.put`, and (for `defer`/`quarantine`) a
+   new `spawn_background_scan` after. `ScanContext::source` is `Local` for an ordinary upload,
+   `Appservice` when `UploadContext::appservice_id` is set (new field — see below).
+3. **Federation fetch (RFC 0008 section 4, point 3): the clean seam it needs, not code.** RFC 0007
+   (federation media) is still design-only — track 06 has no federation client for this crate to
+   call into yet, exactly as session 1 and 2 both recorded. Nothing to wire here yet;
+   `ScanSourceKind::Federation` already exists in `crate::scanning::types` for whenever it lands,
+   and `ScanEngine::evaluate`'s `allow_replacement_here: bool` parameter is exactly the seam RFC
+   0007's future caller needs to pass `false` through (upload-only replacement, RFC 0008 section
+   3.4 rule 1) — documented at the call site in `crate::repository::decide_scan`'s doc and in
+   `crate::scanning::engine`'s module doc, both already written by session 2.
+4. **Appservice bypass, wired and audited** (RFC 0008 section 4, point 4): `UploadContext` gained
+   a new field, `appservice_id: Option<String>`, threaded from `hs_auth::requester::Requester::
+   appservice` in `crate::routes::upload`'s three handlers (`upload_sync`, `create`, `put_upload`).
+   `decide_scan` checks `ScanEngine::appservice_bypassed` (new accessor) before ever building a
+   `ScanContext` for the provider call; a bypass calls the new `ScanEngine::record_bypass`
+   (writes `AuditKind::AppserviceBypass` directly, matching RFC 0008 section 4's "recorded in the
+   audit log" requirement) and skips scanning entirely — proven in
+   `repository::scanning_integration::appservice_bypass_skips_scanning_and_is_audited` by a fake
+   provider configured to always say "infected," asserted never called.
+5. **Four genuinely different modes**, not two collapsing into one:
+   - **`off`**: `decide_scan` returns immediately if `self.scanning` is `None` or
+     `engine.mode() == ScanMode::Off` — unchanged behavior, zero overhead.
+   - **`block`**: `engine.evaluate` is awaited synchronously before `object_store.put`; `Reject`
+     returns a new `MediaError::RejectedByScanner(String)` (mapped to `403 M_FORBIDDEN` in
+     `error.rs`, following that file's existing pattern) with nothing ever persisted, exactly as
+     RFC 0008 section 5 requires.
+   - **`defer`**: the record is stored **immediately quarantined** (`quarantined_by:
+     Some("system:pending-scan")`) before the response is even built, so it is retrievable by media
+     ID (the reservation/upload succeeds) but every download attempt gets the identical `404`
+     shape `MediaError::Quarantined` already produces for admin-quarantined and not-found media —
+     the brief's exact ask ("a download in the interim returns the same not-found response
+     quarantined media already returns, so the two are indistinguishable to a caller"). A
+     `tokio::spawn`-ed background task runs the real scan and either clears the marker (clean/
+     allowed) or leaves it quarantined (bad verdict) — see `defer_mode_hides_the_upload_until_a_
+     clean_verdict_arrives` and `defer_mode_stays_hidden_on_a_bad_verdict`.
+   - **`quarantine`**: the record is stored **immediately servable** (no marker at all); the same
+     background task quarantines it after the fact only if the verdict turns out bad
+     (`quarantined_by: Some("system:scan")`) — see `infected_upload_is_quarantined_under_
+     quarantine_mode`, which asserts the item is servable *before* waiting for the background
+     scan and only becomes `Quarantined` after polling for it.
+   The two marker strings (`PENDING_SCAN_MARKER` = `"system:pending-scan"`, `SCAN_QUARANTINE_
+   MARKER` = `"system:scan"`) are distinct so an admin (or a future admin-API `GET
+   /media/{...}`) can tell "still deciding" apart from "the scanner said no" apart from an actual
+   admin's own quarantine action (`by: Some("@admin:...")`, unrelated marker shape).
+6. **What "background" honestly is and is not.** `spawn_background_scan` is `tokio::spawn`, not
+   job-scheduler infrastructure: no persistence, no retry, no lease, nothing observable except the
+   audit log and the row it eventually updates. Documented at length in that method's own doc
+   comment and repeated here because it is the one thing to not silently forget: a process crash
+   between "the client received a `content_uri`" and "the spawned task resolves" leaves `defer`
+   media quarantined forever (safe, but stuck until an admin manually clears it — no worse a
+   failure mode than the scanner being down under `fail: closed`) and leaves `quarantine` media
+   un-quarantined even if the verdict would have said otherwise (an extended version of the
+   exposure window `quarantine` mode always accepts by design, not a new kind of unsafety). The
+   real fix is track 03/12's background-job leasing, which this crate does not own and did not
+   attempt to build a substitute for. This is the honest answer to the brief's "if you cannot do
+   that without background job infrastructure that belongs to another track, implement what you
+   can... and say precisely what is missing" — what's missing is durability across a restart, not
+   the mode distinction itself (that part is real, per item 5 above).
+7. **RFC 0008 section 3.4's replacement rules, applied at the real call sites, not only tested as a
+   pure function.** `decide_scan` (block mode) and `spawn_background_scan` (defer/quarantine mode)
+   both call `engine.evaluate(..., allow_replacement_here: true)` — true because both are
+   upload-time scan points, the one case section 3.4 rule 1 allows replacement at all. A
+   `Verdict::Replaced` result overwrites the stored bytes and `content_type` (immediately for
+   `block`; via the new `MetadataStore::update_content_type_and_length` for `defer`/`quarantine`,
+   once the background scan resolves — see `quarantine_mode_applies_a_replacement_from_the_
+   background_scan`). **Bug found and fixed while wiring this**: `ScanEngine::decision_for`'s
+   `AuditKind::ReplacementApplied` audit entry had `original_sha256: String::new()` with a comment
+   claiming "filled in by the caller" — no caller ever did, since `decision_for` never received the
+   original bytes to hash. Fixed by computing the hash once in `ScanEngine::evaluate` (which does
+   have the original bytes) and threading it down to both `raw_outcome` (the cache-key path,
+   already had its own local copy — now shares the one hash instead of computing it twice) and
+   `decision_for` (the audit path, previously broken). No test exercised the exact hash value
+   before, so nothing caught this in session 2; it is real now for any caller.
+8. **`MediaError::RejectedByScanner(String)`** (`crates/hs-media/src/error.rs`): maps to `403`/
+   `M_FORBIDDEN`, following the file's existing per-variant pattern; two direct tests
+   (`error::tests::rejected_by_scanner_is_403_with_m_forbidden` plus the integration coverage in
+   `repository::scanning_integration`).
+9. **`MetadataStore::update_content_type_and_length`** (`crates/hs-media/src/metadata.rs`): a new
+   method overwriting only a completed row's `content_type`/`byte_length` in place (used when a
+   background scan's replacement lands after the client already has a `content_uri`), leaving
+   `completed`/`expires_at_ms`/quarantine state untouched. Two direct tests plus the integration
+   test above.
+10. **12 new integration tests through the real upload path**
+    (`crates/hs-media/src/repository.rs`, `mod scanning_integration`, inside `#[cfg(test)]` —
+    unit tests calling `MediaRepository::upload`/`complete_reservation` directly, per this track's
+    existing convention of testing the repository layer without a real HTTP listener, since none
+    exists yet): clean upload retrievable; infected upload rejected under `block`; infected
+    quarantined under `quarantine` (servable-then-quarantined, proven with a poll); `defer` hides
+    until a clean verdict *and* stays hidden on a bad one; a `defer`/`quarantine`-mode replacement
+    is applied by the background path; scanner timeout under both `fail: closed` (rejects) and
+    `fail: open` (allows); encrypted content accepted and the fake provider proven never called;
+    replacement applied when `allow_replacement: true`, refused (demoted to a scanner error, then
+    rejected under `fail: closed`) when `false`; the async-upload completion path (`create` +
+    `complete_reservation`) scanned too, not just the synchronous path; appservice bypass. A local
+    `FixedVerdict`/`AlwaysTimesOut` fake `ContentScanner` stands in for a real provider, the same
+    pattern session 2's `scanning::engine::tests::FakeScanner` used — no public fake-provider
+    surface was added to the crate for this, since `ContentScanner` is already public and a test
+    module implementing it directly needs nothing else exported.
+11. **`deploy/media-scanning/`**: a reference deployment (`compose.yaml`, `media-scanning.yaml`,
+    `README.md`) running `opencloudeu/clamav-icap` (c-icap with a co-located clamd, one container)
+    beside a commented-out homeserver service, plus the exact `media.scanning` YAML block
+    (`ScanningConfig::from_yaml`'s shape) pointing `icap.host`/`icap.port`/`icap.service` at it.
+    **Explicitly marked untested** (Docker unavailable here, matching `deploy/Dockerfile`'s own
+    disclaimer) — reviewed line by line against `opencloudeu/clamav-icap`'s documented usage and
+    this crate's `scanning::providers::icap` wire behavior, never started. The homeserver service
+    is commented out with an explanation, not silently wrong: no `hs-*` binary reads
+    `media.scanning` from a config file or calls `MediaRepository::with_scanning` at startup yet
+    (`grep -rl MediaRepository::new crates/ | grep -v crates/hs-media` finds nothing — no listener
+    crate constructs a `MediaRepository` at all). The README's "What's still missing" section notes
+    track 12 should add the equivalent Helm sub-chart (`deploy/helm/hs` has none today) and lists
+    three other concrete gaps (a real EICAR-through-this-stack test, track 13's config folding, the
+    startup wiring itself).
+12. **`docs/rfcs/0011-admin-scanning-endpoints.md`**: the wire-shape proposal to track 15 that
+    `crate::scanning::admin`'s module doc has referenced since session 2 (that comment is now
+    updated to point at a real file). Specifies `GET /media/scan-verdicts` (paginated,
+    `AuditEntry`-backed), `POST /media/{server_name}/{media_id}/rescan` (with an
+    `apply_quarantine` query flag), `POST /media/rescan` (bulk, filter-based, a `Task` — the
+    "after a signature update" case), and `GET /media/scan-provider-health`, all extending the
+    existing `/media` resource family (`crates/hs-admin/openapi/openapi.yaml`, already implemented
+    by track 15) rather than forming a new one, matching RFC 0008 section 8's explicit instruction.
+    Section 7 of that RFC is a direct, honest list of three things `crates/hs-media` still needs
+    before section 4's endpoints are actually implementable: a concrete `impl ScanAdmin` (still
+    just a trait), a cache-bypassing scan path (`ScanEngine::evaluate` always prefers the verdict
+    cache, which defeats "rescan after a signature update" as stated), and a stable identifier on
+    `AuditEntry` (needed for the list endpoint's pagination cursor). None of these were built this
+    session — the RFC is scoped to the wire shape, per the brief's "if budget remains" framing.
+
+### Known gaps carried forward from this session (said precisely, not left implicit)
+
+- **Background scanning is `tokio::spawn`, not durable job infrastructure** — see "Done" item 6.
+  This is this session's central, deliberate simplification; do not silently upgrade the module
+  doc to imply otherwise without also building the real thing.
+- **`ScanAdmin` still has no implementation** (RFC 0011 section 7, item 1) — blocked on giving
+  `MediaRepository` a concrete `Arc<InMemoryAuditSink>` handle (today `ScanEngine` only exposes
+  `Arc<dyn AuditSink>`, which has no `recent()`).
+- **No cache-bypassing scan path** (RFC 0011 section 7, item 2) — `ScanEngine::evaluate` always
+  tries the verdict cache first; there is no way to force a fresh scan yet, which matters for both
+  a future `ScanAdmin::rescan` and the admin API's stated "rescan after a signature update" use
+  case.
+- **The EICAR-through-a-real-ICAP-daemon test** (session 2's own flagged gap) is still not
+  written — `deploy/media-scanning/` (item 11 above) is the prerequisite that makes it
+  straightforward to add, per that session's own note, but writing the test itself was not this
+  session's scope either (Docker is still unavailable here to run it against).
+- **No fuzzing was run** this session either, same caveat as both prior sessions (`cargo-fuzz`/a
+  nightly toolchain are not available in this sandbox).
+- **`appservice_id` threading stops at `UploadContext`.** `UploadPolicy` (the quota trait) now
+  receives a field it does not use — a deliberate, noted-in-code choice (see `policy.rs`'s doc on
+  the new field) to avoid a second, scanning-specific context type, not an oversight.
+
+### Next (in priority order)
+
+1. A concrete `impl ScanAdmin for MediaRepository<B>` plus the `Arc<InMemoryAuditSink>` handle it
+   needs (RFC 0011 section 7, item 1) — the fastest way to make the admin RFC's endpoints real.
+2. `ScanEngine::rescan` (or equivalent cache-bypassing path) — RFC 0011 section 7, item 2; blocks
+   "rescan after a signature update" from doing anything useful even once `ScanAdmin` exists.
+3. A stable id on `AuditEntry` — RFC 0011 section 7, item 3; blocks `GET /media/scan-verdicts`'s
+   pagination cursor.
+4. The EICAR-through-`deploy/media-scanning/` test, once Docker is available somewhere this can
+   run (env-var-gated, mirroring `tests/s3_backend.rs`).
+5. Everything session 1 and 2 already deferred and this session did not touch: URL previews,
+   federation media fetch/serve (blocked on track 06), direct media for bridges, GCS/Azure
+   backends, fuzzing for real, the track 12 Helm sub-chart for `deploy/media-scanning/`. See the
+   "Next"/"Interfaces needed" sections at the end of this file (session 1's original list; still
+   the accurate read for everything outside content scanning).
 
 ## Session 2: pluggable content scanning (`crate::scanning`)
 

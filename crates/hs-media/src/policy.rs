@@ -20,6 +20,13 @@ pub struct UploadContext {
     /// The server this request arrived on behalf of (normally this homeserver's own name; kept
     /// distinct from `user_id`'s domain for the rare appservice-masquerade case).
     pub server_name: String,
+    /// The appservice registration id (`hs_auth::requester::AppserviceIdentity::appservice_id`),
+    /// if this upload was made by an appservice through the ordinary upload path. `None` for an
+    /// ordinary user upload. Not used by [`UploadPolicy`] itself (a quota policy is free to
+    /// ignore it) — threaded through this struct only so `crate::repository` has it in hand to
+    /// check `crate::scanning::config::ScanningConfig::appservice_bypass` without a second,
+    /// scanning-specific context type.
+    pub appservice_id: Option<String>,
 }
 
 /// A pluggable upload quota check.
@@ -148,6 +155,7 @@ mod tests {
         UploadContext {
             user_id: "@alice:example.org".into(),
             server_name: "example.org".into(),
+            appservice_id: None,
         }
     }
 
@@ -173,10 +181,12 @@ mod tests {
         let alice = UploadContext {
             user_id: "@alice:example.org".into(),
             server_name: "example.org".into(),
+            appservice_id: None,
         };
         let bob = UploadContext {
             user_id: "@bob:example.org".into(),
             server_name: "example.org".into(),
+            appservice_id: None,
         };
         policy.check(&alice, Some(700)).await.unwrap();
         policy.record(&alice, 700).await;

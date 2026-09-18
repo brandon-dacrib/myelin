@@ -209,6 +209,40 @@ impl<B: KvBackend> MetadataStore<B> {
         .map_err(|e| MediaError::Metadata(e.to_string()))
     }
 
+    /// Overwrites a completed row's `content_type`/`byte_length` in place, without touching
+    /// anything else (`completed`, `expires_at_ms`, quarantine state). Used when a content-scanning
+    /// provider's [`crate::scanning::types::Verdict::Replaced`] is applied *after* the client
+    /// already received a `content_uri` — `defer`/`quarantine` mode's background scan
+    /// (`crate::repository`) — so the stored bytes and the row describing them stay consistent
+    /// even though the replacement was not known at the moment [`MetadataStore::put_media`] first
+    /// ran.
+    ///
+    /// # Errors
+    /// Returns [`MediaError::Metadata`] on a backend failure, or `Ok(false)` if no such row.
+    pub fn update_content_type_and_length(
+        &self,
+        server_name: &str,
+        media_id: &str,
+        content_type: &str,
+        byte_length: u64,
+    ) -> Result<bool, MediaError> {
+        let key = (server_name.to_string(), media_id.to_string());
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let Some(bytes) = self.media.get(txn, &key).map_err(to_kv_err)? else {
+                return Ok(false);
+            };
+            let mut record: MediaRecord = serde_json::from_slice(&bytes)
+                .map_err(|e| hs_kv::KvError::backend(DecodeError(e.to_string())))?;
+            record.content_type = content_type.to_string();
+            record.byte_length = Some(byte_length);
+            let value = serde_json::to_vec(&record)
+                .map_err(|e| hs_kv::KvError::backend(DecodeError(e.to_string())))?;
+            self.media.put(txn, &key, &value).map_err(to_kv_err)?;
+            Ok(true)
+        })
+        .map_err(|e| MediaError::Metadata(e.to_string()))
+    }
+
     /// Sets or clears the quarantine flag on a media row.
     ///
     /// # Errors
@@ -367,6 +401,38 @@ mod tests {
     fn missing_media_is_none() {
         let store = store();
         assert!(store.get_media("example.org", "nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn update_content_type_and_length_overwrites_only_those_fields() {
+        let store = store();
+        let rec = sample("replaced1");
+        store.put_media(&rec).unwrap();
+
+        let updated = store
+            .update_content_type_and_length("example.org", "replaced1", "image/png", 42)
+            .unwrap();
+        assert!(updated);
+
+        let got = store
+            .get_media("example.org", "replaced1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.content_type, "image/png");
+        assert_eq!(got.byte_length, Some(42));
+        // Everything else (notably `completed` and `quarantined_by`) is untouched.
+        assert_eq!(got.completed, rec.completed);
+        assert_eq!(got.quarantined_by, rec.quarantined_by);
+        assert_eq!(got.upload_name, rec.upload_name);
+    }
+
+    #[test]
+    fn update_content_type_and_length_on_missing_row_returns_false() {
+        let store = store();
+        let updated = store
+            .update_content_type_and_length("example.org", "nope", "image/png", 1)
+            .unwrap();
+        assert!(!updated);
     }
 
     #[test]

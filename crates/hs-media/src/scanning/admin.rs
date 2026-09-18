@@ -5,14 +5,17 @@
 //! (`crates/hs-admin/openapi/openapi.yaml`) belongs to track 15 and is not edited here. This
 //! module is this crate's side of that seam: a trait track 15's HTTP handlers can call, plus the
 //! plain data types those handlers would serialize. The wire-shape proposal for track 15's
-//! endpoints is `docs/rfcs/0011-admin-scanning-endpoints.md (not yet written)`.
+//! endpoints is `docs/rfcs/0011-admin-scanning-endpoints.md`.
 //!
-//! **Not implemented in this session**: a concrete `impl ScanAdmin`. The natural home is
-//! `crate::repository::MediaRepository<B>` once it holds a `crate::scanning::engine::ScanEngine<B>`
-//! (rescanning needs the repository's object-store access to re-read a media item's bytes; listing
-//! recent verdicts needs an `AuditSink` that also supports reading back, such as
-//! `crate::scanning::audit::InMemoryAuditSink::recent`). See `docs/status/09-media.md` for the
-//! exact next steps.
+//! **Not implemented in this session**: a concrete `impl ScanAdmin`. `crate::repository::
+//! MediaRepository<B>` now holds a `crate::scanning::engine::ScanEngine<B>` (see
+//! `MediaRepository::with_scanning`, wired into the upload path this session), which gets a
+//! `ScanAdmin` implementation most of the way there for `rescan`/`rescan_many` (the repository
+//! already has object-store access to re-read a media item's bytes), but `recent_verdicts` still
+//! needs a concrete `Arc<InMemoryAuditSink>` handle threaded alongside the engine, since
+//! `ScanEngine` only holds `Arc<dyn AuditSink>` (no `recent()` method on the trait object) — see
+//! RFC 0011 section 7 for the exact list of what is still missing and why. See
+//! `docs/status/09-media.md` for the exact next steps.
 
 use async_trait::async_trait;
 

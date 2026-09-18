@@ -41,6 +41,12 @@ pub enum ServeError {
     /// Bridging the native config to `hs-auth`'s own config type failed.
     #[error(transparent)]
     Bridge(#[from] config_bridge::BridgeError),
+    /// Converting the native config into `hs-auth`'s config type failed.
+    #[error(transparent)]
+    AuthConfig(#[from] hs_auth::config::ConfigConversionError),
+    /// Opening the persistent authentication store failed.
+    #[error(transparent)]
+    AuthStore(#[from] hs_auth::store::StoreError),
     /// Opening the configured storage backend failed.
     #[error(transparent)]
     Storage(#[from] storage::StorageOpenError),
@@ -257,8 +263,16 @@ pub async fn spawn_serve(
 
     let opened_storage = storage::open_storage(&config.storage)?;
 
-    let auth_config = config_bridge::auth_config_from(&config)?;
-    let auth_state = AuthState::in_memory_with_config(auth_config);
+    // Wired by the integration lead per docs/status/07-auth-and-identity.md "For track 12":
+    // the persistent store replaces the in-memory one, so users, devices and tokens survive a
+    // restart. `backend.clone()` is a cheap Arc-backed handle sharing the same open database.
+    let auth_config = hs_auth::config::AuthConfig::try_from(&config)?;
+    let auth_store: Arc<dyn hs_auth::store::AuthStore> = match &opened_storage {
+        storage::OpenedStorage::Embedded(backend) => {
+            Arc::new(hs_auth::store::tables::TablesAuthStore::open(backend.clone())?)
+        }
+    };
+    let auth_state = AuthState::with_store(auth_store, auth_config);
     let metrics = Arc::new(Metrics::new());
     let ready = Arc::new(AtomicBool::new(true));
     let unstable_features = Arc::new(versions::load_unstable_features(

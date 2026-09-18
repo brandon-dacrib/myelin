@@ -1,0 +1,57 @@
+# Reference deployment: c-icap fronting ClamAV, for hs-media's `icap` content-scanning provider
+# (docs/rfcs/0008-content-scanning.md). Read README.md in this directory before using this file.
+#
+# UNTESTED: Docker was not available in the sandbox this was written in (the same constraint
+# deploy/Dockerfile already documents for the homeserver image itself). This file was reviewed
+# line by line against opencloudeu/clamav-icap's documented usage
+# (https://github.com/opencloud-eu/container-clamav-icap) and against
+# crates/hs-media/src/scanning/providers/icap.rs's actual wire behavior, but never actually
+# started. Validate with `docker compose -f deploy/media-scanning/compose.yaml up` before relying
+# on it, and see README.md's "What's still missing" for exactly what that validation does not yet
+# cover even once it runs.
+
+services:
+  # c-icap, with ClamAV built in: the `opencloudeu/clamav-icap` image bundles both in one
+  # container (c-icap fronting a co-located clamd, with virus definitions fetched via `freshclam`
+  # at image *build* time -- see README.md for the signature-freshness implication of that). This
+  # is the direct target of crates/hs-media/src/scanning/providers/icap.rs's `IcapConfig`.
+  clamav-icap:
+    image: opencloudeu/clamav-icap:latest
+    restart: unless-stopped
+    ports:
+      # 1344 is ICAP's IANA-assigned port and c-icap's default. Published here only so the
+      # service is reachable from outside the compose network for manual testing
+      # (icap://localhost:1344/avscan) -- the homeserver container below would reach it over the
+      # compose network directly by service name and does not need this port published.
+      - "1344:1344"
+    healthcheck:
+      # c-icap has no HTTP health endpoint of its own; a bare TCP connect is the cheapest real
+      # signal that the ICAP listener has come up.
+      test: ["CMD-SHELL", "echo > /dev/tcp/127.0.0.1/1344"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  # The homeserver, with media.scanning pointed at the clamav-icap service above.
+  #
+  # COMMENTED OUT, not incomplete: as of this file, no `hs-*` binary reads `media.scanning` from a
+  # config file and calls `MediaRepository::with_scanning` at startup yet --
+  # crates/hs-media's `ScanEngine`/`ScanningConfig` are fully built and independently tested
+  # (docs/status/09-media.md) but nothing in crates/hs-cli or any listener crate constructs a
+  # `MediaRepository` at all yet (there is no caller to wire this into). Uncomment this service
+  # once that startup wiring exists (track 03/12's listener binary, or whichever crate ends up
+  # owning that `main.rs`), pointing `build`/`image` at the real binary and mounting a config file
+  # that embeds (or otherwise includes) the `media.scanning` section from `media-scanning.yaml` in
+  # this directory at whatever path that binary expects.
+  #
+  # homeserver:
+  #   build:
+  #     context: ../..
+  #     dockerfile: deploy/Dockerfile
+  #   depends_on:
+  #     clamav-icap:
+  #       condition: service_healthy
+  #   volumes:
+  #     - ./media-scanning.yaml:/etc/hs/media-scanning.yaml:ro
+  #   ports:
+  #     - "8008:8008"

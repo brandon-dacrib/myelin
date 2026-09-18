@@ -1,0 +1,36 @@
+# The `media.scanning` configuration block this deployment enables, in the exact shape
+# `hs_media::scanning::ScanningConfig::from_yaml` parses -- see that method's tests
+# (crates/hs-media/src/scanning/config.rs, `parses_the_rfcs_example_yaml`) for the authoritative
+# shape this file was hand-written to match.
+#
+# Track 13 owns folding a section like this into the real `hs_config::Config` document under the
+# key `media.scanning` (docs/status/09-media.md, "Interfaces needed" -- as of this file, that
+# folding does not exist yet). Until then, this file is what to hand
+# `hs_media::scanning::ScanningConfig::from_yaml` directly, or what to paste under a
+# `media.scanning:` key in a homeserver's full config once that key exists.
+#
+# `mode: block` is the safest starting point for a reference deployment (the upload fails until a
+# verdict arrives -- see docs/rfcs/0008-content-scanning.md section 5 for `defer`/`quarantine`'s
+# trade-offs if upload latency matters more than blocking on the scan).
+mode: block
+provider: icap
+allow_replacement: false
+fail: closed
+timeout: 30s
+max_size: 100MiB
+oversize: quarantine
+cache:
+  ttl: 7d
+  unversioned_ttl: 1h
+  capacity: 100000
+icap:
+  # `clamav-icap` resolves to the compose service of that name on the compose network
+  # (compose.yaml in this directory). Replace with a real hostname/IP for a non-compose
+  # deployment.
+  host: clamav-icap
+  port: 1344
+  # opencloudeu/clamav-icap exposes the same ICAP service under two aliases: `avscan` and
+  # `srv_clamav`. Either works; `avscan` is used here because it is the image's documented
+  # primary alias.
+  service: avscan
+  preview: negotiate

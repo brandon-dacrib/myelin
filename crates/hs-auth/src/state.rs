@@ -51,6 +51,24 @@ impl AuthState {
         }
     }
 
+    /// Builds an `AuthState` around an already-open store (in practice
+    /// [`crate::store::tables::TablesAuthStore`] over a real `hs_kv::KvBackend`, for a server
+    /// that must survive a restart) and the given config, keeping every other piece
+    /// ([`InMemoryAppserviceRegistry`], an unlimited rate limiter, the real system clock) the
+    /// same as [`AuthState::in_memory`]. This is the constructor a real `hs serve` process
+    /// should use once it has opened a persistent backend — see
+    /// `docs/status/07-auth-and-identity.md`'s "Interfaces provided" for the exact call this
+    /// replaces (`AuthState::in_memory_with_config`) and what `hs-cli`'s `serve.rs` needs to
+    /// change to use it.
+    #[must_use]
+    pub fn with_store(store: Arc<dyn AuthStore>, config: AuthConfig) -> Self {
+        Self {
+            store,
+            config: Arc::new(config),
+            ..Self::in_memory()
+        }
+    }
+
     /// The current time, milliseconds since the Unix epoch, from this state's clock.
     #[must_use]
     pub fn now_ms(&self) -> u64 {
@@ -73,5 +91,18 @@ mod tests {
         let state = AuthState::in_memory();
         let cloned = state.clone();
         assert_eq!(state.config.server_name, cloned.config.server_name);
+    }
+
+    #[test]
+    fn with_store_uses_the_given_store_and_config() {
+        use crate::store::tables::TablesAuthStore;
+        let backend = hs_kv::memory::MemoryBackend::new();
+        let store: Arc<dyn AuthStore> = Arc::new(TablesAuthStore::open(backend).unwrap());
+        let config = AuthConfig {
+            server_name: ruma::server_name!("with-store.example.org").to_owned(),
+            ..AuthConfig::default()
+        };
+        let state = AuthState::with_store(store, config);
+        assert_eq!(state.server_name(), "with-store.example.org");
     }
 }

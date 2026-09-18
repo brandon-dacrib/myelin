@@ -1,13 +1,20 @@
 //! Storage traits for users, devices, tokens and user-interactive-auth sessions.
 //!
-//! Track 01 is building `hs-kv` and `hs-tables` concurrently; this crate does not depend on them
-//! yet (`docs/workstreams/README.md` rule 1: own crates only, cross-track changes are RFCs). These
-//! traits are the seam: an `hs-tables`-backed implementation lands later behind an RFC in
-//! `docs/rfcs/` without changing any caller, because callers hold `Arc<dyn AuthStore>` (or the
-//! individual sub-traits), never a concrete type. [`memory::InMemoryAuthStore`] is the only
-//! implementation today and is what [`crate::state::AuthState`] uses.
+//! Two implementations exist: [`memory::InMemoryAuthStore`] (non-persistent, used by every test in
+//! this crate and by anything that wants a store without opening a backend) and
+//! [`tables::TablesAuthStore`] (persistent, generic over `hs_kv::KvBackend` — in practice either
+//! `hs_kv::memory::MemoryBackend` for fast tests of the tables-backed code path itself, or
+//! `hs_kv::fjall_backend::FjallBackend` for `hs serve`). Callers depend on the traits, not a
+//! concrete type — they hold `Arc<dyn AuthStore>` (or an individual sub-trait) — so which store
+//! backs a running server is a construction-time choice, not something that leaks into call
+//! sites. `store::shared_tests` (test-only) runs the same behavioral test suite against both
+//! implementations so they cannot silently drift apart.
 
 pub mod memory;
+pub mod tables;
+
+#[cfg(test)]
+pub(crate) mod shared_tests;
 
 use async_trait::async_trait;
 use ruma::{OwnedDeviceId, OwnedUserId};
@@ -33,7 +40,7 @@ pub enum StoreError {
 }
 
 /// A local user account.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UserRecord {
     /// The full Matrix user ID (`@localpart:server_name`).
     pub user_id: OwnedUserId,
@@ -80,7 +87,7 @@ impl UserRecord {
 }
 
 /// A device belonging to a user.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeviceRecord {
     /// The owning user.
     pub user_id: OwnedUserId,
@@ -96,7 +103,7 @@ pub struct DeviceRecord {
 }
 
 /// A stored access token record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AccessTokenRecord {
     /// Hash of the token string (never the token itself).
     pub hash: TokenHash,
@@ -118,7 +125,7 @@ pub struct AccessTokenRecord {
 }
 
 /// A stored refresh token record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RefreshTokenRecord {
     /// Hash of the token string.
     pub hash: TokenHash,
@@ -142,7 +149,7 @@ pub struct RefreshTokenRecord {
 }
 
 /// A stored short-term login token (`m.login.token`) record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LoginTokenRecord {
     /// Hash of the token string.
     pub hash: TokenHash,

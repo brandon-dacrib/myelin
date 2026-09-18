@@ -81,6 +81,13 @@ pub enum MediaError {
     /// rather than collapsing every auth failure into a generic `400`.
     #[error("authentication failed: {0}")]
     Auth(hs_auth::error::MatrixError),
+
+    /// Content scanning (`crate::scanning`) rejected this upload outright (`block` mode's bad
+    /// verdict, or a per-reason `unscannable`/`oversize` policy configured to `block`). Per RFC
+    /// 0008 section 5's `block` mode, the content is never persisted when this is returned —
+    /// `crate::repository::MediaRepository` returns this *before* calling `object_store.put`.
+    #[error("upload rejected by content scanning: {0}")]
+    RejectedByScanner(String),
 }
 
 impl From<object_store::Error> for MediaError {
@@ -164,6 +171,11 @@ impl MediaError {
                 MatrixErrorCode::Other(e.errcode().as_str().to_string()),
                 e.to_string(),
             ),
+            MediaError::RejectedByScanner(reason) => MatrixError::custom(
+                axum::http::StatusCode::FORBIDDEN,
+                MatrixErrorCode::Forbidden,
+                format!("upload rejected by content scanning: {reason}"),
+            ),
         }
     }
 }
@@ -206,5 +218,13 @@ mod tests {
     fn range_not_satisfiable_is_416() {
         let me = MediaError::RangeNotSatisfiable.to_matrix_error();
         assert_eq!(me.status, axum::http::StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    #[test]
+    fn rejected_by_scanner_is_403_with_m_forbidden() {
+        let e = MediaError::RejectedByScanner("infected: Eicar-Test-Signature".into());
+        let me = e.to_matrix_error();
+        assert_eq!(me.status, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(me.errcode.as_str(), "M_FORBIDDEN");
     }
 }

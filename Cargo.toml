@@ -110,6 +110,15 @@ kube = { version = "1", default-features = false, features = ["derive", "client"
 # not the workspace's schemars "1").
 k8s-openapi = { version = "0.25", features = ["latest", "schemars"] }
 
+# Added by track 06 (federation and security): DNS resolution (A/AAAA/SRV) for server-name
+# discovery (`docs/design/06-federation-threat-model.md` section 2.1), per the brief and decision
+# 0007's reuse principle rather than a hand-rolled DNS client. `ipnet` is CIDR parsing/containment
+# for `FederationConfig::ip_range_blocklist`/`ip_range_allowlist` enforcement in the federation
+# client (threat model section 2.6); already pulled in transitively by `hickory-net`, promoted to
+# a direct dependency rather than hand-rolling CIDR matching, per decision 0007.
+hickory-resolver = { version = "0.26", features = ["tokio"] }
+ipnet = "2"
+
 [profile.dev]
 opt-level = 0
 debug = 1

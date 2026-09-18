@@ -103,6 +103,7 @@ pub(crate) async fn upload_fixture(
     let ctx = UploadContext {
         user_id: user_id.to_string(),
         server_name: state.repository.server_name().to_string(),
+        appservice_id: None,
     };
     let bytes = Bytes::from(crate::test_fixtures::valid_png());
     let id = state

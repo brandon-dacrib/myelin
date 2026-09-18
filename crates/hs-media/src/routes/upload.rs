@@ -62,6 +62,10 @@ pub(crate) async fn upload_sync<B: KvBackend>(
     let ctx = UploadContext {
         user_id: requester.user_id.to_string(),
         server_name: state.repository.server_name().to_string(),
+        appservice_id: requester
+            .appservice
+            .as_ref()
+            .map(|a| a.appservice_id.clone()),
     };
     let media_id = state
         .repository
@@ -79,6 +83,10 @@ pub(crate) async fn create<B: KvBackend>(
     let ctx = UploadContext {
         user_id: requester.user_id.to_string(),
         server_name: state.repository.server_name().to_string(),
+        appservice_id: requester
+            .appservice
+            .as_ref()
+            .map(|a| a.appservice_id.clone()),
     };
     let (media_id, unused_expires_at) = state.repository.create_reservation(&ctx)?;
     let content_uri = mxc_uri(state.repository.server_name(), media_id.as_str());
@@ -122,6 +130,10 @@ pub(crate) async fn put_upload<B: KvBackend>(
     let ctx = UploadContext {
         user_id: requester.user_id.to_string(),
         server_name: state.repository.server_name().to_string(),
+        appservice_id: requester
+            .appservice
+            .as_ref()
+            .map(|a| a.appservice_id.clone()),
     };
     state
         .repository
