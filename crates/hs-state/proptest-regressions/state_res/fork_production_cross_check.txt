@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a2d0b87cfb5d5e34648a6c52063a88726ced2bf1b6f9e95495d3f6361758020a # shrinks to version_idx = 0, actions_a = [], actions_b = [RaisePower { who: 0, level: 0, by: 0 }]

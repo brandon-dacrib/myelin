@@ -1,8 +1,52 @@
 # 02 State and model: status
 
-Updated: 2026-09-18 (session 3).
+Updated: 2026-09-18 (session 4).
 
-## Session 3 (this session): closing the room-actor/state-store seam
+## Session 4 (this session): the two items session 3 left open, closed
+
+Assignment: close the two gaps session 3's "Next, in detail" flagged as the difference between
+claiming the state seam is closed and demonstrating it. Both are done.
+
+1. **The `StateStore` -> `StateFetch` adapter, built.** `hs_state::state_fetch::StoreStateFetch<'a,
+   S: StateStore, B: EventBody>` (`crates/hs-state/src/state_fetch.rs`) bridges a `(store, root)`
+   pair plus a new `EventBody` trait (event-body lookup by `EventSn`, the "small local trait,
+   analogous to `FlatState`'s shape" session 3's "Next" predicted) into `StateFetch`.
+   `StateFetch::get` on this type costs exactly two `StateStore` calls
+   (`intern_state_key` then `get`) plus one `EventBody::body` call -- no materialization of
+   anything beyond the single entry asked for, matching event auth's actual access pattern (a
+   handful of point lookups per event, per this session's assignment). See "Implications for
+   tracks 04 and 06" below for the exact call sequence track 04 needs to delete
+   `crate::pipeline::CurrentState`'s flat map.
+2. **The three-way fork integration test, written, plus a property-test generalization.**
+   `crates/hs-state/src/state_res/fork_production_cross_check.rs` (a `#[cfg(test)]` module inside
+   the crate, since `state_res::oracle` is crate-private -- exactly as session 3's "Next" said this
+   test would have to live) builds a genuine fork (a power-levels conflict and a membership
+   conflict on top of one shared parent, exercising two different auth paths at once), resolves it
+   through the production `KvStateStore` (`FrameRepr` over `hs_kv::memory::MemoryBackend`), and
+   asserts every state key's winner matches both `state_res::oracle::resolve` and
+   `state_res::v2::resolve` (`ruma-state-res`-backed) resolving the *same* two state maps directly.
+   A second test in the same module generalizes this into a 64-case property test over randomly
+   generated forks (mixing kick/ban/power-level/join-rule actions) across four room versions (V2,
+   V6, V8, V11), reusing the same `RoomBuilder`/`Action` machinery
+   `state_res::cross_check_tests`'s existing oracle-vs-`ruma-state-res` property test already used
+   -- pulled out into a new shared `state_res::test_support` module so both tests build on one
+   implementation of "construct a random forked room," not two. **All cases pass, including the
+   property test's 64 randomly generated forks: no divergence was found between the production
+   store and either reference implementation.**
+
+`cargo check -p hs-state`, `cargo fmt --check -p hs-state -p hs-model`, `cargo clippy -p hs-model -p
+hs-state --all-targets -- -D warnings`, and `cargo test -p hs-model -p hs-state` are all clean as
+of this update (63 hs-state tests, up from 59: +1 adapter test, +1 hand-built fork test, +1 fork
+property test; 50 hs-model tests, unchanged). `cargo check -p hs-room` was attempted to re-confirm
+the trait surface is still compatible (this session added new items to `state_fetch` but did not
+change the frozen `StateStore` trait itself, so no incompatibility was expected) but currently
+fails for a reason unrelated to this track: `crates/hs-auth/src/store/tables.rs:310` has a
+pre-existing `E0507` (`FnOnce` moved out of an `FnMut` closure) that blocks the build before
+`hs-room` itself is even reached -- another track's concurrent, unfinished work, not touched by or
+related to this session. `hs-state` compiled cleanly in that same run before `hs-auth` failed, which
+is the relevant signal for this track's own correctness.
+
+## Session 3: closing the room-actor/state-store seam
 
 Assignment: close the gap `docs/rfcs/0010-room-actor-state-store-seam.md` (written by track 04)
 named, promote the bake-off winner into production, and make the production store usable by the
@@ -183,21 +227,16 @@ or related to this session.)
   `StateStore`~~ **Done this session** -- see "Session 3" below. `crate::kv_store::ProductionStateStore<KV>`
   (`KvStateStore<FrameRepr<KV>>`) is now the production `StateStore`; `InMemoryStateStore` remains
   for tests only.
-- **Not done this session, and the most important remaining gap**: `hs-state` still has no adapter
-  that turns a `(StateStore, Root)` pair plus an event-body source into
-  `state_fetch::StateFetch`, so track 04 cannot yet delete `crate::pipeline::CurrentState`'s flat
-  map and hand auth checks a `StateStore`-backed view directly. `intern_state_key` (below) plus
-  `get`/`apply`/`resolve`/`current_state` are the primitives; the glue that turns them into
-  something `hs_state::auth` can call still needs writing. See "Next" for the concrete shape.
-- **Not done this session**: the integration test proving a genuine fork (two events extending one
-  parent with conflicting state) resolves identically through the production store,
-  `state_res::v2` (ruma-state-res-backed) and `state_res::oracle` (the independent implementation)
-  all three. `crate::kv_store`'s own `tests` module exercises fork-and-merge through the production
-  representation already (see `kv_store::tests::candidate_b_frames`) and matches the same fixed
-  expected winner `store.rs`'s and `generic_store`'s tests always have, but nothing yet calls
-  `state_res::oracle::resolve` and `state_res::v2::resolve` directly on the *same* two conflicting
-  state maps used to drive the production store and asserts the three-way agreement explicitly.
-  This is real, not yet closed, evidence work -- flagged clearly rather than claimed done.
+- ~~**Not done this session, and the most important remaining gap**: `hs-state` still has no
+  adapter that turns a `(StateStore, Root)` pair plus an event-body source into
+  `state_fetch::StateFetch`~~ **Done in session 4**: `state_fetch::StoreStateFetch` plus the new
+  `state_fetch::EventBody` trait. See "Implications for tracks 04 and 06" for track 04's exact
+  rewiring steps.
+- ~~**Not done this session**: the integration test proving a genuine fork ... resolves
+  identically through the production store, `state_res::v2` ... and `state_res::oracle` ... all
+  three~~ **Done in session 4**: `state_res::fork_production_cross_check`, both a hand-built fork
+  (power-levels conflict + membership conflict) and a 64-case property test over random forks
+  across four room versions. All green -- see "Session 4" above.
 - The results document's "What would change this decision" section names three concrete follow-ups
   if budget allows before this is treated as closed: (1) a real-room corpus once network access and
   a throwaway server are available, (2) a wider-fan-out or coarser-grain revision of candidate C
@@ -214,36 +253,29 @@ or related to this session.)
 - Chain-cover rebuild-from-scratch (for an imported room) and background verification are Phase
   1/2 per the brief; not started.
 
-### Next, in detail: the two items session 3 left open (concrete, for whoever picks this up)
+### Next, in detail: what session 3 left open, and where it stands after session 4
 
-1. **A `StateFetch` adapter over `StateStore`.** Add (likely in `crate::state_fetch`, since it
-   already owns the trait) a type like `StoreStateFetch<'a, S: StateStore, E>` that holds a
-   `&'a S`, an `S::Root`, and something that maps `EventSn -> (&UserId, &CanonicalJsonObject)`
-   (event bodies -- the room actor already has these in memory; a small local trait, analogous to
-   `state_fetch::FlatState`'s shape, is probably the cleanest way to keep this generic instead of
-   depending on `hs_model::event::Event` directly). `get(event_type, state_key)` becomes
-   `self.store.intern_state_key(event_type, state_key)` then `self.store.get(self.root, key_id)`
-   then a body lookup. Once this exists, `crate::pipeline::CurrentState`
-   (`crates/hs-room/src/pipeline.rs`) can be replaced by this type plus a `ProductionStateStore`
-   held per room, and `RoomActor::current_state`'s flat `BTreeMap` can go away. This is track 04's
-   work once the adapter exists (do not edit `hs-room` from this track), but the adapter itself is
-   this track's to build.
-2. **The three-way fork integration test.** Build a small room (create, join, power_levels, two
-   branches setting the same key to conflicting values, e.g. `m.room.name`) as both (a) a sequence
-   of `ProductionStateStore::add_event` calls ending in a merge event that triggers `resolve()`
-   internally, and (b) two `state_res::StateMap`s over one shared `state_res::EventStore` built
-   from the same events by hand (`state_res::cross_check_tests::RoomBuilder` is the existing
-   pattern to reuse). Call `state_res::v2::resolve` and `state_res::oracle::resolve` on (b)
-   directly, call `ProductionStateStore::get` on (a)'s merge root for the conflicting key, and
-   assert all three name the same winning event. `state_res::oracle` is `#[cfg(test)] pub(crate)`
-   (deliberately, from session 1 -- see "Decisions made" further down), so this test must live
-   inside the crate (a `#[cfg(test)]` module, e.g. `crate::kv_store`'s existing `tests` module or a
-   new sibling), not under `crates/hs-state/tests/` where it would not compile against `oracle` at
-   all.
-3. Everything in the pre-session-3 "Next" list below this point that session 3 did not touch
-   (restricted/knock-restricted join property coverage, `state_res::v1`'s missing oracle partner,
-   chain-cover-index wiring into `state_res`'s auth-chain computation, MSC4242 edge tables, and
-   chain-cover rebuild-from-scratch) is all still open and still Phase 1/2 per the brief.
+Items 1 and 2 below (the `StateFetch` adapter and the three-way fork integration test) are what
+session 3 flagged as open and session 4 closed; kept here, struck through, so the history of what
+was asked for and what shipped stays legible in one place rather than being silently deleted.
+
+1. ~~**A `StateFetch` adapter over `StateStore`.**~~ **Done in session 4**:
+   `state_fetch::StoreStateFetch` plus `state_fetch::EventBody`
+   (`crates/hs-state/src/state_fetch.rs`), exactly the shape this item predicted (a type holding
+   `&S`, `S::Root`, and a small local trait for event-body lookup rather than a dependency on
+   `hs_model::event::Event`). See "Implications for tracks 04 and 06" for track 04's exact
+   rewiring steps -- rewiring `crate::pipeline::CurrentState` itself is still track 04's work, not
+   done here (`hs-room` was not edited from this track), but the adapter it needs now exists and
+   is tested.
+2. ~~**The three-way fork integration test.**~~ **Done in session 4**:
+   `state_res::fork_production_cross_check` (`crates/hs-state/src/state_res/fork_production_cross_check.rs`),
+   both as a hand-built fork and as a property test. See "Session 4" above for what it covers and
+   the result (no disagreement found).
+3. Everything in the pre-session-3 "Next" list below this point that neither session 3 nor session
+   4 touched (restricted/knock-restricted join property coverage, `state_res::v1`'s missing oracle
+   partner, chain-cover-index wiring into `state_res`'s auth-chain computation, MSC4242 edge
+   tables, and chain-cover rebuild-from-scratch) is all still open and still Phase 1/2 per the
+   brief.
 
 ## Blockers
 
@@ -257,6 +289,66 @@ or related to this session.)
   this pass touched.
 
 ## Implications for tracks 04 and 06
+
+### Session 4: exactly what track 04 calls to delete `crate::pipeline::CurrentState`
+
+This is the concrete rewiring session 3 said would be track 04's work once the adapter existed.
+The adapter exists now (`state_fetch::StoreStateFetch`, `state_fetch::EventBody`,
+`crates/hs-state/src/state_fetch.rs`); this section is precise enough to rewire from without
+asking this track anything further. (Read-only reference for this section:
+`crates/hs-room/src/pipeline.rs`'s current `CurrentState<'a>` -- this track did not edit
+`hs-room`, per its own ownership rule, but did read that file to make sure this section's
+replacement is exact.)
+
+`CurrentState<'a>` today is two fields: `state: &'a BTreeMap<(String, String), EventSn>` (the flat
+current-state map to delete) and `events: &'a HashMap<EventSn, Event>` (the in-memory event-body
+cache, which does **not** need to change shape at all). Its `StateFetch` impl looks up `state`,
+then dereferences into `events`. The replacement:
+
+1. **Implement `hs_state::state_fetch::EventBody` directly on (a thin wrapper around) the room
+   actor's existing `HashMap<EventSn, Event>`** -- do not copy bodies into
+   `state_fetch::EventBodies` (that type is a test convenience for building fixtures from scratch;
+   the room actor already holds real `Event`s and should read through them, not duplicate them).
+   The one method to implement:
+   ```rust
+   fn body(&self, event: EventSn) -> Option<(&UserId, &CanonicalJsonObject)> {
+       let e = self.get(&event)?;
+       let content = e.json().get("content")?.as_object()?;
+       Some((AsRef::<UserId>::as_ref(&e.header().sender), content))
+   }
+   ```
+   This is line-for-line what `CurrentState`'s existing `StateFetch::get` impl already does to go
+   from an `Event` to a `StateEntry`'s `(sender, content)`; only the entry point changes (by
+   `EventSn` instead of by `(event_type, state_key)`, since key resolution now happens inside
+   `StoreStateFetch`, not here).
+2. **Hold a `hs_state::kv_store::ProductionStateStore<KV>` per room** (already the case per
+   session 3's "Interfaces provided" -- if track 04 has not yet done this part, do it now; nothing
+   below works without it), and **delete the flat `BTreeMap<(String, String), EventSn>` entirely**
+   -- nothing needs it once the adapter is in place.
+3. **At each call site that used to build a `CurrentState` and hand it to
+   `hs_state::auth::check_event_auth` / `check_auth_events_selection`**, instead:
+   ```rust
+   let root = store.current_state(room_version, &forward_extremities)?; // or store.state_at(single_extremity)?
+   let fetch = hs_state::state_fetch::StoreStateFetch::new(&store, root, &event_body_source);
+   // pass `&fetch` wherever `&current_state` (a `&CurrentState`) was passed before
+   ```
+   `current_state`'s single-vs-multiple-extremity handling is already covered by
+   `StateStore::current_state`'s own documented behavior (session 3's "Interfaces provided": a
+   single forward extremity's `state_at` is used directly, no `resolve()` call, exactly matching
+   what the pipeline's own module docs say about the single-writer case collapsing to one
+   snapshot) -- track 04 does not need to special-case "no fork" itself, same as before.
+4. **What does not change**: `EventRef`/`event_ref` and everything else in `pipeline.rs` unrelated
+   to `CurrentState` is untouched by this; `StoreStateFetch::get`'s cost is two `StateStore` calls
+   plus one body lookup per key, matching (not exceeding) what `CurrentState::get` already cost
+   (one `BTreeMap` lookup plus one `HashMap` lookup) -- this is a like-for-like swap in complexity,
+   not a new cost track 04 is taking on.
+
+Track 04 owns doing this rewiring and testing it against `hs-room`'s own test suite; this track
+does not know `hs-room`'s call sites well enough to enumerate them (that would require reading
+beyond this track's ownership boundary in a way its brief does not ask for), but the shape above
+is exact and complete for what to call.
+
+### Session 3: the production representation's cost model
 
 The bake-off's winner, now the production representation (`crates/hs-state/src/frames.rs`,
 `FrameRepr`, wrapped as a `StateStore` by `crates/hs-state/src/kv_store.rs`'s
@@ -317,9 +409,9 @@ consumers of `StateStore`:
   (e.g. for `KvStateStore::new` with a hand-built `repr`); most callers want `open`, not `new`.
   `hs_state::bakeoff::{SnapshotDeltaRepr, PersistentMapRepr}` (candidates A and C) are
   benchmark-only now -- do not build on them.
-  - **The exact call sequence a room actor should use** (replacing `CurrentState`'s flat map, once
-    the `StateFetch` adapter in "Next" item 1 exists -- until then, everything below except the
-    `StateFetch` step is usable as-is): on ingesting an event, call
+  - **The exact call sequence a room actor should use** (replacing `CurrentState`'s flat map --
+    the `StateFetch` adapter this needed is now built, session 4; see "Implications for tracks 04
+    and 06" above for the exact rewiring steps): on ingesting an event, call
     `store.add_event(...)` (mirrors `InMemoryStateStore::add_event`'s parameter list exactly --
     event id/sn, room id, event type, state key, sender, content, depth, timestamp, auth_events,
     prev_events, `only_prev_event_is_room_create`); this returns the new `state_at` root directly.
@@ -337,10 +429,15 @@ consumers of `StateStore`:
 - `hs_state::auth::{check_auth_events_selection, check_event_auth}` and the `StateFetch` trait
   (`crates/hs-state/src/state_fetch.rs`): usable independently of `StateStore` by anything that
   already has a state snapshot in some other form (e.g. a federation `send_join`/`send_leave`
-  handler validating a remote server's claimed state before trusting it). **No adapter from
-  `StateStore` to `StateFetch` exists yet** -- see "Next" item 1; today a caller must still bridge
-  the two by hand (look up via `intern_state_key`/`get`, then fetch the winning event's own
-  sender/content from wherever it keeps event bodies).
+  handler validating a remote server's claimed state before trusting it).
+- **Session 4, new** (`hs-state`): the `StateStore`-to-`StateFetch` adapter,
+  `state_fetch::StoreStateFetch<'a, S: StateStore, B: EventBody>` plus the `state_fetch::EventBody`
+  trait it takes as its event-body source (`crates/hs-state/src/state_fetch.rs`). A caller no
+  longer needs to bridge `StateStore` and `StateFetch` by hand: construct one with
+  `StoreStateFetch::new(&store, root, &event_bodies)` and pass `&it` anywhere a `&impl StateFetch`
+  is expected (`check_event_auth`, `check_auth_events_selection`). See "Implications for tracks 04
+  and 06" above for track 04's exact rewiring steps and "Interfaces needed" below for what this
+  closes.
 
 ## Interfaces needed
 
@@ -348,19 +445,20 @@ consumers of `StateStore`:
   `InMemoryStateStore`'s local `key_of`/`event_id_of` maps; no interface change to `StateStore`
   itself is expected.
 - ~~04 (room actor): tell track 02 which of `StateStore`'s methods the room actor calls in which
-  order~~ **Answered this session**: `docs/rfcs/0010-room-actor-state-store-seam.md` supplied
-  exactly this, and "Interfaces provided" above now names the call sequence. What is still needed
-  *from* track 02, for track 04 to actually rewire `crate::pipeline::CurrentState`: the
-  `StateStore`-to-`StateFetch` adapter, "Next" item 1. Until it lands, track 04's flat map remains
-  the pragmatic choice for the single-writer case (per the RFC's own section 4-equivalent
-  reasoning), and this track is not asking track 04 to rewire early against half-finished plumbing.
+  order~~ **Answered in session 3**: `docs/rfcs/0010-room-actor-state-store-seam.md` supplied
+  exactly this. ~~What is still needed *from* track 02, for track 04 to actually rewire
+  `crate::pipeline::CurrentState`: the `StateStore`-to-`StateFetch` adapter~~ **Built in session
+  4**: nothing further is needed from this track for this item; "Implications for tracks 04 and
+  06" above gives the exact rewiring steps. The rewiring itself (editing `hs-room`) is track 04's
+  own work, not done here.
 - 06 (federation): once inbound `/send` transactions exist, `Command::PersistInbound`
   (`docs/design/04-room-actor-protocol.md` section 2) is where a fork first becomes real -- an
   inbound event whose `prev_events` do not include the local forward extremity. The call is
   `store.current_state(room_version, &all_current_forward_extremities)` after ingesting the new
   event via `add_event` (which itself may need to resolve if the new event's own `prev_events`
-  already fork). No interface changes anticipated beyond the `StateFetch` adapter both 04 and 06
-  will want.
+  already fork). The `StateFetch` adapter both 04 and 06 will want for authorizing against that
+  merged root now exists too (`state_fetch::StoreStateFetch`, session 4); no further interface
+  changes anticipated.
 - 14 (test and conformance): the brief's definition of done names "Synapse's own implementation
   driven through the Python harness that 14 provides" as a fourth cross-check partner for state
   resolution; that harness does not exist yet from this track's side.
@@ -468,6 +566,52 @@ consumers of `StateStore`:
   machinery would have been a pure refactor with no behavioral change and real risk of regressing
   its existing tests for no benefit this assignment asked for.
 
+### Session 4 decisions
+
+- **`EventBody::get` (via `StoreStateFetch`) has no error channel.** `StateFetch::get` returns a
+  plain `Option`, and a storage-layer error from the underlying `StateStore` is therefore
+  indistinguishable from "this key has no value" -- both produce `None`. Documented explicitly on
+  `StoreStateFetch` rather than left implicit, with the escape hatch named (call
+  `intern_state_key`/`get` directly for a caller that needs to tell the two apart, e.g. to surface
+  a real I/O error rather than silently treating a room as if a key had never been set). This
+  matches `StateFetch`'s existing shape (`FlatState::get` also returns `Option`, not `Result`) --
+  the adapter did not invent a new error-handling convention, it inherited the trait's.
+- **`state_fetch::EventBodies` is a test convenience, not what production should hold.** The
+  production room actor already has an event cache (`HashMap<EventSn, Event>`,
+  `crates/hs-room/src/pipeline.rs`); it should implement `EventBody` directly over that (a few
+  lines, shown in "Implications for tracks 04 and 06" above) rather than copy bodies into
+  `EventBodies`, which exists only so this crate's own tests (and any other caller building a
+  small fixture from scratch, the same role `FlatState` already plays for `StateFetch` itself) do
+  not need to hand-roll a `BTreeMap` wrapper.
+- **`RoomBuilder`/`Action`/`action_strategy`/`apply_branch`/`versions` were pulled out of
+  `state_res::cross_check_tests` into a new `state_res::test_support` module**, made `pub(crate)`
+  rather than left private to `cross_check_tests`, so `state_res::fork_production_cross_check`
+  could build the exact same kind of forked room (same genesis, same action generator, same
+  auth-events-via-`expected_auth_types` realism) without a second, drifting copy. `apply_branch`'s
+  signature changed from returning `StateMap` to `(StateMap, OwnedEventId)` (the branch's new tip)
+  as part of this move, since the fork-cross-check test needs the tip event id (to call
+  `StateStore::state_at` on it) in a way the original oracle-vs-`ruma-state-res` test never did;
+  `cross_check_tests.rs` was updated to destructure and discard the now-returned tip, a one-line
+  change at each of its two call sites.
+- **The fork property test (`fork_production_cross_check::production_store_matches_oracle_and_ruma_on_random_forks`)
+  uses 64 cases, not the 256 `cross_check_tests`'s lighter oracle-vs-`ruma-state-res` check uses.**
+  Each case here does strictly more work: build the forked room (shared with the lighter check),
+  then *also* replay every event through a fresh `KvStateStore` (allocating a new `MemoryBackend`,
+  re-interning every key, re-authorizing nothing but re-storing every frame) and compare every key
+  in the union of both branches' state maps. 64 cases already found zero disagreements across four
+  room versions and the full `Action` space (kick/ban/raise-power/change-join-rule); raising the
+  case count is cheap to do later if a future session wants more assurance, but was not necessary
+  to satisfy this session's "several room versions," "randomly generated forks" requirement, and
+  keeping it lower is kinder to the shared 10-core/16GB machine this runs on alongside three other
+  agents' builds.
+- **The fork-cross-check tests use `hs_kv::memory::MemoryBackend`, not the `Fjall` backend.**
+  Matches `kv_store::tests`'s own existing correctness-gate tests (`candidate_a_snapshot_delta`,
+  `candidate_b_frames`, `candidate_c_persistent_map`), which already establish that
+  `KvStateStore`'s ingestion/resolution logic does not depend on which backend it runs over; this
+  session's tests are about state-resolution *correctness*, not storage-backend behavior, so the
+  faster in-memory backend is the right choice, exactly the same reasoning `kv_store.rs`'s own
+  tests already used.
+
 ## Reuse considered
 
 Per `docs/decisions/0007-build-less-reuse-more.md`'s standing obligation. This track's substantial
@@ -530,14 +674,27 @@ cargo clippy -p hs-model -p hs-state --all-targets -- -D warnings
 cargo test -p hs-model -p hs-state
 ```
 
-All green as of this update (also re-verified against `cargo check -p hs-room` and
-`cargo check --workspace`, since this session changed the frozen `StateStore` trait -- see
-"Session 3" above): 50 tests in `hs-model`; 59 unit tests in `hs-state` (module layout changed --
-`bakeoff::frames`/`bakeoff::generic_store`/`bakeoff::repr`/`bakeoff::varint` moved to top-level
-`frames`/`kv_store`/`repr`/`varint`, counts unchanged since nothing was added or removed, only
-moved and one method added to two existing trait impls) plus a 512-case property test
-(`ruma_cross_check`) plus the `state_res::cross_check_tests` oracle-vs-`ruma-state-res` property
-test.
+All green as of this update: 50 tests in `hs-model`; 62 tests via `cargo test -p hs-state --lib`,
+up from 59 at the end of session 3 (+1
+`state_fetch::adapter_tests::store_state_fetch_matches_flat_state_for_auth`, +1
+`state_res::fork_production_cross_check::production_store_matches_oracle_and_ruma_on_power_levels_and_membership_fork`,
++1 `state_res::fork_production_cross_check::production_store_matches_oracle_and_ruma_on_random_forks`
+-- the last one is a 64-case property test, counted as one test function by `cargo test`); plus
+`tests/ruma_cross_check.rs`'s separate 512-case property test (1 test function, unchanged, run via
+`cargo test -p hs-state --test ruma_cross_check`), for 63 test functions total in the crate. The
+headline result of this session: **zero disagreements found between the production store and
+either reference implementation across the hand-built fork and 64 randomly generated forks spread
+over four room versions.**
+
+`cargo check -p hs-room` was attempted this session (this track did not change the frozen
+`StateStore` trait, so no incompatibility was expected, but re-checking costs little) and
+currently fails on an unrelated, pre-existing error in `hs-auth` (`crates/hs-auth/src/store/tables.rs:310`,
+an `E0507` move-out-of-`FnOnce`-in-`FnMut`-closure bug), another track's concurrent, unfinished
+work that blocks the build before `hs-room` is reached at all; `hs-state` itself compiled cleanly
+in that same run. `cargo check --workspace` was not re-run this session (the shared-machine
+guidance prefers `cargo check -p`, and this session's changes are additive to `hs-state` only, not
+a change to the frozen trait the way session 3's was, so a full workspace check was not needed to
+validate this session's own work).
 
 To reproduce the bake-off itself (roughly 10 minutes on the shared development host; the results
 already checked in at `crates/hs-state/corpus/results/bakeoff-results.jsonl` do not need

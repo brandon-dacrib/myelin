@@ -23,7 +23,11 @@ pub mod v2;
 #[cfg(test)]
 mod cross_check_tests;
 #[cfg(test)]
+mod fork_production_cross_check;
+#[cfg(test)]
 pub(crate) mod oracle;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use std::collections::BTreeMap;
 
