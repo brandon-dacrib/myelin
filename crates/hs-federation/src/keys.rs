@@ -122,10 +122,24 @@ impl OwnSigningKeys {
 
         if keys.is_empty() {
             std::fs::create_dir_all(dir)?;
-            let version = format!("a_{}", now_ms());
             let mut seed = [0u8; 32];
             use rand_core::RngCore as _;
             rand_core::OsRng.fill_bytes(&mut seed);
+            // The version must identify this key *material*, not merely when it was made: a
+            // millisecond timestamp alone collides whenever two keys are generated in the same
+            // millisecond, and a key ID shared by two different keys breaks the one thing a key ID
+            // is for. A remote then caches whichever key it saw first under that ID and verifies
+            // the other server's signatures against it, and `old_verify_keys` expiry stops working
+            // entirely, because a lookup finds the still-valid current key under the same ID and
+            // never consults the expired entry. Deriving the suffix from the public key makes a
+            // collision mean an actual key collision. The timestamp stays, ahead of it, so key IDs
+            // still sort into rotation order.
+            let signing_key_for_id = ed25519_dalek::SigningKey::from_bytes(&seed);
+            use base64::Engine as _;
+            let fingerprint = base64::engine::general_purpose::STANDARD_NO_PAD
+                .encode(&signing_key_for_id.verifying_key().to_bytes()[..6])
+                .replace(['+', '/'], "_");
+            let version = format!("a_{}_{fingerprint}", now_ms());
             let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
             let pair = SigningKeyPair::new(version.clone(), signing_key);
             let line = format_signing_key_line(&version, &seed);
