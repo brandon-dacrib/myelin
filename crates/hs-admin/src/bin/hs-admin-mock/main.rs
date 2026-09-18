@@ -20,8 +20,9 @@ use std::sync::{Arc, RwLock as StdRwLock};
 
 use tokio::sync::RwLock;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{MatchedPath, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event as AxumSseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -109,14 +110,79 @@ fn spawn_stats_snapshots(state: MockState) {
     });
 }
 
+/// Runs on every route in the `protected` router built by [`router`]: `openapi.yaml`/`.json` and
+/// `mock/login` are the only unauthenticated paths (RFC 0004 section 3.8; a mock login has to be
+/// reachable without a token already), so everything else — every read handler included — goes
+/// through this before its own handler runs.
+///
+/// This is a `route_layer` (applies only to routes registered on the router it's attached to,
+/// not to the 404 fallback), not a per-handler `HeaderMap` parameter, specifically so that a
+/// forgotten `headers: HeaderMap` on some future handler cannot silently skip authentication the
+/// way `list_users`/`get_user`/`list_rooms`/... did before this fix: a new route only bypasses
+/// auth if it is deliberately added to the `public` router below, not by omission.
+async fn require_auth_middleware(
+    State(state): State<MockState>,
+    matched_path: Option<MatchedPath>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Response {
+    let principal = match require_auth(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    // Beyond "is there a recognized token": look up the operation's minimal scope from the same
+    // table `hs_admin`'s real router enforces against (`openapi/operations.json`, loaded via
+    // `hs_admin::operations::load`), so a token scoped to (say) only `bridges:read` gets a
+    // real `403 insufficient-scope` on `/users`, not a silent 200. `matched_path` is the route's
+    // pattern (`/api/v1/users/{user_id}`, not the concrete request path), which is what the
+    // table is keyed on; it is only available because this runs as a `route_layer`, not a
+    // whole-router `layer` (see `router()`).
+    if let Some(path) = matched_path
+        && let Some(Some(required)) =
+            scope_table().get(&(request.method().clone(), path.as_str().to_string()))
+        && !principal.has_scope(*required)
+    {
+        return hs_http::Problem::insufficient_scope()
+            .with_detail(format!(
+                "this operation requires the {} scope",
+                required.as_str()
+            ))
+            .with_required_scope(required.as_str())
+            .with_instance(path.as_str().to_string())
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// `(method, route pattern) -> required scope` for every non-public operation, built once from
+/// the same generated table (`openapi/operations.json`) the real `hs-admin` router uses. `None`
+/// means "authenticated, any scope" (only `GET /me`); a route with no entry at all (a path this
+/// mock serves that isn't in the OpenAPI document, i.e. none today, or a future drift between the
+/// two) is treated the same as `None` rather than denied, so a lookup miss degrades to "no extra
+/// scope check", not an outage of every route sharing its prefix.
+fn scope_table() -> &'static HashMap<(axum::http::Method, String), Option<Scope>> {
+    static TABLE: std::sync::OnceLock<HashMap<(axum::http::Method, String), Option<Scope>>> =
+        std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        hs_admin::operations::load()
+            .into_iter()
+            .filter(|op| !op.public)
+            .map(|op| ((op.method, format!("/api/v1{}", op.path)), op.scope))
+            .collect()
+    })
+}
+
 fn router(state: MockState) -> Router {
-    Router::new()
+    let public = Router::new()
+        .route("/api/v1/openapi.yaml", get(get_openapi_yaml))
+        .route("/api/v1/openapi.json", get(get_openapi_json))
+        .route("/api/v1/mock/login", post(mock_login));
+
+    let protected = Router::new()
         .route("/api/v1/me", get(get_me))
         .route("/api/v1/server", get(|| async { Json(json!({"name": "hs (mock)", "version": "0.0.1-mock", "build": "mock", "supported_room_versions": ["9", "10", "11"], "enabled_components": ["admin-mock"], "uptime_ms": 0, "contract_version": "1.0-draft"})) }))
         .route("/api/v1/server/health", get(|| async { Json(json!({"status": "ok", "checks": {"mock": "ok"}})) }))
-        .route("/api/v1/openapi.yaml", get(get_openapi_yaml))
-        .route("/api/v1/openapi.json", get(get_openapi_json))
-        .route("/api/v1/mock/login", post(mock_login))
         .route("/api/v1/events", get(sse_events))
         // users
         .route("/api/v1/users", get(list_users).post(create_user))
@@ -215,6 +281,10 @@ fn router(state: MockState) -> Router {
         // audit log
         .route("/api/v1/audit-log", get(list_audit_log))
         .route("/api/v1/audit-log/{id}", get(get_audit_entry))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth_middleware));
+
+    public
+        .merge(protected)
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -2116,5 +2186,159 @@ async fn get_audit_entry(State(state): State<MockState>, Path(id): Path<String>)
             "unavailable",
             e.to_string(),
         ),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// regression tests: every read handler must go through `require_auth_middleware`
+// ---------------------------------------------------------------------------------------------
+//
+// The bug this guards against: read handlers (`list_users`, `get_user`, ...) took `State` and
+// `Query`/`Path` but never `HeaderMap`, so `require_auth` (correct on its own, and called at
+// every mutation's ~30 call sites) was simply never reached for reads — every collection and
+// item GET returned 200 regardless of `Authorization`. Fixed by moving authentication out of
+// individual handlers and onto a `route_layer` (see `require_auth_middleware` and `router()`
+// above) that wraps every non-public route, so a handler cannot opt out by omission. These tests
+// exercise the router as a whole (not `require_auth` in isolation, which was never the part that
+// was broken) on one collection endpoint and one item endpoint, for both ways a request can fail
+// authentication.
+#[cfg(test)]
+mod auth_regression_tests {
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    fn test_state() -> MockState {
+        let mut tokens = HashMap::new();
+        tokens.insert(
+            DEV_TOKEN.to_string(),
+            Principal {
+                kind: PrincipalKind::User,
+                id: "@ops:example.org".to_string(),
+                display_name: Some("Operations (mock)".to_string()),
+                scopes: vec![Scope::AdminWrite],
+                token_id: Some("mock-dev-token".to_string()),
+                expires_at: None,
+                issued_by: Some("hs-admin-mock".to_string()),
+            },
+        );
+        MockState {
+            db: Arc::new(RwLock::new(fixtures::seed())),
+            tokens: Arc::new(StdRwLock::new(tokens)),
+            events: Arc::new(hs_admin::events::EventBus::new()),
+            audit: Arc::new(InMemoryAuditSink::new()),
+        }
+    }
+
+    async fn get(app: &Router, uri: &str, bearer: Option<&str>) -> StatusCode {
+        let mut builder = HttpRequest::builder().uri(uri);
+        if let Some(token) = bearer {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        let request = builder.body(Body::empty()).unwrap();
+        app.clone().oneshot(request).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn collection_endpoint_rejects_missing_and_unknown_token() {
+        let app = router(test_state());
+        assert_eq!(
+            get(&app, "/api/v1/users", None).await,
+            StatusCode::UNAUTHORIZED,
+            "no Authorization header"
+        );
+        assert_eq!(
+            get(&app, "/api/v1/users", Some("not-a-real-token")).await,
+            StatusCode::UNAUTHORIZED,
+            "unrecognized bearer token"
+        );
+        assert_eq!(
+            get(&app, "/api/v1/users", Some(DEV_TOKEN)).await,
+            StatusCode::OK,
+            "the dev token must still work"
+        );
+    }
+
+    #[tokio::test]
+    async fn item_endpoint_rejects_missing_and_unknown_token() {
+        let app = router(test_state());
+        let uri = "/api/v1/users/@alice:example.org";
+        assert_eq!(
+            get(&app, uri, None).await,
+            StatusCode::UNAUTHORIZED,
+            "no Authorization header"
+        );
+        assert_eq!(
+            get(&app, uri, Some("not-a-real-token")).await,
+            StatusCode::UNAUTHORIZED,
+            "unrecognized bearer token"
+        );
+        assert_eq!(
+            get(&app, uri, Some(DEV_TOKEN)).await,
+            StatusCode::OK,
+            "the dev token must still work"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_collection_and_item_endpoint_are_also_covered() {
+        // Not just users: the fix is router-wide, not per-handler, so spot-check a second
+        // resource family too.
+        let app = router(test_state());
+        assert_eq!(
+            get(&app, "/api/v1/appservices", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get(&app, "/api/v1/appservices/telegram", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get(&app, "/api/v1/appservices", Some(DEV_TOKEN)).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn public_endpoints_still_need_no_authentication() {
+        let app = router(test_state());
+        assert_eq!(
+            get(&app, "/api/v1/openapi.yaml", None).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            get(&app, "/api/v1/openapi.json", None).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn insufficient_scope_is_403_not_a_silent_200() {
+        let state = test_state();
+        state.tokens.write().unwrap().insert(
+            "bridges-read-only".to_string(),
+            Principal {
+                kind: PrincipalKind::User,
+                id: "@bridge-operator:example.org".to_string(),
+                display_name: None,
+                scopes: vec![Scope::BridgesRead],
+                token_id: Some("bridges-read-only".to_string()),
+                expires_at: None,
+                issued_by: Some("test".to_string()),
+            },
+        );
+        let app = router(state);
+        // In scope: bridges:read covers /appservices.
+        assert_eq!(
+            get(&app, "/api/v1/appservices", Some("bridges-read-only")).await,
+            StatusCode::OK
+        );
+        // Out of scope: /users needs admin:read, which this token does not have.
+        assert_eq!(
+            get(&app, "/api/v1/users", Some("bridges-read-only")).await,
+            StatusCode::FORBIDDEN
+        );
     }
 }
