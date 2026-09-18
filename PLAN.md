@@ -149,6 +149,8 @@ Language solves three boxes. The other three are solved by data-structure and pl
 
 **D6. Media lives on object storage first.** The `object_store` crate abstracts S3-compatible, GCS, Azure and local filesystem. Thumbnails are generated on demand and cached. Authenticated media endpoints are primary; the legacy unauthenticated endpoints are served behind a config flag with the same freeze semantics Synapse has. Synapse's on-disk media layout is understood by the importer.
 
+**D6b. Malware scanning is a swappable provider, not a built-in.** Operators choose their scanner and change it without changing the server: ClamAV over the clamd protocol, enterprise agents over ICAP, cloud services such as CrowdStrike Falcon over an HTTP contract with submit-and-poll, or a local command. Scanning applies to local uploads, asynchronous upload completion, remote media fetched over federation, and bridge uploads, with verdicts cached by content hash and engine version. Modes are block, defer, quarantine or off, and enabling scanning without choosing fail-open or fail-closed is a configuration error, because that is a policy decision. Encrypted media is reported unscannable rather than clean, and the documentation says so, since an operator who believes a scanner covers encrypted rooms has bought a false assurance. Design in `docs/rfcs/0008-content-scanning.md`.
+
 **D7. Appservices are first-class managed objects** (section 8): registry in the store, hot registration through the admin API, health and backlog per appservice, replay and pause, the encryption-related MSCs on by default, an operator with a `Bridge` custom resource, and a console.
 
 **D8. Synapse compatibility lives at the edges** (section 9): behavior, config translation, admin API, metric names, importer. Not schema, workers or Python modules.
@@ -200,7 +202,7 @@ Owns one user's sync state: the set of rooms the user is in, the last position p
 | `hs-federation` | Server discovery, key server and notary, request signing and verification, transport server (31 routes at parity), federation client, inbound transaction dispatch, backfill and missing events, joins including faster joins, sender shards with batching and backoff, EDUs, server ACLs, policy servers. |
 | `hs-auth` | Native OAuth 2.0 authorization server and OIDC issuer, legacy login and UIA, registration and tokens, 3PIDs, password policy, upstream IdPs (OIDC, SAML, LDAP), MAS delegation mode, account validity, consent, suspension, locking, deactivation and erasure. |
 | `hs-e2e` | Device keys, one-time and fallback keys, cross-signing, key backups, device-list tracking and outbound pokes, dehydrated devices, appservice key proxies. |
-| `hs-media` | Object-store repository, uploads and async uploads, authenticated and legacy downloads, thumbnails, URL previews and oEmbed, quarantine, retention, remote cache. |
+| `hs-media` | Object-store repository, uploads and async uploads, authenticated and legacy downloads, thumbnails, URL previews and oEmbed, quarantine, retention, remote cache, and pluggable content scanning (`docs/rfcs/0008-content-scanning.md`). |
 | `hs-push` | Push rules engine and per-user compiled rules, notification counts, HTTP pushers, email pushers and templates. |
 | `hs-appservice` | Registry, namespaces, transaction scheduler with MSC2409, MSC3202 and MSC4203, identity assertion and device masquerading, MSC4190, ping, third-party lookups, MSC3983 and MSC3984, health and backlog reporting. |
 | `hs-search` | `tantivy` per shard for room events and the user directory. |
