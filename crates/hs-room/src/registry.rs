@@ -187,6 +187,21 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
         self.global.subscribe()
     }
 
+    /// Finds one event by ID across every room this registry's backend holds, without loading
+    /// (or even knowing) the room it belongs to. The returned row carries its `room_id`, which is
+    /// the input to that room's visibility check -- this performs none itself. See
+    /// [`crate::actor::find_event_globally`].
+    ///
+    /// # Errors
+    /// Returns [`RoomError::Store`] on a storage failure, or [`RoomError::Internal`] if the
+    /// stored row cannot be decoded.
+    pub fn find_event_globally(
+        &self,
+        event_id: &ruma::EventId,
+    ) -> Result<Option<crate::persist::PersistedEvent>, RoomError> {
+        crate::actor::find_event_globally(&self.backend, &self.tables, event_id)
+    }
+
     /// Resolves a local alias directly against the store, without loading the target room.
     ///
     /// # Errors

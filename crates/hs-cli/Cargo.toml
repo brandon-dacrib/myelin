@@ -23,6 +23,7 @@ hs-kv = { path = "../hs-kv" }
 hs-telemetry = { path = "../hs-telemetry" }
 hs-http = { path = "../hs-http" }
 hs-room = { path = "../hs-room" }
+hs-federation = { path = "../hs-federation" }
 hs-user = { path = "../hs-user" }
 hs-e2e = { path = "../hs-e2e" }
 hs-push = { path = "../hs-push" }
@@ -32,6 +33,7 @@ hs-admin = { path = "../hs-admin" }
 hs-model = { path = "../hs-model" }
 object_store = { workspace = true }
 
+async-trait = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }

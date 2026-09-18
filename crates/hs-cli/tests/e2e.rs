@@ -428,8 +428,14 @@ async fn sync_keys_and_push_surfaces_answer_through_the_real_binary() {
         .json()
         .await
         .unwrap();
-    let token = register["access_token"].as_str().expect("an access token").to_owned();
-    let device_id = register["device_id"].as_str().expect("a device id").to_owned();
+    let token = register["access_token"]
+        .as_str()
+        .expect("an access token")
+        .to_owned();
+    let device_id = register["device_id"]
+        .as_str()
+        .expect("a device id")
+        .to_owned();
     let auth = |req: reqwest::RequestBuilder| req.bearer_auth(&token);
 
     // --- hs-push: the default ruleset is served, and it is the spec's, not an empty one ---------
@@ -443,18 +449,14 @@ async fn sync_keys_and_push_surfaces_answer_through_the_real_binary() {
         .as_array()
         .expect("the default ruleset has underride rules");
     assert!(
-        underride
-            .iter()
-            .any(|r| r["rule_id"] == ".m.rule.message"),
+        underride.iter().any(|r| r["rule_id"] == ".m.rule.message"),
         "a brand new user must get the spec's predefined rules: {rules}"
     );
 
     // Disabling a rule persists and is readable back through the sub-resource the spec defines.
-    let disable = auth(
-        client.put(format!(
-            "{base}/_matrix/client/v3/pushrules/global/underride/.m.rule.message/enabled"
-        )),
-    )
+    let disable = auth(client.put(format!(
+        "{base}/_matrix/client/v3/pushrules/global/underride/.m.rule.message/enabled"
+    )))
     .json(&json!({"enabled": false}))
     .send()
     .await
@@ -499,37 +501,39 @@ async fn sync_keys_and_push_surfaces_answer_through_the_real_binary() {
     );
 
     // --- hs-e2e: device keys upload, and the one-time-key count comes back ----------------------
-    let upload: serde_json::Value = auth(client.post(format!("{base}/_matrix/client/v3/keys/upload")))
-        .json(&json!({
-            "device_keys": {
-                "user_id": register["user_id"],
-                "device_id": device_id,
-                "algorithms": ["m.olm.v1.curve25519-aes-sha2", "m.megolm.v1.aes-sha2"],
-                "keys": {format!("curve25519:{device_id}"): "curve25519+key+material"},
-                "signatures": {},
-            },
-            "one_time_keys": {"signed_curve25519:AAAAAQ": {"key": "otk-material"}},
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let upload: serde_json::Value =
+        auth(client.post(format!("{base}/_matrix/client/v3/keys/upload")))
+            .json(&json!({
+                "device_keys": {
+                    "user_id": register["user_id"],
+                    "device_id": device_id,
+                    "algorithms": ["m.olm.v1.curve25519-aes-sha2", "m.megolm.v1.aes-sha2"],
+                    "keys": {format!("curve25519:{device_id}"): "curve25519+key+material"},
+                    "signatures": {},
+                },
+                "one_time_keys": {"signed_curve25519:AAAAAQ": {"key": "otk-material"}},
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
     assert_eq!(
         upload["one_time_key_counts"]["signed_curve25519"], 1,
         "the server must report the key it just stored: {upload}"
     );
 
     // The keys read back through /keys/query, which is the call every other user's client makes.
-    let query: serde_json::Value = auth(client.post(format!("{base}/_matrix/client/v3/keys/query")))
-        .json(&json!({"device_keys": {register["user_id"].as_str().unwrap(): []}}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let query: serde_json::Value =
+        auth(client.post(format!("{base}/_matrix/client/v3/keys/query")))
+            .json(&json!({"device_keys": {register["user_id"].as_str().unwrap(): []}}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
     assert_eq!(
         query["device_keys"][register["user_id"].as_str().unwrap()][&device_id]["device_id"],
         serde_json::Value::String(device_id.clone()),
@@ -537,13 +541,14 @@ async fn sync_keys_and_push_surfaces_answer_through_the_real_binary() {
     );
 
     // --- hs-user: /sync answers, with a next_batch a client can come back with -----------------
-    let sync: serde_json::Value = auth(client.get(format!("{base}/_matrix/client/v3/sync?timeout=0")))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let sync: serde_json::Value =
+        auth(client.get(format!("{base}/_matrix/client/v3/sync?timeout=0")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
     let next_batch = sync["next_batch"].as_str().expect("a next_batch token");
     assert!(
         next_batch.starts_with("hsu1_"),
@@ -594,7 +599,10 @@ async fn a_room_created_over_http_reaches_its_creators_sync() {
         .json()
         .await
         .unwrap();
-    let token = register["access_token"].as_str().expect("an access token").to_owned();
+    let token = register["access_token"]
+        .as_str()
+        .expect("an access token")
+        .to_owned();
 
     let created: serde_json::Value = client
         .post(format!("{base}/_matrix/client/v3/createRoom"))
@@ -634,7 +642,10 @@ async fn a_room_created_over_http_reaches_its_creators_sync() {
         !room["state"]["events"].as_array().unwrap().is_empty(),
         "the room's current state should come with it: {room}"
     );
-    let since = sync["next_batch"].as_str().expect("a next_batch").to_owned();
+    let since = sync["next_batch"]
+        .as_str()
+        .expect("a next_batch")
+        .to_owned();
 
     // And a message sent after that token arrives in the next incremental sync.
     let sent = client
@@ -665,10 +676,7 @@ async fn a_room_created_over_http_reaches_its_creators_sync() {
             .as_array()
             .cloned()
             .unwrap_or_default();
-        if events
-            .iter()
-            .any(|e| e["content"]["body"] == "found you")
-        {
+        if events.iter().any(|e| e["content"]["body"] == "found you") {
             found = true;
             break;
         }
@@ -732,9 +740,7 @@ async fn an_invite_reaches_a_user_who_has_never_synced() {
     let room_id = created["room_id"].as_str().expect("a room id").to_owned();
 
     let invited = client
-        .post(format!(
-            "{base}/_matrix/client/v3/rooms/{room_id}/invite"
-        ))
+        .post(format!("{base}/_matrix/client/v3/rooms/{room_id}/invite"))
         .bearer_auth(&inviter_token)
         .json(&json!({"user_id": invitee_id}))
         .send()
@@ -773,6 +779,78 @@ async fn an_invite_reaches_a_user_who_has_never_synced() {
             .any(|e| e["type"] == "m.room.name" && e["content"]["name"] == "Invited"),
         "stripped state should let a client name the room: {events:?}"
     );
+
+    handle.shutdown().await;
+}
+
+/// The key server: `GET /_matrix/key/v2/server` answers without authentication, and what it
+/// answers is a *valid self-signature* over this server's own keys -- checked here by verifying
+/// the response against the very key it publishes, the way a remote homeserver would before
+/// trusting anything else this server says.
+///
+/// Unauthenticated is the point: it is the one federation endpoint a remote can call before it
+/// has any key to sign with, so it must sit outside the `X-Matrix` layer. The second half of this
+/// test confirms everything else does not.
+#[tokio::test]
+async fn the_key_server_publishes_a_self_signed_key_and_federation_requires_signatures() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(reserve_ephemeral_port(), dir.path());
+
+    let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
+        .await
+        .expect("server should boot");
+    let base = handle.base_url();
+    let client = reqwest::Client::new();
+
+    let response = client
+        .get(format!("{base}/_matrix/key/v2/server"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+
+    assert_eq!(body["server_name"], "example.org");
+    let valid_until = body["valid_until_ts"].as_i64().expect("valid_until_ts");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    assert!(
+        valid_until > now,
+        "a key response that is already expired is useless: {valid_until} <= {now}"
+    );
+
+    let verify_keys = body["verify_keys"].as_object().expect("verify_keys");
+    assert_eq!(
+        verify_keys.len(),
+        1,
+        "one active signing key: {verify_keys:?}"
+    );
+    let (key_id, key) = verify_keys.iter().next().unwrap();
+    let encoded = key["key"].as_str().expect("base64 public key");
+
+    // Verify the response's own signature with the published key. If the server signed events
+    // with one key and advertised another, this is what would catch it.
+    use base64::Engine as _;
+    let raw = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(encoded)
+        .expect("the published key must be unpadded base64");
+    let bytes: [u8; 32] = raw.try_into().expect("an ed25519 public key is 32 bytes");
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&bytes).expect("a valid key");
+
+    let canonical = hs_model::signing::to_signable_object(&body).expect("canonicalizable");
+    hs_model::signing::verify_object(&canonical, "example.org", key_id, &verifying_key)
+        .expect("the key response must verify against the key it publishes");
+
+    // Every other federation endpoint is behind the X-Matrix layer, including under the real
+    // mount prefix (which is where a prefix-stripping router would silently break verification).
+    let unsigned = client
+        .get(format!("{base}/_matrix/federation/v1/version"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unsigned.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     handle.shutdown().await;
 }

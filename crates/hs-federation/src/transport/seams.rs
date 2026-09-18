@@ -101,9 +101,11 @@ pub(super) fn add_routes(builder: Builder<FederationState>) -> Builder<Federatio
         "/exchange_third_party_invite/{roomId}",
         "federationExchangeThirdPartyInvite"
     );
+    // `PUT`, not `POST`: `third_party_invite.yaml`'s `onBindThirdPartyIdentifier` is a PUT, and a
+    // seam registered under the wrong method is a 404 to the only caller that would ever use it.
     builder = seam!(
         builder,
-        Method::POST,
+        Method::PUT,
         "/3pid/onbind",
         "federationThreepidOnbind"
     );

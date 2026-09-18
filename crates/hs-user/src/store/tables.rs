@@ -142,11 +142,15 @@ impl<B: KvBackend> TablesUserStore<B> {
         let mut spec = TypedKeyspace::<B::Keyspace, (String, u64)>::prefix(&(uid.to_owned(),));
         spec.reverse = true;
         spec.limit = Some(1);
-        for item in self.feed.range(txn, spec) {
-            let ((_, seq), _) = item.map_err(StoreError::Table)?;
-            return Ok(seq);
+        // The spec above is reversed and limited to one row, so this is "the highest sequence
+        // this user's feed has", or 0 for a user with no feed rows at all.
+        match self.feed.range(txn, spec).next() {
+            Some(item) => {
+                let ((_, seq), _) = item.map_err(StoreError::Table)?;
+                Ok(seq)
+            }
+            None => Ok(0),
         }
-        Ok(0)
     }
 
     fn max_device_cursor_txn<R: hs_kv::KvRead<Keyspace = B::Keyspace>>(

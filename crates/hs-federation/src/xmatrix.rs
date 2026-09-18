@@ -301,6 +301,27 @@ pub async fn verify_x_matrix(
     }
 }
 
+/// The request target the remote server signed: its **full** path, including any prefix this
+/// router is mounted under.
+///
+/// This matters because `axum::Router::nest` rewrites `req.uri()` to the path *relative to* the
+/// nest prefix before the nested router's layers run. A server that mounts this router at
+/// `/_matrix/federation/v1` (which `hs serve` does, and which is the only mount point the spec
+/// allows) would therefore verify against `/version` while the sender signed
+/// `/_matrix/federation/v1/version`, and every inbound request from every real homeserver would
+/// fail verification. `nest` records the pre-rewrite URI in the `OriginalUri` extension for
+/// exactly this reason, so that is what gets signed over when it is present; `req.uri()` is the
+/// right answer only when this router is mounted at the root, which is how this crate's own
+/// tests drive it.
+fn signed_uri(req: &Request<Body>) -> String {
+    let uri = req
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map_or_else(|| req.uri(), |original| &original.0);
+    uri.path_and_query()
+        .map_or_else(|| uri.to_string(), |pq| pq.as_str().to_string())
+}
+
 async fn do_verify(ctx: &XMatrixContext, req: Request<Body>) -> Result<Request<Body>, VerifyError> {
     let auth = parse_x_matrix_header(req.headers()).map_err(VerifyError::Parse)?;
     if auth.destination != ctx.own_server_name {
@@ -308,11 +329,7 @@ async fn do_verify(ctx: &XMatrixContext, req: Request<Body>) -> Result<Request<B
     }
 
     let method = req.method().as_str().to_string();
-    let uri = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| req.uri().to_string());
+    let uri = signed_uri(&req);
 
     let (parts, body) = req.into_parts();
     let bytes: Bytes = axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES)

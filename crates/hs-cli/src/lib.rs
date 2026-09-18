@@ -12,6 +12,7 @@ pub mod auth_manifest;
 pub mod capabilities;
 pub mod cli;
 pub mod config_bridge;
+pub mod federation;
 pub mod generate_config;
 pub mod hash_password;
 pub mod identity;

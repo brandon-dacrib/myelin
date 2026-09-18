@@ -1748,6 +1748,7 @@ name = "hs-cli"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "clap",
@@ -1759,6 +1760,7 @@ dependencies = [
  "hs-compat",
  "hs-config",
  "hs-e2e",
+ "hs-federation",
  "hs-http",
  "hs-kv",
  "hs-media",

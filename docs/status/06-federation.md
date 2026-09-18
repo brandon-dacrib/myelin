@@ -1,6 +1,7 @@
 # 06 Federation: status
 
-Updated: 2026-09-18 (second session). The first session wrote the threat model and the plan below
+Updated: 2026-09-18 (third session -- the mounting session; see "Mounted into `hs serve`" below
+for what changed and what it revealed). Previously updated: 2026-09-18 (second session). The first session wrote the threat model and the plan below
 but stopped before any crate code existed. This session implemented items 1-7 of that plan against
 real, adversarial-input-oriented tests. `crates/hs-federation` is no longer a placeholder: 93
 passing tests, `cargo clippy -p hs-federation --all-targets -- -D warnings` clean, five fuzz
@@ -147,6 +148,66 @@ under `crates/hs-federation/src/` unless stated otherwise.
   executed, only type-checked and given one valid + one adversarial seed file each under
   `fuzz/corpus/<target>/`.
 
+## Mounted into `hs serve` (third session)
+
+The transport server is no longer written-but-unserved. `hs serve` mounts it, and it answers from
+this server's real data.
+
+- **`crates/hs-cli/src/federation.rs`** (new, integration lead). `RegistryRoomSource` implements
+  [`RoomDataSource`] over `hs_room::registry::RoomRegistry` and `hs-user`'s published-room
+  directory; `ServerQuerySource` implements `FederationQuerySource` over `hs-auth`'s user/device
+  store, `hs-e2e`'s device keys and `hs-room`'s alias keyspace; `ClientKeyFetcher` implements
+  `KeyServerFetcher` over the real `FederationClient`, which is what makes inbound verification
+  able to fetch a stranger's keys. `build_mount` assembles all of it, and takes the signing key
+  from the *same* `HomeserverIdentity` `hs-room` signs events with, so the key this server
+  advertises and the key it signs with cannot drift apart.
+- **`crates/hs-cli/src/serve.rs`**. Mounts the transport router at `/_matrix/federation/v1` when
+  `federation.enabled`, plus `GET /_matrix/key/v2/server` *outside* the `X-Matrix` layer (it is
+  the one federation endpoint that must answer an unsigned request -- it is how a remote gets the
+  keys it would need to sign one).
+- **Two real bugs this surfaced**, both only visible once the router was mounted the way a
+  deployment mounts it:
+  1. **`xmatrix.rs`: the verifier signed over the wrong URI under a prefix mount.**
+     `axum::Router::nest` rewrites `req.uri()` to the path *relative to* the nest prefix before
+     inner layers run, so the layer was verifying against `/version` while every real sender signs
+     `/_matrix/federation/v1/version`. Every inbound request from every real homeserver would have
+     failed verification. Fixed by preferring the `OriginalUri` extension (`signed_uri`).
+     `crates/hs-cli/tests/federation_reads.rs` mounts the router under the real prefix precisely
+     so this stays caught.
+  2. **`read_routes.rs`: `/backfill?v=$a&v=$b` was rejected with `400`.** `axum::extract::Query`
+     deserializes through `serde_urlencoded`, which cannot build a sequence from repeated keys, so
+     a `Vec<String>` field failed the whole extraction rather than collecting. Now parsed from raw
+     pairs.
+- **Two spec deviations fixed**: `/3pid/onbind` was registered `POST` where the spec says `PUT`,
+  and `/query/profile` and `/query/directory` are now registered as their own paths (the spec
+  names them; the generic `/query/{queryType}` still works).
+
+### What the adapter deliberately will not answer
+
+- **`/state` and `/state_ids` answer only for the room's newest event**, and return `404` for any
+  older one. The room actor holds one flat current-state map and has no state-at-an-event query,
+  so the newest event is the only one whose state it can report correctly. Answering a question
+  about the past with the present would give a remote state it cannot tell is wrong. Lifting this
+  needs `hs-state`'s historical snapshots.
+- **`/openid/userinfo` resolves nothing**: no OpenID token is ever issued, because the
+  client-server `POST /user/{userId}/openid/request_token` endpoint does not exist yet.
+- **`/query/profile` returns an empty profile for a local user that exists**, because no profile
+  storage exists anywhere in the workspace yet (there is no client-server `/profile` route
+  either). It is `404` only for a user this server does not have.
+- Auth chains are walked transitively from stored `auth_events` (bounded at 2,000 events), not
+  read from `hs-state`'s chain-cover index, which the room actor does not maintain yet.
+
+### Still unmounted or still wrong
+
+- **The v2 join/leave/invite paths are registered under v1** (`/_matrix/federation/v1/send_join/v2/...`
+  rather than `/_matrix/federation/v2/send_join/...`). Harmless today -- they are `501` seams --
+  but whoever implements `send_join` must mount a v2 router rather than implement the handler
+  where it currently sits.
+- **`GET /.well-known/matrix/server` is not served.** Absent is the correct answer for a server
+  reachable at its own name; a deployment that delegates needs this, and nothing generates it.
+- **`/send` and the join handshakes are still seams.** Mounting them changed nothing about that:
+  they answer `501`, which is what "registered is not working" means here.
+
 ## Verification
 
 ```
@@ -157,14 +218,12 @@ cargo fmt -p hs-federation                                             # applied
 cd crates/hs-federation/fuzz && cargo check                            # clean (5 bins type-check)
 ```
 
-`cargo check --workspace` currently fails, but **not from anything in this crate**: `hs-cli`
-fails to build (`crates/hs-cli/src/serve.rs`, calls to
-`hs_http::router::Builder::merge_router` with a `RouteManifest` where `Vec<Route>` is now
-expected) because another track changed `hs_http::router::Builder::merge_router`'s signature
-concurrently with this session. This is pre-existing/concurrent breakage in a crate this track
-does not own and was not touched by this session — confirmed by `cargo check -p hs-federation`
-passing standalone. Flagging here so it isn't mistaken for something this session broke; not
-fixed, per the "do not edit other tracks' crates" rule.
+That concurrent `hs-cli` build breakage the second session flagged here is gone: the whole
+workspace builds and `cargo test --workspace` passes, including the third session's
+`crates/hs-cli/tests/federation_reads.rs` (7 tests: signed and tampered requests, visibility,
+full-PDU shape, state refusal, backfill, auth chain) and the key-server case in
+`crates/hs-cli/tests/e2e.rs`, which verifies the published key response against the key it
+publishes.
 
 ## In progress
 
@@ -245,15 +304,17 @@ per this track's own sequencing instructions (not a blocker on anything this tra
 
 ## Interfaces needed
 
-- **Track 04**: the real `RoomDataSource` adapter over `RoomActorHandle` (see "Next" item 1/2) —
-  the concrete hooks (`query<T, F>`, `state_event`, `full_state`, `event_by_id`, `paginate`,
-  `relations_of`) were already identified by the first session's research; unchanged this session.
+- ~~**Track 04**: the real `RoomDataSource` adapter over `RoomActorHandle`.~~ Built in the third
+  session as `hs_cli::federation::RegistryRoomSource`, over exactly those hooks (`query<T, F>`,
+  `state_event`, `full_state`, `event_by_id`, `paginate`) plus one addition to `hs-room`:
+  `RoomRegistry::find_event_globally`, which `/event/{eventId}` needs because that path is not
+  scoped by room. What it still needs from track 04 is a **state-at-an-event** query; until then
+  `/state` and `/state_ids` refuse every event but the newest (see above).
 - **Track 08 (E2EE)**: `/user/keys/claim` and `/user/keys/query` remain mounted as seams pending
   track 08's contract, per the brief's joint-ownership note.
-- **hs-cli / whoever owns `hs serve`'s wiring**: needs to call `crate::transport::router`,
-  `crate::client::FederationClient::new`, and load `OwnSigningKeys` at startup — none of this is
-  wired yet (see "Next" item 1). This is genuinely this track's own remaining work, not a
-  dependency on another track, just sequenced after everything in "Done".
+- ~~**hs-cli / whoever owns `hs serve`'s wiring**: needs to call `crate::transport::router`,
+  `crate::client::FederationClient::new`, and load `OwnSigningKeys` at startup.~~ Done in the
+  third session -- see "Mounted into `hs serve`" above.
 
 ## Decisions made
 

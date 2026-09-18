@@ -25,6 +25,16 @@ pub(super) fn add_routes(builder: Builder<FederationState>) -> Builder<Federatio
 
     builder
         .get("/version", version, meta("federationVersion"))
+        // The spec names these two query types as their own paths (`query.yaml`'s
+        // `queryProfile` and `queryRoomDirectory`) as well as reaching them through the generic
+        // `{queryType}` form. Registering all three means the manifest reports what this server
+        // actually answers, and a caller using either spelling gets the same handler.
+        .get("/query/profile", query_profile, meta("queryProfile"))
+        .get(
+            "/query/directory",
+            query_directory,
+            meta("queryRoomDirectory"),
+        )
         .get("/query/{queryType}", query, meta("federationQuery"))
         .get(
             "/user/devices/{userId}",
@@ -151,6 +161,14 @@ async fn query(
         )
         .into_response(),
     }
+}
+
+async fn query_profile(state: State<FederationState>, params: Query<QueryParams>) -> Response {
+    query(state, Path("profile".to_owned()), params).await
+}
+
+async fn query_directory(state: State<FederationState>, params: Query<QueryParams>) -> Response {
+    query(state, Path("directory".to_owned()), params).await
 }
 
 async fn user_devices(
@@ -337,24 +355,43 @@ async fn event_auth(
     }
 }
 
-#[derive(serde::Deserialize)]
+/// `/backfill`'s query string, parsed from raw key/value pairs rather than a `serde` struct:
+/// `v` is repeated once per event ID the caller already has (`?v=$a&v=$b`), and
+/// `serde_urlencoded` -- what `axum::extract::Query` deserializes through -- cannot produce a
+/// sequence from repeated keys. Deriving `Deserialize` for a `Vec<String>` field therefore does
+/// not merely drop the extra values: it fails the whole extraction, and every spec-shaped
+/// backfill request is answered `400` before the handler runs.
 struct BackfillParams {
-    #[serde(default, rename = "v")]
     from: Vec<String>,
-    #[serde(default)]
     limit: Option<usize>,
+}
+
+impl BackfillParams {
+    fn from_pairs(pairs: Vec<(String, String)>) -> Self {
+        let mut from = Vec::new();
+        let mut limit = None;
+        for (key, value) in pairs {
+            match key.as_str() {
+                "v" => from.push(value),
+                "limit" => limit = value.parse().ok(),
+                _ => {}
+            }
+        }
+        Self { from, limit }
+    }
 }
 
 async fn backfill(
     State(state): State<FederationState>,
     Path(room_id): Path<String>,
-    Query(params): Query<BackfillParams>,
+    Query(pairs): Query<Vec<(String, String)>>,
     headers: axum::http::HeaderMap,
 ) -> Response {
     let requester = match requesting_server(&headers) {
         Ok(r) => r,
         Err(e) => return (*e).into_response(),
     };
+    let params = BackfillParams::from_pairs(pairs);
     let limit = params
         .limit
         .unwrap_or(MAX_BACKFILL_LIMIT)

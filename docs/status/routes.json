@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-18T21:49:32.339Z",
+  "generated_at": "2026-09-18T22:38:51.997Z",
   "routes": [
     {
       "method": "POST",
@@ -1494,6 +1494,278 @@
       "path": "/_matrix/client/versions",
       "surface": "matrix-client",
       "operation_id": "getVersions",
+      "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/federation/v1/3pid/onbind",
+      "surface": "matrix-federation",
+      "operation_id": "federationThreepidOnbind",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/federation/v1/backfill/{roomId}",
+      "surface": "matrix-federation",
+      "operation_id": "federationBackfill",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/federation/v1/event/{eventId}",
+      "surface": "matrix-federation",
+      "operation_id": "federationGetEvent",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/federation/v1/event_auth/{roomId}/{eventId}",
+      "surface": "matrix-federation",
+      "operation_id": "federationEventAuth",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/federation/v1/exchange_third_party_invite/{roomId}",
+      "surface": "matrix-federation",
+      "operation_id": "federationExchangeThirdPartyInvite",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/federation/v1/extremities/{roomId}",
+      "surface": "matrix-federation",
+      "operation_id": "federationExtremities",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/federation/v1/get_missing_events/{roomId}",
+      "surface": "matrix-federation",
+      "operation_id": "federationGetMissingEvents",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/federation/v1/hierarchy/{roomId}",
+      "surface": "matrix-federation",
+      "operation_id": "federationHierarchy",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/federation/v1/invite/v2/{roomId}/{eventId}",
+      "surface": "matrix-federation",
+      "operation_id": "federationInviteV2",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/federation/v1/invite/{roomId}/{eventId}",
+      "surface": "matrix-federation",
+      "operation_id": "federationInviteV1",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/federation/v1/make_join/{roomId}/{userId}",
+      "surface": "matrix-federation",
+      "operation_id": "federationMakeJoin",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/federation/v1/make_knock/{roomId}/{userId}",
+      "surface": "matrix-federation",
+      "operation_id": "federationMakeKnock",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/federation/v1/make_leave/{roomId}/{userId}",
+      "surface": "matrix-federation",
+      "operation_id": "federationMakeLeave",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/federation/v1/openid/userinfo",
+      "surface": "matrix-federation",
+      "operation_id": "federationOpenIdUserinfo",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/federation/v1/publicRooms",
+      "surface": "matrix-federation",
+      "operation_id": "federationPublicRooms",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/federation/v1/query/account_status",
+      "surface": "matrix-federation",
+      "operation_id": "federationQueryAccountStatus",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/federation/v1/query/directory",
+      "surface": "matrix-federation",
+      "operation_id": "queryRoomDirectory",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/federation/v1/query/profile",
+      "surface": "matrix-federation",
+      "operation_id": "queryProfile",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/federation/v1/query/{queryType}",
+      "surface": "matrix-federation",
+      "operation_id": "federationQuery",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/federation/v1/rooms/{roomId}/complexity",
+      "surface": "matrix-federation",
+      "operation_id": "federationRoomComplexity",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/federation/v1/send/{txnId}",
+      "surface": "matrix-federation",
+      "operation_id": "federationSend",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/federation/v1/send_join/v2/{roomId}/{eventId}",
+      "surface": "matrix-federation",
+      "operation_id": "federationSendJoinV2",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/federation/v1/send_join/{roomId}/{eventId}",
+      "surface": "matrix-federation",
+      "operation_id": "federationSendJoinV1",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/federation/v1/send_knock/{roomId}/{eventId}",
+      "surface": "matrix-federation",
+      "operation_id": "federationSendKnock",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/federation/v1/send_leave/v2/{roomId}/{eventId}",
+      "surface": "matrix-federation",
+      "operation_id": "federationSendLeaveV2",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/federation/v1/send_leave/{roomId}/{eventId}",
+      "surface": "matrix-federation",
+      "operation_id": "federationSendLeaveV1",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/federation/v1/state/{roomId}",
+      "surface": "matrix-federation",
+      "operation_id": "federationGetState",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/federation/v1/state_ids/{roomId}",
+      "surface": "matrix-federation",
+      "operation_id": "federationGetStateIds",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/federation/v1/timestamp_to_event/{roomId}",
+      "surface": "matrix-federation",
+      "operation_id": "federationTimestampToEvent",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/federation/v1/user/devices/{userId}",
+      "surface": "matrix-federation",
+      "operation_id": "federationUserDevices",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/federation/v1/user/keys/claim",
+      "surface": "matrix-federation",
+      "operation_id": "federationUserKeysClaim",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/federation/v1/user/keys/query",
+      "surface": "matrix-federation",
+      "operation_id": "federationUserKeysQuery",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/federation/v1/version",
+      "surface": "matrix-federation",
+      "operation_id": "federationVersion",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/key/v2/server",
+      "surface": "matrix-federation",
+      "operation_id": "getServerKey",
       "auth": "none",
       "rate_limited": false
     },

@@ -38,8 +38,8 @@ use hs_http::router::{AuthKind, Builder, RouteManifest, RouteMeta, Surface};
 use hs_kv::KvBackend;
 use hs_media::state::MediaState;
 use hs_room::state::RoomState;
-use hs_user::state::UserState;
 use hs_telemetry::metrics::Metrics;
+use hs_user::state::UserState;
 
 use crate::config_bridge;
 use crate::metrics_layer::track_metrics;
@@ -200,6 +200,8 @@ fn build_router<B: KvBackend>(
         hs_appservice::routes::ping_router::<B>(mounts.appservice_ping).with_state(auth);
     let ping_routes = crate::appservice_manifest::routes();
 
+    let federation = mounts.federation;
+
     let mut builder = Builder::<()>::new()
         .get(
             "/_matrix/client/versions",
@@ -262,10 +264,52 @@ fn build_router<B: KvBackend>(
             e2e_unstable_router,
             e2e_unstable_routes,
         )
-        .merge_router("/_matrix/client/v3", push_router.clone(), push_routes.clone())
+        .merge_router(
+            "/_matrix/client/v3",
+            push_router.clone(),
+            push_routes.clone(),
+        )
         .merge_router("/_matrix/client/r0", push_router, push_routes)
         .merge_router("/_matrix/client/v1/media", media_router, media_routes)
         .merge_router("/_matrix/client/v1", ping_router, ping_routes);
+
+    if let Some((state, x_matrix, own_keys, server_name)) = federation {
+        let (federation_router, federation_manifest) =
+            hs_federation::transport::router(state, x_matrix);
+        // `/_matrix/key/v2/server` is deliberately *outside* that router: it is the one federation
+        // endpoint that must answer an unsigned request, since it is what a remote server fetches
+        // in order to be able to check signatures in the first place. Putting it behind the
+        // `X-Matrix` layer would make key discovery require the keys it discovers.
+        builder = builder
+            .get(
+                "/_matrix/key/v2/server",
+                move || {
+                    let own_keys = own_keys.clone();
+                    let server_name = server_name.clone();
+                    async move {
+                        match crate::federation::server_key_response(&server_name, &own_keys) {
+                            Ok(body) => axum::Json(body).into_response(),
+                            Err(error) => {
+                                tracing::error!(%error, "could not sign this server's key response");
+                                hs_http::error::MatrixError::custom(
+                                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                    hs_http::error::MatrixErrorCode::Unknown,
+                                    "could not sign the server key response",
+                                )
+                                .into_response()
+                            }
+                        }
+                    }
+                },
+                RouteMeta::new(Surface::MatrixFederation, AuthKind::None)
+                    .with_operation_id("getServerKey"),
+            )
+            .merge_router(
+                "/_matrix/federation/v1",
+                federation_router,
+                federation_manifest.routes,
+            );
+    }
 
     if legacy_media_enabled {
         let (legacy_router, legacy_manifest) = hs_media::router::legacy_router::<B>();
@@ -301,6 +345,17 @@ fn build_router<B: KvBackend>(
 /// six-plus-argument generic function invites transposition bugs.
 struct Mounts<B: KvBackend> {
     room: RoomState<B>,
+    /// The federation transport server and the context its `X-Matrix` layer verifies against, or
+    /// `None` when `federation.enabled` is off -- in which case nothing under
+    /// `/_matrix/federation` or `/_matrix/key` is mounted at all, rather than mounted and
+    /// refusing, so a server with federation disabled looks to a remote exactly like one that
+    /// does not implement federation.
+    federation: Option<(
+        hs_federation::transport::FederationState,
+        Arc<hs_federation::xmatrix::XMatrixContext>,
+        Arc<hs_federation::keys::OwnSigningKeys>,
+        String,
+    )>,
     user: UserState<B, Arc<hs_room::registry::RoomRegistry<B>>>,
     e2e: hs_e2e::state::E2eState<B>,
     push: hs_push::state::PushState<B>,
@@ -358,14 +413,15 @@ fn build_session_mounts<B: KvBackend>(
     let push = hs_push::state::PushState {
         auth: auth.clone(),
         rulesets: Arc::new(hs_push::rulesets::CachedRulesetStore::new(
-            hs_push::rulesets::tables::TablesRulesetStore::open(backend.clone()).map_err(opening)?,
+            hs_push::rulesets::tables::TablesRulesetStore::open(backend.clone())
+                .map_err(opening)?,
         )),
-        pushers: Arc::new(hs_push::pushers::tables::TablesPusherStore::open(
-            backend.clone(),
-        ).map_err(opening)?),
-        counts: Arc::new(hs_push::counts::tables::TablesCountsStore::open(
-            backend.clone(),
-        ).map_err(opening)?),
+        pushers: Arc::new(
+            hs_push::pushers::tables::TablesPusherStore::open(backend.clone()).map_err(opening)?,
+        ),
+        counts: Arc::new(
+            hs_push::counts::tables::TablesCountsStore::open(backend.clone()).map_err(opening)?,
+        ),
         http_pushers: Arc::new(hs_push::pushers::http::HttpPusherClient::new(
             hs_push::pushers::http::RetryPolicy::default(),
         )),
@@ -408,6 +464,16 @@ fn throwaway_mounts() -> Mounts<hs_kv::memory::MemoryBackend> {
     let (user, e2e, push) = build_session_mounts(&backend, &auth, &rooms)
         .expect("opening in-memory session/e2e/push keyspaces cannot fail");
 
+    let (federation_state, x_matrix) = crate::federation::manifest_only_mount();
+    let federation = Some((
+        federation_state,
+        x_matrix,
+        Arc::new(hs_federation::keys::OwnSigningKeys::from_keys(vec![
+            hs_model::signing::SigningKeyPair::generate("a_manifest"),
+        ])),
+        "routes-manifest.invalid".to_string(),
+    ));
+
     let object_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::memory::InMemory::new());
     let metadata = hs_media::metadata::MetadataStore::open(MemoryBackend::new())
@@ -442,6 +508,7 @@ fn throwaway_mounts() -> Mounts<hs_kv::memory::MemoryBackend> {
 
     Mounts {
         room,
+        federation,
         user,
         e2e,
         push,
@@ -580,8 +647,7 @@ pub async fn spawn_serve(
         identity,
     };
 
-    let (user_state, e2e_state, push_state) =
-        build_session_mounts(&backend, &auth_state, &rooms)?;
+    let (user_state, e2e_state, push_state) = build_session_mounts(&backend, &auth_state, &rooms)?;
 
     // Closes the discovery gap (`docs/rfcs/0012-room-registry-global-updates.md`): every room the
     // registry creates or loads is followed into users' durable feeds, so a room created through
@@ -598,8 +664,32 @@ pub async fn spawn_serve(
         &metrics,
     )?;
 
+    // Federation is mounted over the same open backend and stores every other surface uses, so a
+    // remote server reading `/state` sees exactly what a local client reading `/messages` sees.
+    let federation = if config.federation.enabled {
+        let mount = crate::federation::build_mount(
+            &config,
+            &room_state.identity,
+            backend.clone(),
+            rooms.clone(),
+            user_state.hub.store().clone(),
+            auth_state.store.clone(),
+            e2e_state.store.clone(),
+        )?;
+        Some((
+            mount.state,
+            mount.x_matrix,
+            mount.own_keys,
+            mount.server_name,
+        ))
+    } else {
+        tracing::info!("federation is disabled; not mounting the federation transport server");
+        None
+    };
+
     let mounts = Mounts {
         room: room_state,
+        federation,
         user: user_state,
         e2e: e2e_state,
         push: push_state,
