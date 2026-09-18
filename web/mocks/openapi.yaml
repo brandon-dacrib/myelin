@@ -1,0 +1,534 @@
+openapi: 3.1.0
+info:
+  title: hs admin API (track 16 draft)
+  version: "0.0.1-draft"
+  description: >
+    Track 16's own draft of the admin API surface it needs for Phase 0
+    (overview, bridges). This is NOT track 15's document. It exists so the
+    management web interface can generate a typed client and mock server
+    before crates/hs-admin/openapi/openapi.yaml exists. When that file
+    exists and 15's status file marks it usable, this file is reconciled
+    against it (differences recorded in docs/status/16-management-web-interface.md)
+    and this file is trimmed to whatever 15 does not yet cover.
+servers:
+  - url: /api/v1
+paths:
+  /overview:
+    get:
+      operationId: getOverview
+      summary: Server overview for the dashboard.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Overview"
+
+  /bridges/kinds:
+    get:
+      operationId: listBridgeKinds
+      summary: Catalogue of bridge types the add-bridge wizard can offer.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/BridgeKind"
+
+  /bridges:
+    get:
+      operationId: listBridges
+      summary: List registered bridges and appservices.
+      parameters:
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: state
+          in: query
+          schema: { type: string }
+        - name: kind
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BridgePage"
+    post:
+      operationId: createBridge
+      summary: Register a new bridge from the add-bridge wizard.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateBridgeRequest"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Bridge"
+        "409":
+          description: Namespace conflict
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ConflictProblem"
+        "422":
+          description: Validation failed
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ValidationProblem"
+
+  /bridges/{id}:
+    get:
+      operationId: getBridge
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Bridge"
+        "404":
+          description: Not found
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /bridges/{id}/actions/pause:
+    post:
+      operationId: pauseBridge
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Bridge"
+
+  /bridges/{id}/actions/resume:
+    post:
+      operationId: resumeBridge
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Bridge"
+
+  /bridges/{id}/actions/rotate-tokens:
+    post:
+      operationId: rotateBridgeTokens
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BridgeRegistration"
+
+  /bridges/{id}/dead-letters/replay:
+    post:
+      operationId: replayDeadLetters
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                dead_letter_id: { type: string, description: "Replay one; omit to replay all." }
+      responses:
+        "202":
+          description: Accepted
+
+  /appservices/check:
+    get:
+      operationId: checkAppserviceId
+      parameters:
+        - name: id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [available]
+                properties:
+                  available: { type: boolean }
+
+  /appservices/validate:
+    post:
+      operationId: validateAppserviceNamespaces
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                user_namespace: { type: string }
+                alias_namespace: { type: string }
+                room_namespace: { type: string }
+      responses:
+        "200":
+          description: No conflicts
+        "409":
+          description: Conflicts found
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ConflictProblem"
+
+components:
+  schemas:
+    Problem:
+      type: object
+      required: [type, title]
+      properties:
+        type: { type: string }
+        title: { type: string }
+        detail: { type: string }
+        status: { type: integer }
+        instance: { type: string }
+
+    ValidationProblem:
+      allOf:
+        - $ref: "#/components/schemas/Problem"
+        - type: object
+          properties:
+            errors:
+              type: array
+              items:
+                type: object
+                required: [pointer, message]
+                properties:
+                  pointer: { type: string }
+                  message: { type: string }
+
+    ConflictProblem:
+      allOf:
+        - $ref: "#/components/schemas/Problem"
+        - type: object
+          properties:
+            conflicts:
+              type: array
+              items:
+                type: object
+                required: [kind, id, description]
+                properties:
+                  kind: { type: string, enum: [appservice, user] }
+                  id: { type: string }
+                  description: { type: string }
+                  link: { type: string }
+
+    BridgeState:
+      type: string
+      enum:
+        - waiting_for_ping
+        - starting
+        - running
+        - unconfigured
+        - bridge_unreachable
+        - paused
+        - error
+
+    BridgeKind:
+      type: object
+      required: [id, name, network, description, requires]
+      properties:
+        id: { type: string, example: mautrix-whatsapp }
+        name: { type: string, example: WhatsApp }
+        network: { type: string, example: WhatsApp }
+        description: { type: string }
+        requires:
+          type: array
+          items: { type: string }
+        deployment_kinds:
+          type: array
+          items: { type: string, enum: [kubernetes, self-managed] }
+
+    BridgeBacklog:
+      type: object
+      required: [depth]
+      properties:
+        depth: { type: integer }
+        oldest_age_seconds: { type: integer, nullable: true }
+
+    BridgeSummary:
+      type: object
+      required: [id, name, kind, state, backlog, logins_connected, logins_total, updated_at]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        kind: { type: string }
+        state:
+          $ref: "#/components/schemas/BridgeState"
+        backlog:
+          $ref: "#/components/schemas/BridgeBacklog"
+        last_success_at: { type: string, format: date-time, nullable: true }
+        logins_connected: { type: integer }
+        logins_total: { type: integer }
+        paused: { type: boolean }
+        updated_at: { type: string, format: date-time }
+
+    BridgeRegistration:
+      type: object
+      properties:
+        id: { type: string }
+        url: { type: string }
+        sender_localpart: { type: string }
+        as_token: { type: string }
+        hs_token: { type: string }
+        rate_limited: { type: boolean }
+        namespaces:
+          type: object
+          properties:
+            users: { type: array, items: { type: string } }
+            aliases: { type: array, items: { type: string } }
+            rooms: { type: array, items: { type: string } }
+        features:
+          type: object
+          properties:
+            receive_ephemeral: { type: boolean }
+            msc3202: { type: boolean }
+            msc4190: { type: boolean }
+
+    BridgeLogin:
+      type: object
+      properties:
+        matrix_user_id: { type: string }
+        state: { type: string }
+        remote_name: { type: string, nullable: true }
+        remote_profile_url: { type: string, nullable: true }
+        user_action:
+          type: string
+          nullable: true
+          enum: [OPEN_NATIVE, RELOGIN, RESTART]
+
+    BridgeTransaction:
+      type: object
+      properties:
+        id: { type: string }
+        status: { type: string, enum: [ok, failed, pending] }
+        at: { type: string, format: date-time }
+        duration_ms: { type: integer }
+        error: { type: string, nullable: true }
+
+    Bridge:
+      allOf:
+        - $ref: "#/components/schemas/BridgeSummary"
+        - type: object
+          properties:
+            deployment:
+              type: string
+              enum: [kubernetes, self-managed]
+            last_error: { type: string, nullable: true }
+            ping_ms: { type: integer, nullable: true }
+            registration:
+              $ref: "#/components/schemas/BridgeRegistration"
+            logins:
+              type: array
+              items:
+                $ref: "#/components/schemas/BridgeLogin"
+            transactions:
+              type: array
+              items:
+                $ref: "#/components/schemas/BridgeTransaction"
+
+    BridgePage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/BridgeSummary"
+        next_cursor: { type: string, nullable: true }
+
+    CreateBridgeRequest:
+      type: object
+      required: [kind, id, sender_localpart, deployment]
+      properties:
+        kind: { type: string }
+        name: { type: string }
+        id: { type: string }
+        sender_localpart: { type: string }
+        user_namespace: { type: string }
+        alias_namespace: { type: string }
+        room_namespace: { type: string }
+        deployment: { type: string, enum: [kubernetes, self-managed] }
+        namespace: { type: string, description: "Kubernetes namespace, when deployment=kubernetes" }
+        image_tag: { type: string }
+        database_mode: { type: string, enum: [own, shared] }
+        double_puppeting: { type: boolean, default: true }
+        encryption: { type: boolean, default: true }
+        rate_limit_exempt: { type: boolean, default: true }
+
+    AttentionItem:
+      type: object
+      required: [id, severity, summary, action_label, action_href]
+      properties:
+        id: { type: string }
+        severity: { type: string, enum: [warning, danger, info] }
+        summary: { type: string }
+        action_label: { type: string }
+        action_href: { type: string }
+
+    HealthTile:
+      type: object
+      required: [label, value]
+      properties:
+        label: { type: string }
+        value: { type: string }
+        hint: { type: string, nullable: true }
+
+    ActivityPoint:
+      type: object
+      required: [at, value]
+      properties:
+        at: { type: string, format: date-time }
+        value: { type: number }
+
+    ActivitySeries:
+      type: object
+      required: [label, points]
+      properties:
+        label: { type: string }
+        points:
+          type: array
+          items:
+            $ref: "#/components/schemas/ActivityPoint"
+
+    DestinationSummary:
+      type: object
+      required: [server, status]
+      properties:
+        server: { type: string }
+        status: { type: string, enum: [healthy, backing_off, failing] }
+
+    AuditEntrySummary:
+      type: object
+      required: [id, at, actor, summary]
+      properties:
+        id: { type: string }
+        at: { type: string, format: date-time }
+        actor: { type: string }
+        summary: { type: string }
+        resource_href: { type: string, nullable: true }
+
+    Overview:
+      type: object
+      required: [mode, replicas, attention, health, activity, bridges, federation, recent_audit]
+      properties:
+        mode: { type: string, enum: [single-node, cluster] }
+        replicas: { type: integer }
+        attention:
+          type: array
+          items:
+            $ref: "#/components/schemas/AttentionItem"
+        health:
+          type: array
+          items:
+            $ref: "#/components/schemas/HealthTile"
+        activity:
+          type: array
+          items:
+            $ref: "#/components/schemas/ActivitySeries"
+        bridges:
+          type: array
+          items:
+            $ref: "#/components/schemas/BridgeSummary"
+        federation:
+          type: array
+          items:
+            $ref: "#/components/schemas/DestinationSummary"
+        recent_audit:
+          type: array
+          items:
+            $ref: "#/components/schemas/AuditEntrySummary"
+
+  securitySchemes:
+    adminOAuth:
+      type: oauth2
+      flows:
+        authorizationCode:
+          authorizationUrl: /oauth2/authorize
+          tokenUrl: /oauth2/token
+          scopes:
+            admin:read: Read admin resources
+            admin:write: Mutate admin resources
+            bridges:read: Read bridges and appservices
+            bridges:write: Manage bridges and appservices
+            moderation:*: Moderation actions on users, rooms and reports
+
+security:
+  - adminOAuth: [admin:read]

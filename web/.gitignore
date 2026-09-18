@@ -1,0 +1,9 @@
+node_modules
+dist
+dist-mock
+storybook-static
+playwright-report
+test-results
+.vite
+*.local
+*.tsbuildinfo

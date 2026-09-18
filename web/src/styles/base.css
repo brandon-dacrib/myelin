@@ -1,0 +1,163 @@
+/**
+ * Global element defaults. Kept deliberately small: components carry their
+ * own presentation via Tailwind utilities built on the tokens in tokens.css.
+ */
+
+:root {
+  color-scheme: light dark;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  height: 100%;
+}
+
+body {
+  height: 100%;
+  margin: 0;
+  background-color: var(--color-canvas);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: var(--text-base--line-height);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+#root {
+  height: 100%;
+}
+
+/* Visible focus ring everywhere, per accessibility.md #2: 2px, --color-focus,
+   2px offset, never removed without a replacement. */
+:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+  border-radius: var(--radius-xs);
+}
+
+::selection {
+  background-color: var(--color-accent-muted);
+  color: var(--color-text);
+}
+
+/* prefers-reduced-motion: reduce (accessibility.md #7): every transition
+   collapses to an 80ms opacity fade, transforms are removed. Implemented
+   once here so components never special-case it. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 80ms !important;
+    transition-duration: 80ms !important;
+    transition-property: opacity !important;
+    transform: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Identifiers, tokens, raw JSON: monospace at 13px (states-density...md #3). */
+.font-identifier {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+
+img,
+svg {
+  display: block;
+  max-width: 100%;
+}
+
+/* No unlayered `button { color: inherit }` here on purpose: Tailwind's own
+   Preflight already sets it inside `@layer base`, and this file is imported
+   as plain (unlayered) CSS. An unlayered declaration beats every layered
+   one regardless of specificity, so a duplicate here would silently defeat
+   every `text-*` utility applied to a <button> (this took a real axe
+   color-contrast failure on the primary "Add bridge" button to find). */
+
+/* Dialog/sheet/toast enter-exit motion. Cause: dialogs and sheets per
+   states-density-responsiveness.md #5 ("motion communicates cause"). Neutralised
+   under prefers-reduced-motion by the rule above (targets `*`). */
+@keyframes overlay-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes overlay-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+@keyframes dialog-content-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -48%) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+}
+@keyframes dialog-content-out {
+  from {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translate(-50%, -48%) scale(0.98);
+  }
+}
+@keyframes sheet-in-right {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+@keyframes sheet-out-right {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(100%);
+  }
+}
+@keyframes toast-in-right {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+@keyframes toast-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}

@@ -1,0 +1,7 @@
+dist
+dist-mock
+storybook-static
+playwright-report
+test-results
+src/api/schema.d.ts
+node_modules
