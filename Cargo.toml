@@ -39,6 +39,9 @@ serde_yaml_ng = "0.10"
 schemars = { version = "1", features = ["preserve_order"] }
 hmac = "0.12"
 sha1 = "0.10"
+# Added by track 02 (state and model): rand_core 0.6, the version ed25519-dalek 2.x's optional
+# `rand_core` feature pins, for `SigningKeyPair::generate`. `rand` (0.9) is unrelated and stays.
+rand_core = "0.6"
 # Added by track 01 (storage): embedded store, PostgreSQL client and pool, temp dirs for tests.
 fjall = { version = "3", features = ["bytes_1"] }
 tokio-postgres = "0.7"
@@ -56,6 +59,24 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 hyper-util = { version = "0.1", features = ["tokio", "server", "http2", "client"] }
 subtle = "2"
 rcgen = "0.14"
+
+# Added by track 07 (auth and identity): native Argon2id password hashing, bcrypt verification
+# for imported Synapse hashes, CRC32 for Synapse-shaped opaque token checksums, and regex for
+# appservice namespace matching (the in-crate registry stub track 11 will replace).
+argon2 = "0.5"
+bcrypt = "0.17"
+crc32fast = "1"
+regex = "1"
+
+# Added by track 15 (admin API and modules): ULIDs for server-generated identifiers (RFC 0004
+# decision D15.2), RFC 3339 timestamp formatting for the admin API and audit log, the standard
+# axum companion middleware (CORS, body-size limits, tracing) for hs-http, and embedding web/'s
+# built assets at /admin/ (RFC 0004 section 13).
+ulid = { version = "1", features = ["serde"] }
+time = { version = "0.3", features = ["formatting", "parsing", "serde", "macros"] }
+tower-http = { version = "0.6", features = ["cors", "limit", "trace", "set-header"] }
+rust-embed = { version = "8", features = ["mime-guess"] }
+rustls-pemfile = "2"
 
 [profile.dev]
 opt-level = 0

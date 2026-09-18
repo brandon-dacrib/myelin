@@ -5,8 +5,13 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "hs-tables: see docs/workstreams for the owning track"
+description = "hs-tables: typed keyspaces over hs-kv -- tuple key encoding, declarative indexes, migrations, interning. Track 01 (docs/workstreams/01-storage-engine.md)."
 
 [dependencies]
+hs-kv = { path = "../hs-kv" }
+hs-model = { path = "../hs-model" }
+bytes = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
+proptest = { workspace = true }

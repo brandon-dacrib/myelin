@@ -5,8 +5,18 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "hs-kv: see docs/workstreams for the owning track"
+description = "hs-kv: ordered, transactional key-value abstraction. Track 01 (docs/workstreams/01-storage-engine.md)."
+
+[[bench]]
+name = "kv_bench"
+harness = false
 
 [dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+fjall = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
+criterion = { workspace = true }
