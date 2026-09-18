@@ -587,7 +587,7 @@ mod tests {
             )
             .await
             .unwrap();
-        hub.watch_room(handle.clone());
+        hub.watch_room(handle.clone()).await;
         handle
             .send_event(
                 alice.clone(),
@@ -630,7 +630,7 @@ mod tests {
             )
             .await
             .unwrap();
-        hub.watch_room(handle.clone());
+        hub.watch_room(handle.clone()).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let (_first, token) = build(&hub, &alice, params(None)).await.unwrap();
@@ -684,7 +684,7 @@ mod tests {
             )
             .await
             .unwrap();
-        hub.watch_room(handle.clone());
+        hub.watch_room(handle.clone()).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         // The token under test, issued before the message exists.
@@ -728,7 +728,7 @@ mod tests {
             .create_room(alice.clone(), CreateRoomRequest::default(), 1)
             .await
             .unwrap();
-        hub.watch_room(handle.clone());
+        hub.watch_room(handle.clone()).await;
         let (_bob_first, bob_token) = build(&hub, &bob, params(None)).await.unwrap();
 
         handle
@@ -762,7 +762,7 @@ mod tests {
             .create_room(alice.clone(), CreateRoomRequest::default(), 1)
             .await
             .unwrap();
-        hub.watch_room(handle.clone());
+        hub.watch_room(handle.clone()).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
         let (_first, token) = build(&hub, &alice, params(None)).await.unwrap();
 
@@ -780,13 +780,13 @@ mod tests {
             .create_room(alice.clone(), CreateRoomRequest::default(), 1)
             .await
             .unwrap();
-        hub.watch_room(handle_a.clone());
+        hub.watch_room(handle_a.clone()).await;
         let handle_b = hub
             .rooms()
             .create_room(alice.clone(), CreateRoomRequest::default(), 2)
             .await
             .unwrap();
-        hub.watch_room(handle_b.clone());
+        hub.watch_room(handle_b.clone()).await;
 
         // A room the hub has never seen an update for has no membership record, and a sync
         // reports only rooms it has records for (`crate::hub`'s module docs, "The discovery

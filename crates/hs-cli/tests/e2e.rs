@@ -561,3 +561,120 @@ async fn sync_keys_and_push_surfaces_answer_through_the_real_binary() {
 
     handle.shutdown().await;
 }
+
+/// A room created through the client-server API shows up in its creator's `/sync`, and a message
+/// sent afterwards arrives in an incremental sync -- with nothing calling `watch_room` by hand.
+///
+/// This is the discovery gap closing (`docs/rfcs/0012-room-registry-global-updates.md`): before
+/// `RoomRegistry::subscribe_global` existed, `hs-user` only learned a room existed if something
+/// explicitly told it, and nothing in the server did, so every room was invisible to `/sync` in
+/// production no matter how well sync itself worked. That is exactly the kind of gap that unit
+/// tests on either crate cannot see, so the test lives here, against the running binary.
+#[tokio::test]
+async fn a_room_created_over_http_reaches_its_creators_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(reserve_ephemeral_port(), dir.path());
+
+    let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
+        .await
+        .expect("server should boot");
+    let base = handle.base_url();
+    let client = reqwest::Client::new();
+
+    let register: serde_json::Value = client
+        .post(format!("{base}/_matrix/client/v3/register"))
+        .json(&json!({
+            "username": "discovery",
+            "password": "hunter2-discovery",
+            "auth": {"type": "m.login.dummy"},
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = register["access_token"].as_str().expect("an access token").to_owned();
+
+    let created: serde_json::Value = client
+        .post(format!("{base}/_matrix/client/v3/createRoom"))
+        .bearer_auth(&token)
+        .json(&json!({"preset": "private_chat", "name": "Discovered"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let room_id = created["room_id"].as_str().expect("a room id").to_owned();
+
+    // The fan-out runs in a background task off the registry's global stream, so poll rather than
+    // sleep a fixed amount: fast when it works, and a clear failure rather than a flake when it
+    // does not.
+    let mut sync = serde_json::Value::Null;
+    for _ in 0..40 {
+        sync = client
+            .get(format!("{base}/_matrix/client/v3/sync?timeout=0"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if sync["rooms"]["join"].get(&room_id).is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let room = sync["rooms"]["join"]
+        .get(&room_id)
+        .unwrap_or_else(|| panic!("the created room should reach /sync: {sync}"));
+    assert!(
+        !room["state"]["events"].as_array().unwrap().is_empty(),
+        "the room's current state should come with it: {room}"
+    );
+    let since = sync["next_batch"].as_str().expect("a next_batch").to_owned();
+
+    // And a message sent after that token arrives in the next incremental sync.
+    let sent = client
+        .put(format!(
+            "{base}/_matrix/client/v3/rooms/{room_id}/send/m.room.message/txn-1"
+        ))
+        .bearer_auth(&token)
+        .json(&json!({"msgtype": "m.text", "body": "found you"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sent.status(), reqwest::StatusCode::OK);
+
+    let mut found = false;
+    for _ in 0..40 {
+        let incremental: serde_json::Value = client
+            .get(format!(
+                "{base}/_matrix/client/v3/sync?timeout=0&since={since}"
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let events = incremental["rooms"]["join"][&room_id]["timeline"]["events"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if events
+            .iter()
+            .any(|e| e["content"]["body"] == "found you")
+        {
+            found = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(found, "the message should arrive in an incremental sync");
+
+    handle.shutdown().await;
+}

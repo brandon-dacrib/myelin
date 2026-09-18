@@ -583,6 +583,13 @@ pub async fn spawn_serve(
     let (user_state, e2e_state, push_state) =
         build_session_mounts(&backend, &auth_state, &rooms)?;
 
+    // Closes the discovery gap (`docs/rfcs/0012-room-registry-global-updates.md`): every room the
+    // registry creates or loads is followed into users' durable feeds, so a room created through
+    // `/createRoom` shows up in `/sync` and an invite reaches a target who has never synced.
+    // Subscribed here, before any listener is bound below, because the stream does not replay: an
+    // update published before this subscription exists would be missed.
+    user_state.hub.watch_all(rooms.subscribe_global());
+
     let media_state = crate::media::build_media_state(
         &config,
         backend.clone(),

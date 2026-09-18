@@ -1007,6 +1007,39 @@ impl<B: KvBackend> RoomActor<B> {
             .map_err(|e| RoomError::State(e.to_string()))
     }
 
+    /// A [`RoomUpdate`] describing this room's newest timeline event, or `None` for a room with an
+    /// empty timeline (which cannot happen for a persisted room: `m.room.create` is always there).
+    ///
+    /// This is not a synthetic event -- it is the real head of the timeline, reported after the
+    /// fact. It exists so that something which starts watching a room *after* the room was built
+    /// can still discover it: `RoomActor::create_room` publishes its whole create burst while the
+    /// actor is still being constructed, before any caller can possibly hold a handle to subscribe
+    /// with, so those updates reach nobody. `changed_state_keys` and `membership_deltas` are left
+    /// empty because this is a "here is where the room is now" announcement rather than a report of
+    /// one transition; a consumer that cares about membership reads the room's current state, which
+    /// is what `hs_user::hub::SessionHub::process_room_update` does anyway.
+    ///
+    /// See `docs/rfcs/0012-room-registry-global-updates.md` and
+    /// [`crate::registry::RoomRegistry::subscribe_global`].
+    #[must_use]
+    pub fn head_update(&self) -> Option<RoomUpdate> {
+        let (&room_pos, &event_sn) = self.timeline.iter().next_back()?;
+        let event = self.events.get(&event_sn)?;
+        Some(RoomUpdate {
+            room_sn: self.room_sn,
+            room_id: self.room_id.clone(),
+            room_pos,
+            event_sn,
+            event_id: event.event_id().to_owned(),
+            event_type: event.header().event_type.clone(),
+            state_key: event.header().state_key.clone(),
+            sender: event.header().sender.clone(),
+            changed_state_keys: Vec::new(),
+            membership_deltas: Vec::new(),
+            push_evaluation_inputs: Vec::new(),
+        })
+    }
+
     /// Every current-state event: every entry in the resolution of the room's current forward
     /// extremities, dereferenced back into a full [`Event`] through this actor's in-memory cache.
     /// `hs_state::api::StateStore` has no direct "enumerate every key in a root" method, so this

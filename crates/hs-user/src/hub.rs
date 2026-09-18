@@ -172,7 +172,14 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     /// ([`hs_room::actor::RoomActorHandle::subscribe`]) into [`SessionHub::process_room_update`]
     /// for as long as the room stays resident. See the module docs, "The discovery gap", for why
     /// a caller must invoke this for every room.
-    pub fn watch_room(self: &Arc<Self>, handle: hs_room::actor::RoomActorHandle<B>)
+    /// Subscribes before returning, so once this call completes nothing published by `handle` can
+    /// be missed. It deliberately does not spawn the subscription: doing that lost every event a
+    /// caller wrote between calling this and the spawned task actually reaching `subscribe`, which
+    /// is a race a caller has no way to wait out.
+    pub async fn watch_room(
+        self: &Arc<Self>,
+        handle: hs_room::actor::RoomActorHandle<B>,
+    ) -> tokio::task::JoinHandle<()>
     where
         B: 'static,
         // The spawned task holds an `Arc<Self>`, so the room source it reaches through must
@@ -180,30 +187,54 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         // the hub is happy with a borrowed room source.
         R: 'static,
     {
+        let rx = handle.subscribe().await;
         let hub = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut rx = handle.subscribe().await;
-            loop {
-                match rx.recv().await {
-                    Ok(update) => {
-                        if let Err(e) = hub.process_room_update(update).await {
-                            tracing::warn!(error = %e, "failed to process a room update into user feeds");
-                        }
+        tokio::spawn(async move { hub.consume_updates(rx).await })
+    }
+
+    /// Spawns a background task draining `updates` into [`SessionHub::process_room_update`], for
+    /// the whole server at once: pass [`hs_room::registry::RoomRegistry::subscribe_global`]'s
+    /// receiver, and every room the registry loads or creates is followed without anything having
+    /// to call [`SessionHub::watch_room`] per room. This is the production wiring the
+    /// discovery gap described in this module's docs asked for
+    /// (`docs/rfcs/0012-room-registry-global-updates.md`); `watch_room` remains for a caller that
+    /// holds one handle and wants only that room.
+    ///
+    /// Subscribe before serving traffic: the stream does not replay updates published before the
+    /// subscription existed, and an invite missed that way would not reach its target's feed.
+    pub fn watch_all(
+        self: &Arc<Self>,
+        updates: tokio::sync::broadcast::Receiver<RoomUpdate>,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        B: 'static,
+        R: 'static,
+    {
+        let hub = Arc::clone(self);
+        tokio::spawn(async move { hub.consume_updates(updates).await })
+    }
+
+    /// The shared drain loop behind [`SessionHub::watch_room`] and [`SessionHub::watch_all`].
+    async fn consume_updates(&self, mut updates: tokio::sync::broadcast::Receiver<RoomUpdate>) {
+        loop {
+            match updates.recv().await {
+                Ok(update) => {
+                    if let Err(e) = self.process_room_update(update).await {
+                        tracing::warn!(error = %e, "failed to process a room update into user feeds");
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        // A slow consumer missed `skipped` publishes. There is no way to recover
-                        // the exact events from the channel, but nothing is actually lost: the
-                        // room actor's own store still has every position, so the next update
-                        // this hub *does* see will append (or coalesce into) a feed entry
-                        // carrying the room's then-current `room_pos`, and any user who syncs in
-                        // between reads the room's live state directly. Logged, not silently
-                        // dropped.
-                        tracing::warn!(skipped, "session hub lagged behind a room's publish stream");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    // A slow consumer missed `skipped` publishes. There is no way to recover the
+                    // exact events from the channel, but nothing is actually lost: the room
+                    // actor's own store still has every position, so the next update this hub
+                    // *does* see will append (or coalesce into) a feed entry carrying the room's
+                    // then-current `room_pos`, and any user who syncs in between reads the room's
+                    // live state directly. Logged, not silently dropped.
+                    tracing::warn!(skipped, "session hub lagged behind a room's publish stream");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
-        });
+        }
     }
 
     /// Applies one [`RoomUpdate`] to every affected user's durable state: refreshes
@@ -346,7 +377,7 @@ mod tests {
             )
             .await
             .unwrap();
-        hub.watch_room(handle.clone());
+        hub.watch_room(handle.clone()).await;
 
         // Send one more event and give the spawned watcher a moment to process it.
         handle
@@ -383,7 +414,7 @@ mod tests {
             .create_room(alice.clone(), CreateRoomRequest::default(), 1)
             .await
             .unwrap();
-        hub.watch_room(handle.clone());
+        hub.watch_room(handle.clone()).await;
 
         handle
             .membership(
@@ -424,7 +455,7 @@ mod tests {
             )
             .await
             .unwrap();
-        hub.watch_room(handle.clone());
+        hub.watch_room(handle.clone()).await;
         handle
             .membership(
                 bob.clone(),

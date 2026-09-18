@@ -112,7 +112,7 @@ async fn register_invite_join_and_message_flow_reaches_both_users_syncs() {
         .get_or_load(&ruma::RoomId::parse(&room_id).unwrap())
         .await
         .unwrap();
-    hub.watch_room(handle);
+    hub.watch_room(handle).await;
     settle().await;
 
     // 2. Both users take an initial sync baseline before anything else happens.
@@ -272,7 +272,7 @@ async fn a_sync_token_issued_before_a_message_returns_it_even_after_unrelated_ac
         .get_or_load(&ruma::RoomId::parse(&room_id).unwrap())
         .await
         .unwrap();
-    hub.watch_room(handle);
+    hub.watch_room(handle).await;
     settle().await;
 
     // The token under test, issued right after the room was created.

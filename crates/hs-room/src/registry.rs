@@ -14,6 +14,7 @@ use crate::actor::{RoomActor, RoomActorHandle};
 use crate::error::RoomError;
 use crate::identity::HomeserverIdentity;
 use crate::persist::Tables;
+use crate::protocol::RoomUpdate;
 
 struct Entry<B: KvBackend> {
     handle: RoomActorHandle<B>,
@@ -33,6 +34,9 @@ pub struct RoomRegistry<B: KvBackend> {
     tables: Tables<B>,
     identity: HomeserverIdentity,
     rooms: Mutex<HashMap<OwnedRoomId, Entry<B>>>,
+    /// Every resident room's updates, fanned into one stream. See
+    /// [`RoomRegistry::subscribe_global`] and `docs/rfcs/0012-room-registry-global-updates.md`.
+    global: tokio::sync::broadcast::Sender<RoomUpdate>,
 }
 
 impl<B: KvBackend + 'static> RoomRegistry<B> {
@@ -42,11 +46,16 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     /// Returns [`hs_kv::KvError`] if opening the shared keyspaces fails.
     pub fn open(backend: B, identity: HomeserverIdentity) -> Result<Self, hs_kv::KvError> {
         let tables = Tables::open(&backend)?;
+        // Sized to absorb a burst from many rooms at once without stalling any room actor: a
+        // `broadcast` send never blocks, it drops the oldest item and reports `Lagged` to the
+        // slow receiver, which the consumer must handle (`hs_user::hub`'s watcher does).
+        let (global, _rx) = tokio::sync::broadcast::channel(1024);
         Ok(Self {
             backend,
             tables,
             identity,
             rooms: Mutex::new(HashMap::new()),
+            global,
         })
     }
 
@@ -125,7 +134,57 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
                 last_used: Instant::now(),
             },
         );
+        self.spawn_global_forwarder(&handle);
         handle
+    }
+
+    /// Forwards one newly-resident room's publish stream into this registry's global stream. One
+    /// task per inserted handle, which is also one per *residency*: a room evicted and later
+    /// reloaded is a new actor with a new publish channel and gets a new forwarder, while the old
+    /// task ends on its own when the old actor is dropped and its channel closes.
+    fn spawn_global_forwarder(&self, handle: &RoomActorHandle<B>) {
+        let handle = handle.clone();
+        let global = self.global.clone();
+        tokio::spawn(async move {
+            let mut rx = handle.subscribe().await;
+            // Subscribe first, then announce: a room built by `RoomActor::create_room` published
+            // its whole create burst before any handle existed to subscribe with, so without this
+            // a freshly created room would never appear on the global stream at all until someone
+            // wrote to it. Taking the subscription before reading the head means an event landing
+            // in between is seen twice at worst, never missed.
+            if let Some(head) = handle.query(|actor| actor.head_update()).await {
+                let _ = global.send(head);
+            }
+            loop {
+                match rx.recv().await {
+                    // A send failing means nobody is subscribed globally, which is normal (a
+                    // server with no `hs-user` wired in, or before the watcher starts).
+                    Ok(update) => {
+                        let _ = global.send(update);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            skipped,
+                            "the global room-update forwarder fell behind a room's publish stream"
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
+    /// A stream of every [`RoomUpdate`] published by any room this registry loads or creates, from
+    /// the moment the subscription is taken out. This is the fan-in hook
+    /// `docs/rfcs/0012-room-registry-global-updates.md` asked for: it is what lets `hs-user`'s
+    /// session hub learn that a room exists without this crate knowing `hs-user` does.
+    ///
+    /// Updates published *before* the first subscription, and before a room is first loaded, are
+    /// not replayed. A consumer that must not miss an invite should subscribe at startup, before
+    /// serving any request.
+    #[must_use]
+    pub fn subscribe_global(&self) -> tokio::sync::broadcast::Receiver<RoomUpdate> {
+        self.global.subscribe()
     }
 
     /// Resolves a local alias directly against the store, without loading the target room.
@@ -172,5 +231,118 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     /// How many rooms are currently resident. For tests and diagnostics.
     pub async fn resident_count(&self) -> usize {
         self.rooms.lock().await.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actor::CreateRoomRequest;
+    use hs_kv::memory::MemoryBackend;
+    use ruma::user_id;
+
+    fn registry() -> Arc<RoomRegistry<MemoryBackend>> {
+        Arc::new(
+            RoomRegistry::open(
+                MemoryBackend::new(),
+                HomeserverIdentity::for_tests("registry.test"),
+            )
+            .expect("opening an in-memory registry cannot fail"),
+        )
+    }
+
+    /// The fan-in hook of `docs/rfcs/0012-room-registry-global-updates.md`: a subscriber taken out
+    /// before any room exists sees a newly created room, without holding that room's handle.
+    #[tokio::test]
+    async fn subscribe_global_reports_a_room_created_after_subscribing() {
+        let registry = registry();
+        let mut updates = registry.subscribe_global();
+
+        let handle = registry
+            .create_room(
+                user_id!("@alice:registry.test").to_owned(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .expect("create should succeed");
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+
+        // `create_room` publishes its whole create burst while the actor is still under
+        // construction, so the head announcement is what carries the room across -- see
+        // `RoomActor::head_update`.
+        let update = tokio::time::timeout(Duration::from_secs(5), updates.recv())
+            .await
+            .expect("an update should arrive")
+            .expect("the global sender should still be live");
+        assert_eq!(update.room_id, room_id);
+    }
+
+    /// A subsequent write reaches the same subscriber, which is what makes the stream useful past
+    /// discovery: it is the live feed, not a one-shot announcement.
+    #[tokio::test]
+    async fn subscribe_global_reports_later_events_in_a_known_room() {
+        let registry = registry();
+        let mut updates = registry.subscribe_global();
+        let alice = user_id!("@alice:registry.test").to_owned();
+
+        let handle = registry
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .expect("create should succeed");
+
+        handle
+            .send_event(
+                alice,
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"msgtype": "m.text", "body": "hello"}),
+                None,
+                2,
+            )
+            .await
+            .expect("send should succeed");
+
+        // Drain until the message shows up: the head announcement and any create-burst event that
+        // raced the subscription come first.
+        let found = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let update = updates.recv().await.expect("sender should be live");
+                if update.event_type == "m.room.message" {
+                    return update;
+                }
+            }
+        })
+        .await
+        .expect("the message's update should arrive");
+        assert_eq!(found.event_type, "m.room.message");
+    }
+
+    /// Nothing requires a global subscriber: a registry nobody listens to serves rooms normally.
+    /// (`broadcast::Sender::send` returns `Err` with no receivers, which the forwarder must ignore
+    /// rather than treat as a failure.)
+    #[tokio::test]
+    async fn a_room_works_with_no_global_subscriber() {
+        let registry = registry();
+        let handle = registry
+            .create_room(
+                user_id!("@alice:registry.test").to_owned(),
+                CreateRoomRequest::default(),
+                1,
+            )
+            .await
+            .expect("create should succeed");
+        assert_eq!(registry.resident_count().await, 1);
+        assert!(handle.query(|a| a.head_update()).await.is_some());
     }
 }
