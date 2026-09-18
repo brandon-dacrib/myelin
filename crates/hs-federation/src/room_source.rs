@@ -62,6 +62,15 @@ pub trait RoomDataSource: Send + Sync {
         requesting_server: &str,
     ) -> Result<EventJson, RoomSourceError>;
 
+    /// Fetches one event by ID alone (for `/event/{eventId}`, which the spec does not scope by
+    /// room in its path — the server has to know which room an event belongs to). Returns
+    /// `(room_id, event)`.
+    async fn get_event_by_id(
+        &self,
+        event_id: &str,
+        requesting_server: &str,
+    ) -> Result<(String, EventJson), RoomSourceError>;
+
     /// The full current state of the room (for `/state`), plus the auth chain of the event named
     /// by `at_event_id`. Returns `(state_events, auth_chain_events)`.
     async fn state_at(

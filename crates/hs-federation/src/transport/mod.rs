@@ -1,1 +1,209 @@
-//! placeholder
+//! The federation transport server: an axum router fragment mounted the way `hs-media`'s
+//! `router.rs` mounts its own (a `Builder`-based function returning `(Router, RouteManifest)`),
+//! per `docs/status/06-federation.md` item 9.
+//!
+//! The `X-Matrix` verification middleware (`crate::xmatrix::verify_x_matrix`) is applied exactly
+//! once, in [`router`], over the whole merged router built from [`read_router`] and
+//! [`seam_router`] — never per-handler. This is the structural guarantee named in this crate's
+//! decisions: a route added to either sub-router in the future is automatically covered, because
+//! there is no code path into a handler that does not first pass through the layer.  See
+//! [`tests::every_route_is_behind_the_x_matrix_layer`] for the test that enforces this.
+//!
+//! Read/query endpoints (`docs/design/06-federation-threat-model.md` section 2.4) are fully
+//! implemented against [`FederationState`]'s [`RoomDataSource`] and [`FederationQuerySource`]
+//! seams. The join/leave/knock/invite handshakes and `/send` are seams per section 2.5: they
+//! verify the signature (via the shared layer), bound-check the body, and reject with a typed
+//! "not implemented" error — nothing else.
+
+mod queries;
+mod read_routes;
+mod seams;
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use hs_http::router::{AuthKind, Builder, RouteManifest, RouteMeta, Surface};
+
+use crate::room_source::RoomDataSource;
+use crate::xmatrix::{self, XMatrixContext};
+
+pub use queries::{FederationQuerySource, InMemoryQuerySource};
+
+/// State shared by every federation transport handler.
+#[derive(Clone)]
+pub struct FederationState {
+    pub own_server_name: Arc<str>,
+    pub rooms: Arc<dyn RoomDataSource>,
+    pub queries: Arc<dyn FederationQuerySource>,
+    pub allow_public_rooms_over_federation: bool,
+    pub allow_device_name_lookup_over_federation: bool,
+}
+
+fn matrix_federation(operation_id: &str) -> RouteMeta {
+    RouteMeta::new(Surface::MatrixFederation, AuthKind::Matrix).with_operation_id(operation_id)
+}
+
+/// Builds the full federation router: every read/query endpoint, every seam, with the `X-Matrix`
+/// verification layer wrapping the whole thing. `path_prefix` is spec-relative (paths are
+/// registered as `/version`, `/query/{queryType}`, etc. — mounting under `/_matrix/federation/v1`
+/// and composing with other listeners is the caller's job, matching `hs-media`'s convention).
+///
+/// # Panics
+/// Never during normal construction; this function only builds route tables and applies layers.
+#[must_use]
+pub fn router(
+    state: FederationState,
+    x_matrix_ctx: Arc<XMatrixContext>,
+) -> (axum::Router, RouteManifest) {
+    let (read_router, read_routes) = read_routes::router();
+    let (seam_router, seam_routes) = seams::router();
+
+    let (merged, manifest) = Builder::new()
+        .merge_router("", read_router, read_routes)
+        .merge_router("", seam_router, seam_routes)
+        .build();
+
+    let router = merged
+        .with_state(state)
+        // Layer order matters: `Router::layer` wraps outside-in, so the layer added *last* runs
+        // *first*. `Extension` must run before `verify_x_matrix`'s own `Extension` extractor, so
+        // it is added last. See `crate::xmatrix::verify_x_matrix`'s doc for the same note.
+        .layer(axum::middleware::from_fn(xmatrix::verify_x_matrix))
+        .layer(axum::Extension(x_matrix_ctx));
+
+    (router, manifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::{
+        DynRemoteKeyCache, KeyServerFetcher, OwnSigningKeys, RemoteKeyCache,
+        build_server_key_response,
+    };
+    use crate::room_source::InMemoryRoomSource;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    struct EmptyFetcher;
+    #[async_trait]
+    impl KeyServerFetcher for EmptyFetcher {
+        async fn fetch_server_key(&self, _server_name: &str) -> Option<serde_json::Value> {
+            None
+        }
+    }
+
+    fn test_state() -> FederationState {
+        FederationState {
+            own_server_name: Arc::from("us.example.org"),
+            rooms: Arc::new(InMemoryRoomSource::new()),
+            queries: Arc::new(InMemoryQuerySource::default()),
+            allow_public_rooms_over_federation: true,
+            allow_device_name_lookup_over_federation: true,
+        }
+    }
+
+    fn test_ctx() -> Arc<XMatrixContext> {
+        let key_cache: Arc<DynRemoteKeyCache> =
+            Arc::new(RemoteKeyCache::new(Box::new(EmptyFetcher) as Box<dyn KeyServerFetcher>));
+        Arc::new(XMatrixContext {
+            own_server_name: "us.example.org".to_string(),
+            key_cache,
+        })
+    }
+
+    /// Replaces every `{param}` path segment with a harmless placeholder, so every registered
+    /// route can be requested with a syntactically valid (if semantically meaningless) path.
+    fn concretize(path: &str) -> String {
+        path.split('/')
+            .map(|segment| {
+                if segment.starts_with('{') && segment.ends_with('}') {
+                    "placeholder"
+                } else {
+                    segment
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// The load-bearing test named in this crate's decisions: every route this router ever
+    /// registers must be rejected when called with no `Authorization` header at all. If a future
+    /// route is added to `read_routes` or `seams` without going through `router()`'s merge, or if
+    /// the layer is ever restructured to a per-handler opt-in, this test starts failing the
+    /// moment the new route ships — it does not need updating when routes are added.
+    #[tokio::test]
+    async fn every_route_is_behind_the_x_matrix_layer() {
+        let (router, manifest) = router(test_state(), test_ctx());
+        assert!(
+            !manifest.routes.is_empty(),
+            "sanity check: the router must register at least one route for this test to mean anything"
+        );
+
+        for route in &manifest.routes {
+            let path = concretize(&route.path);
+            let request = Request::builder()
+                .method(route.method.as_str())
+                .uri(&path)
+                .body(Body::empty())
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "route {} {} was not rejected without an Authorization header (got {})",
+                route.method,
+                route.path,
+                response.status()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn version_endpoint_works_when_properly_signed() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
+
+        struct FixedFetcher(serde_json::Value);
+        #[async_trait]
+        impl KeyServerFetcher for FixedFetcher {
+            async fn fetch_server_key(&self, _server_name: &str) -> Option<serde_json::Value> {
+                Some(self.0.clone())
+            }
+        }
+        let doc = build_server_key_response("origin.example.org", &keys, &[], 3600).unwrap();
+        let key_cache: Arc<DynRemoteKeyCache> = Arc::new(RemoteKeyCache::new(
+            Box::new(FixedFetcher(doc)) as Box<dyn KeyServerFetcher>
+        ));
+        let ctx = Arc::new(XMatrixContext {
+            own_server_name: "us.example.org".to_string(),
+            key_cache,
+        });
+
+        let (router, _manifest) = router(test_state(), ctx);
+
+        let header = xmatrix::sign_request(
+            "GET",
+            "/version",
+            "origin.example.org",
+            "us.example.org",
+            None,
+            keys.primary(),
+        )
+        .unwrap();
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/version")
+                    .header(axum::http::header::AUTHORIZATION, header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
