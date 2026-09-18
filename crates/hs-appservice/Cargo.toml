@@ -10,6 +10,7 @@ description = "The appservice registry, registration parser and transaction sche
 [dependencies]
 ruma = { workspace = true }
 hs-auth = { path = "../hs-auth" }
+hs-http = { path = "../hs-http" }
 hs-kv = { path = "../hs-kv" }
 hs-tables = { path = "../hs-tables" }
 serde = { workspace = true }
@@ -32,3 +33,4 @@ time = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 hs-kv = { path = "../hs-kv" }
+tower = { workspace = true }

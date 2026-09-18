@@ -164,9 +164,21 @@ impl NamespacesSpec {
     /// Returns the first [`NamespacePatternError`] encountered.
     pub fn compile(&self) -> Result<Namespaces, NamespacePatternError> {
         Ok(Namespaces {
-            users: self.users.iter().map(NamespaceRuleSpec::compile).collect::<Result<_, _>>()?,
-            aliases: self.aliases.iter().map(NamespaceRuleSpec::compile).collect::<Result<_, _>>()?,
-            rooms: self.rooms.iter().map(NamespaceRuleSpec::compile).collect::<Result<_, _>>()?,
+            users: self
+                .users
+                .iter()
+                .map(NamespaceRuleSpec::compile)
+                .collect::<Result<_, _>>()?,
+            aliases: self
+                .aliases
+                .iter()
+                .map(NamespaceRuleSpec::compile)
+                .collect::<Result<_, _>>()?,
+            rooms: self
+                .rooms
+                .iter()
+                .map(NamespaceRuleSpec::compile)
+                .collect::<Result<_, _>>()?,
         })
     }
 }

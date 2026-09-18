@@ -27,3 +27,10 @@ hs-http = { path = "../hs-http" }
 proptest.workspace = true
 tower = { workspace = true, features = ["util"] }
 hs-testkit = { path = "../hs-testkit" }
+# `hs-testkit`'s `FakeClock` calls `tokio::time::advance`, which needs tokio's `test-util`
+# feature; `hs-testkit`'s own Cargo.toml does not request it (see
+# `docs/status/04-room-and-events.md`), so this crate's tests request it here. Cargo unifies
+# features per resolved dependency version across the build graph, so this also fixes
+# `cargo test -p hs-testkit` itself once both are in the same build -- a dev-only, additive
+# feature request, not a change to `hs-testkit`'s own crate.
+tokio = { workspace = true, features = ["test-util"] }

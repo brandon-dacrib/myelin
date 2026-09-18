@@ -8,7 +8,7 @@
 //! profiling says otherwise (no different code path is available yet; see that file's docs for the
 //! `spawn_blocking` escape hatch this crate would reach for first).
 
-use hs_kv::{KvBackend, RangeSpec, TransactConfig, transact};
+use hs_kv::{KvBackend, KvWrite, RangeSpec, TransactConfig, transact};
 use hs_tables::index::{IndexDef, lookup, maintain_index};
 use hs_tables::keyspace::TypedKeyspace;
 use serde::{Deserialize, Serialize};
@@ -39,8 +39,11 @@ pub struct AppserviceRow {
     pub namespaces: NamespacesSpec,
     /// Third-party protocol IDs.
     pub protocols: Vec<String>,
-    /// MSC2409 ephemeral event delivery.
+    /// MSC2409 ephemeral event delivery, stable spelling.
     pub receive_ephemeral: bool,
+    /// MSC2409 ephemeral event delivery, legacy spelling. See
+    /// [`crate::registration::Registration::push_ephemeral_legacy`].
+    pub push_ephemeral_legacy: bool,
     /// MSC3202 device fields and device masquerading.
     pub msc3202: bool,
     /// MSC4190 device management without login.
@@ -72,6 +75,7 @@ impl AppserviceRow {
             namespaces: NamespacesSpec::from(&reg.namespaces),
             protocols: reg.protocols.clone(),
             receive_ephemeral: reg.receive_ephemeral,
+            push_ephemeral_legacy: reg.push_ephemeral_legacy,
             msc3202: reg.msc3202,
             msc4190: reg.msc4190,
             extra: reg.extra.clone(),
@@ -98,6 +102,7 @@ impl AppserviceRow {
             namespaces: self.namespaces.compile()?,
             protocols: self.protocols.clone(),
             receive_ephemeral: self.receive_ephemeral,
+            push_ephemeral_legacy: self.push_ephemeral_legacy,
             msc3202: self.msc3202,
             msc4190: self.msc4190,
             extra: self.extra.clone(),
@@ -243,7 +248,10 @@ impl<B: KvBackend> AppserviceStore<B> {
     ///
     /// # Errors
     /// Returns [`AppserviceError::Store`] or [`AppserviceError::Decode`] on failure.
-    pub fn get_by_as_token(&self, as_token: &str) -> Result<Option<AppserviceRow>, AppserviceError> {
+    pub fn get_by_as_token(
+        &self,
+        as_token: &str,
+    ) -> Result<Option<AppserviceRow>, AppserviceError> {
         let snap = self.backend.snapshot();
         let pks = lookup(&snap, &self.by_as_token, &(as_token.to_string(),))?;
         let Some(pk) = pks.into_iter().next() else {
@@ -313,8 +321,10 @@ impl<B: KvBackend> AppserviceStore<B> {
                 return Err(hs_kv::KvError::backend(RowMissing(row.id.clone())));
             };
             self.registry.put(txn, &key, &value).map_err(to_kv)?;
-            maintain_index(txn, &self.by_as_token, &key, Some(&old), Some(&value)).map_err(to_kv)?;
-            maintain_index(txn, &self.by_hs_token, &key, Some(&old), Some(&value)).map_err(to_kv)?;
+            maintain_index(txn, &self.by_as_token, &key, Some(&old), Some(&value))
+                .map_err(to_kv)?;
+            maintain_index(txn, &self.by_hs_token, &key, Some(&old), Some(&value))
+                .map_err(to_kv)?;
             Ok(())
         })
         .map_err(|e| match e {
@@ -370,13 +380,13 @@ impl<B: KvBackend> AppserviceStore<B> {
             ),
         ] {
             let _ = token;
-            if let Some((existing_id,)) = existing_pk.into_iter().next() {
-                if Some(existing_id.as_str()) != self_id {
-                    return Err(AppserviceError::TokenConflict {
-                        token_kind,
-                        existing_id,
-                    });
-                }
+            if let Some((existing_id,)) = existing_pk.into_iter().next()
+                && Some(existing_id.as_str()) != self_id
+            {
+                return Err(AppserviceError::TokenConflict {
+                    token_kind,
+                    existing_id,
+                });
             }
         }
         Ok(())
@@ -404,7 +414,9 @@ impl<B: KvBackend> AppserviceStore<B> {
     pub fn put_health(&self, id: &str, health: &HealthRow) -> Result<(), AppserviceError> {
         let value = encode(health)?;
         transact(&self.backend, TransactConfig::default(), |txn| {
-            self.health.put(txn, &(id.to_string(),), &value).map_err(to_kv)
+            self.health
+                .put(txn, &(id.to_string(),), &value)
+                .map_err(to_kv)
         })
         .map_err(|e| AppserviceError::Store(e.to_string()))
     }
@@ -423,15 +435,16 @@ impl<B: KvBackend> AppserviceStore<B> {
 
     // ---- transaction queue ----
 
-    /// Allocates the next queue sequence number for `id` (monotonic per appservice, starting at
-    /// 1) and enqueues `body` as a new [`QueuedTransaction`] in `Pending` status, ready to send
+    /// Allocates the next queue sequence number for `id` (monotonic per appservice, starting at 1)
+    /// and enqueues `body` as a new [`QueuedTransaction`] in `Pending` status, ready to send
     /// immediately (`next_attempt_at_ms` = `now_ms`). Both steps happen in one transaction, so a
     /// crash between them cannot allocate a sequence number that is never enqueued or vice versa.
     ///
     /// # Errors
     /// Returns [`AppserviceError::Store`]/[`AppserviceError::Decode`] on failure.
     pub fn enqueue(&self, id: &str, body: Value, now_ms: u64) -> Result<u64, AppserviceError> {
-        transact(&self.backend, TransactConfig::default(), |txn| {
+        transact(&self.backend, TransactConfig::default(), move |txn| {
+            let body = body.clone();
             let seq_key = (id.to_string(),);
             let next = txn
                 .atomic_add(self.txn_seq.raw(), &hs_tables::key::encode(&seq_key), 1)
@@ -477,7 +490,11 @@ impl<B: KvBackend> AppserviceStore<B> {
     ///
     /// # Errors
     /// Returns [`AppserviceError::Store`] on failure.
-    pub fn put_queue_entry(&self, id: &str, entry: &QueuedTransaction) -> Result<(), AppserviceError> {
+    pub fn put_queue_entry(
+        &self,
+        id: &str,
+        entry: &QueuedTransaction,
+    ) -> Result<(), AppserviceError> {
         let value = encode(entry)?;
         transact(&self.backend, TransactConfig::default(), |txn| {
             self.txn_queue
@@ -525,13 +542,9 @@ struct RowMissing(String);
 #[error("failed to encode value: {0}")]
 struct EncodeFail(String);
 
-fn to_kv(e: AppserviceError) -> hs_kv::KvError {
-    hs_kv::KvError::backend(StoreWrap(e.to_string()))
+fn to_kv<E: std::error::Error + Send + Sync + 'static>(e: E) -> hs_kv::KvError {
+    hs_kv::KvError::backend(e)
 }
-
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-struct StoreWrap(String);
 
 #[cfg(test)]
 mod tests {
@@ -553,6 +566,7 @@ mod tests {
             namespaces: NamespacesSpec::default(),
             protocols: vec![],
             receive_ephemeral: false,
+            push_ephemeral_legacy: false,
             msc3202: false,
             msc4190: false,
             extra: Map::new(),

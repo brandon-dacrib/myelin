@@ -5,8 +5,20 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "hs-bridge-conformance: see docs/workstreams for the owning track"
+description = "Synthetic appservice conformance suite replaying mautrix call patterns from PLAN.md Appendix B. Track 11: see docs/workstreams/11-appservices-and-bridges.md"
 
 [dependencies]
+ruma = { workspace = true }
+hs-appservice = { path = "../hs-appservice" }
+hs-auth = { path = "../hs-auth" }
+hs-http = { path = "../hs-http" }
+hs-kv = { path = "../hs-kv" }
+tokio = { workspace = true }
+axum = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tower = { workspace = true }

@@ -58,6 +58,10 @@ pub enum RoomError {
     #[error(transparent)]
     TableCodec(#[from] hs_tables::key::KeyCodecError),
 
+    /// A typed-keyspace operation failed (either a store error or a key codec error).
+    #[error(transparent)]
+    Table(#[from] hs_tables::keyspace::TableError),
+
     /// The pagination token supplied by the client was not one this server issued.
     #[error("invalid pagination token")]
     InvalidPaginationToken,
@@ -99,6 +103,7 @@ impl RoomError {
             | Self::State(_)
             | Self::Store(_)
             | Self::TableCodec(_)
+            | Self::Table(_)
             | Self::Internal(_) => MatrixError::custom(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 MatrixErrorCode::Unknown,

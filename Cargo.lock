@@ -1579,6 +1579,7 @@ dependencies = [
  "fancy-regex",
  "hex",
  "hs-auth",
+ "hs-http",
  "hs-kv",
  "hs-tables",
  "http",
@@ -1592,6 +1593,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tower",
  "tracing",
  "ulid",
 ]
@@ -1752,10 +1754,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hs-identity"
-version = "0.0.1"
-
-[[package]]
 name = "hs-kv"
 version = "0.0.1"
 dependencies = [
@@ -1850,10 +1848,6 @@ dependencies = [
 
 [[package]]
 name = "hs-push"
-version = "0.0.1"
-
-[[package]]
-name = "hs-pushgw"
 version = "0.0.1"
 
 [[package]]

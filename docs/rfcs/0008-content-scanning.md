@@ -51,42 +51,48 @@ pub enum UnscannableReason { Encrypted, TooLarge, TooDeep, UnsupportedFormat, Ot
 
 `ScanSource` is a stream plus the declared content type, size when known, and the content hash. `ScanContext` carries the deadline, the uploading user, whether the upload arrived from a local client, an appservice or federation, and the media identifier.
 
-## 3. Providers shipped
+## 3. What we ship, and what we deploy
 
-**ICAP is the primary adapter, and the others exist around it.** Nearly every scanner an operator might want is reachable over ICAP (RFC 3507), including ones with no ICAP interface of their own:
+**We ship one ICAP client. We ship no antivirus integration of our own.**
 
-| Path to a scanner | Reached by |
-|---|---|
-| ClamAV | `c-icap` with `c-icap-modules`' `virus_scan` service (aliased `srv_clamav`), the standard packaging, port 1344, with ready-made container images |
-| Commercial engines | Native ICAP interfaces: Symantec Protection Engine, Kaspersky Scan Engine and Web Traffic Security, McAfee Web Gateway, Sophos via SAVDI, Trend Micro InterScan, F-Secure Internet Gatekeeper, MetaDefender, Check Point |
-| Cloud APIs | ICAP gateways that front them, such as ICAPeg (VirusTotal, Cloudmersive, ClamAV) and Cloudmersive's own ICAP server |
-| Anything else | An operator can put any engine behind `c-icap` or ICAPeg themselves |
+c-icap is a mature ICAP server that hosts scanning services, and its `c-icap-modules` `virus_scan` service drives ClamAV. That is the division of labour: c-icap owns talking to engines, we own talking to c-icap. Writing our own clamd client would duplicate a service that already exists, is packaged, and has ready-made container images.
 
-The consequence for us: **the quality of one ICAP client matters more than the number of native providers.** Effort goes there first.
+### 3.1 Providers
 
 | Provider | Role |
 |---|---|
-| `icap` | **Primary.** The universal adapter. Anything above reaches us through it. |
-| `clamav` | An optimisation, not a peer: clamd `INSTREAM` directly, for operators who run ClamAV and would rather not also run `c-icap`. One hop instead of two, and one less service to operate. |
-| `http` | For cloud APIs with no ICAP fronting, notably CrowdStrike Falcon, which has no documented first-party ICAP interface and is submit-then-poll. This is why `Verdict::Pending` exists in the interface. |
-| `command` | Spawn a binary such as `clamscan`. Small deployments and air-gapped setups. |
+| `icap` | The provider. Everything reaches us through it. |
+| `http` | Only for cloud APIs with no ICAP fronting, notably CrowdStrike Falcon, which is submit-then-poll and is why `Verdict::Pending` exists. |
 | `none` | Default. Scanning off. |
 
-WebAssembly providers are permitted through the existing module host once it lands, and need no change here.
+Deliberately **not** shipped: a clamd client, a command runner, or any per-engine adapter. Each would be a second path to a problem c-icap already solves, and each would need its own maintenance, tests and failure modes. An operator wanting ClamAV runs c-icap in front of it, which is one container.
 
-### 3.1 What a real ICAP client requires
+### 3.2 What an operator deploys
 
-A toy ICAP client sends a request and reads a status line. A real one negotiates, and the difference is visible in both throughput and correctness:
+| Scanner | Deployment |
+|---|---|
+| ClamAV | c-icap with `virus_scan`, packaged images already exist; the Helm chart ships this as an optional sub-chart and the compose files include it |
+| Commercial engines | Their own native ICAP interfaces: Symantec Protection Engine, Kaspersky, McAfee Web Gateway, Sophos via SAVDI, Trend Micro, F-Secure, MetaDefender, Check Point |
+| Cloud APIs | An ICAP gateway such as ICAPeg (VirusTotal, Cloudmersive, ClamAV) or Cloudmersive's ICAP server; or our `http` provider directly |
+| Anything else | Put it behind c-icap or ICAPeg |
 
-- **OPTIONS negotiation** before use, refreshed per `Options-TTL`, to learn the service's `Preview` size, `Max-Connections`, whether it advertises `Allow: 204`, and its `Transfer-Preview`, `Transfer-Ignore` and `Transfer-Complete` file-type lists.
-- **Preview mode.** Send the first N bytes the server asked for and wait for `100 Continue` before sending the rest. Many verdicts are decided from a file header, so a large upload never crosses the wire. This is the single biggest performance feature in the protocol and it is not optional for us.
-- **`204 No Content` means clean**, requested with `Allow: 204`, which avoids the server echoing the whole body back.
-- **`Transfer-Ignore`** file types are skipped entirely rather than sent and discarded.
-- **Connection reuse** within the advertised `Max-Connections`, rather than a connection per upload.
-- **Correct `Encapsulated` framing** with chunked bodies, since this is where naive implementations corrupt content.
-- **Verdict header parsing across vendors**: `X-Infection-Found`, `X-Virus-ID`, `X-Violations-Found`, plus the fallback of a modified response body meaning a block page was substituted.
+The reference deployment (c-icap plus ClamAV alongside the homeserver) is documented and shipped as chart and compose configuration, so "turn on virus scanning" is a configuration change rather than an integration project.
 
-**`ISTag` is the engine version.** RFC 3507 defines it as an opaque tag the service changes when its configuration or signature set changes. That is precisely the `engine_version` the verdict cache in section 6 keys on, so cache invalidation on a signature update is spec-native and free rather than approximated. The ICAP provider returns the current `ISTag` from `engine_version`, and a scanner that updates its signatures invalidates our cached verdicts automatically.
+### 3.3 The ICAP client itself
+
+`icap-rs` is a tokio-based Rust ICAP/1.0 client and server library following RFC 3507, with protocol types, parsers and serializers. **Evaluate it before writing any protocol code**, per decision 0007. Use it if it covers what follows; contribute upstream if it is close; write our own only with a recorded reason.
+
+Whether through that crate or otherwise, the client must do all of this, because the difference from a toy shows up in both throughput and correctness:
+
+- **OPTIONS negotiation** before use, refreshed per `Options-TTL`, learning `Preview` size, `Max-Connections`, whether `Allow: 204` is advertised, and the `Transfer-Preview`, `Transfer-Ignore` and `Transfer-Complete` file-type lists.
+- **Preview mode**: send the first N bytes, wait for `100 Continue` before sending the rest. Most verdicts are decided from a file header, so a large upload never crosses the wire. Not optional.
+- **`204 No Content` means clean**, requested via `Allow: 204`, avoiding the server echoing the body back.
+- **`Transfer-Ignore`** types skipped entirely rather than sent and discarded.
+- **Connection reuse** within the advertised `Max-Connections`.
+- **Correct `Encapsulated` framing** with chunked bodies, which is where naive implementations corrupt content.
+- **Verdict headers across vendor spellings**: `X-Infection-Found`, `X-Virus-ID`, `X-Violations-Found`.
+
+**`ISTag` is the engine version.** RFC 3507 defines it as an opaque tag the service changes when its configuration or signature set changes, which is exactly what the verdict cache in section 6 keys on. Cache invalidation after a signature update is therefore spec-native and free. Return the current `ISTag` from `engine_version` rather than inventing a versioning scheme.
 
 ## 4. Where scanning happens
 
@@ -103,7 +109,7 @@ Thumbnails are never scanned. They are derived from source bytes that were alrea
 media:
   scanning:
     mode: block            # block | quarantine | defer | off
-    provider: clamav
+    provider: icap
     fail: closed           # closed | open
     timeout: 30s
     max_size: 100MiB
@@ -112,8 +118,9 @@ media:
       ttl: 7d
       unversioned_ttl: 1h
       capacity: 100000
-    clamav:
-      address: unix:/var/run/clamav/clamd.ctl
+    icap:
+      url: icap://c-icap:1344/virus_scan
+      preview: negotiate   # negotiate | <bytes> | off
 ```
 
 - **block**: the upload fails with a Matrix error until a verdict arrives. Safest, adds upload latency.
@@ -147,8 +154,8 @@ Therefore:
 ## 9. Testing
 
 - A fake provider driving every verdict, including pending-then-clean and pending-then-infected.
-- The EICAR test string end to end through the ClamAV provider, skipped cleanly when no clamd is reachable, which is the case in this environment.
-- Protocol-level tests against recorded exchanges, so wire formats are covered without either daemon present: clamd `INSTREAM`, and for ICAP the full negotiation, being OPTIONS parsing, preview with `100 Continue`, preview with an early verdict, `204` clean, `Transfer-Ignore` skipping, and `ISTag` changing between calls.
+- The EICAR test string end to end through a real c-icap plus ClamAV, skipped cleanly when no ICAP service is reachable, which is the case in this environment.
+- Protocol-level tests against recorded ICAP exchanges, so the wire format is covered without a daemon present: OPTIONS parsing, preview with `100 Continue`, preview answered with an early verdict so the body is never sent, `204` clean, `Transfer-Ignore` skipping, and `ISTag` changing between calls invalidating a cached verdict.
 - Failure-mode tests: timeout, connection refused and malformed response, asserted under both `fail: open` and `fail: closed`.
 - A test that a signature version change invalidates the cache.
 - A test that encrypted media is reported unscannable rather than clean, since reporting it clean would be the dangerous failure.

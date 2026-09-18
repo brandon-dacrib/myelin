@@ -45,10 +45,16 @@ pub struct Registration {
     pub namespaces: Namespaces,
     /// Third-party network protocol IDs this appservice answers `/thirdparty/*` queries for.
     pub protocols: Vec<String>,
-    /// MSC2409 ephemeral event delivery, requested as `receive_ephemeral` (stable) or
-    /// `de.sorunome.msc2409.push_ephemeral` / `push_ephemeral` (legacy spellings still sent by
-    /// some bridges and read by Synapse).
+    /// MSC2409 ephemeral event delivery requested under the stable `receive_ephemeral` key.
+    /// Tracked separately from [`Registration::push_ephemeral_legacy`] — Synapse's own loader
+    /// (`synapse/config/appservice.py`, behavioral reference only) reads these as two independent
+    /// booleans and gates the stable `ephemeral` transaction key on this one alone, so a
+    /// registration that sets only the legacy key must not receive the stable key spuriously.
     pub receive_ephemeral: bool,
+    /// MSC2409 ephemeral event delivery requested under the legacy `de.sorunome.msc2409.
+    /// push_ephemeral` (or bare `push_ephemeral`) key, gating the legacy `de.sorunome.msc2409.
+    /// ephemeral` transaction key. See [`Registration::receive_ephemeral`].
+    pub push_ephemeral_legacy: bool,
     /// MSC3202: device-list changes, one-time-key counts and fallback-key-type fields on
     /// transactions, plus permission to use `org.matrix.msc3202.device_id` device masquerading.
     /// Requested as a truthy `org.matrix.msc3202` key.
@@ -59,6 +65,16 @@ pub struct Registration {
     /// Every top-level registration key not named above, preserved verbatim for export
     /// round-tripping.
     pub extra: Map<String, Value>,
+}
+
+impl Registration {
+    /// True if either ephemeral-event flag is set — "does this appservice want ephemeral events
+    /// at all", for callers (the scheduler's enqueue-time filter) that do not need to know which
+    /// wire spelling to use.
+    #[must_use]
+    pub fn wants_ephemeral(&self) -> bool {
+        self.receive_ephemeral || self.push_ephemeral_legacy
+    }
 }
 
 /// An error parsing or validating a registration file.
@@ -94,7 +110,10 @@ pub enum RegistrationError {
     },
 }
 
-fn as_str<'a>(obj: &'a Map<String, Value>, field: &str) -> Result<Option<&'a str>, RegistrationError> {
+fn as_str<'a>(
+    obj: &'a Map<String, Value>,
+    field: &str,
+) -> Result<Option<&'a str>, RegistrationError> {
     match obj.get(field) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.as_str())),
@@ -105,7 +124,10 @@ fn as_str<'a>(obj: &'a Map<String, Value>, field: &str) -> Result<Option<&'a str
     }
 }
 
-fn required_str(obj: &Map<String, Value>, field: &'static str) -> Result<String, RegistrationError> {
+fn required_str(
+    obj: &Map<String, Value>,
+    field: &'static str,
+) -> Result<String, RegistrationError> {
     as_str(obj, field)?
         .map(str::to_string)
         .ok_or(RegistrationError::MissingField(field))
@@ -178,10 +200,12 @@ fn parse_namespace_category(
                 })?;
             let regex = as_str(entry, "regex")?.ok_or(RegistrationError::MissingField("regex"))?;
             let exclusive = as_bool(entry, "exclusive", false)?;
-            NamespaceRule::compile(regex, exclusive).map_err(|source| RegistrationError::Namespace {
-                category,
-                index,
-                source,
+            NamespaceRule::compile(regex, exclusive).map_err(|source| {
+                RegistrationError::Namespace {
+                    category,
+                    index,
+                    source,
+                }
             })
         })
         .collect()
@@ -214,8 +238,8 @@ impl Registration {
     /// or a namespace pattern that fails to compile under both regex engines.
     pub fn parse_yaml(yaml: &str) -> Result<Self, RegistrationError> {
         let yaml_value: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml)?;
-        let json_value = serde_json::to_value(yaml_value)
-            .map_err(|e| RegistrationError::WrongType {
+        let json_value =
+            serde_json::to_value(yaml_value).map_err(|e| RegistrationError::WrongType {
                 field: e.to_string(),
                 expected: "representable as JSON",
             })?;
@@ -239,9 +263,10 @@ impl Registration {
         };
         let protocols = as_str_array(&obj, "protocols")?;
 
-        // Stable name first, then the two legacy spellings mautrix and Synapse both still write.
-        let receive_ephemeral = as_bool(&obj, "receive_ephemeral", false)?
-            || as_bool(&obj, "de.sorunome.msc2409.push_ephemeral", false)?
+        // Tracked as two independent flags, matching Synapse's own loader exactly (see the field
+        // docs on `Registration::receive_ephemeral`/`push_ephemeral_legacy`).
+        let receive_ephemeral = as_bool(&obj, "receive_ephemeral", false)?;
+        let push_ephemeral_legacy = as_bool(&obj, "de.sorunome.msc2409.push_ephemeral", false)?
             || as_bool(&obj, "push_ephemeral", false)?;
         let msc3202 = as_bool(&obj, "org.matrix.msc3202", false)?;
         let msc4190 = as_bool(&obj, "io.element.msc4190", false)?;
@@ -261,6 +286,7 @@ impl Registration {
             namespaces,
             protocols,
             receive_ephemeral,
+            push_ephemeral_legacy,
             msc3202,
             msc4190,
             extra,
@@ -280,22 +306,13 @@ impl Registration {
             "url".to_string(),
             self.url.clone().map_or(Value::Null, Value::String),
         );
-        obj.insert(
-            "as_token".to_string(),
-            Value::String(self.as_token.clone()),
-        );
-        obj.insert(
-            "hs_token".to_string(),
-            Value::String(self.hs_token.clone()),
-        );
+        obj.insert("as_token".to_string(), Value::String(self.as_token.clone()));
+        obj.insert("hs_token".to_string(), Value::String(self.hs_token.clone()));
         obj.insert(
             "sender_localpart".to_string(),
             Value::String(self.sender_localpart.clone()),
         );
-        obj.insert(
-            "rate_limited".to_string(),
-            Value::Bool(self.rate_limited),
-        );
+        obj.insert("rate_limited".to_string(), Value::Bool(self.rate_limited));
 
         let mut namespaces = Map::new();
         for (key, rules) in [
@@ -326,6 +343,8 @@ impl Registration {
 
         if self.receive_ephemeral {
             obj.insert("receive_ephemeral".to_string(), Value::Bool(true));
+        }
+        if self.push_ephemeral_legacy {
             obj.insert(
                 "de.sorunome.msc2409.push_ephemeral".to_string(),
                 Value::Bool(true),
@@ -425,17 +444,19 @@ namespaces:
         assert_eq!(reg.protocols, vec!["whatsapp".to_string()]);
         assert_eq!(reg.namespaces.users.len(), 1);
         assert!(reg.namespaces.users[0].exclusive);
-        assert!(
-            reg.namespaces.users[0].is_match("@whatsapp_alice:example.org")
-        );
+        assert!(reg.namespaces.users[0].is_match("@whatsapp_alice:example.org"));
         assert_eq!(reg.namespaces.aliases.len(), 1);
         assert!(reg.namespaces.rooms.is_empty());
     }
 
     #[test]
-    fn legacy_ephemeral_spelling_alone_is_honored() {
+    fn legacy_ephemeral_spelling_alone_is_honored_independently_of_stable() {
         let reg = Registration::parse_yaml(LEGACY_MAUTRIX_PYTHON).unwrap();
-        assert!(reg.receive_ephemeral);
+        // Only the legacy key was set, so only that flag is true — matching Synapse's own
+        // loader, which reads these as two independent booleans (see the field docs).
+        assert!(reg.push_ephemeral_legacy);
+        assert!(!reg.receive_ephemeral);
+        assert!(reg.wants_ephemeral());
         assert!(!reg.msc3202);
         assert!(!reg.msc4190);
         // rate_limited defaults to true when absent.

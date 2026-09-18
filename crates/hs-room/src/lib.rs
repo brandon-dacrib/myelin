@@ -1,3 +1,42 @@
-//! hs-room
+//! `hs-room`: the room actor -- the unit of consistency for one Matrix room.
 //!
-//! Owned by the track named in `docs/workstreams/`. See `PLAN.md` for the design.
+//! Owned by track 04 (`docs/workstreams/04-room-and-events.md`). See
+//! `docs/design/04-room-actor-protocol.md` for the full design document (command set, publish
+//! stream, hot-state cache and eviction policy) and `docs/status/04-room-and-events.md` for what
+//! has landed.
+//!
+//! # Modules
+//!
+//! - [`pipeline`]: builds, hashes, signs and authorizes a new locally-originated event against a
+//!   room's current state.
+//! - [`actor`]: [`actor::RoomActor`], the room actor itself -- hot state, extremities, timeline,
+//!   persistence.
+//! - [`protocol`]: the room actor's command set, its replies, and [`protocol::RoomUpdate`], the
+//!   publish stream tracks 05, 06, 10 and 11 consume.
+//! - [`membership`]: the membership state machine (join, invite, leave, kick, ban, unban, knock)
+//!   as an explicit transition table.
+//! - [`timeline`]: pagination tokens over a room's room-local timeline positions.
+//! - [`relations`]: `m.relates_to` indexing and bundled aggregations.
+//! - [`registry`]: [`registry::RoomRegistry`], the per-process map from room to actor handle, with
+//!   idle eviction.
+//! - [`state`]: [`state::RoomState`], this crate's axum shared state, and [`state::RoomRequester`].
+//! - [`routes`]: the client-server HTTP endpoints, as a router fragment (`routes::router`).
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+pub mod actor;
+pub mod error;
+pub mod identity;
+pub mod membership;
+pub mod persist;
+pub mod pipeline;
+pub mod protocol;
+pub mod registry;
+pub mod relations;
+pub mod retention;
+pub mod routes;
+pub mod state;
+pub mod timeline;
+
+pub use error::RoomError;
