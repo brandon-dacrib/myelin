@@ -23,6 +23,9 @@ hs-kv = { path = "../hs-kv" }
 hs-telemetry = { path = "../hs-telemetry" }
 hs-http = { path = "../hs-http" }
 hs-room = { path = "../hs-room" }
+hs-user = { path = "../hs-user" }
+hs-e2e = { path = "../hs-e2e" }
+hs-push = { path = "../hs-push" }
 hs-media = { path = "../hs-media" }
 hs-appservice = { path = "../hs-appservice" }
 hs-admin = { path = "../hs-admin" }

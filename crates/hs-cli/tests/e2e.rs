@@ -378,3 +378,186 @@ fn generate_signing_key_produces_a_synapse_shaped_line() {
     assert_eq!(fields.len(), 3);
     assert_eq!(fields[0], "ed25519");
 }
+
+/// The three surfaces mounted in this pass -- `hs-user`'s `/sync`, `hs-e2e`'s `/keys` and
+/// `hs-push`'s `/pushrules` and `/pushers` -- answering through the real binary, as a real logged-in
+/// user, with real storage behind them. Mounting is the step that turns a finished crate into a
+/// served one, and `docs/next-steps.md` records that four crates sat finished and unserved for most
+/// of a day because nobody took it; this test is what makes a regression of that visible.
+///
+/// Deliberately asserts on *behavior*, not just "not 404": an unauthenticated request must be
+/// refused, and an authenticated one must come back with the shape the spec names. A route that is
+/// mounted but broken would pass a 404 check and fail this.
+#[tokio::test]
+async fn sync_keys_and_push_surfaces_answer_through_the_real_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(reserve_ephemeral_port(), dir.path());
+
+    let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
+        .await
+        .expect("server should boot");
+    let base = handle.base_url();
+    let client = reqwest::Client::new();
+
+    // Every one of these refuses an anonymous caller before we bother logging in: proof the routes
+    // are mounted *behind* authentication rather than merely present.
+    for path in [
+        "/_matrix/client/v3/sync",
+        "/_matrix/client/v3/pushrules/",
+        "/_matrix/client/v3/pushers",
+        "/_matrix/client/v3/joined_rooms",
+    ] {
+        let response = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{path} should require a token"
+        );
+    }
+
+    let register: serde_json::Value = client
+        .post(format!("{base}/_matrix/client/v3/register"))
+        .json(&json!({
+            "username": "surfaces",
+            "password": "hunter2-surfaces",
+            "auth": {"type": "m.login.dummy"},
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = register["access_token"].as_str().expect("an access token").to_owned();
+    let device_id = register["device_id"].as_str().expect("a device id").to_owned();
+    let auth = |req: reqwest::RequestBuilder| req.bearer_auth(&token);
+
+    // --- hs-push: the default ruleset is served, and it is the spec's, not an empty one ---------
+    let rules_response = auth(client.get(format!("{base}/_matrix/client/v3/pushrules/")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rules_response.status(), reqwest::StatusCode::OK);
+    let rules: serde_json::Value = rules_response.json().await.unwrap();
+    let underride = rules["global"]["underride"]
+        .as_array()
+        .expect("the default ruleset has underride rules");
+    assert!(
+        underride
+            .iter()
+            .any(|r| r["rule_id"] == ".m.rule.message"),
+        "a brand new user must get the spec's predefined rules: {rules}"
+    );
+
+    // Disabling a rule persists and is readable back through the sub-resource the spec defines.
+    let disable = auth(
+        client.put(format!(
+            "{base}/_matrix/client/v3/pushrules/global/underride/.m.rule.message/enabled"
+        )),
+    )
+    .json(&json!({"enabled": false}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(disable.status(), reqwest::StatusCode::OK);
+    let enabled: serde_json::Value = auth(client.get(format!(
+        "{base}/_matrix/client/v3/pushrules/global/underride/.m.rule.message/enabled"
+    )))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(enabled["enabled"], false, "the write must have persisted");
+
+    // --- hs-push: pushers round-trip ------------------------------------------------------------
+    let set_pusher = auth(client.post(format!("{base}/_matrix/client/v3/pushers/set")))
+        .json(&json!({
+            "pushkey": "a-pushkey",
+            "app_id": "com.example.app",
+            "kind": "http",
+            "app_display_name": "Example",
+            "device_display_name": "Phone",
+            "lang": "en",
+            "data": {"url": "https://push.example.org/_matrix/push/v1/notify"},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(set_pusher.status(), reqwest::StatusCode::OK);
+    let pushers: serde_json::Value = auth(client.get(format!("{base}/_matrix/client/v3/pushers")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        pushers["pushers"][0]["pushkey"], "a-pushkey",
+        "the pusher just set must come back: {pushers}"
+    );
+
+    // --- hs-e2e: device keys upload, and the one-time-key count comes back ----------------------
+    let upload: serde_json::Value = auth(client.post(format!("{base}/_matrix/client/v3/keys/upload")))
+        .json(&json!({
+            "device_keys": {
+                "user_id": register["user_id"],
+                "device_id": device_id,
+                "algorithms": ["m.olm.v1.curve25519-aes-sha2", "m.megolm.v1.aes-sha2"],
+                "keys": {format!("curve25519:{device_id}"): "curve25519+key+material"},
+                "signatures": {},
+            },
+            "one_time_keys": {"signed_curve25519:AAAAAQ": {"key": "otk-material"}},
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        upload["one_time_key_counts"]["signed_curve25519"], 1,
+        "the server must report the key it just stored: {upload}"
+    );
+
+    // The keys read back through /keys/query, which is the call every other user's client makes.
+    let query: serde_json::Value = auth(client.post(format!("{base}/_matrix/client/v3/keys/query")))
+        .json(&json!({"device_keys": {register["user_id"].as_str().unwrap(): []}}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        query["device_keys"][register["user_id"].as_str().unwrap()][&device_id]["device_id"],
+        serde_json::Value::String(device_id.clone()),
+        "the uploaded device must be queryable: {query}"
+    );
+
+    // --- hs-user: /sync answers, with a next_batch a client can come back with -----------------
+    let sync: serde_json::Value = auth(client.get(format!("{base}/_matrix/client/v3/sync?timeout=0")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let next_batch = sync["next_batch"].as_str().expect("a next_batch token");
+    assert!(
+        next_batch.starts_with("hsu1_"),
+        "next_batch should be one of our own tokens: {next_batch}"
+    );
+
+    // And the token is accepted on the way back in, which is the whole point of issuing it.
+    let incremental = auth(client.get(format!(
+        "{base}/_matrix/client/v3/sync?timeout=0&since={next_batch}"
+    )))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(incremental.status(), reqwest::StatusCode::OK);
+
+    handle.shutdown().await;
+}

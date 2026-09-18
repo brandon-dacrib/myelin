@@ -38,6 +38,7 @@ use hs_http::router::{AuthKind, Builder, RouteManifest, RouteMeta, Surface};
 use hs_kv::KvBackend;
 use hs_media::state::MediaState;
 use hs_room::state::RoomState;
+use hs_user::state::UserState;
 use hs_telemetry::metrics::Metrics;
 
 use crate::config_bridge;
@@ -70,6 +71,11 @@ pub enum ServeError {
     /// Opening `hs-room`'s room registry over the configured storage backend failed.
     #[error("failed to open the room registry: {0}")]
     Room(#[from] hs_kv::KvError),
+    /// Opening the keyspaces `hs-user`, `hs-e2e` or `hs-push` need failed. One variant for all
+    /// three because they fail the same way (a keyspace could not be opened on the configured
+    /// backend) and the boxed source carries which one it was.
+    #[error("failed to open session, encryption or push storage")]
+    Sessions(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// Building `hs-media`'s state (object store, metadata store, and — if
     /// `--media-scanning-config` was given — the content scanning engine) failed.
     #[error(transparent)]
@@ -171,6 +177,25 @@ fn build_router<B: KvBackend>(
     let media_router = media_router.with_state(mounts.media.clone());
     let media_routes = media_manifest.routes;
 
+    let (user_router, user_manifest) =
+        hs_user::routes::router::<B, Arc<hs_room::registry::RoomRegistry<B>>>();
+    let user_router = user_router.with_state(mounts.user);
+    let user_routes = user_manifest.routes;
+
+    let (e2e_router, e2e_manifest) = hs_e2e::routes::router::<B>();
+    let e2e_router = e2e_router.with_state(mounts.e2e.clone());
+    let e2e_routes = e2e_manifest.routes;
+
+    // MSC3983/MSC3984's appservice key proxies spell `unstable` in their own paths, so they mount
+    // under `/_matrix/client/unstable` rather than alongside the versioned routes above.
+    let (e2e_unstable_router, e2e_unstable_manifest) = hs_e2e::routes::unstable_router::<B>();
+    let e2e_unstable_router = e2e_unstable_router.with_state(mounts.e2e);
+    let e2e_unstable_routes = e2e_unstable_manifest.routes;
+
+    let (push_router, push_manifest) = hs_push::routes::router::<B>();
+    let push_router = push_router.with_state(mounts.push);
+    let push_routes = push_manifest.routes;
+
     let ping_router =
         hs_appservice::routes::ping_router::<B>(mounts.appservice_ping).with_state(auth);
     let ping_routes = crate::appservice_manifest::routes();
@@ -224,6 +249,21 @@ fn build_router<B: KvBackend>(
             room_routes.clone(),
         )
         .merge_router("/_matrix/client/r0", room_router, room_routes)
+        .merge_router(
+            "/_matrix/client/v3",
+            user_router.clone(),
+            user_routes.clone(),
+        )
+        .merge_router("/_matrix/client/r0", user_router, user_routes)
+        .merge_router("/_matrix/client/v3", e2e_router.clone(), e2e_routes.clone())
+        .merge_router("/_matrix/client/r0", e2e_router, e2e_routes)
+        .merge_router(
+            "/_matrix/client/unstable",
+            e2e_unstable_router,
+            e2e_unstable_routes,
+        )
+        .merge_router("/_matrix/client/v3", push_router.clone(), push_routes.clone())
+        .merge_router("/_matrix/client/r0", push_router, push_routes)
         .merge_router("/_matrix/client/v1/media", media_router, media_routes)
         .merge_router("/_matrix/client/v1", ping_router, ping_routes);
 
@@ -261,9 +301,77 @@ fn build_router<B: KvBackend>(
 /// six-plus-argument generic function invites transposition bugs.
 struct Mounts<B: KvBackend> {
     room: RoomState<B>,
+    user: UserState<B, Arc<hs_room::registry::RoomRegistry<B>>>,
+    e2e: hs_e2e::state::E2eState<B>,
+    push: hs_push::state::PushState<B>,
     media: MediaState<B>,
     appservice_ping: Arc<PingService<B>>,
     admin: hs_admin::router::AdminState,
+}
+
+/// The default fan-out threshold for `hs-user`'s session hub: rooms with more joined members than
+/// this stop getting a durable feed entry per member per event and are marked "hot" instead, so a
+/// message to a very large room does not cost one store write per member. `hs_user::hub`'s module
+/// docs explain the trade (a hot room's `/sync` reads the room's live position directly). No
+/// config field exists for it yet; recorded in `docs/status/05-sync.md`.
+const DEFAULT_FAN_OUT_THRESHOLD: usize = 500;
+
+/// Builds the three states added in this pass -- `hs-user`'s session hub, `hs-e2e`'s key store and
+/// `hs-push`'s rule/pusher/count stores -- over one already-open backend, so both [`spawn_serve`]
+/// and [`throwaway_mounts`] assemble them the same way.
+///
+/// # Errors
+/// Returns the store's own error if any keyspace could not be opened.
+#[allow(clippy::type_complexity)]
+fn build_session_mounts<B: KvBackend>(
+    backend: &B,
+    auth: &AuthState,
+    rooms: &Arc<hs_room::registry::RoomRegistry<B>>,
+) -> Result<
+    (
+        UserState<B, Arc<hs_room::registry::RoomRegistry<B>>>,
+        hs_e2e::state::E2eState<B>,
+        hs_push::state::PushState<B>,
+    ),
+    ServeError,
+> {
+    fn opening(e: impl std::error::Error + Send + Sync + 'static) -> ServeError {
+        ServeError::Sessions(Box::new(e))
+    }
+
+    let user_store: hs_user::store::DynUserStore =
+        Arc::new(hs_user::store::tables::TablesUserStore::open(backend.clone()).map_err(opening)?);
+    let user = UserState {
+        auth: auth.clone(),
+        hub: Arc::new(hs_user::hub::SessionHub::new(
+            user_store,
+            rooms.clone(),
+            DEFAULT_FAN_OUT_THRESHOLD,
+        )),
+    };
+
+    let e2e = hs_e2e::state::E2eState::new(
+        auth.clone(),
+        Arc::new(hs_e2e::store::tables::TablesE2eStore::open(backend.clone()).map_err(opening)?),
+    );
+
+    let push = hs_push::state::PushState {
+        auth: auth.clone(),
+        rulesets: Arc::new(hs_push::rulesets::CachedRulesetStore::new(
+            hs_push::rulesets::tables::TablesRulesetStore::open(backend.clone()).map_err(opening)?,
+        )),
+        pushers: Arc::new(hs_push::pushers::tables::TablesPusherStore::open(
+            backend.clone(),
+        ).map_err(opening)?),
+        counts: Arc::new(hs_push::counts::tables::TablesCountsStore::open(
+            backend.clone(),
+        ).map_err(opening)?),
+        http_pushers: Arc::new(hs_push::pushers::http::HttpPusherClient::new(
+            hs_push::pushers::http::RetryPolicy::default(),
+        )),
+    };
+
+    Ok((user, e2e, push))
 }
 
 fn dummy_admin_state() -> hs_admin::router::AdminState {
@@ -286,14 +394,19 @@ fn throwaway_mounts() -> Mounts<hs_kv::memory::MemoryBackend> {
     use hs_kv::memory::MemoryBackend;
 
     let identity = hs_room::identity::HomeserverIdentity::for_tests("routes-manifest.invalid");
+    let auth = AuthState::in_memory();
+    let backend = MemoryBackend::new();
+    let rooms = Arc::new(
+        hs_room::registry::RoomRegistry::open(backend.clone(), identity.clone())
+            .expect("opening an in-memory room registry cannot fail"),
+    );
     let room = RoomState {
-        auth: AuthState::in_memory(),
-        rooms: Arc::new(
-            hs_room::registry::RoomRegistry::open(MemoryBackend::new(), identity.clone())
-                .expect("opening an in-memory room registry cannot fail"),
-        ),
+        auth: auth.clone(),
+        rooms: rooms.clone(),
         identity,
     };
+    let (user, e2e, push) = build_session_mounts(&backend, &auth, &rooms)
+        .expect("opening in-memory session/e2e/push keyspaces cannot fail");
 
     let object_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::memory::InMemory::new());
@@ -329,6 +442,9 @@ fn throwaway_mounts() -> Mounts<hs_kv::memory::MemoryBackend> {
 
     Mounts {
         room,
+        user,
+        e2e,
+        push,
         media,
         appservice_ping,
         admin: dummy_admin_state(),
@@ -454,14 +570,18 @@ pub async fn spawn_serve(
         hs_appservice::auth_registry::RegistryAppserviceAdapter::new(appservices.registry.clone()),
     );
 
+    let rooms = Arc::new(hs_room::registry::RoomRegistry::open(
+        backend.clone(),
+        identity.clone(),
+    )?);
     let room_state = RoomState {
         auth: auth_state.clone(),
-        rooms: Arc::new(hs_room::registry::RoomRegistry::open(
-            backend.clone(),
-            identity.clone(),
-        )?),
+        rooms: rooms.clone(),
         identity,
     };
+
+    let (user_state, e2e_state, push_state) =
+        build_session_mounts(&backend, &auth_state, &rooms)?;
 
     let media_state = crate::media::build_media_state(
         &config,
@@ -473,6 +593,9 @@ pub async fn spawn_serve(
 
     let mounts = Mounts {
         room: room_state,
+        user: user_state,
+        e2e: e2e_state,
+        push: push_state,
         media: media_state,
         appservice_ping: appservices.ping_service,
         admin: dummy_admin_state(),
