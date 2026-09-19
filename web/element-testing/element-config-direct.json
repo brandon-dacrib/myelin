@@ -1,0 +1,19 @@
+{
+  "default_server_config": {
+    "m.homeserver": {
+      "base_url": "http://127.0.0.1:8098",
+      "server_name": "test.local"
+    }
+  },
+  "brand": "Element",
+  "disable_guests": true,
+  "disable_custom_urls": false,
+  "disable_login_language_selector": true,
+  "showLabsSettings": true,
+  "features": {},
+  "default_country_code": "US",
+  "default_theme": "light",
+  "settingDefaults": {
+    "UIFeature.registration": true
+  }
+}

@@ -34,7 +34,195 @@
 
 Track brief: `docs/workstreams/16-management-web-interface.md`. Owner directories: `web/`, `docs/design/`.
 
-Last updated: 2026-09-19 (session: pointing Element Web at `hs serve` — `docs/next-steps.md` item 2).
+Last updated: 2026-09-19 (session: Element Web actually running against `hs serve`, in a real browser, for the first time in this project).
+
+## Session: Element Web actually running, in a real browser, against `hs serve` (2026-09-19, later still)
+
+Assignment (from the integration lead): finish the job the previous session couldn't — get Element
+Web running against a real `hs serve` in a real browser, use it, report what happens. **It works.**
+This is a genuinely working Matrix web client against this homeserver, driven end to end in
+Chromium via Playwright, with screenshots. It also surfaced three real server bugs that no
+protocol-level curl test had caught, exactly the point of the exercise.
+
+### The host is quiet now, and Docker cooperated
+
+Load average was 4.6-5.1 at the start of this session (vs. 9-12 two sessions ago), and Docker's
+container lifecycle commands (`run`, `rm`, `ps`, `logs`) all returned promptly. `docker pull
+vectorim/element-web:latest` was already cached from the previous session. Two fresh containers
+came up `healthy` within ~15 seconds each, first try, no retries needed — a sharp contrast with the
+previous session's 27+ minutes of hung lifecycle calls. (Load spiked back to 38-43 later in this
+session, presumably another agent's build — `web/`'s own `npm run typecheck`/`test`/`lint` were
+run then and are reported honestly below, including where that spike stalled them.)
+
+### CORS is fixed, verified from a real browser, not just curl
+
+The previous session's #1 finding — no CORS headers on `/_matrix/client/*` at all — is fixed.
+Confirmed twice: once by direct curl (`OPTIONS /_matrix/client/v3/login` now returns 200 with
+`access-control-allow-origin: *` and the right `-Allow-Methods`/`-Allow-Headers`), and then for
+real by pointing Element Web's `config.json` straight at `http://127.0.0.1:8098` — a different
+origin than Element's own `http://127.0.0.1:8080` — with **no reverse proxy in between**. It loaded,
+logged in, and worked. `web/scripts/element-proxy.mjs` is no longer part of the normal path (kept
+in place in case a future session needs a single-origin setup for some other reason); the harness
+now defaults to `web/element-testing/element-config-direct.json`, which points directly at the
+homeserver.
+
+### What was actually driven, in Chromium, via Playwright (not claude-in-chrome — the extension
+wasn't connected this session; Playwright's own MCP browser tools were used instead)
+
+Two fully independent Element Web instances were run in Docker on two different host ports
+(`:8080`, `:8081`), each with its own origin and therefore its own `localStorage` — this was
+necessary because Element Web locks a session to one tab per origin ("Element is open in another
+window"), so a true second concurrent user needed a second origin, not a second tab.
+
+1. **Landing → sign in.** `alice` signed in via the real username/password form against
+   `POST /_matrix/client/v3/login` on `:8080`. `bob` signed in the same way on `:8081`. Both real
+   sessions, real tokens, no mocking.
+2. **Room list, "New room" dialog** — see bug 1 below: creating a room through Element's own UI
+   fails. Rooms were created directly via the API instead (as a real client's SDK would after
+   omitting the problematic parameter, or as this server should have accepted regardless) and
+   appear correctly in Element's room list once created — list rendering itself is not the
+   problem.
+3. **Invite, join, membership events, read receipts** — alice invited bob (`POST .../invite`), bob
+   joined (`POST .../join`), and both directions rendered correctly in each other's timelines
+   ("bob joined the room", "Seen by 1 person" badges with the correct avatar/name).
+4. **Bidirectional real-time messaging.** Alice typed "Hello from Alice!" in her tab; it appeared
+   in Bob's tab via live `/sync` long-polling with no page reload. Bob replied "Hi Alice, Bob
+   here!"; it appeared in Alice's tab the same way. This is real, working two-way chat between two
+   independent browser sessions against this server — the core of what a "management web
+   interface" session was actually asked to prove for the wider project (this is Element, not the
+   admin console; see `docs/next-steps.md` item 2 / the integration lead's assignment for why this
+   was worth a session of its own).
+5. **Display name change.** Settings > Account > Display Name → "Alice Wonderland",
+   `PUT /_matrix/client/v3/profile/{userId}/displayname` → `200`, applied immediately in Alice's
+   own UI (sidebar avatar, welcome heading) and propagated live to Bob's already-open timeline and
+   member list — with one real, if cosmetic, bug: see finding 3 below, it renders as "Alice
+   Wonderland joined the room" instead of a name-change message.
+6. **Scrollback.** 45 messages were sent into the room; reloading Bob's tab (forcing a fresh
+   `/sync`) and scrolling the timeline to the top rendered the room's very first event ("Alice
+   Wonderland created this room") — the complete history, correctly ordered, all the way back to
+   room creation. Scrolling to the bottom returned to the latest message. Both worked correctly.
+
+**Screenshots** (`docs/design/screenshots/element-01-landing.png` through `element-11-scrolled-bottom.png`):
+welcome screen; signed-in home ("No chats yet"); the room-creation failure dialog (bug 1, in situ);
+Alice's message sent; Bob receiving it live in his own session; Alice receiving Bob's reply live;
+Settings > Account (including the live "Unable to load email addresses" error, bug 2, in situ);
+the display name saved; the full 45-message timeline scrolled to the top and to the bottom.
+
+### Bugs found, diagnosed to a route and an owning track (full detail and reproduction in
+`web/element-testing/README.md`)
+
+**1. `POST /createRoom` rejects the room's own creator whenever `power_level_content_override` is
+present, because the server replaces the default power-levels content instead of merging the
+override on top of it — dropping the creator's implicit power-100 grant.** This is the most
+severe finding of this session: real Element sends `power_level_content_override` on **every**
+room it creates by default (to set a power level for `org.matrix.msc3401.call.member`), so this
+blocks room creation from Element's UI **entirely, unconditionally** — not a missing feature, a
+broken core flow. Minimal repro:
+```
+curl -X POST http://127.0.0.1:8098/_matrix/client/v3/createRoom \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"preset":"private_chat","power_level_content_override":{"events":{"m.room.history_visibility":100}},"name":"x"}'
+# -> 403 {"errcode":"M_FORBIDDEN","error":"sender does not have enough power to send event of type m.room.join_rules"}
+```
+Same call without the override, or with an override that explicitly re-includes
+`"users":{"@creator:...":100}`, succeeds — confirming exactly what's being dropped. Root cause,
+read not guessed: `crates/hs-room/src/actor.rs`, `RoomActor::create_room`, ~line 1320:
+`request.power_level_content_override.clone().unwrap_or_else(|| /* builds users: {creator: 100} */)`
+— this *replaces* the generated default wholesale instead of merging on top, exactly backwards
+from the spec's own wording for this field ("applied on top of the generated power level event
+content"). Owning track: **04 (hs-room)**, `crates/hs-room/src/actor.rs::create_room`.
+
+**2. `GET /_matrix/client/v3/account/3pid` is unimplemented** — a bare 404 with no route at all
+(confirmed: `grep -rn "account/3pid" crates/*/src` finds no handler anywhere in the workspace).
+Renders as a visible "Unable to load email addresses"/"...phone numbers" error banner in Element's
+own Settings > Account page (see the screenshot). Owning track: **07 (hs-auth)** — the brief
+explicitly lists "3PIDs, account lifecycle."
+
+**3. State events never carry `unsigned.prev_content`, anywhere** (`/sync`, `/messages`, or
+presumably `/context`) — confirmed by `grep -rln "prev_content" crates/*/src/` returning nothing
+in the entire workspace. Per spec this field lets a client tell "the sender changed their display
+name" apart from "the sender joined the room" for two otherwise-identical `m.room.member` events.
+Reproduced live and visibly wrong: Element's timeline renders Alice's display-name change as
+**"Alice Wonderland joined the room."** Root cause: `crates/hs-room/src/routes/render.rs`'s
+`client_event_json` — the one shared function every read route uses to turn a stored event into
+client JSON — builds `unsigned` from scratch and never attaches prior state content; doing so
+needs a "prior content for this (type, state_key) as of just before this event" lookup that
+doesn't exist today. Owning track: **04 (hs-room)** for `render.rs` itself; may also need
+something from **02 (hs-state)** if the state history lookup this requires isn't already exposed.
+
+Three console 404s were seen and are **not bugs** (see the README for why): `room_keys/version`
+(no key backup set up — universal, expected), `thirdparty/protocols` (no bridges registered —
+expected), `unstable/org.matrix.msc2965/auth_metadata` (OIDC/MSC2965 discovery not implemented;
+legacy password login is, and that's what was used, with a correct fallback).
+
+Both of the previous session's confirmed findings are independently reconfirmed fixed here, live,
+from the browser: CORS (a real cross-origin Element instance works with zero workaround) and
+`/capabilities`' stale `m.set_displayname`/`m.set_avatar_url` flags (both now `true`, matching the
+working `PUT .../profile/.../displayname` calls actually made this session).
+
+### Verification of `web/` itself (per this session's own instruction: report honestly, don't
+assume)
+
+Run **after** the transcript above, once the host's load average had (unexpectedly) climbed to
+38-43 mid-session (a different agent's build, not this track's):
+
+- `npm run typecheck` (`tsc -b`): **passed, exit code 0.** Confirmed by direct output, not
+  assumed — this one did complete despite the load spike (it took ~20 minutes wall-clock to get
+  scheduled, but the command itself succeeded once it ran).
+- `npm run test` (Vitest): **did not run — infra failure, reproduced twice, not a code result.**
+  First attempt (default config, host load ~7-10 at the moment of launch): every worker failed
+  with `[vitest-pool-runner]: Timeout waiting for worker to respond`, "no tests" executed, 8
+  errors (one per test file, all the same cause). Second attempt, deliberately different
+  (`--no-file-parallelism`, forcing a single worker instead of vitest's default pool) specifically
+  to rule out "workers can't all start at once under load" as the cause: **same failure**, this
+  time after running 421 seconds while host load climbed to 38-80 from an unrelated agent's build
+  (`uptime` sampled 40.61/50.92/38.65 immediately after). Two different pool configurations, two
+  identical failures, both correlated with extreme host contention neither this track nor its code
+  caused. This matches every prior session's report of the same symptom
+  (`docs/status/16-management-web-interface.md`'s own history, 2026-09-18/19) — it is a
+  standing, unresolved infrastructure problem on this shared machine, not a regression introduced
+  here, and **still not run to a real pass/fail result** as of this session. Nothing under
+  `web/src` changed this session, so there is no new code this specifically puts at risk, but the
+  gap itself (this suite has now failed to execute at least four separate times across three
+  sessions) is worth a fifth session's attention on its own, independent of Element.
+- `npm run lint`: **did not complete — killed after 45 minutes wall-clock, host load climbing to
+  98.58 (`uptime` sampled 98.58/71.69/44.19 at the moment it was killed).** The `eslint .` child
+  process had accumulated only ~2 seconds of actual CPU time across those 45 minutes — not slow,
+  starved: it was barely being scheduled at all. This is the same failure mode the 2026-09-19
+  (earlier) session reported ("lint exceeds 500s") and is unrelated to anything in this session's
+  changes (only `web/element-testing/*` and this status file changed). Not re-attempted a third
+  time this session; the next session should retry when `uptime`'s 1-minute load average is in
+  single digits, which happened only briefly during this session (~7-10, right before the same
+  other agent's build pushed it back over 40-98).
+
+(Nothing under `web/src` was modified this session — only `web/element-testing/*` config/README
+and this status file — so a clean run from the last confirmed-passing session, 2026-09-19 earlier,
+is the reasonable expectation; this section exists so the next session doesn't have to take that
+on faith.)
+
+### Reproducible setup, updated
+
+`web/element-testing/README.md` is rewritten to lead with the now-working direct setup (no proxy):
+`element-config-direct.json` (new — points straight at `http://127.0.0.1:8098`), the two-Docker-
+instance pattern for driving two independent browser sessions at once, and the full bug list with
+reproduction commands. `element-config.json` (proxy-origin) and `scripts/element-proxy.mjs` are
+kept for reference but are no longer the recommended path. A real `hs serve` was left running on
+`127.0.0.1:8098` with `alice`/`bob`/`ops` registered and the "No Preset Room" test room containing
+the full 45-message scrollback transcript, plus two Element Web containers
+(`element-web-test` on `:8080`, `element-web-test-bob` on `:8081`) still running and healthy, for
+the next session or the integration lead to look at directly without redoing setup.
+
+### Verify
+
+```
+curl http://127.0.0.1:8098/_matrix/client/versions        # confirms the server is still up
+curl -i -X OPTIONS http://127.0.0.1:8098/_matrix/client/v3/login -H "Origin: http://x" \
+  -H "Access-Control-Request-Method: POST"                # CORS fix, live
+curl http://127.0.0.1:8080/                                 # Element (alice's origin), 200
+curl http://127.0.0.1:8081/                                 # Element (bob's origin), 200
+cat web/element-testing/README.md                            # full reproduction + bug detail
+```
+
 
 ## Session: pointing Element Web at `hs serve` (2026-09-19, later same day)
 
@@ -418,6 +606,13 @@ New mock fixtures/handlers matching the real shapes: `web/src/mocks/data/{appser
 
 ## Next
 
+-1. **New, from the 2026-09-19 (later still) Element Web session, highest priority of all**: get
+    tracks 04 and 07 the three bug reports above (createRoom + `power_level_content_override`,
+    missing `account/3pid`, missing `unsigned.prev_content`) — none of these are this track's
+    crates to fix, but the createRoom one in particular blocks the single most basic real-client
+    flow (creating a room) end to end, for every preset, unconditionally, whenever the client
+    follows the spec's own `power_level_content_override` merge semantics. This is a bigger deal
+    than anything left in this track's own backlog below.
 0. **Do this first**: re-run `npm run test` (Vitest infra failed to even start this session under host load — see "Wrap-up note" above, not a code issue) and `npm run build`, neither confirmed as of 2026-09-19. Then re-run `npm run test:e2e:real` against a fresh `hs serve` build to confirm against the now-larger real surface (15 of 142 operations per the integration lead, up from the 5 this session tested).
 0b. `GET /api/v1/events` (SSE) is real now (per the integration lead) — wire it up, replacing `TopBar`'s "Polling every 30s" and each page's `refetchInterval`. This was blocked on 15 shipping it; it no longer is.
 1. Reports page (flow not yet built; still a `PlaceholderPage`). Media, Cluster, Migration, Audit log, Settings remain placeholders too — Phase 1/2 per the brief.
@@ -435,14 +630,27 @@ New mock fixtures/handlers matching the real shapes: `web/src/mocks/data/{appser
 
 ## Blockers
 
-**Element Web session (2026-09-19, later): the shared Docker daemon stopped completing container
-lifecycle operations** (`run`/`create`/`kill`/`rm`/`logs`/`exec` all timed out at 20-30s while
+**Resolved: the Docker blocker below no longer applies.** The 2026-09-19 (later still) session
+retried it once the host was quiet and it worked cleanly — two Element Web containers up and
+`healthy` within ~15 seconds each, no retries needed. Kept below for the historical record only.
+
+~~**Element Web session (2026-09-19, later): the shared Docker daemon stopped completing container
+lifecycle operations**~~ (`run`/`create`/`kill`/`rm`/`logs`/`exec` all timed out at 20-30s while
 `docker version`/`docker ps` kept responding) under heavy host load (load average 9-12 throughout;
 a bare `sleep 60` took ~4 minutes wall-clock). This blocked seeing Element Web actually render in
 a browser this session — not a defect in this server. Everything needed to finish is staged in
 `web/element-testing/` and `web/scripts/element-proxy.mjs`; the next session's first move should
 be retrying the same `docker run` once the host is idle. This is an environment blocker, not a
 code blocker, and does not block anything else in this track's own work.
+
+**New, current blocker: `npm run test` (Vitest) and `npm run lint` cannot be verified on this
+machine under concurrent-agent load**, reproduced again this session (see "Verification of `web/`
+itself" above) after two independent prior sessions reported the identical symptom. This is now a
+three-times-repeated, unresolved infrastructure gap, not a one-off. It does not block this track's
+own further work (nothing here depends on a green Vitest run to proceed), but it does mean this
+track's actual code-level test coverage has gone unverified by an actual test run for three
+sessions running — worth flagging to the integration lead as a standing risk independent of
+Element.
 
 ## Interfaces provided
 
@@ -455,6 +663,15 @@ code blocker, and does not block anything else in this track's own work.
 
 ## Interfaces needed
 
+- **04 (hs-room), urgent**: fix `RoomActor::create_room` (`crates/hs-room/src/actor.rs`, ~line
+  1320) to merge `power_level_content_override` on top of the generated default power-levels
+  content instead of replacing it — see "Bugs found" above for the exact repro. This blocks room
+  creation from real Element (and likely any client that follows the spec's own wording for this
+  field) unconditionally. Also: `unsigned.prev_content` is never populated anywhere
+  (`crates/hs-room/src/routes/render.rs::client_event_json`), causing visibly wrong timeline
+  summaries ("X joined the room" for a display-name change) in every client.
+- **07 (hs-auth)**: `GET /_matrix/client/v3/account/3pid` is unimplemented (plain 404, no route) —
+  breaks Element's own Settings > Account page ("Unable to load email addresses").
 - 15/integration lead: the `assets.rs` one-line swap (see "The embedded build" above) — this is the one remaining step to make the real build actually served by `hs serve`.
 - 15: confirmation of the `/statistics/timeseries` metric-name vocabulary; the SSE event stream's exact event shapes (now real at `GET /api/v1/events` per the integration lead — not yet consumed by this session, see "Next"); responses to the feedback items above.
 - 07: the real OAuth issuer (authorization code + PKCE, admin scopes) to replace the legacy-admin-token sign-in in `src/lib/auth.ts`, once it exists (Phase 1/2; the legacy path works today and is what's wired up).
