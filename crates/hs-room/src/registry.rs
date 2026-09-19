@@ -87,6 +87,11 @@ pub struct RoomRegistry<B: KvBackend> {
     /// then treats a `from` token that isn't this crate's own format as a hard error, same as
     /// before this hook existed.
     global_token_resolver: OnceLock<Arc<dyn GlobalTokenResolver>>,
+    /// See [`crate::fencing::RoomFencing`] and [`RoomRegistry::install_fencing`]. Unset (`None`,
+    /// the default until `hs-cli` installs one) means every actor this registry constructs or
+    /// loads runs with no cluster-fencing check at all -- `RoomActor::persist` behaves exactly as
+    /// it did before this hook existed.
+    fencing: OnceLock<Arc<crate::fencing::RoomFencing<B>>>,
 }
 
 impl<B: KvBackend + 'static> RoomRegistry<B> {
@@ -107,6 +112,7 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             rooms: Mutex::new(HashMap::new()),
             global,
             global_token_resolver: OnceLock::new(),
+            fencing: OnceLock::new(),
         })
     }
 
@@ -130,6 +136,23 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     #[must_use]
     pub fn global_token_resolver(&self) -> Option<&Arc<dyn GlobalTokenResolver>> {
         self.global_token_resolver.get()
+    }
+
+    /// Installs the cluster-fencing hook every actor this registry constructs or loads from now
+    /// on will check inside `RoomActor::persist` (`docs/status/03-cluster.md` item 4). Idempotent
+    /// past the first call, same as [`RoomRegistry::install_global_token_resolver`]: a second
+    /// install is logged and ignored rather than risking a surprising swap.
+    ///
+    /// **Not called anywhere in this crate today.** Wiring it in is `hs-cli`'s line to add (out
+    /// of this crate's ownership) -- see `docs/status/04-room-and-events.md` for exactly what
+    /// that line looks like and why it is not written here.
+    pub fn install_fencing(&self, fencing: Arc<crate::fencing::RoomFencing<B>>) {
+        if self.fencing.set(fencing).is_err() {
+            tracing::warn!(
+                "cluster fencing was already installed on this room registry; ignoring the \
+                 second install"
+            );
+        }
     }
 
     /// The handle for `room_id`, loading it from the store if it is not already resident.
@@ -159,9 +182,10 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
         .await
         .expect("room load task panicked")?;
 
-        let Some(actor) = loaded else {
+        let Some(mut actor) = loaded else {
             return Err(RoomError::RoomNotFound(room_id.to_string()));
         };
+        actor.set_fencing(self.fencing.get().cloned());
         let handle = RoomActorHandle::new(actor);
 
         let mut rooms = self.rooms.lock().await;
@@ -195,8 +219,11 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     }
 
     /// Registers an already-constructed actor (the result of `RoomActor::create_room`), replacing
-    /// any existing entry for its room ID.
-    pub async fn insert(&self, actor: RoomActor<B>) -> RoomActorHandle<B> {
+    /// any existing entry for its room ID. Installs this registry's cluster-fencing hook (if any)
+    /// onto `actor` first, same as [`RoomRegistry::get_or_load`] -- every path that puts an actor
+    /// into this registry's map goes through here or through `get_or_load` directly.
+    pub async fn insert(&self, mut actor: RoomActor<B>) -> RoomActorHandle<B> {
+        actor.set_fencing(self.fencing.get().cloned());
         let room_id = actor.room_id().to_owned();
         let handle = RoomActorHandle::new(actor);
         let mut rooms = self.rooms.lock().await;
@@ -324,6 +351,41 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     /// Returns [`RoomError::Store`] on a storage failure.
     pub fn rooms_joined_by_user(&self, user_id: &UserId) -> Result<Vec<OwnedRoomId>, RoomError> {
         crate::actor::rooms_joined_by_user(&self.backend, &self.tables, user_id)
+    }
+
+    /// Every room this server has ever created. See [`crate::actor::list_all_room_ids`].
+    ///
+    /// # Errors
+    /// Returns [`RoomError::Store`] on a storage failure.
+    pub fn list_all_room_ids(&self) -> Result<Vec<OwnedRoomId>, RoomError> {
+        crate::actor::list_all_room_ids(&self.backend, &self.tables)
+    }
+
+    /// Blocks or unblocks `room_id` (`hs-admin`'s `rooms.set_blocked`). See
+    /// [`crate::actor::set_room_blocked`].
+    ///
+    /// # Errors
+    /// Returns [`RoomError::RoomNotFound`] if `room_id` has never been created, or
+    /// [`RoomError::Store`] on a storage failure.
+    pub fn set_room_blocked(
+        &self,
+        room_id: &ruma::RoomId,
+        blocked: bool,
+        reason: Option<String>,
+    ) -> Result<(), RoomError> {
+        crate::actor::set_room_blocked(&self.backend, &self.tables, room_id, blocked, reason)
+    }
+
+    /// Whether `room_id` is currently blocked, and if so, its reason. See
+    /// [`crate::actor::room_block_reason`].
+    ///
+    /// # Errors
+    /// Returns [`RoomError::Store`] on a storage failure.
+    pub fn room_block_reason(
+        &self,
+        room_id: &ruma::RoomId,
+    ) -> Result<Option<Option<String>>, RoomError> {
+        crate::actor::room_block_reason(&self.backend, &self.tables, room_id)
     }
 
     /// Drops every resident actor idle longer than `max_idle`. Intended to be called

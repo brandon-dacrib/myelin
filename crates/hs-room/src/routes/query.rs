@@ -210,10 +210,20 @@ pub async fn get_context<B: KvBackend + 'static>(
                 .copied()
                 .map(render)
                 .collect();
+            // Pinned to the target event, not this room's *live* current state -- the same bug
+            // class already fixed for `/messages`/`/event`/`/state`/`/members` (reading a live
+            // value instead of one pinned to a point in time). The spec's `state` field is "the
+            // state of the room at the last event returned" for `events_before`'s pagination
+            // window, which for `/context` is the target event itself
+            // (`refs/matrix-spec/content/client-server-api.md`, "get_events_context": "state: A
+            // list of state events relevant to displaying `id`"). `RoomActor::state_at_event`
+            // already exists for exactly this ("the room's state as of immediately after the
+            // queried event").
             let state_json = actor
-                .full_state()
-                .ok()?
-                .into_iter()
+                .state_at_event(target.event_id())
+                .ok()??
+                .state
+                .iter()
                 .map(client_event_json)
                 .collect::<Vec<_>>();
             Some(json!({
@@ -393,4 +403,141 @@ pub async fn get_messages<B: KvBackend + 'static>(
         .await?;
 
     Ok(Json(json!({"start": start, "chunk": chunk, "end": end})).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::extract::Query;
+    use hs_auth::requester::Requester;
+    use hs_auth::state::AuthState;
+    use hs_kv::memory::MemoryBackend;
+    use ruma::user_id;
+
+    use super::*;
+    use crate::identity::HomeserverIdentity;
+    use crate::registry::RoomRegistry;
+    use crate::state::RoomState;
+
+    fn requester(user: &ruma::UserId) -> RoomRequester {
+        RoomRequester(Requester {
+            user_id: user.to_owned(),
+            device_id: None,
+            is_guest: false,
+            is_admin: false,
+            shadow_banned: false,
+            suspended: false,
+            appservice: None,
+            access_token_id: None,
+        })
+    }
+
+    fn app() -> RoomState<MemoryBackend> {
+        let backend = MemoryBackend::new();
+        let identity = HomeserverIdentity::for_tests("hs1");
+        let rooms = Arc::new(RoomRegistry::open(backend, identity.clone()).unwrap());
+        RoomState {
+            auth: AuthState::in_memory(),
+            rooms,
+            identity,
+        }
+    }
+
+    async fn json_body(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// The bug this session fixed: `/context`'s `state` field must reflect the room's state
+    /// pinned to immediately after the target event, not this room's *live* current state --
+    /// the same "read a live value instead of one pinned to a point in time" bug class already
+    /// closed for `/messages`/`/event`/`/state`/`/members`. Sends a message while the topic is
+    /// "first", changes the topic to "second" afterwards, then asserts `/context` for that
+    /// message still reports "first" -- proving `state` did not just re-read current state
+    /// (which would report "second").
+    #[tokio::test]
+    async fn context_state_is_pinned_to_the_target_event_not_current_state() {
+        let state = app();
+        let alice = user_id!("@alice:hs1");
+        let handle = state
+            .rooms
+            .create_room(
+                alice.to_owned(),
+                crate::actor::CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    topic: Some("first".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .expect("create should succeed");
+        let room_id = handle.query(|actor| actor.room_id().to_owned()).await;
+
+        let message = handle
+            .send_event(
+                alice.to_owned(),
+                "m.room.message".to_owned(),
+                None,
+                json!({"msgtype": "m.text", "body": "while topic was first"}),
+                None,
+                2,
+            )
+            .await
+            .expect("message send should succeed");
+
+        handle
+            .send_event(
+                alice.to_owned(),
+                "m.room.topic".to_owned(),
+                Some(String::new()),
+                json!({"topic": "second"}),
+                None,
+                3,
+            )
+            .await
+            .expect("topic change should succeed");
+
+        // Sanity check: current state really did move on, so the assertion below is meaningful.
+        let current_topic = handle
+            .query(|actor| {
+                actor
+                    .state_event("m.room.topic", "")
+                    .unwrap()
+                    .and_then(|e| e.json().get("content"))
+                    .and_then(hs_model::canonical::CanonicalJsonValue::as_object)
+                    .and_then(|c| c.get("topic"))
+                    .and_then(hs_model::canonical::CanonicalJsonValue::as_str)
+                    .map(str::to_owned)
+            })
+            .await;
+        assert_eq!(current_topic.as_deref(), Some("second"));
+
+        let response = get_context::<MemoryBackend>(
+            State(state),
+            Path((room_id.to_string(), message.event_id().to_string())),
+            Query(HashMap::new()),
+            requester(alice),
+        )
+        .await
+        .expect("context should succeed")
+        .into_response();
+        let body = json_body(response).await;
+
+        let state_topic = body["state"]
+            .as_array()
+            .expect("state should be an array")
+            .iter()
+            .find(|e| e["type"] == "m.room.topic")
+            .and_then(|e| e["content"]["topic"].as_str())
+            .map(str::to_owned);
+        assert_eq!(
+            state_topic.as_deref(),
+            Some("first"),
+            "context's state must be pinned to the target event, not the room's live current state"
+        );
+    }
 }

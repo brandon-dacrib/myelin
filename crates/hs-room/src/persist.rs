@@ -43,6 +43,11 @@ pub type PublicRoomKey = (hs_model::RoomSn,);
 /// entries is a contiguous range, independent of how many *other* users are also indexed.
 pub type UserJoinedRoomKey = (String, hs_model::RoomSn);
 
+/// `(RoomSn,) -> RoomBlock`: presence means this room is currently blocked by a server
+/// administrator (`hs-admin`'s `rooms.set_blocked`, `PUT /api/v1/rooms/{room_id}` in RFC 0004
+/// terms). See [`RoomBlock`] and `crate::actor::{set_room_blocked, room_block_reason}`.
+pub type BlockedRoomKey = (hs_model::RoomSn,);
+
 /// One event as stored durably: enough to reconstruct an [`hs_model::event::Event`] (via
 /// [`hs_model::event::Event::parse`] on `json`) plus the room-local bookkeeping
 /// [`hs_model::event::EventHeader`] does not carry.
@@ -68,6 +73,16 @@ pub struct RoomMeta {
     pub room_id: String,
     /// The room version.
     pub room_version: String,
+}
+
+/// The value stored at a [`BlockedRoomKey`]: the optional human-readable reason an administrator
+/// gave when blocking the room (`rooms.set_blocked`'s request body). Presence of the row is what
+/// means "blocked" -- an absent row is "not blocked", not "blocked with no reason" -- so this
+/// struct only needs to carry the reason.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct RoomBlock {
+    /// Why the room was blocked, if the administrator gave one.
+    pub reason: Option<String>,
 }
 
 /// Every `hs-kv` keyspace and interning table [`crate::actor::RoomActor`] persists through,
@@ -101,6 +116,9 @@ pub struct Tables<B: KvBackend> {
     /// `(user_id, RoomSn) -> b""`: every room a user currently holds `join` membership in. See
     /// [`UserJoinedRoomKey`].
     pub joined_rooms: TypedKeyspace<B::Keyspace, UserJoinedRoomKey>,
+    /// `(RoomSn,) -> RoomBlock`: rooms currently blocked by a server administrator. See
+    /// [`BlockedRoomKey`].
+    pub blocked_rooms: TypedKeyspace<B::Keyspace, BlockedRoomKey>,
 }
 
 impl<B: KvBackend> Tables<B> {
@@ -122,6 +140,7 @@ impl<B: KvBackend> Tables<B> {
             relations: TypedKeyspace::new(backend.keyspace("room_relations")?),
             public_rooms: TypedKeyspace::new(backend.keyspace("room_public_directory")?),
             joined_rooms: TypedKeyspace::new(backend.keyspace("room_joined_by_user")?),
+            blocked_rooms: TypedKeyspace::new(backend.keyspace("room_blocked")?),
         })
     }
 }

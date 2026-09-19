@@ -79,6 +79,24 @@ pub enum RoomError {
     #[error("{0}")]
     StillJoined(String),
 
+    /// The room has been blocked by a server administrator (`hs-admin`'s `rooms.set_blocked`,
+    /// enforced by [`crate::actor::RoomActor::send_event_citing`]'s own precheck): new events and
+    /// joins from local users are rejected while the block is in effect. Carries the
+    /// administrator's reason, if one was given.
+    #[error(
+        "this room has been blocked by a server administrator{}",
+        .0.as_deref().map(|r| format!(": {r}")).unwrap_or_default()
+    )]
+    RoomBlocked(Option<String>),
+
+    /// [`crate::actor::RoomActor::persist`]'s belt-and-braces cluster-fencing check
+    /// (`docs/status/03-cluster.md` item 4) found that this replica no longer holds the shard
+    /// this room belongs to -- a real ownership handoff raced the routing gate that should have
+    /// kept this replica from handling the request at all. The caller should retry against the
+    /// current owner (`hs-cli`'s forwarding layer, not this crate, decides who that is).
+    #[error("fenced: {0}")]
+    Fenced(String),
+
     /// [`crate::actor::RoomActor::accept_remote_event`]: the event names a `prev_events` or
     /// `auth_events` entry this actor does not hold. The ordinary federation case of an event
     /// arriving before its ancestors have been backfilled -- not a hard protocol violation, and
@@ -108,6 +126,12 @@ impl RoomError {
             ),
             Self::InvalidEvent(_) | Self::BadRequest(_) => MatrixError::bad_json(self.to_string()),
             Self::Forbidden(msg) => MatrixError::forbidden(msg.clone()),
+            Self::RoomBlocked(_) => MatrixError::forbidden(self.to_string()),
+            Self::Fenced(_) => MatrixError::custom(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                MatrixErrorCode::Unknown,
+                self.to_string(),
+            ),
             Self::StillJoined(msg) => MatrixError::custom(
                 axum::http::StatusCode::BAD_REQUEST,
                 MatrixErrorCode::Unknown,

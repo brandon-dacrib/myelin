@@ -2,10 +2,272 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
-Last updated: 2026-09-19 (session 6: two "a change never reaches other users" bugs closed, spanning
-`hs-room`, `hs-auth` and `hs-e2e` in one sitting -- profile-change propagation into
-`m.room.member`, and the missing device-list-change call sites in device rename/delete and key
-upload).
+Last updated: 2026-09-19 (session 7: the admin API's room directory is now implemented for real
+over `hs-room`; `/context`'s `state` field is pinned to the target event instead of live current
+state; `RoomActor::persist` now checks `hs_cluster::Fence` as the documented belt-and-braces
+guard).
+
+## Session 7 (2026-09-19): the admin room directory, `/context` state pinning, cluster fencing
+
+**Assignment, in priority order**: (1) implement `hs_admin::sources::RoomDirectory` over this
+crate, which was left as a real `503` because nothing implemented it; (2) check the Element Web
+and federation sessions' diagnoses (`docs/status/16-management-web-interface.md`,
+`docs/status/06-federation.md`) for anything attributed to rooms/state/membership/events; (3) this
+crate's own recorded gaps (alias validation, `/state`/`/joined_members` shape, `/context`'s
+live-state bug); (4) `RoomActor::persist` never calling `Fence::check`. Ownership this session:
+`crates/hs-room/**` and this file only -- no Docker, no git.
+
+### 1. The admin room directory (`hs_admin::sources::RoomDirectory`), implemented for real
+
+**New module `crates/hs-room/src/admin.rs`**: `RoomRegistryDirectory<B>` wraps an
+`Arc<RoomRegistry<B>>` and implements every method on the trait track 15 defined and froze on
+`crates/hs-admin/src/sources.rs` last session (`get_room`, `list_rooms`, `set_blocked`,
+`make_admin`). `hs-admin` was added as a normal path dependency of this crate
+(`crates/hs-room/Cargo.toml`) -- no cycle, since `hs-admin` depends on neither `hs-room` nor
+`hs-auth`.
+
+**Enumerating every room the server has ever created** (`GET /rooms` with no filter needs this;
+`RoomRegistry` previously only knew about rooms it had loaded or created in this process, or
+published ones -- the same gap session 5 named for `/search`). New:
+`crate::actor::list_all_room_ids`/`RoomRegistry::list_all_room_ids`, a full scan of
+`Tables::room_meta` (written once per room, at its first persisted event, and never removed) --
+decodes each row's own `room_id` field directly, no interning-table round trip needed. Same
+scaling caveat as `list_published_room_ids`: fine for an admin listing, not a hot path. Loading
+every room's actor to build its summary (`list_rooms` calls `get_or_load` per room) also means
+every room briefly becomes resident in the registry's in-process cache until the idle sweeper
+evicts it -- acceptable for an admin operation, recorded here as a known scaling limit rather than
+solved (a server with a very large room count would want a real summary index instead).
+
+**`RoomActor::admin_summary`** builds the `hs_admin::model::AdminRoom` response shape directly from
+this actor's existing state-reading primitives (`state_event`, `joined_members`, `full_state`,
+`creation_type`) -- no new state-reading machinery, just assembly. One deliberate simplification,
+called out in both the method's doc comment and here: `forgotten` is reported as
+"zero currently-joined members," not "every local member who was ever here has called `/forget`" --
+this crate has no durable per-user forget index across every past member (only `RoomActor::forget`'s
+own in-memory, resident-lifetime-only set), and building one was out of scope for this session.
+
+**Blocking now has a real effect**, per the trait's contract ("expected to have a real effect on
+the room ... enforcing it is `hs-room`'s job"). New durable index: `Tables::blocked_rooms`
+(`(RoomSn,) -> RoomBlock{reason}`, presence means blocked -- same shape as the existing
+`public_rooms`/`joined_rooms` tables), plus `crate::actor::set_room_blocked`/`room_block_reason`
+(free functions, room-ID-keyed, mirroring `set_directory_visibility`/`is_directory_public`'s own
+shape) and a new precheck at the top of `RoomActor::send_event_citing` -- the function both
+`send_event` and `membership_action` funnel through -- that reads this same table fresh on every
+call (no cache to invalidate: a room already resident in memory when it gets blocked rejects its
+very next send). New `RoomError::RoomBlocked(Option<String>)` variant, mapped to `403 M_FORBIDDEN`
+carrying the administrator's reason. **Decision**: the block gate is unconditional, including for
+`make_admin`'s own power-levels write -- an operator who wants to grant an admin in a blocked room
+must unblock first. Not explicitly required by the contract either way; chosen for simplicity and
+because "blocked means no local writes, full stop" is the easier invariant to reason about.
+
+**`make_admin` sends a real `m.room.power_levels` event**, not a flag flip, per the contract's
+explicit requirement. Mirrors Synapse's `make_room_admin` behaviorally (read for behavior only,
+never copied, per this track's brief): the target user is very likely the one *without* enough
+power yet, so the event cannot be sent with them as its own sender. `RoomActor::make_admin` grants
+`min(highest power level currently held by any user in `m.room.power_levels`'s `users` map, 100)`,
+sent as whichever currently-joined member already holds at least `required_power("m.room.power_levels",
+true)` (ties broken by the smaller user ID, for a deterministic choice in tests). Returns
+`RoomError::Forbidden` if the target is not currently joined, `RoomError::BadRequest` if no
+sufficiently-privileged member is currently joined at all (a room whose only admins have all left
+cannot be granted a new one this way).
+
+**Tests**: `crates/hs-room/src/admin.rs` gained its own module (9 tests) -- `get_room` for an
+unknown and a real room (including that `public`/`joined_members_count`/`creator`/`federatable`
+are all populated correctly), `list_rooms` finding every room the server has ever created *after*
+evicting them from residency (proving it does not depend on the in-process cache), the `blocked`
+filter, `set_blocked`'s real effect (a blocked room rejects a new local event; unblocking restores
+it) and its `NotFound` on an unknown room, and `make_admin` both succeeding (asserting the real
+`m.room.power_levels` event's `users` map) and refusing a non-member. `cargo test -p hs-room --lib`:
+58 passed before `/context` and fencing tests below, 63 after those, from 58 at session start.
+
+**The one line `hs-cli` needs** (this track does not own `hs-cli`; noted here per this session's
+explicit instruction rather than made): in `crates/hs-cli/src/serve.rs`'s `admin_state` function
+(around line 536, the same one that already calls `.with_users(...)`), add a `rooms: &Arc<hs_room::
+registry::RoomRegistry<B>>` parameter and:
+```rust
+.with_rooms(Arc::new(hs_room::admin::RoomRegistryDirectory::new(rooms.clone())))
+```
+and at `admin_state`'s one call site (around line 943, inside `spawn_serve`, where `rooms` -- the
+`Arc<RoomRegistry<B>>` -- is already in scope from line 837, built before `admin_state` is called)
+pass `&rooms` as the new argument. `AdminState::with_rooms` already exists and takes exactly
+`Arc<dyn RoomDirectory>` (`crates/hs-admin/src/router.rs`); `RoomRegistryDirectory<B>` implements
+that trait for any `B: KvBackend + 'static`, matching the same `B` `serve.rs` already threads
+through `RoomState`/`UserState`.
+
+### 2. What the Element Web and federation sessions found -- nothing attributed to this crate
+
+Read both `docs/status/16-management-web-interface.md` ("pointing Element Web at `hs serve`") and
+`docs/status/06-federation.md` (still at its "sixth session," TLS/CA) in full. Three real bugs were
+diagnosed live against a real client in the web-interface session -- no CORS headers at all on the
+client-server API, `GET /capabilities` reporting `m.set_displayname`/`m.set_avatar_url` as stale
+`false`s, and `/rooms/{roomId}/receipt/...`/`.../read_markers` 404ing live despite being registered
+-- and all three are explicitly diagnosed to `hs-cli`, `hs-http`'s router composition, or
+`hs-user`'s routes, with `hs-room` explicitly ruled out for the third ("not a naming collision with
+`hs-room`'s router... no other crate defines anything under `/rooms/{roomId}/receipt`"). Confirmed
+independently: `cargo test -p hs-loadgen --test real_client -- --nocapture` (run this session, see
+"Proof" below) shows receipts and read markers working end to end (`"alice's /sync saw bob's public
+read receipt"`, `"bob's /sync reported his own m.fully_read marker"`), so whatever the Element
+session's router-composition bug is, it is either config-specific to that session's `hs serve`
+invocation or has since been fixed elsewhere -- worth flagging to whoever owns that file next, not
+something this session could reproduce or fix from within `hs-room`. The federation session's own
+"Next" item 0 (outbound signing over the unredacted form) was already closed by this track's
+session 5 (`docs/rfcs/0014-event-signing-must-sign-the-redacted-form.md`) -- that federation status
+file just has not been updated to say so yet; nothing new to do here.
+
+### 3. `/context`'s `state` field, pinned to the target event
+
+**The bug, exactly as recorded**: `crate::routes::query::get_context` built its `state` field from
+`actor.full_state()` -- this room's *live* current state -- instead of the state as of immediately
+after the target event, the same "read a live value instead of one pinned to a point in time" bug
+class already closed for `/messages`/`/event`/`/state`/`/members`. **The fix**: one call swapped,
+`actor.state_at_event(target.event_id())?.state` in place of `actor.full_state()` --
+`RoomActor::state_at_event` already existed and does exactly this ("the room's state immediately
+after the queried event"), unused by this endpoint until now.
+
+**Test**: `crate::routes::query::tests::context_state_is_pinned_to_the_target_event_not_current_state`
+-- sends a message while the room's topic is "first", changes the topic to "second" afterwards,
+and asserts `/context` for that message still reports "first" in its `state` array (with an
+explicit sanity check that current state really did move on to "second" first, so the assertion is
+meaningful). Fails without the fix, passes with it.
+
+**Not reached this session** (still open, from session 5's list): alias/canonical-alias
+validation, and the `/state`/`/joined_members` response-shape gaps -- session 4/5's writeup did not
+leave a precise-enough description of what exactly is wrong with either shape to fix blind this
+session, and neither showed up in either of the other two tracks' live-testing sessions this time.
+Left for a session that can name the exact gap (or hits it live) to fix.
+
+### 4. `RoomActor::persist` now calls `Fence::check` (the belt-and-braces cluster guard)
+
+**The gap, exactly as track 03 recorded it**: the routing gate `hs-cli`'s `RoomShardGate` added
+(session before this one, `docs/status/03-cluster.md`) is the *primary* defense against the
+two-replica split-brain that file's history describes -- it stops a non-owning replica from ever
+constructing a `RoomActor` at all. `RoomActor::persist` itself never checked `hs_cluster::Fence`,
+which is the secondary, belt-and-braces defense for the narrow window where a real ownership
+handoff (a partition, a rolling update) happens *between* the gate's check and this transaction's
+commit.
+
+**New**: `hs-cluster` added as a normal dependency of this crate (`crates/hs-room/Cargo.toml`; no
+cycle, `hs-cluster` depends only on `hs-kv`). New module `crates/hs-room/src/fencing.rs`:
+`RoomFencing<B>` bundles everything `persist` needs to check its fence -- `ownership: Arc<dyn
+hs_cluster::Ownership>` (read fresh on every call, never cached), `layout: hs_cluster::ShardLayout`
+(to compute which shard a room ID hashes to), and `cluster_store: hs_cluster::store::ClusterStore<B>`
+(the keyspace `Fence::check` reads its epoch row from, opened over the exact same backend as the
+room registry). `RoomActor` gained an `Option<Arc<RoomFencing<B>>>` field, defaulting to `None` on
+every construction path today (both `create`'s and `load`'s struct literals) -- `None` means
+`persist` behaves exactly as before this session, byte-for-byte, until something installs a
+fencing hook. New `RoomRegistry::install_fencing` (same `OnceLock`, idempotent-past-first-call
+shape as `install_global_token_resolver`) propagates the installed hook onto every actor the
+registry constructs or loads, in both `get_or_load` and `insert` (which `create_room` also goes
+through).
+
+**Where the check runs, and why it has to be there**: as the last read inside `persist`'s existing
+`transact(...)` closure (`crates/hs-room/src/actor.rs`, the same block session 3's cluster
+experiment cited by line number), immediately before the closure returns `Ok`. It must be inside
+this same transaction, not before it: `hs_kv`'s serializable snapshot isolation is what actually
+catches a concurrent handoff -- reading the epoch row *inside* the transaction adds it to that
+transaction's read set, so a concurrent `acquire_shard` write to that same row either fails this
+check immediately (if it already landed) or conflicts this transaction's commit (if it lands
+in between), per `hs_cluster::Fence::check`'s own contract. **How the failure gets back out**:
+`transact`'s closure is fixed by `hs-kv`'s own API to return `Result<T, hs_kv::KvError>`, which has
+no "fenced" variant -- the fix uses `hs_kv::KvError::Aborted` (an existing variant documented for
+exactly this: "a closure ... asked for the transaction to be aborted ... carrying an
+application-level error") to stop `transact`'s retry loop immediately, and a `std::cell::Cell<Option<String>>`
+declared just outside the closure to carry the human-readable message back out, since `Aborted`
+only carries a boxed `std::error::Error`. New `RoomError::Fenced(String)` variant, mapped to `503`
+(the caller should retry against whichever replica now actually owns the shard, which is
+`hs-cli`'s forwarding layer's job, not a client-visible `403`). `ownership.fence(shard)` returning
+`None` (this replica's own local view no longer includes the shard at all) is treated identically
+to a failed epoch check -- also a rejection, not a silent pass.
+
+**Tests**: `crates/hs-room/src/fencing.rs` gained its own module (4 tests), using a small in-crate
+fake `Ownership` (`FixedFence`, answering `fence()` with one fixed value regardless of which shard
+is asked about) rather than the full async `KvOwnership` acquisition machinery, plus a real
+`hs_cluster::store::ClusterStore` over a shared `MemoryBackend` for the actual epoch row:
+`no_fencing_installed_is_a_no_op` (unchanged behavior with the field at its default), `a_current_fence_allows_persist`,
+**`a_stale_fence_after_a_real_handoff_rejects_the_write`** (acquires a shard, then forces a second
+replica to take it over -- a real epoch bump through the real store -- and asserts a send still
+using the first, now-stale fence comes back `RoomError::Fenced`), and
+`ownership_reporting_no_fence_at_all_rejects_the_write`.
+
+**The one line `hs-cli` needs** (not written here, out of this track's ownership): after `let
+cluster_handles = crate::cluster::start(&config, backend.clone()).await?;` in `crates/hs-cli/src/serve.rs`
+(around line 959, by which point `rooms` -- the `Arc<RoomRegistry<B>>` -- has already been built at
+line 837 and `backend` is still in scope), add:
+```rust
+rooms.install_fencing(Arc::new(hs_room::fencing::RoomFencing {
+    ownership: cluster_handles.cluster.ownership().clone(),
+    layout: cluster_handles.layout,
+    cluster_store: hs_cluster::store::ClusterStore::open(backend.clone())
+        .map_err(|e| /* whichever ServeError variant wraps a cluster-store open failure */)?,
+}));
+```
+This is safe to call unconditionally, including in single-node mode: `Cluster::ownership()` there
+returns `hs_cluster::ownership::SingleNode`, whose `fence()` always answers `Fence::inert(shard)`,
+and `Fence::check` on an inert fence (`epoch: None`) is always `Ok(())` -- so installing this in
+single-node mode changes nothing observable, and clustered mode gets the real check.
+
+### How to verify (session 7)
+
+```
+cargo fmt -p hs-room
+cargo clippy -p hs-room --all-targets --no-deps -- -D warnings
+cargo test -p hs-room --lib            # 63 passed (up from 58)
+cargo test -p hs-room --test scenario  # 11 passed, unchanged
+cargo build -p hs-cli --bin hs
+cargo test -p hs-loadgen --test real_client -- --nocapture   # 28 steps, all pass, receipts/read-markers included
+```
+`cargo test -p hs-loadgen --test real_client_encrypted` was not re-run this session (nothing this
+session touched e2ee call paths); no reason to expect a regression there.
+
+### Interfaces provided (new this session)
+
+- **`hs_room::admin::RoomRegistryDirectory<B>`**: implements `hs_admin::sources::RoomDirectory`.
+  The seam track 15 asked for; needs the one `hs-cli` line above to actually reach a running
+  server.
+- **`hs_room::actor::{list_all_room_ids, set_room_blocked, room_block_reason}` /
+  `RoomRegistry::{list_all_room_ids, set_room_blocked, room_block_reason}`**: every room this
+  server has ever created, and the blocked-room flag/reason, both room-ID-keyed and not requiring
+  the room's actor to be resident.
+- **`hs_room::fencing::RoomFencing<B>`** and **`RoomRegistry::install_fencing`**: the cluster-fencing
+  hook, unused by anything in this crate's own wiring until `hs-cli` installs one.
+- **`RoomError::RoomBlocked(Option<String>)`** and **`RoomError::Fenced(String)`**: new error
+  variants, `403`/`503` respectively.
+
+### Interfaces needed
+
+- 15 (admin API): nothing new -- the trait contract from last session was implemented as
+  specified, no changes requested back.
+- 03 (cluster) / whoever next holds `hs-cli`: the two wiring lines above (admin room directory,
+  cluster fencing) are the only things standing between this session's work and a running server
+  actually using either.
+- Unchanged from session 5: the pagination-token format mismatch between `hs-user` and this crate,
+  `forgotten`/directory-publish query surfaces for `hs-user`.
+
+### Decisions made this session
+
+- **`hs-admin` and `hs-cluster` were added as normal path dependencies of `hs-room`** (not behind
+  an indirection trait the way `hs-auth`'s `DeviceListChangeNotifier`/`GlobalTokenResolver` hooks
+  were, in earlier sessions): both are cycle-free (neither depends on `hs-room` or `hs-auth`), so
+  there was no reason to avoid a direct dependency the way those two cases had to.
+- **The admin room directory loads every room's actor to build `list_rooms`**, with no bound on how
+  many rooms end up briefly resident. Accepted as an admin-only-operation scaling limit, the same
+  class of gap `/search` already carries, not fixed this session.
+- **`admin_summary`'s `forgotten` field means "zero currently-joined members," not "every past
+  member has explicitly forgotten it"** -- this crate has no durable index for the latter across
+  every user who has ever left, only `RoomActor::forget`'s in-memory, resident-lifetime set.
+- **A blocked room rejects `make_admin`'s own power-levels write too**, unconditionally, via the
+  same gate as any other local send. An operator must unblock first.
+- **`make_admin` picks the acting sender by highest current power level, ties broken by the
+  smaller user ID** -- deterministic, but arbitrary among equals; the spec/Synapse do not mandate a
+  specific tie-break.
+- **Cluster fencing defaults to installed-nowhere (`None`)** on every construction path in this
+  crate; it is purely additive and changes nothing until `hs-cli` calls
+  `RoomRegistry::install_fencing`, which this session did not do (out of this track's ownership).
+- **The fence-check failure is smuggled out of `hs_kv::transact`'s closure via
+  `KvError::Aborted` plus a `Cell`**, rather than widening `transact`'s fixed `Result<T, KvError>`
+  closure signature (an `hs-kv` change, out of this crate's ownership) or inventing a second
+  transaction. `KvError::Aborted` already exists for exactly "a closure asked for the transaction
+  to be aborted, carrying an application-level error."
 
 ## Session 6 (2026-09-19): profile-change propagation, and the missing device-list call sites
 

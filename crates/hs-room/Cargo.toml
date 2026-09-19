@@ -23,6 +23,14 @@ hs-kv = { path = "../hs-kv" }
 hs-tables = { path = "../hs-tables" }
 hs-auth = { path = "../hs-auth" }
 hs-http = { path = "../hs-http" }
+# Added session 7: the admin API's room directory (`hs_admin::sources::RoomDirectory`) is
+# implemented in this crate (`crate::admin`) over `RoomRegistry`, per `docs/status/15-admin-api-and-modules.md`'s
+# "Interfaces needed". No cycle: `hs-admin` depends on neither `hs-room` nor `hs-auth`.
+hs-admin = { path = "../hs-admin" }
+# Added session 7: `RoomActor::persist` calls `hs_cluster::Fence::check` as the belt-and-braces
+# guard `docs/status/03-cluster.md` names -- see `crate::fencing` and this crate's status file.
+# No cycle: `hs-cluster` depends only on `hs-kv`.
+hs-cluster = { path = "../hs-cluster" }
 
 [dev-dependencies]
 proptest.workspace = true

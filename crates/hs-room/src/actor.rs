@@ -229,6 +229,13 @@ pub struct RoomActor<B: KvBackend> {
     /// "Can re-join room if re-invited" case: forgetting must not be permanent).
     forgotten: HashSet<OwnedUserId>,
     publish: tokio::sync::broadcast::Sender<RoomUpdate>,
+    /// The cluster-fencing hook [`RoomActor::persist`] checks as the last read before committing
+    /// (`docs/status/03-cluster.md` item 4). `None` (the default for every construction path
+    /// today) means no fencing is installed -- single-node mode, or a server that has not wired
+    /// `hs-cluster` in at all -- in which case `persist` behaves exactly as before this field
+    /// existed. Installed by [`crate::registry::RoomRegistry::install_fencing`] onto every actor
+    /// it constructs or loads, once `hs-cli` (out of this crate's ownership) calls it.
+    fencing: Option<Arc<crate::fencing::RoomFencing<B>>>,
 }
 
 impl<B: KvBackend> RoomActor<B> {
@@ -328,6 +335,7 @@ impl<B: KvBackend> RoomActor<B> {
             event_txn: HashMap::new(),
             forgotten: HashSet::new(),
             publish,
+            fencing: None,
         };
         actor.persist(create_event)?;
         Ok(actor)
@@ -386,6 +394,7 @@ impl<B: KvBackend> RoomActor<B> {
             event_txn: HashMap::new(),
             forgotten: HashSet::new(),
             publish,
+            fencing: None,
         };
 
         let range_spec = hs_tables::keyspace::TypedKeyspace::<
@@ -683,6 +692,9 @@ impl<B: KvBackend> RoomActor<B> {
         now_ms: i64,
         prev_events: &[EventSn],
     ) -> Result<Event, RoomError> {
+        if let Some(reason) = self.blocked_reason()? {
+            return Err(RoomError::RoomBlocked(reason));
+        }
         let prev_refs = self.refs_for(prev_events)?;
         let state = self.state_view(prev_events)?;
         let event = pipeline::build_and_authorize(
@@ -1087,6 +1099,11 @@ impl<B: KvBackend> RoomActor<B> {
             .filter(|sn| self.forward_extremities.contains(sn))
             .collect();
 
+        // Set from inside the `transact` closure below when the cluster-fencing check fails, so
+        // the failure can be reported as `RoomError::Fenced` with its real message rather than
+        // the generic `hs_kv::KvError::Aborted` it must travel through `transact`'s fixed error
+        // type as (see `crate::fencing::RoomFencing::check`'s own doc comment).
+        let fence_failure: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
         let event_sn = transact(&self.backend, TransactConfig::default(), |txn| {
             let event_sn = self.tables.event_sn.get_or_create(txn, &event_id_bytes)?;
             if let Some(meta_bytes) = &room_meta_bytes {
@@ -1140,9 +1157,25 @@ impl<B: KvBackend> RoomActor<B> {
                         .map_err(to_kv)?;
                 }
             }
+            // The belt-and-braces cluster-fencing check (`docs/status/03-cluster.md` item 4), as
+            // the last read before this closure returns `Ok`: see `crate::fencing`'s module docs
+            // for why this must run *inside* this same transaction rather than before it. A no-op
+            // when `self.fencing` is unset (every construction path today, until `hs-cli` installs
+            // one -- see this crate's status file).
+            if let Some(fencing) = &self.fencing
+                && let Err(msg) = fencing.check(self.room_id.as_str(), txn)
+            {
+                fence_failure.set(Some(msg.clone()));
+                return Err(hs_kv::KvError::Aborted(Box::new(std::io::Error::other(
+                    msg,
+                ))));
+            }
             Ok(event_sn)
         })
-        .map_err(RoomError::from)?;
+        .map_err(|e| match fence_failure.take() {
+            Some(msg) => RoomError::Fenced(msg),
+            None => RoomError::from(e),
+        })?;
 
         // Feed the production state store. This runs as its own write after the room's own KV
         // transaction above commits, not inside it: `hs_state::api::StateStore`'s methods take
@@ -1489,6 +1522,24 @@ impl<B: KvBackend> RoomActor<B> {
         Ok(out)
     }
 
+    /// Whether this room is currently blocked by a server administrator, and if so, the reason
+    /// given (which may itself be absent). Read fresh from the store on every call -- not cached
+    /// on the actor -- so [`RoomRegistryDirectory`](crate::admin::RoomRegistryDirectory)'s
+    /// `set_blocked` takes effect immediately for a room whose actor is already resident, with
+    /// nothing to invalidate.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::Table`] on a storage failure.
+    fn blocked_reason(&self) -> Result<Option<Option<String>>, RoomError> {
+        let snapshot = self.backend.snapshot();
+        let Some(bytes) = self.tables.blocked_rooms.get(&snapshot, &(self.room_sn,))? else {
+            return Ok(None);
+        };
+        let block: crate::persist::RoomBlock = serde_json::from_slice(&bytes)
+            .map_err(|e| RoomError::Internal(format!("corrupt blocked-room row: {e}")))?;
+        Ok(Some(block.reason))
+    }
+
     // --- queries ---
 
     /// The room's ID.
@@ -1611,6 +1662,209 @@ impl<B: KvBackend> RoomActor<B> {
             .get("type")?
             .as_str()
             .map(str::to_owned)
+    }
+
+    /// Builds this room's admin-API summary (`hs_admin::model::AdminRoom`, the `GET /rooms`/`GET
+    /// /rooms/{room_id}` response shape). See `crate::admin::RoomRegistryDirectory`, the seam
+    /// that calls this.
+    ///
+    /// `forgotten` is a deliberate simplification, recorded in this crate's status file: there is
+    /// no durable per-user "has forgotten this room" index across every user who has ever been a
+    /// member ([`RoomActor::forget`]'s own tracking is in-memory, scoped to whoever called
+    /// `/forget` while this actor has been resident). A room with zero currently-joined members is
+    /// reported as forgotten; a room that still has joined members never is, regardless of who has
+    /// forgotten it.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::State`] if the state store fails.
+    pub fn admin_summary(&self) -> Result<hs_admin::model::AdminRoom, RoomError> {
+        let string_field = |event_type: &str, field: &str| -> Option<String> {
+            self.state_event(event_type, "")
+                .ok()
+                .flatten()?
+                .json()
+                .get("content")?
+                .as_object()?
+                .get(field)?
+                .as_str()
+                .map(str::to_owned)
+        };
+
+        let joined = self.joined_members()?;
+        let joined_members_count = joined.len() as u64;
+        let local_members_count = joined
+            .iter()
+            .filter(|e| {
+                e.header()
+                    .state_key
+                    .as_deref()
+                    .and_then(|k| UserId::parse(k).ok())
+                    .is_some_and(|u| u.server_name().as_str() == self.identity.server_name.as_str())
+            })
+            .count() as u64;
+        let state_events_count = self.full_state()?.len() as u64;
+
+        let create_event = self.state_event("m.room.create", "")?;
+        let creator = create_event.map(|e| e.header().sender.to_string());
+        let federatable = !matches!(
+            create_event
+                .and_then(|e| e.json().get("content"))
+                .and_then(CanonicalJsonValue::as_object)
+                .and_then(|c| c.get("m.federate")),
+            Some(CanonicalJsonValue::Bool(false))
+        );
+
+        let snapshot = self.backend.snapshot();
+        let public = self
+            .tables
+            .public_rooms
+            .get(&snapshot, &(self.room_sn,))?
+            .is_some();
+
+        let (blocked, blocked_reason) = match self.blocked_reason()? {
+            Some(reason) => (true, reason),
+            None => (false, None),
+        };
+
+        let replacement_room_id = self
+            .state_event("m.room.tombstone", "")
+            .ok()
+            .flatten()
+            .and_then(|e| e.json().get("content"))
+            .and_then(CanonicalJsonValue::as_object)
+            .and_then(|c| c.get("replacement_room"))
+            .and_then(CanonicalJsonValue::as_str)
+            .map(str::to_owned);
+
+        Ok(hs_admin::model::AdminRoom {
+            room_id: self.room_id.to_string(),
+            name: string_field("m.room.name", "name"),
+            topic: string_field("m.room.topic", "topic"),
+            avatar_url: string_field("m.room.avatar", "url"),
+            canonical_alias: string_field("m.room.canonical_alias", "alias"),
+            joined_members_count,
+            local_members_count,
+            state_events_count,
+            version: self.room_version.as_str().to_owned(),
+            creator,
+            encrypted: self.state_event("m.room.encryption", "")?.is_some(),
+            join_rule: string_field("m.room.join_rules", "join_rule")
+                .unwrap_or_else(|| "invite".to_owned()),
+            guest_access: string_field("m.room.guest_access", "guest_access")
+                .unwrap_or_else(|| "forbidden".to_owned()),
+            history_visibility: string_field("m.room.history_visibility", "history_visibility")
+                .unwrap_or_else(|| "shared".to_owned()),
+            federatable,
+            public,
+            room_type: self.creation_type(),
+            blocked,
+            blocked_reason,
+            tombstoned: replacement_room_id.is_some(),
+            replacement_room_id,
+            forgotten: joined_members_count == 0,
+        })
+    }
+
+    /// Grants `user_id` this room's highest currently-used power level (capped at 100), for
+    /// `hs-admin`'s `rooms.make_admin`. Sends a new `m.room.power_levels` event as whichever
+    /// currently-joined member already holds enough power to send it -- mirroring Synapse's
+    /// `make_room_admin` (read for behavior only, never copied, per this track's brief): `user_id`
+    /// is very likely the one member *without* enough power yet, so the event cannot be sent with
+    /// them as its own sender. Ties among equally-powerful candidates are broken by the smaller
+    /// user ID, for a deterministic choice.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::Forbidden`] if `user_id` does not currently hold `join` membership,
+    /// [`RoomError::BadRequest`] if no currently-joined member holds enough power to send
+    /// `m.room.power_levels` at all (a room whose only sufficiently-privileged members have all
+    /// left cannot be granted a new admin this way), or any error [`RoomActor::send_event`] can
+    /// return.
+    pub fn make_admin(&mut self, user_id: &UserId, now_ms: i64) -> Result<Event, RoomError> {
+        let is_joined = self
+            .state_event("m.room.member", user_id.as_str())?
+            .and_then(|e| e.json().get("content"))
+            .and_then(CanonicalJsonValue::as_object)
+            .and_then(|c| c.get("membership"))
+            .and_then(CanonicalJsonValue::as_str)
+            == Some("join");
+        if !is_joined {
+            return Err(RoomError::Forbidden(format!(
+                "{user_id} is not a member of this room"
+            )));
+        }
+
+        let power_event = self.state_event("m.room.power_levels", "")?;
+        let content_obj = power_event
+            .and_then(|e| e.json().get("content"))
+            .and_then(CanonicalJsonValue::as_object);
+        let levels = match content_obj {
+            Some(obj) => hs_model::power_levels::PowerLevels::parse(obj, &self.rules)
+                .map_err(|e| RoomError::Internal(e.to_string()))?,
+            None => hs_model::power_levels::PowerLevels::default(),
+        };
+
+        let target_level = levels.users.values().copied().max().unwrap_or(100).min(100);
+        let required = levels.required_power("m.room.power_levels", true);
+
+        let mut candidates: Vec<(i64, OwnedUserId)> = Vec::new();
+        for member in self.joined_members()? {
+            if let Some(sender) = member.header().state_key.as_deref()
+                && let Ok(sender_id) = UserId::parse(sender)
+            {
+                let power = levels.user_power(&sender_id);
+                if power >= required {
+                    candidates.push((power, sender_id.to_owned()));
+                }
+            }
+        }
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let Some((_, acting_sender)) = candidates.into_iter().next() else {
+            return Err(RoomError::BadRequest(
+                "no member of this room currently has enough power to send m.room.power_levels"
+                    .to_owned(),
+            ));
+        };
+
+        let mut new_content: serde_json::Value = match power_event {
+            Some(e) => match e.json().get("content") {
+                Some(c) => serde_json::from_slice(&c.to_canonical_bytes())
+                    .map_err(|err| RoomError::Internal(err.to_string()))?,
+                None => serde_json::json!({}),
+            },
+            None => serde_json::json!({}),
+        };
+        if !new_content.is_object() {
+            new_content = serde_json::json!({});
+        }
+        let users = new_content
+            .as_object_mut()
+            .expect("checked to be an object above")
+            .entry("users")
+            .or_insert_with(|| serde_json::json!({}));
+        if !users.is_object() {
+            *users = serde_json::json!({});
+        }
+        users
+            .as_object_mut()
+            .expect("checked to be an object above")
+            .insert(user_id.to_string(), serde_json::json!(target_level));
+
+        self.send_event(
+            acting_sender,
+            "m.room.power_levels".to_owned(),
+            Some(String::new()),
+            new_content,
+            None,
+            now_ms,
+        )
+    }
+
+    /// Installs (or clears) the cluster-fencing hook [`RoomActor::persist`] checks before
+    /// committing. Called by [`crate::registry::RoomRegistry`] right after constructing or
+    /// loading this actor, if a fencing hook has been installed on the registry -- see
+    /// `crate::fencing`'s module docs.
+    pub(crate) fn set_fencing(&mut self, fencing: Option<Arc<crate::fencing::RoomFencing<B>>>) {
+        self.fencing = fencing;
     }
 
     /// Shared by [`RoomActor::full_state`] and [`RoomActor::full_state_for_reader`]: every event
@@ -2460,6 +2714,95 @@ pub fn rooms_joined_by_user<B: KvBackend>(
     Ok(out)
 }
 
+/// Every room this server has ever created, per `Tables::room_meta` -- written once for every
+/// room, at its first persisted event (`RoomActor::persist`'s `is_first` branch), and never
+/// removed. This is the only enumeration this crate has of "every room on the server" (as opposed
+/// to "every room this process currently has resident", `RoomRegistry`'s own map, or "every
+/// *published* room", [`list_published_room_ids`]): used by the admin room directory
+/// (`crate::admin::RoomRegistryDirectory::list_rooms`), which has no other way to answer `GET
+/// /rooms` without a filter that would otherwise need one. A full keyspace scan, same scaling
+/// caveat as [`list_published_room_ids`] -- fine for an admin listing, not a hot path.
+///
+/// # Errors
+/// Returns [`RoomError::Store`]/[`RoomError::Table`] on a storage failure, or
+/// [`RoomError::Internal`] if a stored row fails to decode (should not happen: every entry here
+/// was written by [`RoomActor::persist`] itself).
+pub fn list_all_room_ids<B: KvBackend>(
+    backend: &B,
+    tables: &Tables<B>,
+) -> Result<Vec<OwnedRoomId>, RoomError> {
+    let snapshot = backend.snapshot();
+    let mut out = Vec::new();
+    for item in tables.room_meta.range(&snapshot, RangeSpec::full()) {
+        let (_, bytes) = item?;
+        let meta: RoomMeta = serde_json::from_slice(&bytes)
+            .map_err(|e| RoomError::Internal(format!("corrupt room_meta row: {e}")))?;
+        out.push(
+            OwnedRoomId::try_from(meta.room_id).map_err(|e| RoomError::Internal(e.to_string()))?,
+        );
+    }
+    Ok(out)
+}
+
+/// Blocks or unblocks `room_id` (`hs-admin`'s `rooms.set_blocked`). The real enforcement is
+/// [`RoomActor::send_event_citing`]'s own precheck (an internal read of this same row, fresh on
+/// every call) -- this function only needs to write it.
+///
+/// # Errors
+/// Returns [`RoomError::RoomNotFound`] if `room_id` has never been created, or
+/// [`RoomError::Store`] on a storage failure.
+pub fn set_room_blocked<B: KvBackend>(
+    backend: &B,
+    tables: &Tables<B>,
+    room_id: &RoomId,
+    blocked: bool,
+    reason: Option<String>,
+) -> Result<(), RoomError> {
+    let snapshot = backend.snapshot();
+    let Some(room_sn) = tables.room_sn.lookup(&snapshot, room_id.as_bytes())? else {
+        return Err(RoomError::RoomNotFound(room_id.to_string()));
+    };
+    transact(backend, TransactConfig::default(), |txn| {
+        if blocked {
+            let value = serde_json::to_vec(&crate::persist::RoomBlock {
+                reason: reason.clone(),
+            })
+            .map_err(|e| hs_kv::KvError::backend(std::io::Error::other(e.to_string())))?;
+            tables
+                .blocked_rooms
+                .put(txn, &(room_sn,), &value)
+                .map_err(to_kv)
+        } else {
+            tables.blocked_rooms.delete(txn, &(room_sn,)).map_err(to_kv)
+        }
+    })
+    .map_err(RoomError::from)
+}
+
+/// Whether `room_id` is currently blocked, and if so, its reason (which may itself be absent).
+/// `Ok(None)` means "not blocked", including for a room that has never been created (same
+/// existence-agnostic convention as [`is_directory_public`]); `Ok(Some(reason))` means blocked.
+///
+/// # Errors
+/// Returns [`RoomError::Store`]/[`RoomError::Table`] on a storage failure, or
+/// [`RoomError::Internal`] if the stored row fails to decode.
+pub fn room_block_reason<B: KvBackend>(
+    backend: &B,
+    tables: &Tables<B>,
+    room_id: &RoomId,
+) -> Result<Option<Option<String>>, RoomError> {
+    let snapshot = backend.snapshot();
+    let Some(room_sn) = tables.room_sn.lookup(&snapshot, room_id.as_bytes())? else {
+        return Ok(None);
+    };
+    let Some(bytes) = tables.blocked_rooms.get(&snapshot, &(room_sn,))? else {
+        return Ok(None);
+    };
+    let block: crate::persist::RoomBlock = serde_json::from_slice(&bytes)
+        .map_err(|e| RoomError::Internal(format!("corrupt blocked-room row: {e}")))?;
+    Ok(Some(block.reason))
+}
+
 #[derive(Debug)]
 struct AliasInUse;
 impl std::fmt::Display for AliasInUse {
@@ -2595,6 +2938,23 @@ impl<B: KvBackend> RoomActorHandle<B> {
         B: 'static,
     {
         self.with_actor(move |actor| actor.forget(&user)).await
+    }
+
+    /// `hs-admin`'s `rooms.make_admin` (`RoomActor::make_admin`).
+    pub async fn make_admin(&self, user_id: OwnedUserId, now_ms: i64) -> Result<Event, RoomError>
+    where
+        B: 'static,
+    {
+        self.with_actor(move |actor| actor.make_admin(&user_id, now_ms))
+            .await
+    }
+
+    /// This room's admin-API summary (`RoomActor::admin_summary`).
+    pub async fn admin_summary(&self) -> Result<hs_admin::model::AdminRoom, RoomError>
+    where
+        B: 'static,
+    {
+        self.with_actor(move |actor| actor.admin_summary()).await
     }
 
     /// `crate::protocol`'s `redact` command: sends the `m.room.redaction` event, then applies its

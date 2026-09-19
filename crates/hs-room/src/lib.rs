@@ -24,12 +24,18 @@
 //!   idle eviction.
 //! - [`state`]: [`state::RoomState`], this crate's axum shared state, and [`state::RoomRequester`].
 //! - [`routes`]: the client-server HTTP endpoints, as a router fragment (`routes::router`).
+//! - [`admin`]: implements `hs_admin::sources::RoomDirectory` over [`registry::RoomRegistry`], the
+//!   seam the admin API's `/rooms` operations call.
+//! - [`fencing`]: [`fencing::RoomFencing`], the optional cluster-fencing hook
+//!   [`actor::RoomActor::persist`] checks before committing.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod actor;
+pub mod admin;
 pub mod error;
+pub mod fencing;
 pub mod history_visibility;
 pub mod identity;
 pub mod membership;
