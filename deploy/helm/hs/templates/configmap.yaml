@@ -14,7 +14,16 @@ data:
       {{- if .Values.publicBaseUrl }}
       public_baseurl: {{ .Values.publicBaseUrl | quote }}
       {{- end }}
-      signing_key_path: /etc/hs/secrets/signing.key
+      # A *directory*, not a file: `hs-cli`'s identity loader
+      # (crates/hs-cli/src/identity.rs::first_signing_key_in_dir) does a non-recursive
+      # `read_dir` over every regular file here, Synapse-style, and reads the first parseable
+      # `ed25519 <key-id> <base64-seed>` line it finds. Pointing this at a file (as an earlier
+      # version of this chart did, `subPath`-mounting the Secret directly onto this path) makes
+      # `read_dir` fail silently, and `hs serve` falls back to a fresh in-memory key every
+      # restart — verified live against the built image, 2026-09-19 (see
+      # docs/status/12-platform-and-kubernetes.md). The volume below mounts the whole Secret as a
+      # directory instead, with no `subPath`.
+      signing_key_path: /etc/hs/secrets/signing-key
     listeners:
       listeners:
         - port: {{ .Values.service.clientPort }}

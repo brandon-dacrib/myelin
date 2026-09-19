@@ -11,14 +11,17 @@
 //!
 //! # Status
 //!
-//! No cluster access exists in the environment this crate was written in (no `kind`, no live
-//! Kubernetes API). Everything here is therefore validated by: CRD schema generation succeeding
-//! and round-tripping through YAML (`crds::tests`), reconcile stub logic exercised directly as
-//! plain async functions against hand-built resource values (`reconcile::tests`), and
-//! `deploy/crds/*.yaml` reviewed by eye against the OpenAPI v3 schema Kubernetes expects. None of
-//! this proves the CRDs actually apply cleanly to a real API server or that a real `Controller`
-//! watch loop behaves correctly under real events; `docs/status/12-platform-and-kubernetes.md`
-//! records that gap explicitly.
+//! CRD schema generation round-trips through YAML (`crds::tests`), reconcile stub logic is
+//! exercised directly as plain async functions against hand-built resource values
+//! (`reconcile::tests`), and `deploy/crds/*.yaml` applies cleanly to a real Kubernetes API server
+//! (verified 2026-09-19 against a real cluster, not `kind` — see
+//! `docs/status/12-platform-and-kubernetes.md`). `src/bin/live_smoke.rs` additionally proved that
+//! a real `kube::runtime::Controller` watching a real API server delivers events into
+//! [`reconcile::reconcile_homeserver`] and produces the expected `Action` — the stub reconcile
+//! functions have run against a live cluster, not just in-process unit tests. What has *not* been
+//! built yet: the reconcile functions still only compute a `status`, with no create/patch calls
+//! against owned resources (`StatefulSet`/`ConfigMap`/`Service`) — see `reconcile`'s module doc
+//! for exactly what remains Phase 1/2 work.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

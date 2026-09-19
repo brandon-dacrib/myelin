@@ -2307,15 +2307,20 @@ dependencies = [
 name = "hs-compat"
 version = "0.0.1"
 dependencies = [
+ "axum",
  "hex",
  "hmac 0.12.1",
  "hs-config",
+ "http-body-util",
  "rand 0.9.5",
  "serde",
  "serde_json",
  "serde_yaml_ng",
  "sha1",
  "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tower",
 ]
 
 [[package]]
@@ -2534,6 +2539,7 @@ dependencies = [
  "futures",
  "k8s-openapi",
  "kube",
+ "rustls",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -2695,6 +2701,7 @@ dependencies = [
  "hs-http",
  "hs-kv",
  "hs-model",
+ "hs-push",
  "hs-room",
  "hs-tables",
  "hs-testkit",

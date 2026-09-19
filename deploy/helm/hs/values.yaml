@@ -120,9 +120,14 @@ secrets:
   sessionSecret:
     existingSecret: ""
     key: session-secret
-  ## The Ed25519 signing key file (`hs generate-signing-key` format). Required; there is no
-  ## generated default, since a signing key must be stable across restarts and (for federation)
-  ## across the cluster.
+  ## The Ed25519 signing key (`hs generate-signing-key` format). Required; there is no generated
+  ## default, since a signing key must be stable across restarts and (for federation) across the
+  ## cluster. The whole Secret named by `existingSecret` is mounted as a directory at
+  ## `server.signing_key_path` (`hs-cli` scans every file in that directory, Synapse-style, for
+  ## the first parseable key) — `key` documents which data key inside that Secret should hold it
+  ## (`kubectl create secret generic <name> --from-file=signing.key=<path>`); it is no longer
+  ## used to `subPath`-mount a single file, since that silently defeated key persistence (see
+  ## templates/configmap.yaml's comment on `signing_key_path`).
   signingKey:
     existingSecret: ""
     key: signing.key

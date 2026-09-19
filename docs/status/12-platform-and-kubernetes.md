@@ -1,6 +1,220 @@
 # 12. Platform and Kubernetes
 
-Last updated 2026-09-18, by the "mount what already exists" assignment: `hs serve` mounted only
+## From "runs on my machine" to "runs in a cluster" (2026-09-19)
+
+This session's assignment: the server had never been packaged or deployed for real — no
+production image had ever been built and run, and the operator had never reconciled against a
+real API server. Both are now true, with transcripts. See the four subsections immediately below;
+everything from "Mounting hs-room/hs-media/hs-appservice/hs-admin" down is the prior session's
+record, unchanged.
+
+### 1. Production image: built, run, and one real bug found and fixed
+
+`deploy/Dockerfile` had never been built (its own header said so). Building it
+(`docker build -f deploy/Dockerfile -t hs:track12-verify .`, OrbStack, linux/arm64 native) found
+one real bug: `FROM rust:${RUST_VERSION}-slim-bookworm` read a build arg that was never declared
+with `ARG RUST_VERSION` above the `FROM` line (global build args must be declared before the
+first `FROM` to be visible there). `${RUST_VERSION}` silently resolved to `""` — `rust:-slim-
+bookworm`, not a real tag — so the image had *never* successfully built, ever, in any environment.
+Fixed with `ARG RUST_VERSION=1.98` (a default, so a plain `docker build` with no `--build-arg`
+still works) — see the Dockerfile's own header comment for the full explanation.
+
+With that one-line fix, the image builds clean: multi-stage, static-musl release build of `hs-cli`
+(`cargo build --release --locked -p hs-cli --target aarch64-unknown-linux-musl`, ~2m41s compile),
+copied into `gcr.io/distroless/static-debian12:nonroot`. Final image: **50.9MB**, runs as
+`65532:65532` (verified with `docker top`, not just read off the Dockerfile), no shell.
+
+Ran it end to end:
+```
+$ docker run -d --name hs-track12-verify --read-only --tmpfs /tmp \
+    -v .../homeserver.yaml:/etc/hs/config/homeserver.yaml:ro \
+    -v .../signing-key-dir:/etc/hs/secrets/signing-key:ro \
+    -v .../data:/var/lib/hs/data -v .../media:/var/lib/hs/media \
+    -p 18108:8008 hs:track12-verify serve -c /etc/hs/config/homeserver.yaml
+
+$ curl http://127.0.0.1:18108/health/live       -> 200 "ok"
+$ curl http://127.0.0.1:18108/health/ready      -> 200 "ready"
+$ curl http://127.0.0.1:18108/_matrix/client/versions
+  -> 200 {"versions":["r0.0.1",...,"v1.12"],"unstable_features":{}}
+$ curl http://127.0.0.1:18108/metrics | head
+  -> hs_http_requests_total{method="GET",route="/health/live",status_class="2xx"} 1  (etc.)
+$ docker restart hs-track12-verify; curl .../health/live -> 200 "ok"   # survives a restart
+```
+`docker top` during the run showed `USER 65532`, confirming the non-root claim is real, not just
+asserted. Image and build cache pruned after (`docker rmi`, `docker builder prune -f`,
+`docker image prune -f`); disk went from 11GiB free at session start to 15GiB free at session end
+(a stray ~2GB of pre-existing dangling build cache got reclaimed along with this session's own).
+
+**Second real bug, found by actually running the image against the chart's own config shape**:
+`hs-cli`'s signing-key loader (`crates/hs-cli/src/identity.rs::first_signing_key_in_dir`) treats
+`server.signing_key_path` as a *directory* — non-recursive `read_dir`, Synapse-style, one key file
+per directory entry — not a file. The chart's `configmap.yaml` set `signing_key_path` to a literal
+file path (`/etc/hs/secrets/signing.key`) and `statefulset.yaml` `subPath`-mounted the Secret onto
+exactly that file. `read_dir` on a regular file fails, so `hs serve` silently fell back to a fresh
+in-memory-only signing key (logged at `warn`, easy to miss) — reproduced live: the first run logged
+`no ed25519 signing key found; generating an ephemeral one for this process only`. Every pod
+restart under the old chart would have gotten a *different* signing key, silently invalidating
+federation signatures and any persisted state that depends on signature continuity across
+restarts — exactly the property a `StatefulSet` is supposed to give you. Fixed in the chart (mine
+to own): the Secret is now mounted as a directory (no `subPath`) at
+`/etc/hs/secrets/signing-key`, and `signing_key_path` points at that directory. Reran the same
+container with the fixed layout: no ephemeral-key warning, `/health/live` still 200. See
+`deploy/helm/hs/templates/configmap.yaml`'s comment on `signing_key_path` and
+`deploy/helm/hs/templates/statefulset.yaml`'s comment on the `secrets-signing-key` volume mount
+for the full explanation; `deploy/helm/hs/values.yaml`'s `secrets.signingKey` doc comment updated
+to match.
+
+Also fixed, found while reading the chart end to end for this session: `templates/NOTES.txt`'s
+"check readiness" `kubectl get pods -l ...` command built its label selector from
+`hs.selectorLabels` (which renders YAML `key: value` lines, correct for a labels block) by only
+replacing newlines with commas — producing `app.kubernetes.io/name: hs,app.kubernetes.io/instance:
+hstest`, which is not valid `-l` selector syntax (needs `=`, no space). Cosmetic (doesn't affect
+the actual chart resources), but it's copy-paste output from `helm install` itself, so it's now
+fixed to also replace `": "` with `"="`.
+
+`helm lint` and `helm template` still pass after all three fixes (unchanged from the previous
+session's baseline claim, now re-verified after edits).
+
+### 2. Chart installed against a real cluster — twice, both cleaned up after
+
+No `kind`/`minikube`/`k3d` binary exists in this environment. `kubectl config current-context`
+resolves to `admin@dacrib0`, a real, long-lived, non-disposable Talos cluster (nodes at 42-415
+days uptime; `cnpg-system`, `cert-manager`, `argocd`, `longhorn-system`, `metallb-system`, etc.
+already installed) — the same one the previous session found and deliberately left untouched. This
+session's judgment call: touching it is fine as long as every change is additively scoped to a
+throwaway namespace this session creates and fully tears down, and nothing pre-existing is read,
+modified, or deleted. Two such round trips happened, both cleaned up completely
+(`kubectl get ns`/`get crd` confirmed empty afterward):
+
+**a. `helm install` (real install, not `--dry-run`)**, `singleNode`/`embedded` mode (the mode
+`hs-cli` can actually run today — Postgres/SlateDB storage backends still return
+`StorageOpenError::BackendNotImplemented`, per the previous session's notes, unchanged), into a
+scratch namespace, `image.pullPolicy=Never` (this session's locally-built image lives only on this
+Mac; the cluster's Talos nodes are separate machines with no route to a registry this session has
+push access to, so a real container is out of reach here — noted honestly rather than glossed
+over). Real, informative results from the real API server:
+- `PersistentVolumeClaim` bound automatically against the cluster's real default StorageClass
+  (`longhorn`) — proves the embedded-storage PVC template is correct, not just syntactically valid.
+- Pod scheduled, `SuccessfulAttachVolume` for the bound PVC, `ConfigMap`/`Secret` volumes
+  constructed and referenced correctly (mount plan accepted, no error before the image pull step).
+- `PodSecurityContext`/`SecurityContext` (non-root, read-only-root-fs, drop-all-caps,
+  `seccompProfile: RuntimeDefault`) passed the API server's admission with no `PodSecurity` denial.
+- Failed exactly where expected and nowhere else: `ErrImageNeverPull` on
+  `ghcr.io/hs:track12-verify` (not present on the node, `pullPolicy: Never`) — the one piece this
+  environment cannot supply (a registry the cluster can pull from), not a chart defect.
+- `Service`/`Service-headless` created with the right selectors; `PodDisruptionBudget` correctly
+  *absent* (skipped by the template, as documented, since `mode: singleNode` forces one replica).
+
+  Cleanup: `helm uninstall`, `kubectl delete pvc/secret/namespace` — `kubectl get ns` confirmed
+  the namespace is gone.
+
+**b. `hs-operator`'s CRDs**, `kubectl apply --dry-run=server` for all five kinds (an upgrade from
+the previous session's `--dry-run=client --validate=false`, which never contacted the API server's
+own structural-schema validation) — all five `created (server dry run)`, no admission error. See
+"3. The operator" below for the further step of actually applying `Homeserver`'s CRD for real (not
+dry-run) and reconciling against it.
+
+If another track needs a disposable cluster on demand rather than negotiating scoped access to a
+real one each time, that is worth raising with whoever can provision one (self-hosted `kind`-in-CI
+runner, or a dedicated ephemeral namespace-per-track convention on this same cluster) — out of
+scope to set up this session.
+
+### 3. The operator: reconciled against a real API server for the first time
+
+Previously: zero cluster access, by the previous session's own account
+(`crates/hs-operator/src/lib.rs`'s old "Status" section said exactly that), so every claim about
+the CRDs and reconcile stubs was validated only by unit tests with no `kube::Client` involved
+anywhere.
+
+This session, with real (scoped, cleaned-up) cluster access available: applied
+`deploy/crds/homeserver.yaml` for real (not dry-run), created a real `Homeserver` object in a
+scratch namespace, and ran a new diagnostic binary
+(`crates/hs-operator/src/bin/live_smoke.rs`, `cargo run -p hs-operator --bin live-smoke`) that
+builds a real `kube::Client` from the ambient kubeconfig and wires the *actual*
+`reconcile::reconcile_homeserver` function (the same one `reconcile::tests` calls directly on
+hand-built values, completely unchanged) into a real `kube::runtime::Controller`. Output:
+```
+SMOKE: connected, watching Homeserver objects in namespace "hs-operator-smoke"
+SMOKE-OK: reconciled ObjectRef { dyntype: (), name: "sample", namespace: Some("hs-operator-smoke"),
+  extra: Extra { resource_version: Some("220237321"), uid: Some("540e9fc5-...") } }
+  -> Action { requeue_after: Some(300s) }
+```
+This proves the watch-stream-to-reconcile-function plumbing is correct against a real API server
+(typed deserialization of a real object off the wire, `Arc<Homeserver>` handed to the exact
+production reconcile function, `Action` returned and honored) — something no test in this crate
+had ever exercised before. It does **not** prove more than that: `reconcile_homeserver` is still
+the stub it always was (computes a status, makes no create/patch calls) — see `reconcile`'s module
+doc, unchanged, for what "stub" still means and what Phase 1/2 work remains (owned-resource
+creation, status subresource patches, finalizers). `crates/hs-operator/src/lib.rs`'s "Status"
+section is updated to describe exactly this line: real plumbing proven, real workload creation not
+yet built.
+
+`live-smoke` is a manual verification tool, not a production binary — nothing in `deploy/` runs it,
+it is not built into `deploy/Dockerfile`'s image, and it needs `rustls`'s default `CryptoProvider`
+installed by hand (`rustls::crypto::ring::default_provider().install_default()`) since nothing
+else in this crate does that for it, unlike `hs-cli` which gets one transitively. Left in the crate
+so the next person (or a future `kind`-based CI job) can rerun the same proof without taking this
+session's word for it. Cleanup after the run: deleted the sample `Homeserver`, the scratch
+namespace, and the CRD itself (`kubectl get crd | grep matrix` confirmed empty afterward) — the
+cluster carries zero trace of this session's work.
+
+`cargo fmt -p hs-operator`, `cargo clippy -p hs-operator --all-targets -- -D warnings`, and
+`cargo test -p hs-operator` (20 tests, unchanged pass count from before this session, plus the new
+`live-smoke` binary target compiling clean as part of `--all-targets`) all still pass.
+
+### 4. Probes: read the real behavior, didn't touch `hs-cli` (not owned by this track this session)
+
+Traced `/health/live` and `/health/ready` in `crates/hs-cli/src/serve.rs` (read-only — `hs-cli` is
+out of scope this session) rather than assuming the brief's framing ("today it answers from a
+flag") was still current. It is not, entirely: **track 03 has already wired real cluster-ownership
+readiness in**, apparently concurrently with or shortly before this session:
+
+- `/health/live` (`serve.rs:653`): unconditional 200. Correct as a liveness check — it should stay
+  cheap and answer "is the process alive", not "is it useful".
+- `/health/ready` (`serve.rs:662`): checks, in order, (a) a per-process `Arc<AtomicBool>` `ready`
+  flag, and (b) `hs_cluster::Cluster::ready()`, which returns
+  `Readiness::Ready`/`Readiness::NotReady(reason)` — explicitly documented in `hs-cluster` itself
+  (`crates/hs-cluster/src/ownership.rs:64-71`) as "consumed by track 12's `/health/ready`" and, per
+  that doc comment, `Ready` means "joined the mesh (or running single-node), heartbeated, and
+  ownership has converged". So **shard-ownership readiness is already real**, not a gap — this
+  session's brief was written before (or without seeing) that landed.
+- **What's still missing, precisely**: the `ready` `AtomicBool` (b above) is constructed with
+  `AtomicBool::new(true)` (`serve.rs:940`, right after storage and cluster startup already
+  succeeded — a failure there returns `Err` before this line, so the flag existing at all already
+  implies storage opened and cluster startup succeeded) and **is never set to `false` anywhere in
+  the file** — grepped for every `ready` reference to confirm. `ServeHandle::shutdown` (`serve.rs`,
+  around the `Cluster::drain` call at line ~724) *does* correctly call `cluster.drain(...)` before
+  tearing down HTTP listeners on `SIGTERM`, which is the right shape for graceful handoff — but it
+  never flips the `ready` flag to `false` first. If `Cluster::drain` itself doesn't make
+  `cluster.ready()` report `NotReady` while draining (not verified this session — `hs-cluster`'s
+  internals are track 03's, not read in depth here), then `/health/ready` may keep answering 200
+  for the length of `CLUSTER_DRAIN_DEADLINE` after `SIGTERM` is received, meaning the Kubernetes
+  `Service` could keep routing new requests to a pod that is actively trying to hand off its
+  shards and shut down — a real, if narrow, race during rolling updates. The fix, if
+  `Cluster::drain` doesn't already cover it: flip `ready.store(false, Ordering::SeqCst)` as the
+  very first line of `ServeHandle::shutdown`, before calling `cluster.drain(...)`. This is a one-
+  or two-line `hs-cli` change; flagging it here rather than making it, per this session's scope
+  boundary.
+- **Storage reachability**: not a live, ongoing check — it's checked once at startup (opening the
+  backend is one of the first things `spawn_serve` does; failure there is a hard `Err`, the process
+  never gets far enough to bind a listener at all). That's a reasonable fail-fast design for a
+  storage handle that, once open, doesn't silently go away (Fjall) or is expected to reconnect
+  transparently (a `sqlx`/similar pool, for the Postgres backend once that lands) — but it means a
+  storage backend that becomes unreachable *after* startup (e.g., the Postgres backend once
+  implemented, if the network partition outlasts the pool's own retry logic) has no dedicated
+  `/health/ready` signal distinguishing it from "healthy" today. Worth a real check
+  (`SELECT 1`-equivalent, rate-limited so it doesn't hammer the backend every 5s per the chart's
+  `probes.readiness.periodSeconds`) once a reconnecting backend exists; moot for the embedded
+  (Fjall) backend, which doesn't fail this way.
+- **Listener-bound status**: implicit and correct as-is — a listener that failed to bind is a
+  startup `Err` (same fail-fast shape as storage), and `/health/live`/`/health/ready` cannot even
+  be reached by a probe on a port that never opened, so Kubernetes already sees this correctly via
+  `startupProbe`/`livenessProbe` timing out against a connection refused, not a wrong 200.
+
+No `hs-cli` files were edited to produce this section — it is exactly what's on disk today, read
+and cross-referenced against `hs-cluster`'s own doc comments.
+
+ `hs serve` mounted only
 `hs-auth`'s routes even though `hs-room`, `hs-media`, `hs-appservice` and `hs-admin` were fully
 built, tested and committed in their own crates — the structural finding that spec-coverage
 reported 17/235 routes not because the work wasn't done, but because nothing served it. This
@@ -422,29 +636,46 @@ existing test) — all passing; `cargo clippy ... -- -D warnings` clean on both 
 
 ## In progress / Next
 
-- Wire `hs-operator`'s stub reconcile functions into a real `kube::runtime::Controller` that
-  actually creates/patches owned resources (`StatefulSet`, `ConfigMap`, `Service`), against a
-  `kind` cluster once one is available in this environment.
+- **Now unblocked, not yet done**: wire `hs-operator`'s stub reconcile functions into real
+  create/patch calls against owned resources (`StatefulSet`, `ConfigMap`, `Service`) — the
+  `live-smoke` bin (this session) proved the `Controller`/API-server plumbing works, so this is
+  now purely "write the reconcile logic", not "find out whether a controller can even run here".
+  Also still open: status-subresource patches (`.status().patch(...)`) and finalizers — neither
+  attempted this session, `live-smoke` only exercised the read side.
 - Fold `deploy/helm/hs` into `element-hq/ess-helm`'s `matrix-stack` umbrella chart as an
   alternative to its `synapse:` block (today it is a standalone chart with an aligned-but-separate
   values schema).
-- Actually build and push `deploy/Dockerfile` once Docker is available; add cosign signing and
-  SBOM generation (`PLAN.md` section 7's requirement — not started).
+- **Cosign signing and SBOM generation for the image** (`PLAN.md` section 7's requirement): still
+  not started. The image itself now builds and runs (this session); signing/SBOM tooling around
+  it is a separate step.
+- Multi-arch: this session only built and ran `linux/arm64` natively (OrbStack on Apple Silicon).
+  `docker buildx build --platform linux/amd64,linux/arm64` (the Dockerfile's own documented
+  invocation) was not attempted — worth a follow-up run once there's a reason to believe the
+  amd64 leg needs anything the arm64 leg didn't already exercise (unlikely, given no
+  architecture-specific code path exists, but unverified is unverified).
+- A real image registry the cluster's nodes can pull from: this session's chart install proved
+  everything up to the image pull (PVC binding, ConfigMap/Secret mounts, security context
+  admission all real and correct) and stopped at `ErrImageNeverPull` because there is no registry
+  bridging this Mac's local Docker images to the Talos cluster's containerd. Push access to a
+  registry both sides can reach (`ghcr.io` with real credentials, or a registry inside the
+  cluster) is what the next full-pod-boot verification needs.
 - Turn `.github/workflows/nightly-bench.yml` from "runs and uploads raw output" into a real
   pass/fail budget check against `PLAN.md` section 7.4's numbers, and get a dedicated (non-shared,
   non-GitHub-hosted) arm64 rig instead of `ubuntu-24.04-arm`.
 - Per-listener resource filtering in `hs serve` (`listeners[].resources` is parsed and stored but
   every listener currently serves the full router regardless of its declared resource list — see
-  `crates/hs-cli/src/serve.rs`'s `build_router` doc comment).
+  `crates/hs-cli/src/serve.rs`'s `build_router` doc comment). Not this track's file to edit this
+  session; noted for whoever owns `hs-cli` next.
 - `docs/config.md` generation, Debian/RPM packages, a Nix flake, cert-manager mTLS for the mesh,
-  the arm64 benchmark rig producing real numbers: none started (Phase 0/1 items from the original
-  brief, deprioritized this session in favor of the newly-assigned `hs-cli` work, which the
-  integration lead's message marked as the priority — "cannot package or probe a server that has
-  no entry point").
+  the arm64 benchmark rig producing real numbers: still none started.
 
 ## Blockers
 
-- None outright, but several "Next" items need a `kind` cluster or Docker, neither available here.
+- None outright. Docker and a real (if not disposable) cluster both turned out to be available
+  this session — see "Decisions made" for how the non-disposable-cluster question was handled.
+  The one genuine environment gap found: no image registry reachable from both this Mac and the
+  cluster's nodes, so a full pod successfully pulling and running this session's image was not
+  achievable here (see "In progress / Next").
 
 ## Interfaces provided
 
@@ -462,12 +693,25 @@ existing test) — all passing; `cargo clippy ... -- -D warnings` clean on both 
   `hs_cli::appservices::load` (registration-file loading + registry construction), and
   `hs_cli::media::build_media_state` (object store + metadata store + optional content-scanning
   engine from `--media-scanning-config`).
-- `hs-operator`: CRD schemas (Rust types in `hs_operator::crds`, generated YAML in `deploy/crds/`).
-- `deploy/helm/hs`: the chart values schema (`deploy/helm/hs/values.yaml`).
+- `hs-operator`: CRD schemas (Rust types in `hs_operator::crds`, generated YAML in `deploy/crds/`),
+  now also `live-smoke` (`cargo run -p hs-operator --bin live-smoke`), a manual diagnostic that
+  proves the reconcile stubs run against a real `kube::runtime::Controller`/API server — see "3.
+  The operator" above.
+- `deploy/helm/hs`: the chart values schema (`deploy/helm/hs/values.yaml`), now with a fixed
+  `signing_key_path` mount shape (a directory, not a `subPath` file — see "1. Production image").
 - CI: `.github/workflows/ci.yml` is what every track's PR now runs against.
 
 ## Interfaces needed
 
+- **From track 03 or whoever owns `hs-cli`'s shutdown path next**: `crate::serve::ServeHandle::shutdown`
+  calls `Cluster::drain(...)` on `SIGTERM` but never flips the per-process `ready` `AtomicBool`
+  (`serve.rs:940`) to `false` first. If `Cluster::drain` doesn't already make `cluster.ready()`
+  report `NotReady` for its own duration, `/health/ready` can keep answering 200 for up to
+  `CLUSTER_DRAIN_DEADLINE` after a pod receives `SIGTERM`, letting the Kubernetes `Service` keep
+  routing new requests to a pod that is mid-handoff. Suggested fix (one or two lines, in
+  `hs-cli`, not this track's file to edit this session):
+  `ready.store(false, Ordering::SeqCst)` as the first line of `ServeHandle::shutdown`, before
+  `cluster.drain(...)`. See "4. Probes" above for the full trace.
 - **From track 13 (`hs-config`)**: no `capabilities`/`unstable_features` section exists in the
   native config schema, and it cannot be bolted onto the main file today (`hs_config::Config`
   denies unknown top-level keys). `hs-cli` works around this with its own `--capabilities-config`
@@ -531,6 +775,30 @@ existing test) — all passing; `cargo clippy ... -- -D warnings` clean on both 
 
 ## Decisions made
 
+- **Touching the real cluster, this session (2026-09-19)**: the previous session found
+  `admin@dacrib0` (a real, long-lived cluster, not disposable) and deliberately used only
+  `--dry-run=client` against it, flagging the decision of whether to go further as one for
+  whoever picks up cluster-dependent work next. This session made that call: every interaction
+  was scoped to a namespace or CRD this session created itself, verified empty/gone afterward
+  (`kubectl get ns`, `kubectl get crd | grep matrix`), and nothing pre-existing on the cluster was
+  read, modified, or deleted. See "2. Chart installed against a real cluster" and "3. The
+  operator" above for exactly what ran and what was torn down.
+- **`deploy/Dockerfile`'s missing `ARG RUST_VERSION`**: fixed with a default
+  (`ARG RUST_VERSION=1.98`) rather than requiring `--build-arg` on every invocation, so CI and a
+  developer's plain `docker build` both work without extra flags; still overridable.
+- **Chart's `signing_key_path` mount shape**: changed from a `subPath` file mount to a whole-
+  Secret directory mount (see "1. Production image" above for why the file mount was a live bug,
+  reproduced and fixed this session). `secrets.signingKey.key` in `values.yaml` is kept as
+  documentation of which data key inside the Secret should hold the key, even though it is no
+  longer used to build a `subPath` — removing the field entirely would be a values-schema break
+  for no benefit, since the field still answers a real question (“what should I name the key when
+  I create this Secret”).
+- **`hs-operator` `live-smoke` bin, not a test**: a real `kube::Client`/`Controller` run against a
+  live API server does not fit `cargo test`'s model (no cluster is guaranteed to exist, and this
+  crate's other tests must stay fast and hermetic), so it is a separate opt-in binary rather than
+  a `#[test]` behind an env-var guard. Kept in the crate (not deleted after use) so the proof is
+  re-runnable, e.g. from a future `kind`-based CI job, instead of being a one-time claim in this
+  file that nobody can check.
 - **`hs-cli` scope**: implemented every subcommand `docs/compat/cli-shims.md` specifies
   (`serve`, `serve --synapse-config`, `generate-config`, `hash-password`,
   `generate-signing-key`, `register`, `version`). Password prompts use `rpassword` (added to
@@ -597,6 +865,10 @@ existing test) — all passing; `cargo clippy ... -- -D warnings` clean on both 
 - `crates/hs-operator/Cargo.toml` additionally pins `schemars = "0.8"` **directly** (not via
   `{ workspace = true }`, which stays at `"1"` for every other crate) — see "Decisions made" for
   why this one crate cannot follow the workspace's shared version.
+- `rustls = { workspace = true }` added as a direct dependency of `hs-operator` (2026-09-19; the
+  workspace entry already existed for other crates, so no root `Cargo.toml` change) — only used by
+  the new `live-smoke` diagnostic bin, to install a process-level `CryptoProvider` before `kube`'s
+  `rustls-tls` feature makes its first TLS connection. See `src/bin/live_smoke.rs`.
 
 ## How to verify everything in this file
 
@@ -651,4 +923,52 @@ helm template t deploy/helm/hs --set serverName=example.org --set secrets.signin
 # Observability skeletons
 python3 -c "import json; json.load(open('deploy/observability/grafana/hs-overview.json'))"
 python3 -c "import yaml; yaml.safe_load(open('deploy/observability/alerts/hs-rules.yaml'))"
+```
+
+## How to verify this session's additions (2026-09-19)
+
+```sh
+# Production image: build, run, curl, restart, teardown (needs Docker)
+docker build -f deploy/Dockerfile -t hs:verify .
+docker run --rm hs:verify generate-signing-key > /tmp/hs-verify/signing-key-dir/signing.key
+docker run --rm hs:verify generate-config --server-name verify.example > /tmp/hs-verify/homeserver.yaml
+# edit the generated config's signing_key_path/data_dir/media path to the mounts below, then:
+docker run -d --name hs-verify --read-only --tmpfs /tmp \
+  -v /tmp/hs-verify/homeserver.yaml:/etc/hs/config/homeserver.yaml:ro \
+  -v /tmp/hs-verify/signing-key-dir:/etc/hs/secrets/signing-key:ro \
+  -v /tmp/hs-verify/data:/var/lib/hs/data -v /tmp/hs-verify/media:/var/lib/hs/media \
+  -p 18108:8008 hs:verify serve -c /etc/hs/config/homeserver.yaml
+curl http://127.0.0.1:18108/health/live      # expect 200 "ok"
+curl http://127.0.0.1:18108/health/ready     # expect 200 "ready"
+curl http://127.0.0.1:18108/_matrix/client/versions
+docker logs hs-verify | grep -i ephemeral    # expect NO match (persistent key loaded)
+docker top hs-verify -o user                 # expect 65532 (non-root)
+docker rm -f hs-verify; docker rmi hs:verify
+
+# Chart against a real cluster (needs a kubectl context; creates/tears down a scratch namespace)
+kubectl create namespace hs-verify
+kubectl -n hs-verify create secret generic hs-signing-key --from-file=signing.key=/tmp/hs-verify/signing-key-dir/signing.key
+helm install hstest deploy/helm/hs -n hs-verify --set serverName=verify.example \
+  --set secrets.signingKey.existingSecret=hs-signing-key --set mode=singleNode \
+  --set image.repository=hs --set image.tag=verify --set image.pullPolicy=Never
+kubectl -n hs-verify get pod,pvc,svc   # expect PVC Bound, pod scheduled (ImagePullBackOff expected
+                                        # with no reachable registry — everything else should be clean)
+helm uninstall hstest -n hs-verify; kubectl delete namespace hs-verify
+
+# CRDs against a real API server (server-side dry run, no state left behind)
+for f in deploy/crds/*.yaml; do kubectl apply --dry-run=server -f "$f"; done
+
+# Operator: real Controller against a real API server (creates/tears down a CRD + scratch namespace)
+kubectl apply -f deploy/crds/homeserver.yaml
+kubectl create namespace hs-operator-smoke
+kubectl apply -n hs-operator-smoke -f <a sample Homeserver manifest — see src/bin/live_smoke.rs's doc comment>
+cargo build -p hs-operator --bin live-smoke
+HS_OPERATOR_SMOKE_NAMESPACE=hs-operator-smoke ./target/debug/live-smoke   # expect "SMOKE-OK: reconciled ..."
+kubectl delete namespace hs-operator-smoke
+kubectl delete -f deploy/crds/homeserver.yaml
+
+# hs-operator unit tests + lint (unchanged pass count, now also covers the live-smoke bin target)
+cargo fmt -p hs-operator
+cargo clippy -p hs-operator --all-targets -- -D warnings
+cargo test -p hs-operator
 ```

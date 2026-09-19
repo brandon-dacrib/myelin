@@ -6,7 +6,7 @@ Check rollout status:
   kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "hs.fullname" . }}
 
 Check readiness:
-  kubectl -n {{ .Release.Namespace }} get pods -l {{ include "hs.selectorLabels" . | replace "\n" "," }}
+  kubectl -n {{ .Release.Namespace }} get pods -l {{ include "hs.selectorLabels" . | replace ": " "=" | replace "\n" "," }}
 
 Port-forward the client API for a local check:
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "hs.fullname" . }} {{ .Values.service.clientPort }}:{{ .Values.service.clientPort }}

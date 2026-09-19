@@ -131,9 +131,12 @@ spec:
             - name: config
               mountPath: /etc/hs/config
               readOnly: true
+            ## Mounted as a directory (no `subPath`): `server.signing_key_path` in the rendered
+            ## config points at this directory, not a single file — see configmap.yaml's comment
+            ## on `signing_key_path` for why a file mount here silently produces a fresh signing
+            ## key on every restart instead of failing loudly.
             - name: secrets-signing-key
-              mountPath: /etc/hs/secrets/signing.key
-              subPath: {{ .Values.secrets.signingKey.key }}
+              mountPath: /etc/hs/secrets/signing-key
               readOnly: true
             {{- if .Values.secrets.registrationSharedSecret.existingSecret }}
             - name: secrets-registration-shared-secret

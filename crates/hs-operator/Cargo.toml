@@ -11,6 +11,10 @@ description = "kube-rs CRD schemas (Homeserver, AppService, Bridge, PushGateway,
 name = "gen-crds"
 path = "src/bin/gen_crds.rs"
 
+[[bin]]
+name = "live-smoke"
+path = "src/bin/live_smoke.rs"
+
 [dependencies]
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
@@ -28,5 +32,12 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
+# Only used by the `live-smoke` bin: `kube`'s `rustls-tls` feature needs a process-level
+# `rustls::crypto::CryptoProvider` installed before the first TLS connection, which nothing else
+# in this crate does for it (unlike `hs-cli`, which pulls one in transitively through other
+# crates). See `src/bin/live_smoke.rs`'s `main` for the `install_default()` call, and
+# `crates/hs-cluster/src/mesh/tls.rs::provider` for the same `ring` choice made elsewhere in this
+# workspace (matching the workspace's own `rustls` feature pin: `features = ["ring", ...]`).
+rustls = { workspace = true }
 
 [dev-dependencies]

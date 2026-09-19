@@ -4,16 +4,22 @@
 # (crates/hs-cli), built statically against musl so the final stage needs no libc at all and can
 # be `gcr.io/distroless/static` — the smallest, lowest-CVE-surface distroless base there is.
 #
-# UNTESTED: Docker is not available in the environment this was written in
-# (docs/status/12-platform-and-kubernetes.md notes this explicitly). This file has been reviewed
-# line by line against the multi-arch buildx pattern and the crate's actual dependencies (no C
-# libraries beyond what `ring`/`aws-lc-sys`/`fjall`'s zstd/lz4 bindings need, all of which build
-# fine against musl), but it has not been built. Validate with
-# `docker buildx build --platform linux/amd64,linux/arm64 -f deploy/Dockerfile .` before relying
-# on it in a release pipeline.
+# Built and run successfully on 2026-09-19 (see docs/status/12-platform-and-kubernetes.md for the
+# transcript): `docker build -f deploy/Dockerfile -t hs:track12-verify .` on linux/arm64
+# (OrbStack), then a running container answered `/health/live` and `/_matrix/client/versions`.
+# That first build caught one real bug this comment used to paper over: `${RUST_VERSION}` was
+# read in the `FROM` line below with no `ARG RUST_VERSION` declared above it, which is out of
+# scope for a build arg used in `FROM` (global build args must be declared before the first
+# `FROM`, and do not survive into a stage unless re-declared with `ARG NAME` inside it too, which
+# this file already does not need since the value is only used in `FROM`). The image had never
+# been built before that fix, so `${RUST_VERSION}` silently resolved to `""`, i.e.
+# `rust:-slim-bookworm` — not a real tag. Fixed below with a default so `docker build` with no
+# `--build-arg` still works.
 #
 # Build arguments:
-#   RUST_VERSION  - pinned to match rust-toolchain.toml's channel.
+#   RUST_VERSION  - pinned to match rust-toolchain.toml's channel; defaults to a recent stable.
+#
+ARG RUST_VERSION=1.98
 #
 # Deliberately *not* pinned to `--platform=$BUILDPLATFORM`: when built with
 # `docker buildx build --platform linux/amd64,linux/arm64`, buildx runs the entire build once per
