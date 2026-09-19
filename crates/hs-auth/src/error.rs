@@ -255,6 +255,21 @@ impl MatrixError {
         Self::new(StatusCode::BAD_REQUEST, ErrCode::UnknownDevice, msg)
     }
 
+    /// `404 M_UNRECOGNIZED`: the route exists in code but the feature it implements is not
+    /// configured on this server (for example,
+    /// `POST /_synapse/admin/v1/register` with no `registration_shared_secret` set). Deliberately
+    /// indistinguishable from "this route does not exist at all" -- neither a `500` nor a
+    /// working-but-pointless nonce -- so an unconfigured feature does not confirm its own
+    /// existence to an unauthenticated prober.
+    #[must_use]
+    pub fn feature_not_configured() -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            ErrCode::Unrecognized,
+            "Unrecognised request",
+        )
+    }
+
     /// `500 M_UNKNOWN` for storage/internal failures. Never leaks the underlying error text to
     /// the client; callers should `tracing::error!` the real cause before returning this.
     #[must_use]
@@ -364,5 +379,12 @@ mod tests {
         let err = MatrixError::user_suspended();
         assert_eq!(err.status(), StatusCode::FORBIDDEN);
         assert_eq!(err.errcode(), ErrCode::UserSuspended);
+    }
+
+    #[test]
+    fn feature_not_configured_is_404_unrecognized() {
+        let err = MatrixError::feature_not_configured();
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        assert_eq!(err.errcode(), ErrCode::Unrecognized);
     }
 }

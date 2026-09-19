@@ -49,6 +49,39 @@ pub(crate) async fn create_user_exact_duplicate_is_conflict<S: AuthStore>(s: &S)
     assert!(matches!(err, Err(StoreError::Conflict(_))));
 }
 
+pub(crate) async fn list_users_is_empty_for_a_fresh_store<S: AuthStore>(s: &S) {
+    assert!(s.list_users().await.unwrap().is_empty());
+}
+
+pub(crate) async fn list_users_is_sorted_by_user_id<S: AuthStore>(s: &S) {
+    s.create_user(UserRecord::new(user_id!("@zeta:example.org").to_owned(), 3))
+        .await
+        .unwrap();
+    s.create_user(UserRecord::new(
+        user_id!("@alice:example.org").to_owned(),
+        1,
+    ))
+    .await
+    .unwrap();
+    s.create_user(UserRecord::new(
+        user_id!("@mallory:example.org").to_owned(),
+        2,
+    ))
+    .await
+    .unwrap();
+
+    let users = s.list_users().await.unwrap();
+    let ids: Vec<&str> = users.iter().map(|u| u.user_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![
+            "@alice:example.org",
+            "@mallory:example.org",
+            "@zeta:example.org",
+        ]
+    );
+}
+
 pub(crate) async fn is_localpart_available_reflects_existing_users<S: AuthStore>(s: &S) {
     assert!(s.is_localpart_available("alice").await.unwrap());
     s.create_user(UserRecord::new(
@@ -424,6 +457,8 @@ pub(crate) async fn run_all<S: AuthStore>(make_store: impl Fn() -> S) {
     create_user_then_get_round_trips(&make_store()).await;
     create_user_conflict_is_case_insensitive(&make_store()).await;
     create_user_exact_duplicate_is_conflict(&make_store()).await;
+    list_users_is_empty_for_a_fresh_store(&make_store()).await;
+    list_users_is_sorted_by_user_id(&make_store()).await;
     is_localpart_available_reflects_existing_users(&make_store()).await;
     user_flag_setters_round_trip(&make_store()).await;
     set_password_hash_on_missing_user_is_not_found(&make_store()).await;

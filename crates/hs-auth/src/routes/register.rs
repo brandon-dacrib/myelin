@@ -83,7 +83,7 @@ pub async fn get_register_available(
     Ok(Json(json!({"available": true})))
 }
 
-fn validate_localpart(state: &AuthState, username: &str) -> Result<(), MatrixError> {
+pub(crate) fn validate_localpart(state: &AuthState, username: &str) -> Result<(), MatrixError> {
     UserId::parse_with_server_name(username, state.server_name())
         .map(|_| ())
         .map_err(|_| {

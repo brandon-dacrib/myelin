@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 
-use hs_kv::{KvBackend, KvError, TransactConfig, transact};
+use hs_kv::{KvBackend, KvError, RangeSpec, TransactConfig, transact};
 use hs_tables::index::{IndexDef, lookup, maintain_index};
 use hs_tables::keyspace::TypedKeyspace;
 use rand::Rng;
@@ -287,6 +287,25 @@ impl<B: KvBackend> UserStore for TablesAuthStore<B> {
             }
             None => Ok(None),
         }
+    }
+
+    /// A **full keyspace scan** of `hs_auth.users` -- there is no secondary index this could use
+    /// instead (`users_by_localpart_lower` is a point-lookup index, not an enumeration one), so
+    /// this reads every row in the keyspace on every call, decodes it, and sorts the result. See
+    /// [`UserStore::list_users`]'s doc comment for the cost trade-off; acceptable for a single
+    /// operator's admin-API user directory, not something to call in a hot path.
+    async fn list_users(&self) -> Result<Vec<UserRecord>, StoreError> {
+        let snap = self.backend.snapshot();
+        let mut users: Vec<UserRecord> = self
+            .users
+            .range(&snap, RangeSpec::full())
+            .map(|item| {
+                let (_k, v) = item.map_err(|e| StoreError::Backend(e.to_string()))?;
+                decode(&v)
+            })
+            .collect::<Result<_, StoreError>>()?;
+        users.sort_by(|a, b| a.user_id.cmp(&b.user_id));
+        Ok(users)
     }
 }
 

@@ -102,6 +102,20 @@ pub struct AuthConfig {
     /// the reference `devture` module already had to provision a *second* secret anyway — reusing
     /// the registration one here is strictly less new configuration surface, not more.
     pub shared_secret_auth_secret: Option<String>,
+
+    /// The shared secret for Synapse's `POST /_synapse/admin/v1/register` shared-secret
+    /// registration protocol (`crate::routes::synapse_admin`, `hs_compat::shared_secret`).
+    /// `None` (the default) disables both routes outright -- they answer `404 M_UNRECOGNIZED`
+    /// rather than issuing a nonce or accepting a MAC nobody could compute correctly anyway, so
+    /// an unconfigured server does not even reveal that the feature exists. Mapped from the same
+    /// `hs_config::AuthConfig::registration_shared_secret` field
+    /// [`shared_secret_auth_secret`](Self::shared_secret_auth_secret) reuses, but kept as its own
+    /// field rather than folded into that one: they are two different protocols (`register_new_
+    /// matrix_user`'s admin API vs. the `com.devture.shared_secret_auth` login type), and a
+    /// future split of `hs_config`'s single field into two operator-facing settings must not
+    /// silently change who can register admin accounts through this route. See
+    /// `docs/status/07-auth-and-identity.md` "Decisions made".
+    pub registration_shared_secret: Option<String>,
 }
 
 impl Default for AuthConfig {
@@ -126,6 +140,7 @@ impl Default for AuthConfig {
             terms_enabled: false,
             password_policy: PasswordPolicy::default(),
             shared_secret_auth_secret: None,
+            registration_shared_secret: None,
         }
     }
 }
@@ -188,6 +203,14 @@ impl TryFrom<&hs_config::Config> for AuthConfig {
             registration_enabled: config.auth.enable_registration,
             // See this method's doc comment: deliberately reused, not left at the default.
             shared_secret_auth_secret: config
+                .auth
+                .registration_shared_secret
+                .as_str()
+                .map(str::to_owned),
+            // The same native config field, mapped onto its own separate field per
+            // `registration_shared_secret`'s own doc comment -- two different protocols reading
+            // the same operator-configured secret, not one field silently standing in for both.
+            registration_shared_secret: config
                 .auth
                 .registration_shared_secret
                 .as_str()
@@ -385,6 +408,31 @@ mod tests {
         config.auth.registration_shared_secret = hs_config::SecretString::from("topsecret");
         let auth = AuthConfig::try_from(&config).unwrap();
         assert_eq!(auth.shared_secret_auth_secret.as_deref(), Some("topsecret"));
+    }
+
+    #[test]
+    fn try_from_maps_registration_shared_secret_as_its_own_field() {
+        let mut config = minimal_native_config();
+        assert!(
+            AuthConfig::try_from(&config)
+                .unwrap()
+                .registration_shared_secret
+                .is_none(),
+            "unset registration_shared_secret disables the synapse-admin register route"
+        );
+
+        config.auth.registration_shared_secret = hs_config::SecretString::from("topsecret");
+        let auth = AuthConfig::try_from(&config).unwrap();
+        assert_eq!(
+            auth.registration_shared_secret.as_deref(),
+            Some("topsecret")
+        );
+        // Both fields read the same native config value, but are independent fields (see this
+        // field's doc comment for why they are not folded into one).
+        assert_eq!(
+            auth.registration_shared_secret,
+            auth.shared_secret_auth_secret
+        );
     }
 
     #[test]

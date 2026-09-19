@@ -18,6 +18,11 @@
 //!   `/register`, `/account/*`, `/devices*`.
 //! - [`admin_verifier::AdminTokenVerifier`]: the `hs_admin::auth::TokenVerifier` implementation
 //!   `hs serve` wires into the admin API, over this crate's own user/token storage.
+//! - [`admin_directory::AuthStoreUserDirectory`]: the `hs_admin::sources::UserDirectory`
+//!   implementation `hs serve` wires into the admin API's `/users` surface, over the same store.
+//! - [`synapse_admin_router`]: the `/_synapse/admin/v1/register` shared-secret admin registration
+//!   router fragment, mounted separately from [`routes::router`] (see that function's own doc
+//!   comment for why).
 //!
 //! The native OAuth 2.0 authorization server is design-only for now:
 //! `docs/rfcs/0003-native-oauth-issuer.md`.
@@ -25,6 +30,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod admin_directory;
 pub mod admin_verifier;
 pub mod appservice;
 pub mod clock;
@@ -46,6 +52,15 @@ pub mod uia;
 pub use error::{ErrCode, MatrixError};
 pub use requester::{AppserviceIdentity, Requester, RequesterContext};
 pub use state::AuthState;
+
+/// The `/_synapse/admin/v1/register` shared-secret registration router fragment
+/// ([`routes::synapse_admin::router`]), re-exported at the crate root so callers do not need to
+/// reach into `routes::synapse_admin` directly. Mount this **separately** from
+/// [`routes::router()`] -- it is not nested under `/_matrix/client/v3`, it is an absolute path at
+/// the server root. See `docs/status/07-auth-and-identity.md` for the exact `hs serve` line.
+pub fn synapse_admin_router() -> axum::Router<AuthState> {
+    routes::synapse_admin::router()
+}
 
 /// Ruma re-export so consumers pin the same version this crate was built against.
 pub use ruma;

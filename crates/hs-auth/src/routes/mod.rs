@@ -6,6 +6,11 @@
 //! `/_matrix/client/v3`. Prefixing, version aliasing (`r0` vs `v3`) and mounting alongside every
 //! other track's routes is `hs-http`'s job (owned jointly with 15 and 14); this crate hands over a
 //! router fragment, not a listener.
+//!
+//! [`synapse_admin`] is a separate router fragment at an absolute, non-`/_matrix` path
+//! (`/_synapse/admin/v1/register`) and is deliberately **not** part of [`router`]'s fragment --
+//! see that module's doc comment for why. [`crate::synapse_admin_router`] re-exports it at the
+//! crate root for callers that do not want to reach into `routes::synapse_admin` directly.
 
 pub mod account;
 pub mod devices;
@@ -13,6 +18,7 @@ pub mod login;
 pub mod logout;
 pub mod refresh;
 pub mod register;
+pub mod synapse_admin;
 pub mod whoami;
 
 use axum::Router;

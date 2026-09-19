@@ -85,7 +85,7 @@ fn store_unavailable(err: StoreError) -> AuthError {
 /// epoch on an out-of-range value rather than panicking; `Principal.expires_at` is
 /// display/audit-only information, never consulted for the accept/reject decision itself (that
 /// uses `expires_at_ms` directly, before this function is ever called).
-fn format_rfc3339_ms(ms: u64) -> String {
+pub(crate) fn format_rfc3339_ms(ms: u64) -> String {
     use time::OffsetDateTime;
     use time::macros::format_description;
 
@@ -158,7 +158,10 @@ mod tests {
     use crate::store::memory::InMemoryAuthStore;
     use crate::store::{AccessTokenRecord, TokenStore, UserRecord, UserStore};
 
-    fn verifier_with(store: InMemoryAuthStore, now_ms: u64) -> (AdminTokenVerifier, Arc<FixedClock>) {
+    fn verifier_with(
+        store: InMemoryAuthStore,
+        now_ms: u64,
+    ) -> (AdminTokenVerifier, Arc<FixedClock>) {
         let clock = Arc::new(FixedClock::new(now_ms));
         let verifier = AdminTokenVerifier::new(Arc::new(store), clock.clone());
         (verifier, clock)
@@ -255,7 +258,10 @@ mod tests {
         let (verifier, _clock) = verifier_with(store, 1000);
 
         let principal = verifier.verify("syt_admintoken").await.unwrap();
-        assert_eq!(principal.expires_at.as_deref(), Some("1970-01-01T00:00:05.000Z"));
+        assert_eq!(
+            principal.expires_at.as_deref(),
+            Some("1970-01-01T00:00:05.000Z")
+        );
     }
 
     #[tokio::test]

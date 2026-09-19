@@ -2,9 +2,75 @@
 
 Track brief: `docs/workstreams/07-auth-and-identity.md`. Owner crate: `hs-auth`.
 
-Last updated: 2026-09-18 (session 3, completed its assignment — see "Session 3" below).
+Last updated: 2026-09-18 (session 4, completed its assignment — see "Session 4" below).
 
-## Session 3 summary (read this first)
+## Session 4 summary (read this first)
+
+Assignment (from `docs/next-steps.md` item 1 and the integration lead directly): **make it
+possible to have an admin at all, and give the admin API a real user data source.** Three
+deliverables, all done:
+
+1. **`crates/hs-auth/src/routes/synapse_admin.rs`** (new) — `GET`/`POST
+   /_synapse/admin/v1/register`, the shared-secret admin registration protocol
+   (`hs_compat::shared_secret`, already built and tested by track 13) finally wired to an HTTP
+   handler and a real account-creation path. Exported as its own router fragment (`pub fn
+   router() -> Router<AuthState>`, re-exported at the crate root as `hs_auth::synapse_admin_router`)
+   because it lives at an absolute, non-`/_matrix` path and must **not** be nested under
+   `routes::router()`'s `/_matrix/client/v3` mount point. The `NonceRegistry` lives in the router
+   fragment's own `Arc<Mutex<NonceRegistry>>`, injected via `axum::Extension`, not on `AuthState` —
+   see the module doc for why. Added `AuthConfig::registration_shared_secret: Option<String>` as its
+   own field (mapped from the same `hs_config::AuthConfig::registration_shared_secret` that
+   `shared_secret_auth_secret` already reused) rather than overloading the existing
+   `shared_secret_auth_secret` field, per this session's own instructions — the two protocols
+   (`register_new_matrix_user`'s admin API vs. `com.devture.shared_secret_auth` login) must stay
+   independently toggleable even though they read the same operator-configured secret today. Both
+   routes 404 with `M_UNRECOGNIZED` (`MatrixError::feature_not_configured`, new) when the secret is
+   unset. On success, account creation follows `routes::register.rs::register_user`'s exact shape
+   (password policy check, localpart availability check with a defensive TOCTOU re-check right
+   before `create_user`, `password::hash_password`, `UserRecord::new`, `session::create_session`)
+   but skips UIA entirely — the verified MAC *is* this endpoint's authentication — and sets
+   `is_admin` from the request body's `admin` field. Response body matches the Synapse shape
+   `crates/hs-cli/src/register.rs::RegisteredUser` already deserializes
+   (`user_id`/`access_token`/`home_server`/`device_id`). 8 new tests, including one each for a
+   replayed nonce, a bad MAC and a taken username, plus a full round trip that checks the created
+   user's `is_admin` flag against the store directly.
+2. **`UserStore::list_users`** (new trait method) — implemented in both `store::memory::
+   InMemoryAuthStore` (clone-and-sort) and `store::tables::TablesAuthStore` (a full,
+   undocumented-cost-until-now keyspace scan over `hs_auth.users` via `RangeSpec::full()`, following
+   `list_devices`'s range/decode shape; the scan cost is spelled out in both the trait method's and
+   the impl's doc comments — there is no secondary index to narrow it against, since there was never
+   a bounded "list users" access pattern to index for before now). Two new shared-behavior tests in
+   `store/shared_tests.rs` (`list_users_is_empty_for_a_fresh_store`,
+   `list_users_is_sorted_by_user_id`), run against both backends via the existing `run_all` harness.
+3. **`crates/hs-auth/src/admin_directory.rs`** (new) — `AuthStoreUserDirectory`, implementing
+   `hs_admin::sources::UserDirectory` (track 15 landed the `sources` module *during this session*,
+   mid-flight — confirmed against the live contract in `crates/hs-admin/src/sources.rs`, not the
+   snapshot pasted into this session's instructions, and it matched exactly) over `Arc<dyn
+   AuthStore>`. Fills `user_id`/`admin`/`deactivated`/`locked`/`suspended`/`shadow_banned`/
+   `created_at` straight from `UserRecord`, and `device_count`/`last_seen_at` from
+   `DeviceStore::list_devices` (count, and the max of the devices' `last_seen_ms`). `room_count` and
+   `media_count` are left at `0` — this crate has no view onto rooms (04) or media (09); see
+   "Interfaces needed". `display_name`/`avatar_url`/`user_type`/`consent_version`/`appservice_id`/
+   `erased` are also left at `AdminUser::default()` — none of them exist on `UserRecord` yet (profile
+   data is track 04's territory; erasure is an unbuilt Phase 1/2 lifecycle feature). 7 new tests.
+
+Also added, needed to make the above possible: `MatrixError::feature_not_configured()` (404
+`M_UNRECOGNIZED`, `error.rs`), and `admin_verifier::format_rfc3339_ms` and
+`routes::register::validate_localpart` both changed from private to `pub(crate)` so
+`admin_directory.rs`/`synapse_admin.rs` could reuse the existing RFC 3339 formatter and localpart
+validation instead of re-deriving them.
+
+**`hs-cli` still does not mount anything from this session.** `hs register --admin` will keep
+404ing, and `GET /api/v1/users` will keep answering from whatever fake/absent directory `hs serve`
+wires today, until track 12 (or whoever owns `serve.rs`) makes the three changes under "Interfaces
+provided" below. All three are mechanical — no design judgment left to make — and this crate's own
+tests (156 passing, up from 149) already exercise every piece that needs wiring.
+
+**Verification:** `cargo fmt --all` (clean), `cargo clippy -p hs-auth --all-targets -- -D warnings`
+(clean), `cargo test -p hs-auth` (156 passed, 0 failed). All three commands run from
+`/Users/brandon/Documents/git/matrix-reimplement`.
+
+## Session 3 summary
 
 Assignment: **replace `InMemoryAuthStore`-only storage with a persistent `hs-kv`/`hs-tables`-backed
 `AuthStore`** — the single most operationally important gap in the project, since until this landed
@@ -291,12 +357,47 @@ diffing:
   `TablesAuthStore` in `hs serve` — see "Interfaces provided" below, not made here per this crate's
   own-crate-only rule.
 
+## Session 4 additions to "Done"
+
+Session 4's assignment (synapse-admin registration route, `UserStore::list_users`,
+`AuthStoreUserDirectory`) is covered in full above under "Session 4 summary" — not repeated here.
+File-by-file:
+
+- **New**: `crates/hs-auth/src/routes/synapse_admin.rs` (router fragment + handlers + 8 tests),
+  `crates/hs-auth/src/admin_directory.rs` (`AuthStoreUserDirectory` + 7 tests).
+- **Edited**: `crates/hs-auth/src/store/mod.rs` (`UserStore::list_users` trait method, with a doc
+  comment on scan cost), `crates/hs-auth/src/store/memory.rs` (implementation),
+  `crates/hs-auth/src/store/tables.rs` (implementation, `RangeSpec` import), `crates/hs-auth/src/
+  store/shared_tests.rs` (two new shared tests, registered in `run_all`), `crates/hs-auth/src/
+  config.rs` (`AuthConfig::registration_shared_secret` field, its `TryFrom` mapping, two new tests),
+  `crates/hs-auth/src/error.rs` (`MatrixError::feature_not_configured`, one new test),
+  `crates/hs-auth/src/admin_verifier.rs` (`format_rfc3339_ms` made `pub(crate)` so
+  `admin_directory.rs` can reuse it), `crates/hs-auth/src/routes/register.rs`
+  (`validate_localpart` made `pub(crate)`; unused by `synapse_admin.rs` in the end — it needed the
+  parsed `OwnedUserId`, not just a yes/no check, so it parses directly instead, but the visibility
+  change is harmless and left in place), `crates/hs-auth/src/routes/mod.rs` (registered `pub mod
+  synapse_admin;`, **not** added to `router()`), `crates/hs-auth/src/lib.rs` (`pub mod
+  admin_directory;`, `pub fn synapse_admin_router()` re-export), `crates/hs-auth/Cargo.toml`
+  (`hs-compat` path dependency; `hs-admin` was already present from session 3's admin verifier
+  work, no change needed there).
+- **Not touched**: no other track's crate, including `crates/hs-admin` (its `sources` module landed
+  from another agent mid-session; this session wrote against it read-only) and `crates/hs-cli` (the
+  three mounting/construction changes are listed under "Interfaces provided" for whoever owns
+  `serve.rs` to make).
+
 ## In progress
 
-Nothing mid-flight in `hs-auth` itself. This session's full assignment (items 1–6) is done. The
-native OAuth issuer (RFC 0003) remains fully unstarted design-only work — see "Next".
+Nothing mid-flight in `hs-auth` itself. Session 4's full assignment (all three deliverables) is
+done. The native OAuth issuer (RFC 0003) remains fully unstarted design-only work — see "Next".
 
 ## Next
+
+**Whoever owns `hs-cli`/`serve.rs`: make the three mechanical changes under "Interfaces provided"
+below.** Nothing in this session's assignment is real until `hs serve` mounts
+`synapse_admin_router()`, constructs `AdminTokenVerifier` (already done, from session 3 — unwiring
+that is not this session's finding, just re-flagging it since it is the same "wire it in `serve.rs`"
+category of work), and constructs `AuthStoreUserDirectory`. All three are one-or-two-line,
+no-design-judgment changes; none of them need anything further from track 07.
 
 **Native OAuth 2.0 issuer implementation (RFC 0003), still not started.** This is now the largest
 remaining Phase 1/2 item on this track. RFC 0003's section 10 has the proposed build order (grants,
@@ -304,7 +405,15 @@ PKCE, device authorization grant, discovery, dynamic client registration, scopes
 account management, MAS delegation mode). In-house grant implementation over `oxide-auth`;
 `jsonwebtoken` over `josekit` — both already decided, not re-litigated.
 
-**Smaller, still-open items from sessions 1/2, unaffected by this session:**
+**Smaller, still-open items from sessions 1/2/4, unaffected by this session:**
+- `room_count`/`media_count` on `AuthStoreUserDirectory`'s `AdminUser` are hardcoded to `0` — track
+  04 (rooms) and track 09 (media) each need their own data-source seam for the admin API to fill
+  these for real, or `hs-admin`'s `router.rs` needs to compose three directories' worth of data
+  before returning a `User`. Not this crate's call to make; noted for whoever wires the admin
+  `/users` router.
+- `AuthStoreUserDirectory::list_users`'s free-text filter matches `user_id` only (no
+  `display_name`, since `UserRecord` doesn't have one) — revisit once track 04's profile data is
+  reachable from here.
 - Wire `hs-auth`'s router into whatever crate ends up owning the real listener and
   `/_matrix/client/v3` prefixing (**done since session 1 by track 12** — `hs-cli` mounts this
   crate's router under both `/_matrix/client/v3` and `/_matrix/client/r0`, per
@@ -325,12 +434,49 @@ account management, MAS delegation mode). In-house grant implementation over `ox
 
 ## Blockers
 
-None. The persistent `AuthStore` (this session's whole assignment) is done. The native OAuth issuer
-is the next largest item and needs no external input either — it is purely implementation work
-against RFC 0003's already-settled design.
+None. This session's three deliverables (synapse-admin registration route, `UserStore::list_users`,
+`AuthStoreUserDirectory`) are done. The native OAuth issuer is the next largest item and needs no
+external input either — it is purely implementation work against RFC 0003's already-settled design.
 
 ## Interfaces provided
 
+- **For whoever owns `hs-cli`/`serve.rs`, three changes to make this session's work real (session
+  4, new — read this first if that is you):**
+
+  1. **Mount the synapse-admin router.** Wherever `spawn_serve` builds the client-server router
+     from `hs_auth::routes::router()`, also merge in `hs_auth::synapse_admin_router()` — **do not**
+     nest it under `/_matrix/client/v3` or any other prefix, it is already at its final absolute
+     path (`/_synapse/admin/v1/register`):
+     ```rust
+     let app = Router::new()
+         .merge(hs_auth::synapse_admin_router().with_state(auth_state.clone()))
+         // ... existing merges of hs_auth::routes::router() under /_matrix/client/v3, /r0, etc.
+         ;
+     ```
+     (Exact call site depends on how `serve.rs` currently composes its top-level `Router`; the
+     constraint is just "merged at the root, not nested".) Without this, `hs register --admin`
+     keeps 404ing — this is the item `docs/next-steps.md`'s item 1 named as broken.
+  2. **Construct `AuthStoreUserDirectory` and wire it into `hs-admin`'s router state**, sharing the
+     same `AuthState`/store `AdminTokenVerifier` already shares (see the existing bullet below for
+     the verifier — this is the same pattern, added by session 3, still not wired as of this
+     write-up):
+     ```rust
+     let user_directory: std::sync::Arc<dyn hs_admin::sources::UserDirectory> =
+         std::sync::Arc::new(hs_auth::admin_directory::AuthStoreUserDirectory::from_auth_state(&auth_state));
+     ```
+     Then pass `user_directory` into whatever `hs_admin::router::AdminState` (or equivalent
+     constructor track 15 has built by the time this lands) takes for its user-directory field —
+     check `crates/hs-admin/src/router.rs` for the exact field name, since this session did not
+     edit that crate and its shape may have changed since this was written.
+  3. **Construct `AdminTokenVerifier`** (carried over from session 3, restated here because it is
+     the same "nothing is wired in `serve.rs`" problem this session's work also hits):
+     ```rust
+     let admin_verifier = hs_auth::admin_verifier::AdminTokenVerifier::from_auth_state(&auth_state);
+     ```
+     replacing whatever `StaticVerifier`/`dummy_admin_state()` stands in today.
+
+  All three are mechanical (no design judgment beyond "use the type this track built"); none needs
+  anything further from track 07.
 - **For track 12, to wire the persistent store into `hs serve` (session 3, new — the reason this
   section exists is operational, read this first if you are track 12):**
   `crates/hs-cli/src/serve.rs`'s `spawn_serve` currently has:
@@ -416,9 +562,20 @@ against RFC 0003's already-settled design.
 - **`crate::shared_secret_auth::{compute_token, verify_token}`** (session 2, new): the
   `com.devture.shared_secret_auth` HMAC-SHA512 primitives, exposed in case anything else (an admin
   tool minting a bridge's config value, say) wants them independent of the login route.
-- **`docs/rfcs/0004-admin-api.md` section 8.1's `hs_admin::auth::TokenVerifier`**: not yet
-  implemented (needs the native OAuth issuer, RFC 0003, which is design-only so far); tracked as
-  "Next" work, not a current blocker for 15 since 15's mock/scaffold work does not need it yet.
+- **`docs/rfcs/0004-admin-api.md` section 8.1's `hs_admin::auth::TokenVerifier`**: **implemented as
+  of session 3** (`crate::admin_verifier::AdminTokenVerifier`) — this line is stale and should have
+  been removed at the end of session 3; leaving the correction here rather than silently deleting
+  it. Not yet wired into `hs serve` — see "Interfaces provided"'s session 4 bullet.
+- **`crate::routes::synapse_admin::router`/`crate::synapse_admin_router`** (session 4, new): the
+  `/_synapse/admin/v1/register` router fragment. Mount separately from `routes::router()` — see
+  "Interfaces provided" above for the exact `hs-cli` line and why it cannot be nested.
+- **`crate::store::UserStore::list_users`** (session 4, new): lists every registered user, sorted by
+  `user_id`, on both store implementations. A full scan on `TablesAuthStore` — see the trait
+  method's doc comment for the cost trade-off before calling it in a hot path.
+- **`crate::admin_directory::AuthStoreUserDirectory`** (session 4, new): `hs_admin::sources::
+  UserDirectory` over this crate's `AuthStore`. See "Interfaces needed" below for what it still
+  cannot fill (`room_count`, `media_count`) and "Interfaces provided" above for the `hs-cli`
+  construction line.
 
 ## Interfaces needed
 
@@ -428,18 +585,26 @@ against RFC 0003's already-settled design.
   `AppserviceRegistry`, and it now also supplies the two RFC 0009 capability fields.
 - **13 (config)**: satisfied as of session 3 — `crate::config::AuthConfig` now has a real
   `TryFrom<&hs_config::Config>` impl; nothing further needed from track 13.
-- **12 (platform/`hs-cli`)**: needs to make the two mechanical changes under "Interfaces provided"
-  above (wire `TablesAuthStore` into `spawn_serve`, simplify `config_bridge.rs`) to actually get a
-  persistent, correctly-configured server; both are ready and waiting on track 12's own crate, not
+- **12 (platform/`hs-cli`) / whoever owns `serve.rs`**: needs to make the mechanical changes under
+  "Interfaces provided" above (wire `TablesAuthStore` into `spawn_serve`, simplify
+  `config_bridge.rs`, **mount `synapse_admin_router()`, construct `AdminTokenVerifier`, construct
+  `AuthStoreUserDirectory`** — the last three added this session) to actually get a persistent,
+  correctly-configured server with a working admin API; all are ready and waiting on that crate, not
   on anything further from track 07.
 - **hs-http (shared with 07, 14, 15)**: `routes::router()` still returns a bare `Router<AuthState>`
   fragment at spec-relative paths; `hs-cli` (not `hs-http`) ended up doing the mounting and version
   prefixing (`docs/status/12-platform-and-kubernetes.md`) — `hs serve` now serves this crate's
   routes under both `/_matrix/client/v3` and `/_matrix/client/r0`. A real client IP for rate
   limiting is still not threaded through anywhere.
+- **04 (room and events) / 09 (media)**: `AuthStoreUserDirectory`'s `AdminUser.room_count`/
+  `media_count` are hardcoded to `0` (session 4) — this crate has no data source for either. Either
+  track needs to expose its own `hs_admin::sources`-style seam (or an existing one) that whoever
+  wires the admin `/users` router can compose with this session's directory, or `AdminUser`
+  construction needs to move to a place that can see all three sources at once. Not decided here;
+  flagging the gap for track 15/whoever owns `hs-admin`'s router wiring to resolve.
 - **14 (test/conformance)**: Complement and differential-tests-against-Synapse coverage for this
-  surface once `hs-testkit`/the harness exists; this crate's 134 tests (up from 128) are still its
-  own unit and router-level tests only, not run against Complement.
+  surface once `hs-testkit`/the harness exists; this crate's 156 tests are still its own unit and
+  router-level tests only, not run against Complement.
 
 ## Decisions made
 
@@ -583,6 +748,50 @@ against RFC 0003's already-settled design.
   check again); until then, both exist, which is a harmless transitional state, not a bug — noted
   here so it doesn't look like something was missed.
 
+### Session 4 decisions
+
+- **`registration_shared_secret` is its own `AuthConfig` field, not folded into the existing
+  `shared_secret_auth_secret`, even though both currently read the same `hs_config` value.** This
+  was an explicit instruction for this session, and it is the right call independent of that: the
+  two are different protocols (`register_new_matrix_user`'s admin API vs. `com.devture.
+  shared_secret_auth` login), and an operator who wants one but not the other has no way to express
+  that today only because `hs-config` itself has a single field — the day it grows a second one,
+  this crate should not need to change to pick it up correctly. `AuthConfig::try_from` maps the same
+  native field onto both, documented in both fields' doc comments so the duplication reads as
+  intentional, not missed.
+- **The synapse-admin router verifies the MAC (authenticating the caller) before checking username
+  availability or touching the store at all.** Synapse's own `register_new_matrix_user` handler
+  checks availability after MAC verification too, but this was independently re-derived here from
+  first principles (least-privilege: nothing about account state should be observable pre-auth), not
+  copied — worth stating since it is a security-relevant ordering choice, not an incidental one.
+- **`NonceRegistry` lives in the router fragment's own `Arc<Mutex<_>>`, injected via
+  `axum::Extension`, not in `AuthState`.** `AuthState` is cloned into every handler's `State`
+  extractor across the whole crate; putting single-endpoint, 60-second-lived nonce bookkeeping there
+  would mean every other handler's `AuthState` clone carries a `Mutex` it never touches, and would
+  make `AuthState::in_memory()`/`with_store()` responsible for initializing state that is really this
+  one router fragment's private concern. `axum::Extension` is the standard axum idiom for exactly
+  this ("a router fragment needs one piece of shared state its `State<S>` type doesn't carry"), used
+  here in preference to a closure-capturing-`Arc` pattern (also considered — axum handler closures
+  do work and do auto-implement `Clone` when their captures are `Clone`, but `Extension` is more
+  idiomatic and does not require reasoning about closure `Clone` semantics to trust it compiles
+  correctly).
+- **Bad-MAC and bad/replayed/expired-nonce failures get different HTTP statuses (403 vs. 400).**
+  This session did not re-verify the exact codes against a running Synapse or `refs/synapse`'s
+  source for this session's write-up (recalled from general familiarity with Synapse's admin API,
+  not confirmed here) — worth a differential check against real Synapse before calling this
+  Synapse-tooling-compatible with confidence. Not specified by this session's instructions beyond
+  "each needs its own test"; the actual codes chosen (`400` for nonce problems, `403` for a MAC that
+  does not match) are internally consistent and documented in `map_registration_error`'s doc
+  comment, but flagging that they are a best guess, not a verified fact, for whoever runs the
+  differential harness (14) against this route.
+- **`AuthStoreUserDirectory::get_user`/`set_admin`/`set_locked`/`set_deactivated` parse `user_id: &str`
+  with `ruma::UserId::parse` (full Matrix ID only), not `parse_with_server_name`.** `hs_admin::
+  sources::UserDirectory`'s trait contract takes a bare `&str` with no server-name context to
+  resolve a localpart against, and every caller in `hs-admin`'s own router code necessarily already
+  has a full `@user:server` id (it came from a path parameter or a `GET /users` filter, never a
+  bare localpart) — accepting a bare localpart here would silently assume *this* server's name for
+  an admin-API caller who may not have meant that.
+
 ## Reuse considered (decision 0007)
 
 - **`com.devture.shared_secret_auth`'s HMAC verification**: considered depending on
@@ -670,3 +879,12 @@ All additions are path dependencies on sibling crates already in the workspace, 
 - `proptest = { workspace = true }`, `tempfile = { workspace = true }` added to
   `[dev-dependencies]` — both already workspace entries (used by `hs-tables` and `hs-cli`
   respectively); `hs-auth` is a new consumer of each, not a new entry.
+
+### Session 4
+
+- `hs-compat = { path = "../hs-compat" }` — for `hs_compat::shared_secret`'s already-built,
+  already-tested nonce/MAC protocol, reused rather than reimplemented (`routes/synapse_admin.rs`).
+  No new `[workspace.dependencies]` entry (path dependency on a sibling crate); no dependency cycle
+  (`hs-compat` depends only on `hs-config`, confirmed by reading `crates/hs-compat/Cargo.toml`
+  before adding this). `hs-admin` was **not** newly added this session — it was already a dependency
+  of `crates/hs-auth/Cargo.toml` from whichever earlier session/salvage added `admin_verifier.rs`.

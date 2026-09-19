@@ -224,6 +224,22 @@ pub trait UserStore: Send + Sync {
         medium: &str,
         address: &str,
     ) -> Result<Option<OwnedUserId>, StoreError>;
+
+    /// Lists every registered user, sorted by `user_id`. Used by the admin API's user directory
+    /// ([`crate::admin_directory::AuthStoreUserDirectory`], `hs_admin::sources::UserDirectory`)
+    /// and any other bulk-enumeration need.
+    ///
+    /// # Cost
+    /// [`memory::InMemoryAuthStore`]'s implementation clones every stored [`UserRecord`] and
+    /// sorts them, O(n log n) in the number of registered users. `tables::TablesAuthStore`'s
+    /// implementation is a **full keyspace scan** with no secondary index to narrow it (there is
+    /// no bounded "list users" access pattern to index against) -- see that implementation's own
+    /// doc comment for the same caveat. Neither implementation paginates; a caller that needs
+    /// paginated results (the admin API does) is responsible for slicing the returned `Vec`
+    /// itself. Fine for a single operator's user directory; revisit if this server is ever
+    /// expected to host enough accounts that a full scan on every `GET /api/v1/users` call
+    /// becomes a real cost.
+    async fn list_users(&self) -> Result<Vec<UserRecord>, StoreError>;
 }
 
 /// Device storage.

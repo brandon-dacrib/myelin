@@ -166,6 +166,12 @@ impl UserStore for InMemoryAuthStore {
             .get(&(medium.to_string(), address.to_ascii_lowercase()))
             .cloned())
     }
+
+    async fn list_users(&self) -> Result<Vec<UserRecord>, StoreError> {
+        let mut users: Vec<UserRecord> = self.lock().users.values().cloned().collect();
+        users.sort_by(|a, b| a.user_id.cmp(&b.user_id));
+        Ok(users)
+    }
 }
 
 #[async_trait]
