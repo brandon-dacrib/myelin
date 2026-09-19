@@ -505,6 +505,11 @@ mod tests {
             queries: Arc::new(InMemoryQuerySource::default()),
             allow_public_rooms_over_federation: true,
             allow_device_name_lookup_over_federation: true,
+            write_sink: Arc::new(crate::inbound::StaticWriteSink::new(
+                Vec::new(),
+                "not supported",
+            )),
+            transactions: Arc::new(crate::inbound::InMemoryTransactionStore::new()),
         };
         build().with_state(state)
     }
@@ -518,6 +523,11 @@ mod tests {
             queries: Arc::new(InMemoryQuerySource::default()),
             allow_public_rooms_over_federation: false,
             allow_device_name_lookup_over_federation: false,
+            write_sink: Arc::new(crate::inbound::StaticWriteSink::new(
+                Vec::new(),
+                "not supported",
+            )),
+            transactions: Arc::new(crate::inbound::InMemoryTransactionStore::new()),
         };
         let response = router
             .with_state(state)
@@ -597,6 +607,11 @@ mod tests {
             queries: Arc::new(InMemoryQuerySource::default()),
             allow_public_rooms_over_federation: false,
             allow_device_name_lookup_over_federation: false,
+            write_sink: Arc::new(crate::inbound::StaticWriteSink::new(
+                Vec::new(),
+                "not supported",
+            )),
+            transactions: Arc::new(crate::inbound::InMemoryTransactionStore::new()),
         };
         let router = build();
         let header = signed_header("anyone.example.org", "GET", "/publicRooms");

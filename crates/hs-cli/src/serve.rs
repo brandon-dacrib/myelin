@@ -299,7 +299,14 @@ fn build_router<B: KvBackend>(
 
     if let Some((state, x_matrix, own_keys, server_name)) = federation {
         let (federation_router, federation_manifest) =
-            hs_federation::transport::router(state, x_matrix);
+            hs_federation::transport::router(state.clone(), x_matrix.clone());
+        // The v2 spellings of `send_join`/`send_leave`/`invite` live under their own prefix. They
+        // were previously registered inside the v1 router with a literal `/v2/` path segment,
+        // which nothing noticed while they were seams and every remote would have noticed the
+        // moment they were not. Both routers share one `FederationState` (it is `Clone` over
+        // `Arc`s) so a join handled by either sees the same rooms and the same key cache.
+        let (federation_router_v2, federation_manifest_v2) =
+            hs_federation::transport::router_v2(state, x_matrix);
         // `/_matrix/key/v2/server` is deliberately *outside* that router: it is the one federation
         // endpoint that must answer an unsigned request, since it is what a remote server fetches
         // in order to be able to check signatures in the first place. Putting it behind the
@@ -332,6 +339,11 @@ fn build_router<B: KvBackend>(
                 "/_matrix/federation/v1",
                 federation_router,
                 federation_manifest.routes,
+            )
+            .merge_router(
+                "/_matrix/federation/v2",
+                federation_router_v2,
+                federation_manifest_v2.routes,
             );
     }
 

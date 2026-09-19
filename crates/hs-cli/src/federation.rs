@@ -520,6 +520,63 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
             })
             .collect()
     }
+
+    async fn room_version(&self, room_id: &str) -> Option<String> {
+        let handle = self.handle(room_id).await.ok()?;
+        Some(
+            handle
+                .query(|actor| actor.room_version().as_str().to_owned())
+                .await,
+        )
+    }
+
+    async fn forward_extremities(
+        &self,
+        room_id: &str,
+    ) -> Result<Vec<(String, i64)>, RoomSourceError> {
+        // The single-extremity assumption `crate::join`'s (well, `hs_federation::join`'s) module
+        // doc names explicitly: `paginate`'s most recent event is this actor's one forward
+        // extremity in every room this server can currently produce (nothing that reaches it
+        // introduces a fork other than `RoomActor::send_event_citing`, used only by this
+        // workspace's own state-resolution tests).
+        let handle = self.handle(room_id).await?;
+        handle
+            .query(|actor| {
+                let (events, _) = actor.paginate(None, Direction::Backward, 1);
+                Ok(events
+                    .into_iter()
+                    .map(|event| (event.event_id().to_string(), event.header().depth))
+                    .collect())
+            })
+            .await
+    }
+
+    async fn state_for_join(
+        &self,
+        room_id: &str,
+    ) -> Result<hs_federation::room_source::StateForJoin, RoomSourceError> {
+        let handle = self.handle(room_id).await?;
+        handle
+            .query(|actor| {
+                let state = actor
+                    .full_state()
+                    .map_err(|_| RoomSourceError::RoomNotFound)?;
+                let ids: Vec<String> = state
+                    .iter()
+                    .map(|event| event.event_id().to_string())
+                    .collect();
+                let state_pairs: Vec<(String, Value)> = state
+                    .iter()
+                    .map(|event| (event.event_id().to_string(), full_pdu(event)))
+                    .collect();
+                let auth_chain = auth_chain_from(actor, &ids);
+                Ok(hs_federation::room_source::StateForJoin {
+                    state: state_pairs,
+                    auth_chain,
+                })
+            })
+            .await
+    }
 }
 
 /// The `event_id` of every event in a rendered PDU list. Federation PDUs for room version 3+ do
@@ -535,6 +592,69 @@ fn event_ids_of(events: &[Value]) -> Vec<String> {
                 .map(str::to_owned)
         })
         .collect()
+}
+
+/// [`hs_federation::inbound::RoomWriteSink`] over `hs-room`'s [`RoomRegistry`].
+///
+/// This is the honest edge named throughout `hs_federation::inbound` and `hs_federation::join`'s
+/// module docs: it can only ever report success for an event this server already holds (checked
+/// by event ID against the resident room actor). `hs-room`'s `RoomActor` has no API to accept an
+/// already-built, foreign-signed [`hs_model::Event`] -- `send_event`/`send_event_citing` only
+/// build and sign *new*, locally-originated events (see `crates/hs-room/src/actor.rs`, and
+/// `crates/hs-room/src/pipeline.rs`'s own doc comment: "The general three-snapshot check the spec
+/// requires for an *inbound* federation event ... is still track 06's job"). Closing this needs a
+/// new `hs-room` entry point -- see `docs/status/06-federation.md` for the RFC this session wrote
+/// describing exactly what it would need to do.
+pub struct RegistryWriteSink<B: KvBackend> {
+    rooms: Arc<RoomRegistry<B>>,
+}
+
+impl<B: KvBackend + 'static> RegistryWriteSink<B> {
+    /// Wraps an already-open registry.
+    #[must_use]
+    pub fn new(rooms: Arc<RoomRegistry<B>>) -> Self {
+        Self { rooms }
+    }
+
+    async fn handle(&self, room_id: &str) -> Option<hs_room::actor::RoomActorHandle<B>> {
+        let parsed = ruma::RoomId::parse(room_id).ok()?;
+        self.rooms.get_or_load(&parsed).await.ok()
+    }
+}
+
+#[async_trait]
+impl<B: KvBackend + 'static> hs_federation::inbound::RoomWriteSink for RegistryWriteSink<B> {
+    async fn accept_verified_event(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        _event_json: &Value,
+    ) -> Result<hs_federation::inbound::WriteOutcome, hs_federation::inbound::WriteRejected> {
+        use hs_federation::inbound::{WriteOutcome, WriteRejected};
+
+        let Some(handle) = self.handle(room_id).await else {
+            return Err(WriteRejected {
+                error: "unknown room".to_owned(),
+            });
+        };
+        let Ok(parsed_event_id) = ruma::EventId::parse(event_id) else {
+            return Err(WriteRejected {
+                error: "malformed event id".to_owned(),
+            });
+        };
+        let known = handle
+            .query(move |actor| actor.event_by_id(&parsed_event_id).is_some())
+            .await;
+        if known {
+            return Ok(WriteOutcome::AlreadyKnown);
+        }
+        Err(WriteRejected {
+            error: "this server cannot yet persist a newly received federation event into its \
+                    own room store: hs-room's RoomActor has no API to accept an already-signed \
+                    event from another server (see docs/status/06-federation.md)"
+                .to_owned(),
+        })
+    }
 }
 
 // ------------------------------------------------------------------------------------------
@@ -746,13 +866,15 @@ pub fn build_mount<B: KvBackend + 'static>(
         queries: Arc::new(ServerQuerySource::new(
             auth,
             e2e,
-            rooms,
+            rooms.clone(),
             server_name.clone(),
         )),
         allow_public_rooms_over_federation: config.federation.allow_public_rooms_over_federation,
         allow_device_name_lookup_over_federation: config
             .federation
             .allow_device_name_lookup_over_federation,
+        write_sink: Arc::new(RegistryWriteSink::new(rooms)),
+        transactions: Arc::new(hs_federation::inbound::InMemoryTransactionStore::new()),
     };
 
     let x_matrix = Arc::new(hs_federation::xmatrix::XMatrixContext {
@@ -860,6 +982,11 @@ pub fn manifest_only_mount() -> (
         queries: Arc::new(hs_federation::transport::InMemoryQuerySource::default()),
         allow_public_rooms_over_federation: false,
         allow_device_name_lookup_over_federation: false,
+        write_sink: Arc::new(hs_federation::inbound::StaticWriteSink::new(
+            Vec::new(),
+            "manifest-only mount",
+        )),
+        transactions: Arc::new(hs_federation::inbound::InMemoryTransactionStore::new()),
     };
     let key_cache: Arc<hs_federation::keys::DynRemoteKeyCache> =
         Arc::new(hs_federation::keys::RemoteKeyCache::new(

@@ -82,6 +82,8 @@ impl Harness {
             )),
             allow_public_rooms_over_federation: true,
             allow_device_name_lookup_over_federation: true,
+            write_sink: Arc::new(hs_cli::federation::RegistryWriteSink::new(rooms.clone())),
+            transactions: Arc::new(hs_federation::inbound::InMemoryTransactionStore::new()),
         };
 
         let remote_key = SigningKeyPair::generate("a_remote");
@@ -306,7 +308,10 @@ async fn state_is_served_for_any_event_including_historical_ones() {
         "the room's state must include its create event: {pdus:?}"
     );
     assert!(
-        !body["auth_chain"].as_array().expect("auth_chain").is_empty(),
+        !body["auth_chain"]
+            .as_array()
+            .expect("auth_chain")
+            .is_empty(),
         "state must come with the auth chain needed to check it"
     );
 

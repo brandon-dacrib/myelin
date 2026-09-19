@@ -34,25 +34,11 @@ pub(super) fn add_routes(builder: Builder<FederationState>) -> Builder<Federatio
     }
 
     let mut builder = builder;
-    builder = seam!(builder, Method::PUT, "/send/{txnId}", "federationSend");
-    builder = seam!(
-        builder,
-        Method::GET,
-        "/make_join/{roomId}/{userId}",
-        "federationMakeJoin"
-    );
-    builder = seam!(
-        builder,
-        Method::PUT,
-        "/send_join/{roomId}/{eventId}",
-        "federationSendJoinV1"
-    );
-    builder = seam!(
-        builder,
-        Method::PUT,
-        "/send_join/v2/{roomId}/{eventId}",
-        "federationSendJoinV2"
-    );
+    // `/send`, `make_join` and the v1 `send_join` are real now — see `crate::transport::send` and
+    // `crate::transport::join`. The v2 `send_join`/`send_leave`/`invite` spellings are registered
+    // by `add_routes_v2` below, for a router mounted separately at `/_matrix/federation/v2` (they
+    // used to sit here, wrongly, under a literal `/v2/` path segment — see this crate's status
+    // file).
     builder = seam!(
         builder,
         Method::GET,
@@ -64,12 +50,6 @@ pub(super) fn add_routes(builder: Builder<FederationState>) -> Builder<Federatio
         Method::PUT,
         "/send_leave/{roomId}/{eventId}",
         "federationSendLeaveV1"
-    );
-    builder = seam!(
-        builder,
-        Method::PUT,
-        "/send_leave/v2/{roomId}/{eventId}",
-        "federationSendLeaveV2"
     );
     builder = seam!(
         builder,
@@ -88,12 +68,6 @@ pub(super) fn add_routes(builder: Builder<FederationState>) -> Builder<Federatio
         Method::PUT,
         "/invite/{roomId}/{eventId}",
         "federationInviteV1"
-    );
-    builder = seam!(
-        builder,
-        Method::PUT,
-        "/invite/v2/{roomId}/{eventId}",
-        "federationInviteV2"
     );
     builder = seam!(
         builder,
@@ -143,6 +117,30 @@ pub(super) fn add_routes(builder: Builder<FederationState>) -> Builder<Federatio
     builder
 }
 
+/// The v2-mount seams: `send_leave` and `invite`'s v2 spellings, registered as
+/// `/send_leave/{roomId}/{eventId}` and `/invite/{roomId}/{eventId}` for a router mounted
+/// separately at `/_matrix/federation/v2` (see `crate::transport::router_v2`'s doc — the path
+/// string is identical to the v1 seams above; only the mount prefix differs, which is exactly why
+/// these could not previously share one `Builder` with the v1 spellings without colliding).
+pub(super) fn add_routes_v2(builder: Builder<FederationState>) -> Builder<FederationState> {
+    fn meta(op: &str) -> hs_http::router::RouteMeta {
+        super::matrix_federation(op)
+    }
+    builder
+        .add(
+            Method::PUT,
+            "/send_leave/{roomId}/{eventId}",
+            not_implemented,
+            meta("federationSendLeaveV2"),
+        )
+        .add(
+            Method::PUT,
+            "/invite/{roomId}/{eventId}",
+            not_implemented,
+            meta("federationInviteV2"),
+        )
+}
+
 /// The shared seam handler: bounded (by the `X-Matrix` layer's own body cap) body is accepted and
 /// discarded; the response is always a clear, typed "not implemented" error. Reused across every
 /// route registered above rather than one function per route, since they all do exactly this.
@@ -172,6 +170,11 @@ mod tests {
             queries: Arc::new(InMemoryQuerySource::default()),
             allow_public_rooms_over_federation: false,
             allow_device_name_lookup_over_federation: false,
+            write_sink: Arc::new(crate::inbound::StaticWriteSink::new(
+                Vec::new(),
+                "not supported",
+            )),
+            transactions: Arc::new(crate::inbound::InMemoryTransactionStore::new()),
         }
     }
 
@@ -180,26 +183,15 @@ mod tests {
         (router, manifest.routes)
     }
 
-    #[tokio::test]
-    async fn send_is_a_clean_not_implemented_seam() {
-        let (router, _routes) = build();
-        let response = router
-            .with_state(state())
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri("/send/1")
-                    .body(Body::from(r#"{"pdus": [], "edus": []}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    fn build_v2() -> (axum::Router<FederationState>, Vec<hs_http::router::Route>) {
+        let (router, manifest) = add_routes_v2(Builder::<FederationState>::new()).build();
+        (router, manifest.routes)
     }
 
-    #[tokio::test]
-    async fn every_seam_route_responds_not_implemented() {
-        let (router, routes) = build();
+    async fn assert_every_route_is_a_clean_seam(
+        router: axum::Router<FederationState>,
+        routes: Vec<hs_http::router::Route>,
+    ) {
         for route in routes {
             let path = route
                 .path
@@ -227,5 +219,31 @@ mod tests {
                 route.path
             );
         }
+    }
+
+    #[tokio::test]
+    async fn every_seam_route_responds_not_implemented() {
+        let (router, routes) = build();
+        assert_every_route_is_a_clean_seam(router, routes).await;
+    }
+
+    #[tokio::test]
+    async fn every_v2_seam_route_responds_not_implemented() {
+        let (router, routes) = build_v2();
+        assert!(!routes.is_empty());
+        assert_every_route_is_a_clean_seam(router, routes).await;
+    }
+
+    /// `/send`, `make_join` and the v1 `send_join` used to be seams registered by this module;
+    /// this proves they are gone from here (they now live in `crate::transport::send` and
+    /// `crate::transport::join`), so nobody accidentally re-adds a seam for a route this crate now
+    /// implements for real.
+    #[tokio::test]
+    async fn the_real_write_routes_are_not_registered_as_seams_here() {
+        let (_, routes) = build();
+        let paths: Vec<&str> = routes.iter().map(|r| r.path.as_str()).collect();
+        assert!(!paths.contains(&"/send/{txnId}"));
+        assert!(!paths.contains(&"/make_join/{roomId}/{userId}"));
+        assert!(!paths.contains(&"/send_join/{roomId}/{eventId}"));
     }
 }

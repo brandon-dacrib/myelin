@@ -11,6 +11,8 @@ pub mod destination_store;
 pub mod discovery;
 pub mod edu;
 pub mod error;
+pub mod inbound;
+pub mod join;
 pub mod keys;
 pub mod room_source;
 pub mod transport;

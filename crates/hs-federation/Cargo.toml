@@ -34,6 +34,12 @@ hs-kv = { path = "../hs-kv" }
 hs-tables = { path = "../hs-tables" }
 hs-http = { path = "../hs-http" }
 hs-config = { path = "../hs-config" }
+# Added by track 06 (fourth session): `hs_state::auth::{check_event_auth,
+# check_auth_events_selection, expected_auth_types}` is the one real room-version auth-rules
+# engine in the workspace, and `crate::join`/`crate::inbound` reuse it directly against a
+# `StateFetch` built from `RoomDataSource`'s current-state read, rather than re-deriving the
+# power-level/join-rule/membership rules a second time for inbound federation writes.
+hs-state = { path = "../hs-state" }
 
 [dev-dependencies]
 hs-testkit = { path = "../hs-testkit" }

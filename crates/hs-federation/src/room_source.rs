@@ -145,6 +145,43 @@ pub trait RoomDataSource: Send + Sync {
     /// caller (this returns one page's worth — the caller clamps page size per the resource
     /// limits table).
     async fn list_public_rooms(&self, limit: usize, since: Option<&str>) -> Vec<EventJson>;
+
+    /// The room's version, if this server hosts it at all. Not gated by
+    /// [`RoomDataSource::is_visible_to`]: a room's version is needed *before* a join handshake can
+    /// even begin (to pick a compatible `make_join` template), for a caller who by definition is
+    /// not yet a member.
+    async fn room_version(&self, room_id: &str) -> Option<String>;
+
+    /// The room's current forward extremities as `(event_id, depth)` pairs, in the order a new
+    /// event's `prev_events` should cite them. Used by `make_join` to build a join template's
+    /// `prev_events`/`depth`. Ordinarily exactly one entry: nothing that can currently reach this
+    /// server's rooms introduces a second one (see `crate::join`'s module doc for the same
+    /// assumption made explicit).
+    async fn forward_extremities(
+        &self,
+        room_id: &str,
+    ) -> Result<Vec<(String, i64)>, RoomSourceError>;
+
+    /// The room's current state (with each event's ID alongside it, since a stored PDU for room
+    /// version 3+ does not itself carry `event_id`) plus that state's auth chain, for the join
+    /// handshake. Deliberately **not** gated by [`RoomDataSource::is_visible_to`]: handing a
+    /// prospective joiner's server the state and auth chain it needs to construct and authorize a
+    /// join event is the entire purpose of `make_join`/`send_join`, not a bypass of the membership
+    /// check that gates ordinary reads -- the join itself is authorized separately, by
+    /// `hs_state::auth::check_event_auth`, before any of this is ever returned to a caller over the
+    /// wire.
+    async fn state_for_join(&self, room_id: &str) -> Result<StateForJoin, RoomSourceError>;
+}
+
+/// The current state plus its auth chain, as `send_join`/`make_join` need it. See
+/// [`RoomDataSource::state_for_join`].
+#[derive(Debug, Clone, Default)]
+pub struct StateForJoin {
+    /// `(event_id, event_json)` for every event in the room's current state.
+    pub state: Vec<(String, EventJson)>,
+    /// The auth chain of that state (every event's `auth_events`, transitively, excluding the
+    /// state events themselves unless they are also reached that way).
+    pub auth_chain: Vec<EventJson>,
 }
 
 /// An in-memory [`RoomDataSource`] for this crate's own handler tests. Not a production
@@ -165,6 +202,14 @@ pub struct FakeRoom {
     pub auth_chain: HashMap<String, Vec<EventJson>>,
     pub public: bool,
     pub canonical_alias: Option<String>,
+    /// `room_version`, for [`RoomDataSource::room_version`] and the join handshake tests.
+    pub room_version: Option<String>,
+    /// [`RoomDataSource::forward_extremities`]'s answer.
+    pub extremities: Vec<(String, i64)>,
+    /// The auth chain [`RoomDataSource::state_for_join`] returns alongside `state`. Kept separate
+    /// from `auth_chain` (which is keyed per-event, for `/event_auth`) since a join handshake asks
+    /// for the chain of the whole current state at once, not of one named event.
+    pub join_auth_chain: Vec<EventJson>,
 }
 
 impl InMemoryRoomSource {
@@ -357,6 +402,42 @@ impl RoomDataSource for InMemoryRoomSource {
             .map(|r| serde_json::json!({ "canonical_alias": r.canonical_alias }))
             .collect()
     }
+
+    async fn room_version(&self, room_id: &str) -> Option<String> {
+        self.rooms.get(room_id)?.room_version.clone()
+    }
+
+    async fn forward_extremities(
+        &self,
+        room_id: &str,
+    ) -> Result<Vec<(String, i64)>, RoomSourceError> {
+        let room = self
+            .rooms
+            .get(room_id)
+            .ok_or(RoomSourceError::RoomNotFound)?;
+        Ok(room.extremities.clone())
+    }
+
+    async fn state_for_join(&self, room_id: &str) -> Result<StateForJoin, RoomSourceError> {
+        let room = self
+            .rooms
+            .get(room_id)
+            .ok_or(RoomSourceError::RoomNotFound)?;
+        let state = room
+            .state
+            .iter()
+            .filter_map(|event| {
+                event
+                    .get("event_id")
+                    .and_then(Value::as_str)
+                    .map(|id| (id.to_owned(), event.clone()))
+            })
+            .collect();
+        Ok(StateForJoin {
+            state,
+            auth_chain: room.join_auth_chain.clone(),
+        })
+    }
 }
 
 fn extract_ids(events: &[EventJson]) -> Vec<String> {
@@ -383,6 +464,7 @@ mod tests {
             auth_chain: HashMap::new(),
             public: false,
             canonical_alias: None,
+            ..FakeRoom::default()
         }
     }
 

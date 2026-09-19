@@ -15,14 +15,17 @@
 //! verify the signature (via the shared layer), bound-check the body, and reject with a typed
 //! "not implemented" error — nothing else.
 
+mod join;
 mod queries;
 mod read_routes;
 mod seams;
+mod send;
 
 use std::sync::Arc;
 
 use hs_http::router::{AuthKind, Builder, RouteManifest, RouteMeta, Surface};
 
+use crate::inbound::{RoomWriteSink, TransactionStore};
 use crate::room_source::RoomDataSource;
 use crate::xmatrix::{self, XMatrixContext};
 
@@ -36,16 +39,27 @@ pub struct FederationState {
     pub queries: Arc<dyn FederationQuerySource>,
     pub allow_public_rooms_over_federation: bool,
     pub allow_device_name_lookup_over_federation: bool,
+    /// Applies an already-verified inbound event (`/send`'s PDUs, and a validated `send_join`
+    /// submission) to a room this server hosts. See `crate::inbound`'s module doc for what this
+    /// can and cannot promise today.
+    pub write_sink: Arc<dyn RoomWriteSink>,
+    /// Idempotency cache for `/send` transactions, keyed by `(origin, txnId)`.
+    pub transactions: Arc<dyn TransactionStore>,
 }
 
 fn matrix_federation(operation_id: &str) -> RouteMeta {
     RouteMeta::new(Surface::MatrixFederation, AuthKind::Matrix).with_operation_id(operation_id)
 }
 
-/// Builds the full federation router: every read/query endpoint, every seam, with the `X-Matrix`
-/// verification layer wrapping the whole thing. `path_prefix` is spec-relative (paths are
-/// registered as `/version`, `/query/{queryType}`, etc. — mounting under `/_matrix/federation/v1`
-/// and composing with other listeners is the caller's job, matching `hs-media`'s convention).
+/// Builds the full **v1** federation router: every read/query endpoint, every seam, `/send`,
+/// `make_join` and the v1 `send_join` spelling, with the `X-Matrix` verification layer wrapping
+/// the whole thing. Paths are spec-relative (registered as `/version`, `/send/{txnId}`, etc. —
+/// mounting under `/_matrix/federation/v1` and composing with other listeners is the caller's job,
+/// matching `hs-media`'s convention).
+///
+/// The v2-only spellings (`send_join`, `send_leave`, `invite`) live in [`router_v2`], mounted
+/// separately at `/_matrix/federation/v2` — see that function's doc for why they are not just more
+/// routes registered here.
 ///
 /// # Panics
 /// Never during normal construction; this function only builds route tables and applies layers.
@@ -56,17 +70,53 @@ pub fn router(
     let builder = Builder::<FederationState>::new();
     let builder = read_routes::add_routes(builder);
     let builder = seams::add_routes(builder);
+    let builder = send::add_routes(builder);
+    let builder = join::add_routes(builder);
     let (merged, manifest) = builder.build();
 
-    let router = merged
+    (apply_x_matrix_layer(merged, state, x_matrix_ctx), manifest)
+}
+
+/// Builds the **v2** federation router: `send_join`, plus the still-seam `send_leave` and
+/// `invite` v2 spellings, under the same `X-Matrix` layer as [`router`].
+///
+/// This exists as a second function (rather than one router covering both prefixes) because the
+/// v1 and v2 paths for `send_join`/`send_leave`/`invite` share the exact same route string
+/// (`/send_join/{roomId}/{eventId}`, etc.) — only the mount prefix distinguishes them
+/// (`/_matrix/federation/v1` vs `/_matrix/federation/v2`). A single `Builder` cannot register the
+/// same `(method, path)` twice with different handlers, so the two versions need two routers,
+/// composed by the caller at two different mount points. Before this function existed, the v2
+/// spellings were registered *inside* [`router`] under a literal `/v2/` path segment
+/// (`/_matrix/federation/v1/send_join/v2/{roomId}/{eventId}`) — wrong, and invisible for as long as
+/// every handler behind it was a `501` seam. See this crate's status file for the wiring the
+/// caller (`hs-cli`) needs to add: mounting this at `/_matrix/federation/v2`.
+///
+/// # Panics
+/// Never during normal construction; this function only builds route tables and applies layers.
+pub fn router_v2(
+    state: FederationState,
+    x_matrix_ctx: Arc<XMatrixContext>,
+) -> (axum::Router, RouteManifest) {
+    let builder = Builder::<FederationState>::new();
+    let builder = join::add_routes_v2(builder);
+    let builder = seams::add_routes_v2(builder);
+    let (merged, manifest) = builder.build();
+
+    (apply_x_matrix_layer(merged, state, x_matrix_ctx), manifest)
+}
+
+fn apply_x_matrix_layer(
+    merged: axum::Router<FederationState>,
+    state: FederationState,
+    x_matrix_ctx: Arc<XMatrixContext>,
+) -> axum::Router {
+    merged
         .with_state(state)
         // Layer order matters: `Router::layer` wraps outside-in, so the layer added *last* runs
         // *first*. `Extension` must run before `verify_x_matrix`'s own `Extension` extractor, so
         // it is added last. See `crate::xmatrix::verify_x_matrix`'s doc for the same note.
         .layer(axum::middleware::from_fn(xmatrix::verify_x_matrix))
-        .layer(axum::Extension(x_matrix_ctx));
-
-    (router, manifest)
+        .layer(axum::Extension(x_matrix_ctx))
 }
 
 #[cfg(test)]
@@ -97,6 +147,11 @@ mod tests {
             queries: Arc::new(InMemoryQuerySource::default()),
             allow_public_rooms_over_federation: true,
             allow_device_name_lookup_over_federation: true,
+            write_sink: Arc::new(crate::inbound::StaticWriteSink::new(
+                Vec::new(),
+                "not supported",
+            )),
+            transactions: Arc::new(crate::inbound::InMemoryTransactionStore::new()),
         }
     }
 
