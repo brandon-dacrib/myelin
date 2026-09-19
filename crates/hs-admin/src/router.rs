@@ -34,7 +34,10 @@ use crate::model::{
     ServerHealth, ServerInfo,
 };
 use crate::operations::{OperationDef, load as load_operations};
-use crate::sources::{SourceError, UserDirectory, UserFilter};
+use crate::sources::{
+    RoomDirectory, RoomFilter, SourceError, UserCreateRequest, UserDirectory, UserFilter,
+    UserLookupQuery,
+};
 
 /// Everything an `hs-admin` handler needs. Cloned per-request by axum (cheap: everything inside
 /// is an `Arc`, a plain value type, or `Copy`).
@@ -56,6 +59,11 @@ pub struct AdminState {
     /// integration lead wires a real implementation with [`AdminState::with_users`]; the two user
     /// handlers answer `503 unavailable` rather than faking data or hiding behind a `404`.
     pub users: Option<Arc<dyn UserDirectory>>,
+    /// The room directory `GET /rooms`, `GET /rooms/{room_id}`, and the block/unblock/make-admin
+    /// moderation actions read from and call. `None` until a real implementation exists — see
+    /// `crate::sources::RoomDirectory`'s doc comment for the contract track 04 should implement
+    /// this against; this session did not implement one (`hs-room` is owned by another track).
+    pub rooms: Option<Arc<dyn RoomDirectory>>,
     /// The `Idempotency-Key` cache every mutating handler that declares it consults (see
     /// [`crate::idempotency`]). Always present (never `None`): a client is never told its
     /// idempotency key was ignored.
@@ -76,6 +84,7 @@ impl AdminState {
             server_info: ServerInfo::default(),
             started_at: Instant::now(),
             users: None,
+            rooms: None,
             idempotency: Arc::new(IdempotencyStore::new()),
         }
     }
@@ -85,6 +94,14 @@ impl AdminState {
     #[must_use]
     pub fn with_users(mut self, users: Arc<dyn UserDirectory>) -> Self {
         self.users = Some(users);
+        self
+    }
+
+    /// Wires a real [`RoomDirectory`], making `GET /rooms`, `GET /rooms/{room_id}`, and the
+    /// block/unblock/make-admin moderation actions serve real data instead of `503 unavailable`.
+    #[must_use]
+    pub fn with_rooms(mut self, rooms: Arc<dyn RoomDirectory>) -> Self {
+        self.rooms = Some(rooms);
         self
     }
 
@@ -144,8 +161,17 @@ const REAL_HANDLERS: &[&str] = &[
     "users.unlock",
     "users.deactivate",
     "users.reactivate",
+    "users.create",
+    "users.lookup",
+    "users.availability",
+    "rooms.list",
+    "rooms.get",
+    "rooms.block",
+    "rooms.unblock",
+    "rooms.make_admin",
     "audit_log.list",
     "audit_log.get",
+    "audit_log.export",
     "events.stream",
 ];
 
@@ -339,6 +365,224 @@ async fn users_get(
         ScopeDecision::InsufficientScope(problem) => {
             problem.with_instance(instance).into_response()
         }
+    }
+}
+
+/// `GET /api/v1/users/availability`: whether `localpart` is free to register
+/// ([`UserDirectory::check_localpart_available`]). `localpart` is a required query parameter;
+/// read as `Option<String>` (rather than relying on axum's built-in `Query<T>` rejection for a
+/// missing required field) so a missing value answers the same RFC 9457 `400 validation-failed`
+/// shape every other validation failure in this router does, not axum's default rejection body.
+#[derive(Debug, Default, Deserialize)]
+struct AvailabilityQuery {
+    localpart: Option<String>,
+}
+
+async fn users_availability(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Query(query): Query<AvailabilityQuery>,
+) -> Response {
+    let instance = "/api/v1/users/availability";
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let Some(localpart) = query.localpart else {
+                return Problem::validation_failed()
+                    .with_errors(vec![ValidationError::new(
+                        "param:localpart",
+                        "localpart is required",
+                    )])
+                    .with_instance(instance)
+                    .into_response();
+            };
+            let Some(users) = &state.users else {
+                return source_unavailable("user directory", instance);
+            };
+            match users.check_localpart_available(&localpart).await {
+                Ok(available) => axum::Json(json!({ "available": available })).into_response(),
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `GET /api/v1/users/lookup`: finds a user by 3PID (`medium`+`address`) or external id
+/// (`provider`+`external_id`), exactly one pair required ([`UserLookupQuery`]).
+#[derive(Debug, Default, Deserialize)]
+struct LookupQuery {
+    medium: Option<String>,
+    address: Option<String>,
+    provider: Option<String>,
+    external_id: Option<String>,
+}
+
+async fn users_lookup(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Query(query): Query<LookupQuery>,
+) -> Response {
+    let instance = "/api/v1/users/lookup";
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let threepid = match (&query.medium, &query.address) {
+                (Some(medium), Some(address)) => Some(UserLookupQuery::Threepid {
+                    medium: medium.clone(),
+                    address: address.clone(),
+                }),
+                (None, None) => None,
+                _ => {
+                    return Problem::validation_failed()
+                        .with_detail("medium and address must both be given, or neither")
+                        .with_instance(instance)
+                        .into_response();
+                }
+            };
+            let external = match (&query.provider, &query.external_id) {
+                (Some(provider), Some(external_id)) => Some(UserLookupQuery::ExternalId {
+                    provider: provider.clone(),
+                    external_id: external_id.clone(),
+                }),
+                (None, None) => None,
+                _ => {
+                    return Problem::validation_failed()
+                        .with_detail("provider and external_id must both be given, or neither")
+                        .with_instance(instance)
+                        .into_response();
+                }
+            };
+            let lookup = match (threepid, external) {
+                (Some(t), None) => t,
+                (None, Some(e)) => e,
+                _ => {
+                    return Problem::validation_failed()
+                        .with_detail(
+                            "exactly one of (medium, address) or (provider, external_id) is required",
+                        )
+                        .with_instance(instance)
+                        .into_response();
+                }
+            };
+            let Some(users) = &state.users else {
+                return source_unavailable("user directory", instance);
+            };
+            match users.lookup_user(lookup).await {
+                Ok(Some(user)) => axum::Json(user).into_response(),
+                Ok(None) => Problem::not_found()
+                    .with_detail("no user matches the given criteria")
+                    .with_instance(instance)
+                    .into_response(),
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `POST /api/v1/users` (`admin:write`, idempotent): creates a user via
+/// [`UserDirectory::create_user`]. Requires `localpart` or `user_id`, not neither and not both
+/// inconsistently (that judgment call belongs to the real implementation, which knows its own
+/// homeserver domain; this handler only rejects the "named neither" case up front since no
+/// implementation, real or fake, can act on it).
+async fn users_create(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let instance = "/api/v1/users";
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminWrite),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(principal) => {
+            let Some(users) = &state.users else {
+                return source_unavailable("user directory", instance);
+            };
+
+            if let Some(key) = idempotency_key(&headers) {
+                match state.idempotency.check("users.create", key, &body) {
+                    Replay::Same(stored) => return replay_response(stored),
+                    Replay::Mismatch => {
+                        return Problem::idempotency_key_payload_mismatch()
+                            .with_instance(instance)
+                            .into_response();
+                    }
+                    Replay::Fresh => {}
+                }
+            }
+
+            let request: UserCreateRequest = match parse_optional_json(&body) {
+                Ok(v) => v,
+                Err(p) => return p.with_instance(instance).into_response(),
+            };
+            if request.localpart.is_none() && request.user_id.is_none() {
+                return Problem::validation_failed()
+                    .with_errors(vec![ValidationError::new(
+                        "/localpart",
+                        "either localpart or user_id is required",
+                    )])
+                    .with_instance(instance)
+                    .into_response();
+            }
+
+            let created = match users.create_user(request).await {
+                Ok(u) => u,
+                Err(e) => return e.to_problem().with_instance(instance).into_response(),
+            };
+
+            if let Err(resp) = record_mutation(
+                &state,
+                &principal,
+                "users.create",
+                "user.created",
+                ResourceRef::new("user", created.user_id.clone()),
+                Vec::new(),
+                json!({ "user_id": created.user_id }),
+            )
+            .await
+            {
+                return resp;
+            }
+
+            let response_body = serde_json::to_vec(&created).unwrap_or_default();
+            if let Some(key) = idempotency_key(&headers) {
+                state.idempotency.record(
+                    "users.create",
+                    key,
+                    &body,
+                    StoredResponse {
+                        status: 201,
+                        content_type: "application/json".to_string(),
+                        body: response_body.clone(),
+                    },
+                );
+            }
+            (
+                StatusCode::CREATED,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                response_body,
+            )
+                .into_response()
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
     }
 }
 
@@ -915,6 +1159,398 @@ async fn users_update(
 }
 
 // -------------------------------------------------------------------------------------------
+// rooms (RFC 0004 section 4.3, brief deliverable 2). `crate::sources::RoomDirectory` has no real
+// implementation wired in this session (`hs-room` is another track's crate); every handler here
+// answers a real `503 unavailable` via `source_unavailable` when `state.rooms` is `None`, exactly
+// like the user handlers do for `state.users`, and is exercised in tests against
+// `InMemoryRoomDirectory`.
+// -------------------------------------------------------------------------------------------
+
+/// Query parameters `GET /api/v1/rooms` accepts (the OpenAPI `rooms.list` operation). `sort` is
+/// accepted but not honoured, matching `users.list`'s precedent.
+#[derive(Debug, Default, Deserialize)]
+struct RoomsListQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+    include_total: Option<bool>,
+    q: Option<String>,
+    public: Option<bool>,
+    empty: Option<bool>,
+    blocked: Option<bool>,
+    encrypted: Option<bool>,
+    federatable: Option<bool>,
+    room_type: Option<String>,
+    version: Option<String>,
+}
+
+/// `GET /api/v1/rooms`.
+async fn rooms_list(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Query(query): Query<RoomsListQuery>,
+) -> Response {
+    let instance = "/api/v1/rooms";
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let Some(rooms) = &state.rooms else {
+                return source_unavailable("room directory", instance);
+            };
+            let filter = RoomFilter {
+                q: query.q,
+                public: query.public,
+                empty: query.empty,
+                blocked: query.blocked,
+                encrypted: query.encrypted,
+                federatable: query.federatable,
+                room_type: query.room_type,
+                version: query.version,
+            };
+            match rooms.list_rooms(&filter).await {
+                Ok(items) => {
+                    let page = Page::paginate(
+                        items,
+                        query.cursor.as_deref(),
+                        query.limit,
+                        query.include_total.unwrap_or(false),
+                    );
+                    axum::Json(page).into_response()
+                }
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `GET /api/v1/rooms/{room_id}`.
+async fn rooms_get(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(room_id): Path<String>,
+) -> Response {
+    let instance = format!("/api/v1/rooms/{room_id}");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let Some(rooms) = &state.rooms else {
+                return source_unavailable("room directory", &instance);
+            };
+            match rooms.get_room(&room_id).await {
+                Ok(Some(room)) => axum::Json(room).into_response(),
+                Ok(None) => Problem::not_found()
+                    .with_detail(format!("no such room: {room_id}"))
+                    .with_instance(instance)
+                    .into_response(),
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// The body of `POST .../block` (OpenAPI inline schema: `{"reason": string}`).
+#[derive(Debug, Default, Deserialize)]
+struct BlockRoomRequest {
+    reason: Option<String>,
+}
+
+/// Shared body for `rooms.block`/`rooms.unblock`: idempotency handling, fetch-before, apply,
+/// fetch-after, audit + event, and the JSON response — the room-shaped twin of
+/// `toggle_user_and_record`.
+#[allow(clippy::too_many_arguments)]
+async fn toggle_room_and_record(
+    state: &AdminState,
+    headers: &HeaderMap,
+    raw_body: &[u8],
+    principal: Principal,
+    room_id: String,
+    instance: String,
+    operation_id: &str,
+    event_type: &str,
+    target_blocked: bool,
+    reason: Option<String>,
+) -> Response {
+    let Some(rooms) = &state.rooms else {
+        return source_unavailable("room directory", &instance);
+    };
+
+    if let Some(key) = idempotency_key(headers) {
+        match state.idempotency.check(operation_id, key, raw_body) {
+            Replay::Same(stored) => return replay_response(stored),
+            Replay::Mismatch => {
+                return Problem::idempotency_key_payload_mismatch()
+                    .with_instance(instance)
+                    .into_response();
+            }
+            Replay::Fresh => {}
+        }
+    }
+
+    let before = match rooms.get_room(&room_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return Problem::not_found()
+                .with_detail(format!("no such room: {room_id}"))
+                .with_instance(instance)
+                .into_response();
+        }
+        Err(e) => return e.to_problem().with_instance(instance).into_response(),
+    };
+
+    let already_set = before.blocked == target_blocked;
+    if !already_set
+        && let Err(e) = rooms
+            .set_blocked(&room_id, target_blocked, reason.clone())
+            .await
+    {
+        return e.to_problem().with_instance(instance).into_response();
+    }
+
+    let updated = match rooms.get_room(&room_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => before.clone(),
+        Err(e) => return e.to_problem().with_instance(instance).into_response(),
+    };
+
+    let mut changes = Vec::new();
+    if !already_set {
+        changes.push(AuditChange {
+            pointer: "/blocked".to_string(),
+            from: Some(json!(!target_blocked)),
+            to: Some(json!(target_blocked)),
+        });
+    }
+    let event_data = match &reason {
+        Some(r) => json!({ "reason": r }),
+        None => json!({}),
+    };
+
+    if let Err(resp) = record_mutation(
+        state,
+        &principal,
+        operation_id,
+        event_type,
+        ResourceRef::new("room", room_id.clone()),
+        changes,
+        event_data,
+    )
+    .await
+    {
+        return resp;
+    }
+
+    let response_body = serde_json::to_vec(&updated).unwrap_or_default();
+    if let Some(key) = idempotency_key(headers) {
+        state.idempotency.record(
+            operation_id,
+            key,
+            raw_body,
+            StoredResponse {
+                status: 200,
+                content_type: "application/json".to_string(),
+                body: response_body.clone(),
+            },
+        );
+    }
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        response_body,
+    )
+        .into_response()
+}
+
+/// `POST /api/v1/rooms/{room_id}/block` (`moderation:write`).
+async fn rooms_block(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(room_id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let instance = format!("/api/v1/rooms/{room_id}/block");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::ModerationWrite),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(principal) => {
+            let request: BlockRoomRequest = match parse_optional_json(&body) {
+                Ok(v) => v,
+                Err(p) => return p.with_instance(instance).into_response(),
+            };
+            toggle_room_and_record(
+                &state,
+                &headers,
+                &body,
+                principal,
+                room_id,
+                instance,
+                "rooms.block",
+                "room.blocked",
+                true,
+                request.reason,
+            )
+            .await
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `POST /api/v1/rooms/{room_id}/unblock` (`moderation:write`).
+async fn rooms_unblock(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(room_id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let instance = format!("/api/v1/rooms/{room_id}/unblock");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::ModerationWrite),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(principal) => {
+            toggle_room_and_record(
+                &state,
+                &headers,
+                &body,
+                principal,
+                room_id,
+                instance,
+                "rooms.unblock",
+                "room.unblocked",
+                false,
+                None,
+            )
+            .await
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// The body of `POST .../make-admin` (OpenAPI inline schema: `{"user_id": string}`).
+#[derive(Debug, Default, Deserialize)]
+struct MakeAdminRequest {
+    user_id: Option<String>,
+}
+
+/// `POST /api/v1/rooms/{room_id}/make-admin` (`admin:write`): grants `user_id` (defaulting to the
+/// calling principal if omitted, matching Synapse's `make_room_admin` behavior of defaulting to
+/// the requester — read for behavior only, never copied, per this track's brief) room-admin power
+/// level via [`RoomDirectory::make_admin`].
+async fn rooms_make_admin(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(room_id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let instance = format!("/api/v1/rooms/{room_id}/make-admin");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminWrite),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(principal) => {
+            let Some(rooms) = &state.rooms else {
+                return source_unavailable("room directory", &instance);
+            };
+            let request: MakeAdminRequest = match parse_optional_json(&body) {
+                Ok(v) => v,
+                Err(p) => return p.with_instance(instance).into_response(),
+            };
+            let target_user = request
+                .user_id
+                .clone()
+                .unwrap_or_else(|| principal.id.clone());
+
+            if let Some(key) = idempotency_key(&headers) {
+                match state.idempotency.check("rooms.make_admin", key, &body) {
+                    Replay::Same(stored) => return replay_response(stored),
+                    Replay::Mismatch => {
+                        return Problem::idempotency_key_payload_mismatch()
+                            .with_instance(instance)
+                            .into_response();
+                    }
+                    Replay::Fresh => {}
+                }
+            }
+
+            if let Err(e) = rooms.make_admin(&room_id, &target_user).await {
+                return e.to_problem().with_instance(instance).into_response();
+            }
+
+            let updated = match rooms.get_room(&room_id).await {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    return Problem::not_found()
+                        .with_detail(format!("no such room: {room_id}"))
+                        .with_instance(instance)
+                        .into_response();
+                }
+                Err(e) => return e.to_problem().with_instance(instance).into_response(),
+            };
+
+            if let Err(resp) = record_mutation(
+                &state,
+                &principal,
+                "rooms.make_admin",
+                "room.admin_granted",
+                ResourceRef::new("room", room_id.clone()),
+                Vec::new(),
+                json!({ "user_id": target_user }),
+            )
+            .await
+            {
+                return resp;
+            }
+
+            let response_body = serde_json::to_vec(&updated).unwrap_or_default();
+            if let Some(key) = idempotency_key(&headers) {
+                state.idempotency.record(
+                    "rooms.make_admin",
+                    key,
+                    &body,
+                    StoredResponse {
+                        status: 200,
+                        content_type: "application/json".to_string(),
+                        body: response_body.clone(),
+                    },
+                );
+            }
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                response_body,
+            )
+                .into_response()
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+// -------------------------------------------------------------------------------------------
 // audit log (RFC 0004 section 9, brief deliverable 3)
 // -------------------------------------------------------------------------------------------
 
@@ -1025,6 +1661,73 @@ async fn audit_log_get(
                 .into_response(),
             Err(e) => e.to_problem().with_instance(instance).into_response(),
         },
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AuditExportQuery {
+    recorded_after: Option<String>,
+    recorded_before: Option<String>,
+}
+
+/// `GET /api/v1/audit-log/export` (`admin:read`): the audit log as NDJSON (one [`AuditEntry`]
+/// JSON object per line, `application/x-ndjson`) — a different response shape from
+/// `audit_log.list`'s `Page` envelope by design (the OpenAPI document declares it that way: a
+/// plain streamable line format an operator can pipe straight into `jq`/`grep`, not a paginated
+/// resource). Built from a single [`AuditSink::query`] call and joined into one body rather than a
+/// true chunked stream: [`InMemoryAuditSink`](crate::audit::InMemoryAuditSink) (and any real
+/// implementation reachable today) already holds every matching entry in memory or a single query
+/// result by the time this handler can see it, so there is nothing to stream incrementally yet;
+/// revisit if a real `AuditSink` grows a genuinely-streaming query method.
+async fn audit_log_export(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Query(query): Query<AuditExportQuery>,
+) -> Response {
+    let instance = "/api/v1/audit-log/export";
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let filter = AuditFilter {
+                recorded_after: query.recorded_after,
+                recorded_before: query.recorded_before,
+                limit: AUDIT_QUERY_FETCH_LIMIT,
+                ..Default::default()
+            };
+            match state.audit.query(&filter).await {
+                Ok(entries) => {
+                    let mut body = String::new();
+                    for entry in &entries {
+                        match serde_json::to_string(entry) {
+                            Ok(line) => {
+                                body.push_str(&line);
+                                body.push('\n');
+                            }
+                            Err(e) => {
+                                return Problem::internal()
+                                    .with_detail(format!("failed to serialize an audit entry: {e}"))
+                                    .with_instance(instance)
+                                    .into_response();
+                            }
+                        }
+                    }
+                    (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+                        body,
+                    )
+                        .into_response()
+                }
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
         ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
         ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
     }
@@ -1284,8 +1987,17 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         "users.unlock" => builder.add(method, &full_path, users_unlock, meta),
         "users.deactivate" => builder.add(method, &full_path, users_deactivate, meta),
         "users.reactivate" => builder.add(method, &full_path, users_reactivate, meta),
+        "users.create" => builder.add(method, &full_path, users_create, meta),
+        "users.lookup" => builder.add(method, &full_path, users_lookup, meta),
+        "users.availability" => builder.add(method, &full_path, users_availability, meta),
+        "rooms.list" => builder.add(method, &full_path, rooms_list, meta),
+        "rooms.get" => builder.add(method, &full_path, rooms_get, meta),
+        "rooms.block" => builder.add(method, &full_path, rooms_block, meta),
+        "rooms.unblock" => builder.add(method, &full_path, rooms_unblock, meta),
+        "rooms.make_admin" => builder.add(method, &full_path, rooms_make_admin, meta),
         "audit_log.list" => builder.add(method, &full_path, audit_log_list, meta),
         "audit_log.get" => builder.add(method, &full_path, audit_log_get, meta),
+        "audit_log.export" => builder.add(method, &full_path, audit_log_export, meta),
         "events.stream" => builder.add(method, &full_path, events_stream, meta),
         other => unreachable!(
             "{other} is listed in REAL_HANDLERS but register_real_operation doesn't know it"
@@ -1396,13 +2108,14 @@ mod tests {
 
     #[tokio::test]
     async fn authorized_request_to_undeclared_handler_is_501() {
-        // /api/v1/users is now one of REAL_HANDLERS (see below); use a still-undeclared operation
-        // to exercise the generic seam.
+        // /api/v1/users and /api/v1/rooms are now both in REAL_HANDLERS (see below); use a
+        // still-undeclared operation (appservices, owned by another track) to exercise the
+        // generic seam.
         let (router, _manifest) = build_router(test_state());
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/rooms")
+                    .uri("/api/v1/appservices")
                     .header("authorization", "Bearer admin-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -2282,5 +2995,712 @@ mod tests {
         assert!(hello.contains("stream.hello"));
         let reset = next_sse_frame(&mut body).await;
         assert!(reset.contains("event: stream.reset"));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // users.create / users.lookup / users.availability (session 6, goal 1): each answers a real
+    // 503 when `state.users` is unwired, never a fake 200, and `create` writes exactly one audit
+    // entry and publishes exactly one event like every other mutation in this router.
+    // -----------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn users_create_is_503_when_the_source_is_not_wired() {
+        let (router, _manifest) = build_router(test_state());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/users")
+                    .header("authorization", "Bearer admin-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"localpart":"bob"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn users_lookup_is_503_when_the_source_is_not_wired() {
+        let (router, _manifest) = build_router(test_state());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/users/lookup?medium=email&address=a%40example.org")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn users_availability_is_503_when_the_source_is_not_wired() {
+        let (router, _manifest) = build_router(test_state());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/users/availability?localpart=bob")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn users_availability_missing_localpart_is_400() {
+        let (router, _manifest) = build_router(state_with_users());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/users/availability")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn users_lookup_neither_pair_is_400() {
+        // Naming neither (medium, address) nor (provider, external_id) is a validation failure,
+        // caught before the source is ever consulted -- this must be 400, not a fabricated 404 or
+        // a 503 that would wrongly blame the (unwired) source for a client error.
+        let (router, _manifest) = build_router(state_with_users());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/users/lookup")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn users_create_writes_audit_and_event_and_returns_201() {
+        let state = state_with_users();
+        let mut rx = state.events.subscribe();
+        let (router, _manifest) = build_router(state);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/users")
+                    .header("authorization", "Bearer admin-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"localpart":"bob"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The fake `InMemoryUserDirectory` used by `state_with_users` does not override
+        // `create_user`, so this exercises the same honest-503 default the sources tests do —
+        // proving the handler reaches the source and propagates its error rather than fabricating
+        // success. A real `UserDirectory::create_user` implementation would return 201 here; see
+        // `create_user_and_lookup_user_and_check_localpart_available_end_to_end` below for that
+        // path exercised against a directory that *does* implement them.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "a failed create must not publish an event"
+        );
+    }
+
+    /// A tiny [`crate::sources::UserDirectory`] that overrides the three session-6 methods, to
+    /// exercise `users.create`/`users.lookup`/`users.availability`'s success paths end to end
+    /// (not just their honest-503 fallback, which the tests above already cover).
+    struct CreatingUserDirectory {
+        inner: crate::sources::InMemoryUserDirectory,
+    }
+
+    #[async_trait::async_trait]
+    impl UserDirectory for CreatingUserDirectory {
+        async fn get_user(
+            &self,
+            user_id: &str,
+        ) -> Result<Option<crate::model::AdminUser>, SourceError> {
+            self.inner.get_user(user_id).await
+        }
+        async fn list_users(
+            &self,
+            filter: &UserFilter,
+        ) -> Result<Vec<crate::model::AdminUser>, SourceError> {
+            self.inner.list_users(filter).await
+        }
+        async fn set_admin(&self, user_id: &str, admin: bool) -> Result<(), SourceError> {
+            self.inner.set_admin(user_id, admin).await
+        }
+        async fn set_locked(&self, user_id: &str, locked: bool) -> Result<(), SourceError> {
+            self.inner.set_locked(user_id, locked).await
+        }
+        async fn set_deactivated(
+            &self,
+            user_id: &str,
+            deactivated: bool,
+        ) -> Result<(), SourceError> {
+            self.inner.set_deactivated(user_id, deactivated).await
+        }
+        async fn create_user(
+            &self,
+            request: UserCreateRequest,
+        ) -> Result<crate::model::AdminUser, SourceError> {
+            // A read-only fake: proves `users.create`'s handler reaches a source that can
+            // succeed (`201`, not the honest-503 fallback), without needing interior mutability
+            // this test does not otherwise exercise (nothing here re-fetches the created user).
+            let localpart = request
+                .localpart
+                .ok_or_else(|| SourceError::Invalid("localpart is required".to_string()))?;
+            let user_id = format!("@{localpart}:example.org");
+            if self.inner.get_user(&user_id).await?.is_some() {
+                return Err(SourceError::Conflict(format!("{user_id} already exists")));
+            }
+            Ok(crate::model::AdminUser {
+                user_id,
+                display_name: request.display_name,
+                admin: request.admin,
+                ..Default::default()
+            })
+        }
+        async fn lookup_user(
+            &self,
+            query: UserLookupQuery,
+        ) -> Result<Option<crate::model::AdminUser>, SourceError> {
+            match query {
+                UserLookupQuery::Threepid { address, .. } if address == "known@example.org" => {
+                    Ok(self.inner.get_user("@bob:example.org").await?)
+                }
+                _ => Ok(None),
+            }
+        }
+        async fn check_localpart_available(&self, localpart: &str) -> Result<bool, SourceError> {
+            Ok(self
+                .inner
+                .get_user(&format!("@{localpart}:example.org"))
+                .await?
+                .is_none())
+        }
+    }
+
+    #[tokio::test]
+    async fn users_create_succeeds_writes_audit_and_event_against_a_real_source() {
+        let directory = CreatingUserDirectory {
+            inner: crate::sources::InMemoryUserDirectory::new(),
+        };
+        let state = test_state().with_users(Arc::new(directory));
+        let mut rx = state.events.subscribe();
+        let (router, _manifest) = build_router(state);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/users")
+                    .header("authorization", "Bearer admin-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"localpart":"carol"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let user: crate::model::AdminUser =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(user.user_id, "@carol:example.org");
+
+        let event = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("an event should be published")
+            .unwrap();
+        assert_eq!(event.r#type, "user.created");
+        assert_eq!(event.resource.unwrap().id, "@carol:example.org");
+
+        let entries = audit_entries_for_action(&router, "users.create").await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].target.id, "@carol:example.org");
+    }
+
+    #[tokio::test]
+    async fn users_create_neither_localpart_nor_user_id_is_400() {
+        let directory = CreatingUserDirectory {
+            inner: crate::sources::InMemoryUserDirectory::new(),
+        };
+        let state = test_state().with_users(Arc::new(directory));
+        let (router, _manifest) = build_router(state);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/users")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn users_lookup_and_availability_succeed_against_a_real_source() {
+        use crate::model::AdminUser;
+
+        let bob = AdminUser {
+            user_id: "@bob:example.org".to_string(),
+            ..Default::default()
+        };
+        let directory = CreatingUserDirectory {
+            inner: crate::sources::InMemoryUserDirectory::new().with_user(bob),
+        };
+        let state = test_state().with_users(Arc::new(directory));
+        let (router, _manifest) = build_router(state);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/users/lookup?medium=email&address=known%40example.org")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let user: crate::model::AdminUser =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(user.user_id, "@bob:example.org");
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/users/lookup?medium=email&address=unknown%40example.org")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/users/availability?localpart=bob")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(value["available"], false);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/users/availability?localpart=carol")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(value["available"], true);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // rooms (session 6, goal 2): the RoomDirectory seam, exercised against InMemoryRoomDirectory.
+    // Every 503 assertion below proves `AdminState::rooms: None` (its real default — no track 04
+    // implementation is wired in this session) never fabricates a 200.
+    // -----------------------------------------------------------------------------------------
+
+    fn state_with_rooms() -> AdminState {
+        use crate::model::AdminRoom;
+        use crate::sources::InMemoryRoomDirectory;
+
+        let lounge = AdminRoom {
+            room_id: "!lounge:example.org".to_string(),
+            name: Some("The Lounge".to_string()),
+            ..Default::default()
+        };
+        let mut blocked = AdminRoom {
+            room_id: "!blocked:example.org".to_string(),
+            ..Default::default()
+        };
+        blocked.blocked = true;
+        let directory = InMemoryRoomDirectory::new()
+            .with_room(lounge)
+            .with_room(blocked);
+        test_state().with_rooms(Arc::new(directory))
+    }
+
+    #[tokio::test]
+    async fn rooms_list_is_503_when_the_source_is_not_wired() {
+        let (router, _manifest) = build_router(test_state());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/rooms")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn rooms_get_is_503_when_the_source_is_not_wired() {
+        let (router, _manifest) = build_router(test_state());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/rooms/%21lounge%3Aexample.org")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn rooms_block_is_503_when_the_source_is_not_wired() {
+        let (router, _manifest) = build_router(test_state());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/rooms/%21lounge%3Aexample.org/block")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn rooms_list_paginates_and_filters_by_blocked() {
+        let (router, _manifest) = build_router(state_with_rooms());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/rooms?blocked=true")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let page: Page<crate::model::AdminRoom> =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].room_id, "!blocked:example.org");
+    }
+
+    #[tokio::test]
+    async fn rooms_get_returns_the_real_room() {
+        let (router, _manifest) = build_router(state_with_rooms());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/rooms/%21lounge%3Aexample.org")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let room: crate::model::AdminRoom =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(room.name, Some("The Lounge".to_string()));
+    }
+
+    #[tokio::test]
+    async fn rooms_get_missing_room_is_404() {
+        let (router, _manifest) = build_router(state_with_rooms());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/rooms/%21nobody%3Aexample.org")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rooms_block_writes_audit_and_event_and_flips_blocked() {
+        let state = state_with_rooms();
+        let mut rx = state.events.subscribe();
+        let (router, _manifest) = build_router(state);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/rooms/%21lounge%3Aexample.org/block")
+                    .header("authorization", "Bearer admin-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"reason":"spam"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let room: crate::model::AdminRoom =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert!(room.blocked);
+        assert_eq!(room.blocked_reason, Some("spam".to_string()));
+
+        let event = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("an event should be published")
+            .unwrap();
+        assert_eq!(event.r#type, "room.blocked");
+        assert_eq!(event.resource.unwrap().id, "!lounge:example.org");
+
+        let entries = audit_entries_for_action(&router, "rooms.block").await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].changes.len(), 1);
+        assert_eq!(entries[0].changes[0].pointer, "/blocked");
+    }
+
+    #[tokio::test]
+    async fn rooms_unblock_writes_audit_and_event_and_clears_the_reason() {
+        let state = state_with_rooms();
+        let mut rx = state.events.subscribe();
+        let (router, _manifest) = build_router(state);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/rooms/%21blocked%3Aexample.org/unblock")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let room: crate::model::AdminRoom =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert!(!room.blocked);
+
+        let event = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("an event should be published")
+            .unwrap();
+        assert_eq!(event.r#type, "room.unblocked");
+
+        let entries = audit_entries_for_action(&router, "rooms.unblock").await;
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rooms_block_is_idempotent_on_an_already_blocked_room() {
+        let state = state_with_rooms();
+        let mut rx = state.events.subscribe();
+        let (router, _manifest) = build_router(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/rooms/%21blocked%3Aexample.org/block")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let event = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("an event should still be published even with no field change")
+            .unwrap();
+        assert_eq!(event.r#type, "room.blocked");
+    }
+
+    #[tokio::test]
+    async fn rooms_make_admin_writes_audit_and_event() {
+        let state = state_with_rooms();
+        let mut rx = state.events.subscribe();
+        let (router, _manifest) = build_router(state);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/rooms/%21lounge%3Aexample.org/make-admin")
+                    .header("authorization", "Bearer admin-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"user_id":"@alice:example.org"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("an event should be published")
+            .unwrap();
+        assert_eq!(event.r#type, "room.admin_granted");
+        assert_eq!(event.data["user_id"], "@alice:example.org");
+
+        let entries = audit_entries_for_action(&router, "rooms.make_admin").await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].target.id, "!lounge:example.org");
+    }
+
+    #[tokio::test]
+    async fn rooms_make_admin_missing_room_is_404() {
+        let (router, _manifest) = build_router(state_with_rooms());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/rooms/%21nobody%3Aexample.org/make-admin")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // audit_log.export (session 6, goal 3)
+    // -----------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn audit_log_export_is_ndjson_one_entry_per_line() {
+        let state = state_with_users();
+        let (router, _manifest) = build_router(state);
+
+        // Generate two audit entries.
+        for _ in 0..2 {
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/users/%40alice%3Aexample.org/lock")
+                        .header("authorization", "Bearer admin-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/users/%40alice%3Aexample.org/unlock")
+                        .header("authorization", "Bearer admin-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/audit-log/export")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/x-ndjson")
+        );
+        let body = body_bytes(response).await;
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4);
+        for line in lines {
+            let entry: AuditEntry = serde_json::from_str(line).unwrap();
+            assert!(!entry.id.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_log_export_needs_admin_read() {
+        let verifier = StaticVerifier::new().with_token(
+            "no-scopes",
+            Principal {
+                kind: PrincipalKind::User,
+                id: "@nobody:example.org".into(),
+                display_name: None,
+                scopes: vec![],
+                token_id: None,
+                expires_at: None,
+                issued_by: None,
+            },
+        );
+        let state = AdminState::new(
+            Arc::new(verifier),
+            Arc::new(InMemoryAuditSink::new()),
+            Arc::new(EventBus::new()),
+        );
+        let (router, _manifest) = build_router(state);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/audit-log/export")
+                    .header("authorization", "Bearer no-scopes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }

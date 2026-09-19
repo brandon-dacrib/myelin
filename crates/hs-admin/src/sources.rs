@@ -12,10 +12,9 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use async_trait::async_trait;
+use serde::Deserialize;
 
-// `AdminRoom` is defined in `crate::model` but not imported here yet: the `RoomDirectory`
-// trait that will use it is the next slice of this seam (`docs/status/15-admin-api-and-modules.md`).
-use crate::model::{AdminUser, ExternalId, ThreePid};
+use crate::model::{AdminRoom, AdminUser, ExternalId, ThreePid};
 
 /// Why a data-source call failed. Mirrors [`crate::auth::AuthError`]'s "only unavailable escapes
 /// as something other than the obvious status" shape: [`SourceError::NotFound`] maps to `404
@@ -56,7 +55,12 @@ impl SourceError {
 /// `user_id` is expected to be set (validated by the handler, not this struct); which one a real
 /// implementation needs is a detail of how it resolves a homeserver domain, which this crate does
 /// not own — see [`UserDirectory::create_user`]'s doc comment.
-#[derive(Debug, Clone, Default)]
+///
+/// Derives [`Deserialize`] directly (field-for-field match with the OpenAPI `UserCreate` schema)
+/// so `router::users_create` can parse the request body straight into this type rather than a
+/// separate wire struct that would need to be kept in sync with it by hand.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct UserCreateRequest {
     pub localpart: Option<String>,
     pub user_id: Option<String>,
@@ -74,8 +78,14 @@ pub struct UserCreateRequest {
 /// calling [`UserDirectory::lookup_user`].
 #[derive(Debug, Clone)]
 pub enum UserLookupQuery {
-    Threepid { medium: String, address: String },
-    ExternalId { provider: String, external_id: String },
+    Threepid {
+        medium: String,
+        address: String,
+    },
+    ExternalId {
+        provider: String,
+        external_id: String,
+    },
 }
 
 /// Filters for `GET /users` (RFC 0004 section 4.2 / the OpenAPI `users.list` operation).
@@ -262,6 +272,196 @@ impl UserDirectory for InMemoryUserDirectory {
     }
 }
 
+/// Filters for `GET /rooms` (the OpenAPI `rooms.list` operation). `q` is free text matched
+/// against `room_id`, `name`, `topic` and `canonical_alias`, case-insensitively, mirroring
+/// [`UserFilter::q`]'s convention.
+#[derive(Debug, Default, Clone)]
+pub struct RoomFilter {
+    pub q: Option<String>,
+    pub public: Option<bool>,
+    pub empty: Option<bool>,
+    pub blocked: Option<bool>,
+    pub encrypted: Option<bool>,
+    pub federatable: Option<bool>,
+    pub room_type: Option<String>,
+    pub version: Option<String>,
+}
+
+/// The room-directory seam `hs-admin`'s `/rooms` handlers call. **Not implemented against a real
+/// backing store by this session** — `crates/hs-room` (the real source of room state) is owned by
+/// another track and was explicitly out of scope for this session's assignment (see
+/// `docs/status/15-admin-api-and-modules.md` "Interfaces needed" for the exact contract track 04
+/// should implement this against). [`InMemoryRoomDirectory`] is a fake for this crate's own tests
+/// only; `router::AdminState::rooms` defaults to `None`, so `GET /rooms`, `GET /rooms/{room_id}`,
+/// and the three moderation actions all answer an honest `503 unavailable` until a real
+/// implementation is wired in with `AdminState::with_rooms`.
+///
+/// Contract notes for whoever implements this against `hs-room`:
+/// - `list_rooms`/`get_room` should read from whatever room-summary index `hs-room` already
+///   maintains for its own listing needs; this trait does not prescribe how membership counts or
+///   `state_events_count` are computed, only that the resulting [`AdminRoom`] be accurate as of
+///   the call.
+/// - `set_blocked` both flips `AdminRoom::blocked`/`blocked_reason` **and** is expected to have a
+///   real effect on the room (RFC 0004: a blocked room rejects new joins and events from local
+///   users going forward) — this seam only carries the flag across the boundary; enforcing it is
+///   `hs-room`'s job once it reads the flag back.
+/// - `make_admin` grants `user_id` the room's highest power level (or `100`, whichever is lower of
+///   "highest used" and "the room's own admin threshold" — see Synapse's `make_room_admin` for the
+///   reference behavior this mirrors, read for behavior only, never copied per this track's brief)
+///   by sending a new `m.room.power_levels` state event on `user_id`'s behalf. It does not change
+///   any field of [`AdminRoom`] itself, which is why the trait returns `()` rather than an updated
+///   room; the handler re-fetches via `get_room` to build its response, same as the user toggles do.
+#[async_trait]
+pub trait RoomDirectory: Send + Sync + 'static {
+    async fn get_room(&self, room_id: &str) -> Result<Option<AdminRoom>, SourceError>;
+    async fn list_rooms(&self, filter: &RoomFilter) -> Result<Vec<AdminRoom>, SourceError>;
+
+    /// Sets `AdminRoom::blocked`/`blocked_reason` and, on a real implementation, enforces it
+    /// (rejecting new joins/events). `SourceError::NotFound` if the room does not exist.
+    async fn set_blocked(
+        &self,
+        room_id: &str,
+        blocked: bool,
+        reason: Option<String>,
+    ) -> Result<(), SourceError>;
+
+    /// Grants `user_id` room-admin power level in `room_id` (`rooms.make_admin`).
+    /// `SourceError::NotFound` if the room does not exist; `SourceError::Invalid` if `user_id` is
+    /// not a member of the room.
+    async fn make_admin(&self, room_id: &str, user_id: &str) -> Result<(), SourceError>;
+}
+
+/// An in-memory [`RoomDirectory`] for this crate's own handler tests, following
+/// [`InMemoryUserDirectory`]'s shape exactly. Not a production implementation: `make_admin` only
+/// validates the room exists (there is no membership list here to check `user_id` against).
+#[derive(Debug, Default)]
+pub struct InMemoryRoomDirectory {
+    rooms: RwLock<HashMap<String, AdminRoom>>,
+}
+
+impl InMemoryRoomDirectory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Inserts (or replaces) one room, keyed by `room.room_id`.
+    pub fn with_room(self, room: AdminRoom) -> Self {
+        self.rooms
+            .write()
+            .expect("InMemoryRoomDirectory lock poisoned")
+            .insert(room.room_id.clone(), room);
+        self
+    }
+}
+
+#[async_trait]
+impl RoomDirectory for InMemoryRoomDirectory {
+    async fn get_room(&self, room_id: &str) -> Result<Option<AdminRoom>, SourceError> {
+        Ok(self
+            .rooms
+            .read()
+            .expect("InMemoryRoomDirectory lock poisoned")
+            .get(room_id)
+            .cloned())
+    }
+
+    async fn list_rooms(&self, filter: &RoomFilter) -> Result<Vec<AdminRoom>, SourceError> {
+        let rooms = self
+            .rooms
+            .read()
+            .expect("InMemoryRoomDirectory lock poisoned");
+        let q = filter.q.as_ref().map(|q| q.to_lowercase());
+        let mut items: Vec<AdminRoom> = rooms
+            .values()
+            .filter(|r| {
+                if let Some(public) = filter.public
+                    && r.public != public
+                {
+                    return false;
+                }
+                if let Some(empty) = filter.empty
+                    && (r.joined_members_count == 0) != empty
+                {
+                    return false;
+                }
+                if let Some(blocked) = filter.blocked
+                    && r.blocked != blocked
+                {
+                    return false;
+                }
+                if let Some(encrypted) = filter.encrypted
+                    && r.encrypted != encrypted
+                {
+                    return false;
+                }
+                if let Some(federatable) = filter.federatable
+                    && r.federatable != federatable
+                {
+                    return false;
+                }
+                if let Some(room_type) = &filter.room_type
+                    && r.room_type.as_deref() != Some(room_type.as_str())
+                {
+                    return false;
+                }
+                if let Some(version) = &filter.version
+                    && &r.version != version
+                {
+                    return false;
+                }
+                if let Some(q) = &q {
+                    let hay = [
+                        Some(r.room_id.as_str()),
+                        r.name.as_deref(),
+                        r.topic.as_deref(),
+                        r.canonical_alias.as_deref(),
+                    ];
+                    if !hay
+                        .iter()
+                        .flatten()
+                        .any(|s| s.to_lowercase().contains(q.as_str()))
+                    {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        items.sort_by(|a, b| a.room_id.cmp(&b.room_id));
+        Ok(items)
+    }
+
+    async fn set_blocked(
+        &self,
+        room_id: &str,
+        blocked: bool,
+        reason: Option<String>,
+    ) -> Result<(), SourceError> {
+        let mut rooms = self
+            .rooms
+            .write()
+            .expect("InMemoryRoomDirectory lock poisoned");
+        let room = rooms.get_mut(room_id).ok_or(SourceError::NotFound)?;
+        room.blocked = blocked;
+        room.blocked_reason = if blocked { reason } else { None };
+        Ok(())
+    }
+
+    async fn make_admin(&self, room_id: &str, _user_id: &str) -> Result<(), SourceError> {
+        let rooms = self
+            .rooms
+            .read()
+            .expect("InMemoryRoomDirectory lock poisoned");
+        if rooms.contains_key(room_id) {
+            Ok(())
+        } else {
+            Err(SourceError::NotFound)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,5 +560,132 @@ mod tests {
             503
         );
         assert_eq!(SourceError::Invalid("bad".into()).to_problem().status, 400);
+        assert_eq!(SourceError::Conflict("dup".into()).to_problem().status, 409);
+    }
+
+    #[tokio::test]
+    async fn default_create_lookup_availability_are_unavailable() {
+        // Guards session 6's contract: an implementor who only overrides the five original
+        // methods must still compile, and the three new ones must answer 503, never a fake
+        // success, until overridden.
+        let dir = InMemoryUserDirectory::new();
+        assert!(matches!(
+            dir.create_user(UserCreateRequest::default()).await,
+            Err(SourceError::Unavailable(_))
+        ));
+        assert!(matches!(
+            dir.lookup_user(UserLookupQuery::Threepid {
+                medium: "email".into(),
+                address: "a@example.org".into(),
+            })
+            .await,
+            Err(SourceError::Unavailable(_))
+        ));
+        assert!(matches!(
+            dir.check_localpart_available("alice").await,
+            Err(SourceError::Unavailable(_))
+        ));
+    }
+
+    fn room(id: &str) -> AdminRoom {
+        AdminRoom {
+            room_id: id.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn get_room_returns_none_when_absent() {
+        let dir = InMemoryRoomDirectory::new();
+        assert_eq!(dir.get_room("!nobody:example.org").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn get_room_returns_the_inserted_room() {
+        let dir = InMemoryRoomDirectory::new().with_room(room("!abc:example.org"));
+        let found = dir.get_room("!abc:example.org").await.unwrap();
+        assert_eq!(found.map(|r| r.room_id), Some("!abc:example.org".into()));
+    }
+
+    #[tokio::test]
+    async fn list_rooms_filters_by_blocked_flag() {
+        let mut blocked = room("!blocked:example.org");
+        blocked.blocked = true;
+        let dir = InMemoryRoomDirectory::new()
+            .with_room(blocked)
+            .with_room(room("!ok:example.org"));
+        let items = dir
+            .list_rooms(&RoomFilter {
+                blocked: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].room_id, "!blocked:example.org");
+    }
+
+    #[tokio::test]
+    async fn list_rooms_q_matches_name_and_room_id_case_insensitively() {
+        let mut lounge = room("!abc:example.org");
+        lounge.name = Some("The Lounge".to_string());
+        let dir = InMemoryRoomDirectory::new()
+            .with_room(lounge)
+            .with_room(room("!other:example.org"));
+        let items = dir
+            .list_rooms(&RoomFilter {
+                q: Some("lounge".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].room_id, "!abc:example.org");
+    }
+
+    #[tokio::test]
+    async fn set_blocked_on_unknown_room_is_not_found() {
+        let dir = InMemoryRoomDirectory::new();
+        let err = dir
+            .set_blocked("!nobody:example.org", true, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SourceError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn set_blocked_sets_and_clears_the_reason() {
+        let dir = InMemoryRoomDirectory::new().with_room(room("!abc:example.org"));
+        dir.set_blocked("!abc:example.org", true, Some("spam".to_string()))
+            .await
+            .unwrap();
+        let found = dir.get_room("!abc:example.org").await.unwrap().unwrap();
+        assert!(found.blocked);
+        assert_eq!(found.blocked_reason, Some("spam".to_string()));
+
+        dir.set_blocked("!abc:example.org", false, None)
+            .await
+            .unwrap();
+        let found = dir.get_room("!abc:example.org").await.unwrap().unwrap();
+        assert!(!found.blocked);
+        assert_eq!(found.blocked_reason, None);
+    }
+
+    #[tokio::test]
+    async fn make_admin_on_unknown_room_is_not_found() {
+        let dir = InMemoryRoomDirectory::new();
+        let err = dir
+            .make_admin("!nobody:example.org", "@alice:example.org")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SourceError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn make_admin_on_a_known_room_succeeds() {
+        let dir = InMemoryRoomDirectory::new().with_room(room("!abc:example.org"));
+        dir.make_admin("!abc:example.org", "@alice:example.org")
+            .await
+            .unwrap();
     }
 }
