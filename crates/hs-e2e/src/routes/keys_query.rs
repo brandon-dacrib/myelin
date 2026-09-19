@@ -56,11 +56,27 @@ pub(crate) async fn build_keys_query_response<B: KvBackend + 'static>(
         if user_id.server_name() != server_name {
             continue;
         }
-        let wanted: Option<Vec<String>> = device_filter.as_array().map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        });
+        // The per-user device filter must be an array of device id strings (or absent, meaning
+        // "no filter" -- note this is *not* the same as an explicit empty array, which the spec
+        // also treats as "every device", so both are handled identically below). Anything else
+        // (an object, a number, ...) is a malformed request body: Element iOS has been known to
+        // send `{"device_id1": true}` in place of `["device_id1"]`, which a loosely-typed server
+        // would silently treat as an empty array (Python iterates a dict's keys); this server
+        // rejects it outright, matching the spec and Complement's
+        // `TestKeysQueryWithDeviceIDAsObjectFails`.
+        let wanted: Option<Vec<String>> = match device_filter {
+            Value::Null => None,
+            Value::Array(a) => Some(
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect(),
+            ),
+            _ => {
+                return Err(E2eError::BadRequest(format!(
+                    "device_keys.{user_id_str} must be an array of device ids"
+                )));
+            }
+        };
 
         let devices = state.store.list_device_keys(user_id).await?;
         let mut per_user = Map::new();
@@ -73,9 +89,13 @@ pub(crate) async fn build_keys_query_response<B: KvBackend + 'static>(
             }
             per_user.insert(device_id.to_string(), row.keys);
         }
-        if !per_user.is_empty() {
-            device_keys_out.insert(user_id.to_string(), Value::Object(per_user));
-        }
+        // Always report an entry for a requested (valid, local) user, even an empty one -- the
+        // spec's response shape is "for each user requested", not "for each user found with
+        // devices". Omitting the key entirely for a user with no matching devices previously made
+        // `device_keys.<user>` come back missing rather than `{}`, which is exactly what
+        // Complement's key-management tests (e.g. "query for user with no keys returns empty key
+        // dict") catch.
+        device_keys_out.insert(user_id.to_string(), Value::Object(per_user));
 
         if let Some(key) = state
             .store

@@ -47,9 +47,15 @@ impl E2eError {
 impl IntoResponse for E2eError {
     fn into_response(self) -> Response {
         let matrix_error = match &self {
+            // `M_BAD_JSON` (not `M_INVALID_PARAM`) is the spec's errcode for "the request body
+            // does not have the shape this endpoint requires" -- every `BadRequest` in this crate
+            // is exactly that (a missing/misshapen field, not an otherwise-valid parameter with
+            // an invalid value). Complement's malformed-shape tests
+            // (`TestKeysQueryWithDeviceIDAsObjectFails`, `upload_keys_test.go`'s "Rejects invalid
+            // device keys") assert this exact errcode, not just the 400 status.
             Self::BadRequest(msg) => MatrixError::custom(
                 StatusCode::BAD_REQUEST,
-                MatrixErrorCode::InvalidParam,
+                MatrixErrorCode::BadJson,
                 msg.clone(),
             ),
             Self::NotFound(msg) => MatrixError::not_found(msg.clone()),

@@ -15,11 +15,13 @@
 //! never receive the same key — a double claim is the classic bug that produces an undecryptable
 //! message (both parties think they hold the one-time key the other used to establish a
 //! session). [`tables::TablesE2eStore`]'s implementation relies entirely on `hs-kv`'s
-//! serializable snapshot isolation for this: it scans for the lexicographically first key under
-//! the device's `(user_id, device_id, algorithm)` prefix and deletes it inside one
-//! `hs_kv::transact` closure. Two concurrent claims that both scan and see the same key have that
-//! scan recorded in their read sets; whichever commits first deletes the key (removing it from
-//! the range), so the second transaction's commit-time validation sees its scanned range has
+//! serializable snapshot isolation for this: it scans every remaining key under the device's
+//! `(user_id, device_id, algorithm)` prefix, picks the one with the lowest upload sequence number
+//! (not the lexicographically first key id: MSC4225 requires upload order, which a key id's own
+//! sort order does not always match — see `tables`'s private `OtkStored` type), and deletes it
+//! inside one `hs_kv::transact` closure. Two concurrent claims that both scan and see the same key
+//! have that scan recorded in their read sets; whichever commits first deletes the key (removing it
+//! from the range), so the second transaction's commit-time validation sees its scanned range has
 //! changed and reports [`hs_kv::Conflict`], forcing a retry that then sees the key already gone.
 //! No lock, no special "claim" primitive — plain serializability. `store::tables::tests` and
 //! `tests/otk_concurrency.rs` are the executable proof, run against both the in-memory and Fjall

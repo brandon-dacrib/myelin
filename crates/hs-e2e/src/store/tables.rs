@@ -10,7 +10,7 @@
 //! |---|---|---|
 //! | `hs_e2e.device_keys` | `(user_id, device_id)` | [`DeviceKeyStore`] |
 //! | `hs_e2e.device_list_stream` | `(stream_id: u64,)` | [`DeviceKeyStore`]'s change stream |
-//! | `hs_e2e.one_time_keys` | `(user_id, device_id, algorithm, key_id)` | [`OneTimeKeyStore`] — the atomic claim scans and deletes the lexicographically first row under `(user_id, device_id, algorithm)`, see the module docs on [`super`] |
+//! | `hs_e2e.one_time_keys` | `(user_id, device_id, algorithm, key_id)` | [`OneTimeKeyStore`] — the atomic claim scans every row under `(user_id, device_id, algorithm)` and deletes the one with the lowest stored upload sequence number (MSC4225 order, not key-id sort order), see the module docs on [`super`] |
 //! | `hs_e2e.claimed_one_time_keys` | `(user_id, device_id, algorithm, key_id)` | [`OneTimeKeyStore`] — a tombstone per key id ever claimed, so a re-upload of that id cannot resurrect it |
 //! | `hs_e2e.fallback_keys` | `(user_id, device_id, algorithm)` | [`FallbackKeyStore`] |
 //! | `hs_e2e.cross_signing_keys` | `(user_id, key_type)` | [`CrossSigningStore`] |
@@ -319,6 +319,17 @@ fn split_algo_key(composite: &str) -> Result<(&str, &str), StoreError> {
     })
 }
 
+/// A stored one-time key: the client-supplied key content plus the global upload sequence number
+/// it was assigned, so [`TablesE2eStore::claim_one_time_key`] can hand keys out in upload order
+/// (MSC4225) rather than in the lexicographic order of their key ids -- which would silently
+/// reorder keys whenever a client's key ids don't happen to sort the same way they were uploaded
+/// (e.g. uploading id `"1"` before id `"0"`, or crossing the `"9"`/`"10"` boundary).
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct OtkStored {
+    seq: u64,
+    value: Value,
+}
+
 #[async_trait::async_trait]
 impl<B: KvBackend> OneTimeKeyStore for TablesE2eStore<B> {
     async fn upload_one_time_keys(
@@ -335,6 +346,7 @@ impl<B: KvBackend> OneTimeKeyStore for TablesE2eStore<B> {
             let (algorithm, key_id) = split_algo_key(composite)?;
             parsed.push((algorithm.to_string(), key_id.to_string(), value.clone()));
         }
+        let otk_seq_key = ("otk_seq".to_string(),).encode();
         transact(&self.backend, TransactConfig::default(), |txn| {
             for (algorithm, key_id, value) in &parsed {
                 let key = (
@@ -359,7 +371,12 @@ impl<B: KvBackend> OneTimeKeyStore for TablesE2eStore<B> {
                 {
                     continue;
                 }
-                let bytes = encode_kv(value)?;
+                let seq = next_counter(txn, &self.counters, &otk_seq_key)?;
+                let stored = OtkStored {
+                    seq,
+                    value: value.clone(),
+                };
+                let bytes = encode_kv(&stored)?;
                 self.one_time_keys.put(txn, &key, &bytes).map_err(to_kv)?;
             }
             Ok(())
@@ -379,16 +396,23 @@ impl<B: KvBackend> OneTimeKeyStore for TablesE2eStore<B> {
             algorithm.to_string(),
         );
         transact(&self.backend, TransactConfig::default(), |txn| {
-            let spec = TypedKeyspace::<B::Keyspace, OtkKey>::prefix(&prefix).limit(1);
-            let found: Option<(OtkKey, Bytes)> = {
-                let mut iter = self.one_time_keys.range(&*txn, spec);
-                match iter.next() {
-                    Some(Ok(pair)) => Some(pair),
-                    Some(Err(e)) => return Err(to_kv(e)),
-                    None => None,
+            let spec = TypedKeyspace::<B::Keyspace, OtkKey>::prefix(&prefix);
+            // Scan every remaining key under this device/algorithm (not just the first one found)
+            // and pick the one with the lowest upload sequence number, so a claim always returns
+            // the oldest-uploaded key regardless of how key ids happen to sort lexicographically
+            // (MSC4225: "one-time keys must be issued in the same order they were uploaded").
+            let mut oldest: Option<(OtkKey, OtkStored)> = None;
+            for item in self.one_time_keys.range(&*txn, spec) {
+                let (key, bytes) = item.map_err(to_kv)?;
+                let stored: OtkStored = decode_kv(&bytes)?;
+                if oldest
+                    .as_ref()
+                    .is_none_or(|(_, current)| stored.seq < current.seq)
+                {
+                    oldest = Some((key, stored));
                 }
-            };
-            let Some((key, value)) = found else {
+            }
+            let Some((key, stored)) = oldest else {
                 return Ok(None);
             };
             self.one_time_keys.delete(txn, &key).map_err(to_kv)?;
@@ -397,8 +421,7 @@ impl<B: KvBackend> OneTimeKeyStore for TablesE2eStore<B> {
             self.claimed_one_time_keys
                 .put(txn, &key, &[])
                 .map_err(to_kv)?;
-            let parsed: Value = decode_kv(&value)?;
-            Ok(Some((key.3, parsed)))
+            Ok(Some((key.3, stored.value)))
         })
         .map_err(store_err)
     }

@@ -35,11 +35,36 @@ pub async fn post_keys_upload<B: KvBackend + 'static>(
     };
 
     if let Some(device_keys) = body.get("device_keys") {
+        let Some(device_keys_obj) = device_keys.as_object() else {
+            return Err(E2eError::BadRequest(
+                "device_keys must be an object".to_string(),
+            ));
+        };
+        // `algorithms`, `keys` and `signatures` are all `Required` by the spec's `DeviceKeys`
+        // schema; a body missing one is malformed, not merely "unusual" -- accepting it would
+        // store (and later hand other users via `/keys/query`) a device-keys object no client can
+        // actually parse. Matches Complement's `upload_keys_test.go` "Rejects invalid device
+        // keys".
+        for field in ["algorithms", "keys", "signatures"] {
+            if !device_keys_obj.contains_key(field) {
+                return Err(E2eError::BadRequest(format!(
+                    "device_keys is missing required field {field:?}"
+                )));
+            }
+        }
         if let Some(claimed) = device_keys.get("device_id").and_then(Value::as_str)
             && claimed != device_id.as_str()
         {
             return Err(E2eError::BadRequest(format!(
                 "device_keys.device_id {claimed:?} does not match this session's device {device_id}"
+            )));
+        }
+        if let Some(claimed) = device_keys.get("user_id").and_then(Value::as_str)
+            && claimed != requester.user_id.as_str()
+        {
+            return Err(E2eError::BadRequest(format!(
+                "device_keys.user_id {claimed:?} does not match this session's user {}",
+                requester.user_id
             )));
         }
         state
