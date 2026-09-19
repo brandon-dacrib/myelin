@@ -1,5 +1,25 @@
 # 16. Management web interface: status
 
+> **Integration note, 2026-09-19 (integration lead): one of this session's three findings is a
+> false positive, and the other two are confirmed.**
+>
+> - **CORS: confirmed, and serious.** `crates/hs-cli/src/serve.rs` applies no CORS layer to
+>   `/_matrix/*` at all, and `hs_http::cors` was only ever written for `/api/v1`. A browser client
+>   cannot talk to this server. `hs_http::cors::matrix_layer()` now exists with the spec's exact
+>   policy and its own tests; applying it is one line in `serve.rs`, which another agent held when
+>   this was found.
+> - **`/capabilities` stale flags: confirmed.** `m.set_displayname` and `m.set_avatar_url` report
+>   `false` while both routes work.
+> - **Receipts 404: NOT a bug.** Reproduced against the server this session left running, then
+>   retested against a freshly built binary: `POST .../receipt/{type}/{eventId}` and
+>   `POST .../read_markers` both answer **200**. The running server predated track 05 adding those
+>   routes while the routes manifest came from a newer build — a stale-binary mismatch, which this
+>   session's report explicitly listed as ruled out. It was not. There is no fault in
+>   `hs-http`'s `Builder`/`merge_router`, and a probe confirmed axum composes two routers nested at
+>   the same prefix correctly. Worth the care: a "registered but unreachable" bug would have
+>   undermined every coverage number this project quotes.
+
+
 > **Integration note, 2026-09-19 (integration lead):** two corrections to the session below.
 > First, `npm run typecheck` did **not** pass as committed: `src/api/bridges.ts`'s
 > `useDeleteAppservice` was left mid-refactor (`const { error } = ...` followed by
@@ -14,7 +34,262 @@
 
 Track brief: `docs/workstreams/16-management-web-interface.md`. Owner directories: `web/`, `docs/design/`.
 
-Last updated: 2026-09-19 (session: real-server mode, honest 501/503/403 degradation as a shared API-layer + component treatment, and proof against a real, running `hs serve` — not just the mock).
+Last updated: 2026-09-19 (session: pointing Element Web at `hs serve` — `docs/next-steps.md` item 2).
+
+## Session: pointing Element Web at `hs serve` (2026-09-19, later same day)
+
+Assignment (from the integration lead, not the track brief): point Element Web, a real Matrix
+client, at this server — "the single best test of whether this is a homeserver," never done
+before. Full protocol-level verification was completed; **the actual browser run could not be
+completed this session because the shared Docker daemon became unresponsive to container
+lifecycle operations under host load**, not because of anything in this server. Reported
+honestly rather than assumed, per this track's own standing instruction. Everything needed to
+finish the browser run in one command is left in place for the next session.
+
+### What actually happened, step by step
+
+1. **Built the binary and stood up a real server.** `cargo build -p hs-cli --bin hs` (fresh, at
+   commit `6b98961`). Config: `web/element-testing/config.yaml`, generated with
+   `hs generate-config --server-name test.local` then hand-patched (port 8098, `admin` added to
+   the listener's resources, `enable_registration: true` +
+   `registration_shared_secret: elementtestsecret` so Element's own registration UI could be
+   exercised, `public_baseurl: http://127.0.0.1:8098` so `.well-known/matrix/client` would be
+   real, `rate_limits.enabled: false` — a deliberate test-only choice, see the README, since the
+   generated default of 0.2 msg/s would make ordinary Element use look broken). `hs serve -c
+   config.yaml` came up clean, and three users were registered (`ops` admin, `alice`, `bob`) via
+   `hs register` against the live server (shared-secret registration, confirmed working).
+2. **Verified the entire client-server surface Element needs, directly, before trying the
+   browser.** Given the risk that Docker might not cooperate (documented as a known risk in the
+   brief for this session), every capability the assignment lists was exercised by hand against
+   the real, running binary first: `.well-known/matrix/client` discovery, `GET/POST
+   /_matrix/client/v3/login` (password), `POST /register` (`m.login.dummy`), `GET
+   /capabilities`, `POST /createRoom`, `GET /sync` (including **long-polling**: confirmed a
+   30s-timeout poll returns in ~1s when a new message lands mid-poll, and blocks the full
+   duration when nothing happens — the "continuous sync loop" the assignment specifically calls
+   out as different from a scripted SDK's discrete calls), filter upload (`lazy_load_members`),
+   invite/join, `PUT .../send`, `PUT .../typing`, `GET .../members?membership=join`, `GET
+   .../context/{eventId}`, `GET .../state`, media upload/download/config, `PUT
+   .../profile/{userId}/displayname` and `.../avatar_url`, `PUT .../state/m.room.avatar/`, `GET
+   /pushrules/`, `GET /devices`, `GET /account/whoami`, `GET /joined_rooms`, logout and
+   post-logout token revocation (401, correctly). All of this passed and is real, working
+   Matrix protocol surface — see "What works, verified live" below. Three bugs were found this
+   way (below) that a scripted SDK test would not have hit either, because none of the 23-step
+   `hs-loadgen` scenario touches receipts, CORS preflights, or the capabilities/profile
+   cross-check.
+3. **Pulled Element Web** (`docker pull vectorim/element-web:latest`, per instructions — a small
+   published image, not a build; ~205MB, completed fine while the daemon was still healthy).
+4. **Discovered the client-server API has no CORS support at all** (bug 1, below) — meaning
+   Element, run on any origin other than the homeserver's own, cannot make a single API call.
+   Built a same-origin reverse-proxy workaround (`web/scripts/element-proxy.mjs`) so the rest of
+   the scenario could still be attempted: it serves Element's static assets and forwards
+   `/_matrix`, `/_synapse`, `/.well-known` to `hs serve`, collapsing both to one browser-visible
+   origin. This is a **test-harness workaround, not a fix** — the gap is real and is reported to
+   its owning track below.
+5. **`docker run -d ... vectorim/element-web:latest` never became healthy.** The container's
+   entrypoint hung at `/docker-entrypoint.d/18-load-element-modules.sh` (the last log line ever
+   printed) and stayed `unhealthy` for 27+ minutes. `docker logs`, `docker exec`, `docker cp`,
+   `docker kill`, `docker rm -f`, and a fresh `docker create`/`docker run` under a different
+   container name **all timed out** (`timeout 20-30`, exit 124) even though `docker version` and
+   `docker ps` kept responding throughout — i.e. the daemon was alive but its container-lifecycle
+   path was wedged, not merely slow. A patient retry loop (18 attempts, 25s timeout + 10s backoff
+   each) was run for the docker daemon to recover; it did not, across 9 attempts (~6 minutes),
+   and was stopped deliberately rather than left running, since a stuck client-side `docker run`
+   may leave a pending request queued against the daemon and this daemon is shared with track
+   14's image builds this session — piling on more concurrent container-lifecycle calls looked
+   more likely to make a shared resource worse than to win a race. Corroborating evidence this
+   was host-wide contention, not Element-specific: a bare `sleep 60 && echo tick` (no Docker
+   involved) took **~4 minutes wall-clock** to complete, and `npm run typecheck` sat at 0.0-0.7%
+   CPU making ~1.5s of progress over 7+ minutes before it was stopped for the same reason.
+   `uptime` read a load average of 9-12 throughout, on what behaves like a 10-core machine — this
+   matches, and exceeds, what the 2026-09-19 session before this one already documented for
+   Vitest/lint. **The actual Element Web UI was never seen rendered in a browser this session.**
+   `element-web-test` (the one real container that got as far as `docker run -d` succeeding) is
+   still present and unhealthy; `docker rm -f` on it also timed out during cleanup, so it is left
+   running — harmless (it never became reachable), but worth a manual
+   `docker rm -f element-web-test` once the host is idle.
+
+### Bugs found, diagnosed to a route and an owning track
+
+All three were found by direct protocol testing against the real binary (not the browser, which
+never got that far) — exactly the "expect to find something no test had" pattern this assignment
+predicted, just via curl instead of Chrome.
+
+**1. The client-server API emits no CORS headers at all — blocks every browser client hosted on
+a different origin than the homeserver.** This is the most severe finding: it is the reason
+Element (or any web client not embedded in the same origin) cannot function against this server
+without a workaround, and it would have been the very first thing a real browser hit.
+   - Route: any `/_matrix/client/*` route. Reproduced on `/_matrix/client/v3/login`:
+     ```
+     curl -i -X OPTIONS http://127.0.0.1:8098/_matrix/client/v3/login \
+       -H "Origin: http://localhost:8080" -H "Access-Control-Request-Method: POST" \
+       -H "Access-Control-Request-Headers: content-type"
+     ```
+   - Expected: `200`/`204` with `Access-Control-Allow-Origin`, `-Allow-Methods`,
+     `-Allow-Headers` (the Matrix spec requires the client-server API to answer CORS preflights
+     from any origin — every other implementation does this unconditionally, unlike the admin
+     API which is same-origin-by-default per this project's own `docs/decisions/`).
+   - Actual: `405 Method Not Allowed`, `allow: GET,HEAD,POST`, no `Access-Control-*` header at
+     all. A plain `GET /_matrix/client/versions -H "Origin: ..."` also comes back with zero
+     `Access-Control-*` headers (confirmed by direct curl), so even a "simple" cross-origin
+     request's response would be unreadable by browser JS.
+   - Root cause, found by reading, not guessing: `crates/hs-http/src/cors.rs` implements a real,
+     configurable CORS layer, but its own module doc says it is "CORS for `/api/v1`" (the admin
+     API) only — it is applied in `crates/hs-cli/src/serve.rs` to the admin router, never to any
+     of the `/_matrix/client` merges. The Matrix spec's requirement (open CORS on the C-S API,
+     unconditionally) is a different rule than RFC 0004's admin-API default (same-origin unless
+     configured), so this is not a matter of widening `admin_api.cors_origins` — the client
+     router needs its own, always-on CORS layer.
+   - Owning track: whoever assembles `crates/hs-cli/src/serve.rs`'s router (this track's brief
+     lists `hs-cli` as off-limits to me, same as `hs-federation`/`hs-room`/`hs-user`/`hs-auth`).
+     Likely track 05 (sync/user, the crate that owns most `/_matrix/client` traffic patterns) or
+     whichever track next touches `serve.rs`'s `build_router`.
+
+**2. `GET /_matrix/client/v3/capabilities` reports `m.set_displayname` and `m.set_avatar_url` as
+`"enabled": false`, but both routes work correctly and have for at least this long.** Element
+(and every other client) reads this capability before deciding whether to show "change display
+name"/"change avatar" controls in Settings — a real user on this server would not be offered UI
+for a feature the server actually has.
+   - Route: `GET /_matrix/client/v3/capabilities` (no auth required — a separate, smaller,
+     pre-existing gap: this handler ignores the token entirely, noted in its own doc comment as
+     "not yet checking for a token", not new this session).
+   - Expected: `"m.set_displayname": {"enabled": true}`, `"m.set_avatar_url": {"enabled": true}`
+     — `PUT /_matrix/client/v3/profile/{userId}/displayname` and `.../avatar_url` both answered
+     `200` and the write was durable (`GET /profile/{userId}` read back exactly what was set):
+     ```
+     curl -X PUT http://127.0.0.1:8098/_matrix/client/v3/profile/@alice:test.local/displayname \
+       -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+       -d '{"displayname":"Alice Test"}'
+     # -> 200 {}
+     curl http://127.0.0.1:8098/_matrix/client/v3/profile/@alice:test.local
+     # -> 200 {"displayname":"Alice Test","avatar_url":"mxc://test.local/abc123"}
+     ```
+   - Actual: capabilities still says `false` for both.
+   - Root cause: `crates/hs-cli/src/capabilities.rs`'s own doc comment says, explicitly, "no
+     profile or 3PID-management HTTP routes are mounted yet" — true when that file was written,
+     false now that `crates/hs-room/src/routes/profile.rs` exists and is mounted. A one-flag
+     staleness bug, not a design problem; the fix is flipping two `false`s to `true` in
+     `get_capabilities()` (`crates/hs-cli/src/capabilities.rs`, the `Json(json!({...}))` body).
+   - Owning track: same as above — `hs-cli`'s `capabilities.rs`, off-limits to this track.
+
+**3. `POST /rooms/{roomId}/receipt/{receiptType}/{eventId}` and `POST
+/rooms/{roomId}/read_markers` are both defined correctly in source, listed as registered by the
+server's own `routes-manifest`, and 404 live anyway — with a plain, empty-body 404, not the
+server's own JSON `M_NOT_FOUND` shape.** Read receipts and the fully-read marker are core to
+Element's room list (unread badges) and message view (read-up-to line); Element would send these
+continuously and every one would silently fail.
+   - Routes and reproduction:
+     ```
+     curl -i -X POST "http://127.0.0.1:8098/_matrix/client/v3/rooms/%21.../receipt/m.read/%24..." \
+       -H "Authorization: Bearer $TOKEN" -d '{}'
+     # -> 404 Not Found, content-length: 0 (no JSON body at all)
+     curl -i -X POST "http://127.0.0.1:8098/_matrix/client/v3/rooms/%21.../read_markers" \
+       -H "Authorization: Bearer $TOKEN" -d '{}'
+     # -> same: 404, content-length: 0
+     ```
+   - Expected: `200 {}` (both routes are meant to succeed for a joined member — confirmed by
+     reading `crates/hs-user/src/routes/receipts.rs`, which implements both handlers completely
+     and correctly, including the "must be a joined member" rule).
+   - The smoking gun: **the server's own `hs routes-manifest` output lists both routes as
+     registered**, at both `v3` and `r0`, right alongside `PUT .../typing/{userId}` — which
+     *does* work live (confirmed `200` from the exact same router, same file, same registration
+     mechanism, `crates/hs-user/src/routes/mod.rs` lines ~78-91). A `GET` (wrong method) on the
+     receipt path also comes back `404`, not `405` with an `Allow` header the way a real
+     method-mismatch does elsewhere on this server (e.g. `OPTIONS /login` above) — meaning axum's
+     live router genuinely has no matcher for this path template, not that the handler itself
+     rejected the method.
+   - What was ruled out, to save the owning track time: not a stale binary (rebuilt fresh at
+     `6b98961` immediately before testing); not a naming collision with `hs-room`'s router (no
+     other crate defines anything under `/rooms/{roomId}/receipt` or `.../read_markers`); not
+     `RoomShardGate`'s cluster-forwarding middleware (`crates/hs-cli/src/cluster.rs`) — that gate
+     passes every request through untouched in single-node mode (`cluster.single_node: true`,
+     this config's setting), confirmed by reading `RoomShardGate::run`. The likely place left to
+     look is `crates/hs-http/src/router.rs`'s `Builder::build`/`merge_router`, specifically how
+     `axum::Router::nest` composes multiple sub-routers mounted at the identical prefix
+     (`/_matrix/client/v3` is `.nest()`-ed with `room_router`, then separately with
+     `user_router`, then `e2e_router`, ...) — something about this specific path shape inside
+     that composition is being dropped between "the manifest says it's here" and "axum will
+     route it," while sibling routes in the same sub-router survive.
+   - Owning track: `crates/hs-user/src/routes/receipts.rs` is track 05's; the composition bug
+     (if it is in `hs-http`'s `Builder`/`merge_router` or `hs-cli`'s `serve.rs`) is track 14's or
+     whoever last touched `crates/hs-http/src/router.rs`. Flagging both files since the fault
+     could be in either.
+
+### What works, verified live (not assumed)
+
+Everything below was exercised directly against the real, running `hs serve` (not the mock, not
+a unit test) this session, in addition to what the 2026-09-18/19 sessions already proved:
+`.well-known/matrix/client` discovery document; password login and registration via the real
+client-server endpoints (not just the admin shared-secret path); `GET /capabilities` (modulo bug
+2); room creation, invite, join; sending and receiving messages; **long-polling `/sync`,
+including waking early on a new event** (~1s, not the full 10s timeout, when a message lands
+mid-poll) — the continuous-sync-loop behavior a discrete-call SDK test does not exercise; filter
+upload with `lazy_load_members`; lazy-loaded `GET .../members?membership=join`; typing
+notifications; `GET .../context/{eventId}`; room and global state reads; media upload, download
+(with correct `Content-Security-Policy`/`X-Content-Type-Options` headers), and config; thumbnail
+generation correctly rejecting a non-image upload; profile displayname/avatar read and write
+(see bug 2 — the writes work, only the capability flag lies); room avatar (`m.room.avatar` state
+event); push rules; device list; `whoami`; `joined_rooms`; logout and correct 401 on the
+now-revoked token afterward. **This is a wide, working slice of exactly what a browser client
+needs**, verified the same day bug 1 (no CORS) means none of it is reachable from a real browser
+without a same-origin workaround.
+
+Not exercised live (Docker never got far enough): Element's own rendering, its login UI, its
+room list UI, cross-session message delivery as seen by a second browser tab, avatar images
+actually painting, and `.well-known` discovery driven by Element's own domain-entry flow rather
+than a direct curl (that part needs a resolvable domain name and TLS, which this local setup does
+not have — see `web/element-testing/README.md`).
+
+### Reproducible setup, left in place for the next session
+
+- **`web/element-testing/`**: `config.yaml` (patched, working), `element-config.json` (Element's
+  `default_server_config`), `README.md` (exact commands, and why the proxy exists),
+  `.gitignore` (excludes the runtime `data/`/`media-store/`/`signing-keys`/`serve.log` this
+  session generated — keep the config/README, discard the rest on a fresh run).
+- **`web/scripts/element-proxy.mjs`**: the same-origin reverse proxy (plain Node, no new
+  dependency) that works around bug 1 above so Element can be driven at all; documented inline
+  with why it exists and that it is a test harness, not a fix.
+- A real `hs serve` is still running on `127.0.0.1:8098` as this session ends (three users
+  registered: `ops`/admin, `alice`, `bob`, all password `<name>password123`), and the same-origin
+  proxy is running on `127.0.0.1:8090`. **Next session's first move**: once the host is idle,
+  `docker rm -f element-web-test` (currently stuck unhealthy, cleanup itself timed out this
+  session), then `docker run -d --name element-web-test -p 8080:80 -v
+  $PWD/web/element-testing/element-config.json:/app/config.json:ro vectorim/element-web:latest`,
+  confirm `curl http://127.0.0.1:8080/` returns `200`, then open `http://localhost:8090/` in a
+  real browser (or Playwright/claude-in-chrome) and actually drive it — login as `alice`, the
+  room list, sending/receiving, the works. Given bug 1, Element will not function without the
+  proxy (or a real CORS fix) regardless of which browser drives it.
+
+### Verify
+
+```
+curl http://127.0.0.1:8098/_matrix/client/versions              # confirms the server from this session is still up
+cat web/element-testing/README.md                                # full reproduction steps
+node web/scripts/element-proxy.mjs                                # the workaround proxy, standalone
+```
+
+`npm run typecheck` was attempted and did **not** complete this session — it sat at <1% CPU
+making almost no progress over 7+ minutes before being stopped, the same host-contention failure
+mode the 2026-09-19 (earlier) session already documented for Vitest/lint (that session's
+last-confirmed-clean typecheck stands; nothing under `web/src` was touched this session — the
+only additions are `web/scripts/element-proxy.mjs` and `web/element-testing/*`, plain
+`.mjs`/`.yaml`/`.json`/`.md` files outside the TypeScript project graph, matching the existing
+`web/scripts/*.mjs` pattern already excluded from `tsconfig`). Rerun `npm run check` on an idle
+machine to confirm, per that session's own standing instruction — this session did not get a
+quieter machine either.
+
+### Decisions made
+
+- Rate limiting disabled (`rate_limits.enabled: false`) in the test config only, so ordinary
+  interactive use of Element (multiple messages in quick succession) would not look like a
+  server bug during manual testing. Not a recommendation for any real deployment.
+- `web/scripts/element-proxy.mjs` was written from scratch (plain Node `http`, no new
+  dependency) rather than pulling in `http-proxy-middleware` (not already a dependency of
+  `web/`) — a same-origin proxy for two named path prefixes is ~60 lines and did not justify a
+  new `package.json` dependency for a test-only tool.
+- Stopped the Docker retry loop and did not attempt to restart the Docker daemon, even though
+  that might have unstuck the wedged container faster: track 14 owns image builds on this same
+  shared daemon this session, and a daemon restart would have killed their in-progress work.
+  Left `element-web-test` running unhealthy rather than risk a more disruptive cleanup action.
 
 ## Session: real-server mode, honest degradation, proof against the running binary (2026-09-19)
 
@@ -160,7 +435,14 @@ New mock fixtures/handlers matching the real shapes: `web/src/mocks/data/{appser
 
 ## Blockers
 
-None.
+**Element Web session (2026-09-19, later): the shared Docker daemon stopped completing container
+lifecycle operations** (`run`/`create`/`kill`/`rm`/`logs`/`exec` all timed out at 20-30s while
+`docker version`/`docker ps` kept responding) under heavy host load (load average 9-12 throughout;
+a bare `sleep 60` took ~4 minutes wall-clock). This blocked seeing Element Web actually render in
+a browser this session — not a defect in this server. Everything needed to finish is staged in
+`web/element-testing/` and `web/scripts/element-proxy.mjs`; the next session's first move should
+be retrying the same `docker run` once the host is idle. This is an environment blocker, not a
+code blocker, and does not block anything else in this track's own work.
 
 ## Interfaces provided
 

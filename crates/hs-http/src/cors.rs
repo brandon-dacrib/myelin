@@ -58,6 +58,47 @@ pub fn layer(origins: &[String]) -> CorsLayer {
         .expose_headers(exposed_headers())
 }
 
+/// CORS for the Matrix client-server and media APIs, as the specification prescribes
+/// (`refs/matrix-spec/content/client-server-api/_index.md`, "Web Browser Clients"):
+///
+/// ```text
+/// Access-Control-Allow-Origin: *
+/// Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS
+/// Access-Control-Allow-Headers: X-Requested-With, Content-Type, Authorization
+/// ```
+///
+/// This is deliberately *not* the same policy as [`layer`] above, and the difference is the whole
+/// point of having two. The admin API is same-origin by default because it is an operator surface
+/// whose browser client this project ships and can configure. The client-server API is the
+/// opposite: it is meant to be reached by web clients hosted anywhere — app.element.io talking to
+/// your homeserver is the normal case, not an exception — so a wildcard origin is what the spec
+/// asks for and what every implementation does.
+///
+/// Without this, a browser refuses every request after the preflight and a web client sees nothing
+/// but opaque network failures. That was the state of this server until it was pointed at a real
+/// browser client: none of the `/_matrix` routes carried a single `Access-Control-*` header.
+///
+/// The spec also requires that `OPTIONS` never run an endpoint's own logic. `CorsLayer` answers
+/// preflight requests itself before the inner service is called, which satisfies that by
+/// construction.
+#[must_use]
+pub fn matrix_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::any())
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            HeaderName::from_static("x-requested-with"),
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+        ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +116,84 @@ mod tests {
     #[test]
     fn explicit_origin_list() {
         let _ = layer(&["https://admin.example.org".to_string()]);
+    }
+}
+#[cfg(test)]
+mod matrix_cors_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    fn app() -> axum::Router {
+        axum::Router::new()
+            .route("/_matrix/client/versions", get(|| async { "{}" }))
+            .layer(matrix_layer())
+    }
+
+    #[tokio::test]
+    async fn a_preflight_is_answered_without_running_the_endpoint() {
+        // The spec is explicit that OPTIONS must not run the endpoint's own logic. The layer
+        // answers the preflight itself, so the handler is never reached.
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/_matrix/client/versions")
+                    .header("origin", "https://app.element.io")
+                    .header("access-control-request-method", "GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response.status() == StatusCode::OK || response.status() == StatusCode::NO_CONTENT,
+            "a preflight must succeed, got {}",
+            response.status()
+        );
+        let headers = response.headers();
+        assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+        let methods = headers
+            .get("access-control-allow-methods")
+            .expect("preflight names the allowed methods")
+            .to_str()
+            .unwrap()
+            .to_ascii_uppercase();
+        for m in ["GET", "POST", "PUT", "DELETE", "OPTIONS"] {
+            assert!(methods.contains(m), "{m} missing from {methods}");
+        }
+        let allowed = headers
+            .get("access-control-allow-headers")
+            .expect("preflight names the allowed headers")
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        for h in ["x-requested-with", "content-type", "authorization"] {
+            assert!(allowed.contains(h), "{h} missing from {allowed}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_request_carries_the_wildcard_origin() {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/_matrix/client/versions")
+                    .header("origin", "https://app.element.io")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .expect("a browser client cannot read the response without this"),
+            "*"
+        );
     }
 }

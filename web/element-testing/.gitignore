@@ -1,0 +1,7 @@
+# Runtime artifacts from running `hs serve` for this manual test setup; only the config
+# templates and README are meant to be committed.
+data/
+media-store/
+signing-keys
+serve.log
+*.output
