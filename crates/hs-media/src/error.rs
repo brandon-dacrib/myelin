@@ -88,6 +88,21 @@ pub enum MediaError {
     /// `crate::repository::MediaRepository` returns this *before* calling `object_store.put`.
     #[error("upload rejected by content scanning: {0}")]
     RejectedByScanner(String),
+
+    /// `GET .../preview_url` was called but `hs_config::MediaConfig::url_preview_enabled` is
+    /// false.
+    #[error("URL previews are disabled on this server")]
+    PreviewDisabled,
+
+    /// [`crate::preview`]'s SSRF guard refused to fetch a `preview_url` target (or its `og:image`)
+    /// because it resolves to a blocked address range.
+    #[error("could not preview URL: {0}")]
+    PreviewBlocked(String),
+
+    /// A `preview_url` fetch failed for a reason other than the SSRF guard (bad scheme, DNS
+    /// failure, timeout, non-2xx response, oversized response, too many redirects).
+    #[error("could not preview URL: {0}")]
+    PreviewFetchFailed(String),
 }
 
 impl From<object_store::Error> for MediaError {
@@ -175,6 +190,21 @@ impl MediaError {
                 axum::http::StatusCode::FORBIDDEN,
                 MatrixErrorCode::Forbidden,
                 format!("upload rejected by content scanning: {reason}"),
+            ),
+            MediaError::PreviewDisabled => MatrixError::custom(
+                axum::http::StatusCode::FORBIDDEN,
+                MatrixErrorCode::Forbidden,
+                "URL previews are disabled on this server",
+            ),
+            MediaError::PreviewBlocked(msg) => MatrixError::custom(
+                axum::http::StatusCode::FORBIDDEN,
+                MatrixErrorCode::Forbidden,
+                msg.clone(),
+            ),
+            MediaError::PreviewFetchFailed(msg) => MatrixError::custom(
+                axum::http::StatusCode::BAD_GATEWAY,
+                MatrixErrorCode::Unknown,
+                msg.clone(),
             ),
         }
     }

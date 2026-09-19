@@ -65,6 +65,15 @@ pub(crate) fn legacy_router(freeze_ms: Option<u64>) -> (axum::Router, MediaState
     (router.with_state(state.clone()), state)
 }
 
+/// Builds [`crate::router::v1_router`] over a fresh in-memory state — the not-yet-mounted
+/// `/_matrix/media/v1/create` router (see that function's doc for why `hs-cli` still needs to
+/// mount it; this helper lets this crate's own tests exercise the router it builds regardless).
+pub(crate) fn v1_router() -> (axum::Router, MediaState<MemoryBackend>) {
+    let state = build_state(None);
+    let (router, _manifest) = crate::router::v1_router::<MemoryBackend>();
+    (router.with_state(state.clone()), state)
+}
+
 /// Creates a user and a usable access token in `state`'s `hs-auth` store, returning the raw
 /// bearer token string.
 pub(crate) async fn seed_token(state: &MediaState<MemoryBackend>, user_id: &str) -> String {

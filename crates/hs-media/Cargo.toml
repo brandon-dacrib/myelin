@@ -50,6 +50,18 @@ schemars.workspace = true
 base64.workspace = true
 prometheus-client.workspace = true
 hs-telemetry = { path = "../hs-telemetry" }
+# URL preview (`crate::preview`): the SSRF blocklist follows the exact same CIDR-list-over-`ipnet`
+# design `hs-federation`'s `IpPolicy` uses for its own `ip_range_blocklist` (see
+# `docs/status/09-media.md` for why this crate does not depend on `hs-federation` directly to
+# reuse that type verbatim: pulling in federation's discovery/mesh dependency graph for one ~20
+# line struct was not worth it, but the *policy design* -- parse CIDRs, block unless allowed --
+# is deliberately identical code shape, not a second design).
+ipnet.workspace = true
+# URL preview: lenient OpenGraph `<meta>`/`<title>` tag extraction (`crate::preview::opengraph`).
+# A full HTML parser (`html5ever`/`scraper`) was considered and deliberately not added: OG tags
+# only ever need `<meta>`/`<title>` attribute extraction, and Synapse itself does not do a strict
+# DOM parse for this either -- see that module's doc for the exact tradeoff.
+regex.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

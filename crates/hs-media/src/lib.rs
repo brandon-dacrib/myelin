@@ -28,6 +28,9 @@
 //!   track 06's federation client once it exists; see `docs/rfcs/0007-federation-media.md`).
 //! - [`synapse_layout`]: a read-only adapter over Synapse's on-disk media-directory layout, for
 //!   track 13's importer.
+//! - [`preview`]: `GET .../preview_url` — OpenGraph extraction, the SSRF guard, and the response
+//!   cache. Read this module's doc first: it states exactly what the SSRF guard does and does not
+//!   defend against, per this crate's convention for a security control.
 
 #![warn(missing_docs)]
 
@@ -36,6 +39,7 @@ pub mod id;
 pub mod metadata;
 pub mod multipart;
 pub mod policy;
+pub mod preview;
 pub mod repository;
 pub mod router;
 pub mod routes;

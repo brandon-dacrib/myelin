@@ -1,8 +1,11 @@
 # RFC 0006. URL previews: OpenGraph, oEmbed, and the SSRF defenses that make fetching arbitrary URLs safe
 
-Status: proposed, design only — no code yet. Owner: track 09 (media). Consumers: track 07 (whose
-`Requester` gates the endpoint), track 13 (the `homeserver.yaml` translator's
-`url_preview_*` options), track 14 (differential tests against Synapse's preview shape).
+Status: implemented (session 4, `crate::preview` — see `docs/status/09-media.md`'s session 4 entry
+for exactly what matches this design and what deviates, and why). Owner: track 09 (media).
+Consumers: track 07 (whose `Requester` gates the endpoint), track 13 (the `homeserver.yaml`
+translator's `url_preview_*` options — the three new `MediaConfig` fields section 4.4/4.6 propose
+are still not added; `crate::preview` uses hardcoded constants in the meantime), track 14
+(differential tests against Synapse's preview shape).
 
 Companion artifacts: `crates/hs-media` (the crate this will live in, `crate::preview` once
 implemented), `hs_config::media::MediaConfig` (`url_preview_enabled`,

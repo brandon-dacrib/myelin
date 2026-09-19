@@ -74,6 +74,48 @@ impl MediaRecord {
     }
 }
 
+/// A durable "a background content scan is still owed for this media item" marker.
+///
+/// Written (via [`MetadataStore::put_pending_scan`]) in the same call that stores a `defer`/
+/// `quarantine`-mode upload's bytes, *before* [`crate::repository::MediaRepository`] spawns the
+/// background task that actually calls the scan provider, and deleted (via
+/// [`MetadataStore::delete_pending_scan`]) once that scan resolves either way. This is what makes
+/// [`crate::repository::MediaRepository::resume_pending_scans`] possible: the *intent* to scan a
+/// given item lives in the same durable store as every other media row (Fjall or Postgres in
+/// production), not only in the memory of the `tokio::spawn`ed task that would otherwise be the
+/// only record of it — see that method's doc for exactly what durability guarantee this does and
+/// does not provide.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingScan {
+    /// The media's origin server (always this server today — only local uploads schedule a
+    /// background scan; see [`crate::repository::MediaRepository::decide_scan`]).
+    pub server_name: String,
+    /// The media ID.
+    pub media_id: String,
+    /// The content type the scan should evaluate against (the stored `Content-Type`, before any
+    /// replacement a scan itself might later apply).
+    pub content_type: String,
+    /// The uploading user, if any (mirrors [`MediaRecord::uploader`]).
+    pub uploader: Option<String>,
+    /// The uploading appservice's ID, if any (mirrors `UploadContext::appservice_id`).
+    pub appservice_id: Option<String>,
+    /// When this row was written, milliseconds since the Unix epoch.
+    pub enqueued_at_ms: u64,
+}
+
+/// One cached [`crate::preview`] response, keyed by the SHA-256 hex of the previewed URL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedPreview {
+    /// The JSON response body (`og:title`/`og:description`/`og:image`/`matrix:image:size`),
+    /// serialized ahead of time so a cache hit is a single decode of a plain string rather than a
+    /// re-serialization of a `serde_json::Value` tree.
+    pub response_json: String,
+    /// When this entry was cached, milliseconds since the Unix epoch.
+    pub cached_at_ms: u64,
+    /// How long this entry stays valid for, in milliseconds.
+    pub ttl_ms: u64,
+}
+
 /// One generated thumbnail's metadata.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ThumbnailRecord {
@@ -120,10 +162,12 @@ pub struct MetadataStore<B: KvBackend> {
     backend: B,
     media: TypedKeyspace<B::Keyspace, MediaKey>,
     thumbnails: TypedKeyspace<B::Keyspace, ThumbKey>,
+    pending_scans: TypedKeyspace<B::Keyspace, MediaKey>,
+    preview_cache: TypedKeyspace<B::Keyspace, String>,
 }
 
 impl<B: KvBackend> MetadataStore<B> {
-    /// Opens (creating if necessary) this crate's two keyspaces on `backend`.
+    /// Opens (creating if necessary) this crate's keyspaces on `backend`.
     ///
     /// # Errors
     /// Returns [`MediaError::Metadata`] if the backend could not open a keyspace.
@@ -138,10 +182,22 @@ impl<B: KvBackend> MetadataStore<B> {
                 .keyspace("hs_media.thumbnails")
                 .map_err(|e| MediaError::Metadata(e.to_string()))?,
         );
+        let pending_scans = TypedKeyspace::new(
+            backend
+                .keyspace("hs_media.pending_scans")
+                .map_err(|e| MediaError::Metadata(e.to_string()))?,
+        );
+        let preview_cache = TypedKeyspace::new(
+            backend
+                .keyspace("hs_media.preview_cache")
+                .map_err(|e| MediaError::Metadata(e.to_string()))?,
+        );
         Ok(Self {
             backend,
             media,
             thumbnails,
+            pending_scans,
+            preview_cache,
         })
     }
 
@@ -336,6 +392,107 @@ impl<B: KvBackend> MetadataStore<B> {
             out.push(decode_value(&value)?);
         }
         Ok(out)
+    }
+
+    /// Durably records that `(server_name, media_id)` still needs a background content scan (see
+    /// [`PendingScan`]'s doc). Overwrites any existing row for the same key.
+    ///
+    /// # Errors
+    /// Returns [`MediaError::Metadata`] on a backend failure.
+    pub fn put_pending_scan(&self, scan: &PendingScan) -> Result<(), MediaError> {
+        let key = (scan.server_name.clone(), scan.media_id.clone());
+        let value = serde_json::to_vec(scan)
+            .map_err(|e| MediaError::Metadata(format!("encoding pending scan: {e}")))?;
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            self.pending_scans.put(txn, &key, &value).map_err(to_kv_err)
+        })
+        .map_err(|e| MediaError::Metadata(e.to_string()))
+    }
+
+    /// Clears a pending-scan marker once its scan has resolved, one way or another. Not an error
+    /// if no such row exists (resolving twice, e.g. a manual resume racing the original
+    /// background task, is idempotent).
+    ///
+    /// # Errors
+    /// Returns [`MediaError::Metadata`] on a backend failure.
+    pub fn delete_pending_scan(&self, server_name: &str, media_id: &str) -> Result<(), MediaError> {
+        let key = (server_name.to_string(), media_id.to_string());
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            self.pending_scans.delete(txn, &key).map_err(to_kv_err)
+        })
+        .map_err(|e| MediaError::Metadata(e.to_string()))
+    }
+
+    /// Every scan still owed, across all media — read at startup (or on demand) by
+    /// [`crate::repository::MediaRepository::resume_pending_scans`]. Unbounded scan: in practice
+    /// this table only ever holds items between "stored" and "scanned," which for a healthy
+    /// scanner is seconds, so it is expected to be small or empty.
+    ///
+    /// # Errors
+    /// Returns [`MediaError::Metadata`] on a backend failure or an undecodable stored row.
+    pub fn list_pending_scans(&self) -> Result<Vec<PendingScan>, MediaError> {
+        let snapshot = self.backend.snapshot();
+        let mut out = Vec::new();
+        for item in self.pending_scans.range(&snapshot, RangeSpec::full()) {
+            let (_key, value) = item.map_err(|e| MediaError::Metadata(e.to_string()))?;
+            out.push(decode_value(&value)?);
+        }
+        Ok(out)
+    }
+
+    /// Looks up a cached URL-preview response, if present and not expired as of `now_ms`.
+    ///
+    /// # Errors
+    /// Returns [`MediaError::Metadata`] on a backend failure or an undecodable stored row.
+    pub fn get_preview_cache(
+        &self,
+        url_sha256_hex: &str,
+        now_ms: u64,
+    ) -> Result<Option<String>, MediaError> {
+        let snapshot = self.backend.snapshot();
+        let Some(bytes) = self
+            .preview_cache
+            .get(&snapshot, &url_sha256_hex.to_string())
+            .map_err(|e: TableError| MediaError::Metadata(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let entry: CachedPreview = decode_value(&bytes)?;
+        if entry.cached_at_ms.saturating_add(entry.ttl_ms) <= now_ms {
+            return Ok(None);
+        }
+        Ok(Some(entry.response_json))
+    }
+
+    /// Stores a URL-preview response, keyed by the SHA-256 hex of the URL that was previewed.
+    /// Overwrites any existing entry for the same URL. There is no capacity bound or eviction
+    /// here (unlike [`crate::scanning::cache::VerdictCache`]) — a known, stated limitation: a
+    /// long-running server previewing many distinct URLs grows this table without an upper limit
+    /// beyond entries expiring past their `ttl_ms` on the next read of that exact key (there is no
+    /// proactive sweep). See `docs/status/09-media.md`.
+    ///
+    /// # Errors
+    /// Returns [`MediaError::Metadata`] on a backend failure.
+    pub fn put_preview_cache(
+        &self,
+        url_sha256_hex: &str,
+        response_json: &str,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<(), MediaError> {
+        let entry = CachedPreview {
+            response_json: response_json.to_string(),
+            cached_at_ms: now_ms,
+            ttl_ms,
+        };
+        let value = serde_json::to_vec(&entry)
+            .map_err(|e| MediaError::Metadata(format!("encoding preview cache entry: {e}")))?;
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            self.preview_cache
+                .put(txn, &url_sha256_hex.to_string(), &value)
+                .map_err(to_kv_err)
+        })
+        .map_err(|e| MediaError::Metadata(e.to_string()))
     }
 }
 

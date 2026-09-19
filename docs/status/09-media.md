@@ -2,9 +2,354 @@
 
 Track brief: `docs/workstreams/09-media.md`. Owner crate: `hs-media`.
 
-Last updated: 2026-09-18 (session 3: wired `crate::scanning::ScanEngine` into
-`crate::repository::MediaRepository`, closing session 2's largest gap). Sessions 1 and 2's records
-are unchanged below this section.
+Last updated: 2026-09-19 (session 4: closed the two Complement gaps — MSC2246 async upload's real
+`/_matrix/media/v1/create` path and `GET .../preview_url` — plus the content-scanning durability
+gap session 3 flagged). Sessions 1-3's records are unchanged below this section.
+
+## Session 4: the `/_matrix/media/v1/create` path, URL previews, and scan-verdict durability
+
+Scope: three items handed down together — (1) `POST /_matrix/media/v1/create` 404s in Complement,
+(2) `GET /_matrix/media/v3/preview_url` 404s in Complement, (3) the durability gap session 3's
+"Known gaps carried forward" recorded verbatim: "deferred and quarantine scan modes use a spawned
+task — a crash loses an in-flight verdict."
+
+### Verification
+
+```
+cargo fmt -p hs-media                                     # applied, no diff on re-run
+cargo clippy -p hs-media --all-targets -- -D warnings     # clean
+cargo test -p hs-media                                    # 261 passed, 0 failed (249 lib + 11 image_corpus + 1 s3_backend)
+```
+
+(Machine is under heavy contention from 15 other agents this session — several `cargo` invocations
+took minutes rather than seconds; the numbers above are the final, clean run.)
+
+### 1. `POST /_matrix/media/v1/create` — the handler already existed; the path did not
+
+Reading `crate::routes::upload::create`/`complete_reservation` and their existing tests
+(`repository.rs`'s `async_upload_lifecycle`, `completing_twice_is_rejected`,
+`expired_reservation_cannot_be_completed`) before writing anything: **the async-upload logic
+session 1 built was already complete and already tested** — reservation, single-fill enforcement
+(`MediaError::InvalidInput` on a second `PUT`), and TTL expiry (`MediaError::UploadExpired`,
+`DEFAULT_RESERVATION_TTL_MS` = 24h) all already worked, at the HTTP layer too
+(`routes::upload::tests::async_upload_create_then_put_round_trips`,
+`put_upload_by_a_different_user_is_rejected`). The actual bug was narrower than the brief's phrasing
+suggested: this crate's router already served `POST /create` and
+`PUT /upload/{serverName}/{mediaId}` — but only under `/_matrix/client/v1/media` (authenticated
+media) and `/_matrix/media/v3` (`legacy_router`, gated on `allow_legacy_unauthenticated_media`).
+Matrix's real versioning is a quirk here: the MSC2246 `create` step was given its own `v1` the day
+it was added, while the fill-in `PUT` reused the pre-existing `v3` upload path. So
+`PUT /_matrix/media/v3/upload/{serverName}/{mediaId}` **already worked** (once
+`allow_legacy_unauthenticated_media` is on, the default) — only
+`POST /_matrix/media/v1/create` was genuinely missing, because no router in this crate had ever
+served anything at the bare `/_matrix/media/v1` prefix.
+
+**Fix**: `hs_media::router::v1_router` (`crates/hs-media/src/router.rs`) — a new, minimal router
+exposing only `POST /create` (reusing `routes::upload::create`, unchanged), meant to be mounted at
+`/_matrix/media/v1`. Still authenticated, matching `legacy_router`'s own documented precedent for
+its upload endpoints ("still authenticated — only download and thumbnail lost their authentication
+requirement in the legacy path").
+
+**This needs a new `hs-cli` mount point — it does not go live on its own.** Every route inside
+`authenticated_router`/`legacy_router` mounts automatically because `hs-cli` already calls
+`merge_router` on both; `/_matrix/media/v1` is a prefix nothing calls `merge_router` with today. See
+"Wiring the integration lead must add" below for the exact lines.
+
+Proven with `router::tests::v1_router_serves_create_at_its_relative_path`
+(`crates/hs-media/src/router.rs`) — builds `v1_router` over a fresh in-memory state (via a new
+`crate::test_support::v1_router` helper) and asserts `POST /create` returns `200` with a
+`mxc://...` `content_uri`. This is the closest this session could get to "answered a real request"
+without editing `hs-cli`: the binary route only exists once the integration lead adds the mount (see
+below); once it does, the exact same handler this test already exercises is what answers it.
+
+### 2. `GET .../preview_url` — new: `crate::preview`
+
+`docs/rfcs/0006-url-previews.md` already existed (design-only, from an earlier session) and is
+followed closely; deviations are called out explicitly below rather than silently diverging.
+
+**What was built** (`crates/hs-media/src/preview.rs`, new; `crates/hs-media/src/routes/preview.rs`,
+new route handler; two new `MetadataStore` methods for the cache):
+
+- `PreviewIpPolicy`: the SSRF blocklist, built from `hs_config::MediaConfig::url_preview_ip_range_blocklist`
+  (already existed — added by an earlier session, never wired to anything until now). **Explicit
+  instruction from the assignment: "hs-federation's `ip_range_blocklist` config is the precedent to
+  follow, do not invent a second policy."** What this means concretely, and the one place this
+  session deviated from "reuse the exact type": `hs_federation::client::IpPolicy` (CIDR list via
+  `ipnet`, block-unless-allowlisted) is the *design* this crate copies — parse CIDR strings with
+  `ipnet`, skip unparsable ones defensively, block by range membership. This crate does **not**
+  depend on `hs-federation` to get `IpPolicy` itself: that type also carries an allowlist half this
+  crate's config (`MediaConfig`, not `FederationConfig`) has no field for, and pulling in
+  federation's whole dependency graph (mesh RPC, mTLS, discovery) for one ~15-line struct was
+  judged not worth it. `PreviewIpPolicy::from_cidrs`/`allows` are the same shape, same default range
+  list (RFC 1918 + loopback + link-local + CGNAT + IPv6 equivalents —
+  `hs_config::media::default_preview_blocklist`, already identical to federation's own default
+  before this session touched anything), same "parse, skip-on-error" division of responsibility
+  with `MediaConfig::validate`. If a shared `hs-net-policy`-style crate is ever carved out, this is
+  the type that should move into it — noted at the top of `PreviewIpPolicy`'s own doc.
+- `guarded_fetch`: resolves the target host itself (`tokio::net::lookup_host`, no new DNS-resolver
+  dependency — RFC 0006 flagged needing one; `tokio`'s own `net` feature, already enabled via
+  `features = ["full"]` in the workspace, was sufficient), checks **every** resolved address against
+  the blocklist (refuses if *any* one is blocked, not just if all are — stricter than
+  `hs-federation`'s own "connect if any candidate is allowed" semantic, deliberately: a
+  `preview_url` target is attacker-chosen, a federation destination is operator-configured), then
+  pins the actual connection to the checked address via `reqwest::ClientBuilder::resolve` exactly as
+  RFC 0006 section 4.2 and `hs-federation`'s own `client_for` both do. Redirects: automatic
+  following is disabled (`redirect::Policy::none()`); this module follows them itself, up to 5 hops,
+  re-running the full resolve-and-check step against every hop's `Location` (RFC 0006 section 4.3).
+  Also implements RFC 0006 section 4.5 (reject a URL with embedded userinfo,
+  `FetchError::UserinfoNotAllowed`) — the one item this session's first draft missed and added after
+  re-reading the RFC in full.
+- `extract_og_tags`: `og:title`/`og:description`/`og:image` from `<meta>` tags, falling back to
+  `<title>` for the title, attribute-order-independent, both quote styles, the handful of HTML
+  entities that actually show up in practice (`&amp; &lt; &gt; &quot; &apos;` plus decimal/hex
+  numeric character references). **Deviation from RFC 0006 and from decision 0007's spirit, stated
+  precisely**: no HTML-parsing crate was added; this is a `regex`-based `<meta>`/`<title>` scan, not
+  a DOM parse. `regex` was already a workspace dependency (used elsewhere); a real parser
+  (`html5ever`/`scraper`) was considered and rejected for this session's scope — OG extraction never
+  needs anything past `<meta>`/`<title>` attributes, and Synapse itself does not do a strict DOM
+  parse for this either. Revisit if a differential test against Synapse ever surfaces a page this
+  regex mishandles that a real parser would not.
+- `preview_url` (the free function `crate::preview::preview_url`, and
+  `MediaRepository::preview_url` which is a two-line delegator to it): fetches the page, extracts
+  tags, and — if `og:image` is present — fetches *that* URL through the identical guard (recursive,
+  per RFC 0006 section 4.4), sniffs it with `crate::sniff::sniff_format` (never trusts the remote
+  `Content-Type`; unrecognized bytes are dropped from the response rather than cached), stores it
+  through the same object-store/metadata path an ordinary upload uses, and rewrites `og:image` to
+  the resulting `mxc://` URI with `matrix:image:size` set to the stored byte length. A failed or
+  non-image `og:image` fetch is not fatal to the whole preview (Synapse's own behavior) — the
+  response just omits the image fields.
+- Caching: two new `MetadataStore` methods, `get_preview_cache`/`put_preview_cache`, keyed by the
+  SHA-256 hex of the requested URL, TTL'd at `DEFAULT_PREVIEW_CACHE_TTL_MS` (1 hour). **Deviation
+  from RFC 0006, stated precisely**: RFC 0006 section 4.4/4.6 proposes new `MediaConfig` fields
+  (`url_preview_timeout`, `url_preview_max_fetch_size`, `url_preview_cache_lifetime`) — this session
+  did not add them, because they belong in `hs_config` (a crate outside this track's edit
+  permission this session; the assignment's ownership rule is explicit that only `crates/hs-media`
+  and this status file may be touched). `FetchLimits::default()` (10 MiB, 10s timeout, 5 redirects)
+  and `DEFAULT_PREVIEW_CACHE_TTL_MS` are hardcoded constants in `crate::preview` instead. **Track 13
+  (or whoever next touches `hs_config::MediaConfig`) should add these three fields** and thread them
+  through `MediaRepository::preview_url`'s call into `crate::preview::preview_url` (the function
+  already takes `config: &MediaConfig`, so wiring real fields through is a small, additive change,
+  not a redesign).
+- Not implemented, stated precisely: `og:image:width`/`og:image:height` (RFC 0006 section 3 lists
+  them; the assignment's own acceptance criteria only names `og:title`/`og:description`/`og:image`/
+  `matrix:image:size` — width/height would need decoding the fetched image with
+  `crate::sniff::decode_with_limits` and reading its dimensions, not just sniffing its format;
+  cheap to add later, not done this session to stay in scope). oEmbed discovery (RFC 0006's own "out
+  of scope for this RFC" list). In-flight request de-duplication for concurrent identical requests
+  (RFC 0006 section 4.6's "thundering herd" protection) — documented as a known gap in
+  `crate::preview`'s own module doc rather than silently dropped. No capacity bound on the preview
+  cache table (unlike `scanning::cache::VerdictCache`, which evicts oldest-first) — entries only
+  disappear on a read past their TTL, not via a proactive sweep; documented on
+  `MetadataStore::put_preview_cache`'s doc.
+- **Legacy-path authentication: a deliberate deviation from RFC 0006's own text.** RFC 0006 section
+  3 states "Synapse serves `preview_url` unauthenticated on the legacy path today" and proposes
+  matching that. This session mounted `preview_url` as **authenticated on both** the
+  `client/v1/media` and legacy `media/v3` routers (`routes::preview::preview_url` takes
+  `MediaRequester`, same as every other route in both routers except `legacy`'s own
+  download/thumbnail handlers). Rationale: an unauthenticated, internal-network-reachable
+  "fetch any URL I name" oracle is a materially bigger operational risk than a Synapse
+  compatibility gap on one endpoint, and nothing in this session's assignment asked for wire-for-wire
+  legacy parity here specifically. Revisit if track 14's differential testing against real Synapse
+  specifically flags this as a conformance failure worth accepting the risk for.
+
+Routes added inside `authenticated_router`/`legacy_router` (`GET /preview_url` on both) — **these
+go live with no `hs-cli` change**, per this crate's existing convention
+(`hs_media::router::authenticated_router`/`legacy_router` are what `hs serve` mounts).
+
+Tests (`crates/hs-media/src/preview.rs`, `crates/hs-media/src/routes/preview.rs`):
+
+- `blocklist_blocks_private_ranges`, `default_blocklist_matches_media_config_defaults`: the policy
+  logic in isolation.
+- **`fetch_refuses_a_private_address`: the mutation-tested SSRF guard test the assignment asked
+  for by name.** Mutation-tested by hand this session (not left as a claim): the
+  `!candidates.iter().all(|ip| policy.allows(*ip))` check in `resolve_and_check` was temporarily
+  replaced with `if false { ... }` (guard disabled) and `cargo test -p hs-media
+  preview::tests::fetch_refuses_a_private_address` was re-run — it failed (a connection error
+  instead of the expected `FetchError::Blocked`), confirming the test actually exercises the guard
+  rather than passing regardless. The change was then reverted and the suite re-run clean. See this
+  test's own doc comment, which records the exact mutation for the next person who touches this
+  code.
+- `embedded_credentials_are_refused`, `unsupported_scheme_is_refused`: the other cheap-to-bypass
+  checks from RFC 0006 section 4.5.
+- `extracts_basic_og_tags`, `attribute_order_does_not_matter`, `single_quoted_attributes_are_parsed`,
+  `falls_back_to_title_tag_when_no_og_title`, `numeric_character_references_decode`: the OG-tag
+  extraction, including the two "lenient scan, not a DOM parse" edge cases (attribute order,
+  quote style) explicitly worth proving since that is exactly where a regex-based approach could
+  silently misbehave.
+- **`full_preview_flow_fetches_parses_and_caches_the_og_image`: the end-to-end test.** A real local
+  `axum`/`tokio` HTTP server (no external network) serves an HTML page plus a real PNG at the
+  `og:image` path; `crate::preview::preview_url` is called against it with an *empty* blocklist
+  (the SSRF guard is proven separately, above — conflating the two here would either need the test
+  server to bind somewhere non-loopback, which is not possible in this sandbox, or would defeat the
+  guard for the duration of the test). Asserts `og:title`/`og:description` decode correctly
+  (including an HTML entity), `og:image` is rewritten to an `mxc://` URI, and `matrix:image:size`
+  matches the stored byte length. **Cache proof**: after the first call, the mock server's task is
+  `.abort()`-ed, and a second call for the identical URL is asserted to return the byte-identical
+  response anyway — this would be a connection-refused error without the cache, so this is a real
+  proof of caching, not an assumption.
+- `routes::preview::tests`: `preview_url_is_403_when_disabled` (the default —
+  `url_preview_enabled: false`), `preview_url_requires_authentication`,
+  `preview_url_route_exists_on_both_routers` (a direct regression test for the Complement 404 this
+  session closes — asserts `!= 404` on both mounts, not just "some status"),
+  `preview_url_requires_the_url_query_parameter`.
+
+### 3. Scan-verdict durability: `PendingScan` + `MediaRepository::resume_pending_scans`
+
+Session 3's own words, carried forward verbatim as this session's starting point: "Background
+scanning is `tokio::spawn`, not durable job infrastructure... a process crash between 'the client
+received a `content_uri`' and 'the spawned task resolves' leaves `defer` media quarantined forever
+... and leaves `quarantine` media un-quarantined even if the verdict would have said otherwise...
+The real fix is track 03/12's background-job leasing, which this crate does not own."
+
+That remains true — there is still no job queue, no leasing, no cross-node scheduling. What this
+session adds is the piece that does not need one: **the *intent* to scan survives a crash**, because
+it is written to the same durable `MetadataStore` (Fjall/Postgres in production) as every other
+media row, in the same call that stores the upload's bytes, *before* the `tokio::spawn` task that
+might not survive a restart is ever created.
+
+**New** (`crates/hs-media/src/metadata.rs`): `PendingScan` (a new row type: `server_name`,
+`media_id`, `content_type`, `uploader`, `appservice_id`, `enqueued_at_ms`) and a new
+`hs_media.pending_scans` keyspace, with `put_pending_scan`/`delete_pending_scan`/
+`list_pending_scans`.
+
+**New** (`crates/hs-media/src/repository.rs`):
+
+- `MediaRepository::record_pending_scan`, called from both `upload` and `complete_reservation`
+  immediately after the media row is written and *before* `spawn_background_scan` is called (for
+  `defer`/`quarantine` mode only — `block` mode resolves synchronously and never reaches this at
+  all). Proven synchronous, not merely eventual, by
+  `scanning_integration::pending_scan_is_recorded_before_the_background_task_can_have_run`: this
+  relies on `#[tokio::test]`'s default `current_thread` flavor (a `tokio::spawn`ed task cannot run
+  until the spawning task yields at an `.await`), asserts the pending row exists with **no**
+  `.await` between `upload` returning and the check, then lets the real background task run to
+  completion so it does not outlive the test.
+- `MediaRepository::apply_background_scan_decision` now clears the pending-scan row at the end,
+  regardless of which branch resolved it (`Allow`/`AllowReplaced`/`Reject`/`StoreQuarantined`) — the
+  one shared cleanup point both the live `tokio::spawn` path and the new resume path call, so a row
+  is cleared exactly once no matter which path resolved it.
+- **`MediaRepository::resume_pending_scans`**: reads every row `MetadataStore::list_pending_scans`
+  returns, re-fetches the already-durably-stored bytes from the object store (never re-sent over
+  the wire — they were written before the pending-scan row was), rebuilds the same `ScanContext` the
+  original background task would have, calls `ScanEngine::evaluate`, and applies the decision
+  through the same `apply_background_scan_decision` the live path uses. A media item whose bytes
+  cannot be read back (should not happen; defensively handled) is logged and left pending for a
+  future retry rather than silently dropped. Returns the count it attempted.
+
+**What this durability fix guarantees, and what it does not — stated as precisely as session 3's
+own gap statement, per the assignment's explicit ask ("state precisely why it cannot [survive a
+restart] without a job queue that does not exist yet and what the interim guarantee is")**:
+
+- Guarantees: the *fact* that a given media item still needs a scan is never lost to a process
+  crash, because it lives in the same durable store as everything else this crate persists — not
+  process memory, not only the `tokio::spawn` future's captured state. Any process holding the same
+  backend (not necessarily the one that crashed) can complete it by calling
+  `resume_pending_scans` — a restart of the same node is the common case, but the row itself does
+  not care which process reads it.
+- Does not guarantee: **automatic** recovery. Nothing in this crate calls `resume_pending_scans` on
+  its own, on a timer, or on startup — it is a method, not a scheduled job. `hs-cli` needs to call it
+  once at startup for "the intent survives a crash" to become "a restart actually resolves it" — see
+  "Wiring the integration lead must add" below. A scan task that panics mid-scan *without* a process
+  restart (e.g. a bug in a provider adapter) is also not retried until the next explicit
+  `resume_pending_scans` call — this crate does not add a periodic sweep, since a periodic sweep
+  with proper leasing (so two replicas do not double-scan the same item pointlessly) is exactly the
+  job-queue infrastructure track 03/12 owns and this crate was told not to attempt to substitute
+  for. Concurrent `resume_pending_scans` calls (two nodes racing after a shared-backend cluster
+  restart) are not harmful — `apply_background_scan_decision` is idempotent enough that a
+  double-scan wastes work, not correctness (quarantining twice, or clearing an already-cleared
+  marker, are both no-ops in effect) — but this session did not add any coordination to prevent the
+  redundant work itself.
+
+Tests (`crates/hs-media/src/repository.rs`, `scanning_integration` module):
+
+- `pending_scan_is_recorded_before_the_background_task_can_have_run` (see above).
+- **`resume_pending_scans_completes_a_scan_a_crash_left_unresolved`: the direct durability test.**
+  Deliberately does *not* go through `MediaRepository::upload` with a live scanning engine attached
+  (that would race the real `tokio::spawn` task against the test's own assertions on a
+  single-threaded runtime, proving nothing deterministic). Instead it manually reproduces exactly
+  what a crash leaves behind — bytes written to the object store, a servable-but-unscanned media
+  row, a `PendingScan` row — using a fresh `MetadataStore`/object store with **no** repository or
+  engine touching them yet, then constructs a brand-new `MediaRepository` over that same backend
+  (standing in for "the process restarted") with a scanning engine attached, and calls
+  `resume_pending_scans`. Asserts: before resuming, the item is servable but a scan is still owed
+  (`quarantine` mode's defining pre-scan state, held across the simulated restart); after resuming,
+  the (infected) verdict is applied (`MediaError::Quarantined`) and the pending row is gone. This
+  test would fail (in fact, would not compile) without this session's fix.
+- `resume_pending_scans_without_an_engine_is_a_harmless_no_op`: a deployment that never configured
+  `--media-scanning-config` gets `Ok(0)`, not an error.
+
+### Wiring the integration lead must add (`crates/hs-cli`, not touched this session per this
+track's ownership rule)
+
+Two changes, both in `crates/hs-cli/src/serve.rs`:
+
+1. **Mount `v1_router` at `/_matrix/media/v1`** — the fix for the `POST /_matrix/media/v1/create`
+   404. In the existing `if legacy_media_enabled { ... }` block (currently just the `legacy_router`
+   merge, around what was line 350-353 before this session's changes elsewhere in the repo shifted
+   line numbers):
+
+   ```rust
+   if legacy_media_enabled {
+       let (media_v1_router, media_v1_manifest) = hs_media::router::v1_router::<B>();
+       let media_v1_router = media_v1_router.with_state(mounts.media.clone());
+       builder = builder.merge_router("/_matrix/media/v1", media_v1_router, media_v1_manifest.routes);
+
+       let (legacy_router, legacy_manifest) = hs_media::router::legacy_router::<B>();
+       let legacy_router = legacy_router.with_state(mounts.media);
+       builder = builder.merge_router("/_matrix/media/v3", legacy_router, legacy_manifest.routes);
+   }
+   ```
+
+   (`mounts.media.clone()` for the new call since the existing line right after it moves
+   `mounts.media` into `legacy_router`'s `.with_state(...)` — order matters: clone before the move,
+   as shown.) Gated on the same `legacy_media_enabled` flag as `legacy_router` itself, since
+   `/create` at this path is part of the same "still-authenticated legacy" family the existing
+   `legacy_router`'s own module doc describes, not a new always-on surface.
+
+2. **(Recommended, not required for the Complement gap) Call `resume_pending_scans` at startup.**
+   Right after `let media_state = crate::media::build_media_state(...)?;` in `serve.rs`:
+
+   ```rust
+   {
+       let repo = media_state.repository.clone();
+       tokio::spawn(async move {
+           match repo.resume_pending_scans().await {
+               Ok(0) => {}
+               Ok(n) => tracing::info!(count = n, "resumed pending content scans from a previous run"),
+               Err(e) => tracing::error!(error = %e, "failed to resume pending content scans at startup"),
+           }
+       });
+   }
+   ```
+
+   Spawned rather than awaited so a slow/down scanner cannot delay server startup; adjust to
+   `.await` directly instead if the integration lead would rather block startup until any backlog
+   is cleared. This is what turns the "intent survives a crash" guarantee above into "a restart
+   actually resolves it" — without this call, `PendingScan` rows are written and read correctly
+   (proven by this session's tests) but nothing in the running binary ever calls
+   `resume_pending_scans` on its own.
+
+### Decisions made this session
+
+- **`v1_router` is a new, separate router function, not an addition to `legacy_router`.** The two
+  functions in this crate map one-to-one to `hs-cli` mount points; since `/_matrix/media/v1/create`
+  is a different mount point than `/_matrix/media/v3/...`, it needs its own `Builder` output, even
+  though the handler it calls (`routes::upload::create`) is identical to the one `legacy_router`
+  already exposes at `/_matrix/media/v3/create`. Both paths now serve the same handler once
+  `hs-cli` mounts `v1_router` — harmless duplication, not a behavior difference, kept because
+  removing `/_matrix/media/v3/create` risks breaking a client that (incorrectly, but observedly, per
+  some client implementations) calls the wrong version.
+- **`PreviewIpPolicy` duplicates `hs_federation::client::IpPolicy`'s shape rather than importing
+  it.** See "2." above for the full reasoning; recorded here too since it is exactly the kind of
+  cross-track judgment call `docs/decisions/` conventions ask to be visible.
+- **Preview's OG-tag extraction is regex-based, not a DOM parse.** See "2." above.
+- **`preview_url` is authenticated on the legacy router too, diverging from RFC 0006's own claim
+  about Synapse's real behavior.** See "2." above.
+- **New `MediaConfig` fields RFC 0006 proposed (`url_preview_timeout`, `url_preview_max_fetch_size`,
+  `url_preview_cache_lifetime`) were not added** — out of this track's edit permission this session
+  (`hs_config` is not `crates/hs-media`). `crate::preview::FetchLimits`/`DEFAULT_PREVIEW_CACHE_TTL_MS`
+  are hardcoded stand-ins; flagged for whichever session next has `hs_config` open to wire through.
+- **No capacity bound on the preview cache table.** Unlike `scanning::cache::VerdictCache`. See "2."
+  above.
 
 ## Session 3: wiring content scanning into the upload path
 
@@ -665,7 +1010,13 @@ existing, as the brief itself anticipates.
 - **`hs_media::router::{authenticated_router, legacy_router}`**: spec-relative `axum::Router`
   fragments plus `hs_http::router::RouteManifest`, ready for whichever crate owns the real client
   listener to mount under `/_matrix/client/v1/media` and `/_matrix/media/v3` with a concrete
-  `MediaState<B>` supplied via `.with_state(...)`.
+  `MediaState<B>` supplied via `.with_state(...)`. Both now also serve `GET /preview_url`
+  (session 4).
+- **`hs_media::router::v1_router`** (session 4, new): the same shape, for
+  `/_matrix/media/v1` — currently just `POST /create` (MSC2246). **Not yet mounted by `hs-cli`** —
+  see session 4's "Wiring the integration lead must add" for the exact lines.
+- **`MediaRepository::preview_url`/`resume_pending_scans`** (session 4, new): see session 4's
+  entries above for what each guarantees.
 - **`hs_media::synapse_layout`**: `SynapseMediaStore`, `SynapseMediaEntry`,
   `classify_relative_path` — track 13's importer's read-only source for a Synapse media store on
   disk. `docs/compat/synapse-importer-mapping.md` (the policy for what the importer does with what
@@ -689,12 +1040,19 @@ existing, as the brief itself anticipates.
 - **13 (config/compat)**: `docs/compat/synapse-importer-mapping.md` (the importer policy that
   consumes `hs_media::synapse_layout`); the Synapse `homeserver.yaml` mapping for the new
   `MediaConfig` fields RFC 0006 proposes (`url_preview_timeout`, `url_preview_max_fetch_size`,
-  `url_preview_cache_lifetime`), once implemented.
+  `url_preview_cache_lifetime`) — **still not implemented as of session 4**, which built
+  `crate::preview` against hardcoded constants instead precisely because adding fields to
+  `hs_config::MediaConfig` is outside this track's edit permission; see session 4's entry above.
 - **14 (test/conformance)**: Complement media tests and differential tests against Synapse 1.161
   for headers and thumbnail dimensions (this track's definition of done) — not yet run against
-  this crate; this session's 160 tests are this crate's own, not Complement.
+  this crate; this crate's own test count (258 as of session 4) is not a substitute for that.
 - **15 (admin API)**: admin media endpoints (list/delete/purge/quarantine) calling into
   `MediaRepository`.
+- **hs-cli (integration lead)**: the two changes to `crates/hs-cli/src/serve.rs` session 4's
+  "Wiring the integration lead must add" spells out verbatim — mounting `v1_router` at
+  `/_matrix/media/v1` (required to close the Complement 404) and, optionally, calling
+  `resume_pending_scans` at startup (turns the durability fix's "intent survives a crash"
+  guarantee into "a restart actually resolves it").
 
 ## Decisions made
 

@@ -5,6 +5,7 @@
 pub mod config;
 pub mod download;
 pub mod legacy;
+pub mod preview;
 pub mod thumbnail;
 pub mod upload;
 

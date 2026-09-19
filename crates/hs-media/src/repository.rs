@@ -16,7 +16,7 @@ use hs_config::MediaConfig;
 
 use crate::error::MediaError;
 use crate::id::MediaId;
-use crate::metadata::{MediaRecord, MetadataStore, ThumbnailRecord};
+use crate::metadata::{MediaRecord, MetadataStore, PendingScan, ThumbnailRecord};
 use crate::policy::{UploadContext, UploadPolicy};
 use crate::scanning::config::ScanMode;
 use crate::scanning::{EngineDecision, ScanContext, ScanEngine, ScanSourceKind};
@@ -229,6 +229,7 @@ impl<B: KvBackend> MediaRepository<B> {
         self.policy.record(ctx, store_bytes.len() as u64).await;
 
         if spawn_background {
+            self.record_pending_scan(&media_id, &store_content_type, ctx)?;
             self.spawn_background_scan(media_id.clone(), store_content_type, bytes, ctx.clone());
         }
 
@@ -350,6 +351,7 @@ impl<B: KvBackend> MediaRepository<B> {
         self.policy.record(ctx, store_bytes.len() as u64).await;
 
         if spawn_background {
+            self.record_pending_scan(media_id, &store_content_type, ctx)?;
             self.spawn_background_scan(media_id.clone(), store_content_type, bytes, ctx.clone());
         }
 
@@ -454,19 +456,40 @@ impl<B: KvBackend> MediaRepository<B> {
         }
     }
 
+    /// Durably records that `media_id` still needs a background scan, *before*
+    /// [`MediaRepository::spawn_background_scan`] is ever called — see [`PendingScan`]'s doc and
+    /// [`MediaRepository::resume_pending_scans`] for why this ordering (write the durable intent,
+    /// then start the in-memory task) is what makes recovery from a crash possible at all.
+    fn record_pending_scan(
+        &self,
+        media_id: &MediaId,
+        content_type: &str,
+        ctx: &UploadContext,
+    ) -> Result<(), MediaError> {
+        self.metadata.put_pending_scan(&PendingScan {
+            server_name: self.server_name.clone(),
+            media_id: media_id.as_str().to_string(),
+            content_type: content_type.to_string(),
+            uploader: Some(ctx.user_id.clone()),
+            appservice_id: ctx.appservice_id.clone(),
+            enqueued_at_ms: self.now_ms(),
+        })
+    }
+
     /// Runs a scan in the background, after the caller has already stored the original bytes and
     /// (for `quarantine` mode) already returned a success response to the client (`defer`/
     /// `quarantine` mode — see [`ScanDecision::Background`]).
     ///
-    /// This is deliberately `tokio::spawn`, not real background-job infrastructure: nothing here
-    /// persists across a process restart, is retried, or is observable except through the audit
-    /// log and the row it eventually updates. A crash between "the client received a
-    /// `content_uri`" and "this task resolves" leaves `defer`-mode media quarantined forever
-    /// (safe, but stuck — an admin can always clear it manually) and leaves `quarantine`-mode
-    /// media un-quarantined even if the verdict would have said otherwise (the same exposure
-    /// window `quarantine` mode always accepts, just extended indefinitely). Both are recorded as
-    /// a known limitation in `docs/status/09-media.md`; the real fix is track 03/12's
-    /// background-job leasing, which this crate does not own and does not attempt to build here.
+    /// This task itself is deliberately `tokio::spawn`, not real background-job infrastructure:
+    /// nothing about *this future* survives a process restart, is retried, or is observable except
+    /// through the audit log and the row it eventually updates. What *does* survive a crash is the
+    /// durable [`PendingScan`] row [`MediaRepository::record_pending_scan`] writes before this is
+    /// ever called — see [`MediaRepository::resume_pending_scans`]'s doc for the exact durability
+    /// guarantee that gives (the intent to scan is never lost) and what it still does not provide
+    /// (no automatic scheduling; an operator or `hs-cli`'s own startup path has to call
+    /// `resume_pending_scans`). The real fix for *that* remaining gap — automatic, leased,
+    /// cross-node recovery — is track 03/12's background-job infrastructure, which this crate does
+    /// not own and does not attempt to build a substitute for.
     fn spawn_background_scan(
         &self,
         media_id: MediaId,
@@ -584,6 +607,22 @@ impl<B: KvBackend> MediaRepository<B> {
                     );
                 }
             }
+        }
+        // Whichever way the scan resolved, the pending-scan marker no longer describes reality —
+        // clear it so `resume_pending_scans` never re-processes an already-resolved item. This is
+        // the other half of the durability contract documented on `PendingScan` and
+        // `MediaRepository::resume_pending_scans`: called from both the live `tokio::spawn` path
+        // (`spawn_background_scan`) and the post-restart replay path, so a pending row is cleared
+        // exactly once regardless of which path resolved it.
+        if let Err(e) = self
+            .metadata
+            .delete_pending_scan(&server_name, media_id.as_str())
+        {
+            tracing::error!(
+                error = %e,
+                media_id = %media_id.as_str(),
+                "background scan: failed to clear the pending-scan record"
+            );
         }
     }
 
@@ -765,6 +804,88 @@ impl<B: KvBackend> MediaRepository<B> {
     #[must_use]
     pub fn metadata(&self) -> &MetadataStore<B> {
         &self.metadata
+    }
+
+    /// `GET .../preview_url`: fetches `url`, extracts OpenGraph metadata, and (if present) caches
+    /// a local copy of `og:image`. See [`crate::preview`]'s module doc for exactly what the SSRF
+    /// guard does and does not defend against.
+    ///
+    /// # Errors
+    /// [`MediaError::PreviewDisabled`], [`MediaError::PreviewBlocked`],
+    /// [`MediaError::PreviewFetchFailed`] or [`MediaError::Metadata`] — see
+    /// [`crate::preview::preview_url`].
+    pub async fn preview_url(&self, url: &str) -> Result<serde_json::Value, MediaError> {
+        crate::preview::preview_url(
+            &self.metadata,
+            &self.object_store,
+            &self.server_name,
+            &self.config,
+            self.now_ms(),
+            url,
+        )
+        .await
+    }
+
+    /// Re-runs any background content scan (`defer`/`quarantine` mode) left unresolved by a
+    /// previous process's crash or restart. See [`MetadataStore::list_pending_scans`] and
+    /// [`PendingScan`]'s doc for what durably survives a crash and
+    /// [`docs/status/09-media.md`](../../../../docs/status/09-media.md) for the exact interim
+    /// guarantee this provides (no automatic scheduling — an operator or this server's own
+    /// startup path has to call this).
+    ///
+    /// Returns the number of pending scans this call attempted to resolve. A scan whose bytes are
+    /// no longer readable from the object store (should not happen — bytes are written before the
+    /// pending-scan row is — but defensively handled) is logged and left pending rather than
+    /// silently dropped, so a future call can retry it.
+    ///
+    /// # Errors
+    /// [`MediaError::Metadata`] if the pending-scan table itself could not be read.
+    pub async fn resume_pending_scans(&self) -> Result<usize, MediaError> {
+        let Some(engine) = self.scanning.clone() else {
+            return Ok(0);
+        };
+        let pending = self.metadata.list_pending_scans()?;
+        let mut resumed = 0;
+        for p in pending {
+            let Ok(media_id) = MediaId::parse(&p.media_id) else {
+                tracing::error!(media_id = %p.media_id, "resume_pending_scans: stored an invalid media id");
+                continue;
+            };
+            let key = crate::store::content_key(&p.server_name, &media_id);
+            let bytes = match self.object_store.get(&key).await {
+                Ok(get_result) => match get_result.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::error!(error = %e, media_id = %p.media_id, "resume_pending_scans: failed to read bytes for a pending scan, leaving it pending");
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, media_id = %p.media_id, "resume_pending_scans: failed to read bytes for a pending scan, leaving it pending");
+                    continue;
+                }
+            };
+            let source = if p.appservice_id.is_some() {
+                ScanSourceKind::Appservice
+            } else {
+                ScanSourceKind::Local
+            };
+            let scan_ctx = ScanContext {
+                deadline: Instant::now() + engine.timeout(),
+                uploader: p.uploader.clone(),
+                source,
+                media_id: media_id.as_str().to_string(),
+                server_name: p.server_name.clone(),
+            };
+            let now = self.now_ms();
+            let decision = engine
+                .evaluate(&p.content_type, bytes, scan_ctx, now, true)
+                .await;
+            self.apply_background_scan_decision(&media_id, decision)
+                .await;
+            resumed += 1;
+        }
+        Ok(resumed)
     }
 }
 
@@ -1516,5 +1637,143 @@ mod scanning_integration {
                 .iter()
                 .any(|e| matches!(e.kind, AuditKind::AppserviceBypass { .. }))
         );
+    }
+
+    /// The durability fix (`docs/status/09-media.md`'s "the durability gap"): proves the
+    /// pending-scan row is written *synchronously*, as part of `upload` itself, not merely as an
+    /// eventual side effect of the (not-yet-run) background task.
+    ///
+    /// This relies on `#[tokio::test]`'s default `current_thread` flavor: a `tokio::spawn`ed task
+    /// cannot run until the spawning task yields at an `.await`. There is no `.await` between
+    /// `upload` returning and the assertion below, so if the pending-scan row is visible here, it
+    /// was `record_pending_scan`'s synchronous write, never the background task's.
+    #[tokio::test]
+    async fn pending_scan_is_recorded_before_the_background_task_can_have_run() {
+        let scanner = Arc::new(FixedVerdict::new("fake", Verdict::Clean));
+        let (engine, _audit) = engine_from_config(
+            ScanningConfig {
+                mode: ScanMode::Quarantine,
+                provider: ProviderKind::Icap,
+                fail: Some(FailPolicy::Closed),
+                ..ScanningConfig::default()
+            },
+            scanner,
+        );
+        let repo = repo().with_scanning(engine);
+
+        let bytes = Bytes::from(crate::test_fixtures::valid_png());
+        let id = repo.upload(&ctx(), "image/png", None, bytes).await.unwrap();
+
+        let pending = repo.metadata().list_pending_scans().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].media_id, id.as_str());
+        assert_eq!(pending[0].content_type, "image/png");
+
+        // Let the real background task run to completion so it does not outlive the test.
+        wait_until(|| repo.metadata().list_pending_scans().unwrap().is_empty()).await;
+    }
+
+    /// The other half of the durability fix: a scan a crash left unresolved (bytes and the media
+    /// row already durably stored, a `PendingScan` row durably recorded, but no background task
+    /// ever ran or completed — exactly what a process restart between "upload accepted" and "the
+    /// `tokio::spawn`ed task resolves" leaves behind) is completed by
+    /// `MediaRepository::resume_pending_scans` on a *fresh* repository built over the same
+    /// backend, standing in for "the process restarted." Without `resume_pending_scans`, this
+    /// verdict — infected, under `quarantine` mode — would never be applied: the item would stay
+    /// servable forever, which is exactly the gap `docs/status/09-media.md` describes.
+    #[tokio::test]
+    async fn resume_pending_scans_completes_a_scan_a_crash_left_unresolved() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let metadata = MetadataStore::open(MemoryBackend::new()).unwrap();
+
+        let media_id = MediaId::generate();
+        let bytes = Bytes::from(crate::test_fixtures::valid_png());
+        let key = crate::store::content_key("example.org", &media_id);
+        store.put(&key, bytes.clone().into()).await.unwrap();
+        metadata
+            .put_media(&MediaRecord {
+                server_name: "example.org".into(),
+                media_id: media_id.as_str().into(),
+                content_type: "image/png".into(),
+                upload_name: None,
+                byte_length: Some(bytes.len() as u64),
+                created_ms: 0,
+                uploader: Some("@alice:example.org".into()),
+                completed: true,
+                expires_at_ms: None,
+                // `quarantine` mode's pre-scan state: servable, not yet marked either way.
+                quarantined_by: None,
+                safe_from_quarantine: false,
+            })
+            .unwrap();
+        metadata
+            .put_pending_scan(&PendingScan {
+                server_name: "example.org".into(),
+                media_id: media_id.as_str().into(),
+                content_type: "image/png".into(),
+                uploader: Some("@alice:example.org".into()),
+                appservice_id: None,
+                enqueued_at_ms: 0,
+            })
+            .unwrap();
+
+        // "Restart": a brand-new `MediaRepository` over the same durable backend and object
+        // store, with a scanning engine attached the way `hs-cli`'s startup path would build one
+        // from `--media-scanning-config`.
+        let scanner = Arc::new(FixedVerdict::new(
+            "fake",
+            Verdict::Infected {
+                signature: "Eicar-Test-Signature".into(),
+                details: None,
+            },
+        ));
+        let (engine, _audit) = engine_from_config(
+            ScanningConfig {
+                mode: ScanMode::Quarantine,
+                provider: ProviderKind::Icap,
+                fail: Some(FailPolicy::Closed),
+                ..ScanningConfig::default()
+            },
+            scanner,
+        );
+        let repo = MediaRepository::new(
+            store,
+            metadata,
+            Arc::new(MediaConfig::default()),
+            Arc::new(crate::policy::InMemoryQuotaPolicy::unlimited()),
+            ThumbnailPolicy::default(),
+            "example.org".to_string(),
+            || 1_000_000,
+        )
+        .with_scanning(engine);
+
+        // Before resuming: `quarantine` mode's defining property held across the simulated
+        // restart -- servable, even though a verdict is still owed.
+        assert!(
+            repo.get_record("example.org", media_id.as_str())
+                .unwrap()
+                .is_servable()
+        );
+        assert_eq!(repo.metadata().list_pending_scans().unwrap().len(), 1);
+
+        let resumed = repo.resume_pending_scans().await.unwrap();
+        assert_eq!(resumed, 1);
+
+        // The verdict a crash would otherwise have lost forever is now applied, and the
+        // pending-scan row is cleared so a second `resume_pending_scans` call is a no-op.
+        let err = repo
+            .get_record("example.org", media_id.as_str())
+            .unwrap_err();
+        assert!(matches!(err, MediaError::Quarantined));
+        assert!(repo.metadata().list_pending_scans().unwrap().is_empty());
+    }
+
+    /// `resume_pending_scans` with no scanning engine attached at all (e.g. a deployment that
+    /// never configured `--media-scanning-config`) is a documented no-op, not an error — there is
+    /// nothing to resume a scan with.
+    #[tokio::test]
+    async fn resume_pending_scans_without_an_engine_is_a_harmless_no_op() {
+        let repo = repo();
+        assert_eq!(repo.resume_pending_scans().await.unwrap(), 0);
     }
 }
