@@ -44,6 +44,7 @@ use tokio::sync::{Mutex, Notify};
 
 use crate::error::UserError;
 use crate::presence::PresenceRegistry;
+use crate::receipts::{ReceiptKind, ReceiptRegistry};
 use crate::room_source::RoomSource;
 use crate::store::DynUserStore;
 use crate::token::SyncToken;
@@ -203,6 +204,8 @@ pub struct SessionHub<B: KvBackend, R: RoomSource<B>> {
     typing: TypingRegistry,
     /// In-memory `m.presence` state. See [`crate::presence`]'s module docs.
     presence: PresenceRegistry,
+    /// In-memory `m.receipt` state. See [`crate::receipts`]'s module docs.
+    receipts: ReceiptRegistry,
     /// `hs-push`'s cached ruleset store, if installed (see
     /// [`SessionHub::install_push_rules_store`]). `None` until installed -- `/sync` then omits
     /// `m.push_rules` entirely, exactly today's (pre-push-rules) behavior, rather than failing.
@@ -237,6 +240,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             wakers: Mutex::new(HashMap::new()),
             typing: TypingRegistry::new(),
             presence: PresenceRegistry::new(),
+            receipts: ReceiptRegistry::new(),
             push_rules: OnceLock::new(),
             counts: OnceLock::new(),
             _marker: std::marker::PhantomData,
@@ -404,6 +408,48 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     /// `user_id`'s current presence record, if this process has ever recorded one.
     pub async fn presence_of(&self, user_id: &UserId) -> Option<crate::presence::PresenceRecord> {
         self.presence.get(user_id).await
+    }
+
+    /// Records `user_id`'s `kind` receipt for `event_id` in `room_id` and immediately wakes every
+    /// joined member's long-polling `/sync` -- same wake-eagerly shape as
+    /// [`SessionHub::set_typing`]. Waking is not scoped to who is actually allowed to *see* this
+    /// particular receipt (an `m.read.private` receipt still wakes every member, not only its
+    /// sender): an over-broad wake just costs a harmless response-building pass, and the privacy
+    /// scope is enforced where it matters, in [`SessionHub::receipt_content_for`] /
+    /// `crate::receipts::ReceiptRegistry::content_for`.
+    ///
+    /// # Errors
+    /// Returns [`UserError`] if the room could not be loaded.
+    pub async fn set_receipt(
+        &self,
+        room_id: &RoomId,
+        user_id: &UserId,
+        kind: ReceiptKind,
+        event_id: ruma::OwnedEventId,
+        ts: u64,
+    ) -> Result<(), UserError> {
+        self.receipts
+            .set(room_id, user_id, kind, event_id, ts)
+            .await;
+        for member in self.joined_member_ids(room_id).await? {
+            self.wake(&member).await;
+        }
+        Ok(())
+    }
+
+    /// `room_id`'s current receipt cursor. See [`crate::receipts`].
+    pub async fn receipts_seq(&self, room_id: &RoomId) -> u64 {
+        self.receipts.seq(room_id).await
+    }
+
+    /// The `m.receipt` event content for `room_id` as `viewer` (privacy-scoped -- see
+    /// [`crate::receipts::ReceiptRegistry::content_for`]), plus this room's current cursor.
+    pub async fn receipt_content_for(
+        &self,
+        room_id: &RoomId,
+        viewer: &UserId,
+    ) -> (serde_json::Value, u64) {
+        self.receipts.content_for(room_id, viewer).await
     }
 
     /// Every user (other than `user_id`) currently sharing at least one *joined* room with

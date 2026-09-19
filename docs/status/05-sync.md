@@ -20,9 +20,286 @@ Track brief: `docs/workstreams/05-sync.md`. Owner crates: `hs-user` (this sessio
 also covers `crates/hs-loadgen`, the real-client scenario `docs/next-steps.md` item 2 calls "the
 single best test of whether this is a homeserver").
 
-Last updated: 2026-09-19 (session 5: `m.push_rules`/`unread_notifications` consume track 10's
-seam, `GET /keys/changes` resolves this crate's own tokens, and `summary` (heroes + member counts)
-is no longer hardcoded `{}`. Sessions 1-4 preserved unchanged further down.)
+Last updated: 2026-09-19 (session 6: filters actually honour event-type/sender includes and
+excludes, not just `limit`/`lazy_load_members`; `m.receipt`/`m.read.private`/`m.fully_read` exist
+end to end; a stale-server false alarm from track 16's Element-Web session is corrected. Sessions
+1-5 preserved unchanged further down.)
+
+## Session 6 (2026-09-19): getting ahead of Element Web -- filter content matching, receipts
+
+**Task**: another agent was pointing Element Web at this server for the first time. In priority
+order: (1) check whether `room.timeline.types`/`not_types`/`senders`/`not_senders` (and the
+`room.state` equivalents) were honoured, not just parsed -- they were not, and this crate's own
+`filter.rs` said so in its own doc comment; (2) build `m.receipt`/`m.fully_read`, reserved and
+unused since session 1; (3) check `docs/status/16-management-web-interface.md` partway through
+for anything the Element-Web session found that belongs to this track. Scope:
+`crates/hs-user/**`, `crates/hs-loadgen/**` and this file.
+
+### 1. Filters: event-type/sender content matching, for both `room.timeline` and `room.state`
+
+Before this session, `crate::filter::SyncFilter` parsed `types`/`not_types`/`senders`/
+`not_senders` on both `room.timeline` and `room.state` but never applied them -- `crate::sync`
+only ever looked at `limit`, `lazy_load_members`, `include_leave` and the room allow/denylist.
+Element sends a filter (with `lazy_load_members: true`) on every sync, and any client whose
+filter also restricts event types would have silently gotten everything back. Fixed:
+
+- **`crates/hs-user/src/filter.rs`**: `RoomEventFilter::matches(event_type, sender) -> bool`
+  (`not_types`/`not_senders` win outright over `types`/`senders`, matching
+  `SyncFilter::room_allowed`'s existing denylist-wins precedent; `*` suffix wildcards supported,
+  e.g. `"m.room.*"`) and `RoomEventFilter::is_content_noop()`. `SyncFilter::timeline_content_filter()`/
+  `state_content_filter()` return `Option<&RoomEventFilter>`, `None` whenever that section is
+  absent or sets no content restriction, so `crate::sync` can skip the filtered code path
+  entirely in the overwhelmingly common case.
+- **`crates/hs-user/src/sync/mod.rs`**: `build_incremental_timeline`/`build_fresh_timeline` both
+  gained a `content_filter: Option<&RoomEventFilter>` parameter. When absent, behavior is
+  byte-for-byte unchanged from before this session (same single `paginate` call at exactly
+  `limit`, same peek-one-more `limited` check) -- zero regression risk for the overwhelmingly
+  common unfiltered case. When present: one bounded `paginate` call at
+  `limit.max(FILTERED_TIMELINE_SCAN)` (500), filter the raw batch, truncate to `limit`.
+  **`limited` is conservative**: true whenever this response did not *prove* the room has nothing
+  more for this window (either the filtered set already filled `limit`, or the raw scan itself
+  was cut off by the 500-event cap before reaching the true end of history) -- worst case a
+  client pages once more than strictly necessary and gets a smaller/empty page; this never skips
+  a real event, the same direction `resume_mode`'s own fallback already errs in. Documented as a
+  known simplification, not a silent gap: a filter that excludes nearly everything in a room with
+  a very long tail (thousands of events since the filter's cutoff) will not scan past that cap in
+  one response. `build_state_section` gained the equivalent filter as a plain, unbounded `Vec`
+  filter (`full_state()` is already one-event-per-`(type, state_key)`, not a history, so no scan
+  bound is needed there).
+- `crate::filter`'s module doc rewritten: `room.timeline`/`room.state`'s `types`/`not_types`/
+  `senders`/`not_senders` moved from "parsed but ignored" to "applied". Room-scoped account data
+  and ephemeral events (`m.typing`, `m.receipt`) are **not** content-filtered even though the
+  spec's `RoomEventFilter` shape technically allows it there too -- both are already small,
+  bounded, non-history snapshots, so this was judged not worth building this session; recorded as
+  a documented scope cut, not silently dropped.
+- 10 new tests: `filter::tests` (wildcard matching, `not_types`/`not_senders` precedence,
+  `is_content_noop`, the two `SyncFilter` accessor methods); `sync::tests::
+  initial_sync_timeline_type_filter_excludes_non_matching_events` (exercises
+  `build_fresh_timeline`'s filtered branch), `incremental_sync_timeline_type_filter_excludes_non_matching_events`
+  (exercises `build_incremental_timeline`'s filtered branch -- this one initially failed for a
+  reason unrelated to the filter logic itself, see "A test-harness gotcha" below),
+  `state_not_types_filter_excludes_a_matching_state_event`.
+
+### 2. `m.receipt` (`m.read`/`m.read.private`) and `m.fully_read`
+
+`SyncToken::receipts_seq` had been reserved since session 1. Built exactly to the
+typing/presence pattern this crate's own status file already named as the template:
+
+- **`crates/hs-user/src/receipts.rs`** (new): `ReceiptRegistry`, in-memory, keyed by room --
+  mirrors `crate::typing::TypingRegistry`'s shape exactly (global monotonic counter stamped per
+  room, exposed via `SyncToken::receipts_seq`). **Not persisted**, a deliberate cut matching
+  `crate::presence::PresenceRegistry`'s identical precedent (a restart loses read state, same as
+  it already loses typing and presence) -- moving this into `crate::store::UserStore` later is a
+  mechanical follow-up, not a redesign. `ReceiptRegistry::content_for(room_id, viewer)` builds the
+  spec's `{event_id: {receipt_type: {user_id: {ts}}}}` shape **scoped to the viewer**: every
+  `m.read` receipt is public (visible to any member), but an `m.read.private` receipt is omitted
+  entirely unless `viewer` is its own sender -- the entire point of the private variant.
+- **`crates/hs-user/src/hub.rs`**: `SessionHub::set_receipt`/`receipts_seq`/`receipt_content_for`,
+  same wake-eagerly shape as `set_typing` (looks up joined members, calls the hub's `Notify`
+  waker directly for each -- not privacy-scoped at wake time, only at content-build time, same
+  "over-broad wake just costs a harmless extra pass" reasoning already used for typing/presence).
+- **`crates/hs-user/src/routes/receipts.rs`** (new): `POST /rooms/{roomId}/receipt/{receiptType}/{eventId}`
+  and `POST /rooms/{roomId}/read_markers`, both requiring current `join` membership (same rule
+  `typing.rs` already uses). **`receiptType` accepts `m.fully_read` too, not just `m.read`/
+  `m.read.private`** -- this matches Synapse's own accepted behavior on this same endpoint (ruma's
+  own `create_receipt::v3::ReceiptType` models `FullyRead` as a real variant, and
+  `matrix-rust-sdk`'s `Room::send_single_receipt` can be called with it directly), and is what
+  makes a real client's obvious call actually work rather than 400ing on a legal spec extension.
+  `m.fully_read`, from either endpoint, writes straight through the pre-existing
+  `UserStore::put_room_account_data` -- it already has its own durable storage, its own change
+  counter, and its own `/sync` wiring; no new plumbing needed for it at all.
+- **`crates/hs-user/src/sync/mod.rs`**: gathered up front alongside typing (a receipt-only change
+  never touches the feed either), folded into the same `ephemeral.events` array a room's `m.typing`
+  event already occupies. `receipts_seq` is threaded into the outgoing token
+  (previously present in the struct literal only via `..baseline`, now the one remaining field to
+  set explicitly -- clippy's `needless_update` caught the resulting all-fields-explicit literal,
+  fixed by dropping `..baseline` entirely).
+- 16 new tests across `receipts::tests`, `routes::receipts::tests` and one `sync::tests` case
+  (`a_receipt_wakes_a_long_poll_and_appears_as_m_receipt`, same shape as the existing typing wake
+  test: a concurrent task sets a receipt 50ms into a 5s-timeout long poll, the poll returns in
+  well under 2s).
+
+### A test-harness gotcha (not a production bug)
+
+`incremental_sync_timeline_type_filter_excludes_non_matching_events` initially failed with an
+empty `rooms: {}` response -- not a filtering bug at all. `crate::store`'s feed **coalesces**
+repeated updates to the same room into one still-unconsumed entry until some device's cursor
+crosses it (`store::tables::tests::unconsumed_updates_to_the_same_room_coalesce` already proves
+this). The existing passing test this one was modeled on
+(`a_message_sent_after_a_token_was_issued_appears_in_the_next_incremental_sync`) calls
+`hub.store().record_device_cursor(...)` right after the baseline sync for exactly this reason;
+my first draft omitted that call, so the two new sends coalesced into the seed message's
+already-synced feed entry instead of creating a fresh one past the baseline token. Fixed by
+adding the same `record_device_cursor` call. Recorded here so the next person modeling a new
+"seed, baseline, then more activity" test copies this detail too.
+
+### Correction to track 16's Element-Web session: receipts do not 404 on a fresh server
+
+`docs/status/16-management-web-interface.md`'s Element-Web session (read partway through this
+one, per this session's own instructions) reported bug 3: `POST .../receipt/{receiptType}/{eventId}`
+and `POST .../read_markers` both `404` live with an empty body, despite reading this exact crate's
+`routes/receipts.rs` and confirming both handlers "implement... completely and correctly." **That
+404 was real for the process they were curling, but it was not this session's code that was
+missing -- it was a stale, already-running `hs serve` process.** That session's own write-up says
+the server was started early (step 1) and "is still running... as this session ends" -- i.e. one
+long-lived process, started before this session's `routes/mod.rs` mounting existed on disk (both
+crates are edited concurrently in the same working tree; a running process never re-reads source
+after it starts). Proof, against a server built and started *after* this session's routes landed:
+
+```
+$ hs generate-config --server-name verify.local -o config.yaml   # + enable_registration/shared secret, port patch
+$ hs generate-signing-key -o signing-keys
+$ hs serve -c config.yaml &
+$ curl -X POST http://127.0.0.1:18099/_matrix/client/v3/register -d '{"username":"verifyuser","password":"verifypassword123","auth":{"type":"m.login.dummy"}}'
+$ curl -X POST http://127.0.0.1:18099/_matrix/client/v3/createRoom -H "Authorization: Bearer $TOKEN" -d '{}'
+$ curl -X PUT ".../rooms/$ROOM_ID/send/m.room.message/txn1" -H "Authorization: Bearer $TOKEN" -d '{"msgtype":"m.text","body":"hello"}'
+$ curl -i -X POST ".../rooms/$ROOM_ID/receipt/m.read/$EVENT_ID" -H "Authorization: Bearer $TOKEN" -d '{}'
+HTTP/1.1 200 OK
+content-length: 2
+{}
+$ curl -i -X POST ".../rooms/$ROOM_ID/read_markers" -H "Authorization: Bearer $TOKEN" -d '{"m.fully_read": "$EVENT_ID"}'
+HTTP/1.1 200 OK
+content-length: 2
+{}
+```
+
+Both `200`. Independently, this session's own `cargo test -p hs-loadgen --test real_client`
+(below) drives the identical two routes through `matrix-rust-sdk`'s real HTTP client against a
+binary built with `cargo build -p hs-cli --bin hs` in this same session, and both steps pass. **No
+router-composition bug exists in `hs-http`'s `Builder`/`merge_router` for these paths** -- track
+16's own diagnosis correctly ruled out several other causes but didn't have a way to know its
+long-running server predated the routes it was reading about in source. Track 16's bugs 1 (no
+CORS on `/_matrix/client/*`) and 2 (`GET /capabilities` reports stale `m.set_displayname`/
+`m.set_avatar_url: false`) are both real and both squarely `hs-cli`'s (`serve.rs`'s router
+assembly and `capabilities.rs` respectively) -- **not fixed here**, `hs-cli` was off limits this
+session same as every prior one; flagged under "Interfaces needed" below since bug 1 in
+particular blocks every browser client, Element included, from reaching any route this crate
+owns.
+
+### Verification
+
+```
+cargo fmt -p hs-user -p hs-loadgen                                    # clean
+cargo test -p hs-user                                                 # 87 unit + 3 integration = 90 passed (was 70)
+cargo build -p hs-cli --bin hs                                        # clean
+cargo test -p hs-loadgen --test real_client -- --nocapture            # 28 steps, passed (below)
+cargo test -p hs-loadgen --test real_client_encrypted -- --nocapture  # 16 steps, passed, still decrypts
+```
+
+**`cargo clippy -p hs-user -p hs-loadgen --all-targets -- -D warnings`: blocked by an unrelated,
+persistent (not transient) failure in `crates/hs-http/src/cors.rs:85`** (`matrix_layer()` is
+`#[must_use]` with no message, wrapping an already-`#[must_use]` `CorsLayer` -- clippy's
+`double_must_use`), reproduced identically across four retries over roughly 20 minutes, unlike
+the transient `hs-room`/`hs-e2e` compile errors from concurrent edits also hit this session (which
+did resolve within a few retries each, same as prior sessions' notes describe). `hs-http` is not
+this track's crate (nor is it in scope for this session), and clippy lints every local path
+dependency, not just `-p` targets, so this is an environmental block, not a signal about
+`hs-user`/`hs-loadgen`'s own code -- **confirmed by a clean `cargo clippy -p hs-user -p hs-loadgen`
+run earlier in this same session, before this cross-track regression appeared** (right after the
+filter/receipts code was written and two real clippy findings in it -- a `needless_update` and a
+`bool_assert_comparison` in a test -- were fixed). Whoever owns `hs-http` next: `git diff` on
+`crates/hs-http/src/cors.rs` should show a very recent, small change; either remove the redundant
+`#[must_use]` on `matrix_layer()` or give it an explicit reason string.
+
+**`real_client` run** (28 steps, up from 23 -- filters and receipts added as steps 15-16, and
+`m.push_rules` now hard-succeeds where session 5 logged it as `KNOWN BUG`: the `hs-cli` wiring
+that session asked for has since landed):
+
+```
+registered @loadgen-alice:hs-loadgen.test
+registered @loadgen-bob:hs-loadgen.test
+logged in @loadgen-alice:hs-loadgen.test on a second device via POST /login
+alice created room !kGrlBQbuCGsjeFcBKZ:hs-loadgen.test
+alice invited @loadgen-bob:hs-loadgen.test
+@loadgen-bob:hs-loadgen.test joined !kGrlBQbuCGsjeFcBKZ:hs-loadgen.test
+both clients completed a baseline /sync
+alice's baseline /sync carried m.push_rules global account data
+alice sent $aJTicMtFT2WrO4kMgtRHqxj5HYUbwo9QeI704NTy_mw ("hello bob, this is alice")
+bob sent $5ronQm17rMByo4JbV9BAaIjdzdn4ngF97Bpbdy98qb4 ("hi alice, bob here")
+bob's incremental /sync saw alice's message
+alice's incremental /sync saw bob's message
+alice's display name round-tripped through GET/PUT /profile
+room name and topic changes appeared in /sync's timeline
+room membership lists both @loadgen-alice:hs-loadgen.test and @loadgen-bob:hs-loadgen.test
+backward /messages page (no `from`, the live end) contains alice's message (10 events)
+backward /messages page, paginated from a token /sync handed back (not /messages itself), contains alice's message (10 events)
+forward /messages page, paginated from a /sync token issued before any messages, contains alice's message (5 events)
+bob's /sync saw alice's typing notice within the bounded wait
+carol's /sync saw her invite to !kGrlBQbuCGsjeFcBKZ:hs-loadgen.test within the bounded wait
+bob's /sync saw alice's profile change reflected in her m.room.member event
+alice uploaded a sync filter capping room.timeline.limit to 1, filter id 3sTN4Hrqs0VBe0b4
+the uploaded filter round-tripped through GET /user/{userId}/filter/{filterId}
+a sync filter's room.timeline.limit was honoured: 1 event(s) returned, limited=true
+alice's /sync saw bob's public read receipt on $aJTicMtFT2WrO4kMgtRHqxj5HYUbwo9QeI704NTy_mw
+bob's /sync reported his own m.fully_read marker on $aJTicMtFT2WrO4kMgtRHqxj5HYUbwo9QeI704NTy_mw
+both clients logged out
+post-logout /sync was correctly rejected: the server returned an error: [401 / M_UNKNOWN_TOKEN] 401 Unauthorized M_UNKNOWN_TOKEN: Unrecognised access token
+test matrix_rust_sdk_talks_to_a_real_hs_serve ... ok
+```
+
+**`real_client_encrypted` run**: unchanged shape, 16 steps, still decrypts end to end -- no
+regression from this session's `sync/mod.rs`/`hub.rs` changes.
+
+### Decisions made this session
+
+- **Receipts are in-memory, not persisted** -- see `crate::receipts`'s module doc and "2." above.
+  Matches the presence precedent exactly; a mechanical follow-up to move into `UserStore` later,
+  not a redesign.
+- **`m.fully_read` is accepted on `POST .../receipt/m.fully_read/{eventId}` as well as
+  `.../read_markers`**, matching Synapse's own real behavior on that endpoint rather than the
+  spec's narrower documented surface -- see "2." above for why (ruma models it, `matrix-rust-sdk`
+  can call it directly).
+- **Filtered timeline scanning is bounded at 500 raw events per response
+  (`FILTERED_TIMELINE_SCAN`)**, with a conservative `limited` flag rather than looping until
+  `limit` post-filter events are found -- see "1." above. Chosen over an unbounded loop to keep
+  the "bounded response" guarantee `TO_DEVICE_LIMIT` already established elsewhere in this crate.
+  `room.timeline`/`room.state` content filtering does not extend to `room.ephemeral`/
+  `room.account_data` this session -- both are already small, non-history snapshots, judged not
+  worth building given the session's actual priorities (Element sends filters far more for
+  `lazy_load_members`/timeline shaping than for ephemeral-event type filtering).
+- Track 16's Element-Web bug 3 (receipts 404) diagnosed as a stale-server artifact, not a real
+  bug -- see the correction above. Bugs 1 (no CORS) and 2 (stale capabilities flags) are real,
+  confirmed by reading, and belong to `hs-cli` -- forwarded, not fixed (out of scope this
+  session).
+
+### Interfaces provided (new this session)
+
+- `POST /rooms/{roomId}/receipt/{receiptType}/{eventId}` (`m.read`, `m.read.private`,
+  `m.fully_read`) and `POST /rooms/{roomId}/read_markers` (`crate::routes::receipts`).
+- `SessionHub::set_receipt`/`receipts_seq`/`receipt_content_for` (`crate::hub`), `crate::receipts::
+  ReceiptRegistry`/`ReceiptKind` -- all `pub`, usable by another crate that gets a `SessionHub`
+  handle (none does today).
+- `m.receipt` is a new addition to `/sync`'s existing `ephemeral.events` shape, not a new
+  endpoint for another track to integrate against. `crate::filter::RoomEventFilter::matches`/
+  `is_content_noop` and `SyncFilter::timeline_content_filter`/`state_content_filter` are new
+  `pub` methods, usable by any future caller that wants this crate's own event-type-matching
+  logic rather than reimplementing it.
+
+### Interfaces needed
+
+- **From `hs-cli`** (forwarded from track 16's Element-Web session, both confirmed real by
+  reading the cited source): (1) a CORS layer on the `/_matrix/client/*` router, unconditional
+  per the spec (distinct from the admin API's same-origin-by-default policy) -- currently CORS is
+  applied only to the admin router in `serve.rs`; every browser client hosted on a different
+  origin (Element included) cannot make a single client-server API call without this. (2)
+  `crates/hs-cli/src/capabilities.rs`'s `get_capabilities()` still hardcodes `m.set_displayname`/
+  `m.set_avatar_url` to `"enabled": false` from before `hs-room`'s profile routes existed; both
+  routes work correctly today (confirmed live) and the capabilities response should say so.
+- Nothing new required of any other track for this session's own work (filters and receipts are
+  entirely self-contained within `hs-user`).
+
+### What's next for track 05
+
+1. Presence's idle/logout-driven automatic offline transition (deferred since session 4,
+   unchanged scope cut).
+2. Persist receipts into `crate::store::UserStore` instead of `crate::receipts::ReceiptRegistry`'s
+   in-memory registry, once a session has time for the table/schema addition -- see "Decisions
+   made" above.
+3. `room.ephemeral`/`room.account_data` content filtering, if a real client is ever observed
+   actually setting those filter fields (not observed yet; Element's own filter usage per track
+   16's session was `lazy_load_members`, not ephemeral-type filtering).
+4. Once `hs-cli`'s owner adds the CORS layer and fixes the stale capabilities flags (both
+   forwarded above), re-verify Element Web's own browser run can proceed past both blockers.
 
 ## Session 5 (2026-09-19): the three things sync still owed -- push rules, `/keys/changes`, room summaries
 

@@ -26,6 +26,19 @@
 //! See `crate::typing`'s module docs for why a global counter, not a per-room/per-user boolean,
 //! and for why expiry is pruned lazily on read rather than by a background timer.
 //!
+//! # `m.receipt` (`crate::receipts`)
+//!
+//! Follows the identical shape (in-memory registry, global counter, `SyncToken::receipts_seq` --
+//! reserved since session 1, before `crate::receipts` existed): gathered up front alongside
+//! typing (a receipt-only change never touches the feed either), folded into `ephemeral.events`
+//! next to any `m.typing` event already there. Unlike typing, the *content* built for a given
+//! room depends on who is asking: `crate::receipts::ReceiptRegistry::content_for` omits every
+//! other user's `m.read.private` receipt, so this module calls it once per response with
+//! `user_id` (the syncing user) as the viewer, never a shared, unscoped value. `m.fully_read` is
+//! not an ephemeral event at all -- it is private room account data, already carried by this
+//! module's existing account-data section with no extra code (see
+//! `crate::routes::receipts::post_read_markers`).
+//!
 //! `m.typing` is scoped per room (only joined members ever see or send it); `m.presence` is
 //! scoped per user, reported to (and gated on) everyone who currently shares a *joined* room with
 //! the user whose presence changed -- the same privacy scope `device_lists.changed`/`left` uses
@@ -39,11 +52,11 @@
 //!
 //! # Not implemented in this pass (present as documented gaps, not silent omissions)
 //!
-//! - **`m.receipt`**: read-receipt distribution is listed in this track's brief but was not
-//!   reached this session -- `SyncToken::receipts_seq` is reserved for it, unused today.
-//! - **Unread notification counts**: *is* included, per this track's own instructions, shaped
-//!   correctly (`{"highlight_count": 0, "notification_count": 0}`) with both counts hard-zero
-//!   until track 10 (push) lands.
+//! - Presence's idle/logout-driven automatic offline transition (see `crate::presence`'s module
+//!   docs).
+//! - See `crate::filter`'s own doc comment for the full, precise list of which filter fields this
+//!   module applies and which it only parses (`event_fields`, `event_format`, ephemeral/room
+//!   account-data content filtering, and `room.state.include_redundant_members`, among others).
 //!
 //! # `to_device`, `device_lists` and key counts (`docs/rfcs/0013-e2ee-sync-extensions.md`)
 //!
@@ -180,19 +193,61 @@ struct Timeline {
     prev_batch: Option<String>,
 }
 
+/// How many raw timeline events a single `/sync` response will fetch in one `paginate` call once
+/// `room.timeline` carries a content filter (`types`/`not_types`/`senders`/`not_senders`), rather
+/// than the plain `limit` an unfiltered request uses. A filter that excludes nearly everything
+/// (e.g. `types: ["m.room.message"]` in a room dominated by reactions and edits) could otherwise
+/// need to scan arbitrarily far back to fill `limit` post-filter events; this crate does not loop
+/// indefinitely to do so (see [`build_incremental_timeline`]/[`build_fresh_timeline`]'s doc
+/// comments for exactly what "conservative" means for `limited` in that case). Matches this
+/// crate's existing "bounded response" philosophy (`TO_DEVICE_LIMIT`).
+const FILTERED_TIMELINE_SCAN: usize = 500;
+
 fn build_incremental_timeline(
     actor: &hs_room::actor::RoomActor<impl KvBackend>,
     resume_pos: i64,
     limit: usize,
+    content_filter: Option<&crate::filter::RoomEventFilter>,
 ) -> Timeline {
     let from = Some(PaginationToken::new(resume_pos, Direction::Forward));
-    let (events, next) = actor.paginate(from, Direction::Forward, limit);
-    let limited = if events.len() == limit {
-        let (more, _) = actor.paginate(next, Direction::Forward, 1);
-        !more.is_empty()
-    } else {
-        false
+    let request = content_filter.map_or(limit, |_| limit.max(FILTERED_TIMELINE_SCAN));
+    let (raw, next) = actor.paginate(from, Direction::Forward, request);
+    let raw_exhausted = raw.len() < request;
+
+    let (events, limited): (Vec<&Event>, bool) = match content_filter {
+        None => {
+            let limited = if raw.len() == limit {
+                let (more, _) = actor.paginate(next, Direction::Forward, 1);
+                !more.is_empty()
+            } else {
+                false
+            };
+            (raw, limited)
+        }
+        Some(f) => {
+            let filtered: Vec<&Event> = raw
+                .into_iter()
+                .filter(|e| f.matches(&e.header().event_type, e.header().sender.as_str()))
+                .collect();
+            let truncated = filtered.len() > limit;
+            let events = if truncated {
+                filtered.into_iter().take(limit).collect()
+            } else {
+                filtered
+            };
+            // Conservative: `limited` is true whenever this response did not prove the room has
+            // nothing more for this window -- either the filtered set alone already filled
+            // `limit` (there may well be more beyond it), or the raw scan itself was cut off by
+            // `FILTERED_TIMELINE_SCAN` before reaching the true end of the room's forward
+            // history. Worst case a client pages once more than strictly necessary and gets a
+            // smaller-than-expected (possibly empty) page; this never *skips* real events, which
+            // is the direction this crate's other resume-mode fallbacks already choose to err in
+            // (see `resume_mode`'s own doc comment).
+            let limited = truncated || !raw_exhausted;
+            (events, limited)
+        }
     };
+
     let prev_batch = if events.is_empty() {
         None
     } else {
@@ -208,19 +263,52 @@ fn build_incremental_timeline(
 fn build_fresh_timeline(
     actor: &hs_room::actor::RoomActor<impl KvBackend>,
     limit: usize,
+    content_filter: Option<&crate::filter::RoomEventFilter>,
 ) -> Timeline {
-    let (events, next) = actor.paginate(None, Direction::Backward, limit);
-    let limited = if events.len() == limit {
-        let (more, _) = actor.paginate(next, Direction::Backward, 1);
-        !more.is_empty()
-    } else {
-        false
+    let request = content_filter.map_or(limit, |_| limit.max(FILTERED_TIMELINE_SCAN));
+    let (raw, next) = actor.paginate(None, Direction::Backward, request);
+    let raw_exhausted = raw.len() < request;
+
+    let (mut events, limited): (Vec<&Event>, bool) = match content_filter {
+        None => {
+            let limited = if raw.len() == limit {
+                let (more, _) = actor.paginate(next, Direction::Backward, 1);
+                !more.is_empty()
+            } else {
+                false
+            };
+            (raw, limited)
+        }
+        Some(f) => {
+            // `raw` is newest-first; filter first (order-preserving), then take the newest
+            // `limit` of what survives -- taking from the *front* here, unlike the incremental
+            // case's `take(limit)` from a forward-ordered list, is what keeps this the most
+            // recent `limit` matching events rather than the oldest ones in the scanned window.
+            let filtered: Vec<&Event> = raw
+                .into_iter()
+                .filter(|e| f.matches(&e.header().event_type, e.header().sender.as_str()))
+                .collect();
+            let truncated = filtered.len() > limit;
+            let events = if truncated {
+                filtered.into_iter().take(limit).collect()
+            } else {
+                filtered
+            };
+            // Same conservative reasoning as `build_incremental_timeline` above.
+            let limited = truncated || !raw_exhausted;
+            (events, limited)
+        }
     };
+    // The exact continuation token for "everything older than the scanned window" is not
+    // knowable here, when a content filter is present, without threading the filtered-out tail's
+    // own position through (this crate does not track that) -- `next` (from the raw, unfiltered
+    // scan) is still a safe, conservative choice either way: paging from it can only ever
+    // *repeat or skip past* already-scanned raw events, never lose events this response already
+    // returned.
     let prev_batch = next.map(|t| t.to_string());
-    let mut ordered: Vec<&Event> = events;
-    ordered.reverse(); // paginate(Backward) is newest-first; /sync wants chronological order.
+    events.reverse(); // paginate(Backward) is newest-first; /sync wants chronological order.
     Timeline {
-        events: ordered.into_iter().map(client_event_json).collect(),
+        events: events.into_iter().map(client_event_json).collect(),
         limited,
         prev_batch,
     }
@@ -253,13 +341,18 @@ fn stripped_state(
 /// duplicating a state event this response's timeline already carries -- see the module docs'
 /// caveat that this is an approximation of "state at the start of the timeline", not an exact
 /// one), optionally lazy-loaded (`m.room.member` restricted to timeline senders plus the
-/// requester's own membership, when `lazy` is set).
+/// requester's own membership, when `lazy` is set), optionally content-filtered by
+/// `room.state.types`/`not_types`/`senders`/`not_senders` (`content_filter`). Unlike the timeline
+/// builders above, this has no `limit`/scan-bound concern: `full_state` is already the room's
+/// entire *current* state (one event per `(type, state_key)`, not a history), so filtering it is
+/// a plain, unbounded `Vec` filter.
 fn build_state_section(
     actor: &hs_room::actor::RoomActor<impl KvBackend>,
     timeline_event_ids: &HashSet<String>,
     lazy: bool,
     timeline_senders: &HashSet<String>,
     self_user: &UserId,
+    content_filter: Option<&crate::filter::RoomEventFilter>,
 ) -> Result<Vec<Value>, hs_room::RoomError> {
     Ok(actor
         .full_state()?
@@ -271,6 +364,10 @@ fn build_state_section(
             }
             let is_self = e.header().state_key.as_deref() == Some(self_user.as_str());
             is_self || timeline_senders.contains(e.header().sender.as_str())
+        })
+        .filter(|e| {
+            content_filter
+                .is_none_or(|f| f.matches(&e.header().event_type, e.header().sender.as_str()))
         })
         .map(client_event_json)
         .collect())
@@ -414,6 +511,13 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     // `candidate_rooms` here so the main loop below renders it even when nothing else changed.
     let mut typing_by_room: HashMap<OwnedRoomId, Vec<Value>> = HashMap::new();
     let mut new_typing_seq = baseline.typing_seq;
+    // `m.receipt`: gathered the same way and for the same reason as typing above -- a
+    // receipt-only change never touches the feed either. See `crate::receipts`'s module docs for
+    // why this is a separate in-memory registry (mirroring typing/presence) rather than a
+    // `store` table, and for the privacy scope `receipt_content_for` enforces per viewer
+    // (`user_id`, always the syncing user themselves here).
+    let mut receipts_by_room: HashMap<OwnedRoomId, Value> = HashMap::new();
+    let mut new_receipts_seq = baseline.receipts_seq;
     for m in store.list_memberships(user_id).await? {
         if m.membership != "join" {
             continue;
@@ -423,12 +527,21 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         if seq > baseline.typing_seq {
             candidate_rooms.insert(m.room_id.clone());
             typing_by_room.insert(
-                m.room_id,
+                m.room_id.clone(),
                 vec![json!({
                     "type": "m.typing",
                     "content": {"user_ids": users},
                 })],
             );
+        }
+        let receipts_seq = hub.receipts_seq(&m.room_id).await;
+        new_receipts_seq = new_receipts_seq.max(receipts_seq);
+        if receipts_seq > baseline.receipts_seq {
+            candidate_rooms.insert(m.room_id.clone());
+            let (content, _) = hub.receipt_content_for(&m.room_id, user_id).await;
+            if content.as_object().is_some_and(|o| !o.is_empty()) {
+                receipts_by_room.insert(m.room_id, content);
+            }
         }
     }
 
@@ -466,6 +579,12 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         let full_state_requested = params.full_state;
         let lazy = params.filter.lazy_load_members();
         let user_id_owned = user_id.to_owned();
+        // Cloned per room (cheap: absent in the overwhelming common case, and even when present
+        // this is a handful of small `Vec<String>`s) since the `move` closure below needs owned
+        // data, not a borrow of `params` -- see that closure's own call site for why (`query`
+        // requires a `'static` closure).
+        let timeline_content_filter = params.filter.timeline_content_filter().cloned();
+        let state_content_filter = params.filter.state_content_filter().cloned();
 
         match membership_value.as_str() {
             "invite" => {
@@ -508,10 +627,17 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         let (timeline, state_events, summary) = handle
             .query(move |actor| {
                 let timeline = match resume {
-                    ResumeMode::Incremental(pos) => {
-                        build_incremental_timeline(actor, pos, timeline_limit)
-                    }
-                    ResumeMode::FreshRoom => build_fresh_timeline(actor, timeline_limit),
+                    ResumeMode::Incremental(pos) => build_incremental_timeline(
+                        actor,
+                        pos,
+                        timeline_limit,
+                        timeline_content_filter.as_ref(),
+                    ),
+                    ResumeMode::FreshRoom => build_fresh_timeline(
+                        actor,
+                        timeline_limit,
+                        timeline_content_filter.as_ref(),
+                    ),
                 };
                 let timeline_ids: HashSet<String> = timeline
                     .events
@@ -530,6 +656,7 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                         lazy,
                         &timeline_senders,
                         &user_id_owned,
+                        state_content_filter.as_ref(),
                     )?
                 } else {
                     build_state_section(
@@ -538,6 +665,7 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                         lazy,
                         &timeline_senders,
                         &user_id_owned,
+                        state_content_filter.as_ref(),
                     )?
                 };
                 let summary = build_room_summary(actor, &user_id_owned)?;
@@ -566,10 +694,16 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             }
         }
 
-        // Only a joined room can have typing activity (`typing_by_room` above is only ever
+        // Only a joined room can have typing or receipt activity (both maps above are only ever
         // populated for `membership == "join"` rows), so a leave/ban room correctly never has an
         // entry here.
-        let ephemeral_events = typing_by_room.get(room_id).cloned().unwrap_or_default();
+        let mut ephemeral_events = typing_by_room.get(room_id).cloned().unwrap_or_default();
+        if let Some(content) = receipts_by_room.get(room_id) {
+            ephemeral_events.push(json!({
+                "type": "m.receipt",
+                "content": content,
+            }));
+        }
 
         let nothing_changed = timeline.events.is_empty()
             && account_data_json.is_empty()
@@ -784,7 +918,7 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         typing_seq: new_typing_seq,
         presence_seq: new_presence_seq,
         push_rules_seq: new_push_rules_seq,
-        ..baseline
+        receipts_seq: new_receipts_seq,
     };
 
     let mut rooms = serde_json::Map::new();
@@ -891,6 +1025,9 @@ async fn has_new_data<B: KvBackend + 'static, R: RoomSource<B>>(
         if m.membership == "join" {
             let (_, typing_seq) = hub.typing_users(&m.room_id).await;
             if typing_seq > baseline.typing_seq {
+                return Ok(true);
+            }
+            if hub.receipts_seq(&m.room_id).await > baseline.receipts_seq {
                 return Ok(true);
             }
         }
@@ -1282,6 +1419,192 @@ mod tests {
         assert!(!join.contains_key(room_b.as_str()));
     }
 
+    /// `room.timeline.types` on a *fresh* room (an initial sync, exercising
+    /// `build_fresh_timeline`'s filtered branch): a non-matching event is excluded from the
+    /// timeline while a matching one still appears.
+    #[tokio::test]
+    async fn initial_sync_timeline_type_filter_excludes_non_matching_events() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(alice.clone(), CreateRoomRequest::default(), 1)
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+        handle
+            .send_event(
+                alice.clone(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"body": "a message"}),
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        handle
+            .send_event(
+                alice.clone(),
+                "m.reaction".to_owned(),
+                None,
+                serde_json::json!({"key": "x"}),
+                None,
+                3,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let mut p = params(None);
+        p.filter = serde_json::from_value(serde_json::json!({
+            "room": {"timeline": {"types": ["m.room.message"]}}
+        }))
+        .unwrap();
+        let (response, _) = build(&hub, &e2e, &alice, p).await.unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        let events = response["rooms"]["join"][room_id.as_str()]["timeline"]["events"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            events.iter().any(|e| e["type"] == "m.room.message"),
+            "the matching event must still appear: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e["type"] == "m.reaction"),
+            "m.reaction should have been filtered out of the timeline: {events:?}"
+        );
+    }
+
+    /// The same filter on an *incremental* sync (`build_incremental_timeline`'s filtered branch).
+    #[tokio::test]
+    async fn incremental_sync_timeline_type_filter_excludes_non_matching_events() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(alice.clone(), CreateRoomRequest::default(), 1)
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+        handle
+            .send_event(
+                alice.clone(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"body": "seed"}),
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (_first, token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+        // Without a recorded device cursor, the two sends below coalesce into the room's
+        // still-unconsumed feed entry from the seed message (`crate::store`'s own module docs,
+        // "coalescing") instead of creating a fresh entry past `token.feed_seq` -- same reason
+        // `a_message_sent_after_a_token_was_issued_appears_in_the_next_incremental_sync` (above)
+        // does this.
+        hub.store()
+            .record_device_cursor(&alice, "DEV1".into(), token.feed_seq)
+            .await
+            .unwrap();
+
+        handle
+            .send_event(
+                alice.clone(),
+                "m.reaction".to_owned(),
+                None,
+                serde_json::json!({"key": "x"}),
+                None,
+                3,
+            )
+            .await
+            .unwrap();
+        handle
+            .send_event(
+                alice.clone(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"body": "second"}),
+                None,
+                4,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let mut p = params(Some(token));
+        p.filter = serde_json::from_value(serde_json::json!({
+            "room": {"timeline": {"types": ["m.room.message"]}}
+        }))
+        .unwrap();
+        let (response, _) = build(&hub, &e2e, &alice, p).await.unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        let events = response["rooms"]["join"][room_id.as_str()]["timeline"]["events"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            events.iter().any(|e| e["content"]["body"] == "second"),
+            "the matching event must still appear: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e["type"] == "m.reaction"),
+            "m.reaction should have been filtered out of the timeline: {events:?}"
+        );
+    }
+
+    /// `room.state.not_types` excludes a matching state event from the `state` section while
+    /// leaving other state (`m.room.create`) present.
+    #[tokio::test]
+    async fn state_not_types_filter_excludes_a_matching_state_event() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(alice.clone(), CreateRoomRequest::default(), 1)
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+        handle
+            .send_event(
+                alice.clone(),
+                "m.room.topic".to_owned(),
+                Some(String::new()),
+                serde_json::json!({"topic": "hello"}),
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let mut p = params(None);
+        p.filter = serde_json::from_value(serde_json::json!({
+            "room": {"state": {"not_types": ["m.room.topic"]}}
+        }))
+        .unwrap();
+        let (response, _) = build(&hub, &e2e, &alice, p).await.unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        let state = response["rooms"]["join"][room_id.as_str()]["state"]["events"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !state.iter().any(|e| e["type"] == "m.room.topic"),
+            "m.room.topic should have been filtered out of state: {state:?}"
+        );
+        assert!(
+            state.iter().any(|e| e["type"] == "m.room.create"),
+            "m.room.create should still be present: {state:?}"
+        );
+    }
+
     /// `docs/rfcs/0013-e2ee-sync-extensions.md`'s acceptance test, in miniature: a to-device
     /// message must survive a retried sync that presents the *same* `since` token (the response
     /// carrying it may never have reached the client), and must be gone once the client presents
@@ -1526,6 +1849,85 @@ mod tests {
         assert!(
             left.contains(&bob.as_str()),
             "bob left the only room he shared with alice and should be reported: {response}"
+        );
+    }
+
+    /// A read receipt appears in the *next* sync's `ephemeral.events` as `m.receipt`, wakes a
+    /// blocked long poll immediately (`SessionHub::set_receipt`, same wake shape as typing), and
+    /// does not resurface once already delivered with nothing further changed.
+    #[tokio::test]
+    async fn a_receipt_wakes_a_long_poll_and_appears_as_m_receipt() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+
+        let handle = hub
+            .rooms()
+            .create_room(alice.clone(), CreateRoomRequest::default(), 1)
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+        handle
+            .send_event(
+                alice.clone(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"body": "seed"}),
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (_baseline, baseline_token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+
+        let hub2 = hub.clone();
+        let room_id2 = room_id.clone();
+        let alice2 = alice.clone();
+        let setter = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            hub2.set_receipt(
+                &room_id2,
+                &alice2,
+                crate::receipts::ReceiptKind::Read,
+                ruma::event_id!("$one").to_owned(),
+                123,
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut p = params(Some(baseline_token));
+        p.timeout = Duration::from_secs(5);
+        let started = std::time::Instant::now();
+        let (response, next_token) = build(&hub, &e2e, &alice, p).await.unwrap();
+        setter.await.unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the long poll should have been woken well before its 5s timeout, took {:?}",
+            started.elapsed()
+        );
+        let ephemeral = response["rooms"]["join"][room_id.as_str()]["ephemeral"]["events"]
+            .as_array()
+            .unwrap_or_else(|| panic!("room should be present with ephemeral events: {response}"));
+        assert!(
+            ephemeral.iter().any(|e| e["type"] == "m.receipt"
+                && e["content"]["$one"]["m.read"]["@alice:sync.test"]["ts"] == 123),
+            "expected an m.receipt event naming alice's read receipt on $one: {ephemeral:?}"
+        );
+        assert!(next_token.receipts_seq > 0);
+
+        // A second sync from the new token, with nothing further changed, must not repeat it.
+        let (again, _) = build(&hub, &e2e, &alice, params(Some(next_token)))
+            .await
+            .unwrap();
+        let room_again = &again["rooms"]["join"][room_id.as_str()];
+        assert!(
+            room_again.is_null(),
+            "an already-delivered receipt must not resurface with nothing else changed: {again}"
         );
     }
 

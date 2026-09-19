@@ -10,12 +10,19 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use matrix_sdk::config::SyncSettings;
-use matrix_sdk::room::MessagesOptions;
+use matrix_sdk::room::{MessagesOptions, Receipts};
 use matrix_sdk::ruma::OwnedRoomId;
 use matrix_sdk::ruma::api::client::account::register::v3::Request as RegisterRequest;
+use matrix_sdk::ruma::api::client::filter::{
+    FilterDefinition, RoomEventFilter, RoomFilter, create_filter, get_filter,
+};
+use matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType;
 use matrix_sdk::ruma::api::client::room::create_room::v3::Request as CreateRoomRequest;
+use matrix_sdk::ruma::api::client::sync::sync_events::v3::Filter as SyncFilterKind;
 use matrix_sdk::ruma::api::client::uiaa;
+use matrix_sdk::ruma::events::receipt::ReceiptThread;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+use matrix_sdk::ruma::uint;
 use matrix_sdk::sync::SyncResponse;
 use matrix_sdk::{Client, RoomMemberships};
 
@@ -208,6 +215,9 @@ pub async fn run(base_url: &str) -> Result<Vec<String>> {
         "alice sent {} ({alice_message:?})",
         alice_send.response.event_id
     );
+    // Kept for the receipts step, below: a stable, already-visible-to-both-clients event id to
+    // put a read receipt and a fully-read marker on.
+    let alice_message_event_id = alice_send.response.event_id.clone();
 
     let bob_message = "hi alice, bob here";
     let bob_send = bob_room
@@ -516,7 +526,168 @@ pub async fn run(base_url: &str) -> Result<Vec<String>> {
         }
     }
 
-    // 15. Log out.
+    // 15. Filters: `POST`/`GET /user/{userId}/filter` round-trip a filter definition, then
+    // `/sync?filter=<filter_id>` actually *honours* `room.timeline.limit` -- not merely accepts
+    // and ignores it, which this track's own brief calls out as its own bug
+    // (`hs_user::filter`'s module doc names exactly what this crate applies vs. only parses).
+    let mut timeline_filter = RoomEventFilter::default();
+    timeline_filter.limit = Some(uint!(1));
+    let mut filtered_room_filter = RoomFilter::default();
+    filtered_room_filter.timeline = timeline_filter;
+    let mut filter_def = FilterDefinition::default();
+    filter_def.room = filtered_room_filter;
+
+    let filter_id = alice
+        .send(create_filter::v3::Request::new(
+            alice_id.clone(),
+            filter_def,
+        ))
+        .await
+        .context("POST /user/{userId}/filter should succeed")?
+        .filter_id;
+    step!("alice uploaded a sync filter capping room.timeline.limit to 1, filter id {filter_id}");
+
+    let round_tripped = alice
+        .send(get_filter::v3::Request::new(
+            alice_id.clone(),
+            filter_id.clone(),
+        ))
+        .await
+        .context("GET /user/{userId}/filter/{filterId} should succeed")?
+        .filter;
+    if round_tripped.room.timeline.limit != Some(uint!(1)) {
+        bail!(
+            "GET /user/{{userId}}/filter/{{filterId}} did not round-trip the uploaded \
+             room.timeline.limit (this crate's own filter store/parsing -- a real regression)"
+        );
+    }
+    step!("the uploaded filter round-tripped through GET /user/{{userId}}/filter/{{filterId}}");
+
+    // Two more messages since alice's last sync token (`alice_sync_2`, minted in step 9), so
+    // there is more than the filter's `limit: 1` new timeline event for a single filtered sync
+    // response to actually have to cap.
+    room.send(RoomMessageEventContent::text_plain(
+        "filter test message one",
+    ))
+    .await
+    .context("alice sending filter test message one should succeed")?;
+    room.send(RoomMessageEventContent::text_plain(
+        "filter test message two",
+    ))
+    .await
+    .context("alice sending filter test message two should succeed")?;
+
+    let filtered_sync = alice
+        .sync_once(
+            SyncSettings::default()
+                .token(alice_sync_2.next_batch.clone())
+                .filter(SyncFilterKind::FilterId(filter_id)),
+        )
+        .await
+        .context("alice's filtered incremental /sync should succeed")?;
+    let filtered_room = filtered_sync
+        .rooms
+        .joined
+        .get(&room_id)
+        .context("alice's filtered sync should still include the room")?;
+    if filtered_room.timeline.events.len() > 1 {
+        bail!(
+            "room.timeline.limit: 1 was not honoured: got {} timeline events in one filtered \
+             sync response",
+            filtered_room.timeline.events.len()
+        );
+    }
+    if !filtered_room.timeline.limited {
+        bail!(
+            "expected `limited: true` once more events exist than the filter's limit allows, \
+             but the filtered sync reported limited=false"
+        );
+    }
+    step!(
+        "a sync filter's room.timeline.limit was honoured: {} event(s) returned, limited=true",
+        filtered_room.timeline.events.len()
+    );
+
+    // 16. Read receipts and the fully-read marker. Bob posts a public `m.read` receipt on
+    // alice's very first message (`POST /rooms/{roomId}/receipt/m.read/{eventId}`); alice's next
+    // bounded-wait `/sync` (the same `MustSyncUntil` shape steps 12/13 already use) must see it
+    // as an `m.receipt` ephemeral event naming both bob and that event id. This is this track's
+    // own new work this session (`hs_user::routes::receipts`,
+    // `hs_user::hub::SessionHub::set_receipt`) -- a hard failure here is a real regression, not a
+    // documented cross-track gap.
+    bob_room
+        .send_single_receipt(
+            ReceiptType::Read,
+            ReceiptThread::Unthreaded,
+            alice_message_event_id.clone(),
+        )
+        .await
+        .context("bob sending a public read receipt should succeed")?;
+    let (saw_receipt, _) = sync_until(
+        &alice,
+        filtered_sync.next_batch.clone(),
+        Duration::from_secs(10),
+        |response| {
+            response.rooms.joined.get(&room_id).is_some_and(|joined| {
+                joined.ephemeral.iter().any(|raw| {
+                    json_type_and_body(raw.json().get())
+                        .map(|(ty, body)| {
+                            ty == "m.receipt"
+                                && body.contains(bob_id.as_str())
+                                && body.contains(alice_message_event_id.as_str())
+                        })
+                        .unwrap_or(false)
+                })
+            })
+        },
+    )
+    .await
+    .context("alice's bounded-wait /sync for bob's read receipt should succeed")?;
+    if !saw_receipt {
+        bail!(
+            "alice's /sync never saw bob's m.read receipt on {alice_message_event_id} within \
+             the bounded wait (this crate's own code -- not a documented cross-track gap)"
+        );
+    }
+    step!("alice's /sync saw bob's public read receipt on {alice_message_event_id}");
+
+    // The fully-read marker (`POST /rooms/{roomId}/read_markers`'s `m.fully_read` field) is
+    // private room account data, not an ephemeral event -- checked via a fresh, un-tokened sync
+    // for bob himself (current data, no wake-latency race to account for; the wake path itself
+    // is already covered by the read-receipt check just above and by
+    // `hs_user::sync::tests::a_receipt_wakes_a_long_poll_and_appears_as_m_receipt`).
+    bob_room
+        .send_multiple_receipts(
+            Receipts::new().fully_read_marker(Some(alice_message_event_id.clone())),
+        )
+        .await
+        .context("bob setting the fully-read marker via POST .../read_markers should succeed")?;
+    let bob_fresh_sync = bob
+        .sync_once(SyncSettings::default())
+        .await
+        .context("bob's fresh /sync after setting the fully-read marker should succeed")?;
+    let bob_saw_fully_read = bob_fresh_sync
+        .rooms
+        .joined
+        .get(&room_id)
+        .is_some_and(|joined| {
+            joined.account_data.iter().any(|raw| {
+                json_type_and_body(raw.json().get())
+                    .map(|(ty, body)| {
+                        ty == "m.fully_read" && body.contains(alice_message_event_id.as_str())
+                    })
+                    .unwrap_or(false)
+            })
+        });
+    if !bob_saw_fully_read {
+        bail!(
+            "bob's own /sync never reported his m.fully_read marker on {alice_message_event_id} \
+             as room account data"
+        );
+    }
+    step!("bob's /sync reported his own m.fully_read marker on {alice_message_event_id}");
+
+    // 17. Log out.
     alice
         .matrix_auth()
         .logout()

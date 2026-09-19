@@ -16,6 +16,13 @@
 //! - `room.timeline.rooms` / `room.timeline.not_rooms`: same restriction, scoped to the timeline
 //!   section specifically (applied identically to the top-level `room.rooms`/`not_rooms` --  this
 //!   crate does not yet support timeline and state having *different* room sets, see below).
+//! - `room.timeline.types` / `not_types` / `senders` / `not_senders`: content-based filtering of
+//!   which timeline events a room's response carries, applied via [`RoomEventFilter::matches`].
+//!   See [`crate::sync::build_incremental_timeline`]/`build_fresh_timeline`'s doc comments for the
+//!   bounded-scan simplification this implies once a content filter is present (a filter that
+//!   excludes nearly everything cannot turn one `/sync` call into an unbounded history scan).
+//! - `room.state.types` / `not_types` / `senders` / `not_senders`: the equivalent content filter
+//!   for the `state` section.
 //! - `room.state.lazy_load_members`: when true, a room's `state` section includes only the
 //!   senders of events already in the returned `timeline`, plus (always) the requesting user's
 //!   own membership event -- the spec's minimum lazy-loading contract.
@@ -28,15 +35,14 @@
 //! - `event_fields`, `event_format`: no field-pruning or federation-format rendering is
 //!   implemented; every event is always rendered in full client format
 //!   (`hs_room::routes::render::client_event_json`).
-//! - `presence`, `account_data` (top-level, i.e. the *global* account-data filter): presence is
-//!   not implemented in this crate at all yet (`crate::sync`'s `presence` field is always empty),
-//!   and global account data is always returned in full, unfiltered.
-//! - `room.account_data`, `room.ephemeral`: room-scoped account data is always returned in full;
-//!   ephemeral events (typing, receipts) are not implemented in this pass (`crate::sync`'s
-//!   `ephemeral` field is always empty) -- see `docs/status/05-sync.md`.
-//! - `room.timeline.types` / `not_types` / `senders` / `not_senders`, and the equivalent fields on
-//!   `room.state`: content-based event filtering within a room is not applied; every event type
-//!   from every sender passes through subject only to the `limit` and room-set filters above.
+//! - `presence`, `account_data` (top-level, i.e. the *global* account-data filter): global account
+//!   data is always returned in full, unfiltered; the top-level `presence` filter is unused since
+//!   `presence.events` is always built from shared-room scope, not filtered further.
+//! - `room.account_data`, `room.ephemeral`: room-scoped account data and ephemeral events
+//!   (`m.typing`, `m.receipt`) are always returned in full, not content-filtered -- both are
+//!   already small, bounded sets (one typing/receipt snapshot per room, not a history), so this
+//!   crate does not apply `EventFilter`/`RoomEventFilter`'s `types`/`senders` restrictions to
+//!   them.
 //! - `room.state.include_redundant_members`: lazy loading here always includes only the minimal
 //!   set (never redundant members), so this flag has no effect either way.
 //!
@@ -94,6 +100,62 @@ pub struct RoomEventFilter {
     /// Whether to include events with a relation to another event that the filter would
     /// otherwise exclude. Parsed, not applied.
     pub unread_thread_notifications: Option<bool>,
+}
+
+/// Whether `pattern` (one entry of a `types`/`not_types` list) matches `event_type`. The spec
+/// allows a trailing `*` wildcard (e.g. `"m.room.*"`); anything else is an exact match.
+fn type_pattern_matches(pattern: &str, event_type: &str) -> bool {
+    pattern
+        .strip_suffix('*')
+        .map_or(pattern == event_type, |prefix| {
+            event_type.starts_with(prefix)
+        })
+}
+
+impl RoomEventFilter {
+    /// Whether this filter has no content restriction at all (`types`/`not_types`/`senders`/
+    /// `not_senders` all absent) -- used by `crate::sync` to take its unfiltered, single-`paginate`-call
+    /// fast path for the overwhelmingly common case of a filter that only sets `limit` or
+    /// `lazy_load_members`.
+    #[must_use]
+    pub fn is_content_noop(&self) -> bool {
+        self.types.is_none()
+            && self.not_types.is_none()
+            && self.senders.is_none()
+            && self.not_senders.is_none()
+    }
+
+    /// Whether an event of `event_type` from `sender` passes this filter's `types`/`not_types`/
+    /// `senders`/`not_senders`. `not_types`/`not_senders` are checked first and win outright (an
+    /// event excluded by either can never be let back in by `types`/`senders`), matching the
+    /// spec's own denylist-wins-over-allowlist framing (the same precedence
+    /// [`SyncFilter::room_allowed`] already uses for `not_rooms`).
+    #[must_use]
+    pub fn matches(&self, event_type: &str, sender: &str) -> bool {
+        if let Some(not_types) = &self.not_types
+            && not_types
+                .iter()
+                .any(|t| type_pattern_matches(t, event_type))
+        {
+            return false;
+        }
+        if let Some(not_senders) = &self.not_senders
+            && not_senders.iter().any(|s| s == sender)
+        {
+            return false;
+        }
+        if let Some(types) = &self.types
+            && !types.iter().any(|t| type_pattern_matches(t, event_type))
+        {
+            return false;
+        }
+        if let Some(senders) = &self.senders
+            && !senders.iter().any(|s| s == sender)
+        {
+            return false;
+        }
+        true
+    }
 }
 
 /// The `room` section of a filter.
@@ -207,6 +269,28 @@ impl SyncFilter {
             .and_then(|r| r.include_leave)
             .unwrap_or(false)
     }
+
+    /// `room.timeline`'s content filter (`types`/`not_types`/`senders`/`not_senders`), if this
+    /// filter sets one. `None` (not merely a no-op [`RoomEventFilter`]) whenever `room.timeline`
+    /// itself is absent, so a caller can cheaply skip the filtered code path entirely when there
+    /// is nothing to filter on.
+    #[must_use]
+    pub fn timeline_content_filter(&self) -> Option<&RoomEventFilter> {
+        self.room
+            .as_ref()
+            .and_then(|r| r.timeline.as_ref())
+            .filter(|t| !t.is_content_noop())
+    }
+
+    /// `room.state`'s content filter, the equivalent of [`SyncFilter::timeline_content_filter`]
+    /// for the `state` section.
+    #[must_use]
+    pub fn state_content_filter(&self) -> Option<&RoomEventFilter> {
+        self.room
+            .as_ref()
+            .and_then(|r| r.state.as_ref())
+            .filter(|s| !s.is_content_noop())
+    }
 }
 
 /// Resolves `/sync`'s `filter` query parameter: absent means [`SyncFilter::none`]; a string that
@@ -267,18 +351,12 @@ fn log_ignored_fields(filter: &SyncFilter) {
         if room.account_data.is_some() {
             ignored.push("room.account_data");
         }
-        if room.timeline.as_ref().is_some_and(|t| {
-            t.types.is_some()
-                || t.not_types.is_some()
-                || t.senders.is_some()
-                || t.not_senders.is_some()
-        }) {
-            ignored.push("room.timeline.{types,not_types,senders,not_senders}");
-        }
-        if room.state.as_ref().is_some_and(|s| {
-            s.types.is_some() || s.not_types.is_some() || s.include_redundant_members.is_some()
-        }) {
-            ignored.push("room.state.{types,not_types,include_redundant_members}");
+        if room
+            .state
+            .as_ref()
+            .is_some_and(|s| s.include_redundant_members.is_some())
+        {
+            ignored.push("room.state.include_redundant_members");
         }
     }
     if !ignored.is_empty() {
@@ -289,6 +367,81 @@ fn log_ignored_fields(filter: &SyncFilter) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn room_event_filter_types_is_an_allowlist_with_wildcard_support() {
+        let f: RoomEventFilter = serde_json::from_value(serde_json::json!({
+            "types": ["m.room.message", "m.room.*"]
+        }))
+        .unwrap();
+        assert!(!f.is_content_noop());
+        assert!(f.matches("m.room.message", "@alice:example.org"));
+        assert!(f.matches("m.room.topic", "@alice:example.org"));
+        assert!(!f.matches("m.reaction", "@alice:example.org"));
+    }
+
+    #[test]
+    fn room_event_filter_not_types_wins_over_types() {
+        let f: RoomEventFilter = serde_json::from_value(serde_json::json!({
+            "types": ["m.room.*"],
+            "not_types": ["m.room.message"]
+        }))
+        .unwrap();
+        assert!(!f.matches("m.room.message", "@alice:example.org"));
+        assert!(f.matches("m.room.topic", "@alice:example.org"));
+    }
+
+    #[test]
+    fn room_event_filter_senders_and_not_senders() {
+        let f: RoomEventFilter = serde_json::from_value(serde_json::json!({
+            "senders": ["@alice:example.org", "@bob:example.org"],
+            "not_senders": ["@bob:example.org"]
+        }))
+        .unwrap();
+        assert!(f.matches("m.room.message", "@alice:example.org"));
+        assert!(
+            !f.matches("m.room.message", "@bob:example.org"),
+            "not_senders must win over senders"
+        );
+        assert!(!f.matches("m.room.message", "@carol:example.org"));
+    }
+
+    #[test]
+    fn empty_room_event_filter_is_a_content_noop_and_matches_everything() {
+        let f = RoomEventFilter::default();
+        assert!(f.is_content_noop());
+        assert!(f.matches("anything", "@anyone:example.org"));
+    }
+
+    #[test]
+    fn timeline_and_state_content_filters_are_none_when_absent_or_a_noop() {
+        let f = SyncFilter::none();
+        assert!(f.timeline_content_filter().is_none());
+        assert!(f.state_content_filter().is_none());
+
+        let f: SyncFilter = serde_json::from_value(serde_json::json!({
+            "room": {"timeline": {"limit": 5}, "state": {"lazy_load_members": true}}
+        }))
+        .unwrap();
+        assert!(
+            f.timeline_content_filter().is_none(),
+            "limit alone is not a content filter"
+        );
+        assert!(
+            f.state_content_filter().is_none(),
+            "lazy_load_members alone is not a content filter"
+        );
+
+        let f: SyncFilter = serde_json::from_value(serde_json::json!({
+            "room": {
+                "timeline": {"types": ["m.room.message"]},
+                "state": {"not_types": ["m.room.member"]}
+            }
+        }))
+        .unwrap();
+        assert!(f.timeline_content_filter().is_some());
+        assert!(f.state_content_filter().is_some());
+    }
 
     #[test]
     fn empty_filter_allows_every_room_and_uses_the_default_limit() {

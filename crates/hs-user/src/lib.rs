@@ -18,6 +18,7 @@
 //! - [`filter`]: `/sync`'s `filter`/`filter_id` parsing (`crate::filter::SyncFilter`).
 //! - [`typing`]: [`typing::TypingRegistry`], in-memory `m.typing` state.
 //! - [`presence`]: [`presence::PresenceRegistry`], in-memory `m.presence` state.
+//! - [`receipts`]: [`receipts::ReceiptRegistry`], in-memory `m.receipt` state.
 //! - [`sync`]: `/sync` v2's response construction, full and incremental.
 //! - [`routes`]: the client-server HTTP endpoints (`/sync`, `/joined_rooms`, `/publicRooms`,
 //!   account data), as a router fragment (`routes::router`), following the same shape
@@ -34,6 +35,7 @@ pub mod error;
 pub mod filter;
 pub mod hub;
 pub mod presence;
+pub mod receipts;
 pub mod room_source;
 pub mod routes;
 pub mod state;
