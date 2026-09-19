@@ -20,7 +20,11 @@ pub async fn get_joined_rooms<B: KvBackend + 'static, R: RoomSource<B> + 'static
     State(state): State<UserState<B, R>>,
     UserRequester(requester): UserRequester,
 ) -> Result<Response, UserError> {
-    let memberships = state.hub.store().list_memberships(&requester.user_id).await?;
+    let memberships = state
+        .hub
+        .store()
+        .list_memberships(&requester.user_id)
+        .await?;
     let joined: Vec<String> = memberships
         .into_iter()
         .filter(|m| m.membership == "join")
@@ -64,16 +68,23 @@ pub struct PublicRoomsFilter {
     pub generic_search_term: Option<String>,
 }
 
-fn render_chunk(entries: Vec<crate::store::PublicRoomEntry>, search: Option<&str>) -> Vec<serde_json::Value> {
+fn render_chunk(
+    entries: Vec<crate::store::PublicRoomEntry>,
+    search: Option<&str>,
+) -> Vec<serde_json::Value> {
     entries
         .into_iter()
         .filter(|e| {
             let Some(term) = search else { return true };
             let term = term.to_ascii_lowercase();
-            [e.name.as_deref(), e.topic.as_deref(), e.canonical_alias.as_deref()]
-                .into_iter()
-                .flatten()
-                .any(|s| s.to_ascii_lowercase().contains(&term))
+            [
+                e.name.as_deref(),
+                e.topic.as_deref(),
+                e.canonical_alias.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|s| s.to_ascii_lowercase().contains(&term))
         })
         .map(|e| {
             json!({

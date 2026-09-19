@@ -154,11 +154,10 @@ impl SyncFilter {
             .rooms
             .as_deref()
             .or_else(|| room.timeline.as_ref().and_then(|t| t.rooms.as_deref()));
-        let deny = room.not_rooms.as_deref().or_else(|| {
-            room.timeline
-                .as_ref()
-                .and_then(|t| t.not_rooms.as_deref())
-        });
+        let deny = room
+            .not_rooms
+            .as_deref()
+            .or_else(|| room.timeline.as_ref().and_then(|t| t.not_rooms.as_deref()));
         (allow, deny)
     }
 
@@ -268,18 +267,17 @@ fn log_ignored_fields(filter: &SyncFilter) {
         if room.account_data.is_some() {
             ignored.push("room.account_data");
         }
-        if room
-            .timeline
-            .as_ref()
-            .is_some_and(|t| t.types.is_some() || t.not_types.is_some() || t.senders.is_some() || t.not_senders.is_some())
-        {
+        if room.timeline.as_ref().is_some_and(|t| {
+            t.types.is_some()
+                || t.not_types.is_some()
+                || t.senders.is_some()
+                || t.not_senders.is_some()
+        }) {
             ignored.push("room.timeline.{types,not_types,senders,not_senders}");
         }
-        if room
-            .state
-            .as_ref()
-            .is_some_and(|s| s.types.is_some() || s.not_types.is_some() || s.include_redundant_members.is_some())
-        {
+        if room.state.as_ref().is_some_and(|s| {
+            s.types.is_some() || s.not_types.is_some() || s.include_redundant_members.is_some()
+        }) {
             ignored.push("room.state.{types,not_types,include_redundant_members}");
         }
     }
@@ -335,7 +333,10 @@ mod tests {
             "room": {"some_future_msc_field": true},
             "another_unknown_top_level_field": 42
         }));
-        assert!(f.is_ok(), "an unrecognized filter field must not be rejected");
+        assert!(
+            f.is_ok(),
+            "an unrecognized filter field must not be rejected"
+        );
     }
 
     #[tokio::test]

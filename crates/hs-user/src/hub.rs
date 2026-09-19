@@ -85,9 +85,10 @@ fn public_directory_entry<B: KvBackend>(
     if field("m.room.join_rules", "join_rule")?.as_deref() != Some("public") {
         return Ok(None);
     }
-    let world_readable =
-        field("m.room.history_visibility", "history_visibility")?.as_deref() == Some("world_readable");
-    let guest_can_join = field("m.room.guest_access", "guest_access")?.as_deref() == Some("can_join");
+    let world_readable = field("m.room.history_visibility", "history_visibility")?.as_deref()
+        == Some("world_readable");
+    let guest_can_join =
+        field("m.room.guest_access", "guest_access")?.as_deref() == Some("can_join");
     Ok(Some(crate::store::PublicRoomEntry {
         room_id: actor.room_id().to_owned(),
         name: field("m.room.name", "name")?,
@@ -328,7 +329,9 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     /// Returns [`UserError`] if the room could not be loaded.
     pub async fn room_member_count(&self, room_id: &RoomId) -> Result<usize, UserError> {
         let handle = self.rooms.get_or_load(room_id).await?;
-        Ok(handle.query(|actor| actor.members().map(|m| m.len())).await?)
+        Ok(handle
+            .query(|actor| actor.members().map(|m| m.len()))
+            .await?)
     }
 }
 
@@ -350,16 +353,16 @@ mod tests {
     use ruma::user_id;
     use std::sync::Arc as StdArc;
 
-    fn hub(
-        threshold: usize,
-    ) -> (
-        StdArc<SessionHub<MemoryBackend, StdArc<hs_room::registry::RoomRegistry<MemoryBackend>>>>,
-        StdArc<hs_room::registry::RoomRegistry<MemoryBackend>>,
-    ) {
+    type TestRoomRegistry = StdArc<hs_room::registry::RoomRegistry<MemoryBackend>>;
+    type TestHub = StdArc<SessionHub<MemoryBackend, TestRoomRegistry>>;
+
+    fn hub(threshold: usize) -> (TestHub, TestRoomRegistry) {
         let rooms = registry("hub.test");
-        let store: DynUserStore =
-            StdArc::new(TablesUserStore::open(MemoryBackend::new()).unwrap());
-        (StdArc::new(SessionHub::new(store, rooms.clone(), threshold)), rooms)
+        let store: DynUserStore = StdArc::new(TablesUserStore::open(MemoryBackend::new()).unwrap());
+        (
+            StdArc::new(SessionHub::new(store, rooms.clone(), threshold)),
+            rooms,
+        )
     }
 
     #[tokio::test]
@@ -482,10 +485,18 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         let after = hub.store().latest_feed_seq(&alice).await.unwrap();
-        assert_eq!(before, after, "a hot room must not keep appending feed entries");
+        assert_eq!(
+            before, after,
+            "a hot room must not keep appending feed entries"
+        );
 
         let room_id = handle.query(|a| a.room_id().to_owned()).await;
-        let membership = hub.store().get_membership(&alice, &room_id).await.unwrap().unwrap();
+        let membership = hub
+            .store()
+            .get_membership(&alice, &room_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(membership.hot_room);
     }
 }

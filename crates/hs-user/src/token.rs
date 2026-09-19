@@ -237,7 +237,10 @@ mod tests {
 
     #[test]
     fn decode_rejects_missing_prefix() {
-        assert_eq!(SyncToken::decode("not_a_token"), Err(TokenError::MissingPrefix));
+        assert_eq!(
+            SyncToken::decode("not_a_token"),
+            Err(TokenError::MissingPrefix)
+        );
     }
 
     #[test]
@@ -262,7 +265,10 @@ mod tests {
         let mut buf = vec![7u8]; // not VERSION
         buf.extend_from_slice(&[0u8; 48]);
         let s = format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(buf));
-        assert_eq!(SyncToken::decode(&s), Err(TokenError::UnsupportedVersion(7)));
+        assert_eq!(
+            SyncToken::decode(&s),
+            Err(TokenError::UnsupportedVersion(7))
+        );
     }
 
     #[test]

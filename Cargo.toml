@@ -119,6 +119,15 @@ k8s-openapi = { version = "0.25", features = ["latest", "schemars"] }
 hickory-resolver = { version = "0.26", features = ["tokio"] }
 ipnet = "2"
 
+# Added by track 05 (sync): `matrix-rust-sdk` as the real-client driver for `hs-loadgen`'s
+# end-to-end scenario (named for this purpose in `docs/workstreams/14-test-and-conformance.md`).
+# Default features off: `e2e-encryption` (vodozemac) and `sqlite` (native sqlcipher bindings) pull
+# in a lot of build weight this scenario does not need (no encrypted rooms, no persistent store --
+# an in-memory client is fine for a scripted one-shot run), so only a TLS backend is kept (the
+# scenario talks to a local `http://` server, but `matrix-sdk` needs a backend selected to build
+# its HTTP client at all).
+matrix-sdk = { version = "0.19", default-features = false, features = ["rustls-aws-lc-rs"] }
+
 [profile.dev]
 opt-level = 0
 debug = 1

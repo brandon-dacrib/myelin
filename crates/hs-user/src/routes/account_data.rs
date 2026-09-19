@@ -10,7 +10,10 @@ use crate::error::UserError;
 use crate::room_source::RoomSource;
 use crate::state::{UserRequester, UserState};
 
-fn require_self(requester: &hs_auth::requester::Requester, path_user_id: &str) -> Result<(), UserError> {
+fn require_self(
+    requester: &hs_auth::requester::Requester,
+    path_user_id: &str,
+) -> Result<(), UserError> {
     if requester.user_id.as_str() != path_user_id {
         return Err(UserError::NotSelf(
             "cannot access another user's account data".to_owned(),

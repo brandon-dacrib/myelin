@@ -54,9 +54,12 @@ pub fn client_event_json(event: &Event) -> serde_json::Value {
 #[must_use]
 pub fn client_event_json_bundled(event: &Event, bundle: &Bundle) -> serde_json::Value {
     let mut value = client_event_json(event);
-    let is_empty = bundle.replace.is_none() && bundle.annotation.is_none() && bundle.thread.is_none();
+    let is_empty =
+        bundle.replace.is_none() && bundle.annotation.is_none() && bundle.thread.is_none();
     if !is_empty
-        && let Some(unsigned) = value.get_mut("unsigned").and_then(serde_json::Value::as_object_mut)
+        && let Some(unsigned) = value
+            .get_mut("unsigned")
+            .and_then(serde_json::Value::as_object_mut)
         && let Ok(bundle_json) = serde_json::to_value(bundle)
     {
         unsigned.insert("m.relations".to_owned(), bundle_json);

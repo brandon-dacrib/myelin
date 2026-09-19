@@ -431,7 +431,10 @@ impl<B: KvBackend> RoomActor<B> {
     /// [`hs_state::api::StateStore::current_state`]'s documented behavior); with more than one it
     /// is the genuine fork-resolution case -- see this module's doc comment on
     /// `RoomActor::forward_extremities`.
-    fn state_view(&self, prev_sns: &[EventSn]) -> Result<RoomStateView<'_, ProductionStateStore<B>>, RoomError> {
+    fn state_view(
+        &self,
+        prev_sns: &[EventSn],
+    ) -> Result<RoomStateView<'_, ProductionStateStore<B>>, RoomError> {
         let root = if prev_sns.is_empty() {
             self.store.empty_root()
         } else {
@@ -455,9 +458,10 @@ impl<B: KvBackend> RoomActor<B> {
     fn refs_for(&self, sns: &[EventSn]) -> Result<Vec<pipeline::EventRef>, RoomError> {
         sns.iter()
             .map(|sn| {
-                let event = self.events.get(sn).ok_or_else(|| {
-                    RoomError::Internal("cited event not in hot cache".into())
-                })?;
+                let event = self
+                    .events
+                    .get(sn)
+                    .ok_or_else(|| RoomError::Internal("cited event not in hot cache".into()))?;
                 pipeline::event_ref(event, &self.rules)
             })
             .collect()
@@ -481,7 +485,9 @@ impl<B: KvBackend> RoomActor<B> {
         now_ms: i64,
     ) -> Result<Event, RoomError> {
         let prev_sns = self.forward_extremities_vec();
-        self.send_event_citing(sender, event_type, state_key, content, redacts, now_ms, &prev_sns)
+        self.send_event_citing(
+            sender, event_type, state_key, content, redacts, now_ms, &prev_sns,
+        )
     }
 
     /// Builds, hashes, signs, authorizes and persists a new event citing exactly `prev_events` as
@@ -501,6 +507,13 @@ impl<B: KvBackend> RoomActor<B> {
     ///
     /// # Errors
     /// See `crate::pipeline::build_and_authorize` and [`RoomActor::persist`].
+    // `sender`/`event_type`/`state_key`/`content`/`redacts` mirror `pipeline::NewEvent`'s fields
+    // one-for-one (this is the only caller-facing spot that still takes them unbundled); bundling
+    // them into a `NewEvent` here would change this public method's signature, and `hs-federation`
+    // (`crates/hs-federation/src/{join,inbound}.rs`) calls it directly -- out of scope for this
+    // track to edit, so the lint is silenced here rather than risking a signature change that
+    // crate never asked for.
+    #[allow(clippy::too_many_arguments)]
     pub fn send_event_citing(
         &mut self,
         sender: OwnedUserId,
@@ -1030,7 +1043,11 @@ impl<B: KvBackend> RoomActor<B> {
     ///
     /// # Errors
     /// Returns [`RoomError::State`] if the state store fails.
-    pub fn state_event(&self, event_type: &str, state_key: &str) -> Result<Option<&Event>, RoomError> {
+    pub fn state_event(
+        &self,
+        event_type: &str,
+        state_key: &str,
+    ) -> Result<Option<&Event>, RoomError> {
         self.current_view()?
             .event_for(event_type, state_key)
             .map_err(|e| RoomError::State(e.to_string()))
@@ -1349,7 +1366,9 @@ impl<B: KvBackend> RoomActor<B> {
         device_id: Option<&ruma::DeviceId>,
         txn_id: &str,
     ) -> Option<&Event> {
-        let event_id = self.txn_dedup.get(&Self::dedup_key(sender, device_id, txn_id))?;
+        let event_id = self
+            .txn_dedup
+            .get(&Self::dedup_key(sender, device_id, txn_id))?;
         self.event_by_id(event_id)
     }
 
@@ -1830,8 +1849,11 @@ mod tests {
         // access) is unchanged and must appear in both sets identically -- proving this is a real
         // historical reconstruction (a targeted swap of one entry), not current state relabeled
         // or a coincidentally-similar recomputation.
-        let ids_at_first: BTreeSet<OwnedEventId> =
-            at_first.state.iter().map(|e| e.event_id().to_owned()).collect();
+        let ids_at_first: BTreeSet<OwnedEventId> = at_first
+            .state
+            .iter()
+            .map(|e| e.event_id().to_owned())
+            .collect();
         let ids_current: BTreeSet<OwnedEventId> =
             current.iter().map(|e| e.event_id().to_owned()).collect();
         let only_in_first: Vec<_> = ids_at_first.difference(&ids_current).collect();
@@ -2123,9 +2145,10 @@ mod tests {
         );
 
         // After the merge, the room has exactly one forward extremity again (the fork converged).
-        assert_eq!(actor.forward_extremities_vec(), vec![
-            *actor.event_id_index.get(merge.event_id()).unwrap()
-        ]);
+        assert_eq!(
+            actor.forward_extremities_vec(),
+            vec![*actor.event_id_index.get(merge.event_id()).unwrap()]
+        );
 
         // The resolved power-levels state is exactly one of the two branches' content (state
         // resolution picked a winner, not a merge of the two, per the spec's "resolve, don't
@@ -2152,7 +2175,8 @@ mod tests {
             "resolved ban level must be exactly one of the two conflicting branches' values, got {resolved_ban:?}"
         );
         assert!(
-            resolved.event_id() == branch_a.event_id() || resolved.event_id() == branch_b.event_id(),
+            resolved.event_id() == branch_a.event_id()
+                || resolved.event_id() == branch_b.event_id(),
             "the resolved power_levels event must be one of the two genuine fork candidates"
         );
     }
@@ -2186,7 +2210,10 @@ mod tests {
             .unwrap();
         assert_eq!(first.event_id(), retried.event_id());
         assert_eq!(
-            actor.paginate(None, Direction::Backward, usize::MAX).0.len(),
+            actor
+                .paginate(None, Direction::Backward, usize::MAX)
+                .0
+                .len(),
             actor
                 .paginate(None, Direction::Backward, usize::MAX)
                 .0
@@ -2198,7 +2225,14 @@ mod tests {
         );
 
         let redact_first = actor
-            .redact_txn(alice.clone(), None, "txn-2", first.event_id().to_owned(), None, 4)
+            .redact_txn(
+                alice.clone(),
+                None,
+                "txn-2",
+                first.event_id().to_owned(),
+                None,
+                4,
+            )
             .unwrap();
         let redact_retried = actor
             .redact_txn(alice, None, "txn-2", first.event_id().to_owned(), None, 5)

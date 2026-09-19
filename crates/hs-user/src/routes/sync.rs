@@ -47,11 +47,7 @@ pub async fn get_sync<B: KvBackend + 'static, R: RoomSource<B> + 'static>(
     Query(query): Query<SyncQuery>,
     UserRequester(requester): UserRequester,
 ) -> Result<Response, UserError> {
-    let since = query
-        .since
-        .as_deref()
-        .map(SyncToken::decode)
-        .transpose()?;
+    let since = query.since.as_deref().map(SyncToken::decode).transpose()?;
     let filter = crate::filter::resolve(
         state.hub.store(),
         &requester.user_id,

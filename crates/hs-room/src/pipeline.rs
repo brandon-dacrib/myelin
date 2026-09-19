@@ -174,10 +174,7 @@ pub fn decode_event_ids(value: Option<&CanonicalJsonValue>) -> Vec<OwnedEventId>
     };
     items
         .iter()
-        .filter_map(|item| {
-            item.as_str()
-                .or_else(|| item.as_array()?.first()?.as_str())
-        })
+        .filter_map(|item| item.as_str().or_else(|| item.as_array()?.first()?.as_str()))
         .filter_map(|s| EventId::parse(s).ok())
         .map(|id| id.to_owned())
         .collect()
@@ -514,7 +511,8 @@ mod tests {
 
     #[test]
     fn decode_event_ids_handles_both_reference_formats() {
-        let v1_style = serde_json::json!([["$a:hs1", {"sha256": "x"}], ["$b:hs1", {"sha256": "y"}]]);
+        let v1_style =
+            serde_json::json!([["$a:hs1", {"sha256": "x"}], ["$b:hs1", {"sha256": "y"}]]);
         let v1_canonical = to_canonical_object(&serde_json::json!({"x": v1_style}), true).unwrap();
         let decoded = decode_event_ids(v1_canonical.get("x"));
         assert_eq!(decoded.len(), 2);

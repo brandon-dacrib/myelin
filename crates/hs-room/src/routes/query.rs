@@ -70,9 +70,12 @@ pub async fn get_state<B: KvBackend + 'static>(
     let handle = state.rooms.get_or_load(&room_id).await?;
     let events = handle
         .query(|actor| {
-            actor
-                .full_state()
-                .map(|events| events.into_iter().map(client_event_json).collect::<Vec<_>>())
+            actor.full_state().map(|events| {
+                events
+                    .into_iter()
+                    .map(client_event_json)
+                    .collect::<Vec<_>>()
+            })
         })
         .await?;
     Ok(Json(events).into_response())
@@ -180,9 +183,12 @@ pub async fn get_members<B: KvBackend + 'static>(
     let handle = state.rooms.get_or_load(&room_id).await?;
     let chunk = handle
         .query(|actor| {
-            actor
-                .members()
-                .map(|events| events.into_iter().map(client_event_json).collect::<Vec<_>>())
+            actor.members().map(|events| {
+                events
+                    .into_iter()
+                    .map(client_event_json)
+                    .collect::<Vec<_>>()
+            })
         })
         .await?;
     Ok(Json(json!({"chunk": chunk})).into_response())

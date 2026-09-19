@@ -57,8 +57,11 @@ pub(crate) mod test_support {
     /// Builds a throwaway room registry (in-memory backend) usable as a [`RoomSource`].
     pub(crate) fn registry(server_name: &str) -> Arc<RoomRegistry<MemoryBackend>> {
         Arc::new(
-            RoomRegistry::open(MemoryBackend::new(), HomeserverIdentity::for_tests(server_name))
-                .expect("opening an in-memory room registry cannot fail"),
+            RoomRegistry::open(
+                MemoryBackend::new(),
+                HomeserverIdentity::for_tests(server_name),
+            )
+            .expect("opening an in-memory room registry cannot fail"),
         )
     }
 }

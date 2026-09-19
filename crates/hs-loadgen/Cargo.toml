@@ -5,8 +5,16 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "hs-loadgen: see docs/workstreams for the owning track"
+description = "hs-loadgen: matrix-rust-sdk driving a real `hs serve` process over real HTTP (track 05)"
 
 [dependencies]
+matrix-sdk = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true }

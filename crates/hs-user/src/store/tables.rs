@@ -56,7 +56,9 @@ use rand::distr::Alphanumeric;
 use ruma::{DeviceId, RoomId, UserId};
 use serde::{Deserialize, Serialize};
 
-use super::{AccountDataRecord, FeedEntry, MembershipRecord, PublicRoomEntry, StoreError, UserStore};
+use super::{
+    AccountDataRecord, FeedEntry, MembershipRecord, PublicRoomEntry, StoreError, UserStore,
+};
 
 fn to_kv<E: std::error::Error + Send + Sync + 'static>(e: E) -> hs_kv::KvError {
     hs_kv::KvError::backend(e)
@@ -158,8 +160,7 @@ impl<B: KvBackend> TablesUserStore<B> {
         txn: &R,
         uid: &str,
     ) -> Result<u64, StoreError> {
-        let spec =
-            TypedKeyspace::<B::Keyspace, (String, String)>::prefix(&(uid.to_owned(),));
+        let spec = TypedKeyspace::<B::Keyspace, (String, String)>::prefix(&(uid.to_owned(),));
         let mut max = 0u64;
         for item in self.device_cursors.range(txn, spec) {
             let (_, value) = item.map_err(StoreError::Table)?;
@@ -189,8 +190,11 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
                 .transpose()
                 .map_err(to_kv)?;
 
-            let value =
-                json_encode(&FeedValue { room_id: rid.clone(), room_pos }).map_err(to_kv)?;
+            let value = json_encode(&FeedValue {
+                room_id: rid.clone(),
+                room_pos,
+            })
+            .map_err(to_kv)?;
 
             if let Some(seq) = existing_seq
                 && seq > max_cursor
@@ -224,9 +228,10 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
         let uid = user_id.to_string();
         let snap = self.backend.snapshot();
         let mut spec = TypedKeyspace::<B::Keyspace, (String, u64)>::prefix(&(uid.clone(),));
-        spec.start = std::ops::Bound::Excluded(Bytes::from(
-            hs_tables::key::encode(&(uid.clone(), since_feed_seq)),
-        ));
+        spec.start = std::ops::Bound::Excluded(Bytes::from(hs_tables::key::encode(&(
+            uid.clone(),
+            since_feed_seq,
+        ))));
         let mut out = Vec::new();
         for item in self.feed.range(&snap, spec) {
             let ((_, feed_seq), value) = item.map_err(StoreError::Table)?;
@@ -245,7 +250,7 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
 
     async fn latest_feed_seq(&self, user_id: &UserId) -> Result<u64, StoreError> {
         let snap = self.backend.snapshot();
-        self.latest_feed_seq_txn(&snap, &user_id.to_string())
+        self.latest_feed_seq_txn(&snap, user_id.as_ref())
     }
 
     async fn room_pos_as_of(
@@ -303,7 +308,7 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
 
     async fn max_device_cursor(&self, user_id: &UserId) -> Result<u64, StoreError> {
         let snap = self.backend.snapshot();
-        self.max_device_cursor_txn(&snap, &user_id.to_string())
+        self.max_device_cursor_txn(&snap, user_id.as_ref())
     }
 
     async fn latest_account_data_seq(&self, user_id: &UserId) -> Result<u64, StoreError> {
@@ -352,7 +357,11 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
     ) -> Result<Option<MembershipRecord>, StoreError> {
         let snap = self.backend.snapshot();
         let key = (user_id.to_string(), room_id.to_string());
-        match self.memberships.get(&snap, &key).map_err(StoreError::Table)? {
+        match self
+            .memberships
+            .get(&snap, &key)
+            .map_err(StoreError::Table)?
+        {
             Some(bytes) => Ok(Some(json_decode(&bytes)?)),
             None => Ok(None),
         }
@@ -363,8 +372,7 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
         user_id: &UserId,
     ) -> Result<Vec<MembershipRecord>, StoreError> {
         let snap = self.backend.snapshot();
-        let spec =
-            TypedKeyspace::<B::Keyspace, (String, String)>::prefix(&(user_id.to_string(),));
+        let spec = TypedKeyspace::<B::Keyspace, (String, String)>::prefix(&(user_id.to_string(),));
         let mut out = Vec::new();
         for item in self.memberships.range(&snap, spec) {
             let (_, value) = item.map_err(StoreError::Table)?;
@@ -387,9 +395,14 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
                 .map_err(to_kv)?;
             #[allow(clippy::cast_sign_loss, reason = "atomic_add never goes negative here")]
             let seq = seq as u64;
-            let value = json_encode(&AccountDataValue { content: content.clone(), changed_seq: seq })
+            let value = json_encode(&AccountDataValue {
+                content: content.clone(),
+                changed_seq: seq,
+            })
+            .map_err(to_kv)?;
+            self.account_data_global
+                .put(txn, &key, &value)
                 .map_err(to_kv)?;
-            self.account_data_global.put(txn, &key, &value).map_err(to_kv)?;
             Ok(seq)
         })
         .map_err(StoreError::Kv)
@@ -400,8 +413,7 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
         user_id: &UserId,
     ) -> Result<Vec<AccountDataRecord>, StoreError> {
         let snap = self.backend.snapshot();
-        let spec =
-            TypedKeyspace::<B::Keyspace, (String, String)>::prefix(&(user_id.to_string(),));
+        let spec = TypedKeyspace::<B::Keyspace, (String, String)>::prefix(&(user_id.to_string(),));
         let mut out = Vec::new();
         for item in self.account_data_global.range(&snap, spec) {
             let ((_, event_type), value) = item.map_err(StoreError::Table)?;
@@ -446,7 +458,11 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
         event_type: &str,
         content: serde_json::Value,
     ) -> Result<u64, StoreError> {
-        let key = (user_id.to_string(), room_id.to_string(), event_type.to_owned());
+        let key = (
+            user_id.to_string(),
+            room_id.to_string(),
+            event_type.to_owned(),
+        );
         let uid_bytes = user_id.as_bytes().to_vec();
         transact(&self.backend, TransactConfig::default(), |txn| {
             let seq = txn
@@ -454,9 +470,14 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
                 .map_err(to_kv)?;
             #[allow(clippy::cast_sign_loss, reason = "atomic_add never goes negative here")]
             let seq = seq as u64;
-            let value = json_encode(&AccountDataValue { content: content.clone(), changed_seq: seq })
+            let value = json_encode(&AccountDataValue {
+                content: content.clone(),
+                changed_seq: seq,
+            })
+            .map_err(to_kv)?;
+            self.account_data_room
+                .put(txn, &key, &value)
                 .map_err(to_kv)?;
-            self.account_data_room.put(txn, &key, &value).map_err(to_kv)?;
             Ok(seq)
         })
         .map_err(StoreError::Kv)
@@ -582,7 +603,10 @@ mod tests {
 
         let entries = s.feed_since(uid, 0).await.unwrap();
         assert_eq!(entries.len(), 1, "coalesced: one entry, not two");
-        assert_eq!(entries[0].room_pos, 2, "the merged entry carries the latest position");
+        assert_eq!(
+            entries[0].room_pos, 2,
+            "the merged entry carries the latest position"
+        );
     }
 
     #[tokio::test]
@@ -651,7 +675,9 @@ mod tests {
         let uid = user_id!("@alice:example.org");
         let room = room_id!("!a:example.org");
         assert!(s.get_membership(uid, room).await.unwrap().is_none());
-        s.set_membership(uid, room, "invite", 1, false).await.unwrap();
+        s.set_membership(uid, room, "invite", 1, false)
+            .await
+            .unwrap();
         let m = s.get_membership(uid, room).await.unwrap().unwrap();
         assert_eq!(m.membership, "invite");
         s.set_membership(uid, room, "join", 2, false).await.unwrap();

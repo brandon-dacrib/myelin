@@ -359,15 +359,20 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                         &user_id_owned,
                     )?
                 } else {
-                    build_state_section(actor, &timeline_ids, lazy, &timeline_senders, &user_id_owned)?
+                    build_state_section(
+                        actor,
+                        &timeline_ids,
+                        lazy,
+                        &timeline_senders,
+                        &user_id_owned,
+                    )?
                 };
                 Ok::<_, hs_room::RoomError>((timeline, state))
             })
             .await?;
 
-        let nothing_changed = timeline.events.is_empty()
-            && account_data_json.is_empty()
-            && !force_full_state;
+        let nothing_changed =
+            timeline.events.is_empty() && account_data_json.is_empty() && !force_full_state;
         if nothing_changed && !is_initial {
             continue;
         }
@@ -605,7 +610,10 @@ mod tests {
         assert!(token.feed_seq > 0);
         let room_id = handle.query(|a| a.room_id().to_owned()).await;
         let room = &response["rooms"]["join"][room_id.as_str()];
-        assert!(room.is_object(), "room should appear in initial sync: {response}");
+        assert!(
+            room.is_object(),
+            "room should appear in initial sync: {response}"
+        );
         let events = room["timeline"]["events"].as_array().unwrap();
         assert!(
             events.iter().any(|e| e["type"] == "m.room.message"),
@@ -704,7 +712,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         // Present the *early* token, not the latest one.
-        let (response, _) = build(&hub, &alice, params(Some(early_token))).await.unwrap();
+        let (response, _) = build(&hub, &alice, params(Some(early_token)))
+            .await
+            .unwrap();
         let room_id = handle.query(|a| a.room_id().to_owned()).await;
         let events = response["rooms"]["join"][room_id.as_str()]["timeline"]["events"]
             .as_array()
@@ -746,9 +756,7 @@ mod tests {
         let (response, _) = build(&hub, &bob, params(Some(bob_token))).await.unwrap();
         let room_id = handle.query(|a| a.room_id().to_owned()).await;
         assert!(
-            response["rooms"]["invite"]
-                .get(room_id.as_str())
-                .is_some(),
+            response["rooms"]["invite"].get(room_id.as_str()).is_some(),
             "bob's invite should show up: {response}"
         );
     }

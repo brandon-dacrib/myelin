@@ -45,6 +45,19 @@ pub fn router<B: KvBackend + 'static>() -> (axum::Router<RoomState<B>>, RouteMan
             send_state::put_state_no_key::<B>,
             matrix_client("setStateEvent"),
         )
+        // A real client (`matrix-rust-sdk`'s `Room::set_name`/`set_room_topic`, found by
+        // `crates/hs-loadgen`'s scenario) builds the state-with-key URL unconditionally, even for
+        // an empty state key: `PUT .../state/m.room.name/` (a *literal* trailing slash, not the
+        // no-key route above, which has no trailing slash at all). Axum's router treats a path
+        // ending in `/` as a distinct route from the same path without it, and a `{stateKey}`
+        // capture does not match an empty segment -- so without this explicit registration, that
+        // request 404s even though the *other* spelling of "set this room's name" works fine.
+        // Same handler as the no-key route above; only the registered path differs.
+        .put(
+            "/rooms/{roomId}/state/{eventType}/",
+            send_state::put_state_no_key::<B>,
+            matrix_client("setStateEvent"),
+        )
         .get(
             "/rooms/{roomId}/state/{eventType}/{stateKey}",
             query::get_state_with_key::<B>,
@@ -52,6 +65,13 @@ pub fn router<B: KvBackend + 'static>() -> (axum::Router<RoomState<B>>, RouteMan
         )
         .get(
             "/rooms/{roomId}/state/{eventType}",
+            query::get_state_no_key::<B>,
+            matrix_client("getStateEvent"),
+        )
+        // See the PUT variant above: the same empty-state-key-with-trailing-slash URL shape a
+        // real client sends for reads too.
+        .get(
+            "/rooms/{roomId}/state/{eventType}/",
             query::get_state_no_key::<B>,
             matrix_client("getStateEvent"),
         )

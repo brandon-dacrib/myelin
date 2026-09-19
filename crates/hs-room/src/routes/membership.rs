@@ -63,6 +63,26 @@ async fn act<B: KvBackend + 'static>(
     Ok(Json(json!({})).into_response())
 }
 
+/// Like [`act`], but for the two join endpoints: per the spec, `POST /rooms/{roomId}/join` and
+/// `POST /join/{roomIdOrAlias}` respond `{"room_id": "!..."}`, not `{}`. Found by
+/// `crates/hs-loadgen`'s `matrix-rust-sdk` scenario: the SDK's `join_room_by_id` deserializes the
+/// response strictly and rejected the empty body `act` had been sending on every join
+/// (`missing field `room_id``), which every unit test speaking this crate's own dialect had
+/// missed because none of them asserted the join response body, only that joining succeeded.
+async fn act_join<B: KvBackend + 'static>(
+    state: &RoomState<B>,
+    room_id: &str,
+    sender: ruma::OwnedUserId,
+    body: &Value,
+) -> Result<Response, RoomError> {
+    let room_id = parse_room_id(room_id)?;
+    let handle = state.rooms.get_or_load(&room_id).await?;
+    handle
+        .membership(sender.clone(), Action::Join, sender, extra(body), now_ms())
+        .await?;
+    Ok(Json(json!({ "room_id": room_id })).into_response())
+}
+
 /// `POST /rooms/{roomId}/join`.
 pub async fn post_join<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
@@ -70,8 +90,7 @@ pub async fn post_join<B: KvBackend + 'static>(
     RoomRequester(requester): RoomRequester,
     Json(body): Json<Value>,
 ) -> Result<Response, RoomError> {
-    let user = requester.user_id.clone();
-    act(&state, &room_id, user.clone(), Action::Join, user, &body).await
+    act_join(&state, &room_id, requester.user_id, &body).await
 }
 
 /// `POST /join/{roomIdOrAlias}`.
@@ -91,16 +110,7 @@ pub async fn post_join_by_id_or_alias<B: KvBackend + 'static>(
             .resolve_alias(&alias)?
             .ok_or_else(|| RoomError::RoomNotFound(room_id_or_alias.clone()))?
     };
-    let user = requester.user_id.clone();
-    act(
-        &state,
-        room_id.as_str(),
-        user.clone(),
-        Action::Join,
-        user,
-        &body,
-    )
-    .await
+    act_join(&state, room_id.as_str(), requester.user_id, &body).await
 }
 
 /// `POST /rooms/{roomId}/leave`.

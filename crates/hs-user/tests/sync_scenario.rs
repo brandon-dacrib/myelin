@@ -91,7 +91,9 @@ async fn settle() {
 async fn register_invite_join_and_message_flow_reaches_both_users_syncs() {
     let (mut s, rooms, hub) = setup();
 
-    s.register("alice", "alice", "hunter2-alice").await.assert_ok();
+    s.register("alice", "alice", "hunter2-alice")
+        .await
+        .assert_ok();
     s.register("bob", "bob", "hunter2-bob").await.assert_ok();
     let bob_user_id = s.session("bob").unwrap().user_id.clone().unwrap();
 
@@ -123,7 +125,9 @@ async fn register_invite_join_and_message_flow_reaches_both_users_syncs() {
     let bob_initial = s.sync("bob").await;
     bob_initial.assert_ok();
     assert!(
-        bob_initial.json["rooms"]["invite"].as_object().is_none_or(|m| m.is_empty()),
+        bob_initial.json["rooms"]["invite"]
+            .as_object()
+            .is_none_or(|m| m.is_empty()),
         "bob has not been invited yet"
     );
 
@@ -160,7 +164,12 @@ async fn register_invite_join_and_message_flow_reaches_both_users_syncs() {
 
     // 5. bob joins.
     let join = s
-        .send(Some("bob"), Method::POST, &format!("/rooms/{room_id}/join"), Some(json!({})))
+        .send(
+            Some("bob"),
+            Method::POST,
+            &format!("/rooms/{room_id}/join"),
+            Some(json!({})),
+        )
         .await;
     join.assert_ok();
     settle().await;
@@ -226,7 +235,9 @@ async fn register_invite_join_and_message_flow_reaches_both_users_syncs() {
         .cloned()
         .unwrap_or_default();
     assert!(
-        replay_events.iter().any(|e| e["content"]["body"] == "hello bob"),
+        replay_events
+            .iter()
+            .any(|e| e["content"]["body"] == "hello bob"),
         "presenting the same pre-message token again must still return the message: {}",
         replay.json
     );
@@ -247,7 +258,9 @@ async fn register_invite_join_and_message_flow_reaches_both_users_syncs() {
         .cloned()
         .unwrap_or_default();
     assert!(
-        alice_events.iter().any(|e| e["content"]["body"] == "hello bob"),
+        alice_events
+            .iter()
+            .any(|e| e["content"]["body"] == "hello bob"),
         "alice's own old token should also resolve forward to the message: {}",
         alice_after_message.json
     );
@@ -256,7 +269,9 @@ async fn register_invite_join_and_message_flow_reaches_both_users_syncs() {
 #[tokio::test]
 async fn a_sync_token_issued_before_a_message_returns_it_even_after_unrelated_activity_happens() {
     let (mut s, rooms, hub) = setup();
-    s.register("alice", "alice", "hunter2-alice").await.assert_ok();
+    s.register("alice", "alice", "hunter2-alice")
+        .await
+        .assert_ok();
 
     let create = s
         .send(
@@ -316,7 +331,9 @@ async fn a_sync_token_issued_before_a_message_returns_it_even_after_unrelated_ac
         .cloned()
         .unwrap_or_default();
     assert!(
-        events.iter().any(|e| e["content"]["body"] == "delayed but not lost"),
+        events
+            .iter()
+            .any(|e| e["content"]["body"] == "delayed but not lost"),
         "the early token must still surface the message despite unrelated activity in between: {}",
         response.json
     );
