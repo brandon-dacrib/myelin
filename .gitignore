@@ -9,3 +9,15 @@ node_modules/
 .DS_Store
 
 crates/hs-cli/media-store/
+
+# Runtime state from running the server locally: an embedded database, media, signing keys. These
+# were tracked by accident once (64MB of Fjall journal) — the same class of mistake as the media
+# artifacts before them.
+crates/hs-cli/data/
+**/signing-keys/
+**/media-store/
+
+# Playwright output. The traces embed real access tokens from whatever test server produced them,
+# so this must never be committed, least of all to a public repository.
+web/playwright-report*/
+web/test-results/

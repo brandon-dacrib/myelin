@@ -1,11 +1,11 @@
-# Axon
+# Myelin
 
 A modern Matrix homeserver in Rust.
 
-An axon is the fibre that carries a signal away from the cell body — the transmission line of the
-nervous system, and the part built for speed and distance. That is this project's ambition: the
-Matrix protocol exactly as specified, carried faster and further, named in the tradition its
-predecessors set (Synapse, Dendrite).
+Myelin is the sheath that wraps a nerve fibre so a signal travels an order of magnitude faster,
+without altering the signal itself. That is this project's ambition: the Matrix protocol exactly
+as specified, carried a great deal faster, named in the tradition its predecessors set (Synapse,
+Dendrite).
 
 Kubernetes-native, horizontally scalable, and equally at home as a single static binary on a small ARM host. Synapse-compatible at the API and operations level with a migration path. Bridges are first-class. Full specification coverage is enforced mechanically.
 

@@ -1,6 +1,6 @@
 name: cd
 
-# Continuous delivery for Axon: multi-architecture container images, standalone binaries, and
+# Continuous delivery for Myelin: multi-architecture container images, standalone binaries, and
 # the Helm chart.
 #
 # CI (`ci.yml`) proves the tree is good — fmt, clippy and tests on both architectures, plus an
@@ -142,19 +142,19 @@ jobs:
         run: |
           set -euo pipefail
           docker buildx build --load --platform ${{ matrix.platform }} \
-            -f deploy/Dockerfile -t axon:smoke .
+            -f deploy/Dockerfile -t myelin:smoke .
 
           mkdir -p smoke && chmod 777 smoke
-          docker run --rm axon:smoke generate-config --server-name smoke.invalid \
+          docker run --rm myelin:smoke generate-config --server-name smoke.invalid \
             | sed -e 's|data_dir: .*|data_dir: /data|' \
                   -e 's|path: ./media-store|path: /data/media|' \
                   -e 's|signing_key_path: .*|signing_key_path: /data/keys|' \
             > smoke/homeserver.yaml
 
-          docker run -d --name axon-smoke -p 8008:8008 \
+          docker run -d --name myelin-smoke -p 8008:8008 \
             -v "$PWD/smoke/homeserver.yaml:/etc/hs/homeserver.yaml:ro" \
             -v "$PWD/smoke:/data" \
-            axon:smoke
+            myelin:smoke
 
           ok=0
           for _ in $(seq 1 60); do
@@ -163,14 +163,14 @@ jobs:
           done
           if [ "$ok" -ne 1 ]; then
             echo "the image never answered /health/live; logs follow" >&2
-            docker logs axon-smoke >&2 || true
-            docker rm -f axon-smoke >/dev/null 2>&1 || true
+            docker logs myelin-smoke >&2 || true
+            docker rm -f myelin-smoke >/dev/null 2>&1 || true
             exit 1
           fi
           echo "health/live answered; asking what it supports:"
           curl -sf http://127.0.0.1:8008/_matrix/client/versions | head -c 200
           echo
-          docker rm -f axon-smoke >/dev/null
+          docker rm -f myelin-smoke >/dev/null
 
       - name: Export the digest
         id: export
@@ -266,7 +266,7 @@ jobs:
       - name: Package
         run: |
           set -euo pipefail
-          dir="axon-${{ github.ref_name }}-${{ matrix.target }}"
+          dir="myelin-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "$dir"
           cp "target/${{ matrix.target }}/release/hs" "$dir/"
           cp README.md LICENSE "$dir/" 2>/dev/null || true
@@ -275,10 +275,10 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: axon-${{ matrix.target }}
+          name: myelin-${{ matrix.target }}
           path: |
-            axon-*.tar.gz
-            axon-*.tar.gz.sha256
+            myelin-*.tar.gz
+            myelin-*.tar.gz.sha256
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------------------------
@@ -303,7 +303,7 @@ jobs:
         run: |
           set -euo pipefail
           helm lint deploy/helm/hs --set serverName=example.org --set secrets.signingKey.existingSecret=example
-          helm template axon deploy/helm/hs --set serverName=example.org --set secrets.signingKey.existingSecret=example > /dev/null
+          helm template myelin deploy/helm/hs --set serverName=example.org --set secrets.signingKey.existingSecret=example > /dev/null
 
       - name: Package and push
         run: |
@@ -326,14 +326,14 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: axon-*
+          pattern: myelin-*
           merge-multiple: true
 
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            axon-*.tar.gz
-            axon-*.tar.gz.sha256
+            myelin-*.tar.gz
+            myelin-*.tar.gz.sha256
           generate_release_notes: true
           body: |
             ## Container image
@@ -348,8 +348,8 @@ jobs:
             ## Helm chart
 
             ```
-            helm install axon oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts/hs \
+            helm install myelin oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts/hs \
               --version ${GITHUB_REF_NAME#v} \
               --set serverName=example.org \
-              --set secrets.signingKey.existingSecret=axon-signing-key
+              --set secrets.signingKey.existingSecret=myelin-signing-key
             ```
