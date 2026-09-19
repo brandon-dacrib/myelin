@@ -37,6 +37,43 @@ if [ -z "$(find "$SIGNING_KEY_DIR" -type f 2>/dev/null)" ]; then
   hs generate-signing-key -o "$SIGNING_KEY_DIR/hs.signing.key"
 fi
 
+# ---- 2b. Federation CA trust mode --------------------------------------------------------------
+# Retired workaround, kept only as an opt-in escape hatch.
+#
+# Until 2026-09-19 this harness unconditionally set `federation.verify_certificates: false`,
+# because setting `federation.custom_ca_certificates` in a real config file had never had any
+# effect on a running server: `hs-config`/`hs-federation` parsed, validated and unit-tested the
+# option, but `crates/hs-cli/src/federation.rs::client_config` -- the one site that actually boots
+# a `FederationClient` for `hs serve` -- built its `ClientConfig` with `..ClientConfig::default()`
+# for everything not explicitly listed, silently dropping the configured paths on the floor.
+#
+# That is now fixed (see that function's own doc comment for the two-server federation test that
+# proved it), and this session verified it end to end: two back-to-back full runs of the
+# `refs/complement` `tests` package (top-level, federation-heavy) -- one with the old
+# `verify_certificates: false`, one with `custom_ca_certificates: ["/complement/ca/ca.crt"]` and
+# `verify_certificates` left at its real default `true` -- produced byte-for-byte identical
+# top-level and leaf pass/fail/skip results (leaf 212: 52/153/7; top 88: 6/81/1; see
+# docs/status/14-test-and-conformance.md) and zero TLS/certificate errors in either log. There is
+# no remaining reason to run this harness with certificate verification off, so `trust_ca` -- the
+# configuration a real deployment would actually use -- is now the default.
+#
+# HS_COMPLEMENT_CA_MODE=insecure (via Complement's env passthrough:
+# `COMPLEMENT_SHARE_ENV_PREFIX=PASS_ PASS_HS_COMPLEMENT_CA_MODE=insecure go test ...`, Complement
+# strips the `PASS_` prefix before it reaches this container -- see refs/complement/README.md's
+# "pass environment variables to the image under test" section) restores the old
+# `verify_certificates: false` behaviour, kept only in case a future test needs to isolate TLS
+# verification as a variable again; nothing in this project's own CI/README instructions should
+# ever need to set it.
+CA_MODE="${HS_COMPLEMENT_CA_MODE:-trust_ca}"
+if [ "$CA_MODE" = "insecure" ]; then
+  echo "startup.sh: federation CA mode = insecure (verify_certificates: false) -- the retired workaround, opted back in" >&2
+  FEDERATION_CA_CONFIG='  verify_certificates: false'
+else
+  echo "startup.sh: federation CA mode = trust_ca (verify_certificates stays at its default true;" >&2
+  echo "  custom_ca_certificates: [/complement/ca/ca.crt])" >&2
+  FEDERATION_CA_CONFIG='  custom_ca_certificates: ["/complement/ca/ca.crt"]'
+fi
+
 # ---- 3. Native hs-config, written fresh each start (cheap, and SERVER_NAME can differ across
 #         containers reusing the same image even though /data itself is not reused across runs).
 DB_DIR=/data/db
@@ -58,18 +95,7 @@ auth:
   enable_registration: true
   enable_legacy_login: true
 federation:
-  # Complement's containers and synthetic federation-test doubles present certificates signed by
-  # its own generated CA (/complement/ca/ca.crt, trusted into the OS store above) or are reached
-  # over private Docker/host-internal addresses. Neither is trusted by hs-federation's outbound
-  # `reqwest` client as built (rustls-tls's webpki-roots backend never reads the OS trust store,
-  # so step 1's update-ca-certificates is a no-op for it; there is also no config surface yet for
-  # an extra trusted-CA list, unlike Synapse's federation_custom_ca_list). Synapse's own Complement
-  # config (refs/synapse/docker/complement/conf/workers-shared-extra.yaml.j2) resolves the
-  # equivalent two problems with federation_custom_ca_list + federation_ip_range_blacklist: []; the
-  # first has no equivalent here yet (see docs/status/14-test-and-conformance.md), so
-  # verify_certificates: false is the closest available substitute for this harness only -- a real
-  # deployment should keep the default `true` and add proper CA trust instead.
-  verify_certificates: false
+$FEDERATION_CA_CONFIG
   ip_range_blocklist: []
 EOF
 

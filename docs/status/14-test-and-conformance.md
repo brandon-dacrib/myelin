@@ -1,6 +1,252 @@
 # 14 Test and conformance (integration lead): status
 
-## Re-measurement (2026-09-19, this session): csapi moved, federation ran for the first time
+## Re-measurement (2026-09-19, session 3): the CA fix verified end to end, csapi and federation both re-run
+
+Per the coordinator's brief: a great deal landed since the last measurement below (session 2:
+csapi 148/293 leaf, federation 5/89 top-level), and one item mattered directly to this track —
+`federation.custom_ca_certificates` had been parsed, validated and unit-tested by `hs-config`/
+`hs-federation` but never actually wired to a running server (`crates/hs-cli/src/federation.rs`
+dropped the configured paths on the floor). That is now fixed. This session's job: get current
+numbers, and settle whether this harness's `verify_certificates: false` workaround can be retired
+now that the real fix exists.
+
+**Built first, as instructed, before any other action. `git rev-parse HEAD` at build time:
+`f5f514bb3620c5d4eb3cbf344caf16f9c5dd90b8`.** (Rebuilt once more, ~5 minutes later, after this
+session's own `tests/complement/startup.sh` edit — see "Decisions made" — landed; `git rev-parse
+HEAD` was still `f5f514bb3620c5d4eb3cbf344caf16f9c5dd90b8` at that point too, since this track owns
+no crate and does not run git beyond the read-only `rev-parse`. The server-code provenance for
+every number below is that one commit; `tests/complement/` itself changed under it, as it did in
+every prior session that touched the harness mid-run.)
+
+### 1. `csapi`, before vs. after
+
+| Run | Commit | Leaf-level (every assertion) | Top-level (Go `func Test*`) |
+|---|---|---|---|
+| 2026-09-19 (session 2, "before") | `576e1e1` | 293 total: 148 pass, 138 fail, 7 skip | 106 total: 35 pass, 69 fail, 2 skip |
+| **2026-09-19 (session 3, "after")** | **`f5f514b`** | **367 total: 191 pass, 98 fail, 7 skip*** | **106 total: 53 pass, 51 fail, 2 skip** |
+
+\* Leaf-level *count* grew (293 → 367 candidate assertion lines) because several previously-404
+features (threads, relations, room upgrade) now execute far enough to hit many more individual
+per-message/per-field assertions instead of failing on the first `POST .../relations` 404; the
+true comparable "leaf" total after de-duplicating parent-vs-child `--- PASS/FAIL` lines (counting
+`TestFoo/sub/subsub` once, not also its parents) is smaller — see reproduction note below — but
+the pass/fail *counts* quoted here already use that de-duplicated method (191/98/7 sums to 296,
+not 367; 367 is the raw line count including parent-aggregate lines, kept here only to show the
+"more assertions now execute" trend — trust 191/98/7 as the number).
+
+Leaf pass rate: 50.5% → 64.5% (191/296). Top-level: 33.0% → 50.0% (53/106). Reproduction:
+
+```bash
+git rev-parse HEAD   # f5f514bb3620c5d4eb3cbf344caf16f9c5dd90b8, pinned before the image build
+./tests/complement/build.sh complement-hs-reimplement:dev   # 4m31s this session, quiet machine
+cd refs/complement && COMPLEMENT_BASE_IMAGE=complement-hs-reimplement:dev \
+  go test -v -timeout 30m ./tests/csapi/...                 # 806s (~13.4 min) this session
+```
+
+Full log: `/tmp/complement-csapi-run1.log` (not committed, scratch). Leaf/top counts computed with
+a small Python pass over `--- PASS/FAIL/SKIP` lines that treats a test name as a "leaf" only if no
+other reported name is `name + "/" + anything` (i.e. it has no reported children) — the same rule
+session 2 described in prose, applied programmatically this time to remove ambiguity.
+
+**What actually moved, read against session 2's own triage** (see "Updated triage" below for the
+full mapping): threads and relations now execute real logic instead of 404 (`TestThreadsEndpoint`,
+`TestRelationsPagination*` — still fail, but on ordering, not existence); room upgrade progresses
+past its old 404 into a real cross-server join path (`TestPushRuleRoomUpgrade` — still fails, on a
+second-homeserver `404 room not found`, not "upgrade doesn't exist"); URL previews now exist and
+correctly 403 when disabled by config rather than 404 (`TestUrlPreview`); async upload no longer
+404s, now hits a real (if wrong) status-code mismatch (`TestAsyncUpload`). `TestBannedUserCannotSendJoin`
+is a new pass in the federation package (see below) consistent with track 06's join-authorization
+work landing. Filter/invalid-ID rejection (`TestFilter`), search (`TestSearch`, still fully
+unimplemented, still 404), and the presence/device-list `MustSyncUntil` timeout cluster
+(`TestPresence`, `TestDeviceListUpdates`, `TestRoomSummary`, `TestAvatarUrlUpdate`) are still
+present, though `TestAvatarUrlUpdate`'s failure this run was actually a Complement container-log
+extraction race (`No such container: <id>` after the container had already been torn down), not
+the same failure mode as before — worth a rerun in isolation before assuming it's unchanged.
+
+### 2. The federation package: both CA configurations, and the verdict
+
+**First finding, before the comparison: a Complement-side Go panic (SIGSEGV), not our bug in
+itself, but real and blocking.** The very first full-package run (`./tests` with the default,
+pre-existing harness config) crashed the entire `go test` binary 335s in, at
+`TestInboundCanReturnMissingEvents`:
+
+```
+panic: runtime error: invalid memory address or nil pointer dereference [recovered, repanicked]
+...
+github.com/matrix-org/complement/tests.TestInboundCanReturnMissingEvents.func1(...)
+	.../tests/federation_room_get_missing_events_test.go:451
+```
+
+Line 451 is `must.Equal(t, *ev.StateKey(), alice.UserID, ...)` — Complement's test dereferences
+`ev.StateKey()` unconditionally, assuming index 0 of our `/get_missing_events` response is the
+room creator's membership (state) event. It panics because it is not: **this server's
+`get_missing_events` response has the wrong event at index 0** (something without a `state_key` —
+a non-state event, or state/timeline events in the wrong order), which is a real, diagnosed bug in
+`hs-federation`'s backfill/missing-events path (track 06), not a Complement bug, even though the
+crash itself is in Complement's Go code. The practical consequence is worse than an ordinary test
+failure: **it takes the entire test binary down, silently discarding every result for every test
+that would have run after it** (only 21 of 89 top-level tests had completed at the crash point).
+This is not in either configuration's final numbers below — both runs used `-skip
+'TestInboundCanReturnMissingEvents'` to get a complete, comparable number; **it was not added to
+`blacklist.txt`** (see "Blacklist decision" below for why) and should be the first thing track 06
+looks at, both for the ordering bug itself and because it currently makes every future
+`./tests`-wide Complement run silently truncate unless someone remembers to skip it by name.
+
+**The comparison, both against `f5f514b`, both with `-skip 'TestInboundCanReturnMissingEvents'`:**
+
+| Config | `federation.verify_certificates` | `federation.custom_ca_certificates` | Leaf (every assertion) | Top-level (`func Test*`) | Wall clock |
+|---|---|---|---|---|---|
+| A — current harness ("insecure") | `false` | (unset) | 212 total: 52 pass, 153 fail, 7 skip | 88 total: 6 pass, 81 fail, 1 skip | 903.3s |
+| B — real-deployment ("trust_ca") | default (`true`) | `["/complement/ca/ca.crt"]` | 212 total: 52 pass, 153 fail, 7 skip | 88 total: 6 pass, 81 fail, 1 skip | 904.4s |
+
+**Identical.** Byte-for-byte the same set of `--- PASS/FAIL/SKIP` lines in both logs (diffed after
+stripping timings), zero `federation.verify_certificates is FALSE` warnings in config B's log
+(confirming real certificate verification was active, not silently skipped), and zero TLS/
+certificate-authority errors in *either* log (`grep -c 'unknown certificate authority\|remote
+error: tls'` → 0 in both). Config B is strictly the harder configuration to satisfy (verification
+on, only one specific CA trusted) and it lost nothing.
+
+**Verdict: yes, the workaround can be retired, and this session retired it.**
+`tests/complement/startup.sh` now defaults to `trust_ca` (see "Decisions made"); the old
+`verify_certificates: false` behaviour survives only as an explicit opt-out
+(`HS_COMPLEMENT_CA_MODE=insecure`) for a future session that specifically wants to isolate TLS
+verification as a variable again. This is the fix session 2's brief asked for, done: the harness
+now tests the configuration a real deployment would run, not a bypass.
+
+Reproduction:
+
+```bash
+git rev-parse HEAD   # f5f514bb3620c5d4eb3cbf344caf16f9c5dd90b8
+./tests/complement/build.sh complement-hs-reimplement:dev   # 4m54s (rebuilt after startup.sh edit)
+
+# Config A ("insecure" workaround, opt-in only as of this session):
+cd refs/complement && COMPLEMENT_SHARE_ENV_PREFIX=PASS_ PASS_HS_COMPLEMENT_CA_MODE=insecure \
+  COMPLEMENT_BASE_IMAGE=complement-hs-reimplement:dev \
+  go test -v -timeout 30m -skip 'TestInboundCanReturnMissingEvents' ./tests   # 903s
+
+# Config B ("trust_ca", now the default -- this invocation doesn't even need the env var):
+cd refs/complement && COMPLEMENT_BASE_IMAGE=complement-hs-reimplement:dev \
+  go test -v -timeout 30m -skip 'TestInboundCanReturnMissingEvents' ./tests   # 904s
+```
+
+Full logs: `.conformance-run/fed-configA-full.log`, `.conformance-run/fed-configB-full.log`,
+`.conformance-run/fed-configA.log` (the crashing, pre-`-skip` run, kept for the panic trace). Not
+committed (scratch directory, already used by other tracks for their own conformance scratch —
+confirmed pre-existing `irc/`, `synapse/` subdirectories there before this session touched it).
+
+**Comparing to session 2's federation baseline (5/89 top-level, never measured with the CA fix in
+place):** the honest comparison excludes 1 test on each side (session 2's denominator was 89; this
+session's is 88 because of the SIGSEGV skip), but even so: 6/88 pass now vs. 5/89 then, and the
+much more telling number is underneath — 81 top-level failures now show real protocol-level
+symptoms (wrong status codes, missing fields, authorization logic gaps) with **zero** TLS-handshake
+symptoms, where session 2's own 3-test spot check after its harness workaround still found the TLS
+error gone but "distinct, further-along failures" it couldn't yet quantify. This session
+quantifies them (see "Updated triage" below).
+
+### 3. Updated triage by owning track (replaces session 2's list in its entirety)
+
+**Track 06 (federation) — highest priority, two distinct items.**
+1. **P0, harness-breaking:** the `TestInboundCanReturnMissingEvents` SIGSEGV above —
+   `get_missing_events`'s response ordering/typing is wrong at index 0 (expected the room
+   creator's membership/state event, something else came back). Fix this before any future full
+   `./tests` run, or it silently truncates again.
+2. **Restricted-room and knock-restricted joins fail across the board, local and federated** —
+   10 top-level tests (`TestRestrictedRoomsLocalJoin*`, `TestRestrictedRoomsRemoteJoin*`,
+   `TestKnockRestrictedRooms*`, `TestRestrictedRoomsSpacesSummary*`), concrete symptom
+   `M_FORBIDDEN: invalid join_authorised_via_users_server` when a membership event carries that
+   stripped-state field. Also still failing: plain `TestKnocking`/`TestKnockingInMSC3787Room`,
+   `TestFederationRejectInvite`, `TestUnbanViaInvite`, `TestJoinFederatedRoomFailOver`,
+   `TestJoinViaRoomIDAndServerName`. Also newly **passing**: `TestBannedUserCannotSendJoin` (was
+   presumably failing pre-CA-fix; now genuinely exercises ban-then-join-rejection over real TLS).
+3. Backfill/event-auth-chain over federation: `TestGetMissingEventsGapFilling`,
+   `TestOutboundFederationEventSizeGetMissingEvents`,
+   `TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6`, `TestCorruptedAuthChain`,
+   `TestUnrejectRejectedEvents`, `TestInboundFederationRejectsEventsWithRejectedAuthEvents`,
+   `TestNetworkPartitionOrdering`. Several show `missing N ancestor event(s) ... backfill attempt
+   to close it could not fetch ancestor events: response ... was not valid JSON` — worth checking
+   whether that's Complement's synthetic peer intentionally returning garbage (testing our error
+   handling) or a real parse-site bug; not diagnosed further this session.
+4. ACLs (`TestACLs`, `TestACLsForEDUs`), profile query status codes
+   (`TestInboundFederationProfile`, `TestOutboundFederationProfile` — `404 want 400` for a
+   malformed `user_id`, and a missing `displayname` key on an empty-profile response), and the
+   `TestCannotSend{Non}{Join,Knock,Leave}Via*V1/V2` family (server should reject a
+   `send_join`/`send_knock`/`send_leave` transaction whose event doesn't match the endpoint's
+   membership type; currently doesn't) remain open, unchanged in kind from session 2.
+
+**Track 02 (state/room-version model) — room v12 / MSC4289 creator semantics return the wrong
+status code, and create events lose their room ID on read.** `TestMSC4289PrivilegedRoomCreators`
+and all 5 of its sub-variants (`_Additional`, `_AdditionalCreatorsAndInvited`,
+`_AdditionalValidation`, `_InvitedAreCreators`, `_Upgrades`) fail with `403 M_FORBIDDEN` where the
+spec test wants `400`/`M_BAD_JSON` for malformed `additional_creators` (not an array, non-string
+entries, invalid user ID shape) and for "creator user IDs are not allowed in the `users` field" —
+the validation itself fires, just with the wrong HTTP status/errcode pairing (403 reads as an
+authorization failure; these are input-shape failures, which Matrix reserves 400 for).
+`TestComplementCanCreateValidV12Rooms` and `TestMSC4311FullCreateEventOnStrippedState` also fail.
+Separately, **7 read-path assertions across `/state`, `/messages`, `/event/{eventId}`, `/context`
+(both `state` and direct/indirect variants) report "create event is missing room ID"** — the
+`m.room.create` event's `content` (or the wrapper) omits `room_id` where the test expects it
+present, in a v12-created room specifically (`TestMSC4291RoomIDAsHashOfCreateEvent_*`).
+
+**Track 09 (media) — federation-fetched media fails outright, not just the still-missing local
+gaps.** `TestFederationThumbnail`, `TestRemotePngThumbnail`, `TestContentMediaV1`,
+`TestMediaFilenames`, `TestMediaWithoutFileName`/`TestMediaWithoutFileNameCSMediaV1` all fail —
+this is federation-fetched (remote) media specifically, a step beyond session 2's "async upload
+and URL preview unimplemented" triage (both of which, per section 1 above, now execute real logic
+rather than 404ing). `TestLocalPngThumbnail` also fails (local, not just remote).
+
+**Track 08 (e2ee) + Track 06 (federation transport) — device-list and to-device delivery over
+federation don't just fail, they time out at full length.** `TestDeviceListsUpdateOverFederation`
+(170s), `TestToDeviceMessagesOverFederation` (116s),
+`TestUserAppearsInChangedDeviceListOnJoinOverFederation`, `TestFederationKeyUploadQuery`,
+`TestDeviceListsUpdateOverFederationOnRoomJoin` all fail after running their full retry/timeout
+budget rather than failing fast on a clear rejection — consistent with the EDU/PDU never arriving
+at the remote server at all (a delivery gap) rather than arriving malformed (a validation gap).
+Not diagnosed further; flagged for track 06/08 to triage jointly since the transport is 06's and
+the payload shape is 08's.
+
+**Cross-cutting, no single clear owner — the shared HTTP layer's error responses aren't always
+JSON.** `TestUnknownEndpoints` (all 5 sub-cases: client, federation, key, media, unknown-prefix)
+fails because the router's catch-all fallback for an unmatched path returns an **empty body**
+where the spec test expects a JSON `M_UNRECOGNIZED` error. Separately, `TestRequestEncodingFails`
+(csapi) and `TestRoomMembers` (csapi, `/join` with an empty body) both show a **plain-text** parse
+error ("Failed to parse the request body as JSON: ...") instead of a Matrix-shaped JSON error
+envelope — 5 occurrences of that exact string in the csapi log. Both symptoms point at the same
+kind of gap: axum's *default* extractor-rejection and fallback-handler bodies are reaching the
+client unwrapped, instead of being caught and re-shaped into `{"errcode": "M_NOT_JSON"/
+"M_UNRECOGNIZED", "error": "..."}`. No status file in this workspace clearly claims ownership of
+the base router/fallback (closest candidates: track 15's `hs-http`, or whichever crate's
+`axum::Router::fallback`/`.layer` is actually mounted by `hs serve` — not identified this session
+since this track does not read other crates' source to diagnose, per its file-ownership rule).
+Flagged here so the integration lead can route it.
+
+**Carried over, unchanged from session 2 (still real, not re-diagnosed this session):** the
+`MustSyncUntil` timeout cluster (track 05: presence-in-sync, device-list-in-sync, profile-update-
+in-sync, room summaries, push-rules-in-sync); `/keys/query` cross-user empty `device_keys` and the
+`{"device_id": true}` malformed-shape 200-not-400 discrepancy (track 08); `/register/available`
+and mixed-case-username gaps, `GET /capabilities` missing auth (**this session's own run confirms
+this is now `TestServerCapabilities`: `200` with no token, want `401`, still open**), UIA-vs-plain-
+403 ordering on `/device/{id}` and `/account/deactivate` (`TestDeviceManagement`,
+`TestDeactivateAccount` — **new detail this session: both return `403 M_FORBIDDEN` where UIA
+(401) should be attempted first**, a slightly different shape than session 2's phrasing but the
+same underlying gap) (track 07); `/search` unimplemented (track 04, still a flat 404).
+
+### 4. Blacklist decision
+
+**No entries added, third session in a row.** Every failure examined this session is either a bug
+(wrong status code, wrong ordering, a missing field, a delivery gap) or documented future work
+(`/search` still 404, still described as owned/planned in track 04's brief). The one candidate that
+might look like a harness-quarantine case — `TestInboundCanReturnMissingEvents`'s SIGSEGV — was
+deliberately *not* added to `blacklist.txt`: that file's own header frames it as tracking features
+this project has chosen not to build, and a crash caused by a real, diagnosed ordering bug in our
+own `get_missing_events` response doesn't fit that frame even though skipping it was necessary to
+get a complete run. It was skipped for this session's measurement via a `-skip` flag on the `go
+test` invocation only (see reproduction commands above), which is not persistent — the next
+session that runs `./tests` without that flag will hit the crash again until track 06 fixes the
+underlying bug. That is intentional: leaving it un-skipped by default keeps it visible.
+
+---
+
+## Re-measurement (2026-09-19, session 2 — superseded by the section above): csapi moved, federation ran for the first time
 
 Per `docs/next-steps.md` item 1: the 2026-09-18 numbers below predate history-visibility
 enforcement, the room directory, `/createRoom` validation, `/forget`, profiles, inbound
@@ -374,8 +620,10 @@ Track brief: `docs/workstreams/14-test-and-conformance.md`. Owner crates: `hs-te
 `hs-spec-coverage`, `hs-loadgen` (not started, see "Decisions made"), `tests/` (Complement, Sytest,
 differential, oracle harnesses).
 
-Last updated: 2026-09-18 (day one, session 1). A previous attempt was interrupted before writing
-anything; this session started from the empty placeholders it left behind.
+Last updated: 2026-09-19 (session 3 — the CA-fix verification and re-measurement at the top of
+this file). Originally 2026-09-18 (day one, session 1); a previous attempt at session 3's own
+assignment was interrupted before writing anything, so this update started from session 2's
+content, unchanged below this point except where "session 3" is named explicitly.
 
 ## Done
 
@@ -488,20 +736,20 @@ state.
 
 ## Next
 
-- **Highest value: re-run the top-level federation `tests` package** with the
-  `verify_certificates: false` / `ip_range_blocklist: []` harness fix now in `startup.sh`, against
-  a freshly pinned commit (build first, record `git rev-parse HEAD`, exactly as this session did).
-  Expect a large jump from 5/89 — the fix removed the dominant blocker in a 3-test spot check —
-  but the number has never been measured with the fix in place; do not guess it, measure it.
-  Budget ~20 min for the image build (contended) and ~15-20 min for the run.
-  A real fix belongs in `hs-federation`/`hs-config` (a `federation.custom_ca_list` equivalent, or
-  switching the workspace `reqwest` feature set off pure `webpki-roots`), not permanently in this
-  harness — see this file's "Complement" section above.
-- Chase the `MustSyncUntil` timeout cluster (track 05) — it's the single largest bucket in this
-  session's csapi run and appears again in the federation package; likely one or a small number
-  of root causes given how many unrelated-looking tests share the exact same symptom.
-- Re-run `csapi` again once track 04/05/07/08/09's items from this session's triage land, the same
-  way this session re-ran 2026-09-18's number.
+- **Highest value: fix the `TestInboundCanReturnMissingEvents` SIGSEGV's root cause** (track 06,
+  `get_missing_events` response ordering — see session 3's section 2/3 above) so a future
+  `./tests` run doesn't need `-skip` to complete at all.
+- Chase the `MustSyncUntil` timeout cluster (track 05) — still the single largest bucket; unchanged
+  in kind since session 2, not re-diagnosed in session 3.
+- Restricted-room/knock-restricted joins (track 06/04) and room-v12 creator-validation status codes
+  plus create-event room-ID-on-read (track 02) are the two largest new-to-session-3 clusters — see
+  session 3's triage above for the full test lists.
+- The shared-HTTP-layer JSON-envelope gap (`TestUnknownEndpoints`'s empty-body fallback,
+  `TestRequestEncodingFails`/`TestRoomMembers`'s plain-text parse-error bodies) has no confirmed
+  owner in this workspace's status files; the integration lead should route it.
+- Re-run `csapi` and the federation package again once track 02/04/06/08/09's items from session
+  3's triage land, the same way session 3 re-ran session 2's numbers.
+- Remaining items below are session 2's, still open and unchanged by session 3:
 - Fill in the still-`TODO` `tests/sytest/plugins/hs-reimplement/lib/SyTest/Homeserver/
   HsReimplement.pm` the same way `tests/complement/`'s scaffold was filled in this session (real
   `hs` binary, real config) — Sytest's own CPAN dependencies still aren't installed in this
@@ -556,6 +804,30 @@ own end-to-end run.
 
 ## Decisions made
 
+- **(session 3) `tests/complement/startup.sh` now defaults to `federation.custom_ca_certificates:
+  ["/complement/ca/ca.crt"]` with `verify_certificates` left at its real default (`true`),
+  replacing the `verify_certificates: false` workaround as the default.** Verified safe first:
+  two full runs of the federation package (`refs/complement`'s top-level `tests`, 88 top-level
+  tests after excluding the SIGSEGV-crashing one) against the same commit
+  (`f5f514bb3620c5d4eb3cbf344caf16f9c5dd90b8`), one per config, produced byte-for-byte identical
+  `--- PASS/FAIL/SKIP` results (212 leaf: 52/153/7 both times) with zero TLS/certificate errors in
+  either log. `HS_COMPLEMENT_CA_MODE=insecure` (via Complement's `COMPLEMENT_SHARE_ENV_PREFIX`
+  passthrough) restores the old behaviour for a future session that specifically wants to isolate
+  TLS verification as a variable; nothing in this project's own instructions should need it. This
+  directly answers the question session 3 was asked to settle — see the top of this file for the
+  full comparison.
+- **(session 3) The `TestInboundCanReturnMissingEvents` SIGSEGV was worked around with a
+  one-invocation `-skip` flag, not a `blacklist.txt` entry.** It crashes the whole `go test`
+  binary (a nil-pointer panic in Complement's own Go test code, triggered by this server returning
+  the wrong event — no `state_key` — at index 0 of a `/get_missing_events` response). Skipping it
+  via `blacklist.txt` would make every future `./tests` run silently continue past a bug this
+  project hasn't decided to ignore; `-skip` on the command line gets a complete measurement for
+  this session without hiding the bug from the next one. See "Blacklist decision" above.
+- **(session 3) csapi's leaf-level total grew from 293 to 367 raw `--- PASS/FAIL/SKIP` lines**
+  between sessions purely because previously-404 features (threads, relations, upgrade) now
+  execute far enough to hit many more sub-assertions — not a change in counting method. The
+  de-duplicated (parent-vs-child) leaf total this session reports, 296, is the one to trust for a
+  rate comparison; see section 1 at the top of this file.
 - **`docs/rfcs/0005-routes-json-manifest.md` surface extension**: RFC 0005 (drafted by track 15
   before this track started, which the RFC itself anticipated: "track 14 may amend it once it
   starts") lists `matrix-client`, `matrix-federation`, `matrix-appservice`, `synapse-admin-compat`,
@@ -631,13 +903,20 @@ cargo run -p hs-spec-coverage -- --spec-dir refs/matrix-spec/data/api   # 0/235 
 python3 -m unittest discover -s tests/differential/tests -v   # 14 tests
 python3 tests/differential/run_differential.py                # clean skip, exit 0
 
-# Complement (real as of 2026-09-18/19; ~10-20 min image build under contention, ~14 min per
-# csapi run, ~15-20 min for the top-level federation `tests` package):
+# Complement (real as of 2026-09-18/19/19; ~5-20 min image build depending on contention, ~13-15
+# min per csapi or federation run). As of session 3, `federation.custom_ca_certificates` is the
+# default trust mode (see "Decisions made"); HS_COMPLEMENT_CA_MODE=insecure via
+# COMPLEMENT_SHARE_ENV_PREFIX restores the old verify_certificates:false workaround if ever needed.
+# The federation package's own top-level `tests` (not `./tests/...`, which also recurses into
+# csapi and every msc directory) currently needs `-skip 'TestInboundCanReturnMissingEvents'` to
+# finish at all -- see session 3's section 2/3 for the SIGSEGV this works around.
 ./tests/complement/build.sh complement-hs-reimplement:dev
 cd refs/complement && COMPLEMENT_BASE_IMAGE=complement-hs-reimplement:dev \
-  go test -v -timeout 30m ./tests/csapi/...          # csapi: 148 pass / 138 fail / 7 skip (leaf)
+  go test -v -timeout 30m ./tests/csapi/...          # csapi: 191 pass / 98 fail / 7 skip (leaf)
 cd refs/complement && COMPLEMENT_BASE_IMAGE=complement-hs-reimplement:dev \
-  go test -v -timeout 30m ./tests/...                # everything, incl. federation; ~16-20 min
+  go test -v -timeout 30m -skip 'TestInboundCanReturnMissingEvents' ./tests
+  # federation package: 52 pass / 153 fail / 7 skip (leaf), identical with or without
+  # HS_COMPLEMENT_CA_MODE=insecure set -- see session 3's section 2 above
 
 # Sytest / oracle scaffolds (clean-skip without their respective dependencies):
 ./tests/complement/run_cluster.sh
