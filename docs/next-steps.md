@@ -40,15 +40,17 @@ The list is in `docs/status/14-test-and-conformance.md`, triaged by track. In pr
 - **Cross-user `/keys/query` misses devices** and `/keys/claim` returns content that does not match what was uploaded (track 08).
 - **Async media upload (MSC2246) and URL previews are absent** (track 09).
 
-### 2. Make encryption actually work
+### 2. Fix the sync/messages token mismatch
 
-`docs/rfcs/0013-e2ee-sync-extensions.md` specifies it precisely: `GET /sync` omits `to_device`, `device_lists`, `device_one_time_keys_count` and `device_unused_fallback_key_types` entirely, so the Megolm key never reaches the recipient. The four `hs-e2e` store methods it needs already exist and are tested. The acceptance check is `cargo test -p hs-loadgen --test real_client_encrypted`, which logs two `KNOWN BUG` lines today and must stop.
+`hs-user`'s sync tokens (`hsu1_...`) are rejected by `hs-room`'s `PaginationToken`, so `GET /messages?from=<a sync token>` fails for any real client — which is exactly what a client does when scrolling back after a sync. This is the largest remaining cross-track gap and it needs a design decision, not a patch: one token format, or a documented conversion at the boundary. Complement failures in the room-messages tests trace back to it.
 
-### 3. Wire the PostgreSQL backend into `hs serve`
+### 3. Run two replicas against the one PostgreSQL
 
-`hs_kv::postgres_backend::PostgresBackend` exists and passes 9 of 11 conformance scenarios against a real PostgreSQL 17 (the two divergences are documented and understood — see `docs/status/01-storage-engine.md`). Nothing can open it yet: `crates/hs-cli/src/storage.rs` still answers `BackendNotImplemented` for `postgres`, and `spawn_serve` destructures `OpenedStorage::Embedded` irrefutably, so adding the variant means dispatching the generic server setup over two backend types. The exact steps are in that status file under "Wiring the integration lead must add", including the two config fields that have no effect yet (`tls`, which the backend does not support, and `pool_size`).
+`hs serve` runs on PostgreSQL as of 2026-09-19: set `storage.backend: postgres` and it boots, registers, serves, and survives a restart with its data intact (verified end to end, not just by the conformance suite — which passed while the backend could not serve a single request, twice over).
 
-Until this lands, no multi-replica deployment is possible, and every cluster feature in `hs-cluster` is a cluster over nothing shareable.
+What has *not* happened is two processes against one database at the same time. That is what every feature in `hs-cluster` — ownership, leases, fencing epochs, mesh RPC — was built for and has only ever been exercised in its own chaos harness. Start two `hs serve` processes on the same DSN and different ports and find out what breaks. Note the one conformance divergence that matters here: PostgreSQL gives true serializability, not the stronger any-write-into-a-scanned-range guarantee the single-process backends give, so a range-scan-based fencing pattern would not be safe there (point reads, which is what track 03 actually uses, are).
+
+`tls` is refused rather than ignored (the backend connects with NoTls), and `pool_size` is not plumbed through yet.
 
 ### 4. Backfill, so a join can be more than a join
 
@@ -62,17 +64,16 @@ With `send_join` persisting and `.well-known` served, the remaining blockers to 
 
 | Gap | Where | Consequence |
 |---|---|---|
-| History visibility not enforced on reads | `hs-room` | a user who left a private room can still read it |
-| `/sync` omits every E2EE field | `hs-user` | no client can decrypt anything; see RFC 0013 |
-| Room directory unserved | `hs-room` | published rooms never appear in `/publicRooms` |
+| `/sync` and `/messages` disagree on token format | `hs-user`, `hs-room` | a real client cannot paginate from a sync token |
+| `/context`'s `state` reads live state, not state at the event | `hs-room` | same bug class as history visibility, one path left |
 | No backfill | `hs-federation` | a join cannot be followed by history |
-| PostgreSQL backend not wired into `hs serve` | `hs-cli` | still single-node only in practice |
+| Nothing has ever run two replicas | `hs-cluster` | HA is unexercised outside its own harness |
+| Postgres `tls` refused, `pool_size` ignored | `hs-kv`, `hs-cli` | encrypt in front of the database for now |
 | SlateDB backend absent | `hs-kv` | deliberately not started |
 | Profile changes do not rewrite existing memberships | `hs-room` | a rename shows only in rooms joined afterwards |
 | Audit log is in-memory | `hs-admin` | admin history does not survive a restart |
 | Deferred and quarantine scan modes use a spawned task | `hs-media` | a crash loses an in-flight verdict |
 | Media upload quota unlimited | `hs-cli` | no config fields exist for it yet |
-| Cluster code exists but nothing runs multi-replica | `hs-cluster` | ownership, fencing and mesh are tested only in their own chaos harness |
 | `web/`'s unit tests and lint could not run | `web` | Vitest workers time out on a loaded machine; rerun `npm run check` when idle |
 | No nightly compiler on the build machine | `cargo fuzz` | fuzz targets type-check but have never been run |
 | Sytest never run | `tests/sytest` | CPAN dependencies are not installed here |
