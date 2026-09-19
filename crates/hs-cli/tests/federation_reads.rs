@@ -134,6 +134,24 @@ impl Harness {
         (status, body)
     }
 
+    /// The room's `m.room.create` event ID, read from the room itself. It cannot be read off a
+    /// federation response: a PDU for any room version this server creates carries no `event_id`
+    /// field, by design -- the recipient computes it from the reference hash.
+    async fn create_event_id(&self, room_id: &str) -> String {
+        let parsed = ruma::RoomId::parse(room_id).unwrap();
+        let handle = self.rooms.get_or_load(&parsed).await.unwrap();
+        handle
+            .query(|actor| {
+                actor
+                    .state_event("m.room.create", "")
+                    .ok()
+                    .flatten()
+                    .map(|event| event.event_id().to_string())
+            })
+            .await
+            .expect("every room has a create event")
+    }
+
     /// Creates a room owned by a local user, with one message in it. Returns
     /// `(room_id, message_event_id)`.
     async fn room_with_a_message(&self, world_readable: bool) -> (String, String) {
@@ -274,7 +292,7 @@ async fn a_world_readable_room_serves_its_events_as_full_pdus() {
 }
 
 #[tokio::test]
-async fn state_is_served_for_the_newest_event_and_refused_for_older_ones() {
+async fn state_is_served_for_any_event_including_historical_ones() {
     let harness = Harness::new().await;
     let (room_id, newest) = harness.room_with_a_message(true).await;
 
@@ -288,30 +306,39 @@ async fn state_is_served_for_the_newest_event_and_refused_for_older_ones() {
         "the room's state must include its create event: {pdus:?}"
     );
     assert!(
-        !body["auth_chain"]
-            .as_array()
-            .expect("auth_chain")
-            .is_empty(),
+        !body["auth_chain"].as_array().expect("auth_chain").is_empty(),
         "state must come with the auth chain needed to check it"
     );
 
-    // The create event is not the newest event, and this adapter does not reconstruct historical
-    // state -- it says so rather than answering with current state.
-    let create_id = pdus
-        .iter()
-        .find(|e| e["type"] == "m.room.create")
-        .and_then(|e| e["event_id"].as_str())
-        .map(str::to_owned);
-    if let Some(create_id) = create_id {
-        let (status, _) = harness
-            .signed_get(&format!("/state/{room_id}?event_id={create_id}"))
-            .await;
-        assert_eq!(
-            status,
-            StatusCode::NOT_FOUND,
-            "state at an older event must be refused, not answered with current state"
-        );
-    }
+    // State at the create event is the room's state *then*, not now. This is the case the adapter
+    // used to refuse outright rather than answer with current state; `RoomActor::state_at_event`
+    // is what made answering it possible, and the assertion that the two differ is what proves
+    // this is real history and not the current-state map wearing a different event ID.
+    let create_id = harness.create_event_id(&room_id).await;
+
+    let (status, early) = harness
+        .signed_get(&format!("/state/{room_id}?event_id={create_id}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{early}");
+    let early_pdus = early["pdus"].as_array().expect("pdus");
+    assert!(
+        early_pdus.len() < pdus.len(),
+        "state at the create event must be smaller than current state: {} vs {}",
+        early_pdus.len(),
+        pdus.len()
+    );
+    assert!(
+        !early_pdus
+            .iter()
+            .any(|e| e["type"] == "m.room.history_visibility"),
+        "history_visibility was set after the create event, so it is not in the state then: {early_pdus:?}"
+    );
+
+    // An event this server does not have is still a 404, not an empty state map.
+    let (status, _) = harness
+        .signed_get(&format!("/state/{room_id}?event_id=$nonexistent"))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

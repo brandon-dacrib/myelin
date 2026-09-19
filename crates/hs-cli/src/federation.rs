@@ -14,17 +14,14 @@
 //! # What these adapters will and will not answer
 //!
 //! Every method applies [`RegistryRoomSource::visible_to`] before returning any room content, as
-//! [`RoomDataSource`]'s contract requires. Beyond that, two endpoints answer *less* than the spec
+//! [`RoomDataSource`]'s contract requires. Beyond that, one endpoint answers *less* than the spec
 //! allows, deliberately:
 //!
-//! - **`/state` and `/state_ids` only answer for the room's most recent event.** `hs-room`'s
-//!   actor keeps one flat current-state map and has no historical state-at-an-event query, so the
-//!   only event whose state it can report correctly is the newest one in the timeline (whose
-//!   "state after" *is* the current state). Asked about any older event, this returns
-//!   [`RoomSourceError::NotFound`] rather than the current state, because answering a question
-//!   about the past with the present is how a remote server ends up with state it cannot detect
-//!   is wrong. Lifting this needs the state engine's historical snapshots, tracked in
-//!   `docs/status/06-federation.md`.
+//! - **`/openid/userinfo` answers nothing** (below) is now the only such case here. `/state` and
+//!   `/state_ids` used to refuse every event but the newest, because `hs-room` exposed no
+//!   historical state query and answering about the past with the present would have handed a
+//!   remote state it could not detect was wrong. `hs_room::actor::RoomActor::state_at_event`
+//!   lifted that: both endpoints now answer for any event this server holds.
 //! - **`/openid/userinfo` answers nothing**, because no OpenID token is ever issued: the
 //!   client-side `POST /user/{userId}/openid/request_token` endpoint does not exist yet, so there
 //!   is no token this could resolve and every call is an invalid token.
@@ -266,31 +263,6 @@ fn auth_chain_from<B: KvBackend>(actor: &RoomActor<B>, roots: &[String]) -> Vec<
     chain
 }
 
-/// The newest event in the room's timeline, which is the only event whose state this adapter can
-/// report (see the module doc).
-fn newest_event<B: KvBackend>(actor: &RoomActor<B>) -> Option<String> {
-    let (events, _) = actor.paginate(None, Direction::Backward, 1);
-    events.first().map(|e| e.event_id().to_string())
-}
-
-/// The room's current state, plus the auth chain reachable from it, as `/state` wants them.
-fn current_state_with_auth_chain<B: KvBackend>(
-    actor: &RoomActor<B>,
-) -> Result<(Vec<Value>, Vec<Value>), RoomSourceError> {
-    let state = actor
-        .full_state()
-        .map_err(|_| RoomSourceError::RoomNotFound)?;
-    let state_ids: Vec<String> = state.iter().map(|e| e.event_id().to_string()).collect();
-    let pdus: Vec<Value> = state.iter().map(|e| full_pdu(e)).collect();
-    // `/state`'s `auth_chain` is the auth chain of the state events, which (unlike
-    // `/event_auth`'s) conventionally includes the state events themselves: they are what the
-    // recipient must authenticate. Walking from the state events' own auth_events and then adding
-    // the state back is the same set without double-counting.
-    let mut chain = auth_chain_from(actor, &state_ids);
-    chain.extend(pdus.iter().cloned());
-    Ok((pdus, chain))
-}
-
 #[async_trait]
 impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
     async fn is_visible_to(&self, room_id: &str, requesting_server: &str) -> bool {
@@ -344,12 +316,30 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
     ) -> Result<(Vec<EventJson>, Vec<EventJson>), RoomSourceError> {
         let at = at_event_id.to_owned();
         self.with_visible_room(room_id, requesting_server, move |actor| {
-            if newest_event(actor).as_deref() != Some(at.as_str()) {
-                // Not a lie by omission: see the module doc. The alternative is answering a
-                // question about historical state with current state.
-                return Err(RoomSourceError::NotFound);
+            let event_id = ruma::EventId::parse(&at).map_err(|_| RoomSourceError::NotFound)?;
+            let at_state = actor
+                .state_at_event(&event_id)
+                .map_err(|_| RoomSourceError::NotFound)?
+                .ok_or(RoomSourceError::NotFound)?;
+
+            let pdus: Vec<Value> = at_state.state.iter().map(full_pdu).collect();
+            // `/state`'s `auth_chain` conventionally includes the state events themselves -- they
+            // are what the recipient has to authenticate -- while
+            // `RoomActor::state_at_event`'s `auth_chain` is strictly the ancestors. Adding the
+            // state back is what makes the two agree; see that method's doc, which names this
+            // call site.
+            let mut chain: Vec<Value> = at_state.auth_chain.iter().map(full_pdu).collect();
+            let already: HashSet<String> = at_state
+                .auth_chain
+                .iter()
+                .map(|event| event.event_id().to_string())
+                .collect();
+            for (event, rendered) in at_state.state.iter().zip(pdus.iter()) {
+                if !already.contains(&event.event_id().to_string()) {
+                    chain.push(rendered.clone());
+                }
             }
-            current_state_with_auth_chain(actor)
+            Ok((pdus, chain))
         })
         .await
     }
