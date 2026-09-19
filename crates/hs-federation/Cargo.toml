@@ -10,7 +10,15 @@ description = "Federation and security: server discovery, key server, X-Matrix r
 [dependencies]
 axum.workspace = true
 tokio.workspace = true
-reqwest.workspace = true
+# The workspace's own `rustls-tls` feature (`Cargo.toml`) resolves to `rustls-tls-webpki-roots`
+# only -- the ~140 public roots baked into the binary, never the OS trust store. Adding
+# `rustls-tls-native-roots` here (this crate's own `Cargo.toml`, not the workspace root) unlocks
+# `ClientBuilder::tls_built_in_native_certs`, which `client::client_for` uses to make
+# `FederationConfig::trust_os_root_store` an operator-controlled *toggle* rather than an always-on
+# default -- see that field's doc comment for why "off" is the right default. Purely additive:
+# `rustls-native-certs` and its platform dependencies were already resolved in the workspace's
+# `Cargo.lock` via another crate, so this adds no new crate to fetch.
+reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -46,3 +54,15 @@ hs-testkit = { path = "../hs-testkit" }
 tempfile.workspace = true
 tower = { workspace = true, features = ["util"] }
 rcgen.workspace = true
+# For `client::tests`' in-process TLS test (no Docker needed): `rcgen` mints a self-signed
+# certificate, `rustls`/`tokio-rustls`/`rustls-pki-types` terminate real TLS with it over a real
+# loopback socket, and `hyper`/`hyper-util`/`http-body-util` speak one plain HTTP/1.1 response
+# over the resulting stream -- proving `FederationConfig::custom_ca_certificates` actually changes
+# what `reqwest` trusts, not just that the field exists. All five are already
+# `[workspace.dependencies]` entries used elsewhere in the workspace.
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true

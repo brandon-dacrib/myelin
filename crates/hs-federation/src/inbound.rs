@@ -108,8 +108,27 @@ pub async fn verify_pdu(
         ));
     }
 
+    // Per the spec ("Validating hashes and signatures on received events", server-server API):
+    // "the event is redacted following the redaction algorithm, and the resultant object is
+    // checked for signatures ... Note that this step should succeed whether we have been sent
+    // the full event or a redacted copy." A conformant sender signs the *redacted* form of the
+    // event (see the same spec's "Adding hashes and signatures to outgoing events": hash, then
+    // redact, then sign) -- redaction is deterministic from `type` alone, so checking the
+    // signature against the unredacted object instead would reject any legitimately-signed event
+    // whose full content carries anything redaction would strip (almost every event with more
+    // than the bare minimum required content -- a join with a profile, a message with a body,
+    // ...). This was confirmed as a real bug via Complement (`docs/status/06-federation.md`):
+    // `send_join` was rejecting a genuinely, correctly signed join event with `M_BAD_JSON:
+    // signature ... does not verify` because it checked the full event instead of the redacted
+    // one.
+    let redacted = event.redacted_json().map_err(|e| {
+        reject(format!(
+            "cannot redact event for signature verification: {e}"
+        ))
+    })?;
+
     let sender_server = event.header().sender.server_name().as_str();
-    let key_id = signature_key_id(event.json(), sender_server)
+    let key_id = signature_key_id(&redacted, sender_server)
         .ok_or_else(|| reject(format!("no signature from sender's server {sender_server}")))?;
 
     let signed_at = u64::try_from(event.header().origin_server_ts).unwrap_or(0);
@@ -123,12 +142,13 @@ pub async fn verify_pdu(
             ))
         })?;
 
-    hs_model::signing::verify_object(event.json(), sender_server, &key_id, &verifying_key)
-        .map_err(|_| {
+    hs_model::signing::verify_object(&redacted, sender_server, &key_id, &verifying_key).map_err(
+        |_| {
             reject(format!(
                 "signature from {sender_server}/{key_id} does not verify"
             ))
-        })?;
+        },
+    )?;
 
     Ok(event)
 }
@@ -508,7 +528,18 @@ mod tests {
             ),
         );
         let server = ruma::ServerName::parse(sender.split_once(':').unwrap().1).unwrap();
-        sign_object(&mut object, &server, keys.primary()).unwrap();
+        // Per the spec's real signing order (hash, then redact, then sign the *redacted* object,
+        // then copy the signature back onto the full one) -- matches `verify_pdu`'s equally real
+        // verification order below. Signing the unredacted object directly (as a naive test would)
+        // produces a signature `verify_pdu` correctly rejects whenever `content` carries anything
+        // redaction would strip, which for `m.room.message` is everything.
+        let rules = hs_model::room_version::rules_for(&RoomVersionId::V11).unwrap();
+        let mut redacted = hs_model::redaction::redact(&object, &rules.redaction).unwrap();
+        sign_object(&mut redacted, &server, keys.primary()).unwrap();
+        object.insert(
+            "signatures".to_owned(),
+            redacted.remove("signatures").unwrap(),
+        );
         serde_json::from_slice(
             &hs_model::canonical::CanonicalJsonValue::Object(object).to_canonical_bytes(),
         )

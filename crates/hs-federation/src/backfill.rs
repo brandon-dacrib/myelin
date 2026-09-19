@@ -373,7 +373,18 @@ mod tests {
             ),
         );
         let server = ruma::ServerName::parse(sender.split_once(':').unwrap().1).unwrap();
-        hs_model::signing::sign_object(&mut object, &server, keys.primary()).unwrap();
+        // Sign the *redacted* object and copy the signature back onto the full one, matching the
+        // spec's real signing order and `verify_pdu`'s (equally real, since this session) matching
+        // verification order -- see `crate::inbound::verify_pdu`'s doc comment. Signing the
+        // unredacted `m.room.message` content directly would produce a signature `verify_pdu`
+        // correctly rejects, since redaction strips all of a message event's content.
+        let rules = hs_model::room_version::rules_for(&RoomVersionId::V11).unwrap();
+        let mut redacted = hs_model::redaction::redact(&object, &rules.redaction).unwrap();
+        hs_model::signing::sign_object(&mut redacted, &server, keys.primary()).unwrap();
+        object.insert(
+            "signatures".to_owned(),
+            redacted.remove("signatures").unwrap(),
+        );
         serde_json::from_slice(
             &hs_model::canonical::CanonicalJsonValue::Object(object).to_canonical_bytes(),
         )

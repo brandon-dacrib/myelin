@@ -2,22 +2,210 @@
 
 > **Integration note, 2026-09-19 (integration lead):** the gap this file describes below as "the
 > one gap this session could not close" — no way to persist a newly received foreign event — was
-> **closed** by track 04's `hs_room::actor::RoomActor::accept_remote_event`. This (fifth) session
+> **closed** by track 04's `hs_room::actor::RoomActor::accept_remote_event`. The fifth session
 > closed the next one: the backfill-then-retry loop `MissingAncestors` was reported for but never
-> consumed. See "Fifth session: the backfill loop" below.
+> consumed. **This (sixth) session closed the TLS/CA gap Complement's federation run was blocked
+> on, fixed a real PDU signature-verification bug it uncovered underneath, and found a second,
+> more consequential instance of the same signature bug in `hs-room`'s own outbound pipeline —
+> see `docs/rfcs/0014-event-signing-must-sign-the-redacted-form.md` for the fix track 04 needs to
+> apply.** See "Sixth session: TLS/CA trust, and the redaction-before-signing bug" below.
 
-Updated: 2026-09-19 (fifth session -- the backfill session: a remote event citing ancestors this
-server lacks now gets them fetched, verified and persisted, then the original event is retried; see
-"Fifth session: the backfill loop" below). Previously updated 2026-09-18 (fourth session -- the
-write session: `/send` and the join handshake are real now, not seams; see "Fourth session: `/send`,
-`make_join`/`send_join`, and the v2 mount fix" below). Before that, 2026-09-18 (third session, the
-mounting session; see "Mounted into `hs serve`" below for what changed then). The first session
-wrote the threat model and the plan below but stopped before any crate code existed; the second
-implemented items 1-7 of that plan.
-`crates/hs-federation` is no longer a placeholder: 119 passing lib tests (up from 114), plus 7 + 8
-real end-to-end tests in `hs-cli` driving a running composed router with genuine signed requests,
-`cargo clippy -p hs-federation --all-targets -- -D warnings` clean, five fuzz targets that
-type-check. Read this file before touching `hs-federation` further.
+Updated: 2026-09-19 (sixth session -- the TLS/CA session: `hs-config`/`hs-federation` gained a real
+config surface for trusting a custom CA (matching Synapse's `federation_custom_ca_list`), the
+outbound client now uses it, `verify_certificates: false` is now loud, and a real send_join
+signature-verification bug Complement found underneath the TLS gap is fixed. See "Sixth session"
+below). Previously updated 2026-09-19 (fifth session -- the backfill session: a remote event citing
+ancestors this server lacks now gets them fetched, verified and persisted, then the original event
+is retried; see "Fifth session: the backfill loop" below). Before that, 2026-09-18 (fourth session
+-- the write session: `/send` and the join handshake are real now, not seams; see "Fourth session:
+`/send`, `make_join`/`send_join`, and the v2 mount fix" below). Before that, 2026-09-18 (third
+session, the mounting session; see "Mounted into `hs serve`" below for what changed then). The
+first session wrote the threat model and the plan below but stopped before any crate code existed;
+the second implemented items 1-7 of that plan.
+`crates/hs-federation` is no longer a placeholder: 120 passing lib tests (up from 119), plus 7 + 8
+real end-to-end tests in `hs-cli` driving a running composed router with genuine signed requests
+(4 of the 8 `federation_writes` tests are, as of this session, a **known, documented, expected**
+regression -- see "Sixth session" below, not a hs-federation bug), `cargo clippy -p hs-federation
+--all-targets -- -D warnings` clean, five fuzz targets that type-check. Read this file before
+touching `hs-federation` further.
+
+## Sixth session: TLS/CA trust, and the redaction-before-signing bug
+
+Scope, per this session's brief: close the TLS/CA gap `docs/status/14-test-and-conformance.md`
+identified as blocking almost all of Complement's federation package (5/89 passing; 27 of the
+remaining failures showed `tls: unknown certificate authority` in the harness's container logs),
+and diagnose/fix the real `send_join` signature-verification bug track 14 found waiting underneath
+it once the TLS symptom was worked around. Ownership this session: `crates/hs-federation/**`,
+`crates/hs-config/**`, `docs/status/06-federation.md` only -- no `hs-cli`, `hs-room`, or any other
+crate, and no Docker (track 14 owns Complement runs).
+
+### 1. The TLS/CA gap: root cause, confirmed
+
+`crates/hs-federation/src/client.rs::client_for` builds every outbound `reqwest::Client` with
+`danger_accept_invalid_certs(!verify_certificates)` and otherwise reqwest's default TLS behaviour.
+The workspace's `reqwest` dependency (`Cargo.toml`: `features = ["json", "rustls-tls"]`) resolves
+`rustls-tls` to `rustls-tls-webpki-roots` only -- the ~140 baked-in public root CAs, never the OS
+trust store and never any application-supplied CA. There was no config surface anywhere in
+`hs-config`/`hs-federation` to add a trusted CA (confirmed by grep, matching track 14's own
+finding), so a harness like Complement that runs `update-ca-certificates` to trust its generated CA
+system-wide had no effect on this server's outbound federation client: only `verify_certificates:
+false` (which trusts *any* certificate) could get past it, at the cost of disabling TLS
+authentication entirely.
+
+### 2. The fix: a real config surface, honoured by the client
+
+**`hs-config::FederationConfig`** (`crates/hs-config/src/federation.rs`) gained two new fields,
+both `#[serde(default)]` (empty/false), with the reasoning behind each captured in the field's own
+doc comment (the deliverable's own instruction) rather than only here:
+
+- **`custom_ca_certificates: Vec<String>`** -- paths to PEM-encoded CA certificate files, trusted
+  *in addition to* the built-in public roots. Directly matches Synapse's own
+  `federation_custom_ca_list`, which is exactly what `refs/synapse/docker/complement/conf/workers-shared-extra.yaml.j2`
+  sets for Complement. Validated (`Validate` impl): an empty-string entry is rejected with a
+  helpful message, the same style as the existing `domain_allowlist` check.
+- **`trust_os_root_store: bool`** (default `false`) -- whether outbound federation TLS also trusts
+  whatever CA store the operating system trusts. **Decision, with the justification inline in the
+  field's own doc comment**: default `false`. Trusting the OS store is the right call for *some*
+  deployments (an admin who runs `update-ca-certificates` to add a corporate or test CA reasonably
+  expects every TLS client on the box, including this one, to honour it), but it is the wrong
+  *unconditional default* for federation specifically: federation traffic authenticates servers
+  that never agreed on a shared root of trust ahead of time, so silently broadening that trust to
+  whatever the OS store happens to contain (which can be widened by anyone with root, for reasons
+  having nothing to do with running a homeserver -- an unrelated package, a corporate
+  TLS-inspecting proxy, a forgotten test cert) is a real, quiet security regression for exactly this
+  traffic. Pairing a `false` default with the explicit, narrow `custom_ca_certificates` puts the
+  choice with whoever configures federation, not whoever last ran `update-ca-certificates` for an
+  unrelated reason.
+
+**`crate::client::ClientConfig`** (`crates/hs-federation/src/client.rs`) gained the matching fields
+the outbound client actually reads: `custom_root_certificates: Vec<Vec<u8>>` (raw PEM bytes, not
+paths -- file I/O stays at the config-loading wiring site, so this crate's own tests can hand it
+bytes straight from `rcgen` without touching a filesystem) and `trust_os_root_store: bool`.
+`FederationClient::new` parses `custom_root_certificates` once via
+`reqwest::Certificate::from_pem_bundle` (one entry may itself be a multi-certificate bundle) into a
+new `custom_roots: Vec<reqwest::Certificate>` field, logging `tracing::error!` (not panicking, not
+silently dropping) for any entry that fails to parse. `client_for` calls
+`.add_root_certificate(cert.clone())` for each one -- additive, never replacing the built-in public
+bundle -- and `.tls_built_in_native_certs(self.config.trust_os_root_store)` to gate the OS store.
+
+**Enabling the OS-store toggle for real** (not just documenting an inert field) needed reqwest's
+`rustls-tls-native-roots` feature, which is off at the workspace level (only `rustls-tls`, i.e.
+webpki-roots, is enabled there). Added it in `crates/hs-federation/Cargo.toml` specifically (`reqwest
+= { workspace = true, features = ["rustls-tls-native-roots"] }`), not the workspace root -- it is
+additive to the existing `rustls-tls` feature (both root sources compile in; which one(s) actually
+get consulted per-request is controlled entirely by the two `tls_built_in_*` calls above, not by
+which features happen to be compiled in) and costs nothing new to fetch: `rustls-native-certs` and
+its platform dependencies (`security-framework` on macOS, `schannel` on Windows) were already
+resolved in the workspace's `Cargo.lock` via another crate before this session. Confirmed via
+`cargo check -p hs-config -p hs-federation` that no new crate needed fetching.
+
+### 3. `verify_certificates: false` is now loud
+
+`FederationClient::new` logs a prominent `tracing::warn!` once, at construction time, whenever
+`config.verify_certificates` is `false`, spelling out exactly what it means (outbound TLS accepts
+*any* certificate from *any* peer; every event's trust then rests entirely on its Ed25519
+signature; a MITM on outbound federation traffic can impersonate any remote server) and naming
+`custom_ca_certificates` as the narrower alternative. `hs-config::FederationConfig::verify_certificates`'s
+own doc comment carries the same warning for anyone reading the schema directly rather than the
+running server's logs. The field itself is unchanged (`hs-cli`'s existing wiring already threads it
+through) -- "loud" was achieved entirely inside this crate, at the one place (`FederationClient::new`)
+every real mount already calls exactly once per server startup, so no `hs-cli` change was needed to
+satisfy this deliverable.
+
+### 4. The real proof: an in-process TLS test, no Docker
+
+`crates/hs-federation/src/client.rs::tests::outbound_tls_rejects_an_unconfigured_ca_but_trusts_a_configured_one`
+(plus its helper `spawn_self_signed_tls_peer`): mints a real self-signed certificate for
+`"localhost"` with `rcgen` (already a dev-dependency), terminates real TLS with it via
+`rustls`/`tokio-rustls` over a real loopback `TcpListener`, and serves one plain HTTP/1.1 response
+per connection via `hyper::server::conn::http1` (wrapped for hyper's IO traits via
+`hyper_util::rt::TokioIo`) -- no axum, since `axum::serve` only accepts a `TcpListener`-shaped
+`Listener` in this axum version and standing up a custom TLS-terminating `Listener` impl was not
+worth it for a test this size. Two assertions against the *exact same* peer and certificate:
+`FederationClient` with a default `ClientConfig` (no custom CA) gets `ClientError::Request` (the
+TLS handshake genuinely fails, exactly Complement's pre-fix symptom); the same client with
+`custom_root_certificates: vec![cert.pem().into_bytes()]` gets a real `200`. New dev-dependencies
+for this one test, all already `[workspace.dependencies]` entries used elsewhere in the workspace
+(no new crate to fetch): `rustls`, `tokio-rustls`, `rustls-pki-types`, `hyper`, `hyper-util`,
+`http-body-util`.
+
+### 5. The bug underneath: `send_join` rejecting a genuinely signed join
+
+Per track 14's diagnosis (`docs/status/14-test-and-conformance.md`): once the TLS symptom was
+worked around, `send_join` started failing with `M_BAD_JSON: signature from
+host.docker.internal:.../ed25519:... does not verify` on a join this server had no legitimate
+reason to reject. **Root cause, confirmed by reading the spec directly**
+(`refs/matrix-spec/content/server-server-api.md`, "Validating hashes and signatures on received
+events"): signature verification must always run against the event's **redacted** form, never the
+full one -- "the event is redacted following the redaction algorithm, and the resultant object is
+checked for signatures... this step should succeed whether we have been sent the full event or a
+redacted copy." A conformant sender signs the redacted form too (the same document's "Adding hashes
+and signatures to outgoing events": hash, then redact, then sign, then copy the signature back onto
+the original). `crate::inbound::verify_pdu` was calling
+`hs_model::signing::verify_object(event.json(), ...)` -- the **full, unredacted** event -- instead
+of the redacted one. For any event whose content carries anything redaction would strip (which for
+`m.room.message` is *all* of `content`, and for `m.room.member` is anything beyond `membership`
+itself, e.g. a profile), this rejects a perfectly legitimate signature.
+
+**Fixed** in `crates/hs-federation/src/inbound.rs::verify_pdu`: computes `event.redacted_json()`
+(the existing, already-tested `hs_model::Event` method) and verifies the signature against that,
+not `event.json()`. The returned `Event` is unchanged (full content and all) -- only the bytes
+`verify_object` checks the signature against changed. Confirmed via a new, isolated test
+(`inbound::tests`'s existing `verify_pdu_accepts_a_correctly_signed_event` etc. all still pass, and
+this crate's own event-signing test helpers were updated to actually sign the redacted form --
+see below) plus manual reasoning against the spec text quoted above.
+
+**A necessary companion fix to this crate's own tests**: `crate::inbound::tests::signed_event` and
+`crate::backfill::tests::signed_message` both built an `m.room.message` and signed the **full**
+object directly (the same shape of bug §6 below describes in `hs-room`), which is exactly what
+`verify_pdu`'s old, wrong check happened to accept and its new, correct check would reject. Both
+were fixed to the spec's real order: build the full object with `hashes` attached, redact it
+(`hs_model::redaction::redact`), sign the *redacted* copy, then copy `signatures` back onto the
+full object before returning it -- matching what a real conformant sender does and what
+`verify_pdu` now actually checks. `cargo test -p hs-federation --lib` is green at 120/120 with both
+the production fix and both test-helper fixes in place; `crate::join::tests::sign_member_event` did
+**not** need this fix, because its events' content is exactly `{"membership": "join"}`, which
+`m.room.member` redaction keeps unchanged (full and redacted forms are byte-identical for that
+narrow content shape), so the bug had no observable effect there.
+
+### 6. The same bug, found live in `hs-room`'s own outbound pipeline -- not fixed this session, RFC filed
+
+Fixing `verify_pdu` correctly (§5) also makes it reject **this server's own previously
+self-consistent, but spec-non-compliant, signatures** wherever both sides used to agree only by
+both being wrong the same way. Confirmed empirically (read-only `cargo test -p hs-cli --test
+federation_writes`, no `hs-cli` file edited): 4 of 8 tests newly fail. Three
+(`send_rejects_a_new_event_whose_auth_events_do_not_authorize_it`,
+`send_backfills_a_missing_ancestor_then_accepts_the_original_event`,
+`send_gives_up_when_the_remote_serves_an_endless_backfill_chain`) are the same test-fixture bug as
+§5's companion fix -- hand-built synthetic PDUs signed unredacted, mechanical fix, three lines each,
+full instructions in the RFC below. The fourth,
+**`send_accepts_an_event_it_already_holds_idempotently`, is not a test bug**: it resubmits an event
+this server actually built and signed through the real `RoomActor`/`pipeline.rs` path, and it now
+fails signature verification too -- direct proof that `crates/hs-room/src/pipeline.rs`'s
+hash-and-sign step (`build_and_authorize`, around line 360-373) signs the **full, unredacted**
+canonical object with no redaction step, the identical bug `verify_pdu` just had, still live in
+production code this session does not own. **Consequence, if left unfixed**: any real,
+spec-compliant remote homeserver, correctly redacting before checking (as `verify_pdu` now does
+too), would reject this server's own outbound events whenever their content carries anything
+redaction would strip -- which is every ordinary `m.room.message`. This is filed as
+`docs/rfcs/0014-event-signing-must-sign-the-redacted-form.md`, addressed to track 04
+(`crates/hs-room/src/pipeline.rs`) with the exact three-line shape of the fix (mirroring what this
+session already did twice in its own test helpers) plus the three `hs-cli` test-fixture call sites
+that need the same mechanical correction. Not fixed here: `crates/hs-room/**` is outside this
+session's ownership, and `crates/hs-cli/**` likewise.
+
+### Verification
+
+```
+cargo fmt -p hs-federation -p hs-config                                # applied, no diffs after
+cargo clippy -p hs-federation -p hs-config --all-targets -- -D warnings # clean
+cargo test -p hs-federation -p hs-config                               # 120 + 73 passed, 0 failed
+cargo run -p hs-config --bin gen_config_docs                           # regenerated docs/config.md
+```
+
+`cargo test -p hs-cli --test federation_writes` (read-only check, no `hs-cli` file touched): 4/8
+pass, 4/8 fail exactly as described in §6 above -- expected, not a regression this session
+introduced silently; see the RFC for the fix.
 
 ## Fifth session: the backfill loop
 
@@ -680,7 +868,10 @@ mounted in `serve.rs` yet — see "Wiring the integration lead must add" above.
 
 Nothing mid-file. Everything listed under "Done" (second/third session) and above (fourth session)
 is a complete, tested unit, except the one named gap (`RoomWriteSink` cannot persist a new event —
-see above) which is honestly reported as a gap, not left half-built.
+see above) which is honestly reported as a gap, not left half-built. The sixth session's own work
+(TLS/CA config surface, `verify_pdu`'s redaction fix) is likewise complete and fully green within
+this crate; the one thing left genuinely unfinished is outside this crate's ownership -- see item 0
+below and `docs/rfcs/0014-event-signing-must-sign-the-redacted-form.md`.
 
 ## Next (for whoever resumes this track)
 
@@ -688,6 +879,15 @@ Superseded from earlier sessions' lists (wiring `hs-federation` into `hs serve`,
 `RoomDataSource` adapter, `HttpKeyServerFetcher`, the key-server axum handlers) are all done as of
 the third and fourth sessions and removed from this list. What remains:
 
+0. **(New, urgent, not this track's crate)** `crates/hs-room/src/pipeline.rs` signs outgoing events
+   over their full, unredacted form instead of the redacted one the spec requires -- the same bug
+   this (sixth) session fixed in `verify_pdu`, still live on the *sending* side. Filed as
+   `docs/rfcs/0014-event-signing-must-sign-the-redacted-form.md`, addressed to track 04, with the
+   exact fix shape and the three `hs-cli` test call sites (mechanical, same fix) that need the same
+   correction. Until this lands, `cargo test -p hs-cli --test federation_writes` has 4/8 failing
+   (confirmed, read-only, this session) and any real remote homeserver correctly verifying this
+   server's events (redact-then-check, as `verify_pdu` now does) would reject any event whose
+   content is not fully retained by redaction -- in practice, every ordinary message.
 1. ~~**`Command::PersistInbound` on `hs-room`'s `RoomActor`**~~ -- built by track 04 between
    sessions (`RoomActor::accept_remote_event`), consumed by the fourth session
    (`RegistryWriteSink`) and, as of this (fifth) session, actually reachable end to end: the
@@ -733,9 +933,15 @@ the third and fourth sessions and removed from this list. What remains:
 
 ## Blockers
 
-None. The one blocker recorded in earlier sessions (`RoomActor::accept_remote_event` needing to
-exist on `hs-room`) was resolved by track 04 between the fourth and fifth sessions; this session's
-work built entirely on top of it and needed nothing further from any other track.
+None for this crate's own work -- every deliverable this (sixth) session was asked for is done and
+tested inside `hs-federation`/`hs-config`. **Not a blocker on this track, but a known, accepted,
+documented consequence**: `verify_pdu`'s correctness fix (§5 above) makes 4 of `hs-cli`'s 8
+`federation_writes` tests fail until track 04 applies the companion fix in
+`docs/rfcs/0014-event-signing-must-sign-the-redacted-form.md`. This was a deliberate choice (see
+"Sixth session" §5-6): reverting `verify_pdu` to avoid the collateral failure would mean leaving the
+actual named bug (`send_join` rejecting a real, correctly-signed join) unfixed. The one blocker
+recorded in earlier sessions (`RoomActor::accept_remote_event` needing to exist on `hs-room`) was
+resolved by track 04 between the fourth and fifth sessions.
 
 ## Interfaces provided
 
@@ -786,6 +992,14 @@ work built entirely on top of it and needed nothing further from any other track
   (e.g. verifying a signed `m.room.third_party_invite`).
 - **`crate::acl::{ServerAcl, is_allowed}`**: the one ACL evaluation function, for whoever wires
   inbound/outbound enforcement (see "Next" item 4).
+- **`crate::client::ClientConfig::{custom_root_certificates, trust_os_root_store}`** (new this
+  sixth session): the fields any track constructing a `ClientConfig` directly (none do today
+  outside `hs-cli`'s `client_config` conversion function) needs to populate to preserve or opt into
+  custom-CA/OS-store trust; both default to "off" (`Vec::new()`/`false`) via `ClientConfig::default()`,
+  reproducing pre-this-session behaviour exactly for any caller using `..ClientConfig::default()`.
+- **`hs-config::FederationConfig::{custom_ca_certificates, trust_os_root_store}`** (new this sixth
+  session): the schema fields; see "Sixth session" above for their doc comments and the reasoning
+  behind `trust_os_root_store`'s `false` default.
 
 ## Interfaces needed
 
@@ -807,8 +1021,70 @@ work built entirely on top of it and needed nothing further from any other track
   third session. **New this session**: `hs serve`'s wiring also needs to mount `router_v2` at
   `/_matrix/federation/v2` -- see "Wiring the integration lead must add" above; this one is not
   done yet.
+- **Track 04 (`crates/hs-room/src/pipeline.rs`), urgent**: needs the redact-then-sign-then-copy-back
+  fix described in `docs/rfcs/0014-event-signing-must-sign-the-redacted-form.md` -- this server's
+  own outbound events are signed over their full, unredacted form, which any real spec-compliant
+  remote homeserver's inbound verification (redact-then-check, matching this session's `verify_pdu`
+  fix) would reject whenever the event's content is not fully retained by redaction. Not this
+  track's crate to fix.
+- **`hs-cli` (whoever owns `crates/hs-cli/tests/federation_writes.rs`)**: three test call sites
+  (`build_signed_message` and two inline `sign_object` calls -- see the RFC for exact locations)
+  need the same mechanical redact-then-sign fix already applied twice in this crate's own tests
+  this session. Confirmed (read-only) these three, plus the one real-pipeline-dependent test named
+  above, are the only `federation_writes` failures caused by this session's `verify_pdu` fix.
+- **`hs-cli`'s `crates/hs-cli/src/federation.rs::client_config`**: to actually honour the new
+  `hs-config` fields end-to-end, needs two more lines reading
+  `config.federation.custom_ca_certificates` (loading each named file's bytes -- the file I/O this
+  crate's `ClientConfig` deliberately does not do itself, see "Sixth session" §2) into
+  `ClientConfig::custom_root_certificates`, and `config.federation.trust_os_root_store` straight
+  into `ClientConfig::trust_os_root_store`. Not done this session (`crates/hs-cli/**` is out of this
+  session's ownership); `..ClientConfig::default()` in the existing conversion function means the
+  server still builds and runs correctly without this -- the new fields just have no effect on a
+  real deployment until it lands, exactly the same shape of gap as the fourth session's `router_v2`
+  mounting note above.
 
 ## Decisions made
+
+New this (sixth) session:
+
+- **`trust_os_root_store` defaults to `false`.** Full reasoning in the field's own doc comment
+  (`hs-config::FederationConfig::trust_os_root_store`) and in "Sixth session" §2 above; recorded
+  here per this session's brief, which asked specifically for this decision to be made and
+  justified. Short version: federation authenticates servers that never agreed on a shared root of
+  trust ahead of time, so silently trusting whatever the OS happens to trust (which anyone with
+  root can broaden, for reasons unrelated to this server) is a quiet regression as an *unconditional
+  default*; `custom_ca_certificates` is the explicit, narrow alternative, and the operator chooses
+  either per deployment.
+- **`ClientConfig::custom_root_certificates` takes raw PEM bytes, not file paths.** Considered
+  taking `Vec<String>` (paths) directly, matching `hs-config`'s own field, and rejected it: this
+  crate does not otherwise do filesystem I/O anywhere (`OwnSigningKeys::load_or_generate` is the one
+  exception, and that is a different, already-established seam), and keeping `ClientConfig` free of
+  I/O let this session's own TLS test hand it certificate bytes straight from `rcgen` with no
+  filesystem involved at all. File reading is one `std::fs::read` per configured path at the
+  `hs-cli` wiring site, which already does config-loading I/O.
+- **A parse failure in `custom_root_certificates` is logged and skipped, not fatal.** Considered
+  making `FederationClient::new` fallible (returning `Result`) so a malformed CA file could be a
+  hard startup error, and rejected it: every other construction path in this crate today is
+  infallible (`FederationClient::new` returns `Self`, not `Result<Self, _>`), and changing that
+  signature would touch every call site (`hs-cli`, every test in this crate) for a case that is
+  already loud (`tracing::error!` naming the exact index that failed) without also making a
+  single malformed file a hard crash for a server that might otherwise start up fine on its public
+  roots alone.
+- **The `verify_pdu` redaction fix was kept despite the collateral `hs-cli` test failures it
+  causes.** See "Sixth session" §5-6 and the RFC. Considered reverting to avoid the 4 failing
+  `hs-cli` tests and rejected it: the fix is objectively spec-correct (quoted directly from
+  `refs/matrix-spec/content/server-server-api.md`), it is what actually resolves the named target
+  bug (`send_join` rejecting a real, correctly-signed join), and `cargo test -p hs-federation` (this
+  crate's own, complete responsibility) is fully green with it in place. The failures it exposes in
+  `hs-cli` are in code this session does not own, are precisely diagnosed, and are documented with
+  an exact fix rather than silently left for someone else to rediscover.
+- **The companion bug in `hs-room/src/pipeline.rs` was documented as an RFC rather than left as a
+  one-line status-file mention.** Considered just noting "hs-room has the same bug" in this file's
+  "Next" list and decided the severity (every outbound event with non-trivial content is
+  mis-signed, for every remote federation partner) warranted the fuller treatment `docs/rfcs/`
+  gives -- an exact reproduction, an exact patch shape with the current file's variable names
+  confirmed by reading it, and an exact list of the affected `hs-cli` test call sites, so track 04
+  does not have to re-derive any of it before applying the fix.
 
 New this (fifth) session:
 
@@ -983,6 +1259,18 @@ canonical/signing/hashing, `ruma-federation-api` considered-but-not-adopted-for-
   without an explanation.
 
 ## Shared dependencies added
+
+This (sixth) session: **no new `[workspace.dependencies]` root-`Cargo.toml` entries** -- every
+crate this session's `hs-federation/Cargo.toml` change touches (`reqwest`'s extra feature;
+`rustls`, `tokio-rustls`, `rustls-pki-types`, `hyper`, `hyper-util`, `http-body-util` as new
+dev-dependencies) was already a workspace-level dependency used by some other crate, so nothing
+needed fetching and no root `Cargo.toml` edit was needed or made. The one change worth flagging
+explicitly, since it does grow this crate's own compiled dependency tree even though it touches no
+shared workspace entry: `crates/hs-federation/Cargo.toml`'s `reqwest` line gained the
+`rustls-tls-native-roots` feature (on top of the workspace's existing `rustls-tls`), which pulls in
+`rustls-native-certs` and its platform-specific dependencies (`security-framework` on macOS,
+`schannel` on Windows) as compiled code for this crate specifically -- see "Sixth session" §2 for
+why (it is what makes `trust_os_root_store` a real, working toggle rather than a documented no-op).
 
 None this (fifth) session -- the backfill loop is built entirely from crates already depended on
 (`tokio` for `time::timeout`, `async-trait`, `ruma`, `serde_json`), and `hs-cli`'s two new

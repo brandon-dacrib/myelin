@@ -61,8 +61,50 @@ pub struct FederationConfig {
 
     /// Verify TLS certificates on outbound federation requests.
     /// Corresponds to Synapse's `federation_verify_certificates`.
+    ///
+    /// Leave this `true` in production: setting it `false` makes outbound federation TLS accept
+    /// *any* certificate, which is trivially machine-in-the-middled. It exists for test
+    /// deployments and conformance harnesses (Complement and similar) that terminate TLS with a
+    /// certificate this server has no other way to trust yet. The outbound client logs a
+    /// prominent startup warning whenever this is `false`, precisely so it cannot go unnoticed in
+    /// a real deployment. Prefer [`Self::custom_ca_certificates`] instead, if the actual goal is
+    /// federating with one specific server whose certificate chains to a CA this server does not
+    /// already trust — that trusts exactly the named CA, not every certificate on the internet.
     #[serde(default = "default_true")]
     pub verify_certificates: bool,
+
+    /// Paths to additional PEM-encoded CA certificate files trusted for outbound federation TLS,
+    /// on top of (never instead of) the ~140 public root CAs this server trusts by default.
+    /// Corresponds to Synapse's `federation_custom_ca_list`. This is the answer to "how do I
+    /// federate with a server whose certificate was issued by a CA that is not one of the public
+    /// roots" without resorting to [`Self::verify_certificates`], which would trust every
+    /// certificate rather than just the one CA actually meant: name the CA's certificate file
+    /// here. A conformance harness's generated CA (Complement) and an internal deployment's
+    /// private CA are both meant to be configured this way.
+    #[serde(default)]
+    pub custom_ca_certificates: Vec<String>,
+
+    /// Whether outbound federation TLS also trusts whatever CA store the *operating system*
+    /// trusts, in addition to this server's bundled public root CAs. Defaults to `false`.
+    ///
+    /// Trusting the OS store is the right choice for some deployments: an administrator who runs
+    /// `update-ca-certificates` (or the platform equivalent) to add a corporate or internal CA
+    /// reasonably expects every TLS client on that machine, including this one, to honour it
+    /// automatically, and it is what many other pieces of server software do by default. It is
+    /// the wrong choice as this *server's* unconditional default, though: outbound federation
+    /// traffic authenticates events between servers that never agreed on a shared root of trust
+    /// ahead of time (unlike, say, an internal service mesh with its own CA hierarchy), so
+    /// silently broadening federation's trust to include every CA some unrelated piece of
+    /// installed software, corporate TLS-inspecting proxy, or forgotten test certificate has
+    /// added to the OS store is a real, if quiet, security regression for exactly the traffic
+    /// this setting controls — and it is a regression the operator of *this* server may not even
+    /// have chosen (the OS store can be broadened by anyone with root on the machine, for reasons
+    /// having nothing to do with running a homeserver). Defaulting to `false` and pairing it with
+    /// [`Self::custom_ca_certificates`] for the explicit, narrow case (name exactly the CA meant
+    /// to be trusted) keeps that choice with the person configuring federation, not with whoever
+    /// last ran an unrelated `update-ca-certificates`.
+    #[serde(default)]
+    pub trust_os_root_store: bool,
 
     /// Per-request timeout for outbound federation HTTP calls. Corresponds
     /// to Synapse's `federation_client_timeout`.
@@ -95,6 +137,8 @@ impl Default for FederationConfig {
             ip_range_blocklist: default_ip_range_blocklist(),
             ip_range_allowlist: Vec::new(),
             verify_certificates: true,
+            custom_ca_certificates: Vec::new(),
+            trust_os_root_store: false,
             client_timeout: default_client_timeout(),
             max_retry_backoff: default_max_retry_backoff(),
             allow_public_rooms_over_federation: false,
@@ -151,6 +195,14 @@ impl Validate for FederationConfig {
             &self.ip_range_allowlist,
             errors,
         );
+        for (i, path) in self.custom_ca_certificates.iter().enumerate() {
+            if path.trim().is_empty() {
+                errors.push(
+                    format!("{prefix}.custom_ca_certificates[{i}]"),
+                    "must not be empty",
+                );
+            }
+        }
         if self.client_timeout.is_zero() {
             errors.push(format!("{prefix}.client_timeout"), "must be greater than 0");
         }
@@ -186,6 +238,23 @@ mod tests {
         let mut errors = ValidationErrors::new();
         cfg.validate("federation", &mut errors);
         assert_eq!(errors.0[0].path, "federation.ip_range_blocklist[0]");
+    }
+
+    #[test]
+    fn custom_ca_certificates_and_trust_os_root_store_default_off() {
+        let cfg = FederationConfig::default();
+        assert!(cfg.custom_ca_certificates.is_empty());
+        assert!(!cfg.trust_os_root_store);
+        assert!(cfg.verify_certificates);
+    }
+
+    #[test]
+    fn rejects_an_empty_custom_ca_certificate_path() {
+        let mut cfg = FederationConfig::default();
+        cfg.custom_ca_certificates = vec!["  ".into()];
+        let mut errors = ValidationErrors::new();
+        cfg.validate("federation", &mut errors);
+        assert_eq!(errors.0[0].path, "federation.custom_ca_certificates[0]");
     }
 
     #[test]

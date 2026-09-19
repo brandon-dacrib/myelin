@@ -112,7 +112,29 @@ pub struct ClientConfig {
     pub enabled: bool,
     pub domain_policy: DomainPolicy,
     pub ip_policy: IpPolicy,
+    /// Whether outbound federation TLS validates the peer's certificate at all. See
+    /// [`FederationClient::new`]'s doc for the loud warning this crate emits when this is `false`
+    /// — every real deployment must leave this `true`; it exists for test harnesses (Complement,
+    /// ...) that terminate TLS with a certificate this server has no other way to trust yet.
     pub verify_certificates: bool,
+    /// Additional CA certificates trusted for outbound federation TLS, as raw PEM bytes (each
+    /// entry may itself be a bundle of more than one certificate — see
+    /// [`reqwest::Certificate::from_pem_bundle`]). This is the config surface's answer to "how do
+    /// I federate with a server whose certificate chains to a CA that is not one of the ~140
+    /// public roots this server trusts by default": name the CA explicitly here (matching
+    /// Synapse's `federation_custom_ca_list`), rather than reaching for
+    /// [`Self::verify_certificates`], which trusts *any* certificate at all. Added on top of —
+    /// never in place of — the built-in public root bundle, so ordinary public federation is
+    /// unaffected. `hs-config::FederationConfig::custom_ca_certificates` is the schema field this
+    /// is built from (file paths); reading the files is left to the wiring site that already
+    /// does I/O for config loading, so this crate's own tests can supply certificate bytes
+    /// directly (e.g. from `rcgen`) without touching a filesystem.
+    pub custom_root_certificates: Vec<Vec<u8>>,
+    /// Whether outbound federation TLS also trusts whatever CA store the operating system
+    /// trusts. See `hs-config::FederationConfig::trust_os_root_store`'s doc comment for the
+    /// default (`false`) and the reasoning; this field exists purely so this crate's own tests
+    /// can exercise the toggle without a real `hs-config` value.
+    pub trust_os_root_store: bool,
     pub request_timeout: Duration,
     pub max_retry_backoff: Duration,
     pub per_destination_concurrency: usize,
@@ -134,6 +156,8 @@ impl Default for ClientConfig {
             domain_policy: DomainPolicy::default(),
             ip_policy: IpPolicy::default(),
             verify_certificates: true,
+            custom_root_certificates: Vec::new(),
+            trust_os_root_store: false,
             request_timeout: Duration::from_secs(30),
             max_retry_backoff: Duration::from_secs(3600),
             per_destination_concurrency: DEFAULT_PER_DESTINATION_CONCURRENCY,
@@ -164,6 +188,12 @@ pub struct FederationClient {
     /// [`ResolveOutcome`] differs from what is cached (no proactive TTL-based invalidation this
     /// pass — see `docs/status/06-federation.md`).
     http_clients: std::sync::Mutex<HashMap<String, (ResolveOutcome, reqwest::Client)>>,
+    /// `config.custom_root_certificates`, parsed once at construction rather than on every
+    /// `client_for` rebuild. An entry that fails to parse is dropped with a loud `tracing::error!`
+    /// (not a panic and not a silent skip) — a malformed CA file should be visibly wrong at
+    /// startup, not a mysterious TLS failure the first time this server tries to reach the peer
+    /// it was meant to trust.
+    custom_roots: Vec<reqwest::Certificate>,
 }
 
 impl FederationClient {
@@ -177,6 +207,30 @@ impl FederationClient {
         srv: Arc<dyn SrvResolver>,
         addr: Arc<dyn AddrResolver>,
     ) -> Self {
+        if !config.verify_certificates {
+            tracing::warn!(
+                "federation.verify_certificates is FALSE: outbound federation TLS will accept \
+                 ANY certificate, valid or not, from ANY peer. Every event this server receives \
+                 over federation is only as trustworthy as its Ed25519 signature at that point \
+                 -- an attacker who can intercept outbound federation traffic can impersonate any \
+                 remote server. This is a test-harness escape hatch (e.g. Complement, which \
+                 terminates TLS with a certificate this server has no other way to trust yet) and \
+                 must never be set on a production deployment. Prefer \
+                 `federation.custom_ca_certificates` to trust a specific, known CA instead."
+            );
+        }
+
+        let mut custom_roots = Vec::with_capacity(config.custom_root_certificates.len());
+        for (i, pem) in config.custom_root_certificates.iter().enumerate() {
+            match reqwest::Certificate::from_pem_bundle(pem) {
+                Ok(certs) => custom_roots.extend(certs),
+                Err(e) => tracing::error!(
+                    "federation.custom_ca_certificates[{i}] could not be parsed as a PEM \
+                     certificate (or bundle) and will NOT be trusted: {e}"
+                ),
+            }
+        }
+
         Self {
             own_server_name: own_server_name.into(),
             signing_key,
@@ -187,6 +241,7 @@ impl FederationClient {
             addr,
             semaphores: std::sync::Mutex::new(HashMap::new()),
             http_clients: std::sync::Mutex::new(HashMap::new()),
+            custom_roots,
         }
     }
 
@@ -398,7 +453,16 @@ impl FederationClient {
         let mut builder = reqwest::Client::builder()
             .timeout(self.config.request_timeout)
             .danger_accept_invalid_certs(!self.config.verify_certificates)
+            // The ~140 public webpki roots are always trusted (this call never disables them);
+            // whether the OS trust store is *also* trusted is the operator's explicit choice --
+            // see `hs-config::FederationConfig::trust_os_root_store`'s doc comment for why the
+            // default is `false`.
+            .tls_built_in_native_certs(self.config.trust_os_root_store)
             .http1_only(); // HTTP/1.1-only to peers, per the recorded decision.
+
+        for cert in &self.custom_roots {
+            builder = builder.add_root_certificate(cert.clone());
+        }
 
         if let Some(ip) = connect_addr {
             builder = builder.resolve(
@@ -697,6 +761,99 @@ mod tests {
         assert!(requests[0].path.contains("v=$missing"));
         assert!(requests[0].path.contains("limit=50"));
         handle.abort();
+    }
+
+    /// Terminates real TLS (`rustls` via `tokio-rustls`, a real handshake over a real loopback
+    /// socket) with a certificate self-signed by a CA no one but this test knows about --
+    /// deliberately not derived from any of the ~140 public roots `rustls-tls-webpki-roots`
+    /// bundles. Returns `(port, cert_pem)`; the server answers exactly one plain `200 {}` per
+    /// connection, then stops accepting once `stop` is dropped.
+    async fn spawn_self_signed_tls_peer() -> (u16, Vec<u8>, tokio::task::JoinHandle<()>) {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = cert.pem().into_bytes();
+        let cert_der = cert.der().clone();
+        let key_der = rustls_pki_types::PrivateKeyDer::Pkcs8(
+            rustls_pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der()),
+        );
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    return;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    // A handshake failure here (the exact thing the "without the CA" half of this
+                    // test expects the *client* to hit) is not a server-side bug -- just drop the
+                    // connection like a real TLS server would.
+                    let Ok(tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let io = hyper_util::rt::TokioIo::new(tls);
+                    let service = hyper::service::service_fn(
+                        |_req: hyper::Request<hyper::body::Incoming>| async {
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                                http_body_util::Full::new(hyper::body::Bytes::from_static(b"{}")),
+                            ))
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, service)
+                        .await;
+                });
+            }
+        });
+
+        (port, cert_pem, handle)
+    }
+
+    /// The real proof this session's TLS/CA fix is real, per `docs/status/06-federation.md`: a
+    /// self-signed certificate chaining to no public root, verified two ways against the exact
+    /// same peer. Needs no Docker and no network beyond loopback.
+    #[tokio::test]
+    async fn outbound_tls_rejects_an_unconfigured_ca_but_trusts_a_configured_one() {
+        let (port, cert_pem, server) = spawn_self_signed_tls_peer().await;
+        let destination = format!("localhost:{port}");
+
+        // Without the CA configured, this is exactly Complement's pre-fix symptom: a real, correct
+        // TLS server the client has no reason to trust yet.
+        let without_ca = client_for_port(port, ClientConfig::default());
+        let err = without_ca
+            .send(&destination, "GET", "/_matrix/federation/v1/version", None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ClientError::Request(..)),
+            "expected the unconfigured client to fail the TLS handshake, got {err:?}"
+        );
+
+        // The exact same peer, the exact same certificate -- now named via
+        // `custom_root_certificates` (what `hs-config`'s `custom_ca_certificates` feeds into) --
+        // and the handshake succeeds.
+        let with_ca = client_for_port(
+            port,
+            ClientConfig {
+                custom_root_certificates: vec![cert_pem],
+                ..ClientConfig::default()
+            },
+        );
+        let response = with_ca
+            .send(&destination, "GET", "/_matrix/federation/v1/version", None)
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+
+        server.abort();
     }
 
     #[test]
