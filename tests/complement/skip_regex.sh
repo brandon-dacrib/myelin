@@ -5,4 +5,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-grep -v '^\s*#' blacklist.txt | grep -v '^\s*$' | sed -e 's/\s*#.*$//' -e 's/[[:space:]]*$//' | paste -sd '|' -
+# Bug fixed 2026-09-18: under `pipefail`, `grep -v` returning no matching lines (exit 1) used to
+# fail this whole script even on the documented, intended "blacklist is empty" case, which in turn
+# aborted `run_single_node.sh` (`SKIP_REGEX="$(./skip_regex.sh)"` with `set -e`) before it ever
+# built the image. `grep ... || true` on the last filtering stage keeps that case's exit 0 without
+# hiding a real failure in `sed`/`paste`.
+{ grep -v '^\s*#' blacklist.txt || true; } | { grep -v '^\s*$' || true; } | sed -e 's/\s*#.*$//' -e 's/[[:space:]]*$//' | paste -sd '|' -

@@ -1,0 +1,18 @@
+# stunnel config template for the Complement image (see Dockerfile.template's header for why
+# stunnel: `hs serve` does not terminate TLS yet, and this is the smallest tool that does exactly
+# "accept TLS on one port, forward plaintext to another"). `startup.sh` copies this to
+# /etc/stunnel/stunnel.conf after substituting $CERT_DIR, then execs `stunnel` in the foreground.
+;
+; Run in the foreground (not a Debian init-script daemon) so it lives as a plain child process
+; under startup.sh's `exec`-free supervision (see startup.sh: both stunnel and hs are started as
+; background jobs and the script waits on hs, matching "tolerate CMD being run more than once"
+; without needing a process manager).
+foreground = yes
+pid = /data/stunnel.pid
+output = /data/stunnel.log
+
+[federation]
+accept = 8448
+connect = 127.0.0.1:8008
+cert = __CERT_DIR__/server.crt
+key = __CERT_DIR__/server.key

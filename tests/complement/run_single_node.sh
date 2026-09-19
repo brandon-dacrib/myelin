@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Runs Complement against this server in single-node mode: one homeserver process per Complement
-# blueprint, the default and by far most common Complement topology. Untested (needs
-# build.sh, which needs a server binary that does not exist yet, and Docker).
+# blueprint, the default and by far most common Complement topology.
 #
 # Usage: ./run_single_node.sh [-- <extra go test args>]
+# e.g.:  ./run_single_node.sh -- -run 'TestRegistration|TestLogin' -timeout 10m
+#
+# A default -timeout is set below because go test's own default (10m for the whole binary) is
+# too short for the full suite against a real homeserver; pass your own -timeout after `--` to
+# override it.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -30,7 +34,7 @@ SKIP_REGEX="$(./skip_regex.sh)"
 
 cd "$COMPLEMENT_DIR"
 export COMPLEMENT_BASE_IMAGE="$IMAGE_TAG"
-GO_ARGS=(-v ./tests/...)
+GO_ARGS=(-v -timeout 45m ./tests/...)
 if [ -n "$SKIP_REGEX" ]; then
   GO_ARGS=(-skip "$SKIP_REGEX" "${GO_ARGS[@]}")
 fi

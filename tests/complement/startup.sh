@@ -1,13 +1,13 @@
 #!/bin/sh
-# Container entrypoint for the Complement image (see Dockerfile.template). Untested end to end
-# (no `hs-server` binary exists yet to exec at the bottom of this script -- see that file's
-# TODO markers), but the certificate-signing steps are exactly Complement's documented recipe
-# (refs/complement/README.md, "Complement PKI") and can be exercised on their own once Docker is
-# available, independent of the server binary.
+# Container entrypoint for the Complement image (see Dockerfile.template). Every step here is
+# idempotent (`if [ ! -f ... ]` guards) because Complement's image contract requires tolerating
+# CMD/ENTRYPOINT being invoked more than once per container lifetime.
 set -eu
 
 : "${SERVER_NAME:?SERVER_NAME must be set by Complement at container start}"
 
+# ---- 1. Federation TLS certificate, signed against Complement's mounted CA --------------------
+# Exact recipe from refs/complement/README.md's "Complement PKI" section.
 CERT_DIR=/data/tls
 mkdir -p "$CERT_DIR"
 
@@ -22,25 +22,54 @@ if [ ! -f "$CERT_DIR/server.crt" ]; then
     -out "$CERT_DIR/server.crt" -days 1 -sha256
 fi
 
-# Complement's CA is what the *other* containers' certs are signed by; this server needs to trust
-# it too, since Complement runs several homeservers that federate with each other in the same
-# blueprint.
+# Complement runs several homeservers in one blueprint that federate with each other, so this
+# server also needs to trust the same CA (for outbound federation requests it makes as a client).
 if [ -f /complement/ca/ca.crt ]; then
   cp /complement/ca/ca.crt /usr/local/share/ca-certificates/complement-ca.crt
   update-ca-certificates >/dev/null 2>&1 || true
 fi
 
-# TODO: replace with the real invocation once hs-server exists and its config surface (hs-config,
-# track 13) is wired up. Expected shape: listen on 0.0.0.0:8008 (plain HTTP, client-server and
-# appservice traffic) and 0.0.0.0:8448 (HTTPS federation traffic, using $CERT_DIR/server.{crt,key}),
-# server name $SERVER_NAME, embedded hs-kv store rooted at /data, and the Synapse-compatible
-# `/_synapse/admin/v1/register` shared secret hardcoded to `complement` (RFC 0004's Synapse
-# compatibility surface) since that is Complement's own hardcoded expectation, not a real secret.
-exec hs-server \
-  --server-name "$SERVER_NAME" \
-  --client-listen 0.0.0.0:8008 \
-  --federation-listen 0.0.0.0:8448 \
-  --federation-tls-cert "$CERT_DIR/server.crt" \
-  --federation-tls-key "$CERT_DIR/server.key" \
-  --data-dir /data \
-  --registration-shared-secret complement
+# ---- 2. This server's own signing key, persisted across ENTRYPOINT re-invocations -------------
+SIGNING_KEY_DIR=/data/signing-keys
+mkdir -p "$SIGNING_KEY_DIR"
+if [ -z "$(find "$SIGNING_KEY_DIR" -type f 2>/dev/null)" ]; then
+  echo "startup.sh: generating a signing key at $SIGNING_KEY_DIR" >&2
+  hs generate-signing-key -o "$SIGNING_KEY_DIR/hs.signing.key"
+fi
+
+# ---- 3. Native hs-config, written fresh each start (cheap, and SERVER_NAME can differ across
+#         containers reusing the same image even though /data itself is not reused across runs).
+DB_DIR=/data/db
+mkdir -p "$DB_DIR"
+CONFIG_PATH=/data/config.yaml
+cat >"$CONFIG_PATH" <<EOF
+server:
+  server_name: "$SERVER_NAME"
+  signing_key_path: $SIGNING_KEY_DIR
+storage:
+  backend: embedded
+  data_dir: $DB_DIR
+listeners:
+  listeners:
+    - port: 8008
+      bind_addresses: ["0.0.0.0"]
+      resources: [client, federation, media, health]
+auth:
+  enable_registration: true
+  enable_legacy_login: true
+EOF
+
+# ---- 4. TLS termination in front of the plaintext hs listener ---------------------------------
+# hs's single router already answers both client and federation resources on 8008 (see
+# Dockerfile.template's header), so stunnel only needs to forward 8448 -> 8008.
+mkdir -p /etc/stunnel
+sed -e "s#__CERT_DIR__#$CERT_DIR#g" /stunnel.conf.template >/etc/stunnel/stunnel.conf
+stunnel4 /etc/stunnel/stunnel.conf &
+
+# ---- 5. The real server, as PID 1's foreground child ------------------------------------------
+# `wait -n` (bash) would let us notice either process dying; this script is `/bin/sh` (dash on
+# Debian, no `wait -n`), so it just waits on `hs` -- the process Complement's healthcheck and
+# every test actually depend on. If `hs` dies the container exits and Complement notices; if
+# stunnel alone dies, federation-over-TLS tests fail loudly instead of hanging, which is an
+# equally clear signal.
+exec hs serve -c "$CONFIG_PATH"

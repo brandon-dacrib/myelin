@@ -1,48 +1,84 @@
-# Complement image template (docs/workstreams/14-test-and-conformance.md, PLAN.md section 12
-# layer L3). Untested: no `hs-server` binary exists in this workspace yet (as of this writing the
-# per-track HTTP surfaces -- hs-http's listener, hs-auth's router fragment, ... -- are library
-# crates with no assembled listening process to `cargo build --release` here). This file is the
-# structural scaffold the Complement image contract requires
-# (refs/complement/README.md, "Image requirements"); update the `TODO` markers once a server
-# binary exists, then validate with `./build.sh` and `./run_single_node.sh` (see README.md).
+# Complement image (docs/workstreams/14-test-and-conformance.md, PLAN.md section 12 layer L3).
+# Builds the real `hs` binary (crates/hs-cli, `[[bin]] name = "hs"`) -- there has never been a
+# crate named `hs-server`; an earlier draft of this file referenced one that never existed. See
+# docs/status/14-test-and-conformance.md for the date this was fixed and the run it produced.
 #
-# Complement's image contract, this file must satisfy:
-#   - EXPOSE 8008 (plain HTTP client-server traffic) and 8448 (HTTPS federation traffic).
-#   - Accept the server name via the `SERVER_NAME` environment variable at container start.
+# `hs serve` does not terminate TLS itself (`crates/hs-cli/src/serve.rs` logs a warning and binds
+# plaintext even when a listener's `tls:` block is set -- confirmed by reading that file, not
+# assumed). Complement requires HTTPS on 8448 for federation traffic. Rather than wait on another
+# track to add TLS termination to `hs serve`, this image runs `stunnel4` (a few hundred KB,
+# purpose-built for exactly this: terminate TLS on one port, forward plaintext to another) in
+# front of `hs`, which listens on 8008 plaintext for both client and federation resources (the
+# same `axum::Router` serves every configured resource regardless of which listener it came in
+# on -- see `crate::serve::build_router`'s doc comment -- so one plaintext listener is enough; only
+# the *port Complement dials* needs to be HTTPS).
+#
+# Complement's image contract (refs/complement/README.md's "Image requirements" and "Complement
+# PKI" sections), verified against `refs/complement/internal/docker/deployer.go`:
+#   - EXPOSE 8008 (plain HTTP client-server + federation-over-plaintext-behind-stunnel) and 8448
+#     (HTTPS federation traffic, terminated by stunnel here).
+#   - Accept the server name via the `SERVER_NAME` environment variable at container start
+#     (`deployer.go:366`, `env = []string{"SERVER_NAME=" + hsName}`).
 #   - 200 OK on GET /_matrix/client/versions once healthy.
-#   - Trust /complement/ca/ca.crt (mounted by Complement) for its own federation TLS certificate,
-#     signed at each container start (the server name -- and so the cert -- is not known at
-#     image-build time). `startup.sh` does the signing, following the exact openssl invocation
-#     refs/complement/README.md's "Complement PKI" section documents.
+#   - Trust /complement/ca/ca.crt (copied into the container by Complement itself via
+#     `docker cp`-equivalent, not a bind mount -- `deployer.go:467`) and sign this server's own
+#     federation TLS certificate against /complement/ca/ca.key at *container start*, not image
+#     build time (`startup.sh` does this, following refs/complement/README.md's exact `openssl`
+#     recipe).
 #   - Use `complement` as the shared secret for Synapse-compatible admin registration
-#     (`/_synapse/admin/v1/register`), matching `docs/rfcs/0004-admin-api.md`'s Synapse
-#     compatibility surface once that endpoint exists.
-#   - Manage its own storage inside the image/container (the embedded `hs-kv` backend, per
-#     PLAN.md section 7: single-binary, embedded-store mode is exactly what Complement's
-#     single-node contract wants).
-#   - Tolerate CMD/ENTRYPOINT being invoked more than once per container lifetime.
+#     (`/_synapse/admin/v1/register`) if that endpoint exists; if it 404s, Complement skips those
+#     tests instead of failing (confirmed: `client/auth.go`'s `RegisterSharedSecret` skips on a
+#     non-2xx `GET`). This server does not mount that route yet (see
+#     docs/status/14-test-and-conformance.md's per-track triage), so Complement will skip
+#     shared-secret-registration tests and use normal `m.login.dummy` registration for the rest.
+#   - Manage its own storage inside the container (the embedded `hs-kv`/Fjall backend -- exactly
+#     PLAN.md section 7's single-binary, embedded-store mode).
+#   - Tolerate CMD/ENTRYPOINT being invoked more than once per container lifetime (`startup.sh`'s
+#     cert-signing and config-writing steps are idempotent: `if [ ! -f ... ]` guards).
+#
+# The build context for this file is NOT `.` -- see build.sh, which streams a tar excluding
+# `target/` (tens of GB on this workspace) and other large, build-irrelevant directories instead
+# of using `.dockerignore` (a root-level file this track does not own).
 
 # ---- build stage -----------------------------------------------------------------------------
 FROM rust:1.98-slim AS build
 WORKDIR /workspace
+
+# pkg-config/libssl-dev: some transitive dependency in this workspace's Cargo.lock may need a
+# system OpenSSL at build time even where rustls is preferred elsewhere; cheap to have, expensive
+# to discover missing after a 10+ minute build.
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY . .
-# TODO: replace `hs-server` with the real workspace-root binary crate once track assembly lands
-# one (see docs/status/14-test-and-conformance.md's "Interfaces needed" for who owns it).
-RUN cargo build --release -p hs-server
+
+# --jobs 4, not the full core count: this machine is shared with several other agents' `cargo`
+# invocations at once (see this track's brief and docs/status/dashboard.md), and a release build
+# of the whole dependency graph is the single most CPU-hungry thing this track does.
+RUN cargo build --release --jobs 4 -p hs-cli
 
 # ---- runtime stage ----------------------------------------------------------------------------
 FROM debian:trixie-slim
-RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates curl \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssl ca-certificates curl stunnel4 \
     && rm -rf /var/lib/apt/lists/*
 
-# TODO: replace with the real binary's output path once it exists.
-COPY --from=build /workspace/target/release/hs-server /usr/local/bin/hs-server
+COPY --from=build /workspace/target/release/hs /usr/local/bin/hs
 COPY tests/complement/startup.sh /startup.sh
+COPY tests/complement/stunnel.conf.template /stunnel.conf.template
 RUN chmod +x /startup.sh
+# Complement's real deployer copies the CA cert/key into this directory via the low-level
+# CopyToContainer API, which creates any missing parent directories itself (verified by reading
+# refs/complement/internal/docker/deployer.go's `copyToContainer`); this directory is created here
+# anyway so a plain `docker cp` (used for local smoke-testing this image without Complement, and
+# by any Docker client that doesn't behave the same way) also works.
+RUN mkdir -p /complement/ca
 
-# Embedded storage lives here; Complement gives each container a fresh filesystem per run, so no
-# volume is declared (matches the "manage its own storage within the image" requirement).
-VOLUME /data
+# Embedded storage lives at /data, inside the container's own writable layer -- deliberately NOT
+# a `VOLUME /data` declaration: Complement's own deployer warns "has a named VOLUME /data -
+# volumes can lead to unpredictable behaviour due to test pollution" (confirmed: it printed this
+# warning against an earlier build of this image), and an anonymous volume is exactly the kind of
+# extra state a from-scratch container for each test should not have.
 WORKDIR /data
 
 EXPOSE 8008 8448

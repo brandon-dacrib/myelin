@@ -1,5 +1,157 @@
 # 14 Test and conformance (integration lead): status
 
+## Complement: the honest number (2026-09-18, this session)
+
+**The image builds and Complement runs against it.** This had never happened before this session
+(`Dockerfile.template` referenced a crate named `hs-server` that never existed; the real binary is
+`hs` from `crates/hs-cli`). Reproduce with:
+
+```bash
+./tests/complement/build.sh complement-hs-reimplement:dev   # ~4 min cold, ~1s once cargo's layer is cached
+cd refs/complement && COMPLEMENT_BASE_IMAGE=complement-hs-reimplement:dev \
+  go test -v -timeout 30m ./tests/csapi/...
+# or the full wrapper (adds the blacklist -skip regex): ./tests/complement/run_single_node.sh
+```
+
+**Scope of this number: `tests/csapi` only** (106 top-level Go test functions, the core Matrix
+client-server API suite), not the top-level `./tests/...` package (federation-heavy, two-homeserver
+blueprints, ~90 more top-level tests) or any `tests/mscNNNN` package. `./tests/csapi/...` was
+chosen because it is the largest single package that exercises this server without needing
+federation to work first, and because a first number needed to exist before a second, harder one
+did. Both runs below used the embedded (Fjall) storage backend, single node, default blacklist
+(empty — nothing is skipped by this harness's own `-skip` regex; the two `SKIP`s below are
+Complement's own, for the shared-secret-registration and server-notices tests this server
+correctly reports as unsupported by 404/absence).
+
+Two full runs were done, back to back, because the workspace is being edited live by five other
+tracks and the first run's image was built moments before track 04 fixed a routing bug this run's
+own diagnosis had just found (see below) — rebuilding and rerunning showed the fix land in real
+numbers, which is a better demonstration of the harness working than either number alone.
+
+| Run | Image built from | Leaf-level (every individual assertion) | Top-level (Go `func Test*`) |
+|---|---|---|---|
+| 1 | working tree at 2026-09-18 ~22:50 (before the state-key routing fix) | 283 total: **106 pass, 171 fail, 6 skip** | 106 total: **26 pass, 78 fail, 2 skip** |
+| 2 | working tree at 2026-09-18 ~23:40 (after it) | 293 total: **125 pass, 161 fail, 7 skip** | 106 total: **30 pass, 74 fail, 2 skip** |
+
+Full logs: `/tmp/complement-csapi.log` (run 1), `/tmp/complement-csapi2.log` (run 2) — not
+committed (scratch files outside the repo's tracked paths); rerun the reproduction command above to
+regenerate. Leaf-level counts are every individual `--- PASS/FAIL/SKIP` line at maximum
+indentation (i.e., counting `TestFoo/sub/subsub` once, not also its parents `TestFoo` and
+`TestFoo/sub`); top-level counts every `func Test*` Go treats as its own top-level test (each of
+which may itself represent a table of many spec assertions).
+
+**Both runs are against whatever was on disk in this live, multi-agent-edited working tree at
+build time, not a specific git commit** — `tests/complement/build.sh` streams the actual working
+directory (tracked and untracked changes both), not `git archive`, so uncommitted work from other
+tracks' concurrent sessions is included. `git rev-parse HEAD` read at report time (after both test
+runs finished) was `6d6d7beff41f3832d1efc8ebd2d8930adfec51c8`, but that is the commit *after* the
+runs, not what was actually tested; do not treat it as precise provenance, only as a lower bound on
+recency. A rerun against a later HEAD (this session was told mid-run that inbound federation
+`/send`, `make_join`/`send_join`, `.well-known`, profiles and room v12 landed since) would very
+likely score higher, especially on the federation-touching tests below.
+
+### Top failures, grouped by owning track (from run 2's leaf-level failure messages)
+
+1. **Track 04 (room-and-events) — room-state and lifecycle validation gaps.** `POST /createRoom`
+   with invalid `room_version`/params returns `200` where the spec test expects `400`; extensible
+   `m.topic` (`m.topic.m.text`, MSC3765) is not populated on room creation; `POST
+   /rooms/{roomId}/forget` returns `200` instead of `400`/`403` for a non-existent or non-member
+   room. (`apidoc_room_create_test.go`, `apidoc_room_forget_test.go`.)
+2. **Track 04/02 (room-and-events / state) — history-visibility is not enforced on read.**
+   `GET /rooms/{roomId}/messages` and `GET /rooms/{roomId}/event/{eventId}` return `200` with full
+   event content for a room the requesting user has left and that is not world-readable, where the
+   spec test expects `403`/`404`. This also explains several downstream `MustSyncUntil: timed out`
+   failures in the same test files, since the test's next step depends on the prior assertion.
+   (`apidoc_room_history_visibility_test.go`.)
+3. **Track 04 (room-and-events) — room directory.** `PUT
+   /_matrix/client/v3/directory/list/room/{roomId}` returns `404` (route not mounted, or not
+   wired to the room registry), so `GET /publicRooms` never sees the room and the test's
+   `RetryUntil` polling loop times out. (`power_levels_test.go`'s use of `public_rooms_test.go`
+   helpers; also directly in `TestPublicRooms`.)
+4. **Track 08 (e2ee) — key management round-tripping.** `POST /keys/query` for another user's
+   device keys comes back empty (`device_keys.@user-2:hs1` missing) in a cross-user query; `POST
+   /keys/claim`'s returned one-time-key content/signature does not match what was uploaded;
+   `POST /keys/upload` accepts a malformed device-ID-as-object shape the test expects rejected
+   with `400`. (`upload_keys_test.go`, `user_query_keys_test.go`.)
+5. **Track 09 (media) — async upload and URL preview unimplemented.** `POST
+   /_matrix/media/v1/create` (MSC2246 async upload) returns `404`; `GET
+   /_matrix/media/v3/preview_url` returns `404`. (`media_async_uploads_test.go`,
+   `url_preview_test.go`.)
+6. **Track 05 (sync, which per this project's ownership map also owns presence) — presence
+   endpoint absent or incomplete.** `GET`/`PUT /_matrix/client/v3/presence/{userId}/status` return
+   `404` or a non-JSON body rather than a presence document. (`apidoc_presence_test.go`.)
+7. **Track 06 (federation) — cross-server join signature verification, seen from inside a csapi
+   test.** One csapi test (`TestSync`'s federation-join helper) hit `make_join` on a *second*
+   homeserver via `X-Matrix` and got `401 M_UNAUTHORIZED: signature verification failed`. Per the
+   coordinator's update, inbound `/send`, `make_join`/`send_join` landed on HEAD after this run's
+   image was built; this failure may already be fixed and should be the first thing a rerun
+   checks.
+8. **Track 07 (auth) — minor device/session validation gaps.** `DELETE /device/{deviceId}` with a
+   malformed body returns `400` where UIA should be attempted first (`401`); `GET
+   /_matrix/client/v3/devices` after logging out other sessions returns one more device than
+   expected, suggesting a device isn't being cleaned up on that logout path.
+   (`apidoc_device_management_test.go`, `apidoc_logout_test.go`.)
+
+### Harness bugs found and fixed this session (all within `tests/complement/`, so fixed directly)
+
+- **`tests/complement/Dockerfile.template` referenced a nonexistent `hs-server` crate.** Fixed to
+  build the real `[[bin]] name = "hs"` from `crates/hs-cli` (`cargo build --release --jobs 4 -p
+  hs-cli`; `--jobs 4` deliberately, not the full core count, per this track's brief about sharing
+  a 10-core machine with five other agents' `cargo` invocations).
+- **`hs serve` does not terminate TLS** (`crates/hs-cli/src/serve.rs` logs a warning and binds
+  plaintext even with a listener's `tls:` block set — confirmed by reading the code). Complement
+  requires HTTPS on 8448. Fixed by running `stunnel4` (chosen over `nginx`/`nginx-light` for
+  footprint and because it needs no HTTP-proxy configuration, only "TLS in, plaintext out") inside
+  the image, terminating TLS on 8448 and forwarding to `hs` on 8008 — safe because `hs serve`'s one
+  `axum::Router` already answers every resource (client *and* federation) on whichever port it's
+  bound to (see `crate::serve::build_router`'s doc comment), so `hs` only needs one plaintext
+  listener. `tests/complement/stunnel.conf.template` + `startup.sh` do the cert-signing (unchanged
+  from the original scaffold's already-correct `openssl` recipe) and stunnel config generation.
+- **The build context was `.` (repository root)**, and `target/` alone is 27 GB on this shared
+  workspace; a root `.dockerignore` is not a file this track owns. Fixed by having `build.sh`
+  stream a `tar` (excluding `target`, `.git`, `web/node_modules`, `refs`, `media-store`,
+  `.conformance-run`) to `docker build`'s stdin instead of using `.` as the context directly.
+  Aside: macOS's `bsdtar` auto-skips any directory containing a `CACHEDIR.TAG` (which every Cargo
+  `target/` directory has, including nested ones like `crates/hs-federation/fuzz/target`), so the
+  explicit `target` exclude turned out to be redundant but is kept for portability to GNU tar.
+- **`tests/complement/skip_regex.sh` failed under `set -o pipefail` whenever the blacklist had zero
+  active (non-comment, non-blank) lines** — exactly the documented, intended common case — because
+  `grep -v` with no matching lines exits 1, and `pipefail` propagates that through the pipeline
+  even though the final `paste` succeeds. This aborted `run_single_node.sh` (`SKIP_REGEX="$(...)"`
+  under `set -e`) before it ever built the image, so the checked-in wrapper script had never
+  actually reached `go test` even after the image built. Fixed with `{ grep ... || true; }` on
+  both filtering stages.
+- **`VOLUME /data`** in the Dockerfile made Complement print "volumes can lead to unpredictable
+  behaviour due to test pollution" on every run (Complement's own contract-linting warning).
+  Removed — storage is embedded in the container's own writable layer, so no volume was ever
+  needed for the "manage its own storage" requirement.
+
+### Build time on this machine (a finding worth recording per the coordinator's request)
+
+Cold (`cargo build --release --jobs 4 -p hs-cli` inside the build stage, no warm target cache in
+the image): **~4 minutes** (`4m 00s` reported by `cargo` itself, ~251s total Docker stage time,
+including dependency compilation from scratch — the base `rust:1.98-slim` image has no crates.io
+cache). A rebuild that only touches the final runtime stage (no source change): a few hundred
+milliseconds, fully cached. A rebuild after a source change elsewhere in the workspace: not
+measured directly, but expect somewhere between these two depending on how much of the dependency
+graph the change invalidates — Docker's layer cache does not help across *source* changes the way
+`cargo`'s own incremental compilation would, since `COPY . .` invalidates every layer after it
+whenever any file changes. Each `go test` run of `./tests/csapi/...` (106 top-level tests, one or
+two containers each, ~5s container-deploy overhead per test) took **~15 minutes** end to end
+(947s and 909s respectively).
+
+### What a next session should do first
+
+1. Rerun against current HEAD (the federation landing mentioned above) — the `make_join` signature
+   failure and possibly others in the list above may already be gone.
+2. Run the full top-level `./tests/...` package (federation-heavy, two-homeserver blueprints), not
+   just `./tests/csapi/...` — this session did not have time for it after two `csapi` runs.
+3. Once the top-5 list above is address by each owning track, populate `blacklist.txt` with the
+   *remaining* known-and-understood gaps (each with a one-line reason), the way Palpo's own
+   blacklist is grown, rather than leaving it empty forever.
+
+---
+
 Track brief: `docs/workstreams/14-test-and-conformance.md`. Owner crates: `hs-testkit`,
 `hs-spec-coverage`, `hs-loadgen` (not started, see "Decisions made"), `tests/` (Complement, Sytest,
 differential, oracle harnesses).
@@ -118,12 +270,17 @@ state.
 
 ## Next
 
-- Once any track assembles a real `hs-server` (or equivalent) binary: fill in the `TODO`s in
-  `tests/complement/Dockerfile.template`/`startup.sh` and `tests/sytest/plugins/hs-reimplement/
-  lib/SyTest/Homeserver/HsReimplement.pm`, then actually run both suites.
+- **Complement is now real** (see the top of this file): rerun `./tests/complement/build.sh &&
+  cd refs/complement && go test ./tests/csapi/...` against current HEAD, then run the full
+  top-level `./tests/...` package (federation-heavy) which this session didn't have time for.
+- Fill in the still-`TODO` `tests/sytest/plugins/hs-reimplement/lib/SyTest/Homeserver/
+  HsReimplement.pm` the same way `tests/complement/`'s scaffold was filled in this session (real
+  `hs` binary, real config) — Sytest's own CPAN dependencies still aren't installed in this
+  environment, so it can be wired up but not run end to end yet.
 - Once `hs-http`'s `Builder` (or `hs-admin-mock`) is wired into a binary that writes a real
   `routes.json`: point `hs-spec-coverage`/`tools/dashboard.py` at it and watch the coverage number
-  move off 0%.
+  move off 0%. (Unrelated to Complement — `hs serve` already writes `routes.json` via
+  `--routes-manifest`; this bullet is about whichever track's status file still says 0%.)
 - When network is available: record a real Synapse 1.161 baseline (`tests/differential/README.md`)
   and validate the two `tests/oracle/` fixtures against an installed `matrix-synapse`.
 - `hs-loadgen` once the rest of Phase 0 is further along and a server exists to load-test.
@@ -132,9 +289,10 @@ state.
 
 ## Blockers
 
-None for this session's own scope. Everything above that is "untested"/"never executed" is
-blocked on inputs outside this track's control: a server binary (every other track), network
-access (`pip install matrix-synapse`, Sytest's CPAN deps), and Docker being turned on.
+None for this session's own scope. Complement is unblocked as of this session (Docker + a real
+binary both exist now). Still blocked on inputs outside this track's control: network access
+(`pip install matrix-synapse`, Sytest's CPAN deps) for the oracle harness and the Sytest plugin's
+own end-to-end run.
 
 ## Interfaces provided
 

@@ -1,21 +1,31 @@
 # Complement
 
 Layer L3 of `PLAN.md` section 12: Synapse's own black-box Go integration suite
-(`refs/complement/`), run against this server's Docker image. **Everything in this directory is
-untested** — no `hs-server` binary exists in this workspace yet (the per-track HTTP surfaces,
-`hs-http`'s listener and `hs-auth`'s router fragment among them, are library crates with no
-assembled listening process), so `build.sh` cannot succeed and nothing here has run against a
-real container. This is the scaffold Complement's image contract requires, ready for the `TODO`
-markers to be filled in once a server binary exists — see `docs/status/14-test-and-conformance.md`
-for what is blocking that.
+(`refs/complement/`), run against this server's Docker image.
+
+**As of 2026-09-18, the image builds and Complement runs against it for real.** See the top of
+`docs/status/14-test-and-conformance.md` for the actual pass/fail/skip numbers (two full runs of
+`tests/csapi`, 106 top-level tests each), the harness bugs found and fixed to get there, and how
+long the image build takes on this machine. The one-command reproduction is:
+
+```bash
+./tests/complement/build.sh complement-hs-reimplement:dev
+cd ../../refs/complement && COMPLEMENT_BASE_IMAGE=complement-hs-reimplement:dev \
+  go test -v -timeout 30m ./tests/csapi/...
+```
+
+or `./tests/complement/run_single_node.sh` for the wrapper that also applies `blacklist.txt` and
+runs the full `./tests/...` package (not yet run to completion this session — see the status
+file's "What a next session should do first").
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `Dockerfile.template` | The Complement image: build stage (`cargo build --release -p hs-server`, a placeholder crate name), runtime stage (the binary plus `openssl`/`curl`, a `HEALTHCHECK`, `EXPOSE 8008 8448`). |
-| `startup.sh` | Container entrypoint: signs a federation TLS cert against Complement's mounted CA (`/complement/ca/{ca.crt,ca.key}`), trusts that CA itself, then execs the server. The cert-signing half is real and independently testable once Docker is available (it doesn't need the server binary); the final `exec` line is a placeholder for the real CLI once it exists. |
-| `build.sh` | Builds the image; skips cleanly (exit 0) if Docker is unavailable, fails loudly if Docker is available but the build itself fails (a real signal once there's a binary to build). |
+| `Dockerfile.template` | The Complement image: build stage (`cargo build --release --jobs 4 -p hs-cli`, the real `hs` binary), runtime stage (the binary, `stunnel4` terminating TLS on 8448 in front of `hs`'s plaintext 8008, `openssl`/`curl`, a `HEALTHCHECK`, `EXPOSE 8008 8448`). |
+| `stunnel.conf.template` | The `stunnel` config `startup.sh` fills in with the per-container-signed cert path. |
+| `startup.sh` | Container entrypoint: signs a federation TLS cert against Complement's mounted CA (`/complement/ca/{ca.crt,ca.key}`), trusts that CA itself, writes a native `hs-config` YAML to `/data/config.yaml`, starts `stunnel`, then `exec`s `hs serve -c /data/config.yaml`. |
+| `build.sh` | Streams a `tar` of the repo (excluding `target/`, `.git/`, `web/node_modules/`, `refs/` and other build-irrelevant, multi-gigabyte directories) to `docker build`'s stdin, rather than using `.` as the build context directly — see the status file for why. Skips cleanly (exit 0) if Docker is unavailable, fails loudly if Docker is available but the build itself fails. |
 | `run_single_node.sh` | The common case: one server process per Complement blueprint. Builds the image, applies `blacklist.txt` as a `go test -skip` regex, runs `go test ./tests/...` from `refs/matrix-spec`'s sibling checkout `refs/complement`. |
 | `run_cluster.sh` | The seam for track 03/12's cluster deployment topology (sharded rooms, lease handover, multi-container blueprints) — see that script's header for why this is further from working than single-node mode. |
 | `skip_regex.sh` | Turns `blacklist.txt` into the `|`-joined regex `run_single_node.sh` passes to `go test -skip`. |
