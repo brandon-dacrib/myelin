@@ -30,6 +30,25 @@ use hs_model::signing::SigningKeyPair;
 use hs_room::identity::HomeserverIdentity;
 use hs_room::registry::RoomRegistry;
 use serde_json::Value;
+
+/// Signs `object` the way a spec-compliant homeserver does, and the way this server now does
+/// (`hs_room::pipeline`): the *redacted* form is what gets signed, and the resulting signature is
+/// copied back onto the full object. Signing the full object — what these fixtures used to do —
+/// produces a signature `hs_federation::inbound::verify_pdu` correctly rejects, because it redacts
+/// before verifying. See `docs/rfcs/0014-event-signing-must-sign-the-redacted-form.md`.
+fn sign_over_redacted_form(
+    object: &mut hs_model::canonical::CanonicalJsonObject,
+    server: &ruma::ServerName,
+    signing_key: &SigningKeyPair,
+    rules: &hs_model::room_version::RedactionRules,
+) {
+    let mut redacted = hs_model::redaction::redact(object, rules).expect("redaction cannot fail");
+    hs_model::signing::sign_object(&mut redacted, server, signing_key).expect("signing");
+    let signatures = redacted
+        .remove("signatures")
+        .expect("sign_object always inserts signatures");
+    object.insert("signatures".to_owned(), signatures);
+}
 use tokio::net::TcpListener;
 use tower::ServiceExt as _;
 
@@ -427,7 +446,8 @@ fn build_signed_message(
         ),
     );
     let server = ruma::ServerName::parse(sender.split_once(':').unwrap().1).unwrap();
-    hs_model::signing::sign_object(&mut object, &server, signing_key).unwrap();
+    let rules = hs_model::room_version::rules_for(&ruma::RoomVersionId::V11).unwrap();
+    sign_over_redacted_form(&mut object, &server, signing_key, &rules.redaction);
     serde_json::from_slice(&CanonicalJsonValue::Object(object).to_canonical_bytes()).unwrap()
 }
 
@@ -516,7 +536,8 @@ async fn send_rejects_a_new_event_whose_auth_events_do_not_authorize_it() {
         ),
     );
     let server = ruma::ServerName::parse(REMOTE).unwrap();
-    hs_model::signing::sign_object(&mut object, &server, &remote_key).unwrap();
+    let rules = hs_model::room_version::rules_for(&ruma::RoomVersionId::V11).unwrap();
+    sign_over_redacted_form(&mut object, &server, &remote_key, &rules.redaction);
     let pdu: Value =
         serde_json::from_slice(&CanonicalJsonValue::Object(object).to_canonical_bytes()).unwrap();
 
@@ -594,7 +615,8 @@ async fn send_join_v2_persists_the_join_and_it_is_readable_afterwards() {
         ),
     );
     let server = ruma::ServerName::parse(REMOTE).unwrap();
-    hs_model::signing::sign_object(&mut object, &server, &harness.remote_key).unwrap();
+    let rules = hs_model::room_version::rules_for(&ruma::RoomVersionId::V11).unwrap();
+    sign_over_redacted_form(&mut object, &server, &harness.remote_key, &rules.redaction);
     let signed_bytes = CanonicalJsonValue::Object(object).to_canonical_bytes();
     let signed: Value = serde_json::from_slice(&signed_bytes).unwrap();
 

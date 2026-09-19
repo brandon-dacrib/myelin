@@ -83,6 +83,10 @@ pub enum ServeError {
     /// Loading `appservices.registration_files` failed.
     #[error(transparent)]
     Appservices(#[from] crate::appservices::LoadAppservicesError),
+    /// Starting the `hs-cluster` ownership manager (or, when clustered, its mesh forwarder)
+    /// failed.
+    #[error(transparent)]
+    Cluster(#[from] crate::cluster::ClusterSetupError),
     /// Writing `--routes-manifest` failed.
     #[error("failed to write routes manifest to {path:?}: {source}")]
     RoutesManifest {
@@ -168,6 +172,7 @@ fn build_router<B: KvBackend>(
     ready: Arc<AtomicBool>,
     unstable_features: Arc<BTreeMap<String, bool>>,
     well_known: crate::well_known::WellKnown,
+    cluster: &crate::cluster::ClusterHandles,
 ) -> (Router, RouteManifest) {
     let auth_router = hs_auth::routes::router().with_state(auth.clone());
     let auth_routes = crate::auth_manifest::routes();
@@ -271,6 +276,17 @@ fn build_router<B: KvBackend>(
         .merge_router("/_matrix/client/r0", auth_router, auth_routes)
         .merge_router(
             "/_matrix/client/v3",
+            room_router.clone(),
+            room_routes.clone(),
+        )
+        // `/relations` and `/threads` are defined by the spec under `v1`, not `v3`, and a real
+        // client (and Complement) calls them there. Mounting the room router at `v1` as well is
+        // what makes them reachable at all: they were implemented, tested, and still answered 404
+        // in the running server until this line existed. The `v3`/`r0` mounts stay because every
+        // other room route lives there; a route is only reachable under a prefix it is mounted on,
+        // so this deliberately exposes the whole room router three times rather than splitting it.
+        .merge_router(
+            "/_matrix/client/v1",
             room_router.clone(),
             room_routes.clone(),
         )
@@ -387,8 +403,15 @@ fn build_router<B: KvBackend>(
         .layer(Extension(ready))
         .layer(Extension(unstable_features))
         .layer(Extension(metrics.clone()))
+        .layer(Extension(cluster.cluster.clone()))
         .layer(middleware::from_fn_with_state(metrics, track_metrics))
         .layer(hs_telemetry::RequestIdLayer::new());
+
+    // Outermost layer: gates every `/rooms/{roomId}/...` request on shard ownership before it
+    // can reach `hs-room`'s registry at all (see `crate::cluster`'s module docs). A no-op in
+    // single-node mode (`is_mine` is always `true`), so this changes nothing about single-node
+    // behavior beyond one cheap path scan per request.
+    let router = crate::cluster::RoomShardGate::new(cluster).layer(router);
 
     (router, manifest)
 }
@@ -484,6 +507,16 @@ fn build_session_mounts<B: KvBackend>(
             hs_push::pushers::http::RetryPolicy::default(),
         )),
     };
+
+    // Three seams other crates built their half of and cannot reach across themselves, because
+    // all three states are constructed here as siblings: push rules and notification counts into
+    // `/sync` (`docs/status/10-push.md` defines the shapes), and a resolver so `/keys/changes`
+    // can understand the opaque token `/sync` mints instead of rejecting it as malformed. Each
+    // install is idempotent and absent-by-default, so a caller that never wires them gets the
+    // previous behaviour rather than a panic.
+    user.hub.install_push_rules_store(push.rulesets.clone());
+    user.hub.install_counts_store(push.counts.clone());
+    user.hub.install_device_list_token_resolver(&e2e);
 
     Ok((user, e2e, push))
 }
@@ -623,6 +656,7 @@ fn throwaway_mounts() -> Mounts<hs_kv::memory::MemoryBackend> {
 /// and the standalone `hs routes-manifest` subcommand.
 #[must_use]
 pub fn route_manifest() -> RouteManifest {
+    let cluster = crate::cluster::ClusterHandles::single_node(hs_cluster::ShardLayout::default());
     let (_router, manifest) = build_router(
         AuthState::in_memory(),
         throwaway_mounts(),
@@ -632,6 +666,7 @@ pub fn route_manifest() -> RouteManifest {
         // Routes are registered unconditionally; whether a `.well-known` document is *served* or
         // 404s is a runtime decision inside the handler, so the manifest is the same either way.
         crate::well_known::WellKnown::default(),
+        &cluster,
     );
     manifest
 }
@@ -640,11 +675,23 @@ async fn health_live() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-async fn health_ready(Extension(ready): Extension<Arc<AtomicBool>>) -> impl IntoResponse {
-    if ready.load(Ordering::SeqCst) {
-        (StatusCode::OK, "ready").into_response()
-    } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "not ready").into_response()
+/// Ready only once both this process's own startup flag is set *and* `hs-cluster` reports this
+/// replica ready (RFC 0001 section 7): in single-node mode the latter is always `Ready`, so this
+/// is unchanged from before this module existed; in clustered mode a replica that has not yet
+/// heartbeated successfully (still joining, or its own heartbeats are failing) now correctly
+/// answers "not ready" instead of accepting traffic for shards it may not actually hold yet.
+async fn health_ready(
+    Extension(ready): Extension<Arc<AtomicBool>>,
+    Extension(cluster): Extension<hs_cluster::Cluster>,
+) -> impl IntoResponse {
+    if !ready.load(Ordering::SeqCst) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "not ready".to_owned()).into_response();
+    }
+    match cluster.ready() {
+        hs_cluster::Readiness::Ready => (StatusCode::OK, "ready".to_owned()).into_response(),
+        hs_cluster::Readiness::NotReady(reason) => {
+            (StatusCode::SERVICE_UNAVAILABLE, reason).into_response()
+        }
     }
 }
 
@@ -674,12 +721,39 @@ pub struct ServeHandle {
     /// dropping either while listeners are still serving would take the store out from under
     /// them. Type-erased because [`ServeHandle`] is not generic over the backend.
     _storage: Box<dyn std::any::Any + Send + Sync>,
+    /// This replica's `hs-cluster` handle, drained on [`ServeHandle::shutdown`] before the HTTP
+    /// listeners stop accepting (RFC 0001 section 10).
+    cluster: hs_cluster::Cluster,
+    /// The mesh listener, if this replica is clustered.
+    mesh: Option<crate::cluster::MeshRuntime>,
 }
 
+/// How long [`ServeHandle::shutdown`] gives `Cluster::drain` to release this replica's shards and
+/// see them claimed by a peer before giving up and shutting down anyway (RFC 0001 section 10). No
+/// `hs-config` field exists for this yet (see `docs/status/03-cluster.md`); chosen to comfortably
+/// fit inside a typical Kubernetes `terminationGracePeriodSeconds` (30s) with margin for the
+/// listeners' own drain afterwards. A no-op in single-node mode regardless (`SingleNode::drain`
+/// returns immediately, per its own doc comment).
+const CLUSTER_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
 impl ServeHandle {
-    /// Signals every listener to begin graceful shutdown and waits for them to finish draining
-    /// in-flight requests.
+    /// Runs the cluster's graceful handoff (releasing every shard this replica owns and waiting,
+    /// up to [`CLUSTER_DRAIN_DEADLINE`], for a peer to claim it), stops the mesh listener, then
+    /// signals every HTTP listener to begin graceful shutdown and waits for them to finish
+    /// draining in-flight requests. `hs serve`'s `SIGTERM` handler calls this.
     pub async fn shutdown(self) {
+        let report = self.cluster.drain(CLUSTER_DRAIN_DEADLINE).await;
+        if report.handed_off > 0 || report.released_unclaimed > 0 {
+            tracing::info!(
+                handed_off = report.handed_off,
+                released_unclaimed = report.released_unclaimed,
+                elapsed = ?report.elapsed,
+                "cluster drain complete"
+            );
+        }
+        if let Some(mesh) = self.mesh {
+            mesh.shutdown().await;
+        }
         let _ = self.shutdown_tx.send(true);
         let _ = self.join.await;
     }
@@ -877,6 +951,13 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         ),
     };
 
+    // Built before the router below so the room-shard gate layer can wrap it: see
+    // `crate::cluster`'s module docs for why gating every `/rooms/{roomId}/...` request on shard
+    // ownership (not just writes) is what actually stops two replicas from forking a room's event
+    // DAG (`docs/status/03-cluster.md`'s two-replica experiment). Inert in single-node mode
+    // (`config.cluster.single_node`, the default) — this matches today's behavior exactly.
+    let cluster_handles = crate::cluster::start(&config, backend.clone()).await?;
+
     let ready = Arc::new(AtomicBool::new(true));
     let unstable_features = Arc::new(versions::load_unstable_features(
         options.capabilities_config.as_deref(),
@@ -903,7 +984,14 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         ready,
         unstable_features,
         well_known,
+        &cluster_handles,
     );
+
+    // The mesh listener replays a forwarded request against this exact router (see
+    // `crate::cluster::ClusterHandles::spawn_mesh`'s doc comment): a `None` in single-node mode,
+    // where nothing should ever dial in.
+    let mesh = cluster_handles.spawn_mesh(app.clone());
+    let cluster = cluster_handles.cluster.clone();
 
     if let Some(path) = &options.routes_manifest_path {
         manifest
@@ -975,6 +1063,8 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         shutdown_tx,
         join,
         _storage: Box::new(backend.clone()),
+        cluster,
+        mesh,
     })
 }
 

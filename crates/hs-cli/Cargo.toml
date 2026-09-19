@@ -17,6 +17,7 @@ path = "src/lib.rs"
 
 [dependencies]
 hs-config = { path = "../hs-config" }
+hs-cluster = { path = "../hs-cluster" }
 hs-compat = { path = "../hs-compat" }
 hs-auth = { path = "../hs-auth" }
 hs-kv = { path = "../hs-kv" }

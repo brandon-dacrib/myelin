@@ -12,6 +12,7 @@ pub mod audit;
 pub mod auth_manifest;
 pub mod capabilities;
 pub mod cli;
+pub mod cluster;
 pub mod config_bridge;
 pub mod federation;
 pub mod generate_config;

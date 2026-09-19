@@ -1,5 +1,197 @@
 # 03 Cluster: status
 
+## Fix landed, 2026-09-19 (this session): the split-brain is closed
+
+**Summary.** The two-replica experiment below (both the original run and the integration lead's
+independent reproduction) found that nothing ever called `hs-cluster`'s ownership API: `hs-cluster`
+was not even a dependency of `hs-cli`, so two replicas against one PostgreSQL each ran a fully
+independent, uncoordinated `RoomActor` registry and silently forked a room's event DAG under
+concurrent writes. This session wires `hs-cluster` into `hs-cli` end to end -- ownership, forwarding,
+startup and shutdown -- **without editing `hs-room`, `hs-config` or any other track's crate**, and
+reproduces the *fixed* behavior against two real `hs serve` processes on one real PostgreSQL
+database (transcript below). `hs-cluster` itself required no code changes; every primitive the
+brief named (`Cluster::single_node`/`start`, `Ownership::is_mine`/`owner_of`/`fence`,
+`ShardLayout::room_shard`, `Forwarder`, `Fence::check`, `Cluster::ready`/`drain`) was already built
+and tested and is now actually called.
+
+**What changed, all in `crates/hs-cli/**` (new file `crates/hs-cli/src/cluster.rs`, plus edits to
+`crates/hs-cli/src/serve.rs`, `crates/hs-cli/src/lib.rs` and `crates/hs-cli/Cargo.toml`; nothing in
+`crates/hs-cluster/**` needed to change):**
+
+1. **`hs-cluster` is now a dependency of `hs-cli`.**
+2. **Startup** (`crate::cluster::start`, called from `spawn_serve_with_backend` right after storage
+   opens): builds `Cluster::single_node(<host:pid>)` when `config.cluster.single_node` (the
+   default -- inert, zero behavioral change, confirmed by `cargo test -p hs-loadgen --test
+   real_client` and `--test real_client_encrypted` both still passing unmodified), or a real
+   `hs_cluster::Cluster::start` over the same already-open storage backend plus a
+   `hs_cluster::mesh::Forwarder`, otherwise. The `hs_config::ClusterConfig` -> `hs_cluster::
+   ClusterConfig` conversion the previous update flagged as missing now exists
+   (`crate::cluster::to_hs_cluster_config`) -- see "Decisions made" for exactly how the shape
+   mismatch was resolved without adding fields to `hs-config`.
+3. **The fix itself: `RoomShardGate`, an `axum` middleware layered over the *entire* built
+   router.** It inspects every request's path for a `/rooms/{roomId}/...` segment (a small
+   hand-rolled percent-decoder, no new dependency); if this replica does not own that room's
+   shard, the request never reaches `hs-room`'s registry at all -- it is either forwarded
+   verbatim to the owner over the mesh (a raw HTTP reverse proxy: method, path, headers including
+   `Authorization`, and body, replayed against the owner's own copy of the exact same `axum::
+   Router` via `tower::Service::oneshot`, so the owner's own auth middleware authenticates it
+   exactly as if it had arrived directly) or refused with a clear `503 M_HS_NOT_SHARD_OWNER`
+   naming the believed owner. This gates **reads as well as writes** -- see "Decisions made" for
+   why gating only `/send` would not have been sufficient to make both replicas' `/messages`
+   agree.
+4. **Shutdown**: `Cluster::drain` runs before the HTTP listeners stop accepting (`ServeHandle::
+   shutdown`, called from `hs serve`'s existing `SIGTERM` handler in `cli.rs` -- no change needed
+   there), then the mesh listener is stopped. **Readiness**: `/health/ready` now additionally
+   checks `Cluster::ready()` (`NotReady` while a clustered replica has not yet heartbeated
+   successfully), collapsing to exactly today's behavior in single-node mode.
+5. **Fencing inside the write path**: not reachable without editing `hs-room` (confirmed again
+   this session; see "What `hs-room` still needs" below). The routing gate (item 3) is the primary
+   defense and is sufficient on its own for the reproduced bug, per the root-cause analysis
+   below it in this file: two *simultaneously live* owners never trip a fence at all, so fencing
+   alone would not have fixed this bug even if `RoomActor::persist` called it. It remains the
+   documented belt-and-braces gap for the one case the gate cannot cover (a stale `is_mine` read
+   racing a real handoff).
+
+**Acceptance test: the two-replica experiment, re-run against the fix.**
+
+Setup (same as the original experiment, `postgres:17` in Docker on `127.0.0.1:5435`, two `hs
+serve` processes on one host), except both configs now carry a real `cluster:` section instead of
+the default:
+
+```yaml
+storage:
+  backend: postgres
+  host: 127.0.0.1
+  port: 5435
+  database: postgres
+  user: postgres
+  password: hspg
+  tls: false
+cluster:
+  single_node: false
+  room_shards: 4
+  user_shards: 4
+  mesh:
+    port: 18449          # 18450 on the second replica -- see "Decisions made"
+    shared_secret: mesh-shared-secret
+  heartbeat_interval: 200ms
+  lease_ttl: 1s
+```
+
+(A's client listener is `18040`, B's is `18041`; each config's `cluster.mesh.port` must differ
+when co-located on one host, the same as the client listener ports already must.)
+
+```
+$ hs serve -c a.yaml &     # replica A: client 18040, mesh 18449
+$ hs serve -c b.yaml &     # replica B: client 18041, mesh 18450
+$ curl http://127.0.0.1:18040/health/ready   # 200, once both have heartbeated
+$ curl http://127.0.0.1:18041/health/ready   # 200
+
+$ hs register -u alice -p hunter2pass -k cluster-secret -v http://127.0.0.1:18040
+@alice:cluster2.example.org
+$ curl -X POST http://127.0.0.1:18041/_matrix/client/v3/login -d '{...}'    # login on B
+$ curl -X POST http://127.0.0.1:18040/_matrix/client/v3/createRoom -d '{"preset":"public_chat", ...}'
+{"room_id":"!mYHcfy3IDZbukA3Ppa:cluster2.example.org"}
+
+# 5 concurrent PUT /send through A and 5 through B, same room, same user, at once:
+B#1 -> 200   A#1 -> 200   B#2 -> 200   A#4 -> 200   B#3 -> 200
+A#2 -> 200   B#4 -> 200   A#5 -> 200   B#5 -> 200   A#3 -> 200
+```
+
+All ten returned `200` with a distinct `event_id`, exactly as before the fix (`select count(*)
+from kv_room_events` afterward: 17 rows -- 7 state events + 10 messages, all present, none lost).
+**The difference is what `GET /messages` shows afterward:**
+
+```
+GET /messages on A (dir=b, limit=100), messages only:
+10 ['from A #1', 'from A #2', 'from A #3', 'from A #4', 'from A #5',
+    'from B #1', 'from B #2', 'from B #3', 'from B #4', 'from B #5']
+
+GET /messages on B, same call:
+10 ['from A #1', 'from A #2', 'from A #3', 'from A #4', 'from A #5',
+    'from B #1', 'from B #2', 'from B #3', 'from B #4', 'from B #5']
+```
+
+**Identical on both replicas** -- all ten messages, same set, same `event_id`s, same
+`prev_events` chain (confirmed by inspecting the raw JSON: the full ordered chunk matches
+byte-for-byte between A and B). Querying `kv_cluster_shards` directly during the run confirms this
+is real ownership routing, not an accident of a tiny shard count: the room's shard (and each
+user/federation shard) is owned by exactly one of `127.0.0.1:18449` (A) or `127.0.0.1:18450` (B)
+at a time, split across the two replicas (`epoch:1`, no churn during the run) -- so half of the ten
+concurrent sends were transparently forwarded across the mesh to whichever replica actually owned
+the room, and the client making them never saw a difference (all `200`, real `event_id`s). This is
+the **forward** behavior (brief deliverable 2); the **refuse** behavior (deliverable 1) is exercised
+by the same code path whenever the forwarder itself fails (no owner known, mesh unreachable,
+retries exhausted) -- see `crate::cluster::RoomShardGate::refuse` -- and is covered by
+`cluster::tests::single_node_gate_never_forwards_or_refuses` plus the unit tests on `extract_room_id`;
+forcing an actual refuse in the live two-replica setup (e.g. by pointing the mesh secret at the
+wrong value) was not additionally re-run this session given time, but the code path is identical
+regardless of which of the two outcomes `forward` produces.
+
+Shutdown was also exercised as part of the same run: `kill -TERM` on both processes simultaneously
+(no live peer to hand off to) produced, in each log, `cluster drain complete handed_off=0
+released_unclaimed=<n>` after releasing every owned shard and waiting out the drain deadline --
+confirming `Cluster::drain` is now actually wired to `SIGTERM`, not just tested in isolation.
+
+**What `hs-room` still needs (not fixed here, cannot be from `hs-cli`):** `RoomActor::persist`
+(`crates/hs-room/src/actor.rs:884`, track 04's file) should call `fence.check(txn, cluster_store.
+shard_keyspace())` as the last read before its transaction commits, using the `hs_cluster::Fence`
+the caller obtained from `ownership.fence(shard)`. This is not required to fix the reproduced bug
+(the routing gate already ensures only one replica's `RoomActor` for a room is ever live), but it
+is the documented belt-and-braces protection against a stale `is_mine` read racing a real
+ownership handoff (a network partition, a rolling update) between the gate's check and the
+transaction's commit.
+
+**Known gaps, not fixed this session (see "Decisions made" for why each was left):**
+- `/createRoom` is not gated (the room id does not exist yet at request time) -- the replica that
+  handles `/createRoom` always constructs the new room's first `RoomActor` locally, regardless of
+  which replica will end up owning its shard. A subsequent request that is correctly gated will
+  still forward to whichever replica *does* own it, but that first write happens wherever the
+  client's `/createRoom` landed.
+- The mesh's advertised host defaults to the first listener's bind address (or `127.0.0.1` if that
+  is a wildcard), not a real Kubernetes pod IP -- fine for this session's same-host setup, wrong
+  for a real multi-pod deployment. `hs-config` has no field for this yet.
+- Mutual TLS for the mesh is not wired from `hs-cli` (shared-secret only); `hs-cluster` already
+  supports it, wiring it needs `hs_config::listeners::TlsConfig` file paths threaded through, left
+  for a follow-up.
+- The forwarded response's status code is passed through verbatim from the proxied handler, which
+  collides in principle with the two statuses `Forwarder::forward` treats specially (`421`, `503`)
+  -- this workspace's client-server API does not use either today, so it is a latent risk, not an
+  observed bug.
+- `hs cluster status` / drain CLI commands and Kubernetes `Lease` membership remain unimplemented,
+  as recorded in the "Next" section below (unchanged by this session).
+
+**Verify:**
+```sh
+cargo fmt -p hs-cluster -p hs-cli -- --check
+cargo clippy -p hs-cluster --all-targets -- -D warnings
+cargo clippy -p hs-cli --all-targets -- -D warnings
+cargo test -p hs-cluster                 # 40 lib + 5 chaos + 2 mesh-pool tests, unchanged
+cargo test -p hs-cli                     # 81 lib tests + e2e.rs (9) + federation_reads.rs (7) all
+                                          # pass; federation_writes.rs has 3 pre-existing failures
+                                          # unrelated to this change (see below)
+cargo test -p hs-loadgen --test real_client            # passes, single-node unaffected
+cargo test -p hs-loadgen --test real_client_encrypted  # passes, single-node unaffected
+```
+
+**A pre-existing, unrelated failure found while verifying, not caused by this change:**
+`cargo test -p hs-cli --test federation_writes` has 3 failing tests
+(`send_rejects_a_new_event_whose_auth_events_do_not_authorize_it`,
+`send_gives_up_when_the_remote_serves_an_endless_backfill_chain`,
+`send_backfills_a_missing_ancestor_then_accepts_the_original_event`), all failing on a signature
+verification error (`"signature from local.example/ed25519:1 does not verify"` /
+`"signature from remote.example/ed25519:a_remote does not verify"`) rather than the behavior each
+test asserts. `crates/hs-federation/src/{inbound,client,backfill}.rs` (track 06's files) were
+modified during this session (mtimes newer than the test file itself), while `crates/hs-cli/tests/
+federation_writes.rs` was not -- this is track 06's in-flight work, not a cluster-track regression:
+nothing in this update touches signing, federation, or event auth, and these tests exercise
+`/_matrix/federation/v1/send` transport, never `/rooms/{roomId}` client routing, so `RoomShardGate`
+cannot be involved. Reproduced twice (`cargo test -p hs-cli --test federation_writes`, run
+independently of this update's changes). Flagging for the integration lead rather than working
+around it.
+
+---
+
 > **Integration note, 2026-09-19 (integration lead): reproduced independently, with one
 > correction.** The silent DAG fork in answer 3 is real and reproduces exactly: two replicas on
 > one PostgreSQL, five concurrent sends through each, every request `200` — then `/messages` on
@@ -442,10 +634,32 @@ than a contained change; see Decisions below for why.
 
 ## In progress
 
-- Nothing actively in progress; the assignment above is complete for Phase 0.
+- Nothing actively in progress. This session's assignment (wire `hs-cluster` into `hs-cli` to stop
+  the two-replica split-brain) is complete: see "Fix landed, 2026-09-19" at the top of this file.
 
 ## Next (not done; for whoever picks this up next)
 
+- **`hs-room`: call `Fence::check` inside `RoomActor::persist`'s transaction** (line 884,
+  `crates/hs-room/src/actor.rs`), using the `hs_cluster::Fence` the caller obtained from
+  `ownership.fence(shard)`. Not required to fix the reproduced bug (the routing gate in
+  `hs-cli` already ensures only one replica's `RoomActor` for a room is ever live), but it is the
+  documented belt-and-braces protection against a stale `is_mine` read racing a real ownership
+  handoff between the gate's check and the transaction's commit.
+- **`/createRoom` is not shard-gated** (see "Fix landed" above): the id does not exist until the
+  handler runs, so whichever replica receives `/createRoom` always constructs the new room's first
+  `RoomActor` locally, regardless of which replica ends up owning its shard. Every *subsequent*
+  request is correctly gated and will forward to the true owner, but the very first write is not.
+  Fixing this properly needs either a two-phase create (reserve the id, then route) or moving room
+  creation into a per-replica-agnostic path; not attempted this session.
+- **A real advertised mesh address.** `crate::cluster::advertise_host` (`crates/hs-cli/src/
+  cluster.rs`) falls back to the first listener's bind address, or `127.0.0.1` if that is a
+  wildcard -- correct for this session's same-host two-replica test, wrong for a real multi-pod
+  Kubernetes deployment, which needs the pod IP. No `hs-config` field carries this today.
+- **Mutual TLS for the mesh, wired from `hs-cli`.** `hs-cluster` already supports it
+  (`AuthMode::MutualTls`); `crate::cluster::start` currently refuses to boot rather than silently
+  downgrading to shared-secret auth if `cluster.mesh.tls` is set in the native config, since
+  loading the certificate files and building the `TlsMaterial` needs `hs_config::listeners::
+  TlsConfig` threaded through and was not done this session (see "Decisions made" below).
 - Kubernetes `Lease` membership (RFC section 4: "the store may be the data store ... or, in Phase
   1, Kubernetes `coordination.k8s.io/v1` Leases via `kube-rs`"). Only the store-based path is
   implemented; it works everywhere including single-node and is what `deploy/chaos/` exercises.
@@ -461,9 +675,10 @@ than a contained change; see Decisions below for why.
   until then `ClusterMetrics::snapshot()` is the interface.
 - `deploy/chaos/` is unrun. It needs Docker, a `kind` cluster, and `hs chaos-actor` (see the
   README's "what this depends on that does not exist yet").
-- Actual integration with 04's room actor / 05's user session actor / 06's federation sender
-  shards / 11's appservice shards -- this is Phase 1/2 per the brief, and those tracks' actors do
-  not exist yet.
+- Actual integration with 05's user session actor / 06's federation sender shards / 11's
+  appservice shards -- 04's room actor is now integrated (this session, client-server routing
+  only; federation's own `/rooms/{roomId}`-shaped paths, if any, are not gated -- see "Decisions
+  made"). This is Phase 1/2 per the brief for the rest.
 
 ## Blockers
 
@@ -484,26 +699,115 @@ than a contained change; see Decisions below for why.
   `crates/hs-cluster/src/cluster.rs`.
 - `hs_cluster::{ClusterConfig, MeshConfig, HandoffConfig}` -- `crates/hs-cluster/src/config.rs`.
 - `hs_cluster::metrics::ClusterMetrics` -- `crates/hs-cluster/src/metrics.rs`.
-- All frozen as of this update; interface changes go through a new dated RFC per the workstream
-  rules.
+- All of the above frozen as before; unchanged by this session (no `hs-cluster` code was touched).
+- **New, in `hs-cli` (not a frozen cross-track interface, but worth other tracks knowing about):**
+  `hs_cli::cluster::{ClusterHandles, RoomShardGate, MeshRuntime, start}` --
+  `crates/hs-cli/src/cluster.rs`. `RoomShardGate::layer` is how any future `hs-cli` router
+  addition gets shard-ownership gating for free by virtue of being mounted before it in
+  `serve::build_router`; nothing outside `hs-cli` needs to call into this module.
 
 ## Interfaces needed
 
 - 01 Storage: nothing further for Fjall/PostgreSQL (built directly on `hs_kv::KvBackend`, see
   Decisions). When SlateDB lands, its per-shard open needs to accept the epoch
   `ClusterStore::acquire_shard` returns.
-- 04, 05, 06, 11: their actors need to exist before shard ownership actually gates anything in
-  production; until then, this crate's own chaos harness stands in as the proof of the contract
-  (`fence.check` before every commit, drop state on `Lost`, persist idempotency keys durably).
-- 07: `RequesterContext` as a real type; the mesh envelope carries `serde_json::Value` until then.
-- 12: readiness should map to `Cluster::ready()`; `terminationGracePeriodSeconds` should be at
-  least `cluster.handoff.deadline` plus a margin; cert-manager (or an equivalent) for per-pod mTLS
-  certificates if mTLS mode is used in production; a `kind` job to actually run `deploy/chaos/`.
-- 13: the `cluster` config section shape is `ClusterConfig`/`MeshConfig`/`HandoffConfig`
-  (`crates/hs-cluster/src/config.rs`); 13 owns turning YAML into these types.
+- 04: `RoomActor::persist` (`crates/hs-room/src/actor.rs:884`) should call `Fence::check` -- see
+  "Next" above. Not blocking (the routing gate is sufficient for the reproduced bug on its own),
+  but the documented remaining gap.
+- 05, 06, 11: their actors need to exist (or, for 06, be routed through the same kind of gate 04's
+  now is) before shard ownership actually gates anything for them in production.
+- 07: `RequesterContext` as a real type; the mesh envelope carries `serde_json::Value` until then
+  (unaffected by this session -- the reverse-proxy forwarder does not use this field at all, since
+  it re-authenticates from the raw `Authorization` header instead; see "Decisions made").
+- 12: readiness now does map to `Cluster::ready()` (this session, `crate::health_ready` in
+  `crates/hs-cli/src/serve.rs`); `terminationGracePeriodSeconds` should be at least the new
+  `CLUSTER_DRAIN_DEADLINE` (20s, `crates/hs-cli/src/serve.rs`) plus the listeners' own drain
+  margin; cert-manager (or an equivalent) for per-pod mTLS certificates once mTLS mode is wired
+  from `hs-cli` (not yet, see "Next"); a `kind` job to actually run `deploy/chaos/`.
+- 13: **new since this update** -- `hs_config::ClusterConfig` (`crates/hs-config/src/cluster.rs`)
+  has no fields for this replica's identity, its mesh-advertised address, zone, or federation/
+  appservice shard counts (only `room_shards`/`user_shards`); `hs-cli`'s
+  `crate::cluster::to_hs_cluster_config` fills these in from process-level facts and
+  `hs_cluster::ShardLayout::default()`'s federation/appservice counts rather than config, which
+  means every replica in a cluster must be given matching `room_shards`/`user_shards` by hand
+  today (a mismatch is caught: `ClusterStore::init_layout` rejects a layout that disagrees with
+  what is already recorded) but federation/appservice shard counts cannot be configured at all.
+  Also: `hs_config::cluster::MeshConfig` has no host field, only `port` -- see `advertise_host` in
+  `crates/hs-cli/src/cluster.rs` for the fallback this session used instead. Not touched in
+  `hs-config` itself per this session's instructions (owned by another agent); recorded here
+  instead.
 - 15: `hs chaos-actor` subcommand for `deploy/chaos/` to have anything to actually deploy.
 
 ## Decisions made
+
+**This session (2026-09-19, wiring `hs-cluster` into `hs-cli`):**
+
+- **Gate reads as well as writes, not just `/send`.** The brief's deliverable 1 says "a replica
+  that does not own a room's shard must not serve a *write* for it," but `RoomShardGate` gates
+  every `/rooms/{roomId}/...` request regardless of method. Reasoning: `hs-room`'s
+  `RoomRegistry` is a per-process `room_id -> RoomActorHandle` map loaded lazily on *any* access,
+  read or write (`crates/hs-room/src/registry.rs`'s own doc comment: "loaded on first access ...
+  dropped after `evict_idle`"). If only writes were gated, a `GET /messages` on a non-owner that
+  already has (or later loads) a resident `RoomActor` for that room would keep serving from that
+  actor's own local, never-updated-by-the-real-owner view forever -- exactly the kind of silent,
+  self-consistent divergence the original bug produced, just for reads instead of writes. Gating
+  every access is what makes "route to the one live owner" actually true, and it is what the
+  live two-replica re-run above confirms: both replicas' `/messages` agree exactly, not just their
+  write acknowledgements.
+- **The forward path is a raw HTTP reverse proxy, not a structured RPC over the mesh envelope.**
+  `RoomShardGate::forward` serializes the incoming method/path/headers/body into JSON (a `base64`
+  body field so the envelope stays valid text regardless of content) and hands it to
+  `Forwarder::forward`; the owner's `ProxyShardHandler` replays it against its own copy of the
+  same `axum::Router` via `tower::Service::oneshot` and ships the real response back the same way.
+  Rejected alternative: defining a typed `hs-room`-aware RPC (send this event, read these
+  messages) inside `hs-cluster`'s `ShardHandler` -- this would need `hs-cluster` to depend on
+  `hs-room`'s request/response types (or `hs-cli` to hand-translate every route, one at a time,
+  forever staying one route behind whatever `hs-room` adds), and would not have been buildable
+  without editing `hs-room` in some form to expose an in-process call surface, which this session
+  could not do. The reverse-proxy approach forwards *any* `/rooms/{roomId}` route automatically
+  (state, redact, relations, receipts, typing, ...), including ones added to `hs-room` after this
+  session, with zero coupling to its internal types -- the cost is losing structured retry
+  semantics for exactly two status codes (`421`, `503`; see "Known gaps" above) and one extra
+  JSON-plus-base64 encode/decode per forwarded request, both acceptable trade-offs given the
+  alternative.
+- **The owner re-authenticates the forwarded request from its own `Authorization` header rather
+  than trusting a `RequesterContext` the origin attaches.** `Envelope::requester` (track 07's
+  seam, still `serde_json::Value` per the frozen mesh envelope) is left `Null` and never read by
+  `ProxyShardHandler`. This is safe specifically because the payload is a full raw HTTP request
+  including its original `Authorization` header, replayed through the owner's *own* auth
+  middleware -- the owner never has to trust the origin's opinion of who the requester is. This
+  would not be safe for a structured RPC that only carries a claimed user id.
+- **This replica's `hs-cluster` identity is its own dialable mesh address (`host:port`), not a
+  separate name.** `Forwarder::resolve_addr`'s own doc comment already documents this convention
+  ("exactly right for ... `ReplicaId == host:port`"); `to_hs_cluster_config` in
+  `crates/hs-cli/src/cluster.rs` follows it rather than inventing a name-to-address lookup table,
+  which would need its own registry.
+- **Federation and appservice shard counts default to `hs_cluster::ShardLayout::default()`'s
+  values (64 each) rather than being configurable**, since `hs_config::ClusterConfig` has no
+  fields for them (see "Interfaces needed" above). Every replica in one cluster computes the same
+  default, so this is internally consistent; it just cannot be tuned without a `hs-config` change
+  this session did not make.
+- **`cluster.mesh.tls` being set causes startup to fail loudly rather than silently falling back
+  to shared-secret auth.** `to_hs_cluster_config` still records the intent to use mutual TLS in the
+  `AuthMode` value it builds (with empty placeholder paths), and `crate::cluster::start` checks for
+  that variant and returns `ClusterSetupError::Invalid` before ever starting the ownership manager,
+  specifically so a deployment that configured TLS for a reason (an untrusted network between
+  pods) never ends up running unauthenticated-by-certificate without an operator being told.
+  Wiring real mutual TLS is left for a follow-up (see "Next").
+- **`CLUSTER_DRAIN_DEADLINE` (20s) is a `hs-cli`-local constant, not a config field**, since
+  `hs_config::ClusterConfig` has no handoff-deadline field (only `hs_cluster::HandoffConfig`,
+  internal, does) and adding one is out of scope for this session (see "Interfaces needed"). Chosen
+  to comfortably fit inside a 30s Kubernetes `terminationGracePeriodSeconds` with margin left for
+  the HTTP listeners' own drain.
+- **No new `[workspace.dependencies]` entries.** `hs-cluster` was added as an ordinary path
+  dependency of `hs-cli` (`crates/hs-cli/Cargo.toml`); every type or trait `crate::cluster` needed
+  from outside `hs-cluster`/`hs-cli` (`serde`, `base64`, `bytes`, `http`, `tower`, `tokio`,
+  `axum`) was already a dependency of `hs-cli`. No percent-decoding crate was added either -- a
+  dozen-line hand-rolled decoder in `crate::cluster::percent_decode` was enough for one path
+  segment shaped like a Matrix room id, and avoided touching the root `Cargo.toml` at all for this
+  change.
+
+**Carried over from previous updates:**
 
 - **The `LeaseStore` / `EpochReader` split from the day-one RFC draft was dropped.** `hs-kv`
   landed with full serializable snapshot isolation on every backend and its own docs name track
@@ -561,6 +865,12 @@ than a contained change; see Decisions below for why.
 
 ## Shared dependencies added
 
+**This session:** `hs-cluster` added as a path dependency of `hs-cli`
+(`crates/hs-cli/Cargo.toml`). No other new dependency, and no `[workspace.dependencies]` entries
+added -- see "Decisions made" above.
+
+**Carried over from previous updates:**
+
 - `hs-kv` added as a path dependency of `hs-cluster` (`crates/hs-cluster/Cargo.toml`), per this
   track's instructions to build directly on it. Already present in the workspace (track 01).
 - `rustls-pemfile` added to `crates/hs-cluster/Cargo.toml` as `{ workspace = true }`. It was
@@ -573,6 +883,8 @@ than a contained change; see Decisions below for why.
 
 ## How to verify
 
+For `hs-cluster` alone (unchanged this session):
+
 ```sh
 cargo fmt -p hs-cluster -- --check
 cargo clippy -p hs-cluster --all-targets -- -D warnings
@@ -580,6 +892,10 @@ cargo test -p hs-cluster                # 40 lib tests + 5 chaos tests + 2 mesh-
 cargo test -p hs-cluster --test chaos      # just the chaos harness, if iterating on it alone
 cargo test -p hs-cluster --test mesh_pool  # just the connection-pooling tests
 ```
+
+For the `hs-cli` wiring added this session, see the commands and results under "Fix landed,
+2026-09-19" at the top of this file (the live two-replica acceptance test, plus `cargo fmt`/
+`clippy`/`test` for both crates and `hs-loadgen`'s real-client tests for single-node regression).
 
 To re-verify the chaos suite's fencing coverage by mutation (as this update's integration review
 did): in `crates/hs-cluster/src/fence.rs`, make `Fence::check` `{ return Ok(()); }` unconditionally,
