@@ -24,10 +24,13 @@
 //! `"{schema}"."kv_{keyspace}"`, each `(k bytea primary key, v bytea not null)`. All tables for one
 //! [`PostgresBackend`] live in one PostgreSQL schema (`"public"` by default, or whatever
 //! [`PostgresBackend::open`] is given), created with `CREATE SCHEMA IF NOT EXISTS`. Keyspace names
-//! are validated as safe SQL identifiers (`^[A-Za-z_][A-Za-z0-9_]*$`, at most 55 bytes) before
-//! being interpolated into DDL/DML, since PostgreSQL has no way to bind an identifier as a query
-//! parameter; there is no user-controlled input in this path (keyspace names come from
-//! `hs-tables`), but the check is cheap insurance.
+//! are validated by [`validate_keyspace_name`] before being interpolated into DDL/DML, since
+//! PostgreSQL has no way to bind an identifier as a query parameter: either a single safe SQL
+//! identifier (`^[A-Za-z_][A-Za-z0-9_]*$`) or a **dotted path** of them (e.g. `hs_auth.users`,
+//! the convention several consuming crates use to group their own keyspaces — see that function's
+//! docs for why the dot is safe to allow), at most 55 bytes total. There is no user-controlled
+//! input in this path (keyspace names come from other crates' source code, not request data), but
+//! the check is cheap insurance.
 //!
 //! # Ordering and range scans
 //!
@@ -102,10 +105,70 @@
 //! durable" contract identical across backends (a decision already recorded for the Fjall backend
 //! in `docs/status/01-storage-engine.md`); a real `LISTEN`/`NOTIFY` fan-out would only matter for
 //! cross-process wake-ups, which the contract explicitly does not promise.
+//!
+//! # Execution model: why this backend can be opened and called from inside a Tokio runtime
+//!
+//! The synchronous `postgres` crate is not merely "blocking" — every method that talks to the
+//! server (`Client::connect`/`r2d2`'s manager, `batch_execute`, `query`, `query_opt`, `execute`)
+//! internally spins up its own hidden Tokio runtime the first time it is needed and drives it with
+//! `Runtime::block_on`. Tokio detects an already-active runtime on the *calling thread* via a
+//! thread-local and panics rather than nesting ("Cannot start a runtime from within a runtime").
+//! Since [`hs serve`](../../hs-cli) is an async binary — it opens storage from an async fn and
+//! every later request handler that touches storage runs as a Tokio task — naively calling this
+//! backend's methods directly panicked on the very first call, not merely at startup: any thread
+//! Tokio chose to run a handler on could already be carrying that thread-local.
+//!
+//! The fix is that **no method on this backend ever calls into `postgres`/`r2d2` from the thread
+//! the caller invoked it on.** [`run_isolated`] spawns a brand-new, bare OS thread with
+//! [`std::thread::scope`], runs the given closure there, and blocks the calling thread on its
+//! result. A freshly spawned OS thread has its own thread-local storage, initialized from
+//! scratch — it does not inherit whatever the parent thread was doing — so it can never be
+//! "already inside a runtime" no matter what thread asked for the work, including a Tokio worker
+//! thread, `hs serve`'s main thread, or a plain `#[test]`'s single thread. Every single touch
+//! point that reaches `postgres`/`r2d2` (`open`, `keyspace`, `begin`, `commit`,
+//! `drop_schema_for_test`, `snapshot`, every `get`/`multi_get`/`range` on [`PgTxn`] and
+//! [`PgSnapshot`], and both types' `Drop` impls, which issue a real `ROLLBACK`) goes through
+//! [`run_isolated`] — not just the ones that looked risky, because the panic is not "opening is
+//! unsafe", it is "every call is unsafe on the wrong thread", including the rollback a `Drop` runs
+//! silently in the background.
+//!
+//! **Why a fresh thread per call, not a persistent worker pool.** Two credible designs exist here:
+//! a small pool of long-lived worker threads fed through a channel, or `tokio-postgres` driven on
+//! a runtime this backend owns and manages itself. Both were considered; a thread spawned fresh
+//! per call was chosen instead, because the dominant cost of every operation this backend performs
+//! is already a network round trip to PostgreSQL — measured at roughly 5.3ms per uncontended
+//! `transact` cycle against a local Docker container (see the status file). An OS thread spawn
+//! costs on the order of tens of microseconds: three orders of magnitude smaller, i.e. noise
+//! against the cost this backend already pays on every call regardless of execution strategy. A
+//! persistent pool would need its own lifecycle (start it in `open`, shut it down cleanly,
+//! propagate a panicked worker thread's failure back to callers instead of silently wedging the
+//! pool), and `tokio-postgres` would mean this backend owning and threading through its own
+//! runtime handle while still presenting a synchronous [`KvBackend`] to every other crate in the
+//! workspace — either is real, ongoing complexity bought for a savings this backend's own numbers
+//! say does not matter. `std::thread::scope` additionally means [`run_isolated`] can borrow
+//! non-`'static` data (a `&mut postgres::Client` living on the caller's stack, a `&str` SQL
+//! fragment) directly, with no channel plumbing or `Arc`-wrapping to satisfy a `'static` bound. If
+//! profiling of a real deployment ever shows thread-spawn overhead mattering (it would have to
+//! become comparable to a multi-millisecond network round trip first), swapping the body of
+//! [`run_isolated`] for a persistent pool is a localized change: every call site already goes
+//! through this one function.
+//!
+//! The public [`KvBackend`]/[`KvRead`]/[`KvWrite`] surface is completely unchanged by this: every
+//! method is still a plain, synchronous `fn` returning once the (isolated) work is done. A caller
+//! on a Tokio runtime still is, and remains, expected to run `hs-kv` calls through
+//! `tokio::task::spawn_blocking` if it wants to avoid blocking its own worker thread for the
+//! duration of a call — exactly as already documented for the Fjall backend — but it is no longer
+//! *required* to for correctness: this backend now tolerates being called directly from inside a
+//! runtime, it just costs that thread the call's latency if you do. See
+//! `postgres_survives_being_opened_and_called_from_inside_a_tokio_runtime` in
+//! `tests/postgres_conformance.rs` for the regression test that proves this: it opens the backend,
+//! runs a real transaction, and drops it, all from inside `#[tokio::test]`'s ambient
+//! multi-threaded runtime.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::thread;
 
 use bytes::Bytes;
 use postgres::NoTls;
@@ -143,19 +206,81 @@ impl std::error::Error for DeferredError {}
 /// Validates a keyspace or schema name as a safe, unquoted SQL identifier component. Keyspace
 /// names are chosen by `hs-tables`, not user data (see the crate-level contract), but this is
 /// cheap insurance against ever interpolating something unexpected into DDL/DML.
-fn validate_ident(name: &str) -> Result<(), KvError> {
-    let first_ok = name
+/// Whether `segment` is shaped like a safe, unquoted SQL identifier on its own
+/// (`^[A-Za-z_][A-Za-z0-9_]*$`) — the building block both [`validate_ident`] and
+/// [`validate_keyspace_name`] check every dot-separated piece of a name against.
+fn is_safe_ident_segment(segment: &str) -> bool {
+    let first_ok = segment
         .chars()
         .next()
         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
-    let rest_ok = name
+    let rest_ok = segment
         .chars()
         .skip(1)
         .all(|c| c.is_ascii_alphanumeric() || c == '_');
-    if name.is_empty() || name.len() > 55 || !first_ok || !rest_ok {
+    !segment.is_empty() && first_ok && rest_ok
+}
+
+/// Validates a schema name as a single safe, unquoted SQL identifier
+/// (`^[A-Za-z_][A-Za-z0-9_]*$`, at most 55 bytes). Unlike a keyspace name (see
+/// [`validate_keyspace_name`]), a schema name is never dotted — it names exactly one PostgreSQL
+/// schema and is chosen by whoever calls [`PostgresBackend::open`], not by another crate's own
+/// naming convention.
+fn validate_ident(name: &str) -> Result<(), KvError> {
+    if name.is_empty() || name.len() > 55 || !is_safe_ident_segment(name) {
         return Err(KvError::InvalidKeyspaceName(name.to_owned()));
     }
     Ok(())
+}
+
+/// Validates a keyspace name as either a single safe identifier or a **dotted path of them**
+/// (`^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$`, at most 55 bytes total), e.g.
+/// `"events"` or `"hs_auth.users"`.
+///
+/// The dotted form exists because several consuming crates group their own keyspaces under a
+/// crate-scoped prefix this way (see e.g. `crates/hs-auth/src/store/tables.rs`'s `hs_auth.users`,
+/// `hs_auth.access_tokens`, and the equivalent `hs_room.*`/`hs_e2e.*`/`hs_push.*` families in
+/// other crates) — a convention the in-memory and Fjall backends never rejected, since neither
+/// treats a keyspace name as anything more than an opaque map/partition key. This backend does
+/// have to embed the name inside a SQL identifier, but a dot is not special once the whole thing
+/// is inside one pair of double quotes (`"kv_hs_auth.users"` is a single ordinary identifier to
+/// PostgreSQL, not a schema-qualified reference — that syntax needs a separate quoted piece per
+/// segment, which this backend never produces), so accepting the dot costs nothing in safety as
+/// long as every segment on either side of it is still restricted to the same safe character set:
+/// every segment is checked independently against [`is_safe_ident_segment`], which in particular
+/// never allows `"` (the identifier-quote-escape character) or `.` itself as a segment character,
+/// so a name can never smuggle in anything that terminates the quoted identifier early or
+/// resembles a second, attacker-chosen identifier. The 55-byte overall limit (checked before
+/// splitting, so it bounds the dots too) leaves room for the `kv_` table-name prefix
+/// ([`KvBackend::keyspace`]) while staying under PostgreSQL's 63-byte `NAMEDATALEN` identifier
+/// limit — going over that limit doesn't error, it silently truncates, which would risk two
+/// different keyspace names colliding on the same underlying table, so this is a hard cap, not a
+/// style preference.
+fn validate_keyspace_name(name: &str) -> Result<(), KvError> {
+    if name.is_empty() || name.len() > 55 || !name.split('.').all(is_safe_ident_segment) {
+        return Err(KvError::InvalidKeyspaceName(name.to_owned()));
+    }
+    Ok(())
+}
+
+/// Runs `f` to completion on a freshly spawned, bare OS thread and blocks the calling thread
+/// until it finishes, returning `f`'s result. See the module docs ("Execution model") for why
+/// *every* call this backend makes into `postgres`/`r2d2` goes through this function: the
+/// synchronous `postgres` crate drives a hidden Tokio runtime internally and panics if invoked on
+/// a thread that already has one, and a brand-new OS thread — unlike the calling thread, which
+/// might be a Tokio worker — never does.
+///
+/// A panic inside `f` is propagated to the caller (via [`std::panic::resume_unwind`]) rather than
+/// silently swallowed, so a bug in `f` still fails the calling test/request the same way it would
+/// have without this indirection.
+///
+/// # Panics
+/// Propagates any panic from `f`.
+fn run_isolated<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    match thread::scope(|scope| scope.spawn(f).join()) {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 fn is_serialization_conflict(err: &postgres::Error) -> bool {
@@ -181,10 +306,35 @@ fn is_serialization_conflict(err: &postgres::Error) -> bool {
 const WRITE_LOCK_TIMEOUT: &str = "200ms";
 
 struct Inner {
-    pool: PgPool,
+    // `Option`, not a plain `PgPool` field — see `impl Drop for Inner` immediately below for why:
+    // dropping an `r2d2::Pool` drops every pooled `postgres::Client`, whose own `Drop` impl makes
+    // a real blocking call, so it must happen inside `run_isolated` like every other call in this
+    // module, not as an ordinary field drop on whatever thread `Inner` happens to be dropped on.
+    // `Option::take` extracts it safely (this crate forbids `unsafe`, so `ManuallyDrop::take`,
+    // the usual tool for this, is not available). Always `Some` from construction until
+    // `Inner::drop` runs; every other method may assume that and `.expect()` accordingly, exactly
+    // like `PgTxn::with_conn`'s existing "used after commit" invariant below.
+    pool: Option<PgPool>,
     schema: String,
     hub: Hub,
     tables: Mutex<HashMap<String, Arc<str>>>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // `r2d2::Pool` is a cheap `Arc`-backed handle, but dropping the *last* one tears down
+        // every idle pooled connection, and `postgres::Client::drop` issues a real, blocking
+        // `postgres` call of its own (`close_inner` -> `block_on`) — the exact same "no ambient
+        // runtime" hazard as every explicit call in this module (see the module docs, "Execution
+        // model"), just triggered implicitly by a destructor instead of a method call. This is
+        // not hypothetical: dropping a `PostgresBackend` from inside a `#[tokio::test]`'s runtime
+        // panicked here before this fix (see
+        // `postgres_survives_being_opened_and_called_from_inside_a_tokio_runtime` in
+        // `tests/postgres_conformance.rs`, which drops a backend at the end of its round trip).
+        if let Some(pool) = self.pool.take() {
+            run_isolated(move || drop(pool));
+        }
+    }
 }
 
 /// The PostgreSQL [`KvBackend`]. Cloning shares the connection pool.
@@ -207,30 +357,36 @@ impl PostgresBackend {
     pub fn open(dsn: &str, schema: &str) -> Result<Self, KvError> {
         validate_ident(schema)?;
         let config: postgres::Config = dsn.parse().map_err(KvError::backend)?;
-        let manager = PgManager::new(config, NoTls);
-        let pool = Pool::builder()
-            .max_size(16)
-            // Fail fast rather than r2d2's 30-second default: a caller (including a reachability
-            // check like the one `postgres_conformance.rs` uses to decide whether to skip) should
-            // not have to wait half a minute to learn there is no server. Production callers that
-            // want resilience against a slow-starting database retry `open`/individual operations
-            // at a higher level (readiness probes, `hs serve`'s own startup retry), not by waiting
-            // longer here.
-            .connection_timeout(std::time::Duration::from_secs(3))
-            .build(manager)
-            .map_err(KvError::backend)?;
-        {
-            let mut conn = pool.get().map_err(KvError::backend)?;
-            conn.batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""))
+        // See the module docs ("Execution model"): building the pool and taking its first
+        // connection both may dial PostgreSQL, which the synchronous `postgres` crate does by
+        // driving a hidden Tokio runtime — never safe to do on the caller's own thread, since
+        // `open` itself may be called from inside an async fn (as `hs serve` does).
+        run_isolated(move || {
+            let manager = PgManager::new(config, NoTls);
+            let pool = Pool::builder()
+                .max_size(16)
+                // Fail fast rather than r2d2's 30-second default: a caller (including a
+                // reachability check like the one `postgres_conformance.rs` uses to decide
+                // whether to skip) should not have to wait half a minute to learn there is no
+                // server. Production callers that want resilience against a slow-starting
+                // database retry `open`/individual operations at a higher level (readiness
+                // probes, `hs serve`'s own startup retry), not by waiting longer here.
+                .connection_timeout(std::time::Duration::from_secs(3))
+                .build(manager)
                 .map_err(KvError::backend)?;
-        }
-        Ok(Self {
-            inner: Arc::new(Inner {
-                pool,
-                schema: schema.to_owned(),
-                hub: Hub::new(),
-                tables: Mutex::new(HashMap::new()),
-            }),
+            {
+                let mut conn = pool.get().map_err(KvError::backend)?;
+                conn.batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""))
+                    .map_err(KvError::backend)?;
+            }
+            Ok(Self {
+                inner: Arc::new(Inner {
+                    pool: Some(pool),
+                    schema: schema.to_owned(),
+                    hub: Hub::new(),
+                    tables: Mutex::new(HashMap::new()),
+                }),
+            })
         })
     }
 
@@ -240,12 +396,17 @@ impl PostgresBackend {
     /// # Errors
     /// Returns [`KvError::Backend`] on a connection or query failure.
     pub fn drop_schema_for_test(&self) -> Result<(), KvError> {
-        let mut conn = self.inner.pool.get().map_err(KvError::backend)?;
-        conn.batch_execute(&format!(
-            "DROP SCHEMA IF EXISTS \"{}\" CASCADE",
-            self.inner.schema
-        ))
-        .map_err(KvError::backend)
+        let pool = self
+            .inner
+            .pool
+            .as_ref()
+            .expect("PostgresBackend used after Inner was dropped, which cannot happen: Inner is owned by an Arc this handle holds a strong reference to");
+        let schema = &self.inner.schema;
+        run_isolated(move || {
+            let mut conn = pool.get().map_err(KvError::backend)?;
+            conn.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+                .map_err(KvError::backend)
+        })
     }
 }
 
@@ -281,7 +442,26 @@ impl Drop for PgSnapshot {
     fn drop(&mut self) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if let SnapState::Ready(conn) = &mut *state {
-            let _ = conn.batch_execute("ROLLBACK");
+            // See `PgTxn`'s `Drop` impl and the module docs: a real `postgres` call from a `Drop`
+            // impl must be isolated exactly like any other call.
+            run_isolated(move || {
+                let _ = conn.batch_execute("ROLLBACK");
+            });
+        }
+    }
+}
+
+impl PgSnapshot {
+    /// Runs `f` against the live connection on an isolated thread (see the module docs), or
+    /// re-surfaces a pool/connection failure captured at [`KvBackend::snapshot`] time.
+    fn with_conn<T: Send>(
+        &self,
+        f: impl FnOnce(&mut postgres::Client) -> Result<T, postgres::Error> + Send,
+    ) -> Result<T, KvError> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        match &mut *state {
+            SnapState::Ready(conn) => run_isolated(move || f(conn)).map_err(KvError::backend),
+            SnapState::Failed(msg) => Err(KvError::backend(DeferredError(msg.clone()))),
         }
     }
 }
@@ -310,18 +490,29 @@ impl PgTxn {
     /// deadlock, or lock timeout into [`KvError::MidTransactionConflict`] and rolling the
     /// (already server-side-aborted) transaction back immediately — see the module docs. Any
     /// other error becomes [`KvError::Backend`].
-    fn with_conn<T>(
+    fn with_conn<T: Send>(
         &self,
-        f: impl FnOnce(&mut postgres::Client) -> Result<T, postgres::Error>,
+        f: impl FnOnce(&mut postgres::Client) -> Result<T, postgres::Error> + Send,
     ) -> Result<T, KvError> {
         let mut guard = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
         let conn = guard.as_mut().expect(
             "PgTxn used after commit (hs-kv only calls with_conn before commit consumes the txn)",
         );
-        match f(conn) {
+        // Both the query itself and, on a serialization failure, the rollback that follows it
+        // are real `postgres` calls and must happen on the same isolated thread — see the module
+        // docs ("Execution model"). `f(conn)` reborrows `conn` (an ordinary implicit `&mut`
+        // reborrow), so it is still usable afterward for the conditional rollback.
+        match run_isolated(move || {
+            let result = f(conn);
+            if let Err(e) = &result
+                && is_serialization_conflict(e)
+            {
+                let _ = conn.batch_execute("ROLLBACK");
+            }
+            result
+        }) {
             Ok(value) => Ok(value),
             Err(e) if is_serialization_conflict(&e) => {
-                let _ = conn.batch_execute("ROLLBACK");
                 *guard = None;
                 Err(KvError::MidTransactionConflict)
             }
@@ -334,7 +525,12 @@ impl Drop for PgTxn {
     fn drop(&mut self) {
         let mut guard = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(mut conn) = guard.take() {
-            let _ = conn.batch_execute("ROLLBACK");
+            // A real `postgres` call, made from a `Drop` impl that may run on any thread
+            // (including a Tokio worker, if a caller drops a `PgTxn` from inside async code) —
+            // must go through `run_isolated` exactly like every other call. See the module docs.
+            run_isolated(move || {
+                let _ = conn.batch_execute("ROLLBACK");
+            });
         }
     }
 }
@@ -449,17 +645,17 @@ impl KvRead for PgSnapshot {
     type Keyspace = PgKeyspace;
 
     fn get(&self, keyspace: &Self::Keyspace, key: &[u8]) -> Result<Option<Bytes>, KvError> {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let conn = match &mut *state {
-            SnapState::Ready(conn) => conn,
-            SnapState::Failed(msg) => return Err(KvError::backend(DeferredError(msg.clone()))),
-        };
-        let sql = format!("SELECT v FROM {} WHERE k = $1", keyspace.qualified);
-        let row = conn.query_opt(&sql, &[&key]).map_err(KvError::backend)?;
-        Ok(row.map(|r| {
-            let v: Vec<u8> = r.get(0);
-            Bytes::from(v)
-        }))
+        let qualified = keyspace.qualified.clone();
+        self.with_conn(move |conn| {
+            let sql = format!("SELECT v FROM {qualified} WHERE k = $1");
+            conn.query_opt(&sql, &[&key])
+        })
+        .map(|row| {
+            row.map(|r| {
+                let v: Vec<u8> = r.get(0);
+                Bytes::from(v)
+            })
+        })
     }
 
     fn multi_get(
@@ -467,22 +663,11 @@ impl KvRead for PgSnapshot {
         keyspace: &Self::Keyspace,
         keys: &[&[u8]],
     ) -> Result<Vec<Option<Bytes>>, KvError> {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let conn = match &mut *state {
-            SnapState::Ready(conn) => conn,
-            SnapState::Failed(msg) => return Err(KvError::backend(DeferredError(msg.clone()))),
-        };
-        multi_get_impl(conn, &keyspace.qualified, keys).map_err(KvError::backend)
+        self.with_conn(|conn| multi_get_impl(conn, &keyspace.qualified, keys))
     }
 
     fn range<'a>(&'a self, keyspace: &Self::Keyspace, spec: RangeSpec) -> RangeIter<'a> {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let result = match &mut *state {
-            SnapState::Ready(conn) => {
-                run_range(conn, &keyspace.qualified, &spec).map_err(KvError::backend)
-            }
-            SnapState::Failed(msg) => Err(KvError::backend(DeferredError(msg.clone()))),
-        };
+        let result = self.with_conn(|conn| run_range(conn, &keyspace.qualified, &spec));
         range_result_to_iter(result)
     }
 }
@@ -635,7 +820,7 @@ impl KvBackend for PostgresBackend {
     type Txn = PgTxn;
 
     fn keyspace(&self, name: &str) -> Result<Self::Keyspace, KvError> {
-        validate_ident(name)?;
+        validate_keyspace_name(name)?;
         let mut cache = self
             .inner
             .tables
@@ -648,11 +833,19 @@ impl KvBackend for PostgresBackend {
             });
         }
         let qualified: Arc<str> = Arc::from(format!("\"{}\".\"kv_{name}\"", self.inner.schema));
-        let mut conn = self.inner.pool.get().map_err(KvError::backend)?;
-        conn.batch_execute(&format!(
-            "CREATE TABLE IF NOT EXISTS {qualified} (k bytea PRIMARY KEY, v bytea NOT NULL)"
-        ))
-        .map_err(KvError::backend)?;
+        let pool = self
+            .inner
+            .pool
+            .as_ref()
+            .expect("PostgresBackend used after Inner was dropped, which cannot happen: Inner is owned by an Arc this handle holds a strong reference to");
+        let q = qualified.clone();
+        run_isolated(move || {
+            let mut conn = pool.get().map_err(KvError::backend)?;
+            conn.batch_execute(&format!(
+                "CREATE TABLE IF NOT EXISTS {q} (k bytea PRIMARY KEY, v bytea NOT NULL)"
+            ))
+            .map_err(KvError::backend)
+        })?;
         cache.insert(name.to_owned(), qualified.clone());
         Ok(PgKeyspace {
             name: Arc::from(name),
@@ -661,7 +854,12 @@ impl KvBackend for PostgresBackend {
     }
 
     fn snapshot(&self) -> Self::Snapshot {
-        let state = match self.inner.pool.get() {
+        let pool = self
+            .inner
+            .pool
+            .as_ref()
+            .expect("PostgresBackend used after Inner was dropped, which cannot happen: Inner is owned by an Arc this handle holds a strong reference to");
+        let state = run_isolated(move || match pool.get() {
             Ok(mut conn) => {
                 match conn.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY") {
                     Ok(()) => SnapState::Ready(Box::new(conn)),
@@ -669,18 +867,26 @@ impl KvBackend for PostgresBackend {
                 }
             }
             Err(e) => SnapState::Failed(e.to_string()),
-        };
+        });
         PgSnapshot {
             state: Mutex::new(state),
         }
     }
 
     fn begin(&self) -> Result<Self::Txn, KvError> {
-        let mut conn = self.inner.pool.get().map_err(KvError::backend)?;
-        conn.batch_execute(&format!(
-            "BEGIN ISOLATION LEVEL SERIALIZABLE; SET LOCAL lock_timeout = '{WRITE_LOCK_TIMEOUT}'"
-        ))
-        .map_err(KvError::backend)?;
+        let pool = self
+            .inner
+            .pool
+            .as_ref()
+            .expect("PostgresBackend used after Inner was dropped, which cannot happen: Inner is owned by an Arc this handle holds a strong reference to");
+        let conn = run_isolated(move || {
+            let mut conn = pool.get().map_err(KvError::backend)?;
+            conn.batch_execute(&format!(
+                "BEGIN ISOLATION LEVEL SERIALIZABLE; SET LOCAL lock_timeout = '{WRITE_LOCK_TIMEOUT}'"
+            ))
+            .map_err(KvError::backend)?;
+            Ok::<_, KvError>(conn)
+        })?;
         Ok(PgTxn {
             conn: Mutex::new(Some(conn)),
             pending: HashMap::new(),
@@ -700,8 +906,17 @@ impl KvBackend for PostgresBackend {
             return Ok(Err(Conflict));
         };
         drop(guard);
-        let outcome =
-            flush_pending(&mut conn, &txn.pending).and_then(|()| conn.batch_execute("COMMIT"));
+        // Flushing the buffered writes, committing, and (on failure) rolling back are all real
+        // `postgres` calls — one isolated-thread trip covers the whole sequence.
+        let pending = &txn.pending;
+        let outcome = run_isolated(move || {
+            let result =
+                flush_pending(&mut conn, pending).and_then(|()| conn.batch_execute("COMMIT"));
+            if result.is_err() {
+                let _ = conn.batch_execute("ROLLBACK");
+            }
+            result
+        });
         match outcome {
             Ok(()) => {
                 for (ks, key) in &txn.write_keys {
@@ -710,7 +925,6 @@ impl KvBackend for PostgresBackend {
                 Ok(Ok(()))
             }
             Err(e) => {
-                let _ = conn.batch_execute("ROLLBACK");
                 if is_serialization_conflict(&e) {
                     Ok(Err(Conflict))
                 } else {
@@ -722,5 +936,79 @@ impl KvBackend for PostgresBackend {
 
     fn watch(&self, keyspace: &Self::Keyspace, key: &[u8]) -> Watch {
         self.inner.hub.watch(&keyspace.name, key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These are pure, offline unit tests of the identifier validators — no database needed,
+    // unlike the rest of this backend's test coverage (`tests/postgres_conformance.rs`), which is
+    // exactly why the dotted-name regression this covers went unnoticed: nothing exercised
+    // `validate_keyspace_name` in isolation before, and the one integration test that opens a
+    // keyspace always used a bare, undotted name.
+
+    #[test]
+    fn keyspace_name_accepts_a_dotted_prefix_like_other_crates_use() {
+        // Real names other crates already use (see crates/hs-auth/src/store/tables.rs and
+        // friends): a single crate-scoped prefix, a dot, then the table name.
+        for name in [
+            "hs_auth.users",
+            "hs_auth.access_tokens",
+            "hs_room.events",
+            "hs_e2e.device_keys",
+            "hs_push.rules",
+            "plain_no_dot_at_all",
+            "a.b.c",
+        ] {
+            assert!(
+                validate_keyspace_name(name).is_ok(),
+                "{name:?} should be a valid keyspace name"
+            );
+        }
+    }
+
+    #[test]
+    fn keyspace_name_rejects_anything_that_could_escape_the_quoted_identifier() {
+        for name in [
+            "",
+            ".",
+            ".leading_dot",
+            "trailing_dot.",
+            "double..dot",
+            "has space",
+            "has\"quote",
+            "has'quote",
+            "has;semicolon",
+            "has\\backslash",
+            "1starts_with_digit",
+            ".starts_with_dot_segment.ok",
+        ] {
+            assert!(
+                validate_keyspace_name(name).is_err(),
+                "{name:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn keyspace_name_enforces_the_overall_length_limit_even_with_dots() {
+        let short_segments = "a.".repeat(30); // well over 55 bytes once joined
+        assert!(validate_keyspace_name(&short_segments).is_err());
+        let exactly_at_limit = "a".repeat(55);
+        assert!(validate_keyspace_name(&exactly_at_limit).is_ok());
+        let one_over = "a".repeat(56);
+        assert!(validate_keyspace_name(&one_over).is_err());
+    }
+
+    #[test]
+    fn schema_name_stays_undotted_only() {
+        assert!(validate_ident("public").is_ok());
+        assert!(validate_ident("hs_kv_test_123").is_ok());
+        assert!(
+            validate_ident("hs_auth.users").is_err(),
+            "a schema name is never dotted, unlike a keyspace name"
+        );
     }
 }

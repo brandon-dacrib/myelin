@@ -18,15 +18,32 @@
 > its own dedicated thread(s) with no ambient runtime, or move to `tokio-postgres` driven on a
 > runtime handle the backend controls. Whichever is chosen, the acceptance test is booting
 > `hs serve` with `storage.backend: postgres` and registering a user — not the conformance suite.
+>
+> **RESOLVED, session 3 (same day): `PostgresBackend` now isolates every call onto a freshly
+> spawned OS thread — see "Session 3" below.** Every operation, including `open` and both
+> transaction types' `Drop`-time rollback, now runs on a thread with no ambient Tokio context, so
+> the backend tolerates being opened and called from inside a runtime. **Action needed from the
+> integration lead**: delete `StorageOpenError::PostgresInsideRuntime` and its guard in
+> `crates/hs-cli/src/storage.rs` — they are no longer needed and now stand in the way of a real
+> deployment. This track could not make that edit (`hs-cli` is out of scope for track 01).
+>
+> **Integration note, 2026-09-19 (integration lead, follow-up): guard removed, `hs serve` no
+> longer panics, but it fails one step later** — `storage backend error: invalid keyspace name
+> "hs_auth.users"`. Every consuming crate names its keyspaces with a dotted crate-scoped prefix
+> (`hs_auth.users`, `hs_room.*`, `hs_e2e.*`, `hs_push.*`, ...); this backend's identifier
+> validation rejected the dot, which the in-memory and Fjall backends never did. **RESOLVED, same
+> day: see "Dotted keyspace names" under "Session 3" below.**
 
 
 Track brief: `docs/workstreams/01-storage-engine.md`. Owner crates: `hs-kv`, `hs-tables`,
 `hs-search` (not started).
 
-Last updated: 2026-09-19 (session 2: the PostgreSQL `KvBackend`, closing the
-`docs/next-steps.md` gap "PostgreSQL and SlateDB backends absent — only the embedded backend can
-actually open"). SlateDB is **still absent** — out of scope for this session by explicit
-instruction; see "Next".
+Last updated: 2026-09-19 (session 3: `PostgresBackend` execution-model fix, plus a follow-up
+dotted-keyspace-name fix found by actually booting `hs serve` — see "Session 3:
+`PostgresBackend` can now be called from inside a Tokio runtime" below). Session 2 delivered the
+PostgreSQL `KvBackend` itself, closing the `docs/next-steps.md` gap "PostgreSQL and SlateDB
+backends absent — only the embedded backend can actually open". SlateDB is **still absent** — out
+of scope for this session by explicit instruction; see "Next".
 
 ## Done
 
@@ -357,6 +374,218 @@ loudly if any *other* scenario ever fails, or if the first divergence ever stops
    correct and tested" rather than every config knob; flagging it explicitly rather than silently
    ignoring `pool_size`.
 
+## Session 3: `PostgresBackend` can now be called from inside a Tokio runtime
+
+**Scope**: fix exactly the bug in the integration note at the top of this file — `hs-cli` and
+every other crate were explicitly out of bounds this session; only `crates/hs-kv` and this status
+file were touched.
+
+### The bug, precisely
+
+The synchronous `postgres` crate is not "blocking" in the ordinary sense: every method that
+actually talks to the server (`Client::connect` — reached via `r2d2`'s manager whenever the pool
+dials a new connection —, `batch_execute`, `query`, `query_opt`, `execute`, and even
+`Client::drop` itself) spins up a hidden Tokio runtime on first use and drives it with
+`Runtime::block_on`. Tokio detects an already-active runtime on the *calling thread* via a
+thread-local and panics ("Cannot start a runtime from within a runtime") rather than nesting. Since
+`hs serve` opens storage from an async fn and every later request handler that touches storage runs
+as a Tokio task, this was not an "opening" problem to special-case — it was every single call, on
+whatever thread Tokio happened to schedule that task on, and additionally on **`Drop`**, since both
+`PgTxn` and `PgSnapshot` issue a real `ROLLBACK` when dropped, and dropping the last
+`PostgresBackend` handle drops the whole `r2d2::Pool`, which drops every pooled `postgres::Client`,
+whose own `Drop` impl also makes a real blocking call. All four of these — explicit calls, the two
+`Drop` impls, and pool teardown — had to be fixed; fixing only the obviously-named methods left the
+last one as a live panic that a naive "wrap `open` in `spawn_blocking`" fix would have missed
+entirely (confirmed: it reproduced on `PostgresBackend` drop specifically, not on any explicit
+method call, the first time the regression test below was run).
+
+### The fix: `run_isolated`, a fresh bare OS thread per call
+
+Considered both designs the assignment offered:
+
+1. **Chosen**: keep the synchronous `postgres` client, but ensure no method ever calls into it on
+   the thread the caller invoked it on. `run_isolated` (`postgres_backend.rs`) spawns a **brand
+   new OS thread via `std::thread::scope`** for every single touch point that reaches
+   `postgres`/`r2d2`, runs the work there, and blocks the calling thread on the join. A freshly
+   spawned OS thread has its own thread-local storage from scratch — it cannot be "already inside a
+   runtime" regardless of what thread asked for the work, including a Tokio worker thread, `hs
+   serve`'s main thread, or a plain `#[test]`'s single thread.
+2. **Rejected**: driving `tokio-postgres` on a runtime this backend owns. Would work, but means
+   this backend managing its own runtime's lifecycle while still presenting a synchronous
+   `KvBackend` to the rest of the workspace — real, ongoing complexity, for the same outcome.
+
+**Why a thread spawned fresh per call, not a persistent worker pool (the other credible design
+within option 1).** The dominant cost of every operation this backend performs is already a
+network round trip — measured last session at ~5.3ms per uncontended `transact` cycle against a
+local Docker container. An OS thread spawn costs tens of microseconds: three orders of magnitude
+smaller, i.e. noise against a cost this backend pays regardless of execution strategy. A persistent
+pool would need its own lifecycle (started in `open`, shut down cleanly, a panicked worker's
+failure propagated back to callers instead of quietly wedging the pool) for a savings this
+backend's own numbers say doesn't matter. `std::thread::scope` also means `run_isolated` can borrow
+non-`'static` data (a `&mut postgres::Client` living on the caller's stack) directly, with no
+channel plumbing or `Arc`-wrapping needed to satisfy a `'static` bound that a persistent pool fed
+through a channel would require. Full rationale in `postgres_backend`'s module docs ("Execution
+model"), including how to swap to a persistent pool later if this ever needs revisiting (localized:
+every call site already goes through `run_isolated`).
+
+Every touch point now goes through it: `PostgresBackend::open`, `drop_schema_for_test`,
+`keyspace`, `snapshot`, `begin`, `commit`; `PgTxn::with_conn` (which also moved the
+conflict-triggered `ROLLBACK` inside the same isolated call, since it's a `postgres` call too);
+`PgSnapshot`'s new `with_conn` helper (`get`/`multi_get`/`range` now share it, replacing three
+near-identical `match &mut *state` blocks); and both types' `Drop` impls.
+
+**The pool-teardown case needed one more change.** `Inner::pool` changed from a plain `PgPool`
+field to `Option<PgPool>` so `Inner`'s own new `Drop` impl can `.take()` it and drop that value
+inside `run_isolated`, instead of letting Rust's ordinary field-drop order tear down the pool (and
+every idle pooled `postgres::Client`) on whatever thread drops the last `PostgresBackend` handle.
+`hs-kv` has `#![forbid(unsafe_code)]`, so `ManuallyDrop::take` (the usual tool for this) was not
+available; `Option::take` is the safe equivalent and was chosen over it for exactly that reason.
+Every other method that reads `self.inner.pool` now does
+`.as_ref().expect("PostgresBackend used after Inner was dropped, which cannot happen: ...")` —
+consistent with the existing "used after commit" invariant style already in this file
+(`PgTxn::with_conn`) — since the field is `Some` for the entire lifetime of every live
+`PostgresBackend` handle and only becomes `None` inside `Inner::drop` itself.
+
+**Public API impact: none.** `KvBackend`/`KvRead`/`KvWrite` are unchanged — every method is still a
+plain, synchronous `fn`. A caller on a Tokio runtime is still free to (and, to avoid blocking one of
+its own worker threads for a call's duration, may still want to) run `hs-kv` calls through
+`tokio::task::spawn_blocking`, but it is no longer *required* to for correctness.
+
+### The regression test the conformance suite could not have provided
+
+`crates/hs-kv/tests/postgres_conformance.rs` gained two tests sharing one body
+(`round_trip_body`: open, `transact` a `put`, read it back through a `snapshot`, drop everything —
+every step a real blocking call):
+
+- `postgres_round_trip_from_a_plain_test_with_no_ambient_runtime` (plain `#[test]`) — the control
+  case, always passed, kept so both contexts are pinned down side by side.
+- `postgres_survives_being_opened_and_called_from_inside_a_tokio_runtime`
+  (`#[tokio::test(flavor = "multi_thread", worker_threads = 4)]`) — the regression case. Calls the
+  backend directly, no `spawn_blocking`, from a genuine Tokio worker thread — the exact shape `hs
+  serve` uses. **This test is what actually found the pool-teardown case above**, and is recorded
+  as the real debugging sequence in case it recurs: after isolating every explicit `postgres`/`r2d2`
+  call site (`with_conn`, `open`, `begin`, `commit`, etc.) but before also isolating pool teardown,
+  this test still reliably panicked with the same "Cannot start a runtime from within a runtime" —
+  not from any explicit call, but from inside `reachable_dsn`'s probe backend being dropped at the
+  end of the function, which tears down the connection pool and, with it, every pooled
+  `postgres::Client`. Isolating the explicit call sites alone was not sufficient; the `Inner::drop`
+  fix above was needed too, and this test is what proved it.
+
+Exact output, confirming both directions and the full crate:
+
+```
+$ cargo test -p hs-kv --test postgres_conformance -- --nocapture --test-threads=1
+running 4 tests
+test postgres_backend_conformance_breakdown ... ok
+test postgres_round_trip_from_a_plain_test_with_no_ambient_runtime ... ok
+test postgres_survives_being_opened_and_called_from_inside_a_tokio_runtime ... ok
+test reopen_against_the_same_schema_preserves_committed_data ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in ~5.3s
+```
+
+Repeated 3 times for stability (identical result each time), and `cargo test -p hs-kv` (no
+`HS_KV_TEST_POSTGRES_DSN` set, no database running) confirmed still green in ~3s via the existing
+skip path — this fix did not touch, and does not affect, the no-database developer experience.
+
+### Conformance result: unchanged, 9/11, same two documented divergences
+
+Re-ran `cargo test -p hs-kv --test postgres_conformance -- --nocapture --test-threads=1` against a
+real `postgres:17` container per the exact commands already documented under "PostgreSQL
+conformance run" above. **Identical result to session 2, byte-for-byte down to which two scenarios
+diverge**: 9/11 passed,
+`phantom_insert_inside_a_scanned_range_conflicts` fails deterministically (same structural reason,
+unaffected by an execution-model change), `atomic_add_under_contention` fails intermittently (same
+latency/tuning fact — its retry-budget math depends on wall-clock round-trip time, which this
+change did not alter; if anything, a bare OS thread spawn is negligible next to the ~5.3ms network
+round trip, so no measurable latency shift is expected or was observed). This session's change is
+purely about *which thread* issues each call, never *what* is sent to PostgreSQL or *when* within a
+transaction, so this result is exactly what should be expected, not a coincidence.
+
+### Whether the server can now serve on Postgres
+
+**Not fully verified end-to-end, because that requires `hs serve` + a config file + a live
+register call, and this session could not edit `crates/hs-cli`** (owned by the integration lead;
+its temporary guard, `StorageOpenError::PostgresInsideRuntime`, currently still refuses to open
+Postgres inside a runtime on purpose, per the brief, so `hs serve` would still refuse today even
+though the underlying bug is fixed). What *is* verified, as the closest available proxy: a test in
+this track's own crate (`postgres_survives_being_opened_and_called_from_inside_a_tokio_runtime`)
+reproduces the exact shape `hs serve` uses — opening `PostgresBackend` and driving a full
+transact/read/drop cycle directly from inside a multi-threaded Tokio runtime, with no
+`spawn_blocking` — and it passes. **Action needed from the integration lead**: delete
+`StorageOpenError::PostgresInsideRuntime` and the guard that returns it in
+`crates/hs-cli/src/storage.rs`, then run the actual acceptance check (build `hs`, config with
+`storage.backend: postgres`, `hs serve`, `POST /_matrix/client/v3/register` against a real
+PostgreSQL) — that is the only remaining gap between this fix and a verified working deployment,
+and it is entirely inside a file this track is not allowed to touch.
+
+**Update, same day: the integration lead did exactly that, and it found a second, real bug.** With
+the guard removed, `hs serve` no longer panicked, but failed one step later: `storage backend
+error: invalid keyspace name "hs_auth.users"`. See "Dotted keyspace names" immediately below.
+
+### Dotted keyspace names: the execution-model fix's own regression test found the panic, but not this
+
+Every consuming crate names its keyspaces with a crate-scoped, dotted prefix — `hs_auth.users`,
+`hs_auth.access_tokens`, `hs_room.events`, `hs_e2e.device_keys`, `hs_push.rules`, and so on (see
+`crates/hs-auth/src/store/tables.rs` and the equivalent tables modules in other crates). The
+in-memory and Fjall backends never rejected this, since neither treats a keyspace name as more
+than an opaque map/partition key. `PostgresBackend`'s identifier validation (`validate_ident`,
+`^[A-Za-z_][A-Za-z0-9_]*$`, no dot) did — the moment `hs serve` opened its first real store, it
+failed with `invalid keyspace name "hs_auth.users"`. This was invisible to every test this track
+had written, including the brand-new inside-a-runtime regression test above, because every one of
+them (the shared conformance suite's `"t"`, this file's own `"durable"`) uses a bare, undotted
+name. Booting the actual binary is what found it, exactly as the brief anticipated when it said
+the acceptance check is `hs serve` + register, not the conformance suite.
+
+**Fix, in `crates/hs-kv/src/postgres_backend.rs` only:**
+
+- Split the old single `validate_ident` into two functions sharing a new `is_safe_ident_segment`
+  helper (the original per-character check, unchanged): `validate_ident` (schema names — a schema
+  is chosen by whoever calls `PostgresBackend::open`, never dotted) stays exactly as strict as
+  before; a new `validate_keyspace_name` (used only by `KvBackend::keyspace`) accepts either a
+  single safe identifier or a **dotted path** of them — every `.`-separated segment individually
+  checked against the same `^[A-Za-z_][A-Za-z0-9_]*$` rule, so `hs_auth.users` passes but
+  `hs_auth."users`, `hs_auth.'users`, `hs_auth.us;ers`, a leading/trailing/doubled dot, or anything
+  else outside that character set is still rejected exactly as before.
+- **Why this is safe against injection, not just permissive**: the qualified table name is one
+  double-quoted PostgreSQL identifier (`"kv_hs_auth.users"`), and a `.` inside a *single* quoted
+  identifier is just an ordinary character to PostgreSQL, not a schema-qualifier — that syntax
+  needs its own quotes per segment, which this backend never emits. The character actually worth
+  guarding against is `"` (the identifier-quote-escape character), which `is_safe_ident_segment`
+  never allowed, dot or no dot. Restricting every segment independently, rather than only checking
+  the joined string doesn't contain `"`, also means a name can never sneak in something that reads
+  as two identifiers or a schema reference by construction, not just by absence of the one
+  dangerous character.
+- **Length limit unchanged and still correct**: the existing 55-byte overall cap (checked before
+  splitting, so it bounds the dots too) already left headroom for the `kv_` table-name prefix under
+  PostgreSQL's 63-byte `NAMEDATALEN` identifier limit; real dotted names (`hs_auth.access_tokens`
+  is 22 bytes) are nowhere near it. Going over 63 bytes doesn't error in PostgreSQL, it silently
+  truncates — a real hazard (two different long keyspace names could collide on the same
+  underlying table), which is why this stayed a hard cap rather than being loosened.
+
+**Tests added:**
+
+- Four new pure, offline unit tests in `postgres_backend.rs` itself
+  (`#[cfg(test)] mod tests`, no database needed): dotted names from the real families above are
+  accepted; empty/leading-dot/trailing-dot/double-dot/space/quote/semicolon/backslash/
+  digit-first names are all still rejected; the 55-byte limit is enforced with dots in the mix;
+  schema names stay undotted-only. These are exactly the tests that would have caught this before
+  it ever reached `hs serve` — nothing before this exercised `validate_ident`/
+  `validate_keyspace_name` in isolation.
+- `postgres_keyspace_name_with_a_dotted_crate_prefix_round_trips` in
+  `tests/postgres_conformance.rs`: the same open → `transact` a put → drop (exercising pool
+  teardown too) → reopen against the same schema → read-back shape as
+  `reopen_against_the_same_schema_preserves_committed_data`, but against keyspace name
+  `"hs_auth.users"` specifically, proving the round-trip requirement the integration lead asked
+  for: reopening finds the same data under the same dotted name.
+
+**Verification**: `cargo fmt -p hs-kv`, `cargo clippy -p hs-kv --all-targets -- -D warnings` both
+clean. `cargo test -p hs-kv --lib` (9 tests, including the 4 new validator tests) green with no
+database. Full `cargo test -p hs-kv` against a real `postgres:17` container: 5/5 in
+`postgres_conformance.rs` (the new dotted-name test alongside the four from before), unchanged 9/11
+conformance breakdown with the same two documented divergences, plus fjall/memory/unit/doctests all
+green. `cargo test -p hs-kv --test postgres_conformance` with no database running: still green in
+~3s via the existing skip path.
+
 ## Next
 
 - SlateDB backend — **explicitly out of scope this session**, per instruction; still not started
@@ -393,6 +622,12 @@ None.
 - Both crates are usable today by any other track: `hs_kv::memory::MemoryBackend::new()` needs no
   setup and is the recommended backend for other tracks' own unit tests, per
   `docs/workstreams/README.md` rule 2.
+- **Session 3, behavioral only, no signature change**: `hs_kv::postgres_backend::PostgresBackend`
+  now tolerates being opened and called from any thread, including one with an ambient Tokio
+  runtime (a Tokio worker thread, `hs serve`'s async main, etc.) — see "Session 3" above. No
+  `KvBackend`/`KvRead`/`KvWrite` signature changed. Consumers no longer need `spawn_blocking` for
+  correctness against this backend (only, optionally, to avoid blocking a Tokio worker thread for a
+  call's latency).
 
 ## Decisions made
 
@@ -491,3 +726,8 @@ Session 2 (PostgreSQL backend): added to `[workspace.dependencies]` in the root 
   another track may still want them, or a future async consumer of this crate might).
 - `r2d2 = "0.8"` and `r2d2_postgres = "0.18"` — the synchronous connection pool matching a
   synchronous client, used in place of `deadpool-postgres` (an async pool) for the same reason.
+
+Session 3 (execution-model fix): `tokio` added to `crates/hs-kv/[dev-dependencies]` only, so
+`tests/postgres_conformance.rs` can hold an `#[tokio::test]` regression test to an ambient runtime.
+Already present in `[workspace.dependencies]` (with the `full` feature) — not new to the workspace,
+and not a dependency of `hs-kv`'s own library code, only its test target.

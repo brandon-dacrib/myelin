@@ -240,3 +240,119 @@ fn reopen_against_the_same_schema_preserves_committed_data() {
 
     reopened.drop_schema_for_test().expect("cleanup");
 }
+
+/// Real callers never name a keyspace `"durable"` or `"t"` (as every other test in this file and
+/// the shared conformance suite does) — every consuming crate groups its own keyspaces under a
+/// crate-scoped, dotted prefix: `hs_auth.users`, `hs_auth.access_tokens`, `hs_room.events`,
+/// `hs_e2e.device_keys`, `hs_push.rules`, and so on (see
+/// `crates/hs-auth/src/store/tables.rs` and its equivalents in other crates). The in-memory and
+/// Fjall backends never rejected the dot (neither treats a keyspace name as more than an opaque
+/// map/partition key), but this backend's identifier validation did, once upon a time — booting
+/// `hs serve` against real PostgreSQL failed immediately with `invalid keyspace name
+/// "hs_auth.users"` the moment any store tried to open its first table, which no test in this
+/// file caught because none of them used a name shaped like a real one. This test is the fix:
+/// exactly the same open/write/reopen/read round trip as
+/// `reopen_against_the_same_schema_preserves_committed_data` above, but against a real dotted
+/// keyspace name, so a regression here fails a test instead of only ever showing up at `hs serve`
+/// boot time again.
+#[test]
+fn postgres_keyspace_name_with_a_dotted_crate_prefix_round_trips() {
+    let Some(dsn) = reachable_dsn() else {
+        return;
+    };
+    let schema = fresh_schema_name();
+    let keyspace_name = "hs_auth.users";
+
+    {
+        use hs_kv::{KvBackend as _, KvWrite as _, TransactConfig, transact};
+
+        let backend = PostgresBackend::open(&dsn, &schema).expect("open");
+        let ks = backend
+            .keyspace(keyspace_name)
+            .expect("dotted keyspace name must be accepted");
+        transact(&backend, TransactConfig::default(), |txn| {
+            txn.put(&ks, b"@alice:example.org", b"account-data-1")?;
+            Ok(())
+        })
+        .expect("commit");
+        // `backend` is dropped here, exercising the pool-teardown path too (see the "Execution
+        // model" module docs) — the data lives in PostgreSQL, not in this process.
+    }
+
+    use bytes::Bytes;
+    use hs_kv::{KvBackend as _, KvRead as _};
+
+    let reopened = PostgresBackend::open(&dsn, &schema).expect("reopen (same schema, new pool)");
+    let ks = reopened
+        .keyspace(keyspace_name)
+        .expect("reopening must accept the same dotted keyspace name");
+    let snap = reopened.snapshot();
+    assert_eq!(
+        snap.get(&ks, b"@alice:example.org").unwrap(),
+        Some(Bytes::from_static(b"account-data-1")),
+        "a dotted keyspace name must round-trip: reopening must find the same data"
+    );
+    drop(snap);
+
+    reopened.drop_schema_for_test().expect("cleanup");
+}
+
+/// Opens a fresh [`PostgresBackend`], writes a key inside a real transaction, reads it back
+/// through a snapshot, and drops everything — every one of those steps is a real, blocking
+/// `postgres`/`r2d2` call. Shared by the two tests below, which differ only in whether an ambient
+/// Tokio runtime exists on the calling thread while this body runs.
+///
+/// This distinction is the whole point (see `docs/status/01-storage-engine.md`, the "integration
+/// note" at the top, and `postgres_backend`'s module docs' "Execution model" section): before
+/// `PostgresBackend` was made to isolate every call onto a freshly spawned OS thread, this exact
+/// body panicked with "Cannot start a runtime from within a runtime" the moment it ran from
+/// inside a Tokio runtime, while the plain, no-runtime version always passed — which is why the
+/// conformance suite (built entirely of plain `#[test]`s) could never have caught it, and why both
+/// shapes are pinned down here, permanently, as a regression test.
+fn round_trip_body(dsn: &str, schema: &str) {
+    use bytes::Bytes;
+    use hs_kv::{KvBackend as _, KvRead as _, KvWrite as _, TransactConfig, transact};
+
+    let backend = PostgresBackend::open(dsn, schema).expect("open");
+    let ks = backend.keyspace("roundtrip").expect("keyspace");
+    transact(&backend, TransactConfig::default(), |txn| {
+        txn.put(&ks, b"k1", b"v1")?;
+        Ok(())
+    })
+    .expect("commit");
+
+    let snap = backend.snapshot();
+    assert_eq!(
+        snap.get(&ks, b"k1").unwrap(),
+        Some(Bytes::from_static(b"v1")),
+        "a committed write must read back through a fresh snapshot"
+    );
+    drop(snap);
+
+    backend.drop_schema_for_test().expect("cleanup");
+}
+
+/// The control case: the same round trip as the `#[tokio::test]` below, from a plain `#[test]`
+/// with no ambient async runtime at all. This always passed, even on the naive implementation —
+/// it is here so both contexts are exercised side by side and neither can silently regress
+/// without the other catching it.
+#[test]
+fn postgres_round_trip_from_a_plain_test_with_no_ambient_runtime() {
+    let Some(dsn) = reachable_dsn() else {
+        return;
+    };
+    round_trip_body(&dsn, &fresh_schema_name());
+}
+
+/// The regression case that mattered: the identical round trip, called directly (no
+/// `spawn_blocking`) from inside a `#[tokio::test]`'s ambient **multi-threaded** runtime — the
+/// same shape `hs serve` uses in production (open storage from an async fn, call it from async
+/// request handlers running on Tokio worker threads). `reachable_dsn()` itself calls
+/// `PostgresBackend::open`, so even the reachability probe exercises the fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_survives_being_opened_and_called_from_inside_a_tokio_runtime() {
+    let Some(dsn) = reachable_dsn() else {
+        return;
+    };
+    round_trip_body(&dsn, &fresh_schema_name());
+}

@@ -46,16 +46,6 @@ pub enum StorageOpenError {
         #[source]
         source: hs_kv::KvError,
     },
-    /// The PostgreSQL backend was opened from inside a Tokio runtime, which it cannot survive.
-    #[error(
-        "the hs-kv postgres backend cannot be opened from inside a Tokio runtime: its client (the \
-         synchronous `postgres` crate) drives its own internal runtime with `block_on`, which \
-         panics with \"Cannot start a runtime from within a runtime\" on a thread that already \
-         has one. `hs serve` is async, so every storage call would hit this. Tracked in \
-         docs/status/01-storage-engine.md; until the backend dispatches its work onto its own \
-         threads, `storage.backend: postgres` cannot serve. Use `embedded` for now."
-    )]
-    PostgresInsideRuntime,
     /// `storage.postgres.tls` was set, which this backend cannot honour.
     #[error(
         "storage.postgres.tls is set, but the hs-kv postgres backend connects without TLS \
@@ -124,12 +114,6 @@ fn open_postgres(
 ) -> Result<hs_kv::postgres_backend::PostgresBackend, StorageOpenError> {
     if config.tls {
         return Err(StorageOpenError::PostgresTlsUnsupported);
-    }
-    // Refuse deliberately rather than panicking deep inside the client. Found by booting `hs
-    // serve` against a real PostgreSQL: the backend's conformance tests all pass because they run
-    // in plain `#[test]` functions, and the failure only exists once something async opens it.
-    if tokio::runtime::Handle::try_current().is_ok() {
-        return Err(StorageOpenError::PostgresInsideRuntime);
     }
     let password = config.password.as_str().unwrap_or_default();
     let dsn = format!(

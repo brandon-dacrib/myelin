@@ -23,3 +23,9 @@ r2d2_postgres = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }
+# Only for `tests/postgres_conformance.rs`'s `postgres_survives_being_opened_and_called_from_
+# inside_a_tokio_runtime` test, which must run inside a real ambient multi-threaded Tokio runtime
+# to prove `PostgresBackend` tolerates it (see `docs/status/01-storage-engine.md`, session 3).
+# Already a `[workspace.dependencies]` entry (used by several async crates); not new to the
+# workspace.
+tokio = { workspace = true }
