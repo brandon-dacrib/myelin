@@ -17,7 +17,7 @@ cd refs/complement && COMPLEMENT_BASE_IMAGE=complement-hs-reimplement:dev go tes
 
 A cold image build is ~4 minutes; a full `csapi` run is ~15. The federation-heavy top-level `./tests/...` package has still never been run — that is the next session's first move, and it should score better than the number above, which predates the inbound-federation work.
 
-Spec coverage is **127 of 235 routes (54.0%)**: client-server 97/166, server-server **30/36 (83.3%)**. Generated from the manifest the server itself emits, so it cannot overclaim. Registered is still not the same as working — each track's status file says which of its routes are stubs.
+Spec coverage is **138 of 235 routes (58.7%)**: client-server 108/166 (65.1%), server-server **30/36 (83.3%)**. Generated from the manifest the server itself emits, so it cannot overclaim. Registered is still not the same as working — each track's status file says which of its routes are stubs.
 
 ## What works today, verified by running the binary
 
@@ -49,13 +49,23 @@ Then work down what remains, from `docs/status/14-test-and-conformance.md`:
 
 `hs-user`'s sync tokens (`hsu1_...`) are rejected by `hs-room`'s `PaginationToken`, so `GET /messages?from=<a sync token>` fails for any real client — which is exactly what a client does when scrolling back after a sync. This is the largest remaining cross-track gap and it needs a design decision, not a patch: one token format, or a documented conversion at the boundary. Complement failures in the room-messages tests trace back to it.
 
-### 3. Run two replicas against the one PostgreSQL
+### 3. Re-measure, because a great deal changed
 
-`hs serve` runs on PostgreSQL as of 2026-09-19: set `storage.backend: postgres` and it boots, registers, serves, and survives a restart with its data intact (verified end to end, not just by the conformance suite — which passed while the backend could not serve a single request, twice over).
+Everything below item 1's list moved after the last Complement run. Since
+then: outbound signing was found to be spec-wrong and fixed, private-CA
+trust landed, threads, relations, room upgrade, typing, presence, room
+summaries, push rules in sync, profile propagation, device-list
+notifications, five Synapse admin shims, and the room router mounted at
+the v1 prefix it needed. Several of those were the direct causes of named
+Complement failures. Nobody has measured the result.
 
-What has *not* happened is two processes against one database at the same time. That is what every feature in `hs-cluster` — ownership, leases, fencing epochs, mesh RPC — was built for and has only ever been exercised in its own chaos harness. Start two `hs serve` processes on the same DSN and different ports and find out what breaks. Note the one conformance divergence that matters here: PostgreSQL gives true serializability, not the stronger any-write-into-a-scanned-range guarantee the single-process backends give, so a range-scan-based fencing pattern would not be safe there (point reads, which is what track 03 actually uses, are).
+### 4. Two replicas: done, with one gap
 
-`tls` is refused rather than ignored (the backend connects with NoTls), and `pool_size` is not plumbed through yet.
+Two replicas on one PostgreSQL used to fork a room's history silently. They no longer do: a shard gate forwards or refuses any request for a room this replica does not own, verified by reproducing the original experiment — both replicas now return the same ten messages where each previously returned only its own five.
+
+The gap left: `/createRoom` is not gated, because the room id does not exist when the request arrives, so the replica that handles it builds the first actor locally regardless of who will own the shard. Every later request is gated correctly. Fencing inside the write path is also still unwired — not needed for the bug that was fixed, since routing now guarantees one live actor per room, but it is the belt-and-braces against a stale ownership read racing a real handoff.
+
+Postgres `tls` is refused rather than ignored, and `pool_size` is not plumbed through.
 
 ### 4. Backfill, so a join can be more than a join
 
@@ -69,14 +79,11 @@ With `send_join` persisting and `.well-known` served, the remaining blockers to 
 
 | Gap | Where | Consequence |
 |---|---|---|
-| `/keys/changes` cannot parse a sync token | `hs-e2e` | same token mismatch `/messages` had, still open there |
-| No way to trust a private CA | `hs-federation` | cannot federate with any server not using a public root |
-| Presence endpoints 404 | `hs-user` | no presence at all |
-| `/relations`, `/threads`, `/search`, `/upgrade` 404 | `hs-room` | threads and replies do not work for real clients |
-| Push rules absent from `/sync` | `hs-push`, `hs-user` | clients fall back to defaults that are not ours |
+| `/search` unimplemented | `hs-room` | needs a cross-room index the actor model has no place for |
 | `/context`'s `state` reads live state, not state at the event | `hs-room` | same bug class as history visibility, one path left |
 | No backfill | `hs-federation` | a join cannot be followed by history |
-| Nothing has ever run two replicas | `hs-cluster` | HA is unexercised outside its own harness |
+| `/createRoom` is not shard-gated | `hs-cli` | the first actor may be built on a non-owner |
+| Fencing not called in the write path | `hs-room` | no guard against a stale ownership read |
 | Postgres `tls` refused, `pool_size` ignored | `hs-kv`, `hs-cli` | encrypt in front of the database for now |
 | SlateDB backend absent | `hs-kv` | deliberately not started |
 | Profile changes do not rewrite existing memberships | `hs-room` | a rename shows only in rooms joined afterwards |

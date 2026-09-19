@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-19T05:04:51.808Z",
+  "generated_at": "2026-09-19T10:19:24.53Z",
   "routes": [
     {
       "method": "GET",
@@ -251,6 +251,22 @@
     },
     {
       "method": "GET",
+      "path": "/_matrix/client/r0/presence/{userId}/status",
+      "surface": "matrix-client",
+      "operation_id": "getPresence",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/r0/presence/{userId}/status",
+      "surface": "matrix-client",
+      "operation_id": "setPresence",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
       "path": "/_matrix/client/r0/profile/{userId}",
       "surface": "matrix-client",
       "operation_id": "getUserProfile",
@@ -274,11 +290,27 @@
       "rate_limited": false
     },
     {
+      "method": "PUT",
+      "path": "/_matrix/client/r0/profile/{userId}/avatar_url",
+      "surface": "matrix-client",
+      "operation_id": "setAvatarUrl",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
       "method": "GET",
       "path": "/_matrix/client/r0/profile/{userId}/displayname",
       "surface": "matrix-client",
       "operation_id": "getDisplayName",
       "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/r0/profile/{userId}/displayname",
+      "surface": "matrix-client",
+      "operation_id": "setDisplayName",
+      "auth": "matrix",
       "rate_limited": false
     },
     {
@@ -722,10 +754,34 @@
       "rate_limited": false
     },
     {
+      "method": "GET",
+      "path": "/_matrix/client/r0/rooms/{roomId}/threads",
+      "surface": "matrix-client",
+      "operation_id": "getThreadRoots",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/r0/rooms/{roomId}/typing/{userId}",
+      "surface": "matrix-client",
+      "operation_id": "setTyping",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
       "method": "POST",
       "path": "/_matrix/client/r0/rooms/{roomId}/unban",
       "surface": "matrix-client",
       "operation_id": "unban",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/r0/rooms/{roomId}/upgrade",
+      "surface": "matrix-client",
+      "operation_id": "upgradeRoom",
       "auth": "matrix",
       "rate_limited": false
     },
@@ -818,6 +874,70 @@
       "rate_limited": false
     },
     {
+      "method": "POST",
+      "path": "/_matrix/client/v1/createRoom",
+      "surface": "matrix-client",
+      "operation_id": "createRoom",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v1/directory/list/room/{roomId}",
+      "surface": "matrix-client",
+      "operation_id": "getRoomVisibilityOnDirectory",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/v1/directory/list/room/{roomId}",
+      "surface": "matrix-client",
+      "operation_id": "setRoomVisibilityOnDirectory",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "DELETE",
+      "path": "/_matrix/client/v1/directory/room/{roomAlias}",
+      "surface": "matrix-client",
+      "operation_id": "removeRoomAlias",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v1/directory/room/{roomAlias}",
+      "surface": "matrix-client",
+      "operation_id": "getRoomIdByAlias",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/v1/directory/room/{roomAlias}",
+      "surface": "matrix-client",
+      "operation_id": "setRoomAlias",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v1/join/{roomIdOrAlias}",
+      "surface": "matrix-client",
+      "operation_id": "joinRoom",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v1/knock/{roomIdOrAlias}",
+      "surface": "matrix-client",
+      "operation_id": "knock",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
       "method": "GET",
       "path": "/_matrix/client/v1/media/config",
       "surface": "matrix-client",
@@ -851,6 +971,14 @@
     },
     {
       "method": "GET",
+      "path": "/_matrix/client/v1/media/preview_url",
+      "surface": "matrix-client",
+      "operation_id": "previewUrl",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
       "path": "/_matrix/client/v1/media/thumbnail/{serverName}/{mediaId}",
       "surface": "matrix-client",
       "operation_id": "thumbnailMedia",
@@ -870,6 +998,262 @@
       "path": "/_matrix/client/v1/media/upload/{serverName}/{mediaId}",
       "surface": "matrix-client",
       "operation_id": "uploadAsyncMedia",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/v1/profile/{userId}/avatar_url",
+      "surface": "matrix-client",
+      "operation_id": "setAvatarUrl",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/v1/profile/{userId}/displayname",
+      "surface": "matrix-client",
+      "operation_id": "setDisplayName",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v1/publicRooms",
+      "surface": "matrix-client",
+      "operation_id": "publicRooms",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v1/publicRooms",
+      "surface": "matrix-client",
+      "operation_id": "queryPublicRooms",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v1/rooms/{roomId}/aliases",
+      "surface": "matrix-client",
+      "operation_id": "getRoomAliases",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v1/rooms/{roomId}/ban",
+      "surface": "matrix-client",
+      "operation_id": "ban",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v1/rooms/{roomId}/context/{eventId}",
+      "surface": "matrix-client",
+      "operation_id": "getEventContext",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v1/rooms/{roomId}/event/{eventId}",
+      "surface": "matrix-client",
+      "operation_id": "getOneRoomEvent",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v1/rooms/{roomId}/forget",
+      "surface": "matrix-client",
+      "operation_id": "forgetRoom",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v1/rooms/{roomId}/invite",
+      "surface": "matrix-client",
+      "operation_id": "inviteUser",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v1/rooms/{roomId}/join",
+      "surface": "matrix-client",
+      "operation_id": "joinRoomById",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v1/rooms/{roomId}/joined_members",
+      "surface": "matrix-client",
+      "operation_id": "getJoinedMembersByRoom",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v1/rooms/{roomId}/kick",
+      "surface": "matrix-client",
+      "operation_id": "kick",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v1/rooms/{roomId}/knock",
+      "surface": "matrix-client",
+      "operation_id": "knockRoom",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v1/rooms/{roomId}/leave",
+      "surface": "matrix-client",
+      "operation_id": "leaveRoom",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v1/rooms/{roomId}/members",
+      "surface": "matrix-client",
+      "operation_id": "getMembersByRoom",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v1/rooms/{roomId}/messages",
+      "surface": "matrix-client",
+      "operation_id": "getRoomEvents",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/v1/rooms/{roomId}/redact/{eventId}/{txnId}",
+      "surface": "matrix-client",
+      "operation_id": "redactEvent",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v1/rooms/{roomId}/relations/{eventId}",
+      "surface": "matrix-client",
+      "operation_id": "getRelatingEvents",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v1/rooms/{roomId}/relations/{eventId}/{relType}",
+      "surface": "matrix-client",
+      "operation_id": "getRelatingEventsWithRelType",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v1/rooms/{roomId}/relations/{eventId}/{relType}/{eventType}",
+      "surface": "matrix-client",
+      "operation_id": "getRelatingEventsWithRelTypeAndEventType",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/v1/rooms/{roomId}/send/{eventType}/{txnId}",
+      "surface": "matrix-client",
+      "operation_id": "sendMessage",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v1/rooms/{roomId}/state",
+      "surface": "matrix-client",
+      "operation_id": "getRoomState",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v1/rooms/{roomId}/state/{eventType}",
+      "surface": "matrix-client",
+      "operation_id": "getStateEvent",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/v1/rooms/{roomId}/state/{eventType}",
+      "surface": "matrix-client",
+      "operation_id": "setStateEvent",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v1/rooms/{roomId}/state/{eventType}/",
+      "surface": "matrix-client",
+      "operation_id": "getStateEvent",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/v1/rooms/{roomId}/state/{eventType}/",
+      "surface": "matrix-client",
+      "operation_id": "setStateEvent",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v1/rooms/{roomId}/state/{eventType}/{stateKey}",
+      "surface": "matrix-client",
+      "operation_id": "getStateEventWithKey",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/v1/rooms/{roomId}/state/{eventType}/{stateKey}",
+      "surface": "matrix-client",
+      "operation_id": "setStateEventWithKey",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v1/rooms/{roomId}/threads",
+      "surface": "matrix-client",
+      "operation_id": "getThreadRoots",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v1/rooms/{roomId}/unban",
+      "surface": "matrix-client",
+      "operation_id": "unban",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v1/rooms/{roomId}/upgrade",
+      "surface": "matrix-client",
+      "operation_id": "upgradeRoom",
       "auth": "matrix",
       "rate_limited": false
     },
@@ -1107,6 +1491,22 @@
     },
     {
       "method": "GET",
+      "path": "/_matrix/client/v3/presence/{userId}/status",
+      "surface": "matrix-client",
+      "operation_id": "getPresence",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/v3/presence/{userId}/status",
+      "surface": "matrix-client",
+      "operation_id": "setPresence",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
       "path": "/_matrix/client/v3/profile/{userId}",
       "surface": "matrix-client",
       "operation_id": "getUserProfile",
@@ -1130,11 +1530,27 @@
       "rate_limited": false
     },
     {
+      "method": "PUT",
+      "path": "/_matrix/client/v3/profile/{userId}/avatar_url",
+      "surface": "matrix-client",
+      "operation_id": "setAvatarUrl",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
       "method": "GET",
       "path": "/_matrix/client/v3/profile/{userId}/displayname",
       "surface": "matrix-client",
       "operation_id": "getDisplayName",
       "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/v3/profile/{userId}/displayname",
+      "surface": "matrix-client",
+      "operation_id": "setDisplayName",
+      "auth": "matrix",
       "rate_limited": false
     },
     {
@@ -1578,10 +1994,34 @@
       "rate_limited": false
     },
     {
+      "method": "GET",
+      "path": "/_matrix/client/v3/rooms/{roomId}/threads",
+      "surface": "matrix-client",
+      "operation_id": "getThreadRoots",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/v3/rooms/{roomId}/typing/{userId}",
+      "surface": "matrix-client",
+      "operation_id": "setTyping",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
       "method": "POST",
       "path": "/_matrix/client/v3/rooms/{roomId}/unban",
       "surface": "matrix-client",
       "operation_id": "unban",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "POST",
+      "path": "/_matrix/client/v3/rooms/{roomId}/upgrade",
+      "surface": "matrix-client",
+      "operation_id": "upgradeRoom",
       "auth": "matrix",
       "rate_limited": false
     },
@@ -1930,6 +2370,14 @@
       "rate_limited": false
     },
     {
+      "method": "POST",
+      "path": "/_matrix/media/v1/create",
+      "surface": "matrix-client",
+      "operation_id": "createMediaUploadV1",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
       "method": "GET",
       "path": "/_matrix/media/v3/config",
       "surface": "matrix-client",
@@ -1959,6 +2407,14 @@
       "surface": "matrix-client",
       "operation_id": "legacyDownloadMediaWithFilename",
       "auth": "none",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/media/v3/preview_url",
+      "surface": "matrix-client",
+      "operation_id": "legacyPreviewUrl",
+      "auth": "matrix",
       "rate_limited": false
     },
     {
