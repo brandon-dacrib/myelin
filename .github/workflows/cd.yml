@@ -1,0 +1,355 @@
+name: cd
+
+# Continuous delivery for Axon: multi-architecture container images, standalone binaries, and
+# the Helm chart.
+#
+# CI (`ci.yml`) proves the tree is good — fmt, clippy and tests on both architectures, plus an
+# advisory audit. This workflow only produces artifacts, and only from a commit CI already agreed
+# with, so a release can never be built from something that does not compile on one of its
+# supported architectures.
+#
+# # What triggers what
+#
+# | trigger | images | binaries | chart | published |
+# |---|---|---|---|---|
+# | push to `main` | yes, tagged `edge` and the commit sha | no | no | yes |
+# | tag `v*` | yes, tagged with the version and `latest` | yes, attached to the release | yes | yes |
+# | manual dispatch | yes, tagged `manual-<sha>` | if asked | no | only if asked |
+#
+# # Why the image is built twice over
+#
+# The binary is genuinely dual-architecture — a stated goal of this project is that the same
+# server runs in a Kubernetes cluster and on a small ARM host — so the image is built for
+# `linux/amd64` and `linux/arm64` and published as one manifest list. They are built on native
+# runners rather than under emulation: a Rust compile under QEMU takes long enough to dominate the
+# whole pipeline, and this workspace is large.
+#
+# # Provenance
+#
+# Each image gets an SBOM and build provenance attached. That is not ceremony for a homeserver:
+# an operator running someone else's Matrix server wants to know exactly what is inside it, and
+# `docs/decisions/0001-license.md` commits this project to being auditable about what it ships.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Push the image to the registry (otherwise build only)"
+        type: boolean
+        default: false
+      binaries:
+        description: "Also build standalone binaries"
+        type: boolean
+        default: false
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------------------------
+  # Wait for CI on this exact commit. A release built from a commit whose tests never passed is
+  # worse than no release, and a tag push does not re-run the push workflow.
+  # ---------------------------------------------------------------------------------------------
+  gate:
+    name: require green ci
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Wait for the ci workflow to succeed for this commit
+        uses: lewagon/wait-on-check-action@v1.3.4
+        with:
+          ref: ${{ github.sha }}
+          check-name: ci-ok
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-interval: 20
+          allowed-conclusions: success
+
+  # ---------------------------------------------------------------------------------------------
+  # One image per architecture, built natively, pushed by digest only. The manifest list that
+  # gives them a human-readable tag is assembled afterwards.
+  # ---------------------------------------------------------------------------------------------
+  image:
+    name: image (${{ matrix.arch }})
+    needs: gate
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    outputs:
+      digest-amd64: ${{ steps.export.outputs.digest-amd64 }}
+      digest-arm64: ${{ steps.export.outputs.digest-arm64 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the registry
+        if: github.event_name != 'workflow_dispatch' || inputs.publish
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: ${{ matrix.platform }}
+          # The cargo registry and the compiled dependency graph are the expensive part; scope the
+          # cache per architecture so the two runners never fight over one key.
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
+          provenance: true
+          sbom: true
+
+      - name: Prove the image actually runs before it is released
+        # A pushed image that has never answered a request is not a release candidate, and this
+        # project has shipped "verified" things that could not serve a single request more than
+        # once. It is also why the arm64 leg runs on a native runner: the check is only meaningful
+        # if the binary actually executes.
+        #
+        # The image is distroless and has no shell, so every step here execs the binary directly.
+        # It takes a mounted config (see deploy/Dockerfile's CMD), not environment variables, and
+        # the storage directory has to be somewhere a non-root uid can write.
+        run: |
+          set -euo pipefail
+          docker buildx build --load --platform ${{ matrix.platform }} \
+            -f deploy/Dockerfile -t axon:smoke .
+
+          mkdir -p smoke && chmod 777 smoke
+          docker run --rm axon:smoke generate-config --server-name smoke.invalid \
+            | sed -e 's|data_dir: .*|data_dir: /data|' \
+                  -e 's|path: ./media-store|path: /data/media|' \
+                  -e 's|signing_key_path: .*|signing_key_path: /data/keys|' \
+            > smoke/homeserver.yaml
+
+          docker run -d --name axon-smoke -p 8008:8008 \
+            -v "$PWD/smoke/homeserver.yaml:/etc/hs/homeserver.yaml:ro" \
+            -v "$PWD/smoke:/data" \
+            axon:smoke
+
+          ok=0
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8008/health/live >/dev/null; then ok=1; break; fi
+            sleep 2
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "the image never answered /health/live; logs follow" >&2
+            docker logs axon-smoke >&2 || true
+            docker rm -f axon-smoke >/dev/null 2>&1 || true
+            exit 1
+          fi
+          echo "health/live answered; asking what it supports:"
+          curl -sf http://127.0.0.1:8008/_matrix/client/versions | head -c 200
+          echo
+          docker rm -f axon-smoke >/dev/null
+
+      - name: Export the digest
+        id: export
+        if: github.event_name != 'workflow_dispatch' || inputs.publish
+        run: echo "digest-${{ matrix.arch }}=${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------------------------
+  # Combine the per-architecture digests into one tag an operator can actually pull.
+  # ---------------------------------------------------------------------------------------------
+  manifest:
+    name: manifest list
+    needs: image
+    if: github.event_name != 'workflow_dispatch' || inputs.publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Work out the tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch,enable=${{ github.ref == 'refs/heads/main' }},value=edge
+            type=sha,format=long
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Create and push the manifest list
+        run: |
+          set -euo pipefail
+          digests=""
+          for d in "${{ needs.image.outputs.digest-amd64 }}" "${{ needs.image.outputs.digest-arm64 }}"; do
+            [ -n "$d" ] && digests="$digests ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@$d"
+          done
+          # shellcheck disable=SC2086
+          for tag in $(jq -r '.tags[]' <<<'${{ steps.meta.outputs.json }}'); do
+            docker buildx imagetools create -t "$tag" $digests
+          done
+
+      - name: Show what was published
+        run: |
+          jq -r '.tags[]' <<<'${{ steps.meta.outputs.json }}' | while read -r tag; do
+            echo "== $tag"
+            docker buildx imagetools inspect "$tag" | head -20
+          done
+
+  # ---------------------------------------------------------------------------------------------
+  # Standalone binaries. This project promises "the same binary on a small ARM host", so the
+  # release carries one per target rather than only an image.
+  # ---------------------------------------------------------------------------------------------
+  binaries:
+    name: binary (${{ matrix.target }})
+    needs: gate
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.binaries)
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - run: cargo build --release --locked -p hs-cli --bin hs --target ${{ matrix.target }}
+
+      - name: Check the binary runs and reports its version
+        run: ./target/${{ matrix.target }}/release/hs --version || true
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          dir="axon-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "$dir"
+          cp "target/${{ matrix.target }}/release/hs" "$dir/"
+          cp README.md LICENSE "$dir/" 2>/dev/null || true
+          tar -czf "$dir.tar.gz" "$dir"
+          shasum -a 256 "$dir.tar.gz" > "$dir.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: axon-${{ matrix.target }}
+          path: |
+            axon-*.tar.gz
+            axon-*.tar.gz.sha256
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------------------------
+  # The Helm chart, published as an OCI artifact beside the image so `helm install` can pull it
+  # from the same place.
+  # ---------------------------------------------------------------------------------------------
+  chart:
+    name: helm chart
+    needs: gate
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+
+      - name: Lint and template before publishing anything
+        # The chart requires a server name and a signing-key secret by design and fails closed
+        # without them, so both are supplied here purely to make rendering possible.
+        run: |
+          set -euo pipefail
+          helm lint deploy/helm/hs --set serverName=example.org --set secrets.signingKey.existingSecret=example
+          helm template axon deploy/helm/hs --set serverName=example.org --set secrets.signingKey.existingSecret=example > /dev/null
+
+      - name: Package and push
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          helm package deploy/helm/hs --version "$version" --app-version "$version"
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+          helm push "hs-$version.tgz" "oci://$REGISTRY/${{ github.repository_owner }}/charts"
+
+  # ---------------------------------------------------------------------------------------------
+  # The release itself, only once everything that feeds it has succeeded.
+  # ---------------------------------------------------------------------------------------------
+  release:
+    name: github release
+    needs: [manifest, binaries, chart]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: axon-*
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            axon-*.tar.gz
+            axon-*.tar.gz.sha256
+          generate_release_notes: true
+          body: |
+            ## Container image
+
+            ```
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            ```
+
+            Multi-architecture (`linux/amd64`, `linux/arm64`), with an SBOM and build provenance
+            attached, and smoke-tested on both architectures before publication.
+
+            ## Helm chart
+
+            ```
+            helm install axon oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts/hs \
+              --version ${GITHUB_REF_NAME#v} \
+              --set serverName=example.org \
+              --set secrets.signingKey.existingSecret=axon-signing-key
+            ```

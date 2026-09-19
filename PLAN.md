@@ -1,7 +1,7 @@
 # Plan: a modern Matrix homeserver in Rust
 
 Status: proposal v2, written 2026-09-17. Supersedes the schema-compatible draft from earlier the same day.
-Project name: to be decided. Crate names below use the placeholder prefix `hs-`.
+Project name: **Axon** (decided 2026-09-19). Crate names below still use the `hs-` prefix; renaming the crates is mechanical follow-up work, deliberately not done while parallel tracks are mid-flight.
 
 Companion files:
 

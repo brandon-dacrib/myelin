@@ -1,4 +1,11 @@
-# A modern Matrix homeserver in Rust
+# Axon
+
+A modern Matrix homeserver in Rust.
+
+An axon is the fibre that carries a signal away from the cell body — the transmission line of the
+nervous system, and the part built for speed and distance. That is this project's ambition: the
+Matrix protocol exactly as specified, carried faster and further, named in the tradition its
+predecessors set (Synapse, Dendrite).
 
 Kubernetes-native, horizontally scalable, and equally at home as a single static binary on a small ARM host. Synapse-compatible at the API and operations level with a migration path. Bridges are first-class. Full specification coverage is enforced mechanically.
 
@@ -9,5 +16,8 @@ Kubernetes-native, horizontally scalable, and equally at home as a single static
 - `docs/decisions/`: dated decision records. `docs/rfcs/`: interface change proposals.
 - `crates/`: the Rust workspace. `web/`: the management web interface.
 - `tools/fetch-refs.sh`: clones the reference codebases into `refs/` (git-ignored).
+
+The binary and the crates keep the `hs-` prefix for now; renaming them is mechanical and is
+tracked separately, because doing it mid-flight would collide with work in progress.
 
 License: Apache-2.0 (provisional, see `docs/decisions/0001-license.md`).
