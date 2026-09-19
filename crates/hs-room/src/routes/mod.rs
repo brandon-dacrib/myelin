@@ -6,6 +6,7 @@
 
 pub mod aliases;
 pub mod create_room;
+pub mod directory;
 pub mod membership;
 pub mod query;
 pub mod redact;
@@ -194,6 +195,26 @@ pub fn router<B: KvBackend + 'static>() -> (axum::Router<RoomState<B>>, RouteMan
             "/rooms/{roomId}/relations/{eventId}/{relType}/{eventType}",
             relations::get_relations_by_rel_type_and_event_type::<B>,
             matrix_client("getRelatingEventsWithRelTypeAndEventType"),
+        )
+        .put(
+            "/directory/list/room/{roomId}",
+            directory::put_directory_visibility::<B>,
+            matrix_client("setRoomVisibilityOnDirectory"),
+        )
+        .get(
+            "/directory/list/room/{roomId}",
+            directory::get_directory_visibility::<B>,
+            matrix_client("getRoomVisibilityOnDirectory"),
+        )
+        .get(
+            "/publicRooms",
+            directory::get_public_rooms::<B>,
+            matrix_client("publicRooms"),
+        )
+        .post(
+            "/publicRooms",
+            directory::post_public_rooms::<B>,
+            matrix_client("queryPublicRooms"),
         )
         .build()
 }

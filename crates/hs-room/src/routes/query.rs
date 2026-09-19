@@ -28,17 +28,24 @@ fn parse_event_id(raw: &str) -> Result<ruma::OwnedEventId, RoomError> {
 }
 
 /// `GET /rooms/{roomId}/state/{eventType}/{stateKey}`.
+///
+/// Reads through [`crate::actor::RoomActor::state_event_for_reader`], not the room's unconditional
+/// current state: a departed member sees this room's state as of when they left, per
+/// `m.room.history_visibility` ("after a user has left a room, they may see any events which they
+/// were allowed to see before they left the room, but no events received after they left") --
+/// `apidoc_room_history_visibility_test.go`-style coverage for `.../state`, not just
+/// `.../event`/`.../messages`.
 pub async fn get_state_with_key<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path((room_id, event_type, state_key)): Path<(String, String, String)>,
-    RoomRequester(_requester): RoomRequester,
+    RoomRequester(requester): RoomRequester,
 ) -> Result<Response, RoomError> {
     let room_id = parse_room_id(&room_id)?;
     let handle = state.rooms.get_or_load(&room_id).await?;
     let content = handle
         .query(move |actor| {
             actor
-                .state_event(&event_type, &state_key)
+                .state_event_for_reader(&requester.user_id, &event_type, &state_key)
                 .map(|found| found.and_then(|e| e.json().get("content").cloned()))
         })
         .await?;
@@ -60,22 +67,27 @@ pub async fn get_state_no_key<B: KvBackend + 'static>(
     get_state_with_key(state, Path((room_id, event_type, String::new())), requester).await
 }
 
-/// `GET /rooms/{roomId}/state`.
+/// `GET /rooms/{roomId}/state`. See [`get_state_with_key`]'s doc comment: reads through
+/// `RoomActor::full_state_for_reader`, so a departed member sees this room's state as of when
+/// they left, not its live current state.
 pub async fn get_state<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_id): Path<String>,
-    RoomRequester(_requester): RoomRequester,
+    RoomRequester(requester): RoomRequester,
 ) -> Result<Response, RoomError> {
     let room_id = parse_room_id(&room_id)?;
     let handle = state.rooms.get_or_load(&room_id).await?;
     let events = handle
-        .query(|actor| {
-            actor.full_state().map(|events| {
-                events
-                    .into_iter()
-                    .map(client_event_json)
-                    .collect::<Vec<_>>()
-            })
+        .query(move |actor| {
+            actor
+                .full_state_for_reader(&requester.user_id)
+                .map(|found| {
+                    found
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(client_event_json)
+                        .collect::<Vec<_>>()
+                })
         })
         .await?;
     Ok(Json(events).into_response())
@@ -93,17 +105,25 @@ pub async fn get_event<B: KvBackend + 'static>(
     let room_id = parse_room_id(&room_id)?;
     let event_id = parse_event_id(&event_id)?;
     let handle = state.rooms.get_or_load(&room_id).await?;
-    let found = handle
+    let found: Result<serde_json::Value, RoomError> = handle
         .query(move |actor| {
-            actor.event_by_id(&event_id).map(|event| {
-                let bundle = actor.relation_bundle(event.event_id(), &requester.user_id);
-                crate::routes::render::client_event_json_bundled(event, &bundle)
-            })
+            let event = actor
+                .event_by_id(&event_id)
+                .ok_or_else(|| RoomError::EventNotFound("event not found".into()))?;
+            // `m.room.history_visibility` denies by returning "not found", not "forbidden": the
+            // spec's read-side algorithm makes no distinction between "this event does not exist"
+            // and "you may not see it", so neither does this response (see this crate's status
+            // file, session on history-visibility enforcement).
+            if !actor.event_visible_to(event, &requester.user_id)? {
+                return Err(RoomError::EventNotFound("event not found".into()));
+            }
+            let bundle = actor.relation_bundle(event.event_id(), &requester.user_id);
+            Ok(crate::routes::render::client_event_json_bundled(
+                event, &bundle,
+            ))
         })
         .await;
-    found
-        .map(|v| Json(v).into_response())
-        .ok_or_else(|| RoomError::EventNotFound("event not found".into()))
+    found.map(|v| Json(v).into_response())
 }
 
 /// `GET /rooms/{roomId}/context/{eventId}`.
@@ -127,6 +147,20 @@ pub async fn get_context<B: KvBackend + 'static>(
     let result = handle
         .query(move |actor| {
             let target = actor.event_by_id(&event_id)?;
+            // Same "not found, not forbidden" shape as `get_event`: a target the requester may
+            // not see per `m.room.history_visibility` is reported identically to one that does
+            // not exist at all.
+            if !actor
+                .event_visible_to(target, &requester.user_id)
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            let visible = |e: &&&hs_model::Event| {
+                actor
+                    .event_visible_to(e, &requester.user_id)
+                    .unwrap_or(false)
+            };
             let render = |e: &hs_model::Event| {
                 let bundle = actor.relation_bundle(e.event_id(), &requester.user_id);
                 crate::routes::render::client_event_json_bundled(e, &bundle)
@@ -145,12 +179,23 @@ pub async fn get_context<B: KvBackend + 'static>(
             // target first): that is exactly ascending-index order over `all[pos+1..end]`, since
             // `all` is already newest-first.
             let end = (pos + 1 + limit).min(all.len());
-            let events_before: Vec<_> = all[pos + 1..end].iter().copied().map(render).collect();
+            let events_before: Vec<_> = all[pos + 1..end]
+                .iter()
+                .filter(visible)
+                .copied()
+                .map(render)
+                .collect();
             // "events_after" (newer than target) in chronological order (nearest to the target
             // first, i.e. oldest of the "after" set first): `all[start..pos]` is newest-first, so
             // reverse it.
             let start = pos.saturating_sub(limit);
-            let events_after: Vec<_> = all[start..pos].iter().rev().copied().map(render).collect();
+            let events_after: Vec<_> = all[start..pos]
+                .iter()
+                .rev()
+                .filter(visible)
+                .copied()
+                .map(render)
+                .collect();
             let state_json = actor
                 .full_state()
                 .ok()?
@@ -177,14 +222,17 @@ pub async fn get_context<B: KvBackend + 'static>(
 pub async fn get_members<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_id): Path<String>,
-    RoomRequester(_requester): RoomRequester,
+    RoomRequester(requester): RoomRequester,
 ) -> Result<Response, RoomError> {
     let room_id = parse_room_id(&room_id)?;
     let handle = state.rooms.get_or_load(&room_id).await?;
+    // `members_for_reader`, not `members`: a departed member must not see a member who joined
+    // after they left (`room_leave_test.go`'s `TestLeftRoomFixture`).
     let chunk = handle
-        .query(|actor| {
-            actor.members().map(|events| {
-                events
+        .query(move |actor| {
+            actor.members_for_reader(&requester.user_id).map(|found| {
+                found
+                    .unwrap_or_default()
                     .into_iter()
                     .map(client_event_json)
                     .collect::<Vec<_>>()
@@ -259,21 +307,46 @@ pub async fn get_messages<B: KvBackend + 'static>(
         .transpose()?;
     let limit = query.limit.unwrap_or(10).min(1000);
 
-    let handle = state.rooms.get_or_load(&room_id).await?;
+    // A non-existent room reports the same `403 M_FORBIDDEN` as "you aren't a member of the
+    // room" (`room_messages_test.go`'s `TestFetchMessagesFromNonExistentRoom`), rather than
+    // leaking room existence through a distinct 404.
+    let handle = match state.rooms.get_or_load(&room_id).await {
+        Ok(handle) => handle,
+        Err(RoomError::RoomNotFound(_)) => {
+            return Err(RoomError::Forbidden(
+                "you aren't a member of the room".into(),
+            ));
+        }
+        Err(e) => return Err(e),
+    };
     let (start, chunk, end) = handle
-        .query(move |actor| {
+        .query(move |actor| -> Result<_, RoomError> {
+            // The entry gate: forgetting, or never having had a membership record in a
+            // non-world-readable room, refuses the whole call outright -- see
+            // `RoomActor::can_read_room`'s doc comment for exactly what this distinguishes from
+            // per-event filtering below.
+            if !actor.can_read_room(&requester.user_id)? {
+                return Err(RoomError::Forbidden(
+                    "you aren't a member of the room".into(),
+                ));
+            }
             let (events, next) = actor.paginate(from, direction, limit);
             let start_token = from.unwrap_or_else(|| PaginationToken::new(0, direction));
             let chunk = events
                 .into_iter()
+                .filter(|e| {
+                    actor
+                        .event_visible_to(e, &requester.user_id)
+                        .unwrap_or(false)
+                })
                 .map(|e| {
                     let bundle = actor.relation_bundle(e.event_id(), &requester.user_id);
                     crate::routes::render::client_event_json_bundled(e, &bundle)
                 })
                 .collect::<Vec<_>>();
-            (start_token.to_string(), chunk, next.map(|t| t.to_string()))
+            Ok((start_token.to_string(), chunk, next.map(|t| t.to_string())))
         })
-        .await;
+        .await?;
 
     Ok(Json(json!({"start": start, "chunk": chunk, "end": end})).into_response())
 }

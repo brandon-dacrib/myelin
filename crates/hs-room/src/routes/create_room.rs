@@ -72,35 +72,81 @@ fn parse_initial_state(body: &Value) -> Result<Vec<InitialStateEvent>, RoomError
         .collect()
 }
 
+/// `PRESETS`: the only `preset` values the spec defines. A `preset` outside this set is rejected
+/// with `M_BAD_JSON` rather than silently falling back to `private_chat`'s defaults, which is what
+/// `RoomActor::create_room`'s own `match preset { ... _ => ... }` would otherwise do for a typo.
+const PRESETS: &[&str] = &["private_chat", "public_chat", "trusted_private_chat"];
+
 /// `POST /createRoom`.
 pub async fn post_create_room<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     RoomRequester(requester): RoomRequester,
     Json(body): Json<Value>,
 ) -> Result<Response, RoomError> {
-    let room_version = match body.get("room_version").and_then(Value::as_str) {
-        Some(v) => Some(
-            RoomVersionId::try_from(v)
-                .map_err(|_| RoomError::UnsupportedRoomVersion(v.to_owned()))?,
+    // `room_version` must be a JSON string if present at all -- a well-formed-but-wrong-typed
+    // value (a number, an object, ...) is `M_BAD_JSON` (sytest/Complement: "rejects attempts to
+    // create rooms with numeric versions"), distinct from a well-typed but unrecognized version
+    // string, which is `M_UNSUPPORTED_ROOM_VERSION` (below, via `RoomActor::create`'s own check --
+    // `ruma::RoomVersionId::try_from` accepts any syntactically valid opaque token, known or not,
+    // so *this* function cannot tell "unsupported" apart from "unknown" itself; that gate is
+    // `hs_model::room_version::rules_for`, reached through `RoomActor::create`).
+    let room_version = match body.get("room_version") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(v)) => Some(
+            RoomVersionId::try_from(v.as_str())
+                .map_err(|_| RoomError::UnsupportedRoomVersion(v.clone()))?,
         ),
-        None => None,
+        Some(_) => {
+            return Err(RoomError::BadRequest(
+                "room_version must be a string".into(),
+            ));
+        }
     };
+
+    let preset = body
+        .get("preset")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(preset) = preset.as_deref()
+        && !PRESETS.contains(&preset)
+    {
+        return Err(RoomError::BadRequest(format!(
+            "preset must be one of {PRESETS:?}, got {preset:?}"
+        )));
+    }
+
+    if let Some(visibility) = body.get("visibility") {
+        match visibility.as_str() {
+            Some("public" | "private") => {}
+            _ => {
+                return Err(RoomError::BadRequest(
+                    "visibility must be \"public\" or \"private\"".into(),
+                ));
+            }
+        }
+    }
+
+    let creation_content = match body.get("creation_content") {
+        None => json!({}),
+        Some(v @ Value::Object(_)) => v.clone(),
+        Some(_) => {
+            return Err(RoomError::BadRequest(
+                "creation_content must be an object".into(),
+            ));
+        }
+    };
+
+    let publish = body.get("visibility").and_then(Value::as_str) == Some("public");
 
     let request = CreateRoomRequest {
         room_version,
-        preset: body
-            .get("preset")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        preset,
         name: body.get("name").and_then(Value::as_str).map(str::to_owned),
         topic: body.get("topic").and_then(Value::as_str).map(str::to_owned),
         invite: parse_user_list(&body, "invite")?,
         initial_state: parse_initial_state(&body)?,
         power_level_content_override: body.get("power_level_content_override").cloned(),
-        creation_content: body
-            .get("creation_content")
-            .cloned()
-            .unwrap_or_else(|| json!({})),
+        creation_content,
         room_alias_name: body
             .get("room_alias_name")
             .and_then(Value::as_str)
@@ -113,6 +159,13 @@ pub async fn post_create_room<B: KvBackend + 'static>(
         .await?;
 
     let room_id = handle.query(|actor| actor.room_id().to_owned()).await;
+
+    // `visibility` controls only the published room directory (`GET /publicRooms`), orthogonal to
+    // `preset`'s join-rule/history-visibility/guest-access defaults -- see this crate's status
+    // file for why these are two independent request fields, not one.
+    if publish {
+        state.rooms.set_directory_visibility(&room_id, true)?;
+    }
 
     Ok(Json(json!({"room_id": room_id.to_string()})).into_response())
 }

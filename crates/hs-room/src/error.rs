@@ -72,6 +72,13 @@ pub enum RoomError {
     #[error("internal room actor invariant violated: {0}")]
     Internal(String),
 
+    /// [`crate::actor::RoomActor::forget`]: the user is still joined to the room (or the room
+    /// does not exist at all -- `crate::routes::membership::post_forget` reuses this variant for
+    /// that case too, since the spec documents only one error shape for this endpoint: `400
+    /// M_UNKNOWN`).
+    #[error("{0}")]
+    StillJoined(String),
+
     /// [`crate::actor::RoomActor::accept_remote_event`]: the event names a `prev_events` or
     /// `auth_events` entry this actor does not hold. The ordinary federation case of an event
     /// arriving before its ancestors have been backfilled -- not a hard protocol violation, and
@@ -101,6 +108,11 @@ impl RoomError {
             ),
             Self::InvalidEvent(_) | Self::BadRequest(_) => MatrixError::bad_json(self.to_string()),
             Self::Forbidden(msg) => MatrixError::forbidden(msg.clone()),
+            Self::StillJoined(msg) => MatrixError::custom(
+                axum::http::StatusCode::BAD_REQUEST,
+                MatrixErrorCode::Unknown,
+                msg.clone(),
+            ),
             Self::InvalidPaginationToken => MatrixError::custom(
                 axum::http::StatusCode::BAD_REQUEST,
                 MatrixErrorCode::InvalidParam,

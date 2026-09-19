@@ -24,6 +24,12 @@ pub type RoomAliasKey = (hs_model::RoomSn, String);
 /// `(RoomSn,)`: a room's fixed metadata (room version), set once at creation.
 pub type RoomMetaKey = (hs_model::RoomSn,);
 
+/// `(RoomSn,) -> b""`: presence means this room is currently published to the server's room
+/// directory (`PUT /_matrix/client/v3/directory/list/room/{roomId}`). Absence means private (the
+/// spec's default) -- deleting the key on unpublish, not writing a "private" marker, keeps
+/// "published" a simple presence check with no value to decode.
+pub type PublicRoomKey = (hs_model::RoomSn,);
+
 /// One event as stored durably: enough to reconstruct an [`hs_model::event::Event`] (via
 /// [`hs_model::event::Event::parse`] on `json`) plus the room-local bookkeeping
 /// [`hs_model::event::EventHeader`] does not carry.
@@ -76,6 +82,9 @@ pub struct Tables<B: KvBackend> {
     pub room_meta: TypedKeyspace<B::Keyspace, RoomMetaKey>,
     /// `(RoomSn, target_event_sn, rel_type, child_event_sn) -> b""`: `m.relates_to` index.
     pub relations: TypedKeyspace<B::Keyspace, crate::relations::RelationKey>,
+    /// `(RoomSn,) -> b""`: the published room directory (`crate::registry::RoomRegistry`'s
+    /// `set_directory_visibility`/`list_published_rooms`).
+    pub public_rooms: TypedKeyspace<B::Keyspace, PublicRoomKey>,
 }
 
 impl<B: KvBackend> Tables<B> {
@@ -95,6 +104,7 @@ impl<B: KvBackend> Tables<B> {
             room_aliases: TypedKeyspace::new(backend.keyspace("room_aliases_by_room")?),
             room_meta: TypedKeyspace::new(backend.keyspace("room_meta")?),
             relations: TypedKeyspace::new(backend.keyspace("room_relations")?),
+            public_rooms: TypedKeyspace::new(backend.keyspace("room_public_directory")?),
         })
     }
 }

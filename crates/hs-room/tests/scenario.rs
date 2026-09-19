@@ -16,21 +16,30 @@ use hs_room::state::RoomState;
 use hs_testkit::Scenario;
 use serde_json::json;
 
-fn app() -> axum::Router {
+/// Like [`app`], but also hands back the [`RoomRegistry`] directly -- for tests that need to
+/// check something (like the room directory's publish flag) that has no HTTP surface of its own
+/// in this crate today; see `crate::routes::directory`'s module doc for why
+/// `GET`/`POST /publicRooms` are not mounted here (`hs-user` already serves them).
+fn app_with_registry() -> (axum::Router, Arc<RoomRegistry<MemoryBackend>>) {
     let auth_state = AuthState::in_memory();
     let backend = MemoryBackend::new();
     let identity = HomeserverIdentity::for_tests("example.org");
-    let registry = RoomRegistry::open(backend, identity.clone()).expect("open registry");
+    let registry = Arc::new(RoomRegistry::open(backend, identity.clone()).expect("open registry"));
     let room_state = RoomState {
         auth: auth_state.clone(),
-        rooms: Arc::new(registry),
+        rooms: registry.clone(),
         identity,
     };
     let (room_router, _manifest) = hs_room::routes::router::<MemoryBackend>();
 
-    hs_auth::routes::router()
+    let router = hs_auth::routes::router()
         .with_state(auth_state)
-        .merge(room_router.with_state(room_state))
+        .merge(room_router.with_state(room_state));
+    (router, registry)
+}
+
+fn app() -> axum::Router {
+    app_with_registry().0
 }
 
 #[tokio::test]
@@ -547,4 +556,691 @@ async fn profile_propagates_into_join_invite_and_knock_membership_content() {
         updated.json["displayname"], "Bobby",
         "re-sending join must pick up the new profile"
     );
+}
+
+/// The security fix this session's brief opened with: `m.room.history_visibility: joined` must
+/// stop a departed member from seeing events sent after they left, on both
+/// `GET .../messages` and `GET .../event/{eventId}` -- previously neither endpoint enforced
+/// `history_visibility` at all, so a user who left a non-world-readable room kept full read
+/// access to everything, including events sent after they left.
+#[tokio::test]
+async fn history_visibility_joined_hides_events_sent_after_a_member_leaves() {
+    let mut scenario = Scenario::new(app());
+    scenario
+        .register("alice", "alice", "correct horse battery staple")
+        .await
+        .assert_ok();
+    scenario
+        .register("bob", "bob", "hunter2official")
+        .await
+        .assert_ok();
+
+    let created = scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({
+                "preset": "public_chat",
+                "initial_state": [{
+                    "type": "m.room.history_visibility",
+                    "state_key": "",
+                    "content": {"history_visibility": "joined"},
+                }],
+            })),
+        )
+        .await;
+    created.assert_ok();
+    let room_id = created.str_field("room_id").to_string();
+
+    scenario
+        .send(
+            Some("bob"),
+            Method::POST,
+            &format!("/rooms/{room_id}/join"),
+            Some(json!({})),
+        )
+        .await
+        .assert_ok();
+
+    let before = scenario
+        .send(
+            Some("alice"),
+            Method::PUT,
+            &format!("/rooms/{room_id}/send/m.room.message/txn-before"),
+            Some(json!({"msgtype": "m.text", "body": "before bob left"})),
+        )
+        .await;
+    before.assert_ok();
+    let before_id = before.str_field("event_id").to_string();
+
+    // Bob can see it while he is still joined.
+    scenario
+        .send(
+            Some("bob"),
+            Method::GET,
+            &format!("/rooms/{room_id}/event/{before_id}"),
+            None,
+        )
+        .await
+        .assert_ok();
+
+    scenario
+        .send(
+            Some("bob"),
+            Method::POST,
+            &format!("/rooms/{room_id}/leave"),
+            Some(json!({})),
+        )
+        .await
+        .assert_ok();
+
+    let after = scenario
+        .send(
+            Some("alice"),
+            Method::PUT,
+            &format!("/rooms/{room_id}/send/m.room.message/txn-after"),
+            Some(json!({"msgtype": "m.text", "body": "after bob left"})),
+        )
+        .await;
+    after.assert_ok();
+    let after_id = after.str_field("event_id").to_string();
+
+    // A departed member (not forgotten) may still call /messages at all...
+    let page = scenario
+        .send(
+            Some("bob"),
+            Method::GET,
+            &format!("/rooms/{room_id}/messages?dir=b&limit=20"),
+            None,
+        )
+        .await;
+    page.assert_ok();
+    let bodies: Vec<&str> = page.json["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["content"]["body"].as_str())
+        .collect();
+    assert!(
+        bodies.contains(&"before bob left"),
+        "an event sent while bob was joined must remain visible: {bodies:?}"
+    );
+    assert!(
+        !bodies.contains(&"after bob left"),
+        "an event sent after bob left a `joined`-visibility room must not be visible: {bodies:?}"
+    );
+
+    // ...but the event sent after he left is a 404 by direct ID too, not merely absent from a
+    // page (the same "not found, not forbidden" shape `apidoc_room_history_visibility_test.go`
+    // expects).
+    scenario
+        .send(
+            Some("bob"),
+            Method::GET,
+            &format!("/rooms/{room_id}/event/{after_id}"),
+            None,
+        )
+        .await
+        .assert_matrix_error(StatusCode::NOT_FOUND, "M_NOT_FOUND");
+
+    // The event sent before he left is still directly fetchable.
+    scenario
+        .send(
+            Some("bob"),
+            Method::GET,
+            &format!("/rooms/{room_id}/event/{before_id}"),
+            None,
+        )
+        .await
+        .assert_ok();
+}
+
+/// A user who never joined a non-world-readable room at all gets the same `404` on
+/// `GET .../event/{eventId}` as a departed member denied by history-visibility -- and, per
+/// `room_messages_test.go`'s "you aren't a member of the room", `403` outright on
+/// `GET .../messages` before any per-event filtering runs.
+#[tokio::test]
+async fn a_stranger_to_a_shared_visibility_room_is_denied_reads() {
+    let mut scenario = Scenario::new(app());
+    scenario
+        .register("alice", "alice", "correct horse battery staple")
+        .await
+        .assert_ok();
+    scenario
+        .register("eve", "eve", "another passphrase entirely")
+        .await
+        .assert_ok();
+
+    let created = scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    created.assert_ok();
+    let room_id = created.str_field("room_id").to_string();
+
+    let sent = scenario
+        .send(
+            Some("alice"),
+            Method::PUT,
+            &format!("/rooms/{room_id}/send/m.room.message/txn1"),
+            Some(json!({"msgtype": "m.text", "body": "hello"})),
+        )
+        .await;
+    sent.assert_ok();
+    let event_id = sent.str_field("event_id").to_string();
+
+    scenario
+        .send(
+            Some("eve"),
+            Method::GET,
+            &format!("/rooms/{room_id}/event/{event_id}"),
+            None,
+        )
+        .await
+        .assert_matrix_error(StatusCode::NOT_FOUND, "M_NOT_FOUND");
+
+    scenario
+        .send(
+            Some("eve"),
+            Method::GET,
+            &format!("/rooms/{room_id}/messages"),
+            None,
+        )
+        .await
+        .assert_matrix_error(StatusCode::FORBIDDEN, "M_FORBIDDEN");
+}
+
+/// `POST /rooms/{roomId}/forget`: rejects a still-joined member, rejects a room that does not
+/// exist, and -- once forgotten -- blocks `/messages` outright even though the room's
+/// `shared`-visibility default would otherwise let a past member read what they saw while joined;
+/// rejoining un-forgets it.
+#[tokio::test]
+async fn forget_validates_membership_and_blocks_messages_until_rejoin() {
+    let mut scenario = Scenario::new(app());
+    scenario
+        .register("alice", "alice", "correct horse battery staple")
+        .await
+        .assert_ok();
+
+    let created = scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    created.assert_ok();
+    let room_id = created.str_field("room_id").to_string();
+
+    // Still joined: rejected.
+    scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            &format!("/rooms/{room_id}/forget"),
+            Some(json!({})),
+        )
+        .await
+        .assert_matrix_error(StatusCode::BAD_REQUEST, "M_UNKNOWN");
+
+    // A room that does not exist at all: also rejected, same shape.
+    scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/rooms/!does-not-exist:example.org/forget",
+            Some(json!({})),
+        )
+        .await
+        .assert_matrix_error(StatusCode::BAD_REQUEST, "M_UNKNOWN");
+
+    scenario
+        .send(
+            Some("alice"),
+            Method::PUT,
+            &format!("/rooms/{room_id}/send/m.room.message/txn1"),
+            Some(json!({"msgtype": "m.text", "body": "hello"})),
+        )
+        .await
+        .assert_ok();
+    scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            &format!("/rooms/{room_id}/leave"),
+            Some(json!({})),
+        )
+        .await
+        .assert_ok();
+    scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            &format!("/rooms/{room_id}/forget"),
+            Some(json!({})),
+        )
+        .await
+        .assert_ok();
+
+    scenario
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/rooms/{room_id}/messages"),
+            None,
+        )
+        .await
+        .assert_matrix_error(StatusCode::FORBIDDEN, "M_FORBIDDEN");
+
+    // Rejoining (the room is `public_chat`, so no invite is needed) un-forgets it.
+    scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            &format!("/rooms/{room_id}/join"),
+            Some(json!({})),
+        )
+        .await
+        .assert_ok();
+    scenario
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/rooms/{room_id}/messages"),
+            None,
+        )
+        .await
+        .assert_ok();
+}
+
+/// `POST /createRoom` validates `room_version`'s JSON *type* (a number is `M_BAD_JSON`, distinct
+/// from a well-typed-but-unrecognized version string, which stays `M_UNSUPPORTED_ROOM_VERSION`),
+/// `preset` against the three spec-defined values, `visibility` against `public`/`private`, and
+/// `creation_content`'s type.
+#[tokio::test]
+async fn create_room_validates_request_shape() {
+    let mut scenario = Scenario::new(app());
+    scenario
+        .register("alice", "alice", "correct horse battery staple")
+        .await
+        .assert_ok();
+
+    scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({"room_version": 1, "preset": "public_chat"})),
+        )
+        .await
+        .assert_matrix_error(StatusCode::BAD_REQUEST, "M_BAD_JSON");
+
+    scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({"room_version": "not-a-real-version", "preset": "public_chat"})),
+        )
+        .await
+        .assert_matrix_error(StatusCode::BAD_REQUEST, "M_UNSUPPORTED_ROOM_VERSION");
+
+    scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({"preset": "not-a-real-preset"})),
+        )
+        .await
+        .assert_matrix_error(StatusCode::BAD_REQUEST, "M_BAD_JSON");
+
+    scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({"visibility": "not-a-real-visibility"})),
+        )
+        .await
+        .assert_matrix_error(StatusCode::BAD_REQUEST, "M_BAD_JSON");
+
+    scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({"creation_content": "not-an-object"})),
+        )
+        .await
+        .assert_matrix_error(StatusCode::BAD_REQUEST, "M_BAD_JSON");
+
+    // A well-formed request still works after all that.
+    scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({"preset": "public_chat", "room_version": "10"})),
+        )
+        .await
+        .assert_ok();
+}
+
+/// `PUT`/`GET /_matrix/client/v3/directory/list/room/{roomId}` end to end, `GET`/`POST
+/// /publicRooms`'s listing, and `POST /createRoom`'s own `visibility: "public"` field. Also
+/// checks the underlying publish flag directly through
+/// [`RoomRegistry::is_directory_public`]/[`RoomRegistry::list_published_room_ids`] -- see
+/// `crate::routes::directory`'s module doc for why this crate's `/publicRooms` (not `hs-user`'s)
+/// is the one actually mounted in `hs-cli`.
+#[tokio::test]
+async fn room_directory_publish_and_unpublish_round_trip() {
+    let (router, registry) = app_with_registry();
+    let mut scenario = Scenario::new(router);
+    scenario
+        .register("alice", "alice", "correct horse battery staple")
+        .await
+        .assert_ok();
+
+    let created = scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({
+                "preset": "public_chat",
+                "name": "Wombat Discussion",
+                "topic": "All about wombats",
+            })),
+        )
+        .await;
+    created.assert_ok();
+    let room_id = created.str_field("room_id").to_string();
+    let room_id_parsed = <&ruma::RoomId>::try_from(room_id.as_str()).unwrap();
+
+    // Not published yet: `GET .../directory/list/room/{roomId}` and the registry agree.
+    let get_visibility = scenario
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/directory/list/room/{room_id}"),
+            None,
+        )
+        .await;
+    get_visibility.assert_ok();
+    assert_eq!(get_visibility.json["visibility"], "private");
+    assert!(!registry.is_directory_public(room_id_parsed).unwrap());
+    assert!(
+        !registry
+            .list_published_room_ids()
+            .unwrap()
+            .iter()
+            .any(|id| id.as_str() == room_id)
+    );
+    let not_listed = scenario
+        .send(Some("alice"), Method::GET, "/publicRooms", None)
+        .await;
+    not_listed.assert_ok();
+    assert!(
+        !not_listed.json["chunk"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["room_id"] == room_id)
+    );
+
+    scenario
+        .send(
+            Some("alice"),
+            Method::PUT,
+            &format!("/directory/list/room/{room_id}"),
+            Some(json!({"visibility": "public"})),
+        )
+        .await
+        .assert_ok();
+
+    let get_visibility_after = scenario
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/directory/list/room/{room_id}"),
+            None,
+        )
+        .await;
+    get_visibility_after.assert_ok();
+    assert_eq!(get_visibility_after.json["visibility"], "public");
+    assert!(registry.is_directory_public(room_id_parsed).unwrap());
+    assert!(
+        registry
+            .list_published_room_ids()
+            .unwrap()
+            .iter()
+            .any(|id| id.as_str() == room_id)
+    );
+
+    let listed = scenario
+        .send(Some("alice"), Method::GET, "/publicRooms", None)
+        .await;
+    listed.assert_ok();
+    let entry = listed.json["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["room_id"] == room_id)
+        .cloned()
+        .expect("the published room must appear in /publicRooms");
+    assert_eq!(entry["name"], "Wombat Discussion");
+    assert_eq!(entry["topic"], "All about wombats");
+    assert_eq!(entry["num_joined_members"], 1);
+    assert_eq!(entry["world_readable"], false);
+    assert!(entry.get("guest_can_join").is_some());
+
+    // The `POST` filtered form finds it by a case-insensitive substring of its topic.
+    let searched = scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/publicRooms",
+            Some(json!({"filter": {"generic_search_term": "WOMBATS"}})),
+        )
+        .await;
+    searched.assert_ok();
+    let search_chunk = searched.json["chunk"].as_array().unwrap();
+    assert_eq!(search_chunk.len(), 1);
+    assert_eq!(search_chunk[0]["room_id"], room_id);
+
+    // Unpublishing removes it again.
+    scenario
+        .send(
+            Some("alice"),
+            Method::PUT,
+            &format!("/directory/list/room/{room_id}"),
+            Some(json!({"visibility": "private"})),
+        )
+        .await
+        .assert_ok();
+    assert!(!registry.is_directory_public(room_id_parsed).unwrap());
+
+    // `POST /createRoom`'s own `visibility: "public"` field publishes without a separate
+    // directory call.
+    let created_public = scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({"visibility": "public", "name": "Born Public"})),
+        )
+        .await;
+    created_public.assert_ok();
+    let public_room_id = created_public.str_field("room_id").to_string();
+    let public_room_id_parsed = <&ruma::RoomId>::try_from(public_room_id.as_str()).unwrap();
+    assert!(registry.is_directory_public(public_room_id_parsed).unwrap());
+
+    // A malformed `visibility` value is `M_BAD_JSON`, not silently treated as private.
+    scenario
+        .send(
+            Some("alice"),
+            Method::PUT,
+            &format!("/directory/list/room/{room_id}"),
+            Some(json!({"visibility": "nonsense"})),
+        )
+        .await
+        .assert_matrix_error(StatusCode::BAD_REQUEST, "M_BAD_JSON");
+
+    // Publishing a room that does not exist 404s rather than silently succeeding.
+    scenario
+        .send(
+            Some("alice"),
+            Method::PUT,
+            "/directory/list/room/!does-not-exist:example.org",
+            Some(json!({"visibility": "public"})),
+        )
+        .await
+        .assert_matrix_error(StatusCode::NOT_FOUND, "M_NOT_FOUND");
+}
+
+/// `GET .../state`, `.../state/{eventType}(/{stateKey})` and `.../members` must show a departed
+/// member the room **as of when they left**, not its live current state -- the same
+/// history-visibility principle `event_visible_to` enforces per-event, applied to these bulk
+/// reads. Regression test for exactly the bug `apidoc_room_history_visibility_test.go`'s sibling,
+/// `room_leave_test.go`'s `TestLeftRoomFixture`, demonstrated: before this session's fix, a
+/// departed member's `GET .../state/{type}` returned whatever the room's state had become by the
+/// time they asked, including changes made after they left, and `.../members` included members
+/// who joined afterward too.
+#[tokio::test]
+async fn departed_member_sees_state_and_members_as_of_when_they_left() {
+    let mut scenario = Scenario::new(app());
+    scenario
+        .register("alice", "alice", "correct horse battery staple")
+        .await
+        .assert_ok();
+    scenario
+        .register("bob", "bob", "hunter2official")
+        .await
+        .assert_ok();
+    scenario
+        .register("carol", "carol", "another passphrase")
+        .await
+        .assert_ok();
+
+    let created = scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({"preset": "public_chat", "name": "Before"})),
+        )
+        .await;
+    created.assert_ok();
+    let room_id = created.str_field("room_id").to_string();
+
+    scenario
+        .send(
+            Some("bob"),
+            Method::POST,
+            &format!("/rooms/{room_id}/join"),
+            Some(json!({})),
+        )
+        .await
+        .assert_ok();
+
+    scenario
+        .send(
+            Some("bob"),
+            Method::POST,
+            &format!("/rooms/{room_id}/leave"),
+            Some(json!({})),
+        )
+        .await
+        .assert_ok();
+
+    // After bob leaves: the name changes, and carol joins.
+    scenario
+        .send(
+            Some("alice"),
+            Method::PUT,
+            &format!("/rooms/{room_id}/state/m.room.name/"),
+            Some(json!({"name": "After"})),
+        )
+        .await
+        .assert_ok();
+    scenario
+        .send(
+            Some("carol"),
+            Method::POST,
+            &format!("/rooms/{room_id}/join"),
+            Some(json!({})),
+        )
+        .await
+        .assert_ok();
+
+    // Bob still sees "Before", both via the single-key and full-state endpoints...
+    let name_with_key = scenario
+        .send(
+            Some("bob"),
+            Method::GET,
+            &format!("/rooms/{room_id}/state/m.room.name/"),
+            None,
+        )
+        .await;
+    name_with_key.assert_ok();
+    assert_eq!(name_with_key.json["name"], "Before");
+
+    let full_state = scenario
+        .send(
+            Some("bob"),
+            Method::GET,
+            &format!("/rooms/{room_id}/state"),
+            None,
+        )
+        .await;
+    full_state.assert_ok();
+    let name_event = full_state
+        .json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["type"] == "m.room.name")
+        .expect("m.room.name must be in the departed member's state snapshot");
+    assert_eq!(name_event["content"]["name"], "Before");
+
+    // ...and does not see carol, who joined after bob left.
+    let members = scenario
+        .send(
+            Some("bob"),
+            Method::GET,
+            &format!("/rooms/{room_id}/members"),
+            None,
+        )
+        .await;
+    members.assert_ok();
+    let member_ids: Vec<&str> = members.json["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["state_key"].as_str().unwrap())
+        .collect();
+    assert!(member_ids.contains(&"@alice:example.org"));
+    assert!(
+        !member_ids.contains(&"@carol:example.org"),
+        "a departed member must not see a member who joined after they left: {member_ids:?}"
+    );
+
+    // Meanwhile alice, still joined, sees the live state.
+    let alice_name = scenario
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/rooms/{room_id}/state/m.room.name/"),
+            None,
+        )
+        .await;
+    alice_name.assert_ok();
+    assert_eq!(alice_name.json["name"], "After");
 }

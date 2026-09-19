@@ -1,10 +1,10 @@
 //! [`RoomActor`]: the synchronous, single-room state machine. [`RoomActorHandle`]: the async,
 //! serialized mailbox wrapping it. See `crate::protocol` for the design rationale.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use hs_kv::{KvBackend, TransactConfig, transact};
+use hs_kv::{KvBackend, RangeSpec, TransactConfig, transact};
 use hs_model::Event;
 use hs_model::canonical::CanonicalJsonValue;
 use hs_model::ids::{EventSn, RoomSn};
@@ -19,6 +19,7 @@ use ruma::{
 };
 
 use crate::error::RoomError;
+use crate::history_visibility;
 use crate::identity::HomeserverIdentity;
 use crate::membership::{self, Action, PriorState};
 use crate::persist::{PersistedEvent, RoomMeta, Tables};
@@ -133,6 +134,34 @@ fn extract_redacts(event: &Event) -> Option<OwnedEventId> {
         .map(|id| id.to_owned())
 }
 
+/// Reads `event.content[key]` as a string, if present and a string. A small shared helper for the
+/// `content.get(...).and_then(as_object).and_then(...).and_then(as_str)` chain repeated across
+/// this module's membership- and history-visibility-reading code.
+fn content_str<'a>(event: &'a Event, key: &str) -> Option<&'a str> {
+    event
+        .json()
+        .get("content")
+        .and_then(CanonicalJsonValue::as_object)
+        .and_then(|c| c.get(key))
+        .and_then(CanonicalJsonValue::as_str)
+}
+
+/// Parses an `m.room.member` event's `content.membership` string into a [`PriorState`]
+/// (`PriorState::None` for an absent event or an unrecognized value -- matching
+/// [`RoomActor::prior_membership`]'s own mapping, which this duplicates in miniature because that
+/// method reads through `state_event`/a fallible current-state lookup, not an already-resolved
+/// content string).
+fn parse_membership(raw: Option<&str>) -> PriorState {
+    match raw {
+        Some("join") => PriorState::Join,
+        Some("invite") => PriorState::Invite,
+        Some("leave") => PriorState::Leave,
+        Some("ban") => PriorState::Ban,
+        Some("knock") => PriorState::Knock,
+        _ => PriorState::None,
+    }
+}
+
 /// The synchronous room actor. Not `Send`-safe to hold across an `.await` (it borrows nothing
 /// async), which is exactly why [`RoomActorHandle`] runs its methods inside
 /// `tokio::task::spawn_blocking`. See `crate::protocol`'s module docs for the full design.
@@ -176,6 +205,12 @@ pub struct RoomActor<B: KvBackend> {
     /// file for why that scope is enough to fix the bug this closes (a flaky-connection retry,
     /// not a reconnect minutes later) without a durable table.
     txn_dedup: HashMap<(OwnedUserId, String, String), OwnedEventId>,
+    /// Users who have called `POST /rooms/{roomId}/forget` and not since rejoined. In-memory
+    /// only, same scope caveat as `txn_dedup`: does not survive an idle eviction and reload
+    /// (`RoomActor::load` does not repopulate it). Read by [`RoomActor::can_read_room`];
+    /// [`RoomActor::membership_action`] clears an entry the moment its user rejoins (the spec's
+    /// "Can re-join room if re-invited" case: forgetting must not be permanent).
+    forgotten: HashSet<OwnedUserId>,
     publish: tokio::sync::broadcast::Sender<RoomUpdate>,
 }
 
@@ -273,6 +308,7 @@ impl<B: KvBackend> RoomActor<B> {
             next_room_pos: 1,
             relations_by_target: HashMap::new(),
             txn_dedup: HashMap::new(),
+            forgotten: HashSet::new(),
             publish,
         };
         actor.persist(create_event)?;
@@ -329,6 +365,7 @@ impl<B: KvBackend> RoomActor<B> {
             next_room_pos: 1,
             relations_by_target: HashMap::new(),
             txn_dedup: HashMap::new(),
+            forgotten: HashSet::new(),
             publish,
         };
 
@@ -490,6 +527,26 @@ impl<B: KvBackend> RoomActor<B> {
         self.state_view(&self.forward_extremities_vec())
     }
 
+    /// A [`RoomStateView`] over the state as of immediately *after* one specific event (not
+    /// necessarily the timeline head), via [`hs_state::api::StateStore::state_at`]. Used by
+    /// [`RoomActor::event_visible_to`] -- the same primitive `RoomActor::state_at_event` already
+    /// uses, but returning the lazy view instead of eagerly diffing it into a `Vec<Event>`, since a
+    /// visibility check only ever looks up one or two `(event_type, state_key)` pairs.
+    fn state_view_at_sn(
+        &self,
+        sn: EventSn,
+    ) -> Result<RoomStateView<'_, ProductionStateStore<B>>, RoomError> {
+        let root = self
+            .store
+            .state_at(sn)
+            .map_err(|e| RoomError::State(e.to_string()))?;
+        Ok(RoomStateView {
+            store: &self.store,
+            root,
+            bodies: EventMap(&self.events),
+        })
+    }
+
     fn refs_for(&self, sns: &[EventSn]) -> Result<Vec<pipeline::EventRef>, RoomError> {
         sns.iter()
             .map(|sn| {
@@ -599,14 +656,41 @@ impl<B: KvBackend> RoomActor<B> {
         membership::precheck(&self.rules, action, prior)
             .map_err(|e| RoomError::Forbidden(e.to_string()))?;
         let content = membership::content_for(action, extra);
-        self.send_event(
+        let event = self.send_event(
             sender,
             "m.room.member".to_owned(),
             Some(target.to_string()),
             content,
             None,
             now_ms,
-        )
+        )?;
+        // A rejoin un-forgets the room: `POST /forget` is not meant to be a permanent exile, only
+        // "stop counting this room until I come back to it" (see the spec's "Can re-join room if
+        // re-invited" case in `apidoc_room_forget_test.go`). `action == Join` here always means
+        // the *target* (== the sender, since a client can only join on its own behalf) is joining.
+        if action == Action::Join {
+            self.forgotten.remove(&target);
+        }
+        Ok(event)
+    }
+
+    /// `POST /rooms/{roomId}/forget`: marks `user` as having forgotten this room -- see
+    /// [`RoomActor::can_read_room`] for what that then blocks. Ported from the spec's documented
+    /// rule (`refs/matrix-spec/data/api/client-server/leaving.yaml`, Apache-2.0): a currently
+    /// joined user must leave first.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::StillJoined`] if `user`'s current membership is `join`.
+    pub fn forget(&mut self, user: &UserId) -> Result<(), RoomError> {
+        let prior = self.prior_membership(user)?;
+        if prior == PriorState::Join {
+            return Err(RoomError::StillJoined(format!(
+                "User {user} is in room {}",
+                self.room_id
+            )));
+        }
+        self.forgotten.insert(user.to_owned());
+        Ok(())
     }
 
     fn prior_membership(&self, target: &UserId) -> Result<PriorState, RoomError> {
@@ -1111,11 +1195,24 @@ impl<B: KvBackend> RoomActor<B> {
             )?;
         }
         if let Some(topic) = &request.topic {
+            // The top-level `topic` request field (unlike an `m.room.topic` sent through
+            // `initial_state`, which is passed through byte-for-byte) additionally populates the
+            // extensible-text representation, `m.topic.m.text` (MSC3765, stabilized into the
+            // spec's `m.room.topic` schema): "an `m.room.topic` event with a `text/plain`
+            // mimetype will be sent" (`refs/matrix-spec/data/api/client-server/create_room.yaml`,
+            // Apache-2.0). `mimetype` is left unset rather than written as `"text/plain"`
+            // explicitly -- the schema defaults an absent mimetype to `text/plain`, and
+            // Complement's own test for this accepts either.
             actor.send_event(
                 creator.clone(),
                 "m.room.topic".to_owned(),
                 Some(String::new()),
-                serde_json::json!({"topic": topic}),
+                serde_json::json!({
+                    "topic": topic,
+                    "m.topic": {
+                        "m.text": [{"body": topic}],
+                    },
+                }),
                 None,
                 now_ms,
             )?;
@@ -1292,7 +1389,15 @@ impl<B: KvBackend> RoomActor<B> {
     /// # Errors
     /// Returns [`RoomError::State`] if the state store fails.
     pub fn full_state(&self) -> Result<Vec<&Event>, RoomError> {
-        let root = self.current_view()?.root;
+        self.state_at_root(self.current_view()?.root)
+    }
+
+    /// Shared by [`RoomActor::full_state`] and [`RoomActor::full_state_for_reader`]: every event
+    /// the resolution rooted at `root` sets, dereferenced through this actor's in-memory cache.
+    fn state_at_root(
+        &self,
+        root: <ProductionStateStore<B> as StateStore>::Root,
+    ) -> Result<Vec<&Event>, RoomError> {
         let diff = self
             .store
             .diff(self.store.empty_root(), root)
@@ -1302,6 +1407,111 @@ impl<B: KvBackend> RoomActor<B> {
             .values()
             .filter_map(|sn| self.events.get(sn))
             .collect())
+    }
+
+    /// The state view `requester` should read this room's state through for `GET .../state`,
+    /// `.../state/{eventType}(/{stateKey})` and `.../members`: their own current, live view if
+    /// they are currently joined, or if the room is `world_readable`; otherwise a view pinned to
+    /// the state as of immediately after their own most recent membership-changing event (their
+    /// leave, kick or ban) -- implementing the history-visibility module's "after a user has left
+    /// a room, they may see any events which they were allowed to see before they left the room,
+    /// but no events received after they left" for these bulk-state reads, the same way
+    /// [`RoomActor::event_visible_to`] implements it per-event for `.../event`/`.../messages`.
+    ///
+    /// `Ok(None)` means "deny outright": `requester` has no `m.room.member` event in this room's
+    /// current state at all (never joined, invited, knocked, or been banned/kicked) and the room
+    /// is not `world_readable` -- the same "never a member" case
+    /// [`RoomActor::can_read_room`] denies for `.../messages`.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::State`] if the state store fails, or [`RoomError::Internal`] if
+    /// `requester`'s own membership event is in the current state but missing from this actor's
+    /// event-ID index (should not happen: every current-state event was indexed when persisted).
+    fn reader_view(
+        &self,
+        requester: &UserId,
+    ) -> Result<Option<RoomStateView<'_, ProductionStateStore<B>>>, RoomError> {
+        let current = self.current_view()?;
+        let membership_event = current
+            .event_for("m.room.member", requester.as_str())
+            .map_err(|e| RoomError::State(e.to_string()))?;
+        let membership =
+            parse_membership(membership_event.and_then(|e| content_str(e, "membership")));
+        if membership == PriorState::Join {
+            return Ok(Some(current));
+        }
+        let world_readable = history_visibility::HistoryVisibility::parse(
+            current
+                .event_for("m.room.history_visibility", "")
+                .map_err(|e| RoomError::State(e.to_string()))?
+                .and_then(|e| content_str(e, "history_visibility")),
+        ) == history_visibility::HistoryVisibility::WorldReadable;
+        if world_readable {
+            return Ok(Some(current));
+        }
+        let Some(membership_event) = membership_event else {
+            return Ok(None);
+        };
+        let sn = *self
+            .event_id_index
+            .get(membership_event.event_id())
+            .ok_or_else(|| {
+                RoomError::Internal("current-state event missing from event-ID index".into())
+            })?;
+        Ok(Some(self.state_view_at_sn(sn)?))
+    }
+
+    /// [`RoomActor::full_state`], but through [`RoomActor::reader_view`]: a departed member sees
+    /// the room's state as of when they left, not its current state. `Ok(None)` denies outright
+    /// (see `reader_view`'s doc comment for exactly when).
+    ///
+    /// # Errors
+    /// Returns [`RoomError::State`] if the state store fails.
+    pub fn full_state_for_reader(
+        &self,
+        requester: &UserId,
+    ) -> Result<Option<Vec<&Event>>, RoomError> {
+        let Some(view) = self.reader_view(requester)? else {
+            return Ok(None);
+        };
+        self.state_at_root(view.root).map(Some)
+    }
+
+    /// [`RoomActor::state_event`], but through [`RoomActor::reader_view`]. `Ok(None)` covers both
+    /// "no such state event" and "requester may not read this room's state at all" -- callers that
+    /// must tell the two apart (to answer `403` instead of `404`, say) should call
+    /// [`RoomActor::can_read_room`] first.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::State`] if the state store fails.
+    pub fn state_event_for_reader(
+        &self,
+        requester: &UserId,
+        event_type: &str,
+        state_key: &str,
+    ) -> Result<Option<&Event>, RoomError> {
+        let Some(view) = self.reader_view(requester)? else {
+            return Ok(None);
+        };
+        view.event_for(event_type, state_key)
+            .map_err(|e| RoomError::State(e.to_string()))
+    }
+
+    /// [`RoomActor::members`], but through [`RoomActor::reader_view`]. `Ok(None)` denies outright
+    /// (see `reader_view`'s doc comment).
+    ///
+    /// # Errors
+    /// Returns [`RoomError::State`] if the state store fails.
+    pub fn members_for_reader(&self, requester: &UserId) -> Result<Option<Vec<&Event>>, RoomError> {
+        let Some(state) = self.full_state_for_reader(requester)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            state
+                .into_iter()
+                .filter(|e| e.header().event_type == "m.room.member")
+                .collect(),
+        ))
     }
 
     /// The room's state as of immediately after `event_id` (`hs_state::api::StateStore::state_at`
@@ -1395,6 +1605,142 @@ impl<B: KvBackend> RoomActor<B> {
                     == Some("join")
             })
             .collect())
+    }
+
+    /// Whether `requester` may call the bulk read endpoints this crate serves on top of the whole
+    /// timeline (`GET .../messages` today) at all, before any single event is filtered by
+    /// [`RoomActor::event_visible_to`]. Two denials this distinguishes from "yes, then filter":
+    ///
+    /// - A user who has **forgotten** this room (`RoomActor::forget`) is refused outright, even
+    ///   though `m.room.history_visibility: shared`'s per-event rule would otherwise let a former
+    ///   member see events from while they were joined -- this is `apidoc_room_forget_test.go`'s
+    ///   "Forgotten room messages cannot be paginated", a deliberate, spec-documented exception
+    ///   ("stop remembering about a particular room") to the general history-visibility algorithm.
+    /// - A user with **no `m.room.member` event at all** in this room's current state (never
+    ///   joined, invited, knocked, or been banned/kicked) is refused, unless the room is currently
+    ///   `world_readable` -- matching `room_messages_test.go`'s "you aren't a member of the room".
+    ///
+    /// A past member who has *not* forgotten the room (left or was banned, but never called
+    /// `/forget`) passes this gate and falls through to ordinary per-event filtering
+    /// (`apidoc_room_forget_test.go`'s "Can get rooms/{roomId}/messages for a departed room").
+    ///
+    /// # Errors
+    /// Returns [`RoomError::State`] if the state store fails.
+    pub fn can_read_room(&self, requester: &UserId) -> Result<bool, RoomError> {
+        let view = self.current_view()?;
+        let hv = history_visibility::HistoryVisibility::parse(
+            view.event_for("m.room.history_visibility", "")
+                .map_err(|e| RoomError::State(e.to_string()))?
+                .and_then(|e| content_str(e, "history_visibility")),
+        );
+        if hv == history_visibility::HistoryVisibility::WorldReadable {
+            return Ok(true);
+        }
+        if self.forgotten.contains(requester) {
+            return Ok(false);
+        }
+        let has_membership_record = view
+            .event_for("m.room.member", requester.as_str())
+            .map_err(|e| RoomError::State(e.to_string()))?
+            .is_some();
+        Ok(has_membership_record)
+    }
+
+    /// The room-local send position (`room_pos`) of a known [`EventSn`], by linear scan of
+    /// `self.timeline`. Phase 0 scope, same tradeoff as `RoomActor::get_context`'s full scan for
+    /// an event's position: this crate holds a room's whole timeline resident in memory already
+    /// (see `events`'s doc comment), so a scan costs a `Vec`-sized comparison loop, not a store
+    /// round trip -- a `HashMap<EventSn, i64>` reverse index is the obvious speed-up if profiling
+    /// ever shows this mattering.
+    fn room_pos_of(&self, sn: EventSn) -> Option<i64> {
+        self.timeline
+            .iter()
+            .find_map(|(pos, s)| (*s == sn).then_some(*pos))
+    }
+
+    /// Whether `requester` may see `event`, per the `m.room.history_visibility` read-side
+    /// algorithm (`crate::history_visibility`; ported from
+    /// `refs/matrix-spec/content/client-server-api/modules/history_visibility.md`'s "Server
+    /// behaviour" section, CC-BY-4.0). Evaluated against the room's state **as of `event`**, with
+    /// the two "before or after" special cases that section documents for
+    /// `m.room.history_visibility` events and for the requester's own `m.room.member` events --
+    /// not just the room's *current* setting, which is what let a user who had left a
+    /// non-world-readable room read full event content before this method existed (this crate's
+    /// security-fix session; see `docs/status/04-room-and-events.md`).
+    ///
+    /// # Errors
+    /// Returns [`RoomError::State`] if the state store fails, or [`RoomError::EventNotFound`] if
+    /// this actor does not hold `event` (should not happen for an event this same actor just
+    /// handed back from its own cache).
+    pub fn event_visible_to(&self, event: &Event, requester: &UserId) -> Result<bool, RoomError> {
+        let sn = *self
+            .event_id_index
+            .get(event.event_id())
+            .ok_or_else(|| RoomError::EventNotFound(event.event_id().to_string()))?;
+        let pos = self
+            .room_pos_of(sn)
+            .ok_or_else(|| RoomError::EventNotFound(event.event_id().to_string()))?;
+
+        // Rule 3's "the user joined the room at any point after the event was sent": true if any
+        // later timeline entry is an `m.room.member` event for `requester` with `membership:
+        // join`, regardless of whether they are still joined now.
+        let joined_later = self
+            .timeline
+            .range((std::ops::Bound::Excluded(pos), std::ops::Bound::Unbounded))
+            .filter_map(|(_, s)| self.events.get(s))
+            .any(|e| {
+                e.header().event_type == "m.room.member"
+                    && e.header().state_key.as_deref() == Some(requester.as_str())
+                    && content_str(e, "membership") == Some("join")
+            });
+
+        let prev_sns: Vec<EventSn> = pipeline::decode_event_ids(event.json().get("prev_events"))
+            .iter()
+            .filter_map(|id| self.event_id_index.get(id).copied())
+            .collect();
+        let before = self.state_view(&prev_sns)?;
+        let after = self.state_view_at_sn(sn)?;
+
+        let hv_before = history_visibility::HistoryVisibility::parse(
+            before
+                .event_for("m.room.history_visibility", "")
+                .map_err(|e| RoomError::State(e.to_string()))?
+                .and_then(|e| content_str(e, "history_visibility")),
+        );
+        let hv_after = history_visibility::HistoryVisibility::parse(
+            after
+                .event_for("m.room.history_visibility", "")
+                .map_err(|e| RoomError::State(e.to_string()))?
+                .and_then(|e| content_str(e, "history_visibility")),
+        );
+        let membership_before = parse_membership(
+            before
+                .event_for("m.room.member", requester.as_str())
+                .map_err(|e| RoomError::State(e.to_string()))?
+                .and_then(|e| content_str(e, "membership")),
+        );
+        let membership_after = parse_membership(
+            after
+                .event_for("m.room.member", requester.as_str())
+                .map_err(|e| RoomError::State(e.to_string()))?
+                .and_then(|e| content_str(e, "membership")),
+        );
+
+        let event_type = event.header().event_type.as_str();
+        let is_own_member_event = event_type == "m.room.member"
+            && event.header().state_key.as_deref() == Some(requester.as_str());
+        let is_hv_event = event_type == "m.room.history_visibility";
+
+        let allowed = if is_hv_event {
+            history_visibility::base_rule_allows(hv_before, membership_after, joined_later)
+                || history_visibility::base_rule_allows(hv_after, membership_after, joined_later)
+        } else if is_own_member_event {
+            history_visibility::base_rule_allows(hv_after, membership_before, joined_later)
+                || history_visibility::base_rule_allows(hv_after, membership_after, joined_later)
+        } else {
+            history_visibility::base_rule_allows(hv_after, membership_after, joined_later)
+        };
+        Ok(allowed)
     }
 
     /// Pages the timeline from `from` (or the live end, if `None`) in `direction`, returning up to
@@ -1692,6 +2038,87 @@ pub fn resolve_alias<B: KvBackend>(
     ))
 }
 
+/// Publishes or unpublishes a room in the server's room directory
+/// (`PUT /_matrix/client/v3/directory/list/room/{roomId}`). Directory membership is tracked
+/// separately from any room-actor state (a room's `RoomSn` presence in
+/// `Tables::public_rooms`, not an event in the room's own timeline -- publication is a
+/// server-local administrative fact, not something other servers or room members need to see),
+/// which is why this is a free function over `(backend, tables)` rather than a `RoomActor` method:
+/// `GET /publicRooms` must enumerate published rooms without loading each one's actor first.
+///
+/// # Errors
+/// Returns [`RoomError::RoomNotFound`] if `room_id` has never been created, or
+/// [`RoomError::Store`] on a storage failure.
+pub fn set_directory_visibility<B: KvBackend>(
+    backend: &B,
+    tables: &Tables<B>,
+    room_id: &RoomId,
+    published: bool,
+) -> Result<(), RoomError> {
+    let snapshot = backend.snapshot();
+    let Some(room_sn) = tables.room_sn.lookup(&snapshot, room_id.as_bytes())? else {
+        return Err(RoomError::RoomNotFound(room_id.to_string()));
+    };
+    transact(backend, TransactConfig::default(), |txn| {
+        if published {
+            tables
+                .public_rooms
+                .put(txn, &(room_sn,), b"")
+                .map_err(to_kv)
+        } else {
+            tables.public_rooms.delete(txn, &(room_sn,)).map_err(to_kv)
+        }
+    })
+    .map_err(RoomError::from)
+}
+
+/// Whether `room_id` is currently published, per [`set_directory_visibility`]. Returns `Ok(false)`
+/// (not [`RoomError::RoomNotFound`]) for a room that has never been created: a caller that only
+/// needs a yes/no answer (`GET .../directory/list/room/{roomId}`) should not have to distinguish
+/// "private" from "does not exist" -- the spec documents `private` as the default either way.
+///
+/// # Errors
+/// Returns [`RoomError::Store`] on a storage failure.
+pub fn is_directory_public<B: KvBackend>(
+    backend: &B,
+    tables: &Tables<B>,
+    room_id: &RoomId,
+) -> Result<bool, RoomError> {
+    let snapshot = backend.snapshot();
+    let Some(room_sn) = tables.room_sn.lookup(&snapshot, room_id.as_bytes())? else {
+        return Ok(false);
+    };
+    Ok(tables.public_rooms.get(&snapshot, &(room_sn,))?.is_some())
+}
+
+/// Every currently published room ID (`GET /publicRooms`'s source of truth for which rooms to
+/// enumerate before rendering each one's directory chunk from its own current state). A full scan
+/// of the directory keyspace; ordering is whatever the keyspace's own byte order over interned
+/// `RoomSn`s happens to produce, not publish time.
+///
+/// # Errors
+/// Returns [`RoomError::Store`]/[`RoomError::Table`] on a storage failure, or
+/// [`RoomError::Internal`] if a room's ID cannot be resolved back from its interned `RoomSn`
+/// (should not happen: every entry in this keyspace was written by [`set_directory_visibility`]
+/// right after looking that same `RoomSn` up).
+pub fn list_published_room_ids<B: KvBackend>(
+    backend: &B,
+    tables: &Tables<B>,
+) -> Result<Vec<OwnedRoomId>, RoomError> {
+    let snapshot = backend.snapshot();
+    let mut out = Vec::new();
+    for item in tables.public_rooms.range(&snapshot, RangeSpec::full()) {
+        let ((room_sn,), _) = item?;
+        let Some(room_id_bytes) = tables.room_sn.resolve(&snapshot, room_sn)? else {
+            continue;
+        };
+        let room_id =
+            String::from_utf8(room_id_bytes).map_err(|e| RoomError::Internal(e.to_string()))?;
+        out.push(OwnedRoomId::try_from(room_id).map_err(|e| RoomError::Internal(e.to_string()))?);
+    }
+    Ok(out)
+}
+
 #[derive(Debug)]
 struct AliasInUse;
 impl std::fmt::Display for AliasInUse {
@@ -1801,6 +2228,14 @@ impl<B: KvBackend> RoomActorHandle<B> {
     {
         self.with_actor(move |actor| actor.membership_action(sender, action, target, extra, now_ms))
             .await
+    }
+
+    /// `POST /rooms/{roomId}/forget` (`RoomActor::forget`).
+    pub async fn forget(&self, user: OwnedUserId) -> Result<(), RoomError>
+    where
+        B: 'static,
+    {
+        self.with_actor(move |actor| actor.forget(&user)).await
     }
 
     /// `crate::protocol`'s `redact` command: sends the `m.room.redaction` event, then applies its

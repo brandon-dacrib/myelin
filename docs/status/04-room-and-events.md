@@ -2,8 +2,336 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
-Last updated: 2026-09-18 (session 3, `RoomActor::accept_remote_event` -- the `Command::PersistInbound`
-gap).
+Last updated: 2026-09-19 (session 4, Complement triage: history-visibility enforcement on reads,
+the room directory, `POST /createRoom` validation, `POST /forget`, extensible `m.topic`).
+
+## Session 4 (2026-09-19): fixing this track's largest Complement failure cluster
+
+**Starting point.** `docs/status/14-test-and-conformance.md`'s first-ever Complement run (csapi
+package) scored 125/293 leaf assertions passing, and named this track as owner of the largest
+failure cluster: history-visibility not enforced on reads (a real security bug), the room
+directory 404ing, `POST /createRoom` accepting invalid parameters, and `POST /forget` not
+validating membership. This session closed all four, plus the optional fifth item (extensible
+`m.topic`, MSC3765), and found one more read path with the same history-visibility bug the brief
+didn't explicitly name (`GET /state`, `GET /state/{eventType}(/{stateKey})`, `GET /members`).
+Scope: **`crates/hs-room/**` and this status file only** -- every other crate was off limits
+(other tracks in flight); one genuine cross-track collision was hit and resolved without editing
+anything outside this crate (see "The `/publicRooms` collision with track 05" below).
+
+### 1. History visibility enforced on every read path (the security fix)
+
+**The bug.** `GET /rooms/{roomId}/messages`, `GET /rooms/{roomId}/event/{eventId}`,
+`GET /rooms/{roomId}/context/{eventId}`, `GET /rooms/{roomId}/state(/...)"` and
+`GET /rooms/{roomId}/members` all read the room's **current** resolved state unconditionally,
+regardless of the requester's own membership history. A user who had left a non-world-readable
+room kept full read access to everything, including events and state changes that happened
+*after* they left -- the read-side half of `m.room.history_visibility` (the module at
+`refs/matrix-spec/content/client-server-api/modules/history_visibility.md`, CC-BY-4.0) was simply
+never implemented; only the write side (auth-checking new events, in `hs-state`, track 02's crate)
+existed.
+
+**The fix, per event (`GET .../event`, `.../context`, `.../messages`).**
+`crates/hs-room/src/history_visibility.rs` is a new, pure module porting the spec's "Server
+behaviour" section verbatim: `HistoryVisibility::{WorldReadable, Shared, Invited, Joined}` and
+`base_rule_allows(visibility, membership, joined_later) -> bool`, implementing rules 1-5 exactly
+(world_readable always allows; a `join` membership always allows regardless of visibility; shared
+allows if the user joined at any point *after* the event was sent, even if they've since left
+again; invited allows an `invite` membership; otherwise deny).
+`crates/hs-room/src/actor.rs::RoomActor::event_visible_to(event, requester)` supplies the two state
+snapshots this needs -- "state resolved from `event`'s own `prev_events`" and "state at `event`"
+(`hs_state::api::StateStore::state_at`, already available; state history was never the underlying
+gap, just never surfaced through a read path) -- plus a forward timeline scan for rule 3's "joined
+later", and applies the spec's two special cases: for an `m.room.history_visibility` event itself,
+allow if the visibility *before or after* the change would allow it; for the requester's *own*
+`m.room.member` event, allow if their membership *before or after* the transition would allow it
+(so a user can always see their own leave event, the *m.room.name*-for-a-departed-room test below
+depends on this).
+
+`get_event`/`get_context` deny by returning `RoomError::EventNotFound` (404), not `Forbidden`
+(403): the spec's algorithm makes no distinction between "this event does not exist" and "you may
+not see it", so neither does this response (matches
+`apidoc_room_history_visibility_test.go`'s expected 404s exactly, and avoids leaking whether an
+event exists to someone not allowed to see it). `get_context` filters `events_before`/
+`events_after` individually (an invisible one is simply omitted, not an error) but 404s outright if
+the *target* itself is invisible.
+
+**The fix, for `.../messages` specifically -- a second, coarser gate on top.**
+`RoomActor::can_read_room(requester)` answers "may this requester call `.../messages` on this room
+at all", *before* any per-event filtering: `world_readable` always allows; otherwise, a requester
+with **no** `m.room.member` event in the room's current state at all (never joined, invited,
+knocked, banned -- truly never touched the room) is refused outright with `403 M_FORBIDDEN`
+(`room_messages_test.go`'s "you aren't a member of the room"; also applied to a room that does not
+exist at all, so `TestFetchMessagesFromNonExistentRoom` gets the same 403 instead of leaking a 404
+that would prove the room's absence). A **forgotten** room (see item 4) is refused the same way,
+even though `shared` visibility's per-event rule would otherwise let a past member read what they
+saw while joined -- see item 4 for why. Once past this gate, `get_messages` filters the fetched
+page one event at a time through `event_visible_to`, same as `.../event`.
+
+**The fix nobody asked for but the same bug required: `GET /state`, `GET
+/state/{eventType}(/{stateKey})`, `GET /members`.** Complement's `room_leave_test.go`
+(`TestLeftRoomFixture`) demonstrated the identical bug on these three endpoints: a departed member
+asking for the room's state or member list got the room's *live* state (including changes made,
+and members who joined, after they left), not the state as of when they left. Fixed with
+`RoomActor::reader_view(requester)`: if the requester is currently joined, or the room is
+`world_readable`, returns the live `RoomStateView`; otherwise (requester has left/been banned)
+returns a view pinned to the state as of *immediately after their own last membership-changing
+event* (`state_view_at_sn` on that event's `EventSn` -- the same `state_at` primitive
+`event_visible_to` uses), which is exactly "what they were allowed to see before they left, and
+nothing after" without needing per-event filtering for this bulk case. `Ok(None)` denies outright
+(no membership record at all, non-world-readable room). `RoomActor::full_state_for_reader`,
+`state_event_for_reader` and `members_for_reader` wrap this for `crate::routes::query`'s
+`get_state`, `get_state_with_key` and `get_members` respectively. **Not touched**:
+`GET /joined_members` (spec only ever means "currently joined", no historical version makes
+sense), and `GET /context`'s own `state` field (still reads live current state, a separate,
+narrower version of the same bug this session ran out of time for -- noted below).
+
+**Proof.** New scenario tests in `crates/hs-room/tests/scenario.rs`:
+`history_visibility_joined_hides_events_sent_after_a_member_leaves` (a `joined`-visibility room:
+bob sees a message sent while he was in, not one sent after he left, on both `/messages` and
+direct `/event`), `a_stranger_to_a_shared_visibility_room_is_denied_reads` (never-a-member gets 404
+on `/event`, 403 on `/messages`), `departed_member_sees_state_and_members_as_of_when_they_left`
+(bob's `/state`, `/state/m.room.name`, `/members` all show the pre-departure snapshot; alice, still
+joined, sees the live one). Plus `history_visibility.rs`'s own unit tests for the pure rule table.
+Against real Complement (`apidoc_room_history_visibility_test.go`, `room_leave_test.go`): all seven
+`TestFetch*` history-visibility tests pass, and `TestLeftRoomFixture`'s state/members-for-a-departed-room
+subtests pass (its two `.../messages` subtests still fail, but for an unrelated, pre-existing
+reason -- see "What is left" below).
+
+### 2. The room directory: a real publish flag, and a collision with track 05
+
+**What's real.** `PUT`/`GET /_matrix/client/v3/directory/list/room/{roomId}`
+(`crates/hs-room/src/routes/directory.rs`) are new, backed by a real, durable publish flag:
+`crate::persist::Tables::public_rooms` (a new `(RoomSn,) -> b""` keyspace; presence means
+published), `RoomActor`-free functions `set_directory_visibility`/`is_directory_public`/
+`list_published_room_ids` (`crate::actor`, following the same free-function-over-`(backend,
+tables)` pattern as `resolve_alias`/`find_event_globally`, since directory membership is a
+server-local administrative fact, not room state visible to other members or servers), and thin
+`RoomRegistry` wrappers. `POST /createRoom` gained a `visibility` field (`"public"`/`"private"`,
+default `"private"`, validated against exactly those two strings): `visibility: "public"`
+publishes the room immediately after creation, independent of `preset` (these are genuinely
+orthogonal per the spec -- a `private_chat`-preset room can still be published, keeping its
+`join_rule: "invite"`).
+
+**`GET`/`POST /publicRooms` (`crate::routes::directory::{get,post}_public_rooms`) render the
+listing from this flag**: for each published room ID, load its actor and build a
+`PublicRoomsChunk` (`room_id`, `num_joined_members`, `world_readable`, `guest_can_join`,
+`join_rule`, and `name`/`topic`/`canonical_alias`/`avatar_url` *omitted* when unset rather than
+sent as empty strings -- `public_rooms_test.go`'s "Name/topic keys are correct" checks exactly
+this). `POST`'s `filter.generic_search_term` does a case-insensitive substring match against
+`name`/`topic`/`canonical_alias`.
+
+**The `/publicRooms` collision with track 05, and how it resolved.** Partway through this session,
+building the real `hs` binary to run the loadgen regression net panicked at startup:
+`hs-http`'s `Builder` (shared across every track's router fragment, merged in
+`crates/hs-cli/src/serve.rs`) rejects two handlers registered for the same method+path, and
+`hs-user` (track 05) had *also* independently implemented `GET`/`POST /publicRooms`
+(`crates/hs-user/src/routes/rooms.rs`, backed by its own `UserStore::list_public_rooms`, populated
+from `m.room.join_rules == "public"` via `hub.rs`'s `public_directory_entry` -- a materially
+different and less spec-correct heuristic: it conflates "publicly joinable" with "listed in the
+directory", so a `private_chat`-preset room published via `visibility: "public"` would never show
+up for it). Track 05 hit this same collision independently (their own `crates/hs-user/src/routes/mod.rs`
+carries a doc comment recording it) and resolved it *from their side* by leaving their
+implementation unmounted, deferring to this crate's. This session's router
+(`crates/hs-room/src/routes/mod.rs`) is therefore the one that mounts `GET`/`POST /publicRooms` in
+the real server. **No file outside `crates/hs-room/**` was edited to resolve this** -- it resolved
+itself once both tracks' sessions landed in the same working tree, which is worth recording as a
+case study in why the workspace's "leave a clear seam, document don't coordinate live" convention
+works. `hs-user`'s implementation is left in place (unmounted) by that crate's own choice, in case
+it has something worth merging in later.
+
+**Proof.** `crates/hs-room/tests/scenario.rs::room_directory_publish_and_unpublish_round_trip`:
+publish via `PUT`, confirm via `GET .../directory/list/room` and the registry directly, confirm it
+appears in `GET /publicRooms` with the right fields, confirm the `POST` search filter finds it,
+unpublish, confirm it disappears, confirm `POST /createRoom`'s own `visibility: "public"` publishes
+without a separate call, confirm a malformed `visibility` value is `M_BAD_JSON` and publishing a
+nonexistent room 404s. Against real Complement (`public_rooms_test.go::TestPublicRooms`): both
+subtests ("Can search public room list", "Name/topic keys are correct", including all seven
+alias/name/topic/unicode variants) pass.
+
+### 3. `POST /createRoom` validates its request shape
+
+`crates/hs-room/src/routes/create_room.rs`: `room_version` must be a JSON *string* if present at
+all -- a syntactically-valid-but-wrong-typed value (a bare number, the sytest/Complement case) is
+now `400 M_BAD_JSON` instead of being silently ignored via `.and_then(Value::as_str)` returning
+`None` and falling back to the default version (the room got created anyway, `200 OK`, where the
+spec test wants `400`). A well-typed-but-unrecognized version string (`"ahfgwjyerhgiuveisbruvybseyrugvi"`)
+still correctly reaches `400 M_UNSUPPORTED_ROOM_VERSION` via `RoomActor::create`'s existing
+`room_version::rules_for` gate -- worth recording *why* this function itself cannot make that
+distinction: `ruma::RoomVersionId::try_from(&str)` never fails for a syntactically valid opaque
+token (any 1-32-codepoint string becomes a real, if unknown, `RoomVersionId::_Custom` value per
+that type's own doc comment), so "unsupported" is only detectable once `rules_for` is consulted.
+Also added: `preset` must be one of the three spec-defined values (`private_chat`/`public_chat`/
+`trusted_private_chat`) or `M_BAD_JSON`, rather than silently falling back to `private_chat`'s
+defaults for a typo; `visibility` must be `"public"`/`"private"`; `creation_content`, if present,
+must be a JSON object, rather than being silently coerced to `{}` by `RoomActor::create_room`'s own
+`if !creation_content.is_object() { creation_content = json!({}) }` guard (that guard is now
+dead-unreachable from this route, since the route itself rejects a non-object first, but it stays
+as `RoomActor::create_room`'s own defensive invariant for any other future caller).
+
+**Proof.** `crates/hs-room/tests/scenario.rs::create_room_validates_request_shape`. Against real
+Complement (`apidoc_room_create_test.go::TestRoomCreate`): 13 of 14 subtests pass (numeric and
+unknown room versions both now correctly `400`, plus everything that was already passing); the one
+remaining failure (`Rooms can be created with an initial invite list (SYN-205)`) is a `/sync`
+invite-delivery flake in `hs-user` (track 05) unrelated to `createRoom` itself -- the room is
+created and the invite is sent successfully; the test's `MustSyncUntil` on the invitee times out
+waiting for `/sync` to report it. Not this track's code.
+
+### 4. `POST /rooms/{roomId}/forget` validates membership and actually forgets
+
+Previously a total no-op (accepted anything, remembered nothing). Now:
+`RoomActor::forget(user)` rejects with a new `RoomError::StillJoined` (`400 M_UNKNOWN`, matching
+the spec's one documented error shape for this endpoint exactly --
+`refs/matrix-spec/data/api/client-server/leaving.yaml`'s example error body, Apache-2.0) if the
+user's current membership is `join`; `crate::routes::membership::post_forget` reuses the same
+variant/message shape for a room that does not exist at all (the spec does not distinguish the two
+cases in its documented response). Otherwise it records the user in a new in-memory `forgotten:
+HashSet<OwnedUserId>` field on `RoomActor` (same in-memory-only, does-not-survive-eviction scope
+caveat as `txn_dedup`, recorded there and here) and returns success. `RoomActor::can_read_room`
+(item 1) refuses `.../messages` outright to a forgotten user even though `shared` visibility would
+otherwise permit it (`apidoc_room_forget_test.go`'s "Forgotten room messages cannot be paginated" --
+a deliberate, spec-documented exception: forgetting means "stop remembering about a particular
+room", not merely "you happen to have left"). **Rejoining clears the forgotten flag**
+(`RoomActor::membership_action` removes the target from `forgotten` on a successful `Join`), so
+"forget, then get re-invited and rejoin" (the spec test of the same name) is not a permanent exile.
+
+**Proof.** `crates/hs-room/tests/scenario.rs::forget_validates_membership_and_blocks_messages_until_rejoin`.
+Against real Complement (`apidoc_room_forget_test.go::TestRoomForget`): 6 of 7 subtests pass ("Can't
+forget room you're still in", "Forgotten room messages cannot be paginated", "Can forget room
+you've been kicked from", "Can re-join room if re-invited", "Can forget room we weren't an actual
+member", "Leave for forgotten room shows up in v2 incremental /sync"). The one remaining failure
+("Forgetting room does not show up in v2 initial /sync") needs `hs-user`'s `/sync` to know a room
+was forgotten at all -- this crate's `forgotten` set is private, in-process, per-`RoomActor` state
+with no query surface for another crate yet; see "Interfaces needed" for the seam track 05 would
+need.
+
+### 5. Extensible `m.topic` (MSC3765)
+
+`RoomActor::create_room`: when the top-level `topic` request field is given (not when a
+`m.room.topic` arrives only through `initial_state`, which is passed through byte-for-byte,
+matching `TestRoomCreate`'s "makes a room with a topic via initial_state" -- no `m.topic` key
+expected there), the resulting event's content now also carries
+`"m.topic": {"m.text": [{"body": <topic>}]}` alongside the plain `topic` field. `mimetype` is left
+unset (defaults to `text/plain` per the schema; the Complement test accepts either). Proof: real
+Complement, `TestRoomCreate/.../makes a room with a topic and writes rich topic representation` and
+its "...via initial_state overwritten by topic" sibling both pass.
+
+### Complement: before and after, this track's targeted subset
+
+Reproduced with (per `docs/status/14-test-and-conformance.md`'s documented harness):
+
+```bash
+./tests/complement/build.sh complement-hs-reimplement:dev
+cd refs/complement && COMPLEMENT_BASE_IMAGE=complement-hs-reimplement:dev \
+  go test -v -timeout 10m ./tests/csapi/... \
+  -run '^(TestFetchEvent|TestFetchHistoricalJoinedEventDenied|TestFetchHistoricalSharedEvent|TestFetchHistoricalInvitedEventFromBetweenInvite|TestFetchHistoricalInvitedEventFromBeforeInvite|TestFetchEventNonWorldReadable|TestFetchEventWorldReadable|TestRoomCreate|TestPublicRooms|TestRoomForget|TestLeftRoomFixture|TestFetchMessagesFromNonExistentRoom|TestSendAndFetchMessage|TestRoomMessagesLazyLoading|TestRoomMessagesLazyLoadingLocalUser|TestSendMessageWithTxn)$'
+```
+
+| Run | Top-level (`func Test*`) | Leaf-level (every `--- PASS/FAIL` line, any depth) |
+|---|---|---|
+| First this session (items 1/3/4/5 landed, item 2 had a route collision not yet resolved) | 7 pass / 9 fail | 26 pass / 27 fail |
+| Final this session (item 2's collision resolved, departed-reader `/state`+`/members` fix added) | 8 pass / 8 fail | **39 pass / 14 fail** |
+
+The remaining 8 top-level failures, all confirmed **not** this track's code (see each item's "Proof"
+above for the specific subtest-level breakdown):
+
+- `TestRoomCreate`, `TestRoomForget`: one subtest each, both `/sync` invite/forget-visibility
+  timing in `hs-user` (track 05).
+- `TestFetchHistoricalInvitedEventFromBetweenInvite`, `TestFetchHistoricalInvitedEventFromBeforeInvite`:
+  time out in `MustSyncUntil` waiting for an invite to appear in `/sync`, before the test ever
+  reaches a history-visibility assertion -- same `/sync` territory.
+- `TestLeftRoomFixture`, `TestSendAndFetchMessage`, `TestRoomMessagesLazyLoading`,
+  `TestRoomMessagesLazyLoadingLocalUser`: all fail on `GET .../messages?from=hsu1_...` with `400
+  M_INVALID_PARAM: invalid pagination token` -- `hs-user`'s `/sync` issues tokens prefixed `hsu1_`
+  in its own format, and `crate::timeline::PaginationToken::from_str` (this crate's room-local
+  pagination token, unchanged by this session) does not understand that format. This is a real,
+  pre-existing cross-track token-format incompatibility, not a regression from anything in this
+  session -- `PaginationToken` parsing was not touched. Recorded under "What is left" and
+  "Interfaces needed" below for whichever track picks it up (likely track 05 and 04 jointly, since
+  it is exactly the "seam" `docs/workstreams/README.md` asks tracks to write down rather than
+  silently patch around).
+
+Full logs: `/tmp/complement-track04-after.log` (first run), `/tmp/complement-track04-after2.log`
+(final run) -- not committed (scratch files outside tracked paths).
+
+### Also verified this session
+
+```
+cargo fmt -p hs-room
+cargo clippy -p hs-room --all-targets -- -D warnings
+cargo test -p hs-room                         # 48 tests: 38 lib/unit + 10 scenario, all green
+cargo build -p hs-cli --bin hs
+cargo test -p hs-loadgen --test real_client -- --nocapture   # still all 17 steps green
+```
+
+### What is left
+
+- **The `hsu1_...` pagination-token format mismatch** between `hs-user`'s `/sync` and this crate's
+  `GET .../messages` (see above) -- not fixed this session (would need either this crate's
+  `PaginationToken` to accept/translate a sync token, or `hs-user` to hand out room-local tokens
+  for this purpose; a real cross-track design question, not a quick patch).
+- **`hs-user`'s `/sync` does not know about this crate's `forgotten` set** (item 4's one remaining
+  Complement failure) or its **real publish flag** (item 2's `Tables::public_rooms`, which
+  `hs-user`'s own `public_directory_entry` still does not consult, relying on `join_rule ==
+  "public"` instead -- true today only because this session's `/publicRooms` is the one actually
+  mounted, per item 2's collision writeup). Both need a query surface from this crate that does not
+  exist yet; see "Interfaces needed".
+- **`GET .../context`'s own `state` field** still reads the room's *live* current state, not state
+  pinned to the target event -- the same category of bug item 1 fixed everywhere else, just not
+  reached this session. `RoomActor::state_at_event(event_id)` already computes exactly what this
+  field wants; wiring it in is a small, isolated follow-up.
+- Everything already listed as not-yet-started in earlier sessions (retention, upgrades, spaces,
+  `/hierarchy`, room version 12 create-time two-phase construction refinements, etc.) is unchanged
+  by this session.
+
+### Interfaces needed
+
+- **05 (sync)**: a way for `hs-user` to learn (a) whether a user has forgotten a room
+  (`RoomActor`'s `forgotten` set, currently private/in-memory/no query surface) and (b) this
+  crate's real directory-publish flag (`RoomRegistry::is_directory_public`/
+  `list_published_room_ids`, already `pub`, just not yet consulted by `hub.rs`'s
+  `public_directory_entry`) -- see "What is left" above for both. Also: `hs-user`'s `/sync` token
+  format (`hsu1_...`) and this crate's room-local `PaginationToken` need to either agree on one
+  format or have an explicit translation at the boundary; right now a token minted by one is simply
+  rejected by the other, breaking `GET .../messages?from=<a /sync token>` for every real client
+  (the "Getting messages going forward is limited for a departed room" Complement pattern uses
+  exactly this).
+- Everything already on this list from earlier sessions (02's `StateKeyId` interning gap, 03's
+  cluster ownership routing, 06's soft-fail/backfill, 10's push-evaluation-inputs shape, 14's
+  differential-testing coverage) is unchanged by this session.
+
+### Decisions made this session
+
+- **`event_visible_to`/`can_read_room` deny by `404`/`403` respectively, not a shared shape.**
+  `.../event`/`.../context` (single-event reads) use `404` uniformly regardless of *why* an event
+  is invisible (never-a-member vs. history-visibility-denied vs. does-not-exist), matching the
+  spec's own algorithm making no such distinction. `.../messages` (a whole-room read) uses a
+  coarser `403` gate (`can_read_room`) for "may not read this room at all", separate from per-event
+  filtering for "may not read this specific event" -- because a Complement test
+  (`TestFetchMessagesFromNonExistentRoom`) explicitly wants `403` for a nonexistent room on this
+  endpoint specifically, unlike `.../event`.
+- **`GET .../state`/`.../members`'s deny case returns an empty result (`200`), not `403`.** No
+  Complement test in this session's scope stresses "a total stranger calls `GET /state` on a
+  non-world-readable room", so an empty, non-leaking response was chosen over inventing an
+  unverified error shape. Revisit if a real client or test demonstrates the wrong choice.
+- **The room directory's publish flag lives in a new `Tables::public_rooms` keyspace, not as room
+  state.** Publication is a server-local administrative fact (like an alias), not something other
+  members or servers need to see in the room's own event graph -- see item 2's writeup.
+- **`visibility` and `preset` are independent `POST /createRoom` fields**, per the spec: `preset`
+  sets join-rule/history-visibility/guest-access defaults; `visibility` only controls directory
+  publication. No "contradictory combination" is actually rejected (a `private_chat` room can be
+  published, and that is correct, not a conflict) -- the task brief's phrase "contradictory
+  preset/visibility combinations" turned out, on reading the spec text precisely
+  (`refs/matrix-spec/data/api/client-server/create_room.yaml`), not to name a real spec-defined
+  error case; validating each field's own allowed values (done) was the actual, checkable gap.
+- **This crate's `GET`/`POST /publicRooms` is the one mounted in the real server, not `hs-user`'s.**
+  Not a unilateral decision -- track 05 independently reached the same conclusion from their side
+  (see item 2). Recorded here so a future session does not "fix" the collision a second time by
+  re-mounting `hs-user`'s copy.
+- **`RoomActor::forgotten` stays in-memory-only, not persisted**, same reasoning as `txn_dedup`
+  (session 1): the only Complement-visible consequence of losing it on eviction is a forgotten room
+  looking un-forgotten again after this process's `RoomRegistry` evicts and reloads it, which is a
+  narrower, less user-visible failure mode than the feature not existing at all, and Phase 0 scope
+  does not ask for cross-restart durability here yet.
 
 ## Session 3 (2026-09-18): `RoomActor::accept_remote_event` -- persisting an event this server did not create
 
@@ -457,7 +785,16 @@ None. Everything this pass needed from other tracks (`hs-kv`, `hs-tables`, `hs-m
   track 10 specifies the shape it actually needs — flag if a different field shape than
   "empty until specified" would have been more useful to start against.
 - `hs_room::registry::RoomRegistry<B>`: `get_or_load`, `create_room`, `resolve_alias`,
-  `evict_idle`, `spawn_eviction_sweeper`.
+  `evict_idle`, `spawn_eviction_sweeper`, and (session 4) `set_directory_visibility`/
+  `is_directory_public`/`list_published_room_ids` -- the room directory's real publish flag. **Track
+  05**: `hub.rs`'s `public_directory_entry` should consult `is_directory_public` (or OR it with the
+  existing `join_rule == "public"` check) instead of relying on `join_rule` alone; see this file's
+  session 4 section, item 2.
+- `hs_room::actor::RoomActor`'s history-visibility read-side (session 4):
+  `event_visible_to(event, requester)`, `can_read_room(requester)`,
+  `full_state_for_reader`/`state_event_for_reader`/`members_for_reader(requester)`, and the pure
+  rule table in `hs_room::history_visibility::{HistoryVisibility, base_rule_allows}`. Every read
+  route in this crate goes through these now; see session 4's item 1 for the exact contract.
 - `hs_room::routes::router::<B>()`: the client-server HTTP fragment, `(Router<RoomState<B>>,
   RouteManifest)`, spec-relative paths, following `hs_auth::routes::router`'s and
   `hs_media::router::authenticated_router`'s convention.

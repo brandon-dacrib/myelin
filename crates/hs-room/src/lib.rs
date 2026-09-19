@@ -17,6 +17,9 @@
 //!   as an explicit transition table.
 //! - [`timeline`]: pagination tokens over a room's room-local timeline positions.
 //! - [`relations`]: `m.relates_to` indexing and bundled aggregations.
+//! - [`history_visibility`]: the `m.room.history_visibility` read-side algorithm (pure logic;
+//!   `actor::RoomActor::event_visible_to`/`can_read_room` supply the state snapshots it reasons
+//!   about).
 //! - [`registry`]: [`registry::RoomRegistry`], the per-process map from room to actor handle, with
 //!   idle eviction.
 //! - [`state`]: [`state::RoomState`], this crate's axum shared state, and [`state::RoomRequester`].
@@ -27,6 +30,7 @@
 
 pub mod actor;
 pub mod error;
+pub mod history_visibility;
 pub mod identity;
 pub mod membership;
 pub mod persist;

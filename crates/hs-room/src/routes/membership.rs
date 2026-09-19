@@ -171,15 +171,29 @@ pub async fn post_leave<B: KvBackend + 'static>(
     act(&state, &room_id, user.clone(), Action::Leave, user, &body).await
 }
 
-/// `POST /rooms/{roomId}/forget`. Not implemented as a distinct effect in this pass (this crate
-/// does not yet track a "forgotten" flag per user per room, since serving `/sync` -- the consumer
-/// of that flag -- is track 05's job); accepted as a no-op so clients that call it unconditionally
-/// after `/leave` are not broken.
+/// `POST /rooms/{roomId}/forget`. Per the spec
+/// (`refs/matrix-spec/data/api/client-server/leaving.yaml`, Apache-2.0): `400 M_UNKNOWN` if the
+/// requester is still joined to the room, or if the room does not exist at all (this crate does
+/// not distinguish the two in its response, matching the spec's one documented error shape for
+/// this endpoint -- see [`RoomError::StillJoined`]'s doc comment). Otherwise marks the room
+/// forgotten (`crate::actor::RoomActor::forget`), which `GET .../messages` (`can_read_room`) then
+/// refuses outright until the requester rejoins.
 pub async fn post_forget<B: KvBackend + 'static>(
-    State(_state): State<RoomState<B>>,
-    Path(_room_id): Path<String>,
-    RoomRequester(_requester): RoomRequester,
+    State(state): State<RoomState<B>>,
+    Path(room_id): Path<String>,
+    RoomRequester(requester): RoomRequester,
 ) -> Result<Response, RoomError> {
+    let room_id = parse_room_id(&room_id)?;
+    let handle = match state.rooms.get_or_load(&room_id).await {
+        Ok(handle) => handle,
+        Err(RoomError::RoomNotFound(_)) => {
+            return Err(RoomError::StillJoined(format!(
+                "room {room_id} does not exist"
+            )));
+        }
+        Err(e) => return Err(e),
+    };
+    handle.forget(requester.user_id).await?;
     Ok(Json(json!({})).into_response())
 }
 

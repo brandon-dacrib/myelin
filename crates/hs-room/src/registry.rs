@@ -213,6 +213,37 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
         crate::actor::resolve_alias(&self.backend, &self.tables, alias)
     }
 
+    /// Publishes or unpublishes `room_id` in the server's room directory
+    /// (`PUT /_matrix/client/v3/directory/list/room/{roomId}`). See
+    /// [`crate::actor::set_directory_visibility`].
+    ///
+    /// # Errors
+    /// Returns [`RoomError::RoomNotFound`] if `room_id` has never been created, or
+    /// [`RoomError::Store`] on a storage failure.
+    pub fn set_directory_visibility(
+        &self,
+        room_id: &ruma::RoomId,
+        published: bool,
+    ) -> Result<(), RoomError> {
+        crate::actor::set_directory_visibility(&self.backend, &self.tables, room_id, published)
+    }
+
+    /// Whether `room_id` is currently published. See [`crate::actor::is_directory_public`].
+    ///
+    /// # Errors
+    /// Returns [`RoomError::Store`] on a storage failure.
+    pub fn is_directory_public(&self, room_id: &ruma::RoomId) -> Result<bool, RoomError> {
+        crate::actor::is_directory_public(&self.backend, &self.tables, room_id)
+    }
+
+    /// Every currently published room ID. See [`crate::actor::list_published_room_ids`].
+    ///
+    /// # Errors
+    /// Returns [`RoomError::Store`] on a storage failure.
+    pub fn list_published_room_ids(&self) -> Result<Vec<OwnedRoomId>, RoomError> {
+        crate::actor::list_published_room_ids(&self.backend, &self.tables)
+    }
+
     /// Drops every resident actor idle longer than `max_idle`. Intended to be called
     /// periodically (see [`RoomRegistry::spawn_eviction_sweeper`]); safe to call directly in
     /// tests for a deterministic assertion instead of waiting on a timer.
