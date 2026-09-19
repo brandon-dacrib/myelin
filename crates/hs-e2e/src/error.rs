@@ -31,6 +31,17 @@ pub enum E2eError {
     /// A storage backend failure.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// `POST /keys/device_signing/upload` was asked to verify a self-signing or user-signing key
+    /// against a master key, but the user has none in the request and none stored
+    /// (`M_MISSING_PARAM`, per `cross_signing.yaml`'s documented 400 case).
+    #[error("missing param: {0}")]
+    MissingParam(String),
+    /// A signature did not verify against the key it claims to be by
+    /// (`M_INVALID_SIGNATURE`) -- used only for `/keys/device_signing/upload`'s request-level
+    /// rejection; `/keys/signatures/upload` reports the same errcode per-item in its `failures`
+    /// map instead of as a request error, per `cross_signing.yaml`.
+    #[error("invalid signature: {0}")]
+    InvalidSignature(String),
 }
 
 impl E2eError {
@@ -60,6 +71,16 @@ impl IntoResponse for E2eError {
             ),
             Self::NotFound(msg) => MatrixError::not_found(msg.clone()),
             Self::Forbidden(msg) => MatrixError::forbidden(msg.clone()),
+            Self::MissingParam(msg) => MatrixError::custom(
+                StatusCode::BAD_REQUEST,
+                MatrixErrorCode::MissingParam,
+                msg.clone(),
+            ),
+            Self::InvalidSignature(msg) => MatrixError::custom(
+                StatusCode::BAD_REQUEST,
+                MatrixErrorCode::InvalidSignature,
+                msg.clone(),
+            ),
             Self::WrongBackupVersion { given, current } => MatrixError::custom(
                 StatusCode::FORBIDDEN,
                 MatrixErrorCode::WrongRoomKeysVersion,

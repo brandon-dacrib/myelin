@@ -10,10 +10,13 @@
 use std::sync::Arc;
 
 use axum::http::{Method, StatusCode};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD_NO_PAD;
 use hs_auth::state::AuthState;
 use hs_e2e::state::E2eState;
 use hs_e2e::store::tables::TablesE2eStore;
 use hs_kv::memory::MemoryBackend;
+use hs_model::signing::{SigningKeyPair, sign_bytes, to_signable_object};
 use hs_testkit::Scenario;
 use serde_json::{Value, json};
 
@@ -21,6 +24,18 @@ fn obj1(k: impl Into<String>, v: Value) -> Value {
     let mut map = serde_json::Map::new();
     map.insert(k.into(), v);
     Value::Object(map)
+}
+
+/// Test-only signing helper: computes the exact bytes `hs_model::signing::verify_object` would
+/// check for `value` (canonical JSON with `signatures`/`unsigned` stripped) and signs them with
+/// `key`, returning the unpadded-base64 signature. Lets tests build genuinely valid cross-signing
+/// signatures rather than well-formed-looking fakes, now that the routes under test verify them.
+fn sign_canonical(value: &Value, key: &SigningKeyPair) -> String {
+    let mut canonical = to_signable_object(value).expect("value canonicalizes for signing");
+    canonical.remove("signatures");
+    canonical.remove("unsigned");
+    let bytes = hs_model::canonical::CanonicalJsonValue::Object(canonical).to_canonical_bytes();
+    STANDARD_NO_PAD.encode(sign_bytes(&bytes, key).to_bytes())
 }
 
 fn app() -> axum::Router {
@@ -318,19 +333,59 @@ async fn signatures_upload_merges_without_dropping_the_device_keys_it_signs() {
             Some("alice"),
             Method::POST,
             "/keys/upload",
-            Some(obj1("device_keys", device_keys)),
+            Some(obj1("device_keys", device_keys.clone())),
         )
         .await
         .assert_ok();
 
-    // Sign alice's own device with what looks like a self-signing-key signature.
+    // Bootstrap real cross-signing keys: a master key (the trust root, never itself required to
+    // verify against anything) and a self-signing key genuinely signed by it, exactly as a real
+    // client would via `/keys/device_signing/upload` -- this crate's verifier checks that
+    // signature now, so a fake one would be rejected before we ever get to signing the device.
+    let master = SigningKeyPair::generate("master");
+    let ssk = SigningKeyPair::generate("ssk");
+    let master_key_id = format!("ed25519:{}", master.verifying_key_base64());
+    let ssk_key_id = format!("ed25519:{}", ssk.verifying_key_base64());
+    let master_key_json = json!({
+        "user_id": alice_id,
+        "usage": ["master"],
+        "keys": { master_key_id.clone(): master.verifying_key_base64() },
+    });
+    let mut ssk_key_json = json!({
+        "user_id": alice_id,
+        "usage": ["self_signing"],
+        "keys": { ssk_key_id.clone(): ssk.verifying_key_base64() },
+    });
+    let ssk_signature = sign_canonical(&ssk_key_json, &master);
+    ssk_key_json["signatures"] =
+        json!({ alice_id.clone(): { master_key_id.clone(): ssk_signature } });
+    scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/keys/device_signing/upload",
+            Some(json!({
+                "master_key": master_key_json,
+                "self_signing_key": ssk_key_json,
+            })),
+        )
+        .await
+        .assert_ok();
+
+    // Sign alice's own device with her real self-signing key, over the exact object she uploaded
+    // (the spec requires the signed object to match the stored key besides `signatures`).
+    let device_signature = sign_canonical(&device_keys, &ssk);
     let signature_upload = obj1(
         alice_id.clone(),
         obj1(
             alice_device.clone(),
             json!({
+                "user_id": alice_id,
+                "device_id": alice_device,
+                "algorithms": original_algorithms,
+                "keys": original_keys,
                 "signatures": {
-                    alice_id.clone(): {"ed25519:SSK": "aFakeButWellFormedSignature"},
+                    alice_id.clone(): { ssk_key_id.clone(): device_signature },
                 },
             }),
         ),
@@ -346,7 +401,8 @@ async fn signatures_upload_merges_without_dropping_the_device_keys_it_signs() {
     signed.assert_ok();
     assert!(
         signed.json["failures"].as_object().unwrap().is_empty(),
-        "the device exists, so the signature merge must not be reported as a failure: {:?}",
+        "a genuinely valid signature by alice's own self-signing key must not be reported as a \
+         failure: {:?}",
         signed.json
     );
 
@@ -370,7 +426,7 @@ async fn signatures_upload_merges_without_dropping_the_device_keys_it_signs() {
         "the signature merge must not touch the device's original keys"
     );
     assert_eq!(
-        device["signatures"][&alice_id]["ed25519:SSK"], "aFakeButWellFormedSignature",
+        device["signatures"][&alice_id][&ssk_key_id], device_signature,
         "the newly-merged signature must be readable back exactly as submitted: {device:?}"
     );
 }

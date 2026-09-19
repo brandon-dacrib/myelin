@@ -24,6 +24,8 @@ hs-tables = { path = "../hs-tables" }
 hs-auth = { path = "../hs-auth" }
 hs-http = { path = "../hs-http" }
 hs-appservice = { path = "../hs-appservice" }
+hs-model = { path = "../hs-model" }
+ed25519-dalek = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
