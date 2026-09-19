@@ -1244,3 +1244,80 @@ async fn departed_member_sees_state_and_members_as_of_when_they_left() {
     alice_name.assert_ok();
     assert_eq!(alice_name.json["name"], "After");
 }
+
+/// `GET /rooms/{roomId}/event/{eventId}` carries `unsigned.transaction_id` back to the sending
+/// user, per `txnid_test.go`'s `TestTxnInEvent`, but not to a different user reading the same
+/// event -- the client-server API's local-echo field is scoped to the sender, not public.
+#[tokio::test]
+async fn transaction_id_is_echoed_back_to_the_sender_only() {
+    let mut scenario = Scenario::new(app());
+    scenario
+        .register("alice", "alice", "correct horse battery staple")
+        .await
+        .assert_ok();
+    scenario
+        .register("bob", "bob", "hunter2official")
+        .await
+        .assert_ok();
+
+    let created = scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    created.assert_ok();
+    let room_id = created.str_field("room_id").to_string();
+
+    scenario
+        .send(
+            Some("bob"),
+            Method::POST,
+            &format!("/rooms/{room_id}/join"),
+            Some(json!({})),
+        )
+        .await
+        .assert_ok();
+
+    let sent = scenario
+        .send(
+            Some("alice"),
+            Method::PUT,
+            &format!("/rooms/{room_id}/send/m.room.message/my-txn-id"),
+            Some(json!({"msgtype": "m.text", "body": "hello"})),
+        )
+        .await;
+    sent.assert_ok();
+    let event_id = sent.str_field("event_id").to_string();
+
+    let seen_by_sender = scenario
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/rooms/{room_id}/event/{event_id}"),
+            None,
+        )
+        .await;
+    seen_by_sender.assert_ok();
+    assert_eq!(
+        seen_by_sender.json["unsigned"]["transaction_id"], "my-txn-id",
+        "the sender must see its own transaction id echoed back"
+    );
+
+    let seen_by_bob = scenario
+        .send(
+            Some("bob"),
+            Method::GET,
+            &format!("/rooms/{room_id}/event/{event_id}"),
+            None,
+        )
+        .await;
+    seen_by_bob.assert_ok();
+    assert!(
+        seen_by_bob.json["unsigned"]["transaction_id"].is_null(),
+        "a different user must never see another user's transaction id: {:?}",
+        seen_by_bob.json["unsigned"]
+    );
+}

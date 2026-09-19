@@ -44,6 +44,7 @@ use hs_model::Event;
 use hs_model::canonical::{CanonicalJsonObject, CanonicalJsonValue, to_canonical_object};
 use hs_model::hash;
 use hs_model::ids::EventSn;
+use hs_model::redaction;
 use hs_model::room_version::{EventsReferenceFormat, RoomVersionRules};
 use hs_model::signing::{self, SigningKeyPair};
 use hs_state::api::StateStore;
@@ -374,7 +375,27 @@ pub fn build_and_authorize<S: StateStore>(
             CanonicalJsonValue::String(content_hash),
         )])),
     );
-    signing::sign_object(&mut canonical, server_name, signing_key)?;
+    // Sign the *redacted* form, not the full event -- the spec's algorithm
+    // (`refs/matrix-spec/content/server-server-api.md`, "Adding hashes and signatures to outgoing
+    // events"): hash the full event (above), redact, sign the redacted object, then copy the
+    // resulting signature back onto the original, unredacted object this function returns and
+    // persists. A spec-compliant verifier always redacts *before* checking a signature (the
+    // matching "Validating hashes and signatures on received events" text), so signing the full
+    // object instead -- what this line used to do -- produces a signature that verifies only
+    // against this server's own unredacted copy, and mismatches for any event type whose content
+    // redaction does not fully retain (an ordinary `m.room.message`'s `content` most of all: see
+    // `hs_model::redaction::redact_content`). See `docs/rfcs/0014-event-signing-must-sign-the-redacted-form.md`
+    // for the full writeup (discovered by track 06 fixing the symmetric bug on the verification
+    // side, `hs_federation::inbound::verify_pdu`).
+    let mut redacted =
+        redaction::redact(&canonical, &rules.redaction).map_err(hs_model::EventError::from)?;
+    signing::sign_object(&mut redacted, server_name, signing_key)?;
+    canonical.insert(
+        "signatures".to_owned(),
+        redacted
+            .remove("signatures")
+            .expect("sign_object always inserts a signature"),
+    );
 
     let final_bytes = CanonicalJsonValue::Object(canonical).to_canonical_bytes();
     let final_value: serde_json::Value =

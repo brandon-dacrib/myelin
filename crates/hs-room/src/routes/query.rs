@@ -118,8 +118,14 @@ pub async fn get_event<B: KvBackend + 'static>(
                 return Err(RoomError::EventNotFound("event not found".into()));
             }
             let bundle = actor.relation_bundle(event.event_id(), &requester.user_id);
-            Ok(crate::routes::render::client_event_json_bundled(
-                event, &bundle,
+            let txn_id = actor.transaction_id_for(
+                event.event_id(),
+                &requester.user_id,
+                requester.device_id.as_deref(),
+            );
+            Ok(crate::routes::render::attach_transaction_id(
+                crate::routes::render::client_event_json_bundled(event, &bundle),
+                txn_id,
             ))
         })
         .await;
@@ -163,7 +169,15 @@ pub async fn get_context<B: KvBackend + 'static>(
             };
             let render = |e: &hs_model::Event| {
                 let bundle = actor.relation_bundle(e.event_id(), &requester.user_id);
-                crate::routes::render::client_event_json_bundled(e, &bundle)
+                let txn_id = actor.transaction_id_for(
+                    e.event_id(),
+                    &requester.user_id,
+                    requester.device_id.as_deref(),
+                );
+                crate::routes::render::attach_transaction_id(
+                    crate::routes::render::client_event_json_bundled(e, &bundle),
+                    txn_id,
+                )
             };
             let target_json = render(target);
             // Find the target's position in the timeline via a full scan. Acceptable for Phase
@@ -363,7 +377,15 @@ pub async fn get_messages<B: KvBackend + 'static>(
                 })
                 .map(|e| {
                     let bundle = actor.relation_bundle(e.event_id(), &requester.user_id);
-                    crate::routes::render::client_event_json_bundled(e, &bundle)
+                    let txn_id = actor.transaction_id_for(
+                        e.event_id(),
+                        &requester.user_id,
+                        requester.device_id.as_deref(),
+                    );
+                    crate::routes::render::attach_transaction_id(
+                        crate::routes::render::client_event_json_bundled(e, &bundle),
+                        txn_id,
+                    )
                 })
                 .collect::<Vec<_>>();
             Ok((start_token.to_string(), chunk, next.map(|t| t.to_string())))

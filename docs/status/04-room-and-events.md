@@ -2,8 +2,305 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
-Last updated: 2026-09-19 (session 4, Complement triage: history-visibility enforcement on reads,
-the room directory, `POST /createRoom` validation, `POST /forget`, extensible `m.topic`).
+Last updated: 2026-09-19 (session 5: an urgent cross-track signing bug fixed first
+(`docs/rfcs/0014-event-signing-must-sign-the-redacted-form.md`), then `/threads`, `/upgrade`,
+idempotent state/join, `unsigned.transaction_id`, and a precise diagnosis of the `/forget`
+sync-left regression and of why `/relations`/`/threads` still 404 in a real deployment).
+
+## Session 5 (2026-09-19): signing fix, `/threads`, `/upgrade`, idempotency, `unsigned.transaction_id`
+
+**Starting point.** Assigned, in value order: (1) whole endpoints 404ing --
+`/relations`/`/threads`/`/search`/room `/upgrade`; (2) diagnose a `/forget` regression in
+`/sync`'s `left` section (track 05's file, not this crate's to fix); (3) non-idempotent state/join
+(sending the same state event or join twice creates a second event); (4) missing
+`unsigned.transaction_id`; (5) alias/canonical-alias validation and `/state`/`/joined_members`
+shape gaps. Mid-session, the integration lead interrupted with a higher-priority, independently
+verified bug in this crate (`docs/rfcs/0014-event-signing-must-sign-the-redacted-form.md`) and
+asked for it first; it is fixed and tested (see item 0 below), then the rest of the list was
+picked back up. Item 5 (alias/canonical-alias validation, `/state`/`/joined_members` shape gaps)
+was not reached this session -- out of time, not attempted.
+
+### 0. The signing bug: events were signed unredacted, not redacted (urgent, fixed first)
+
+**The bug**, per `docs/rfcs/0014-event-signing-must-sign-the-redacted-form.md` (written by track
+06 after it independently found and fixed the symmetric bug on the *verification* side,
+`hs_federation::inbound::verify_pdu`): the spec's signing algorithm is hash the full event,
+**redact** it, sign the **redacted** object, then copy the resulting signature back onto the
+original unredacted event. `crate::pipeline::build_and_authorize`'s hash-and-sign step computed
+the content hash correctly but then called `signing::sign_object` directly on the **unredacted**
+object -- no redaction in between. Since redaction is deterministic from an event's `type` alone
+and strips *all* of `content` for any type without a special case (`m.room.message` among them,
+via `hs_model::redaction::redact_content`), every ordinary message this server has ever
+originated carried a signature that a spec-compliant remote homeserver -- which always redacts
+before verifying, per the matching "Validating hashes and signatures" text -- would reject.
+Outbound federation had likely never been verifiable by a compliant peer, independent of the
+TLS/CA gap track 14 found the same session.
+
+**The fix** (`crates/hs-room/src/pipeline.rs`, the hash-and-sign block): redact the canonical
+object (`hs_model::redaction::redact(&canonical, &rules.redaction)`), sign *that* copy, then move
+the resulting `signatures` entry back onto the real, unredacted `canonical` this function returns
+and persists. Three lines added, matching the exact shape the RFC specified and the pattern
+already used in `hs_federation`'s own test helpers.
+
+**The test that would have caught it**:
+`crate::actor::tests::a_sent_message_is_signed_over_its_redacted_form_not_the_full_event`. Sends a
+real `m.room.message` through the actual `RoomActor::send_event` path (not a hand-built test
+fixture), redacts the persisted event's own JSON independently, and asserts three things: (1)
+`hs_model::signing::verify_object` succeeds against the *redacted* form (the spec-compliant check
+-- this is what would have failed before the fix); (2) the full, unredacted event's `content` is
+still intact for an ordinary client read (the fix must not touch what gets stored/served, only
+what gets hashed for the signature); (3) as a sanity check that the test is actually exercising
+the bug, the full unredacted object's `content` genuinely differs from the redacted form's, and
+verifying the signature against the *full* object fails (proving the signature really is scoped
+to the redacted bytes, not "verifies against anything"). All three of `builds_and_authorizes_a_create_event`,
+this new test, and the rest of `cargo test -p hs-room` (48 tests before this session, now 58) stay
+green with the fix in place.
+
+Left for another session/track: `crates/hs-cli/tests/federation_writes.rs`'s three test-fixture
+call sites that sign a synthetic PDU the same wrong way (mechanical, same three-line fix, and
+explicitly not this crate's file to touch -- the RFC names it, and the integration lead said
+another agent holds `hs-cli` and would fix those fixtures directly).
+
+### 1. `/threads` (`GET /rooms/{roomId}/threads`, client-server API "Threading", v1.4)
+
+**New**: `crate::actor::RoomActor::thread_roots(requester, participated_only) -> Vec<&Event>` --
+every event that is the target of at least one `m.thread` relation, most-recently-active-thread
+first (ordered by the latest `m.thread` child's `origin_server_ts`, descending;
+`room_threads_test.go`'s `TestThreadsEndpoint` checks this ordering directly, including that a new
+reply to an older thread moves it back to the front). `crate::routes::threads::get_threads` wraps
+it with history-visibility filtering (`event_visible_to`), a plain-decimal-offset pagination token
+(thread order is "most active first", not a timeline position, so the existing
+`crate::timeline::PaginationToken` does not apply), and the same bundled-aggregation +
+`unsigned.transaction_id` rendering every other read path uses. Registered in
+`crate::routes::router` as `GET /rooms/{roomId}/threads`.
+
+**A real bug found and fixed along the way**: the threading module's `current_user_participated`
+rule is "true when the user is *either* (1) the sender of the thread root, *or* (2) the sender of
+an `m.thread` child" (`refs/matrix-spec/content/client-server-api/modules/threading.md`). The
+existing `crate::relations::bundle` (used by `/relations`, `/event`, `/messages`, `/context`
+already) only implemented rule 2 -- a user who started a thread but never replied to it was
+reported as not having participated in their own thread. Fixed by threading the root event's
+sender into `bundle()` as a new `Option<&UserId>` parameter (`crate::actor::RoomActor::relation_bundle`
+now looks it up and passes it through). This affects every endpoint that renders
+`unsigned.m.relations.m.thread.current_user_participated`, not just the new `/threads` endpoint.
+
+**Tests**: `crate::relations::tests::bundle_counts_the_thread_root_sender_as_participating_even_without_a_reply`
+(the participation-rule fix, isolated); `crate::actor::tests::thread_roots_are_ordered_by_latest_reply_and_reorder_on_a_new_reply`
+and `crate::actor::tests::thread_roots_participated_filter_matches_the_threading_module_rules`
+(the new endpoint's core logic, at the actor level).
+
+### 2. `/upgrade` (`POST /rooms/{roomId}/upgrade`)
+
+Implemented per the spec's documented server behaviour
+(`refs/matrix-spec/content/client-server-api/modules/room_upgrades.md`), locally only (no
+federation -- out of this crate's scope): validates the target room version
+(`hs_model::room_version::rules_for`) before any side effect; mints the replacement room's ID
+up front (`ruma::RoomId::new_v1`) so both the old room's tombstone (`content.replacement_room`)
+and the new room's create event (`content.predecessor.event_id`) can name each other without a
+two-phase build-then-persist dance; sends the tombstone to the old room (which is also the
+permission check -- an unauthorized sender gets `RoomError::Forbidden` from the ordinary
+event-authorization path and nothing else in the handler runs); creates the replacement room via
+`RoomActor::create_room` reusing the recommended transferable state
+(`crate::actor::RoomActor::transferable_state`: `m.room.server_acl`, `encryption`, `name`,
+`avatar`, `topic`, `guest_access`, `history_visibility`, `join_rules`, `power_levels`, whichever
+of these the old room actually has set) and the create event's `type` field
+(`crate::actor::RoomActor::creation_type`); moves local aliases and, best-effort, the canonical
+alias content; and, best-effort (the spec's own "if possible" hedge), locks the old room's power
+levels down (`events_default`/`invite` raised to `max(50, users_default + 1)`).
+
+**New in `crate::actor::CreateRoomRequest`**: a `room_id: Option<OwnedRoomId>` field -- `None`
+(every existing caller, via `..Default::default()`) means "generate one" exactly as before;
+`/upgrade` is the only caller that sets it, since it must know the replacement room's ID before
+creating it. Additive, no existing call site needed more than the `..Default::default()` it
+already had.
+
+**Not implemented** (documented scope narrowing, not oversight): push-rule migration for local
+users (Synapse/Dendrite do this; it needs `hs-push` and `hs-user` cooperation and is the subject
+of `room_upgrade_test.go`'s only real Complement test, `TestPushRuleRoomUpgrade` -- which also
+needs two-homeserver federation, out of reach for a single-crate fix regardless); MSC4291
+`additional_creators` handling (spec v1.16, deliberately out of scope the same way room version
+12's own hash-based room ID support already is, per session 3's decision).
+
+**Tests**: `crate::routes::upgrade::tests::upgrade_creates_a_replacement_room_with_predecessor_and_tombstone`
+(end-to-end through the real route handlers -- `RoomRequester` constructed directly rather than
+through HTTP/auth middleware, since nothing about this handler's logic depends on how the
+requester was authenticated; checks the new room's version, its `predecessor`, that `m.room.topic`
+was carried over, and that the old room's tombstone names the new room) and
+`crate::routes::upgrade::tests::upgrade_to_an_unsupported_version_is_rejected_before_any_side_effect`
+(no tombstone, no replacement room, when the version check fails first).
+
+### 3. `/relations` and `/threads` both 404 in the real deployed server -- and it is not this crate's bug
+
+**`/relations` was already fully implemented** (`crate::routes::relations`, `crate::relations`
+module, session before this one or earlier -- this session found it working and complete, needing
+only the participation-rule fix in item 1 above) when this session started, yet
+`docs/status/14-test-and-conformance.md`'s Complement run and this session's own assignment both
+named it as 404ing. **Root cause, confirmed by reading `crates/hs-cli/src/serve.rs`**: the client-server
+spec places `/relations` and `/threads` at basePath `/_matrix/client/v1`
+(`refs/matrix-spec/data/api/client-server/relations.yaml` and `threads_list.yaml`'s `servers:`
+block; Complement's own test code hits them there --
+`refs/complement/tests/csapi/room_relations_test.go`/`room_threads_test.go` call
+`["_matrix", "client", "v1", "rooms", roomID, "relations", ...]` verbatim, never `v3`), but
+`hs-cli/src/serve.rs` mounts `hs_room::routes::router()` (this crate's whole router fragment,
+including `/relations` and the new `/threads`) only at `/_matrix/client/v3` and
+`/_matrix/client/r0` (lines ~277-282). It already mounts *other* crates' routers at v1
+(`/_matrix/client/v1/media`, `/_matrix/client/v1` for appservice ping) -- the infrastructure
+exists, this crate's router is just never merged into it there. **Every request Complement (or
+any client following the spec literally) makes to `/_matrix/client/v1/rooms/{roomId}/relations/...`
+or `/threads` 404s today, regardless of how correct this crate's own handlers are**, because axum
+never routes the request to them at all.
+
+**This is `crates/hs-cli/src/serve.rs`, explicitly out of this track's ownership this session**
+(another agent holds it). The fix is one line, added next to the existing v1 merges:
+```rust
+.merge_router("/_matrix/client/v1", room_router.clone(), room_routes.clone())
+```
+(reusing the same `room_router`/`room_routes` values `serve.rs` already builds and merges at v3/r0
+a few lines above -- see that file's existing `.merge_router("/_matrix/client/v3", room_router.clone(), room_routes.clone())`
+call). **Flagging for the integration lead / whoever next holds `hs-cli`**: this single line is
+very likely the actual fix for the `/relations` and `/threads` items on this track's list, more
+than anything achievable by editing `crates/hs-room` alone.
+
+### 4. `/search` -- skipped
+
+Not attempted. `POST /search` (not room-scoped) needs to enumerate every room a requesting user
+has ever been a member of and full-text-match `content.body`/`content.name`/`content.topic`
+across all of them. This crate's per-room actor model has no such cross-room index today: a
+`RoomRegistry` only knows the rooms it has loaded or created in this process, not "every room
+this server hosts" (there is no `list_all_room_ids`, unlike the room directory's
+`list_published_room_ids`, which is a much narrower, already-solved case), and there is no
+per-user "rooms I have joined" index anywhere in this crate either (that lives on the `hs-user`
+side, or would need `hs-01-storage`'s tantivy integration per `PLAN.md`). Implementing a
+correct-but-slow version (load every room this server has ever created, scan every event) would
+be a lot of new surface for a single session to get right and verify, for a feature `PLAN.md`
+already earmarks for a real search index elsewhere. Left for a session with more room to build
+(and verify) that index properly, or for whichever track ends up owning full-text search
+infrastructure.
+
+### 5. Non-idempotent state and join, fixed
+
+**The bug** (`rooms_state_test.go`'s "Setting state twice is idempotent" and "Joining room twice
+is idempotent", ported from sytest): `PUT /rooms/{roomId}/state/{eventType}(/{stateKey})` has no
+`{txnId}` in its path at all (unlike `/send`/`/redact`), so the existing transaction-ID dedup
+machinery (`RoomActor::send_event_txn`/`redact_txn`) never applied to it, and a retried state PUT
+-- or a retried `POST /join` (`membership_action` also goes through `send_event`) -- created a
+second event every time, even when the content was byte-for-byte identical to the room's current
+state for that `(event_type, state_key)`.
+
+**The fix**: `crate::actor::RoomActor::send_event` (the shared path both direct state sends and
+`membership_action`'s join call go through -- not `send_event_citing`, the lower-level primitive
+this crate's own fork tests deliberately need to *not* dedupe) now checks, when `state_key` is
+`Some`, whether the room's current event for that `(event_type, state_key)` already carries
+exactly `content` (structural `serde_json::Value` equality -- insensitive to key order, since one
+side round-trips through canonical JSON and the other is the raw client body). If so, it returns
+the existing event instead of building a new one. This one check covers both halves of the bug
+for free: an unchanged repeated join produces byte-identical `membership_action`-constructed
+content (assuming no profile change happened in between -- see session 4's profile-propagation
+design, which intentionally still allows a *changed* re-join to mint a new event), so the same
+equality check that fixes ordinary state idempotency fixes join idempotency too, with no
+join-specific special case needed.
+
+**Tests**: `crate::actor::tests::setting_the_same_state_twice_is_idempotent` (identical content ->
+same event ID; genuinely different content -> a real new event, so the fix isn't over-broad) and
+`crate::actor::tests::joining_a_room_twice_is_idempotent`.
+
+### 6. `unsigned.transaction_id`, added
+
+**The gap**: a client that sends an event through a `{txnId}`-suffixed endpoint
+(`PUT .../send/{txnId}`, `PUT .../redact/{txnId}`) needs that transaction ID echoed back on its
+own later view of the event (`unsigned.transaction_id`) to match its optimistic local echo against
+the real event -- client-server API "Local echo" / `txnid_test.go`. This crate recorded the
+`(sender, device, txnId) -> event_id` mapping for dedup (`RoomActor::txn_dedup`, session 4) but
+never surfaced it back out through any read path, and every rendered event's `unsigned` was always
+just `{}` (or the relations bundle) regardless of who was asking.
+
+**The fix**: a new reverse index, `RoomActor::event_txn: HashMap<EventId, (sender, device,
+txn_id)>`, populated alongside `txn_dedup` in a new shared `RoomActor::record_txn` helper (used by
+both `send_event_txn` and `redact_txn`, replacing their previous direct `txn_dedup.insert` calls).
+`RoomActor::transaction_id_for(event_id, viewer, viewer_device)` looks it up and returns `Some`
+only when the viewer's `(user_id, device_id)` matches the `(sender, device)` that actually sent it
+-- device-scoped, not access-token-scoped, per `txnid_test.go`'s `TestTxnScopeOnLocalEcho` (two
+sessions sharing one device ID, e.g. a relogin without a new device or a refreshed access token,
+must see the same transaction ID; a different device of the same user, or any other user, must
+never see it, even for the exact same event). `crate::routes::render::attach_transaction_id` is
+the new rendering helper, wired into every event-rendering call site that has a requester in scope:
+`get_event`, `get_context` (the target plus `events_before`/`events_after`), `get_messages`, and
+the new `/threads` endpoint.
+
+**Not surfaced**: `/sync`'s own timeline rendering (`hs-user`, track 05) needs the identical
+lookup for its own timeline events. `RoomActor::transaction_id_for` is `pub` specifically so that
+crate can call it through `RoomActorHandle::query` exactly the way this crate's own routes do --
+no new interface needed, just documenting that it exists (see "Interfaces provided" below).
+
+**Tests**: `crate::actor::tests::transaction_id_for_is_scoped_to_sender_and_device` (all four
+cases: sending device sees it, a different device of the same user does not, a different user
+does not even with the same device ID, and an ordinary state event -- never sent through a
+`{txnId}` endpoint -- never carries one) and the HTTP-level
+`crate::tests::transaction_id_is_echoed_back_to_the_sender_only` in `tests/scenario.rs` (real
+`PUT .../send/{txnId}` then `GET .../event/{eventId}` as both the sender and a different user).
+
+### 7. The `/forget` regression in `/sync`'s `left` section -- diagnosed, not fixed (track 05's file)
+
+**Per this session's instructions, diagnosed rather than fixed** (the bug lives in `hs-user`,
+track 05's crate, which was in flight this session). **Root cause, found by reading this crate's
+own `RoomActor::forget`**: forgetting a room (`POST /rooms/{roomId}/forget` ->
+`RoomActor::forget` -> `self.forgotten.insert(user)`) is **entirely invisible outside this
+actor**. It does not publish a `RoomUpdate` on the room's broadcast stream (nothing about
+forgetting changes the room's state or timeline -- there is no event to publish), and there is no
+public accessor at all for "has `user` forgotten this room" (`forgotten: HashSet<OwnedUserId>` is
+a private field; only this actor's own `can_read_room`/read-path checks consult it). If `hs-user`'s
+`/sync` determines whether a left room should keep appearing under `left` by watching this
+crate's `RoomUpdate` stream and/or membership history alone (the natural design, and the only
+public surface this crate currently offers), it has **no way to ever learn that a forget
+happened** -- so a room a user left *and then forgot* has no mechanism to stop appearing in
+`left`, because nothing ever told `hs-user` the forget occurred. This matches the reported
+symptom exactly ("a forgotten room is not leaving `/sync`'s `left` section correctly") and does
+not require any assumption about `hs-user`'s internals to explain -- the gap is fully on this
+crate's side of the interface, in what it fails to expose, even though the actual code that needs
+to change to consume it is track 05's.
+
+**Recommended fix, for whichever session picks this up** (not implemented this session --
+out of time after the higher-priority items above, and the instructions for this session asked
+for a diagnosis, not a fix, on this specific item): add a public
+`RoomActor::has_forgotten(&self, user: &UserId) -> bool` accessor (a one-line wrapper over the
+existing private `forgotten.contains`) so `hs-user` can check it directly through
+`RoomActorHandle::query`, the same pattern every other cross-crate read already uses in this
+codebase (`transaction_id_for`, `event_visible_to`, ...). Whether `hs-user` should poll this at
+sync time or whether `RoomActor::forget` should *also* start publishing a synthetic `RoomUpdate`
+(so a long-poll `/sync` in flight wakes up immediately instead of only reflecting the forget on
+its *next* poll) is a design call for track 05, not something to guess at from this side of the
+interface.
+
+## How to verify (session 5)
+
+```
+cargo fmt -p hs-room -- --check
+cargo clippy -p hs-room --all-targets --no-deps -- -D warnings   # --no-deps: hs-admin (track 15,
+                                                                  # in flight this session) fails
+                                                                  # -D warnings on its own unused
+                                                                  # imports; not this crate's bug,
+                                                                  # see "Blockers"
+cargo test -p hs-room
+```
+
+58 tests today (up from 48 at session start): 47 unit/property tests (`cargo test -p hs-room
+--lib`, up from 38) plus 11 `hs-testkit` scenario tests (`cargo test -p hs-room --test scenario`,
+up from 10) -- all green as of this session's last run.
+
+## Blockers
+
+**Transient, not this crate's fault, noted for whoever hits it next**: `cargo clippy -p hs-room
+--all-targets -- -D warnings` (without `--no-deps`) fails today because `hs-admin` (track 15,
+actively being edited this session) has an unused-import warning that `-D warnings` promotes to a
+hard error for the whole invocation, even though only `hs-room` was requested with `-p`. Use
+`--no-deps` to scope enforcement to this crate alone (verified clean); the plain form should start
+working again once track 15's edit settles. Similarly, mid-session, `cargo test -p hs-room --test
+scenario` briefly failed all 11 tests with `401 Unauthorized`/UIA-required on registration (an
+in-flight `hs-auth`/track 07 change to `POST /register`'s UIA requirements, reproduced twice,
+confirmed unrelated to anything in this crate via `cargo test -p hs-loadgen --test real_client`
+failing identically against a real `matrix-rust-sdk` client) -- this has since resolved itself
+(the same 11 tests pass again as of this session's final run) without this crate changing at all.
+Neither blocker needed or received a workaround in this crate.
 
 ## Session 4 (2026-09-19): fixing this track's largest Complement failure cluster
 
@@ -770,6 +1067,15 @@ None. Everything this pass needed from other tracks (`hs-kv`, `hs-tables`, `hs-m
 
 ## Interfaces provided
 
+- **Session 5 additions, most relevant to track 05**: `RoomActor::transaction_id_for(event_id,
+  viewer, viewer_device) -> Option<&str>` (call through `RoomActorHandle::query` to render
+  `unsigned.transaction_id` on `/sync` timeline events the way this crate's own routes now do --
+  see session 5, item 6); `RoomActor::thread_roots(requester, participated_only) -> Vec<&Event>`
+  (backs `/threads`); `CreateRoomRequest::room_id: Option<OwnedRoomId>` (additive, `None`
+  everywhere except `/upgrade`). **Track 05, read session 5's item 7 above**: this crate has no
+  public way to answer "has `user` forgotten this room" today (`RoomActor::forget`'s effect is
+  entirely private) -- that is very likely why a forgotten room does not leave `/sync`'s `left`
+  section; a small additive accessor is the recommended fix, not yet added.
 - `hs_room::actor::{RoomActor, RoomActorHandle, CreateRoomRequest, InitialStateEvent}`: the room
   actor and its async handle.
 - `hs_room::actor::{RoomActor, RoomActorHandle}::accept_remote_event` /

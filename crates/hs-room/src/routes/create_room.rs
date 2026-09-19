@@ -151,6 +151,7 @@ pub async fn post_create_room<B: KvBackend + 'static>(
             .get("room_alias_name")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        ..Default::default()
     };
 
     let handle = state

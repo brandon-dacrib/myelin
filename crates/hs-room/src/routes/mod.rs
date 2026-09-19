@@ -13,6 +13,8 @@ pub mod redact;
 pub mod relations;
 pub mod render;
 pub mod send_state;
+pub mod threads;
+pub mod upgrade;
 
 use hs_http::router::{AuthKind, Builder, RouteManifest, RouteMeta, Surface};
 use hs_kv::KvBackend;
@@ -201,6 +203,16 @@ pub fn router<B: KvBackend + 'static>() -> (axum::Router<RoomState<B>>, RouteMan
             "/rooms/{roomId}/relations/{eventId}/{relType}/{eventType}",
             relations::get_relations_by_rel_type_and_event_type::<B>,
             matrix_client("getRelatingEventsWithRelTypeAndEventType"),
+        )
+        .get(
+            "/rooms/{roomId}/threads",
+            threads::get_threads::<B>,
+            matrix_client("getThreadRoots"),
+        )
+        .post(
+            "/rooms/{roomId}/upgrade",
+            upgrade::post_upgrade::<B>,
+            matrix_client("upgradeRoom"),
         )
         .put(
             "/directory/list/room/{roomId}",

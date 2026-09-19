@@ -82,8 +82,20 @@ pub struct Bundle {
 
 /// Computes the bundle for a target event from its children, in the order the children were
 /// persisted (ascending `origin_server_ts`/timeline order is what callers should pass).
+///
+/// `root_sender` is the target (thread root) event's own sender, if known -- needed for
+/// `m.thread`'s `current_user_participated`, which the spec defines as true for *either* the
+/// sender of a threaded reply *or* the sender of the thread root itself
+/// (`refs/matrix-spec/content/client-server-api/modules/threading.md`, CC-BY-4.0: "The `sender`
+/// of the thread root event" is rule 1, listed before "the `sender` of an event which references
+/// the thread root"). `None` (the root is not resident, or genuinely has no sender on record)
+/// falls back to rule 2 alone.
 #[must_use]
-pub fn bundle(children: &[ChildEvent], requesting_user: &ruma::UserId) -> Bundle {
+pub fn bundle(
+    children: &[ChildEvent],
+    requesting_user: &ruma::UserId,
+    root_sender: Option<&ruma::UserId>,
+) -> Bundle {
     let mut out = Bundle::default();
 
     if let Some(latest_edit) = children
@@ -121,7 +133,8 @@ pub fn bundle(children: &[ChildEvent], requesting_user: &ruma::UserId) -> Bundle
         .filter(|c| c.relation.rel_type == "m.thread")
         .collect();
     if let Some(latest) = threads.iter().max_by_key(|c| c.origin_server_ts) {
-        let participated = threads.iter().any(|c| c.sender == requesting_user);
+        let participated = root_sender == Some(requesting_user)
+            || threads.iter().any(|c| c.sender == requesting_user);
         out.thread = Some(serde_json::json!({
             "latest_event": {
                 "event_id": latest.event_id.to_string(),
@@ -184,7 +197,7 @@ mod tests {
             child("m.annotation", Some("👍"), bob, 3),
             child("m.annotation", Some("🎉"), bob, 4),
         ];
-        let b = bundle(&children, alice);
+        let b = bundle(&children, alice, None);
         assert_eq!(b.replace.unwrap()["origin_server_ts"], 5);
         let chunk = b.annotation.unwrap()["chunk"].clone();
         assert_eq!(chunk.as_array().unwrap().len(), 2);
@@ -195,13 +208,35 @@ mod tests {
         let alice = user_id!("@alice:hs1");
         let bob = user_id!("@bob:hs1");
         let children = vec![child("m.thread", None, bob, 1)];
-        let b = bundle(&children, alice);
+        let b = bundle(&children, alice, Some(bob));
         let thread = b.thread.unwrap();
         assert_eq!(thread["count"], 1);
-        assert_eq!(thread["current_user_participated"], false);
+        assert_eq!(
+            thread["current_user_participated"], false,
+            "alice neither started nor replied to this thread"
+        );
 
         let children = vec![child("m.thread", None, alice, 1)];
-        let b = bundle(&children, alice);
-        assert_eq!(b.thread.unwrap()["current_user_participated"], true);
+        let b = bundle(&children, alice, Some(bob));
+        assert_eq!(
+            b.thread.unwrap()["current_user_participated"],
+            true,
+            "alice replied to the thread, even though bob started it"
+        );
+    }
+
+    /// Threading module rule 1 ("The `sender` of the thread root event"): a user who started a
+    /// thread but never replied to it still counts as having participated.
+    #[test]
+    fn bundle_counts_the_thread_root_sender_as_participating_even_without_a_reply() {
+        let alice = user_id!("@alice:hs1");
+        let bob = user_id!("@bob:hs1");
+        let children = vec![child("m.thread", None, bob, 1)];
+        let b = bundle(&children, alice, Some(alice));
+        assert_eq!(
+            b.thread.unwrap()["current_user_participated"],
+            true,
+            "alice started the thread, even though only bob has replied so far"
+        );
     }
 }

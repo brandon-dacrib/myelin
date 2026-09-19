@@ -47,6 +47,30 @@ pub fn client_event_json(event: &Event) -> serde_json::Value {
     value
 }
 
+/// Attaches `unsigned.transaction_id` if `txn_id` is `Some` -- the client-server API's local-echo
+/// field ("Transaction identifiers": a client matches an optimistic local copy of a message it
+/// sent against the real event by transaction ID). Left absent, exactly as [`client_event_json`]
+/// leaves it, when `txn_id` is `None` -- either the event was never sent through a
+/// `{txnId}`-suffixed endpoint, or the viewer is not the `(sender, device)` that sent it; see
+/// [`crate::actor::RoomActor::transaction_id_for`]'s doc comment for exactly which case is which.
+#[must_use]
+pub fn attach_transaction_id(
+    mut value: serde_json::Value,
+    txn_id: Option<&str>,
+) -> serde_json::Value {
+    if let Some(txn_id) = txn_id
+        && let Some(unsigned) = value
+            .get_mut("unsigned")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        unsigned.insert(
+            "transaction_id".to_owned(),
+            serde_json::Value::String(txn_id.to_owned()),
+        );
+    }
+    value
+}
+
 /// [`client_event_json`], with `bundle` attached to `unsigned.m.relations` if it has any
 /// aggregation to report (`crate::relations::bundle`'s bundled-aggregations module: `m.replace`,
 /// `m.annotation`, `m.thread`). A `Bundle` with nothing set (the target event has no children)

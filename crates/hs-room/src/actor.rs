@@ -60,6 +60,12 @@ pub struct CreateRoomRequest {
     pub creation_content: serde_json::Value,
     /// `room_alias_name`: the localpart of a local alias to create for this room.
     pub room_alias_name: Option<String>,
+    /// An explicit room ID to use instead of generating a fresh random one. `None` (the ordinary
+    /// `POST /createRoom` case) means "generate one" ([`RoomId::new_v1`]). `Some` exists for
+    /// `POST /rooms/{roomId}/upgrade` (`crate::routes::upgrade`), which must know the replacement
+    /// room's ID *before* creating it (to put it in the old room's `m.room.tombstone` content)
+    /// and therefore cannot let this function choose.
+    pub room_id: Option<OwnedRoomId>,
 }
 
 /// One `initial_state` entry.
@@ -205,6 +211,17 @@ pub struct RoomActor<B: KvBackend> {
     /// file for why that scope is enough to fix the bug this closes (a flaky-connection retry,
     /// not a reconnect minutes later) without a durable table.
     txn_dedup: HashMap<(OwnedUserId, String, String), OwnedEventId>,
+    /// The reverse of `txn_dedup`: `event_id -> (sender, device_id-or-empty, txn_id)`, for
+    /// rendering `unsigned.transaction_id` on the sending device's own echo of an event it sent
+    /// through a `{txnId}`-suffixed endpoint (client-server API "Local echo": a client matches an
+    /// optimistic local copy of a message against the real one by transaction ID). Scoped to
+    /// `(sender, device)` -- not access token -- because two sessions sharing one device ID (a
+    /// client that logged back in without allocating a new device, or a refreshed access token)
+    /// must see the same transaction ID for their own shared echo
+    /// (`txnid_test.go`'s `TestTxnScopeOnLocalEcho`/`TestTxnIdWithRefreshToken`); an *different*
+    /// device, or any other user, must never see it, even for the very same event. Same
+    /// in-memory-only lifetime caveat as `txn_dedup`.
+    event_txn: HashMap<OwnedEventId, (OwnedUserId, String, String)>,
     /// Users who have called `POST /rooms/{roomId}/forget` and not since rejoined. In-memory
     /// only, same scope caveat as `txn_dedup`: does not survive an idle eviction and reload
     /// (`RoomActor::load` does not repopulate it). Read by [`RoomActor::can_read_room`];
@@ -308,6 +325,7 @@ impl<B: KvBackend> RoomActor<B> {
             next_room_pos: 1,
             relations_by_target: HashMap::new(),
             txn_dedup: HashMap::new(),
+            event_txn: HashMap::new(),
             forgotten: HashSet::new(),
             publish,
         };
@@ -365,6 +383,7 @@ impl<B: KvBackend> RoomActor<B> {
             next_room_pos: 1,
             relations_by_target: HashMap::new(),
             txn_dedup: HashMap::new(),
+            event_txn: HashMap::new(),
             forgotten: HashSet::new(),
             publish,
         };
@@ -565,6 +584,17 @@ impl<B: KvBackend> RoomActor<B> {
     /// at once. See [`RoomActor::send_event_citing`] for building against an explicit, narrower
     /// ancestor set instead.
     ///
+    /// If `state_key` is `Some` and the room's *current* event for `(event_type, state_key)`
+    /// already carries exactly `content` (structural equality, key order insensitive), no new
+    /// event is built at all -- the existing one is returned as-is. This is the client-server
+    /// spec's documented idempotency for repeated state ("Setting state twice is idempotent",
+    /// `rooms_state_test.go`), and it is also what makes a repeated `m.room.member`/join with an
+    /// unchanged (not-freshly-profile-edited) content a no-op instead of a second join event
+    /// (`rooms_state_test.go`'s "Joining room twice is idempotent" -- [`RoomActor::membership_action`]
+    /// calls this, not [`RoomActor::send_event_citing`] directly, for exactly this reason). A
+    /// message event (`state_key: None`) is never affected: those only deduplicate on transaction
+    /// ID, via [`RoomActor::send_event_txn`].
+    ///
     /// # Errors
     /// See `crate::pipeline::build_and_authorize` and [`RoomActor::persist`].
     pub fn send_event(
@@ -576,10 +606,47 @@ impl<B: KvBackend> RoomActor<B> {
         redacts: Option<OwnedEventId>,
         now_ms: i64,
     ) -> Result<Event, RoomError> {
+        if let Some(existing) =
+            self.idempotent_state_reuse(&event_type, state_key.as_deref(), &content)?
+        {
+            return Ok(existing);
+        }
         let prev_sns = self.forward_extremities_vec();
         self.send_event_citing(
             sender, event_type, state_key, content, redacts, now_ms, &prev_sns,
         )
+    }
+
+    /// The idempotency check [`RoomActor::send_event`]'s doc comment describes. Returns the
+    /// existing event when it applies, `None` when a new event should genuinely be built.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::State`] if reading the current state fails.
+    fn idempotent_state_reuse(
+        &self,
+        event_type: &str,
+        state_key: Option<&str>,
+        content: &serde_json::Value,
+    ) -> Result<Option<Event>, RoomError> {
+        let Some(state_key) = state_key else {
+            return Ok(None);
+        };
+        let Some(existing) = self.state_event(event_type, state_key)? else {
+            return Ok(None);
+        };
+        let existing_content = existing
+            .json()
+            .get("content")
+            .map(|v| {
+                serde_json::from_slice::<serde_json::Value>(&v.to_canonical_bytes())
+                    .unwrap_or(serde_json::Value::Null)
+            })
+            .unwrap_or(serde_json::Value::Null);
+        if &existing_content == content {
+            Ok(Some(existing.clone()))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Builds, hashes, signs, authorizes and persists a new event citing exactly `prev_events` as
@@ -1066,7 +1133,10 @@ impl<B: KvBackend> RoomActor<B> {
         let rules = room_version::rules_for(&room_version)
             .ok_or_else(|| RoomError::UnsupportedRoomVersion(room_version.as_str().to_owned()))?;
 
-        let room_id = RoomId::new_v1(&identity.server_name);
+        let room_id = request
+            .room_id
+            .clone()
+            .unwrap_or_else(|| RoomId::new_v1(&identity.server_name));
 
         let mut creation_content = request.creation_content.clone();
         if !creation_content.is_object() {
@@ -1390,6 +1460,57 @@ impl<B: KvBackend> RoomActor<B> {
     /// Returns [`RoomError::State`] if the state store fails.
     pub fn full_state(&self) -> Result<Vec<&Event>, RoomError> {
         self.state_at_root(self.current_view()?.root)
+    }
+
+    /// `POST /rooms/{roomId}/upgrade`'s step 3: whichever of the spec's recommended transferable
+    /// state event types
+    /// (`refs/matrix-spec/content/client-server-api/modules/room_upgrades.md`, CC-BY-4.0 --
+    /// `m.room.server_acl`, `m.room.encryption`, `m.room.name`, `m.room.avatar`, `m.room.topic`,
+    /// `m.room.guest_access`, `m.room.history_visibility`, `m.room.join_rules`,
+    /// `m.room.power_levels`) this room currently has set, as `(event_type, content)` pairs in
+    /// that fixed order. Membership events and anything sender-sensitive outside this list are
+    /// deliberately never included, per the same spec section ("servers should not transfer state
+    /// events which are sensitive to who sent them").
+    #[must_use]
+    pub fn transferable_state(&self) -> Vec<(&'static str, serde_json::Value)> {
+        const TRANSFERABLE: &[&str] = &[
+            "m.room.server_acl",
+            "m.room.encryption",
+            "m.room.name",
+            "m.room.avatar",
+            "m.room.topic",
+            "m.room.guest_access",
+            "m.room.history_visibility",
+            "m.room.join_rules",
+            "m.room.power_levels",
+        ];
+        TRANSFERABLE
+            .iter()
+            .filter_map(|&event_type| {
+                let event = self.state_event(event_type, "").ok().flatten()?;
+                let content = event.json().get("content")?;
+                let content =
+                    serde_json::from_slice::<serde_json::Value>(&content.to_canonical_bytes())
+                        .ok()?;
+                Some((event_type, content))
+            })
+            .collect()
+    }
+
+    /// The `type` field on this room's `m.room.create` event, if it has one -- `/upgrade` copies
+    /// it into the replacement room's own create event verbatim (spec step 2: "a `type` field
+    /// which is copied from the predecessor room").
+    #[must_use]
+    pub fn creation_type(&self) -> Option<String> {
+        self.state_event("m.room.create", "")
+            .ok()
+            .flatten()?
+            .json()
+            .get("content")?
+            .as_object()?
+            .get("type")?
+            .as_str()
+            .map(str::to_owned)
     }
 
     /// Shared by [`RoomActor::full_state`] and [`RoomActor::full_state_for_reader`]: every event
@@ -1825,6 +1946,7 @@ impl<B: KvBackend> RoomActor<B> {
     /// per-viewer).
     #[must_use]
     pub fn relation_bundle(&self, target: &EventId, requesting_user: &UserId) -> relations::Bundle {
+        let root_sender = self.event_by_id(target).map(|e| e.header().sender.as_ref());
         let children: Vec<relations::ChildEvent> = self
             .relations_of(target, None)
             .into_iter()
@@ -1844,7 +1966,58 @@ impl<B: KvBackend> RoomActor<B> {
                 })
             })
             .collect();
-        relations::bundle(&children, requesting_user)
+        relations::bundle(&children, requesting_user, root_sender)
+    }
+
+    /// `GET /rooms/{roomId}/threads`: every event in this room that is the target of at least one
+    /// `m.thread`-`rel_type` relation (a thread root), newest-active-thread first -- ordered by
+    /// the latest `m.thread` child's `origin_server_ts`, descending. `room_threads_test.go`'s
+    /// `TestThreadsEndpoint` checks this ordering directly, including that a new reply to an
+    /// older thread moves it back to the front.
+    ///
+    /// `participated_only` applies the `?include=participated` filter: a thread is kept only if
+    /// `requester` is the root's sender or the sender of one of its `m.thread` children (the
+    /// module's `current_user_participated` rule -- see [`relations::bundle`]'s doc comment).
+    ///
+    /// Visibility (`m.room.history_visibility`) is **not** applied here: this returns every
+    /// thread root this actor holds, full stop. Callers must filter through
+    /// [`RoomActor::event_visible_to`] themselves, exactly as `crate::routes::query::get_messages`
+    /// filters its own timeline scan -- keeping the visibility policy in one place (`event_visible_to`
+    /// itself) rather than duplicating it into every enumeration method.
+    #[must_use]
+    pub fn thread_roots(&self, requester: &UserId, participated_only: bool) -> Vec<&Event> {
+        let mut roots: Vec<(&Event, i64)> = self
+            .relations_by_target
+            .keys()
+            .filter_map(|target| {
+                let root = self.event_by_id(target)?;
+                let thread_children = self.relations_of(target, Some("m.thread"));
+                if thread_children.is_empty() {
+                    return None;
+                }
+                if participated_only {
+                    let participated = root.header().sender == *requester
+                        || thread_children
+                            .iter()
+                            .any(|c| c.header().sender == *requester);
+                    if !participated {
+                        return None;
+                    }
+                }
+                let latest_ts = thread_children
+                    .iter()
+                    .map(|c| c.header().origin_server_ts)
+                    .max()?;
+                Some((root, latest_ts))
+            })
+            .collect();
+        // Descending by latest activity, with event ID as a deterministic tie-break (two threads
+        // updated in the same millisecond must still sort consistently across calls).
+        roots.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| a.0.event_id().cmp(b.0.event_id()))
+        });
+        roots.into_iter().map(|(e, _)| e).collect()
     }
 
     /// Subscribes to this room's publish stream. See `crate::protocol`.
@@ -1915,6 +2088,47 @@ impl<B: KvBackend> RoomActor<B> {
         self.event_by_id(event_id)
     }
 
+    /// Records `event`'s `(sender, device, txnId)` in both directions: `txn_dedup` (used by
+    /// [`RoomActor::dedup_lookup`] to replay it) and `event_txn` (used by
+    /// [`RoomActor::transaction_id_for`] to render `unsigned.transaction_id` back to the sending
+    /// device later).
+    fn record_txn(
+        &mut self,
+        sender: &UserId,
+        device_id: Option<&ruma::DeviceId>,
+        txn_id: &str,
+        event_id: &EventId,
+    ) {
+        let key = Self::dedup_key(sender, device_id, txn_id);
+        self.txn_dedup.insert(key.clone(), event_id.to_owned());
+        self.event_txn.insert(event_id.to_owned(), key);
+    }
+
+    /// The transaction ID `event_id` was sent with, if any, **and** `viewer`/`viewer_device`
+    /// match the `(sender, device)` that sent it (client-server API "Local echo": only the
+    /// sending device's own view of the event carries `unsigned.transaction_id` --
+    /// `txnid_test.go`'s `TestTxnScopeOnLocalEcho`). Same in-memory-only lifetime caveat as
+    /// [`RoomActor::txn_dedup`]: a room reloaded after idle eviction has forgotten every
+    /// transaction ID it ever saw, so this returns `None` for events sent before the last reload
+    /// even to their own sender.
+    #[must_use]
+    pub fn transaction_id_for(
+        &self,
+        event_id: &EventId,
+        viewer: &UserId,
+        viewer_device: Option<&ruma::DeviceId>,
+    ) -> Option<&str> {
+        let (sender, device, txn_id) = self.event_txn.get(event_id)?;
+        if sender != viewer {
+            return None;
+        }
+        let viewer_device = viewer_device.map(ToString::to_string).unwrap_or_default();
+        if *device != viewer_device {
+            return None;
+        }
+        Some(txn_id.as_str())
+    }
+
     /// Sends a `{txnId}`-suffixed non-state event (`PUT .../send/{eventType}/{txnId}`),
     /// deduplicating on `(sender, device, txnId)`: replaying the same transaction ID returns the
     /// same event rather than sending a second one.
@@ -1934,10 +2148,7 @@ impl<B: KvBackend> RoomActor<B> {
             return Ok(existing.clone());
         }
         let event = self.send_event(sender.clone(), event_type, None, content, None, now_ms)?;
-        self.txn_dedup.insert(
-            Self::dedup_key(&sender, device_id, txn_id),
-            event.event_id().to_owned(),
-        );
+        self.record_txn(&sender, device_id, txn_id, event.event_id());
         Ok(event)
     }
 
@@ -1972,10 +2183,7 @@ impl<B: KvBackend> RoomActor<B> {
             now_ms,
         )?;
         self.apply_redaction(&target)?;
-        self.txn_dedup.insert(
-            Self::dedup_key(&sender, device_id, txn_id),
-            event.event_id().to_owned(),
-        );
+        self.record_txn(&sender, device_id, txn_id, event.event_id());
         Ok(event)
     }
 }
@@ -2322,6 +2530,75 @@ mod tests {
         let joined = actor.joined_members().unwrap();
         assert_eq!(joined.len(), 1);
         assert_eq!(joined[0].header().state_key.as_deref(), Some("@alice:hs1"));
+    }
+
+    /// The bug `docs/rfcs/0014-event-signing-must-sign-the-redacted-form.md` describes: an
+    /// event's signature must be computed over its *redacted* form -- spec order is hash the full
+    /// event, redact, sign the redacted object, then copy the resulting signature back onto the
+    /// full event (`refs/matrix-spec/content/server-server-api.md`, "Adding hashes and signatures
+    /// to outgoing events") -- not over the full, unredacted event directly. `m.room.message` is
+    /// the sharpest case: redaction strips *all* of its `content`
+    /// (`hs_model::redaction::redact_content`), so signing the unredacted object produces a
+    /// signature a spec-compliant verifier -- which always redacts before checking -- rejects
+    /// outright.
+    #[test]
+    fn a_sent_message_is_signed_over_its_redacted_form_not_the_full_event() {
+        let mut actor = room("public_chat");
+        let alice = user_id!("@alice:hs1").to_owned();
+
+        let event = actor
+            .send_event(
+                alice,
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"msgtype": "m.text", "body": "hello, redact me"}),
+                None,
+                2,
+            )
+            .unwrap();
+
+        let rules = room_version::rules_for(actor.room_version()).unwrap();
+        let redacted = hs_model::redaction::redact(event.json(), &rules.redaction).unwrap();
+
+        let verifying_key = actor.identity.signing_key.verifying_key();
+        let key_id = actor.identity.signing_key.key_id();
+        let server_name = actor.identity.server_name.as_str();
+
+        // The spec-compliant check -- verify against the *redacted* form -- must succeed.
+        hs_model::signing::verify_object(&redacted, server_name, &key_id, &verifying_key)
+            .expect("a real, spec-compliant verifier redacts before checking -- this must verify");
+
+        // The fix must not affect what this server actually stores and serves: the full,
+        // unredacted event's `content` is still there for an ordinary client to read. Only what
+        // gets hashed to produce the signature bytes changes.
+        assert_eq!(
+            event
+                .json()
+                .get("content")
+                .and_then(CanonicalJsonValue::as_object)
+                .and_then(|c| c.get("body"))
+                .and_then(CanonicalJsonValue::as_str),
+            Some("hello, redact me")
+        );
+
+        // Negative check, proving this test actually exercises the bug: the full, unredacted
+        // event's `content` must genuinely differ from the redacted form's (otherwise this test
+        // would pass even with the old, buggy "sign the full event" code), and verifying the
+        // full object against the same signature must fail, since the signature covers only the
+        // redacted bytes.
+        let full = event.json();
+        assert_ne!(
+            full.get("content"),
+            redacted.get("content"),
+            "an m.room.message's content must actually be stripped by redaction, or this test \
+             proves nothing"
+        );
+        let err = hs_model::signing::verify_object(full, server_name, &key_id, &verifying_key);
+        assert!(
+            err.is_err(),
+            "the full, unredacted object must NOT verify under a signature computed over the \
+             redacted form -- if it does, this test is not exercising the bug"
+        );
     }
 
     #[test]
@@ -2885,6 +3162,142 @@ mod tests {
         assert_eq!(redact_first.event_id(), redact_retried.event_id());
     }
 
+    /// `unsigned.transaction_id`'s rendering contract (`RoomActor::transaction_id_for`):
+    /// present for the sending `(user, device)`, absent for a different device of the same user,
+    /// absent for a different user entirely, and absent for an event that was never sent through
+    /// a `{txnId}`-suffixed endpoint at all.
+    #[test]
+    fn transaction_id_for_is_scoped_to_sender_and_device() {
+        use ruma::device_id;
+        let mut actor = room("public_chat");
+        let alice = user_id!("@alice:hs1").to_owned();
+
+        let event = actor
+            .send_event_txn(
+                alice.clone(),
+                Some(device_id!("DEVICE1")),
+                "txn-scope",
+                "m.room.message".to_owned(),
+                serde_json::json!({"body": "hi"}),
+                2,
+            )
+            .unwrap();
+
+        assert_eq!(
+            actor.transaction_id_for(event.event_id(), &alice, Some(device_id!("DEVICE1"))),
+            Some("txn-scope"),
+            "the sending device must see its own transaction id"
+        );
+        assert_eq!(
+            actor.transaction_id_for(event.event_id(), &alice, Some(device_id!("DEVICE2"))),
+            None,
+            "a different device of the same user must not see it"
+        );
+        assert_eq!(
+            actor.transaction_id_for(
+                event.event_id(),
+                user_id!("@bob:hs1"),
+                Some(device_id!("DEVICE1"))
+            ),
+            None,
+            "a different user must not see it, even with the same device id"
+        );
+
+        // An ordinary state event (not sent through a `{txnId}` endpoint) never carries one.
+        let state_event = actor
+            .send_event(
+                alice.clone(),
+                "m.room.topic".to_owned(),
+                Some(String::new()),
+                serde_json::json!({"topic": "hello"}),
+                None,
+                3,
+            )
+            .unwrap();
+        assert_eq!(
+            actor.transaction_id_for(state_event.event_id(), &alice, Some(device_id!("DEVICE1"))),
+            None
+        );
+    }
+
+    /// Client-server API "Setting state twice is idempotent" (`rooms_state_test.go`): resending
+    /// the exact same `(event_type, state_key, content)` returns the existing event rather than
+    /// persisting a second one; a genuinely different content still creates a new event.
+    #[test]
+    fn setting_the_same_state_twice_is_idempotent() {
+        let mut actor = room("public_chat");
+        let alice = user_id!("@alice:hs1").to_owned();
+
+        let first = actor
+            .send_event(
+                alice.clone(),
+                "a.test.state.type".to_owned(),
+                Some(String::new()),
+                serde_json::json!({"a_key": "a_value"}),
+                None,
+                2,
+            )
+            .unwrap();
+        let second = actor
+            .send_event(
+                alice.clone(),
+                "a.test.state.type".to_owned(),
+                Some(String::new()),
+                serde_json::json!({"a_key": "a_value"}),
+                None,
+                3,
+            )
+            .unwrap();
+        assert_eq!(
+            first.event_id(),
+            second.event_id(),
+            "identical state content must not create a second event"
+        );
+
+        let changed = actor
+            .send_event(
+                alice,
+                "a.test.state.type".to_owned(),
+                Some(String::new()),
+                serde_json::json!({"a_key": "a_different_value"}),
+                None,
+                4,
+            )
+            .unwrap();
+        assert_ne!(
+            first.event_id(),
+            changed.event_id(),
+            "genuinely different content must still create a new event"
+        );
+    }
+
+    /// Client-server API "Joining room twice is idempotent" (`rooms_state_test.go`): a repeated
+    /// join with unchanged content (no profile change in between) must not mint a second
+    /// `m.room.member` event.
+    #[test]
+    fn joining_a_room_twice_is_idempotent() {
+        let mut actor = room("public_chat");
+        let bob = user_id!("@bob:hs1").to_owned();
+
+        let first = actor
+            .membership_action(
+                bob.clone(),
+                Action::Join,
+                bob.clone(),
+                serde_json::json!({}),
+                2,
+            )
+            .unwrap();
+        let second = actor
+            .membership_action(bob.clone(), Action::Join, bob, serde_json::json!({}), 3)
+            .unwrap();
+        assert_eq!(
+            first.event_id(),
+            second.event_id(),
+            "rejoining with unchanged content must not create a second join event"
+        );
+    }
+
     // --- `RoomActor::accept_remote_event`: the "join a real public room over federation" gap ---
 
     /// Builds a `m.room.message`, hashed and signed exactly the way `hs_federation::inbound`'s
@@ -3137,6 +3550,137 @@ mod tests {
         assert!(
             matches!(err, RoomError::MissingAncestors(_)),
             "expected MissingAncestors, got {err:?}"
+        );
+    }
+
+    // --- `GET /rooms/{roomId}/threads`: `RoomActor::thread_roots` ---
+
+    fn thread_reply(
+        actor: &mut RoomActor<MemoryBackend>,
+        sender: &UserId,
+        root: &EventId,
+        now_ms: i64,
+    ) -> Event {
+        actor
+            .send_event(
+                sender.to_owned(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({
+                    "msgtype": "m.text",
+                    "body": "reply",
+                    "m.relates_to": {"rel_type": "m.thread", "event_id": root.as_str()},
+                }),
+                None,
+                now_ms,
+            )
+            .unwrap()
+    }
+
+    /// `room_threads_test.go`'s `TestThreadsEndpoint`: thread roots come back most-recently-active
+    /// first, and a new reply to an older thread moves it back to the front.
+    #[test]
+    fn thread_roots_are_ordered_by_latest_reply_and_reorder_on_a_new_reply() {
+        let mut actor = room("public_chat");
+        let alice = user_id!("@alice:hs1").to_owned();
+
+        let root1 = actor
+            .send_event(
+                alice.clone(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"msgtype": "m.text", "body": "Thread 1 Root"}),
+                None,
+                2,
+            )
+            .unwrap();
+        let root2 = actor
+            .send_event(
+                alice.clone(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"msgtype": "m.text", "body": "Thread 2 Root"}),
+                None,
+                3,
+            )
+            .unwrap();
+        thread_reply(&mut actor, &alice, root1.event_id(), 4);
+        thread_reply(&mut actor, &alice, root2.event_id(), 5);
+
+        let roots = actor.thread_roots(&alice, false);
+        assert_eq!(
+            roots.iter().map(|e| e.event_id()).collect::<Vec<_>>(),
+            vec![root2.event_id(), root1.event_id()],
+            "the thread with the most recent reply (root2) must come first"
+        );
+
+        // A new reply to the *older* thread must move it back to the front.
+        thread_reply(&mut actor, &alice, root1.event_id(), 6);
+        let roots = actor.thread_roots(&alice, false);
+        assert_eq!(
+            roots.iter().map(|e| e.event_id()).collect::<Vec<_>>(),
+            vec![root1.event_id(), root2.event_id()],
+            "a new reply to root1's thread must move it back to the front"
+        );
+    }
+
+    /// `?include=participated`: only threads the requester started or replied to come back.
+    #[test]
+    fn thread_roots_participated_filter_matches_the_threading_module_rules() {
+        let mut actor = room("public_chat");
+        let alice = user_id!("@alice:hs1").to_owned();
+        let bob = user_id!("@bob:hs1").to_owned();
+        actor
+            .membership_action(
+                bob.clone(),
+                Action::Join,
+                bob.clone(),
+                serde_json::json!({}),
+                2,
+            )
+            .unwrap();
+
+        // alice starts a thread but never replies to it (rule 1: root sender counts).
+        let alice_root = actor
+            .send_event(
+                alice.clone(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"msgtype": "m.text", "body": "alice's thread"}),
+                None,
+                3,
+            )
+            .unwrap();
+        thread_reply(&mut actor, &bob, alice_root.event_id(), 4);
+
+        // bob starts a different thread that alice never touches at all.
+        let bob_root = actor
+            .send_event(
+                bob.clone(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"msgtype": "m.text", "body": "bob's thread"}),
+                None,
+                5,
+            )
+            .unwrap();
+        thread_reply(&mut actor, &bob, bob_root.event_id(), 6);
+
+        let all = actor.thread_roots(&alice, false);
+        assert_eq!(
+            all.len(),
+            2,
+            "both threads exist regardless of participation"
+        );
+
+        let participated = actor.thread_roots(&alice, true);
+        assert_eq!(
+            participated
+                .iter()
+                .map(|e| e.event_id())
+                .collect::<Vec<_>>(),
+            vec![alice_root.event_id()],
+            "alice participated only in her own thread, never bob's"
         );
     }
 }
