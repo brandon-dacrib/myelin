@@ -174,6 +174,46 @@ pub struct MediaConfig {
     /// authenticated media is not optional here).
     #[serde(default = "default_true")]
     pub allow_legacy_unauthenticated_media: bool,
+    /// Per-request timeout for a `preview_url` fetch (each redirect hop is
+    /// timed separately). Synapse has no config knob for this — it hardcodes
+    /// a 30-second body-read timeout in its HTTP client
+    /// (`refs/synapse/synapse/http/client.py`'s `get_file`, `timeout_deferred(...,
+    /// timeout=30, ...)`); this project exposes it as a real setting instead.
+    /// See `docs/rfcs/0006-url-previews.md` section 4.5 and
+    /// `hs_media::preview::FetchLimits::timeout`, which this field is meant
+    /// to populate (`hs-media` cannot depend on this crate's consumer wiring
+    /// — see that crate's status file for the one-line change needed).
+    #[serde(default = "default_url_preview_timeout")]
+    pub url_preview_timeout: Duration,
+    /// Maximum response body size accepted for a `preview_url` page fetch or
+    /// its `og:image` fetch (each capped independently at this value).
+    /// Corresponds to Synapse's `max_spider_size`, whose own default is
+    /// `"10M"` (`refs/synapse/synapse/config/repository.py`:
+    /// `self.max_spider_size = self.parse_size(config.get("max_spider_size",
+    /// "10M"))`). See `hs_media::preview::FetchLimits::max_body_bytes`.
+    #[serde(default = "default_url_preview_max_fetch_size")]
+    pub url_preview_max_fetch_size: ByteSize,
+    /// How long a `preview_url` response is cached before it is fetched
+    /// again. Synapse has no config knob for this either — it hardcodes a
+    /// one-hour cache lifetime (`refs/synapse/synapse/media/url_previewer.py`:
+    /// `ONE_HOUR = 60 * 60 * 1000`, used as both the in-memory and the
+    /// on-disk `url_cache` expiry); this project exposes it as a real
+    /// setting instead. See `hs_media::preview::DEFAULT_PREVIEW_CACHE_TTL_MS`,
+    /// which this field is meant to replace.
+    #[serde(default = "default_url_preview_cache_lifetime")]
+    pub url_preview_cache_lifetime: Duration,
+}
+
+fn default_url_preview_timeout() -> Duration {
+    Duration::from_secs(30)
+}
+
+fn default_url_preview_max_fetch_size() -> ByteSize {
+    ByteSize::mib(10)
+}
+
+fn default_url_preview_cache_lifetime() -> Duration {
+    Duration::from_hours(1)
 }
 
 fn default_preview_blocklist() -> Vec<String> {
@@ -200,6 +240,9 @@ impl Default for MediaConfig {
             url_preview_ip_range_blocklist: default_preview_blocklist(),
             remote_media_retention: default_remote_media_retention(),
             allow_legacy_unauthenticated_media: true,
+            url_preview_timeout: default_url_preview_timeout(),
+            url_preview_max_fetch_size: default_url_preview_max_fetch_size(),
+            url_preview_cache_lifetime: default_url_preview_cache_lifetime(),
         }
     }
 }
@@ -227,6 +270,18 @@ impl Validate for MediaConfig {
             if let Err(e) = validate_cidr(cidr) {
                 errors.push(format!("{prefix}.url_preview_ip_range_blocklist[{i}]"), e);
             }
+        }
+        if self.url_preview_timeout.is_zero() {
+            errors.push(
+                format!("{prefix}.url_preview_timeout"),
+                "must be greater than 0",
+            );
+        }
+        if self.url_preview_max_fetch_size.as_u64() == 0 {
+            errors.push(
+                format!("{prefix}.url_preview_max_fetch_size"),
+                "must be greater than 0",
+            );
         }
         match &self.storage {
             MediaStorageBackend::Local { path } => {
@@ -356,5 +411,44 @@ mod tests {
         assert!(validate_cidr("10.0.0.0/33").is_err());
         assert!(validate_cidr("10.0.0.0/24").is_ok());
         assert!(validate_cidr("::1/129").is_err());
+    }
+
+    #[test]
+    fn rejects_zero_url_preview_timeout() {
+        let mut cfg = MediaConfig::default();
+        cfg.url_preview_timeout = Duration::ZERO;
+        let mut errors = ValidationErrors::new();
+        cfg.validate("media", &mut errors);
+        assert_eq!(errors.0.len(), 1);
+        assert_eq!(errors.0[0].path, "media.url_preview_timeout");
+    }
+
+    #[test]
+    fn rejects_zero_url_preview_max_fetch_size() {
+        let mut cfg = MediaConfig::default();
+        cfg.url_preview_max_fetch_size = ByteSize::bytes(0);
+        let mut errors = ValidationErrors::new();
+        cfg.validate("media", &mut errors);
+        assert_eq!(errors.0.len(), 1);
+        assert_eq!(errors.0[0].path, "media.url_preview_max_fetch_size");
+    }
+
+    #[test]
+    fn url_preview_defaults_match_synapse_behavior() {
+        // See the field doc comments for exactly which `refs/synapse` source lines these were
+        // checked against (Synapse hardcodes all three; none are Synapse config options).
+        let cfg = MediaConfig::default();
+        assert_eq!(cfg.url_preview_timeout, Duration::from_secs(30));
+        assert_eq!(cfg.url_preview_max_fetch_size, ByteSize::mib(10));
+        assert_eq!(cfg.url_preview_cache_lifetime, Duration::from_hours(1));
+    }
+
+    #[test]
+    fn url_preview_fields_round_trip_through_yaml() {
+        let yaml = "url_preview_timeout: \"5s\"\nurl_preview_max_fetch_size: \"2M\"\nurl_preview_cache_lifetime: \"30m\"\n";
+        let cfg: MediaConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(cfg.url_preview_timeout, Duration::from_secs(5));
+        assert_eq!(cfg.url_preview_max_fetch_size, ByteSize::mib(2));
+        assert_eq!(cfg.url_preview_cache_lifetime, Duration::from_mins(30));
     }
 }

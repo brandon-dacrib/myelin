@@ -107,7 +107,7 @@ pub const OPTIONS: &[KeyInfo] = &[
         key: "serve_server_wellknown",
         classification: Classification::MappedDiff,
         native: "`server.well_known_server`",
-        note: "Synapse takes a boolean and derives the advertised value itself; the native field takes the advertised `host[:port]` directly, so `serve_server_wellknown: true` translates to whatever destination that deployment actually delegates to, which the Synapse config alone does not state. Unset means the route 404s (`crates/hs-cli/src/well_known.rs`).",
+        note: "Synapse takes a boolean and derives the advertised value from `server_name` itself (`host:443`, or `server_name` verbatim if it already names a port); the native field takes the advertised `host[:port]` directly instead. The translator (`crate::translate::derive_well_known_server`) reproduces Synapse's derivation exactly, so `serve_server_wellknown: true` is fully translated, not merely acknowledged. Unset means the route 404s (`crates/hs-cli/src/well_known.rs`).",
     },
     KeyInfo {
         key: "extra_well_known_client_content",
@@ -459,9 +459,9 @@ pub const OPTIONS: &[KeyInfo] = &[
     },
     KeyInfo {
         key: "federation_custom_ca_list",
-        classification: Classification::Unsupported,
-        native: "",
-        note: "R-PHASE1 (hs-federation). Only the platform CA trust store is used today.",
+        classification: Classification::MappedDiff,
+        native: "`federation.custom_ca_certificates`",
+        note: "Checked against `crates/hs-federation/src/client.rs`, which loads these PEM files into the outbound federation TLS trust store, and `crates/hs-config/src/federation.rs`'s doc comment. The shapes match (both a flat list of PEM file paths) but the trust semantics differ: Synapse's `trustRootFromCertificates` *replaces* the platform trust store with exactly this list (`refs/synapse/synapse/config/tls.py`, `refs/synapse/synapse/crypto/context_factory.py`), while the native field adds these CAs *on top of* the ~140 bundled public roots. An operator relying on Synapse's replace semantics to federate only with a closed set of privately-CA'd servers gets a looser trust boundary here unless they also set `federation.verify_certificates = false` and rely on the custom CA alone being sufficient, which is not equivalent either — flagged for that operator to review, not silently translated as identical.",
     },
     KeyInfo {
         key: "federation_domain_whitelist",
@@ -759,9 +759,9 @@ pub const OPTIONS: &[KeyInfo] = &[
     },
     KeyInfo {
         key: "max_spider_size",
-        classification: Classification::Unsupported,
-        native: "",
-        note: "R-PHASE1 (hs-media, preview fetch byte cap).",
+        classification: Classification::Mapped,
+        native: "`media.url_preview_max_fetch_size`",
+        note: "Checked against `crates/hs-media/src/preview.rs`'s `FetchLimits::max_body_bytes` (still a hardcoded 10 MiB constant as of this check — see that crate's status file for the one-line consumer change needed to read this field instead) and `refs/synapse/synapse/config/repository.py`'s `max_spider_size` default (`\"10M\"`), which the native field's own default matches.",
     },
     KeyInfo {
         key: "url_preview_accept_language",

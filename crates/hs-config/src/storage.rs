@@ -72,12 +72,28 @@ pub struct PostgresStorageConfig {
     #[serde(default)]
     pub password_file: Option<PathBuf>,
     /// Connection pool size. Corresponds to Synapse's
-    /// `database.args.cp_max`.
+    /// `database.args.cp_max`. Accepted by `hs_kv::postgres_backend::PostgresBackend::open`'s
+    /// caller today but not yet threaded through — `open` hardcodes a pool size of 16 regardless
+    /// of this value (see `docs/status/01-storage-engine.md`'s "Wiring the integration lead must
+    /// add" item 5, checked); wiring it is a small change to that backend's public constructor,
+    /// not a config-schema gap.
     #[serde(default = "default_pool_size")]
     pub pool_size: u32,
-    /// Require TLS for the connection.
+    /// Require TLS for the connection. Accepted but not yet honoured:
+    /// `hs_kv::postgres_backend::PostgresBackend::open` connects with `postgres::NoTls`
+    /// unconditionally, and `crates/hs-cli/src/storage.rs` (checked) returns a startup error
+    /// naming this field rather than silently connecting in the clear when it is `true`, until
+    /// TLS support is added to that backend.
     #[serde(default)]
     pub tls: bool,
+    // Deliberately no `schema` field yet: `hs_kv::postgres_backend::PostgresBackend::open(dsn,
+    // schema)` takes one, and `crates/hs-cli/src/storage.rs` hardcodes `"public"` for it (checked
+    // — see `docs/status/01-storage-engine.md`'s "Wiring the integration lead must add" item 4),
+    // but `PostgresStorageConfig` is built as a full struct literal (not `..Default::default()`)
+    // in that crate's own test module, which this track cannot edit — adding a field here today
+    // would break `hs-cli`'s build out from under it. Add this field in the same change that
+    // updates both of `hs-cli`'s literal constructions (`open_postgres` and its test's
+    // `postgres_config` helper), not as an `hs-config`-only change.
 }
 
 fn default_pg_port() -> u16 {

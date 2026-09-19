@@ -68,8 +68,8 @@ PostgreSQL. The default clustered backend.
 | `user` | string | *required* | Connecting role. |
 | `password` *(secret)* | string | — | An inline secret value. Prefer the matching `*_file` key to avoid putting secrets in the config file. |
 | `password_file` *(secret)* | string \| null | — | Path to a file containing the password. |
-| `pool_size` | integer | `10` | Connection pool size. Corresponds to Synapse's `database.args.cp_max`. |
-| `tls` | boolean | `false` | Require TLS for the connection. |
+| `pool_size` | integer | `10` | Connection pool size. Corresponds to Synapse's `database.args.cp_max`. Accepted by `hs_kv::postgres_backend::PostgresBackend::open`'s caller today but not yet threaded through — `open` hardcodes a pool size of 16 regardless of this value (see `docs/status/01-storage-engine.md`'s "Wiring the integration lead must add" item 5, checked); wiring it is a small change to that backend's public constructor, not a config-schema gap. |
+| `tls` | boolean | `false` | Require TLS for the connection. Accepted but not yet honoured: `hs_kv::postgres_backend::PostgresBackend::open` connects with `postgres::NoTls` unconditionally, and `crates/hs-cli/src/storage.rs` (checked) returns a startup error naming this field rather than silently connecting in the clear when it is `true`, until TLS support is added to that backend. |
 
 ### `storage` variant: `slatedb`
 
@@ -97,6 +97,9 @@ Media repository settings.
 | `url_preview_ip_range_blocklist` | array<string> | `["127.0.0.0/8","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","100.64.0.0/10","169.254.0.0/16","::1/128","fe80::/10","fc00::/7"]` | IP ranges URL previews must not fetch from (SSRF protection). Corresponds to Synapse's `url_preview_ip_range_blacklist`. |
 | `remote_media_retention` | object | — | How long to keep cached copies of remote media. `None` means keep forever. Corresponds to Synapse's `media_retention.remote_media_lifetime`. |
 | `allow_legacy_unauthenticated_media` | boolean | `true` | Serve the pre-authentication-media (legacy, unauthenticated) endpoints alongside the authenticated ones. Corresponds to Synapse's `enable_authenticated_media` (inverted: this flag adds the legacy endpoints rather than removing the new ones, since authenticated media is not optional here). |
+| `url_preview_timeout` | string \| integer | — | A duration: a string of <number><unit> groups (ms, s, m, h, d, w, y), or an integer number of milliseconds. |
+| `url_preview_max_fetch_size` | string \| integer | — | A byte size: a number with an optional unit (K, M, G, T with 1024 multipliers; KiB/MiB/GiB; KB/MB/GB with 1000 multipliers), or an integer byte count. |
+| `url_preview_cache_lifetime` | string \| integer | — | A duration: a string of <number><unit> groups (ms, s, m, h, d, w, y), or an integer number of milliseconds. |
 
 
 ## `federation`

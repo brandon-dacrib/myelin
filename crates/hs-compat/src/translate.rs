@@ -78,6 +78,12 @@ pub fn translate(
     let mut report = TranslationReport::new();
 
     // --- Pass 1: keys later steps depend on ---
+    // `server_name` is extracted first (rather than left to pass 2's file-order-dependent loop)
+    // because `serve_server_wellknown`'s translation below derives its value from it, and a YAML
+    // mapping's key order should not decide whether that derivation sees the right server name.
+    if let Some(s) = get_str(&doc, "server_name") {
+        config.server.server_name = s;
+    }
     let global_tls = TlsPaths {
         cert: get_path(&doc, "tls_certificate_path"),
         key: get_path(&doc, "tls_private_key_path"),
@@ -288,6 +294,22 @@ fn translate_listeners(doc: &Value, config: &mut Config, global_tls: &TlsPaths) 
     }
 }
 
+/// Derives the value `serve_server_wellknown: true` should advertise, matching Synapse's own
+/// `parse_server_name` + `ServerWellKnownResource` behavior
+/// (`refs/synapse/synapse/rest/well_known.py`, `refs/synapse/synapse/util/__init__.py`'s
+/// `parse_server_name`): `server_name` already carrying an explicit `host:port` is used verbatim,
+/// otherwise `:443` (Synapse's federation default port, not `:8448`) is appended.
+fn derive_well_known_server(server_name: &str) -> String {
+    let has_explicit_port = server_name
+        .rsplit_once(':')
+        .is_some_and(|(_, port)| port.parse::<u16>().is_ok());
+    if has_explicit_port {
+        server_name.to_owned()
+    } else {
+        format!("{server_name}:443")
+    }
+}
+
 fn listener_resource(name: &str) -> Option<ListenerResource> {
     Some(match name {
         "client" => ListenerResource::Client,
@@ -308,6 +330,19 @@ fn translate_key(key: &str, v: &Value, config: &mut Config) {
         "server_name" => {
             if let Some(s) = v.as_str() {
                 config.server.server_name = s.to_owned();
+            }
+        }
+        // Synapse derives the advertised `.well-known/matrix/server` value from `server_name`
+        // itself (`refs/synapse/synapse/rest/well_known.py`'s `ServerWellKnownResource.__init__`:
+        // `host, port = parse_server_name(server_name)`, `port` defaulting to 443), rather than
+        // taking it as a separate setting the way the native `server.well_known_server` field
+        // does. `server_name` is guaranteed already translated by the time this arm runs (see
+        // pass 1's comment in `translate`), so the derivation below matches Synapse's own
+        // behavior exactly rather than leaving the field unset.
+        "serve_server_wellknown" => {
+            if v.as_bool() == Some(true) {
+                config.server.well_known_server =
+                    Some(derive_well_known_server(&config.server.server_name));
             }
         }
         "public_baseurl" => config.server.public_baseurl = v.as_str().map(str::to_owned),
@@ -339,6 +374,14 @@ fn translate_key(key: &str, v: &Value, config: &mut Config) {
         "federation_verify_certificates" => {
             if let Some(b) = v.as_bool() {
                 config.federation.verify_certificates = b;
+            }
+        }
+        "federation_custom_ca_list" => {
+            if let Some(seq) = v.as_sequence() {
+                config.federation.custom_ca_certificates = seq
+                    .iter()
+                    .filter_map(|x| x.as_str().map(str::to_owned))
+                    .collect();
             }
         }
         "allow_public_rooms_over_federation" => {
@@ -476,6 +519,11 @@ fn translate_key(key: &str, v: &Value, config: &mut Config) {
                     .iter()
                     .filter_map(|x| x.as_str().map(str::to_owned))
                     .collect();
+            }
+        }
+        "max_spider_size" => {
+            if let Some(sz) = get_bytesize_value(v) {
+                config.media.url_preview_max_fetch_size = sz;
             }
         }
         "media_retention" => {
@@ -929,5 +977,68 @@ experimental_features:
         assert!(keys.contains(&"server_name"));
         assert!(keys.contains(&"report_stats"));
         assert!(keys.contains(&"enable_metrics"));
+    }
+
+    #[test]
+    fn serve_server_wellknown_derives_host_and_default_port() {
+        let yaml = "server_name: example.org\nserve_server_wellknown: true\n";
+        let (config, report) = translate(yaml, TranslateOptions::default()).unwrap();
+        assert_eq!(
+            config.server.well_known_server.as_deref(),
+            Some("example.org:443")
+        );
+        assert!(!report.has_blocking());
+    }
+
+    #[test]
+    fn serve_server_wellknown_keeps_an_explicit_port_in_server_name() {
+        let yaml = "server_name: example.org:8448\nserve_server_wellknown: true\n";
+        let (config, _) = translate(yaml, TranslateOptions::default()).unwrap();
+        assert_eq!(
+            config.server.well_known_server.as_deref(),
+            Some("example.org:8448")
+        );
+    }
+
+    #[test]
+    fn serve_server_wellknown_false_leaves_the_route_unset() {
+        let yaml = "server_name: example.org\nserve_server_wellknown: false\n";
+        let (config, _) = translate(yaml, TranslateOptions::default()).unwrap();
+        assert_eq!(config.server.well_known_server, None);
+    }
+
+    #[test]
+    fn serve_server_wellknown_sees_server_name_regardless_of_key_order() {
+        // `serve_server_wellknown` appears before `server_name` in the source file; pass 1's
+        // early extraction of `server_name` (see `translate`'s doc comment on that line) must
+        // make this independent of file order.
+        let yaml = "serve_server_wellknown: true\nserver_name: example.org\n";
+        let (config, _) = translate(yaml, TranslateOptions::default()).unwrap();
+        assert_eq!(
+            config.server.well_known_server.as_deref(),
+            Some("example.org:443")
+        );
+    }
+
+    #[test]
+    fn translates_federation_custom_ca_list() {
+        let yaml =
+            "server_name: example.org\nfederation_custom_ca_list:\n  - myCA1.pem\n  - myCA2.pem\n";
+        let (config, report) = translate(yaml, TranslateOptions::default()).unwrap();
+        assert_eq!(
+            config.federation.custom_ca_certificates,
+            vec!["myCA1.pem".to_string(), "myCA2.pem".to_string()]
+        );
+        assert!(!report.has_blocking());
+    }
+
+    #[test]
+    fn translates_max_spider_size() {
+        let yaml = "server_name: example.org\nmax_spider_size: \"20M\"\n";
+        let (config, _) = translate(yaml, TranslateOptions::default()).unwrap();
+        assert_eq!(
+            config.media.url_preview_max_fetch_size,
+            hs_config::ByteSize::mib(20)
+        );
     }
 }

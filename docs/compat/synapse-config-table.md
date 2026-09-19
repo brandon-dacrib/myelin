@@ -12,7 +12,7 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 
 | List | Mapped | Mapped (diff) | Unsupported | Total |
 |---|---|---|---|---|
-| Top-level options | 25 | 22 | 182 | 229 |
+| Top-level options | 26 | 24 | 179 | 229 |
 | `experimental_features` flags | 0 | 1 | 50 | 51 |
 
 (Counts are exact against the tables below; regenerate this summary whenever a row changes. See "Keeping this current".)
@@ -56,8 +56,8 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 | `use_frozen_dicts` | Unsupported | — | R-PY. |
 | `web_client_location` | Unsupported | — | Redirecting `/` to a bundled web client is not implemented; use a reverse-proxy redirect. |
 | `public_baseurl` | Mapped | `server.public_baseurl` | |
-| `serve_server_wellknown` | Unsupported | — | R-PHASE1 (hs-http). `/.well-known/matrix/*` is planned to be served unconditionally when `public_baseurl` differs from `https://{server_name}`; no opt-out flag yet. |
-| `extra_well_known_client_content` | Unsupported | — | R-PHASE1 (hs-http), paired with `serve_server_wellknown`. |
+| `serve_server_wellknown` | Mapped (diff) | `server.well_known_server` | Synapse takes a boolean and derives the advertised value from `server_name` itself (`host:443`, or `server_name` verbatim if it already names a port); the native field takes the advertised `host[:port]` directly instead. The translator reproduces Synapse's derivation exactly. Unset means the route 404s (`crates/hs-cli/src/well_known.rs`, checked). |
+| `extra_well_known_client_content` | Unsupported | — | R-PHASE1. `/.well-known/matrix/client` is served from `server.public_baseurl` (`crates/hs-cli/src/well_known.rs`, checked) but carries only `m.homeserver`; arbitrary extra keys have no native field yet. |
 | `soft_file_limit` | Unsupported | — | R-PROC. `ulimit` is a deployment-platform concern. |
 | `presence` | Unsupported | — | R-PHASE1 (hs-user). Presence enable/tuning is owned by the user-session actor's own config, not yet exposed in `hs-config`. |
 | `require_auth_for_profile_requests` | Unsupported | — | R-PHASE1 (hs-user/profile). |
@@ -125,7 +125,7 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 | `federation_verify_certificates` | Mapped | `federation.verify_certificates` | |
 | `federation_client_minimum_tls_version` | Unsupported | — | R-PHASE1 (hs-federation). `rustls`'s default TLS 1.2+ floor is used; not yet configurable. |
 | `federation_certificate_verification_whitelist` | Unsupported | — | R-SECURITY. A per-domain certificate-verification bypass list is not offered; use `federation.verify_certificates = false` globally (test/private-federation use) or a reverse proxy. |
-| `federation_custom_ca_list` | Unsupported | — | R-PHASE1 (hs-federation). Only the platform CA trust store is used today. |
+| `federation_custom_ca_list` | Mapped (diff) | `federation.custom_ca_certificates` | Checked against `crates/hs-federation/src/client.rs` (loads these PEM files into the outbound federation TLS trust store) and `crates/hs-config/src/federation.rs`. Same shape (a flat list of PEM file paths) but different trust semantics: Synapse's `trustRootFromCertificates` *replaces* the platform trust store with exactly this list, while the native field adds these CAs *on top of* the bundled public roots. An operator relying on Synapse's replace-only semantics should review this before cutover. |
 
 ## Federation
 
@@ -205,7 +205,7 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 | `url_preview_ip_range_blacklist` | Mapped | `media.url_preview_ip_range_blocklist` | |
 | `url_preview_ip_range_whitelist` | Unsupported | — | R-PHASE1 (hs-media). No allowlist override for preview fetches yet (unlike `federation.ip_range_allowlist`). |
 | `url_preview_url_blacklist` | Unsupported | — | R-PHASE1 (hs-media). URL/domain-pattern blocklist, distinct from the IP-range blocklist. |
-| `max_spider_size` | Unsupported | — | R-PHASE1 (hs-media, preview fetch byte cap). |
+| `max_spider_size` | Mapped | `media.url_preview_max_fetch_size` | Checked against `crates/hs-media/src/preview.rs`'s `FetchLimits::max_body_bytes` (still a hardcoded 10 MiB constant as of this check, not yet reading this field — see `docs/status/13-config-compat-and-migration.md` for the one-line consumer change 09 still needs) and Synapse's own default (`"10M"`, `refs/synapse/synapse/config/repository.py`), which the native default matches. |
 | `url_preview_accept_language` | Unsupported | — | R-PHASE1 (hs-media). |
 | `oembed` | Unsupported | — | R-PHASE1 (hs-media, oEmbed provider list). |
 

@@ -17,5 +17,10 @@ hmac = { workspace = true }
 sha1 = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+http-body-util = { workspace = true }
+time = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true }
