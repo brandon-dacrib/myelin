@@ -160,6 +160,26 @@ impl Default for FetchLimits {
     }
 }
 
+impl FetchLimits {
+    /// The limits an operator configured, rather than this module's own defaults.
+    ///
+    /// `max_redirects` has no configuration field: it is a structural safety bound on how far one
+    /// request may be chased, not a tuning knob, and Synapse has no equivalent setting either.
+    /// The other two come from `media.url_preview_timeout` and `media.url_preview_max_fetch_size`,
+    /// whose defaults deliberately match Synapse's (30s, 10 MiB) — so wiring this changes the
+    /// effective timeout from this module's old hardcoded 10s to 30s, which is the documented
+    /// intent, not a regression.
+    #[must_use]
+    pub fn from_config(config: &hs_config::MediaConfig) -> Self {
+        Self {
+            max_body_bytes: usize::try_from(config.url_preview_max_fetch_size.as_u64())
+                .unwrap_or(usize::MAX),
+            timeout: config.url_preview_timeout.into(),
+            max_redirects: Self::default().max_redirects,
+        }
+    }
+}
+
 /// Why a [`guarded_fetch`] failed.
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
@@ -505,7 +525,7 @@ pub async fn preview_url<B: KvBackend>(
     }
 
     let policy = PreviewIpPolicy::from_cidrs(&config.url_preview_ip_range_blocklist);
-    let limits = FetchLimits::default();
+    let limits = FetchLimits::from_config(config);
 
     let page = guarded_fetch(url, &policy, &limits)
         .await
@@ -568,7 +588,7 @@ pub async fn preview_url<B: KvBackend>(
         &cache_key,
         &serialized,
         now_ms,
-        DEFAULT_PREVIEW_CACHE_TTL_MS,
+        config.url_preview_cache_lifetime.as_millis(),
     )?;
     Ok(value)
 }
