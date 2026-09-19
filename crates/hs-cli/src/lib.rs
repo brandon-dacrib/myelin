@@ -25,6 +25,7 @@ pub mod serve;
 pub mod signing_key;
 pub mod storage;
 pub mod synapse_serve;
+pub mod synapse_shims;
 pub mod versions;
 pub mod well_known;
 

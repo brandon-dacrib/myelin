@@ -391,12 +391,23 @@ fn build_router<B: KvBackend>(
     // empty prefix.
     let (admin_router, admin_manifest) = hs_admin::router::build_router(mounts.admin);
     manifest.routes.extend(admin_manifest.routes);
+    // Cloned before the merge below consumes it: the Synapse compatibility shims forward into
+    // this very router, so they answer from the same handlers and the same scope checks.
+    let admin_router_for_shims = admin_router.clone();
     let router = router.merge(admin_router);
 
     // Same reasoning as the admin router directly above: an absolute path merges onto the
     // top-level router rather than nesting under a prefix.
     manifest.routes.extend(synapse_admin_routes);
     let router = router.merge(synapse_admin_router);
+
+    // The read-only Synapse admin shims (`hs-compat`), which answer from the native `/api/v1`
+    // router rather than reimplementing anything: an operator's existing Synapse tooling keeps
+    // working against this server. They are built over a clone of the admin router assembled
+    // above, so both surfaces enforce exactly the same scopes on the same data.
+    let (shim_router, shim_routes) = crate::synapse_shims::router(admin_router_for_shims);
+    manifest.routes.extend(shim_routes);
+    let router = router.merge(shim_router);
 
     let router = router
         // Without this a browser client cannot talk to this server at all: it fails every
