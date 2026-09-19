@@ -6,15 +6,42 @@
 //! bound to it, so the spec requires proof the caller still is who they say they are.
 
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
-use crate::error::MatrixError;
+use crate::error::{ErrCode, MatrixError};
 use crate::reauth;
 use crate::requester::Requester;
 use crate::state::AuthState;
 use crate::store::DeviceRecord;
+
+/// Parses a request body that may legitimately be empty into a JSON [`Value`], treating "no body
+/// at all" as `{}` rather than a parse failure.
+///
+/// `axum::Json<Value>` cannot be used for `DELETE /devices/{deviceId}` and
+/// `POST /delete_devices`: both are UI-Auth-gated, and the spec's UIA dance starts with a client
+/// sending **no** `auth` field to receive the flow challenge -- for these two endpoints that often
+/// means no body at all. `Json<T>`'s extractor rejects an empty (or content-type-less) body before
+/// the handler ever runs, turning that into a `400`/`415` from the framework instead of the `401`
+/// UIA challenge `reauth::run` would otherwise produce. Confirmed against
+/// `refs/complement/tests/csapi/apidoc_device_management_test.go`'s "DELETE /device/{deviceId}
+/// with no body gives a 401" (asserts `401` with `session`/`flows`/`params` present, i.e. a UIA
+/// challenge, not a body-parse error). A body that *is* present but is not valid JSON is still a
+/// real client error and stays a `400 M_NOT_JSON`.
+pub(crate) fn parse_optional_json_body(bytes: &Bytes) -> Result<Value, MatrixError> {
+    if bytes.is_empty() {
+        return Ok(Value::Object(serde_json::Map::new()));
+    }
+    serde_json::from_slice(bytes).map_err(|_| {
+        MatrixError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            ErrCode::NotJson,
+            "Request body is not valid JSON",
+        )
+    })
+}
 
 fn device_json(d: &DeviceRecord) -> Value {
     json!({
@@ -108,8 +135,9 @@ pub async fn delete_device(
     State(state): State<AuthState>,
     requester: Requester,
     Path(device_id): Path<String>,
-    Json(body): Json<Value>,
+    raw_body: Bytes,
 ) -> Result<Response, MatrixError> {
+    let body = parse_optional_json_body(&raw_body)?;
     let msc4190 = requester
         .appservice
         .as_ref()
@@ -141,8 +169,9 @@ pub async fn delete_device(
 pub async fn post_delete_devices(
     State(state): State<AuthState>,
     requester: Requester,
-    Json(body): Json<Value>,
+    raw_body: Bytes,
 ) -> Result<Response, MatrixError> {
+    let body = parse_optional_json_body(&raw_body)?;
     if let Some(response) = reauth::run(&state, &requester, &body).await? {
         return Ok(response);
     }
@@ -244,6 +273,12 @@ mod tests {
         assert_eq!(device.display_name.as_deref(), Some("renamed"));
     }
 
+    /// Converts a JSON [`Value`] into the raw [`Bytes`] `delete_device`/`post_delete_devices` now
+    /// take, mirroring what an HTTP body actually carries over the wire.
+    fn body_bytes(v: Value) -> Bytes {
+        Bytes::from(v.to_string())
+    }
+
     #[tokio::test]
     async fn delete_device_requires_uia() {
         let (state, requester, did) = state_with_device().await;
@@ -251,11 +286,31 @@ mod tests {
             State(state),
             requester,
             Path(did.to_string()),
-            Json(json!({})),
+            body_bytes(json!({})),
         )
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// `refs/complement/tests/csapi/apidoc_device_management_test.go`: "DELETE /device/{deviceId}
+    /// with no body gives a 401" -- a genuinely empty body (not `{}`, nothing at all) must still
+    /// reach UIA and get the `401` challenge, not a framework-level `400`/`415` from a JSON body
+    /// extractor rejecting the missing/empty payload before the handler runs.
+    #[tokio::test]
+    async fn delete_device_with_a_completely_empty_body_still_gets_the_uia_challenge() {
+        let (state, requester, did) = state_with_device().await;
+        let response = delete_device(State(state), requester, Path(did.to_string()), Bytes::new())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json.get("session").is_some());
+        assert!(json.get("flows").is_some());
+        assert!(json.get("params").is_some());
     }
 
     #[tokio::test]
@@ -266,7 +321,7 @@ mod tests {
             State(state.clone()),
             requester.clone(),
             Path(did.to_string()),
-            Json(body),
+            body_bytes(body),
         )
         .await
         .unwrap();
@@ -345,7 +400,7 @@ mod tests {
             State(state.clone()),
             requester.clone(),
             Path(did.to_string()),
-            Json(json!({})),
+            body_bytes(json!({})),
         )
         .await
         .unwrap();
@@ -364,9 +419,10 @@ mod tests {
     async fn bulk_delete_devices() {
         let (state, requester, did) = state_with_device().await;
         let body = json!({"auth": {"type": "m.login.dummy"}, "devices": [did.to_string()]});
-        let response = post_delete_devices(State(state.clone()), requester.clone(), Json(body))
-            .await
-            .unwrap();
+        let response =
+            post_delete_devices(State(state.clone()), requester.clone(), body_bytes(body))
+                .await
+                .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(
             state

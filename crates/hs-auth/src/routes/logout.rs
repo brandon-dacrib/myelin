@@ -11,15 +11,34 @@ use crate::state::AuthState;
 /// `POST /logout`: invalidates the access token used for this request, and its paired refresh
 /// token if it had one. Guests may log out (matching Synapse's `allow_guest=True` here), so this
 /// takes [`AllowGuest`] rather than [`crate::requester::Requester`].
+///
+/// Also deletes the device the token was bound to. The spec is explicit that this is not
+/// optional (`refs/matrix-spec/data/api/client-server/logout.yaml`, `/logout`: "Invalidates an
+/// existing access token... **The device associated with the access token is also deleted.**"),
+/// and Complement checks it: `refs/complement/tests/csapi/apidoc_logout_test.go`'s "Can logout
+/// current device" registers a second device, logs it out, and asserts `GET /devices` on the
+/// *other*, still-live session now lists exactly one device with the logged-out device's id gone.
+/// Before this fix, only the tokens were deleted; the device record (and therefore `GET
+/// /devices`) outlived the session that owned it.
 pub async fn post_logout(
     State(state): State<AuthState>,
     AllowGuest(requester): AllowGuest,
 ) -> Result<Json<Value>, MatrixError> {
     if let Some(hash) = requester.access_token_id {
-        if let Some(record) = state.store.get_access_token(&hash).await?
-            && let Some(refresh_hash) = record.refresh_token_hash
-        {
-            state.store.delete_refresh_token(&refresh_hash).await?;
+        if let Some(record) = state.store.get_access_token(&hash).await? {
+            if let Some(refresh_hash) = record.refresh_token_hash {
+                state.store.delete_refresh_token(&refresh_hash).await?;
+            }
+            if let Some(device_id) = record.device_id {
+                state
+                    .store
+                    .delete_access_tokens_for_device(&requester.user_id, &device_id)
+                    .await?;
+                state
+                    .store
+                    .delete_device(&requester.user_id, &device_id)
+                    .await?;
+            }
         }
         state.store.delete_access_token(&hash).await?;
     }
@@ -27,7 +46,13 @@ pub async fn post_logout(
 }
 
 /// `POST /logout/all`: invalidates every access and refresh token for the requesting user, across
-/// every device.
+/// every device, and deletes every one of the user's devices.
+///
+/// Per the same spec file as [`post_logout`]: "`/logout/all`... All devices for the user are also
+/// deleted." Complement's "Can logout all devices" only checks that every session's token stops
+/// working, not `GET /devices` directly, but leaving devices behind would be the same class of
+/// bug `post_logout` had (and the spec text is unambiguous either way), so this is fixed
+/// alongside it rather than left for a second, separate report.
 pub async fn post_logout_all(
     State(state): State<AuthState>,
     AllowGuest(requester): AllowGuest,
@@ -40,13 +65,19 @@ pub async fn post_logout_all(
         .store
         .delete_all_refresh_tokens_for_user(&requester.user_id)
         .await?;
+    for device in state.store.list_devices(&requester.user_id).await? {
+        state
+            .store
+            .delete_device(&requester.user_id, &device.device_id)
+            .await?;
+    }
     Ok(Json(json!({})))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{AccessTokenRecord, RefreshTokenRecord, UserRecord};
+    use crate::store::{AccessTokenRecord, DeviceRecord, RefreshTokenRecord, UserRecord};
     use crate::token::TokenHash;
     use ruma::{device_id, user_id};
 
@@ -115,6 +146,60 @@ mod tests {
         );
     }
 
+    /// `refs/complement/tests/csapi/apidoc_logout_test.go`'s "Can logout current device": logging
+    /// out one device's session must remove that device from `GET /devices` (checked here at the
+    /// store level rather than through the router, matching this file's other tests) while
+    /// leaving a second, unrelated device alone. Before this fix `post_logout` deleted only the
+    /// tokens, never `hs_auth::store::DeviceStore`'s row, so the device outlived its session.
+    #[tokio::test]
+    async fn logout_deletes_the_device_bound_to_the_token_used() {
+        let state = AuthState::in_memory();
+        let uid = user_id!("@alice2:example.org").to_owned();
+        state
+            .store
+            .create_user(UserRecord::new(uid.clone(), 0))
+            .await
+            .unwrap();
+        for device in ["D1", "D2"] {
+            state
+                .store
+                .upsert_device(DeviceRecord {
+                    user_id: uid.clone(),
+                    device_id: device_id!(device).to_owned(),
+                    display_name: None,
+                    last_seen_ms: None,
+                    last_seen_ip: None,
+                })
+                .await
+                .unwrap();
+        }
+        let access_hash = TokenHash::of("syt_logout_device");
+        state
+            .store
+            .put_access_token(AccessTokenRecord {
+                hash: access_hash,
+                user_id: uid.clone(),
+                device_id: Some(device_id!("D1").to_owned()),
+                expires_at_ms: None,
+                refresh_token_hash: None,
+                last_used_ms: None,
+            })
+            .await
+            .unwrap();
+
+        let requester = crate::requester::Requester {
+            access_token_id: Some(access_hash),
+            ..crate::requester::Requester::for_user(uid.clone())
+        };
+        let _ = post_logout(State(state.clone()), AllowGuest(requester))
+            .await
+            .unwrap();
+
+        let remaining = state.store.list_devices(&uid).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].device_id, device_id!("D2"));
+    }
+
     #[tokio::test]
     async fn logout_all_clears_every_token_for_the_user() {
         let state = AuthState::in_memory();
@@ -151,5 +236,37 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    /// `refs/matrix-spec/data/api/client-server/logout.yaml`'s `/logout/all`: "All devices for
+    /// the user are also deleted." Before this fix `post_logout_all` cleared tokens but left
+    /// every `DeviceStore` row behind.
+    #[tokio::test]
+    async fn logout_all_deletes_every_device_for_the_user() {
+        let state = AuthState::in_memory();
+        let uid = user_id!("@bob2:example.org").to_owned();
+        state
+            .store
+            .create_user(UserRecord::new(uid.clone(), 0))
+            .await
+            .unwrap();
+        for device in ["D1", "D2", "D3"] {
+            state
+                .store
+                .upsert_device(DeviceRecord {
+                    user_id: uid.clone(),
+                    device_id: device_id!(device).to_owned(),
+                    display_name: None,
+                    last_seen_ms: None,
+                    last_seen_ip: None,
+                })
+                .await
+                .unwrap();
+        }
+        let requester = crate::requester::Requester::for_user(uid.clone());
+        let _ = post_logout_all(State(state.clone()), AllowGuest(requester))
+            .await
+            .unwrap();
+        assert!(state.store.list_devices(&uid).await.unwrap().is_empty());
     }
 }

@@ -69,6 +69,17 @@ async fn verify_stage(state: &AuthState, data: &AuthData) -> bool {
 }
 
 /// `GET /register/available?username=...`.
+///
+/// Deliberately does **not** lower-case `username` the way [`register_user`] does before
+/// checking it. Read `refs/synapse/synapse/rest/client/register.py`'s
+/// `UsernameAvailabilityRestServlet.on_GET`: it passes the raw query parameter straight to
+/// `check_username` with no `.lower()` call (unlike both of `RegisterRestServlet`'s call sites),
+/// so an upper-case query on real Synapse gets `M_INVALID_USERNAME` even though `/register` would
+/// happily downcase and accept the same string. That is a genuine asymmetry between the two
+/// endpoints, not an oversight this crate is inventing — Complement's own
+/// `apidoc_register_test.go` never exercises an upper-case `/register/available` query, so there
+/// is no conformance test pulling either way; matching Synapse's actual behavior here rather than
+/// guessing was the tie-breaker.
 pub async fn get_register_available(
     State(state): State<AuthState>,
     Query(query): Query<HashMap<String, String>>,
@@ -83,12 +94,39 @@ pub async fn get_register_available(
     Ok(Json(json!({"available": true})))
 }
 
+/// Rejects any localpart outside the spec's *strict* user ID grammar.
+///
+/// `UserId::parse_with_server_name`'s own validation (`ruma_identifiers_validation::user_id::
+/// validate`, used by `UserId::parse`/`TryFrom<&str>`) only rejects a literal `:` or NUL byte —
+/// that is the *historical* grammar, kept permissive so a server can still parse old user IDs
+/// already sitting in room state (refs/matrix-spec/content/appendices.md, "Historical User IDs":
+/// "clients and servers MUST accept user IDs with localparts consisting of any legal
+/// non-surrogate Unicode code points except for `:` and `NUL`"). A server *minting a new* user ID
+/// must be stricter: the same file's "User Identifiers" section says a localpart "MUST contain
+/// only the characters a-z, 0-9, `.`, `_`, `=`, `-`, `/`, and `+`", and the `/register`
+/// `operationId`'s own description adds "the server MUST either map the provided `username` onto
+/// a `user_id` in a logical manner, or reject any `username` which does not comply to the
+/// grammar with `M_INVALID_USERNAME`" (refs/matrix-spec/data/api/client-server/registration.yaml).
+/// `UserId::validate_strict` (`ruma_identifiers_validation::user_id::localpart_is_fully_
+/// conforming`) is exactly that stricter check.
+///
+/// Confirmed against Complement's `refs/complement/tests/csapi/apidoc_register_test.go`:
+/// "POST /register rejects usernames with special characters" submits localparts containing
+/// `!"\:?\\@[]{}|£é\n'` and expects `400 M_INVALID_USERNAME` for every one of them (before UIA is
+/// even attempted — Complement's own comment there: "servers are expected to validate request
+/// bodies before handling UIA, so 400 is expected here, not 401"), and "GET /register/available
+/// returns M_INVALID_USERNAME for invalid user name" does the same for a bare comma. Before this
+/// fix, `validate_localpart` accepted all of the above (none of them are `:` or NUL), so
+/// `/register/available` reported `available: true` for shapes `/register` would then also
+/// silently accept instead of rejecting — the exact gap
+/// `docs/status/14-test-and-conformance.md` recorded for this track.
 pub(crate) fn validate_localpart(state: &AuthState, username: &str) -> Result<(), MatrixError> {
-    UserId::parse_with_server_name(username, state.server_name())
-        .map(|_| ())
-        .map_err(|_| {
-            MatrixError::invalid_username(format!("'{username}' is not a valid user ID localpart"))
-        })
+    let user_id = UserId::parse_with_server_name(username, state.server_name()).map_err(|_| {
+        MatrixError::invalid_username(format!("'{username}' is not a valid user ID localpart"))
+    })?;
+    user_id.validate_strict().map_err(|_| {
+        MatrixError::invalid_username(format!("'{username}' is not a valid user ID localpart"))
+    })
 }
 
 fn random_localpart() -> String {
@@ -147,8 +185,23 @@ async fn register_user(state: &AuthState, body: &Value) -> Result<Response, Matr
         state.config.password_policy.validate(pw)?;
     }
 
-    let username = body.get("username").and_then(Value::as_str);
-    if let Some(username) = username {
+    // Per the spec's rationale for excluding upper-case from the user ID grammar
+    // (appendices.md, "User Identifiers": "we chose to disallow upper-case characters because we
+    // do not consider it valid to have two user IDs which differ only in case... [this] requir[es]
+    // homeservers to downcase usernames when creating user IDs for new users"), lower-case the
+    // client-supplied `username` *before* validating or checking availability, so
+    // "User-UPPER" and "user-upper" register the same account instead of two. Matches Synapse's
+    // `RegisterRestServlet.on_POST` (`refs/synapse/synapse/rest/client/register.py`:
+    // `desired_username = desired_username.lower()`, applied before `check_username`), and
+    // Complement's `apidoc_register_test.go` "POST /register downcases capitals in usernames"
+    // (registers `user-UPPER`, expects `user_id: "@user-upper:hs1"`). ASCII-only: the grammar
+    // itself is ASCII (`validate_localpart` rejects anything else), so a locale-aware
+    // `str::to_lowercase` would only risk surprising non-ASCII casing rules for no benefit.
+    let username = body
+        .get("username")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    if let Some(username) = &username {
         validate_localpart(state, username)?;
         if !state.store.is_localpart_available(username).await? {
             return Err(MatrixError::user_in_use());
@@ -203,7 +256,7 @@ async fn register_user(state: &AuthState, body: &Value) -> Result<Response, Matr
 
     // Re-check availability defensively (closes the TOCTOU window between the early check above
     // and account creation, for two concurrent registrations of the same name).
-    let user_id = match username {
+    let user_id = match &username {
         Some(name) => {
             if !state.store.is_localpart_available(name).await? {
                 return Err(MatrixError::user_in_use());
@@ -458,5 +511,122 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body["available"], true);
+    }
+
+    /// `refs/complement/tests/csapi/apidoc_register_test.go`: "GET /register/available returns
+    /// M_INVALID_USERNAME for invalid user name" uses `"username,should_not_be_valid"` (a comma is
+    /// legal ASCII, not `:` or NUL, so the old lenient check accepted it and reported
+    /// `available: true`; want `400 M_INVALID_USERNAME`).
+    #[tokio::test]
+    async fn register_available_rejects_an_invalid_username_shape() {
+        let state = AuthState::in_memory();
+        let mut query = HashMap::new();
+        query.insert(
+            "username".to_string(),
+            "username,should_not_be_valid".to_string(),
+        );
+        let err = get_register_available(State(state), Query(query))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(err.errcode().as_str(), "M_INVALID_USERNAME");
+    }
+
+    /// `refs/complement/tests/csapi/apidoc_register_test.go`: "POST /register rejects usernames
+    /// with special characters" — every one of these localparts must 400 with `M_INVALID_USERNAME`
+    /// *before* UIA runs (Complement's own comment: "servers are expected to validate request
+    /// bodies before handling UIA, so 400 is expected here, not 401"). None of these characters are
+    /// `:` or NUL, so the old `UserId::parse_with_server_name`-only check accepted all of them.
+    #[tokio::test]
+    async fn register_rejects_usernames_with_special_characters() {
+        let state = AuthState::in_memory();
+        for ch in [
+            "!", "\"", ":", "?", "\\", "@", "[", "]", "{", "|", "}", "£", "é", "\n", "'",
+        ] {
+            let body = json!({
+                "username": format!("user-{ch}-reject-please"),
+                "password": "sUp3rs3kr1t",
+            });
+            let err = post_register(State(state.clone()), Query(HashMap::new()), Json(body))
+                .await
+                .unwrap_err();
+            assert_eq!(err.status(), StatusCode::BAD_REQUEST, "char {ch:?}");
+            assert_eq!(err.errcode().as_str(), "M_INVALID_USERNAME", "char {ch:?}");
+        }
+    }
+
+    /// `refs/complement/tests/csapi/apidoc_register_test.go`: "POST /register downcases capitals
+    /// in usernames" — registering `user-UPPER` must succeed with `user_id: "@user-upper:..."`,
+    /// not store the localpart verbatim (which would let `@user-UPPER:...` and a later
+    /// `@user-upper:...` registration coexist as two accounts a client can't tell apart, per the
+    /// spec's user-ID-grammar rationale).
+    #[tokio::test]
+    async fn register_downcases_uppercase_usernames() {
+        let state = AuthState::in_memory();
+        let body = json!({
+            "username": "user-UPPER",
+            "password": "sUp3rs3kr1t",
+            "auth": {"type": "m.login.dummy"}
+        });
+        let response = post_register(State(state), Query(HashMap::new()), Json(body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["user_id"], "@user-upper:example.org");
+    }
+
+    /// The reverse direction of the above: once `user-upper` is lower-cased and stored, a second
+    /// registration attempt spelled with different capitalization must collide with it rather than
+    /// creating a second account — the exact "two accounts a client considers the same" failure
+    /// mode this fix closes.
+    #[tokio::test]
+    async fn register_treats_different_capitalizations_as_the_same_username() {
+        let state = AuthState::in_memory();
+        let first = json!({
+            "username": "CaseCollide",
+            "password": "sUp3rs3kr1t",
+            "auth": {"type": "m.login.dummy"}
+        });
+        let response = post_register(State(state.clone()), Query(HashMap::new()), Json(first))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let second = json!({
+            "username": "casecollide",
+            "password": "sUp3rs3kr1t",
+            "auth": {"type": "m.login.dummy"}
+        });
+        let err = post_register(State(state), Query(HashMap::new()), Json(second))
+            .await
+            .unwrap_err();
+        assert_eq!(err.errcode().as_str(), "M_USER_IN_USE");
+    }
+
+    /// Registration in a single round trip -- `username`/`password`/`auth: {"type":
+    /// "m.login.dummy"}` sent all at once, no prior call to fetch the session -- must keep
+    /// working. Complement's `apidoc_register_test.go` "Registration without a session fails"
+    /// wants a stricter rule that would break exactly this pattern; `refs/synapse/synapse/
+    /// handlers/auth.py::AuthHandler.check_ui_auth` confirms real Synapse allows it (mints a
+    /// fresh session and completes the stage on it in the same call whenever `session` is
+    /// absent), and that Complement test itself skips Synapse, Dendrite and Conduit for the same
+    /// reason. See `uia::advance`'s doc comment and `docs/status/07-auth-and-identity.md` for the
+    /// full read.
+    #[tokio::test]
+    async fn registration_completes_in_a_single_round_trip_with_no_prior_session() {
+        let state = AuthState::in_memory();
+        let body = json!({
+            "username": "single-round-trip",
+            "password": "sUp3rs3kr1t",
+            "auth": {"type": "m.login.dummy"}
+        });
+        let response = post_register(State(state), Query(HashMap::new()), Json(body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

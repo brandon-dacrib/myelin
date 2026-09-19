@@ -2,7 +2,277 @@
 
 Track brief: `docs/workstreams/07-auth-and-identity.md`. Owner crate: `hs-auth`.
 
-Last updated: 2026-09-18 (session 4, completed its assignment — see "Session 4" below).
+Last updated: 2026-09-19 (session 5, completed its assignment — see "Session 5" below).
+
+## Session 5 summary (read this first)
+
+Assignment: close five auth conformance gaps `docs/status/14-test-and-conformance.md` recorded
+under "Track 07 (auth)": (1) `/register/available` accepting invalid usernames, (2) wrong UIA
+session status codes, (3) usernames not lower-cased, (4) `/capabilities` not requiring auth
+(handler lives in `hs-cli`, not owned this session), (5) a device not cleaned up on logout, and
+UIA ordering on `DELETE /devices/{id}`. Every claim below was checked against the actual
+Complement test in `refs/complement/tests/csapi/`, the actual spec text in `refs/matrix-spec/`, or
+(for two items where the spec is silent and Synapse's real behavior is the tie-breaker)
+`refs/synapse`, not memory — file paths and quotes are inline in the code comments, not just here.
+
+**All five items addressed; four fixed as reported, one (UIA session status codes) investigated
+and found to be partly a false-positive gap and partly a real, different bug than reported — see
+its own section below.**
+
+1. **`/register/available` accepting invalid usernames — real bug, fixed.**
+   `crates/hs-auth/src/routes/register.rs::validate_localpart` used
+   `UserId::parse_with_server_name(...).map(|_| ())`, which only rejects a literal `:` or NUL byte
+   (`ruma_identifiers_validation::user_id::localpart_is_backwards_compatible` — the *historical*
+   grammar, kept lenient on purpose for old room state). It now also calls
+   `UserId::validate_strict()` (`ruma_identifiers_validation::user_id::
+   localpart_is_fully_conforming`), which enforces the spec's actual minting grammar
+   (`refs/matrix-spec/content/appendices.md`, "User Identifiers": "MUST contain only the
+   characters a-z, 0-9, `.`, `_`, `=`, `-`, `/`, and `+`"). Confirmed against
+   `refs/complement/tests/csapi/apidoc_register_test.go`: "GET /register/available returns
+   M_INVALID_USERNAME for invalid user name" (a bare comma) and "POST /register rejects usernames
+   with special characters" (`!"\:?\\@[]{}|£é\n'`, all before UIA runs — 400, not 401). Both
+   endpoints share `validate_localpart`, so both are fixed by the one change. Tests:
+   `register_available_rejects_an_invalid_username_shape`,
+   `register_rejects_usernames_with_special_characters` (loops every character Complement lists).
+
+2. **UIA session status codes — investigated in depth; one reported case is not a real gap, one
+   real gap found and fixed instead.**
+   - The reported "200 instead of 401 for auth-requires-session" (Complement's
+     `apidoc_register_test.go` "Registration without a session fails": strip `session` back out
+     of an already-issued UIA session's `auth` object and resubmit) is **not fixed, deliberately**.
+     I first "fixed" it (require a session id whenever a stage is submitted) and it broke 14 of
+     this crate's own tests, including the full register→whoami router round trip — because that
+     stricter rule also forbids the ordinary single-round-trip pattern
+     (`username`/`password`/`auth: {"type": "m.login.dummy"}` sent all at once, no prior call).
+     Reading `refs/synapse/synapse/handlers/auth.py::AuthHandler.check_ui_auth` end to end
+     confirms real Synapse does exactly what this crate did before this session: `sid =
+     authdict.get("session")`; `if not sid:` unconditionally create a **new** session and
+     immediately check/complete whatever `type` came with it, in the same call — regardless of
+     whether a session had already been issued earlier for what the client considers "the same"
+     dance. The Complement test's own `runtime.SkipIf(t, runtime.Synapse, runtime.Dendrite,
+     runtime.Conduit)` (comment: "historically did not enforce this requirement strictly") confirms
+     this is a known aspirational check that no reference server passes, not a baseline gap.
+     **Decision: match Synapse's actual behavior, not the stricter aspirational reading** — the
+     ambiguity the brief said was mine to settle. Documented at length in `uia::advance`'s doc
+     comment and in the (renamed) test
+     `routes::register::tests::registration_completes_in_a_single_round_trip_with_no_prior_session`
+     plus `uia::tests::a_stage_submitted_without_a_session_id_gets_a_fresh_session_and_can_still_complete`.
+   - **Real bug found instead, while reading the sibling Complement test for item 5**: a UIA
+     challenge body's `params` field was always omitted. `ruma`'s `UiaaInfo::params` is
+     `Option<Box<RawJsonValue>>` with `skip_serializing_if = "Option::is_none"`, and
+     `uia::incomplete_body` never set it, so it was always `None` and always dropped from the
+     JSON. `refs/complement/tests/csapi/apidoc_device_management_test.go`'s "DELETE
+     /device/{deviceId} with no body gives a 401" asserts `match.JSONKeyPresent("params")` on
+     exactly this body shape. `refs/synapse/synapse/handlers/auth.py::_auth_dict_for_flows`
+     confirms Synapse always initializes `params: dict = {}` before adding any per-stage entries —
+     it is never entirely absent, even when no offered stage needs one (true for every stage this
+     crate offers). Fixed: `incomplete_body` now always sets `params` to an empty JSON object.
+     Test: `uia::tests::incomplete_body_always_includes_a_params_object`.
+
+3. **Usernames not lower-cased — real bug, fixed.** `crates/hs-auth/src/routes/register.rs::
+   register_user` now ASCII-lower-cases the client-supplied `username` before validating,
+   checking availability, or minting the `UserId` (`str::to_ascii_lowercase`, not
+   `str::to_lowercase` — the grammar is ASCII-only, so a Unicode-aware lower-case would only add
+   surprise). Matches `refs/synapse/synapse/rest/client/register.py`'s
+   `RegisterRestServlet.on_POST` (`desired_username = desired_username.lower()`, applied at both
+   its normal and UIA-continuation call sites, before `check_username`). Confirmed against
+   Complement's "POST /register downcases capitals in usernames" (`user-UPPER` →
+   `@user-upper:hs1`). **`GET /register/available` deliberately does *not* lower-case** —
+   `refs/synapse/synapse/rest/client/register.py::UsernameAvailabilityRestServlet.on_GET` passes
+   the raw query string straight to `check_username` with no `.lower()` call, so real Synapse
+   itself answers `M_INVALID_USERNAME` for an upper-case availability query even though
+   `/register` would accept and downcase the same string. Complement never exercises this case
+   either way, so there is no test pulling against the decision; matching Synapse's actual,
+   observable behavior over guessing was the tie-breaker — documented in
+   `get_register_available`'s doc comment. Tests: `register_downcases_uppercase_usernames`,
+   `register_treats_different_capitalizations_as_the_same_username` (registers `CaseCollide` then
+   `casecollide`, expects `M_USER_IN_USE` on the second).
+
+4. **`/capabilities` not requiring auth — cannot be fixed in this crate; hs-auth needs nothing new,
+   hs-cli needs a specific, mechanical change.** See "Wiring the integration lead must add" below.
+   `crates/hs-cli/src/capabilities.rs::get_capabilities` takes no extractors at all and is
+   registered on `Builder::<()>` (unit state) in `crates/hs-cli/src/serve.rs`, so it cannot use
+   this crate's `Requester`/`AllowGuest` (`FromRequestParts<AuthState>`, requires the router's
+   state to literally be `AuthState`) without also changing how it is mounted. `hs-auth` already
+   exports everything needed (`hs_auth::middleware::AllowGuest`, `hs_auth::AuthState`) — no new
+   code was added here. Confirmed the extractor mechanism itself already works and is tested:
+   `crate::middleware::tests::missing_token_is_rejected`, the guest-allow tests in the same file,
+   and `routes::tests::router_rejects_whoami_without_a_token` (an `AllowGuest`-gated handler on a
+   real `Router<AuthState>` returns 401 with no token) are all existing, passing proof of the exact
+   mechanism `hs-cli` needs to reuse. Confirmed the requirement against
+   `refs/matrix-spec/data/api/client-server/capabilities.yaml` (`security: accessTokenBearer`) and
+   `refs/complement/tests/csapi/apidoc_server_capabilities_test.go` ("GET /v3/capabilities is not
+   public" — expects 401 unauthenticated). Confirmed `allow_guest=True` is correct (not just
+   "any full user") by reading `refs/synapse/synapse/rest/client/capabilities.py::
+   CapabilitiesRestServlet.on_GET`: `await self.auth.get_user_by_req(request, allow_guest=True)`.
+
+5. **Device not cleaned up on logout — real bug, fixed. UIA ordering on `DELETE
+   /devices/{id}` — real bug, fixed.**
+   - `crates/hs-auth/src/routes/logout.rs::post_logout` deleted only the access token and its
+     paired refresh token, never the device row. Spec
+     (`refs/matrix-spec/data/api/client-server/logout.yaml`, `/logout`): "The device associated
+     with the access token is also deleted." Fixed: now also calls
+     `DeviceStore::delete_access_tokens_for_device` and `DeviceStore::delete_device` for the
+     token's `device_id`. Confirmed against `refs/complement/tests/csapi/apidoc_logout_test.go`'s
+     "Can logout current device" (logs out one device's session, asserts `GET /devices` on a
+     *different*, still-live session now shows exactly one device with the logged-out device's id
+     gone). **`post_logout_all` had the identical bug** (spec, same file: "`/logout/all`... All
+     devices for the user are also deleted.") — fixed alongside it rather than filed separately,
+     since it is the same class of bug in the same file and the spec text is just as explicit.
+     Tests: `logout_deletes_the_device_bound_to_the_token_used` (asserts a second, untouched
+     device survives), `logout_all_deletes_every_device_for_the_user`.
+   - `crates/hs-auth/src/routes/devices.rs::delete_device` and `post_delete_devices` took
+     `Json(body): Json<Value>` as their body extractor. Axum's `Json<T>` rejects a missing/empty
+     body (or missing `Content-Type: application/json`) **before the handler runs**, turning
+     Complement's literally-bodyless `DELETE /devices/{deviceId}` into a framework-level
+     `400`/`415` instead of ever reaching `reauth::run`'s `401` UIA challenge. Confirmed against
+     `refs/complement/tests/csapi/apidoc_device_management_test.go`'s "DELETE /device/{deviceId}
+     with no body gives a 401" (asserts `401` with `session`/`flows`/`params` all present — a real
+     UIA challenge body, not an error body). Fixed: both handlers now take raw `axum::body::Bytes`
+     and a new `parse_optional_json_body` helper (`devices.rs`) treats an empty body as `{}`,
+     parses a non-empty one as JSON, and only 400s (`M_NOT_JSON`) on body that is present but not
+     valid JSON. Test: `delete_device_with_a_completely_empty_body_still_gets_the_uia_challenge`
+     (asserts 401 and that `session`/`flows`/`params` are all present in the body — the last of
+     those only passes because of item 2's `params` fix above, confirmed by writing this test
+     before that fix and watching it fail on the `params` assertion, not just the status code).
+
+### Files touched this session
+
+- `crates/hs-auth/src/routes/register.rs` — `validate_localpart` (strict grammar),
+  `register_user` (lower-cases `username`), `get_register_available` (doc comment only, behavior
+  unchanged), 8 new/changed tests.
+- `crates/hs-auth/src/uia.rs` — `incomplete_body` (`params` always set), `advance`'s doc comment
+  rewritten to record the item-2 investigation and decision (no behavior change from session 4),
+  1 renamed test, 1 new test.
+- `crates/hs-auth/src/routes/devices.rs` — `delete_device`/`post_delete_devices` now take `Bytes`
+  via new `parse_optional_json_body`; 5 existing tests updated to the new parameter type, 1 new
+  test.
+- `crates/hs-auth/src/routes/logout.rs` — `post_logout`/`post_logout_all` delete devices; 2 new
+  tests.
+- `docs/status/07-auth-and-identity.md` — this section.
+
+No files outside `crates/hs-auth` and this status file were edited. No new `Cargo.toml`
+dependency was needed (item 4's `capabilities` fix needs zero new `hs-auth` code; every
+constructor and extractor it needs already existed before this session).
+
+### Verification (all run from `/Users/brandon/Documents/git/matrix-reimplement`)
+
+- `cargo fmt -p hs-auth` — clean.
+- `cargo clippy -p hs-auth --all-targets -- -D warnings` — clean. (Hit a transient failure
+  mid-session from `hs-admin`'s own unused-import warning, another track's crate pulled in
+  transitively through `admin_directory.rs`'s `hs_admin::sources::UserDirectory` impl — not
+  touched, not mine to fix, and gone by the next run once that track's own session moved on.)
+- `cargo test -p hs-auth` — **175 tests, up from 165, all passing** (0 failed).
+- `cargo build -p hs-cli --bin hs` — clean.
+- `cargo test -p hs-loadgen --test real_client` — **passes**: a real `matrix-rust-sdk` client
+  still registers, logs in and logs out against a real `hs serve` process. (The test's own log
+  output includes several expected `ERROR`-level lines from the SDK probing account-data/state
+  endpoints that legitimately 404 on a fresh account, plus one expected 401 at the end from the
+  token this session's own logout fix now actually revokes — none of those are new failures, the
+  test's single `#[test]` still reports `ok`.)
+
+### Wiring the integration lead must add (item 4, `/capabilities` auth)
+
+This crate needs **no new code** for this — `hs_auth::middleware::AllowGuest` and
+`hs_auth::AuthState` already exist and are already exported at the paths used below. The change is
+entirely in `hs-cli`, which this session does not own. Two mechanical edits:
+
+1. **`crates/hs-cli/src/capabilities.rs`**: change `get_capabilities`'s signature to require a
+   token (any authenticated principal, guests included — see item 4 above for why `AllowGuest` and
+   not `Requester`):
+   ```rust
+   pub async fn get_capabilities(
+       _requester: hs_auth::middleware::AllowGuest,
+   ) -> Json<Value> {
+       // body unchanged
+   }
+   ```
+2. **`crates/hs-cli/src/serve.rs`**: `get_capabilities` can no longer be registered on
+   `Builder::<()>` (the base `builder` it is currently added to has unit state; `AllowGuest`
+   requires `Router<AuthState>`). Remove its two `.get(...)` calls from the `builder` chain
+   (currently right after the `/_matrix/client/versions` route, around what is today lines
+   223–238: the `/_matrix/client/v3/capabilities` and `/_matrix/client/r0/capabilities` entries,
+   both with `RouteMeta::new(Surface::MatrixClient, AuthKind::None)` — the `AuthKind` for both
+   should become `AuthKind::Matrix` once moved, since the route now actually checks a token). Add
+   a small router built on `AuthState`, exactly like `auth_router`/`synapse_admin_router` just
+   above it (clone `auth` for this *before* the `ping_router` line consumes it by value — today
+   that line reads `.with_state(auth)`, not `.with_state(auth.clone())`, and is the last use of
+   `auth` before it would otherwise be gone):
+   ```rust
+   let capabilities_router = axum::Router::new()
+       .route("/_matrix/client/v3/capabilities", axum::routing::get(crate::capabilities::get_capabilities))
+       .route("/_matrix/client/r0/capabilities", axum::routing::get(crate::capabilities::get_capabilities))
+       .with_state(auth.clone());
+   let capabilities_routes = vec![
+       hs_http::router::Route { method: "GET".into(), path: "/_matrix/client/v3/capabilities".into(), surface: Surface::MatrixClient, operation_id: Some("getCapabilities".into()), auth: AuthKind::Matrix },
+       hs_http::router::Route { method: "GET".into(), path: "/_matrix/client/r0/capabilities".into(), surface: Surface::MatrixClient, operation_id: Some("getCapabilities".into()), auth: AuthKind::Matrix },
+   ];
+   ```
+   Then, after `let (router, mut manifest) = builder.build();` (today's line ~373), merge it the
+   same way `synapse_admin_router` is merged just below that (today's lines ~385–387 — an absolute
+   path merged directly onto the built router, not through `merge_router`, for the same reason
+   given there: "an absolute path merges onto the top-level router rather than nesting under a
+   prefix"):
+   ```rust
+   manifest.routes.extend(capabilities_routes);
+   let router = router.merge(capabilities_router);
+   ```
+3. Existing `hs-cli` tests that assert `/capabilities` works unauthenticated (e.g.
+   `capabilities_endpoint_is_mounted_under_v3_and_r0` in `serve.rs`, if it sends no token today)
+   will need a token added to their request — that test lives in `hs-cli`, not touched here.
+
+Line numbers above are as of this session's read of `crates/hs-cli/src/serve.rs`; they will drift
+as other tracks' agents edit that file concurrently — match by the code shown, not the numbers.
+
+### Decisions made
+
+- **Strict user-ID grammar enforcement** (item 1): `validate_localpart` now rejects anything
+  outside `UserId::validate_strict`'s fully-conforming set, for both `/register` and
+  `/register/available`. No ambiguity here — the spec is explicit and Complement is precise.
+- **`/register/available` does not lower-case; `/register` does** (item 3): deliberate asymmetry,
+  matched to Synapse's actual, observed behavior (`UsernameAvailabilityRestServlet.on_GET` has no
+  `.lower()` call; both of `RegisterRestServlet`'s call sites do). Complement does not test an
+  upper-case `/register/available` query either way.
+- **Did not implement Complement's stricter "session becomes mandatory once issued" UIA rule**
+  (item 2): matched Synapse's real, source-confirmed behavior instead, because the stricter rule
+  breaks the ordinary single-round-trip registration pattern this crate (and, all evidence
+  suggests, real clients) rely on, and because Synapse/Dendrite/Conduit are all skipped from that
+  exact Complement test for not implementing it either. If a future session wants to revisit this,
+  the honest way to satisfy the Complement test without breaking single-round flows would need a
+  way to distinguish "a session was never issued for this dance" from "a session was issued and
+  the client is now omitting it" — which is not recoverable from the request alone under the
+  current (stateless-per-call) design; it would need the UIA session to be looked up by some other
+  correlating key (e.g. the exact `username`/`password` pair) before falling back to "mint fresh",
+  which is a real design change, not a one-line fix.
+- **`AllowGuest`, not `Requester`, for `/capabilities`** (item 4): matches Synapse's
+  `allow_guest=True`, confirmed by reading `CapabilitiesRestServlet.on_GET`.
+- **`post_logout_all` device cleanup fixed alongside `post_logout`'s** (item 5), even though only
+  `post_logout`'s bug was named in the triage: same file, same class of bug, same unambiguous spec
+  sentence for the sibling endpoint two paragraphs down.
+
+### What the earlier triage did not name
+
+- The UIA challenge body's missing `params` field (see item 2) — found while reading
+  `apidoc_device_management_test.go` for item 5, not named in either the original triage or the
+  session's own brief.
+- `post_logout_all` never deleted devices, same as `post_logout` — the triage only named the
+  single-device `post_logout` case (from the "Can logout current device" test); "Can logout all
+  devices" doesn't happen to assert `GET /devices` afterward, so Complement itself won't catch
+  this one, but the spec text is just as explicit for it.
+
+### Interfaces provided
+
+Unchanged from session 4 — see that section below. No new public API surface this session; all
+five fixes are internal behavior changes to already-mounted routes.
+
+### Interfaces needed
+
+- `hs-cli`: the two mechanical `serve.rs`/`capabilities.rs` changes under "Wiring the integration
+  lead must add" above, to actually require a token on `/capabilities`.
+
+### Shared dependencies added
+
+None.
 
 ## Session 4 summary (read this first)
 
