@@ -253,7 +253,18 @@ pub async fn resolve(
             server: ResolvedServer {
                 connect_host: ip.to_string(),
                 connect_port: port.unwrap_or(DEFAULT_FEDERATION_PORT),
-                tls_server_name: server_name.to_string(),
+                // The bare IP, *not* `server_name` (which, when `port` is `Some`, is the whole
+                // original `"<ip>:<port>"` string): `tls_server_name` is combined with
+                // `connect_port` again downstream (`crate::client::FederationClient::send_inner`'s
+                // `format!("{scheme}://{tls_server_name}:{connect_port}{path}")`), so embedding
+                // the port here too produced a doubled-port URL
+                // (`https://192.0.2.1:8449:8449/...`) for every IP-literal destination with an
+                // explicit port -- a real bug, confirmed live against a second local instance of
+                // this server (`crates/hs-federation/scripts/two-server-federation.sh`) rather
+                // than caught by `ipv4_literal_with_port_bypasses_discovery_entirely`, which never
+                // asserted `tls_server_name`. Every `Hostname` arm below already does this
+                // correctly (stores `host`, not the original `host:port` string).
+                tls_server_name: ip.to_string(),
                 via: ResolutionPath::IpLiteral,
             },
             addresses: vec![ip],
@@ -302,7 +313,9 @@ async fn resolve_via_well_known_then_srv(
                     server: ResolvedServer {
                         connect_host: ip.to_string(),
                         connect_port: port.unwrap_or(DEFAULT_FEDERATION_PORT),
-                        tls_server_name: delegated_to,
+                        // Same fix as step 1's `IpLiteral` arm above, for a well-known document
+                        // that delegates to an IP literal with an explicit port.
+                        tls_server_name: ip.to_string(),
                         via: ResolutionPath::WellKnownIpLiteral,
                     },
                     addresses: vec![ip],
@@ -758,6 +771,13 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.server.connect_port, 8449);
         assert_eq!(outcome.server.via, ResolutionPath::IpLiteral);
+        // Regression test: `tls_server_name` used to be the *whole* original string
+        // (`"192.0.2.1:8449"`), which `crate::client::FederationClient::send_inner` then combines
+        // with `connect_port` again, producing a doubled-port URL
+        // (`https://192.0.2.1:8449:8449/...`) for every IP-literal destination with an explicit
+        // port -- confirmed live against a second local instance of this server
+        // (`crates/hs-federation/scripts/two-server-federation.sh`).
+        assert_eq!(outcome.server.tls_server_name, "192.0.2.1");
     }
 
     #[tokio::test]
@@ -829,6 +849,9 @@ mod tests {
         assert_eq!(outcome.server.connect_host, "203.0.113.20");
         assert_eq!(outcome.server.connect_port, 8449);
         assert_eq!(outcome.server.via, ResolutionPath::WellKnownIpLiteral);
+        // Same regression as `ipv4_literal_with_port_bypasses_discovery_entirely`, for the
+        // well-known-delegates-to-an-IP-literal path.
+        assert_eq!(outcome.server.tls_server_name, "203.0.113.20");
     }
 
     // --- Step 3c: well-known delegates to bare hostname -> SRV --------------------------------

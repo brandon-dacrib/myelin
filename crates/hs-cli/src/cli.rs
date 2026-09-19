@@ -34,8 +34,45 @@ pub enum Command {
     /// Writes the `routes.json` manifest (`docs/rfcs/0005-routes-json-manifest.md`) without
     /// booting a server — routes are static, independent of runtime config.
     RoutesManifest(RoutesManifestArgs),
+    /// Joins a room hosted by another server via the real `make_join`/`send_join` federation
+    /// handshake (`hs_federation::outbound_join::join_room`), as this server's own user.
+    ///
+    /// This is a diagnostic/administrative tool, not (yet) what `POST /join` calls: no code path
+    /// in this workspace triggers an outbound federated join from the ordinary client API yet,
+    /// because doing so durably needs an `hs-room` API this server does not have (see
+    /// `docs/rfcs/0015-outbound-join-needs-a-room-bootstrap-api.md`). This command performs the
+    /// real handshake anyway and reports what it verified: proof the wire protocol, TLS/CA trust
+    /// and event signing all work against a real remote, even though the room cannot yet be
+    /// represented locally afterward.
+    #[command(name = "federation-join-room")]
+    FederationJoinRoom(FederationJoinRoomArgs),
     /// Prints the `hs` version.
     Version,
+}
+
+/// `hs federation-join-room` arguments.
+#[derive(Debug, Args)]
+pub struct FederationJoinRoomArgs {
+    /// Native `hs-config` YAML file this server would otherwise run `hs serve` from: supplies
+    /// this server's own `server_name` and signing key (used to sign the join event) plus its
+    /// federation policy (TLS/CA trust, IP range policy, timeouts).
+    #[arg(short = 'c', long = "config")]
+    pub config: PathBuf,
+
+    /// The resident server to ask -- one already participating in the room, e.g.
+    /// `matrix.example.org` or, for two local instances with no DNS, `localhost:8448`.
+    #[arg(long = "destination")]
+    pub destination: String,
+
+    /// The room to join, e.g. `!abc123:matrix.example.org`.
+    #[arg(long = "room")]
+    pub room: String,
+
+    /// The full Matrix user ID performing the join, e.g. `@alice:example.org`. Must belong to
+    /// this server's own `server_name` (the resident server checks this; this command does not
+    /// pre-check it).
+    #[arg(long = "user")]
+    pub user: String,
 }
 
 /// `hs serve` arguments.
@@ -190,6 +227,7 @@ pub async fn dispatch(cli: Cli) -> i32 {
         Command::Register(args) => run_register(&args).await,
         Command::RoutesManifest(args) => run_routes_manifest(&args),
         Command::Serve(args) => run_serve(&args).await,
+        Command::FederationJoinRoom(args) => crate::federation::run_join_room(&args).await,
     }
 }
 

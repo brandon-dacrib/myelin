@@ -15,6 +15,7 @@ pub mod error;
 pub mod inbound;
 pub mod join;
 pub mod keys;
+pub mod outbound_join;
 pub mod room_source;
 pub mod transport;
 pub mod xmatrix;

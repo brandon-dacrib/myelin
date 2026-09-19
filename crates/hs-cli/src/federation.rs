@@ -923,7 +923,48 @@ pub fn build_mount<B: KvBackend + 'static>(
 }
 
 /// `hs-config`'s federation settings, in the shape the outbound client takes them.
+///
+/// **Bug fixed here, found by actually running two live instances against each other
+/// (`docs/status/06-federation.md`'s seventh session)**: this function used to build the outbound
+/// client's `ClientConfig` with `..ClientConfig::default()` for everything it did not list
+/// explicitly, which silently defaulted `custom_root_certificates` to empty and
+/// `trust_os_root_store` to `false` regardless of what `federation.custom_ca_certificates` /
+/// `federation.trust_os_root_store` said in the YAML. `hs-federation`'s own sixth session added
+/// real config fields and a real `ClientConfig` seam for exactly this (see that struct's own doc
+/// comments), and proved the seam works with an in-process test that constructs `ClientConfig`
+/// directly -- but nothing ever read `custom_ca_certificates`' *paths* off disk and passed the
+/// bytes through at the one site (`build_mount`, below) that actually boots a `FederationClient`
+/// for `hs serve`. The result: setting `federation.custom_ca_certificates` in a real config file
+/// had never had any effect on a running server, only in this crate's own unit tests -- the exact
+/// "everything landed, nothing was put together" gap this session's brief warned about. Confirmed
+/// by grep (`custom_root_certificates`/`custom_ca_certificates`/`trust_os_root_store` appeared
+/// nowhere in `crates/hs-cli/src/*.rs` before this fix) and then by running it: two live `hs
+/// serve` instances federating over TLS terminated with a private CA (see
+/// `crates/hs-federation/scripts/two-server-federation.sh`) failed outbound TLS verification
+/// until this function actually read the configured CA file.
+///
+/// A CA file that fails to read is logged loudly and skipped, not a fatal boot error: matching
+/// `FederationClient::new`'s own tolerance for a CA entry that parses but is malformed, an entry
+/// that cannot even be read (typo'd path, permissions) should be visible in the log the first time
+/// this server tries to use it, not a mysterious refusal to start.
 fn client_config(config: &hs_config::FederationConfig) -> hs_federation::client::ClientConfig {
+    let custom_root_certificates = config
+        .custom_ca_certificates
+        .iter()
+        .filter_map(|path| match std::fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) => {
+                tracing::error!(
+                    path,
+                    %error,
+                    "federation.custom_ca_certificates entry could not be read and will NOT be \
+                     trusted for outbound federation TLS"
+                );
+                None
+            }
+        })
+        .collect();
+
     hs_federation::client::ClientConfig {
         enabled: config.enabled,
         domain_policy: hs_federation::client::DomainPolicy::new(config.domain_allowlist.clone()),
@@ -932,6 +973,8 @@ fn client_config(config: &hs_config::FederationConfig) -> hs_federation::client:
             &config.ip_range_allowlist,
         ),
         verify_certificates: config.verify_certificates,
+        custom_root_certificates,
+        trust_os_root_store: config.trust_os_root_store,
         request_timeout: config.client_timeout.into(),
         max_retry_backoff: config.max_retry_backoff.into(),
         ..hs_federation::client::ClientConfig::default()
@@ -1040,5 +1083,98 @@ struct NoKeyFetcher;
 impl hs_federation::keys::KeyServerFetcher for NoKeyFetcher {
     async fn fetch_server_key(&self, _server_name: &str) -> Option<Value> {
         None
+    }
+}
+
+// ------------------------------------------------------------------------------------------
+// `hs federation-join-room`: the client-role join handshake, driven from the command line
+// ------------------------------------------------------------------------------------------
+
+/// Implements `hs federation-join-room`: loads `config_path` the same way `hs serve` would (same
+/// server name, same signing key, same federation policy -- TLS/CA trust, IP range policy,
+/// timeouts), then performs a real `hs_federation::outbound_join::join_room` against
+/// `args.destination`, printing what was verified.
+///
+/// Deliberately opens no storage: everything this needs (`server_name`, the signing key,
+/// `hs-config::FederationConfig`) comes from the config file alone, and nothing it produces can be
+/// persisted locally yet (see `hs_federation::outbound_join`'s module doc and
+/// `docs/rfcs/0015-outbound-join-needs-a-room-bootstrap-api.md` for why) -- so there is no local
+/// room store for it to open in the first place. Uses an in-memory destination-backoff store
+/// (`InMemoryDestinationStore`) rather than `KvDestinationStore`, unlike `build_mount`'s `hs
+/// serve` client, for the same reason: a one-shot command has no state worth persisting across
+/// runs.
+pub async fn run_join_room(args: &crate::cli::FederationJoinRoomArgs) -> i32 {
+    let config = match hs_config::Config::load(&args.config) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hs federation-join-room: {e}");
+            return 1;
+        }
+    };
+    let identity = match crate::identity::load_or_generate(&config) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("hs federation-join-room: invalid server.server_name: {e}");
+            return 1;
+        }
+    };
+
+    let destinations = Arc::new(hs_federation::destination_store::InMemoryDestinationStore::new());
+    let well_known = Arc::new(hs_federation::discovery::CachingWellKnownFetcher::new(
+        hs_federation::discovery::HttpWellKnownFetcher::new(),
+    ));
+    let (srv, addr) = resolvers();
+    let client = Arc::new(hs_federation::client::FederationClient::new(
+        identity.server_name.to_string(),
+        (*identity.signing_key).clone(),
+        client_config(&config.federation),
+        destinations,
+        well_known,
+        srv,
+        addr,
+    ));
+    let key_cache: hs_federation::keys::DynRemoteKeyCache =
+        hs_federation::keys::RemoteKeyCache::new(Box::new(ClientKeyFetcher::new(client.clone()))
+            as Box<dyn hs_federation::keys::KeyServerFetcher>);
+
+    match hs_federation::outbound_join::join_room(
+        &client,
+        &key_cache,
+        &args.destination,
+        &args.room,
+        &args.user,
+        &identity.server_name,
+        &identity.signing_key,
+    )
+    .await
+    {
+        Ok(outcome) => {
+            println!("join accepted by {}", args.destination);
+            println!("  room_id:      {}", outcome.room_id);
+            println!("  room_version: {}", outcome.room_version.as_str());
+            println!("  join_event:   {}", outcome.join_event.event_id());
+            println!("  state events verified:      {}", outcome.state.len());
+            println!("  auth_chain events verified: {}", outcome.auth_chain.len());
+            println!("  members_omitted: {}", outcome.members_omitted);
+            println!();
+            println!(
+                "This join is real and durably persisted on {}'s side -- confirm with, e.g.,",
+                args.destination
+            );
+            println!(
+                "  GET /_matrix/client/v3/rooms/{}/members there. {} cannot yet",
+                outcome.room_id, identity.server_name
+            );
+            println!(
+                "represent this room locally for {} to sync or post into: see",
+                args.user
+            );
+            println!("  docs/rfcs/0015-outbound-join-needs-a-room-bootstrap-api.md.");
+            0
+        }
+        Err(e) => {
+            eprintln!("hs federation-join-room: {e}");
+            1
+        }
     }
 }

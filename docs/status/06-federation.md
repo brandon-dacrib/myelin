@@ -4,13 +4,25 @@
 > one gap this session could not close" — no way to persist a newly received foreign event — was
 > **closed** by track 04's `hs_room::actor::RoomActor::accept_remote_event`. The fifth session
 > closed the next one: the backfill-then-retry loop `MissingAncestors` was reported for but never
-> consumed. **This (sixth) session closed the TLS/CA gap Complement's federation run was blocked
-> on, fixed a real PDU signature-verification bug it uncovered underneath, and found a second,
-> more consequential instance of the same signature bug in `hs-room`'s own outbound pipeline —
-> see `docs/rfcs/0014-event-signing-must-sign-the-redacted-form.md` for the fix track 04 needs to
-> apply.** See "Sixth session: TLS/CA trust, and the redaction-before-signing bug" below.
+> consumed. The sixth session closed the TLS/CA gap Complement's federation run was blocked on,
+> fixed a real PDU signature-verification bug it uncovered underneath, and found a second, more
+> consequential instance of the same signature bug in `hs-room`'s own outbound pipeline (fixed by
+> track 04 since, per RFC-0014). **This (seventh) session put two real, live instances of this
+> server in front of each other for the first time — the first genuine "join a room on a different
+> server" this workspace has ever run — and found that the pieces the previous six sessions built
+> had never actually been assembled: `federation.custom_ca_certificates` had no effect on a real
+> `hs serve` process (the config field existed, the client field existed, nothing read the file
+> off disk), an IP-literal destination with an explicit port produced a malformed, doubled-port
+> URL, and nothing in this workspace could *initiate* an outbound join at all — only answer one.**
+> All three are fixed; see "Seventh session" below.
 
-Updated: 2026-09-19 (sixth session -- the TLS/CA session: `hs-config`/`hs-federation` gained a real
+Updated: 2026-09-19 (seventh session -- the two-instance session: two real `hs serve` processes,
+different server names, federated over real HTTPS with a private CA and real X-Matrix signatures,
+for the first time. Found and fixed a `hs-cli` wiring bug that silently no-op'd
+`federation.custom_ca_certificates` on every real deployment, a `hs-federation` discovery bug that
+broke every IP-literal-with-port destination, and closed the "nothing can initiate an outbound
+join" gap with a new `crate::outbound_join` module. See "Seventh session" below). Previously
+updated 2026-09-19 (sixth session -- the TLS/CA session: `hs-config`/`hs-federation` gained a real
 config surface for trusting a custom CA (matching Synapse's `federation_custom_ca_list`), the
 outbound client now uses it, `verify_certificates: false` is now loud, and a real send_join
 signature-verification bug Complement found underneath the TLS gap is fixed. See "Sixth session"
@@ -22,12 +34,185 @@ is retried; see "Fifth session: the backfill loop" below). Before that, 2026-09-
 session, the mounting session; see "Mounted into `hs serve`" below for what changed then). The
 first session wrote the threat model and the plan below but stopped before any crate code existed;
 the second implemented items 1-7 of that plan.
-`crates/hs-federation` is no longer a placeholder: 120 passing lib tests (up from 119), plus 7 + 8
-real end-to-end tests in `hs-cli` driving a running composed router with genuine signed requests
-(4 of the 8 `federation_writes` tests are, as of this session, a **known, documented, expected**
-regression -- see "Sixth session" below, not a hs-federation bug), `cargo clippy -p hs-federation
---all-targets -- -D warnings` clean, five fuzz targets that type-check. Read this file before
-touching `hs-federation` further.
+`crates/hs-federation` is no longer a placeholder: 124 passing lib tests (up from 120), plus 24 real
+end-to-end tests in `hs-cli` (9 e2e + 7 federation_reads + 8 federation_writes, all passing --
+RFC-0014's fix has landed in `hs-room` since the sixth session, so `federation_writes` is 8/8
+again, not 4/8), `cargo clippy -p hs-federation --all-targets --no-deps -- -D warnings` clean (see
+"Seventh session"'s verification section for why `--no-deps` is named explicitly this time), five
+fuzz targets that type-check. Read this file before touching `hs-federation` further.
+
+## Seventh session: two real instances, federating for real -- and three bugs only that could find
+
+Scope, per this session's brief (`docs/next-steps.md` item 2, sharpened): put two local instances
+of this server in front of each other, different server names, real HTTP, real X-Matrix signatures
+-- not a public join (no public name or CA on this laptop), but the same code paths. Ownership this
+session: `crates/hs-federation/**`, `crates/hs-cli/**`, `docs/status/06-federation.md` only.
+
+### 0. The headline finding: assembling working parts for the first time finds bugs no unit test can
+
+Every one of this session's three bugs (below) was invisible to every existing test in this
+workspace -- 120 passing `hs-federation` lib tests, 24 passing `hs-cli` end-to-end tests, all still
+green *with the bugs present* -- because every one of them is a seam between two things that had
+never both been real at once before: a config file loaded by the actual `hs-cli` wiring (not a
+`ClientConfig` built by hand in a test), a destination string shaped like a real deployment might
+plausibly use, and a join initiated by an actual second process rather than a synthetic
+already-signed event handed to `send_join`. This is the same lesson the fourth, fifth and sixth
+sessions each drew independently (a missing `room_id` in a join response, a trailing slash, the
+redaction-before-signing bug) -- restated here because it happened a third time, at a different
+seam, the moment real assembly was attempted again.
+
+### 1. `federation.custom_ca_certificates` had never worked on a real server
+
+**Root cause.** `crates/hs-cli/src/federation.rs::client_config` -- the one function that converts
+`hs-config::FederationConfig` into the `hs_federation::client::ClientConfig` a real `hs serve`
+process's `FederationClient` is built from -- listed `verify_certificates`, `request_timeout` and
+a few others explicitly, then filled in everything it did not mention with
+`..ClientConfig::default()`. `custom_root_certificates` and `trust_os_root_store` were never in
+that explicit list, so they silently took their `ClientConfig::default()` values (empty /
+`false`) regardless of what `federation.custom_ca_certificates` said in the YAML. The sixth
+session built the schema field, the `ClientConfig` field, the PEM-parsing logic, and proved all of
+it works with an in-process TLS test that constructs `ClientConfig` directly -- and that test is
+exactly why this went unnoticed: it never went through `client_config`, the one place a real
+config file's file *paths* get turned into bytes. Confirmed by grep before touching anything:
+`custom_root_certificates`/`custom_ca_certificates`/`trust_os_root_store` appeared nowhere in
+`crates/hs-cli/src/*.rs`.
+
+**Fixed** in `client_config` (`crates/hs-cli/src/federation.rs`): reads each configured path with
+`std::fs::read`, collecting the bytes into `ClientConfig::custom_root_certificates`; a path that
+fails to read is logged with `tracing::error!` and skipped, not a fatal boot error (matching
+`FederationClient::new`'s own tolerance for a CA entry that reads fine but parses as malformed
+PEM). `trust_os_root_store` is copied straight through. Proven by running, not just reading: this
+session's two-instance script failed outbound TLS verification against the private CA until this
+fix landed, then succeeded.
+
+### 2. An IP-literal destination with an explicit port produced a malformed, doubled-port URL
+
+**Root cause**, found while diagnosing why `federation-join-room` (below) could not even reach a
+server whose TLS and registration all demonstrably worked (`curl` against the same address
+succeeded). `crates/hs-federation/src/discovery.rs::resolve`'s `ParsedServerName::IpLiteral` arm
+(both the direct one and the well-known-delegates-to-an-IP-literal one) set
+`tls_server_name: server_name.to_string()` -- the **entire original input string**, e.g.
+`"192.0.2.1:8449"` -- instead of just the IP. `crate::client::FederationClient::send_inner` then
+builds the request URL as `format!("{scheme}://{tls_server_name}:{connect_port}{path}")`, which for
+an IP literal with an explicit port produces `https://192.0.2.1:8449:8449/...` -- a syntactically
+invalid authority that `reqwest` simply fails to connect, surfacing as a generic
+`ClientError::Request` with no further detail (the actual gap that made this take real
+investigation: `reqwest::Error`'s `Display` does not show the malformed-URL cause, only "error
+sending request for url (...)"). Every `Hostname` arm already stored the bare host correctly;
+`ipv4_literal_with_port_bypasses_discovery_entirely`, the one existing test for this exact input
+shape, asserted `connect_port` and `via` but never `tls_server_name`, so the bug shipped invisibly.
+
+**Fixed**: both `IpLiteral` arms in `discovery.rs::resolve` now set `tls_server_name: ip.to_string()`
+(the bare IP), matching every other arm's convention. Two regression assertions added to the
+existing tests (`ipv4_literal_with_port_bypasses_discovery_entirely`,
+`well_known_delegates_to_ip_literal`) that would have caught this on day one. `cargo test -p
+hs-federation --lib discovery` -- 20/20 pass.
+
+Also discovered along the way, not a code bug but worth recording: `hs-federation`'s
+`AddrResolver` (`HickoryResolver`, backed by `hickory-resolver`) is a pure userspace DNS stub that
+queries the configured nameservers directly and does **not** consult `/etc/hosts`. On a network
+with a search-domain-configured `/etc/resolv.conf` (this laptop's has one), resolving the hostname
+`"localhost"` through it is genuinely unreliable -- it is not guaranteed to return `127.0.0.1`,
+unlike `curl`/`dig`/anything going through `getaddrinfo`. This session's script uses IP literals
+(`127.0.0.1:8448`/`127.0.0.1:8449`) specifically to sidestep this, not merely for convenience; see
+the script's own comments. This is not a bug to fix (a pure-Rust stub resolver correctly not
+reading `/etc/hosts` is ordinary, documented `hickory-resolver` behavior) but is worth any future
+session knowing before spending an hour on it again.
+
+### 3. Nothing in this workspace could *initiate* a federated join -- only answer one
+
+**The gap.** `crate::join::{make_join, send_join}` and their mount (`crate::transport::join`) are
+the *resident* side of the join handshake: this server, hosting a room, answering a remote's
+`GET /make_join` and `PUT /send_join`. That side is real and was already tested end to end
+(`crates/hs-cli/tests/federation_writes.rs`). Nothing anywhere in this workspace played the other
+role -- a server whose own user wants to join a room hosted elsewhere, which means calling *out* to
+another server's `/make_join`/`/send_join`. This was invisible until this session because nothing
+had ever tried: every previous test of the join handshake, in this crate and in `hs-cli`, hands a
+synthetic already-signed join event to `send_join` as if a remote had produced it.
+
+**Closed the handshake half.** New module `crates/hs-federation/src/outbound_join.rs`,
+`pub async fn join_room(client, key_cache, destination, room_id, user_id, own_server_name,
+signing_key) -> Result<RemoteJoinOutcome, OutboundJoinError>`: calls `GET make_join` via the same
+`FederationClient::send` every other outbound call uses (so discovery, TLS/CA trust and outbound
+`X-Matrix` signing all come for free), signs the returned template the spec's real way -- hash the
+full event, redact, sign the *redacted* form, copy the signature back onto the full event, per
+RFC-0014, which this module follows rather than re-deriving -- calls `PUT send_join` (v2), and
+verifies every event in the response's `state` and `auth_chain` through the same
+`crate::inbound::verify_pdu` any other inbound PDU gets. Four tests, including a full live-HTTP
+round trip against a real `axum::serve` resident bound to a real loopback socket (not
+`tower::oneshot`, no mocked transport) -- see `outbound_join::tests::
+join_room_completes_the_real_handshake_against_a_live_resident`. `cargo test -p hs-federation
+--lib outbound_join` -- 4/4 pass.
+
+**Did not, and could not, close persistence.** `join_room` returns a fully verified snapshot and
+stops there: `hs-room` has no API to create a local room from a federation join response's state,
+only to originate a brand new one (`RoomActor::create_room`) or apply one more event to a room it
+already has (`RoomActor::accept_remote_event`) -- neither fits "this room's real `m.room.create`
+was authored by a different server and I have never seen this room before." Filed as
+`docs/rfcs/0015-outbound-join-needs-a-room-bootstrap-api.md`, addressed to track 04, with the exact
+shape of the needed entry point. **Consequence**: the join is real and durably persisted on the
+*resident's* side (proven live, see below) but the joining server cannot yet represent the room for
+its own user to sync or post into -- a one-way proof, honestly reported as such by both the RFC and
+the script's own printed summary.
+
+**A diagnostic CLI surface, since nothing in the ordinary client API can trigger this yet.** New
+`hs federation-join-room -c <config> --destination <server> --room <id> --user <user_id>`
+(`crates/hs-cli/src/cli.rs`'s `Command::FederationJoinRoom`, implemented in
+`crates/hs-cli/src/federation.rs::run_join_room`): loads a real `hs-config` file the same way `hs
+serve` would (same server name, same signing key, same federation policy) and runs `join_room`
+against it, printing what was verified. Opens no storage -- nothing it produces can be persisted
+locally yet, so there is nothing for it to open. This is not what `POST /join` calls (no wiring
+exists there yet, and adding it needs RFC-0015 first): it is the only way, today, to exercise the
+real cross-server join handshake this crate provides.
+
+### 4. The script: `crates/hs-federation/scripts/two-server-federation.sh`
+
+Runnable in one command (`bash crates/hs-federation/scripts/two-server-federation.sh [workdir]`,
+workdir defaults to a fresh `mktemp -d`). Requires `cargo`, `openssl`, `curl`, `jq`, and `stunnel`
+(`brew install stunnel` on macOS -- `hs serve` does not terminate TLS itself yet, exactly the same
+reasoning and the same tool `tests/complement/Dockerfile.template` already uses; this script's
+`stunnel.conf`s are the same accept-here-forward-there shape as `tests/complement/stunnel.conf.template`).
+No Docker.
+
+What it does, in order, against two real `hs serve` processes on 127.0.0.1 with different
+server names (`127.0.0.1:8448`, `127.0.0.1:8449`) and different embedded-storage data directories:
+generates a private CA and one IP-SAN server certificate; writes each server's native config
+(`federation.custom_ca_certificates` pointing at the shared CA, `ip_range_blocklist: []` since both
+instances are on loopback); starts both `hs serve` processes and a `stunnel` in front of each
+(TLS on `:8448`/`:8449`, forwarding to plaintext `:8008`/`:8018`); sanity-checks that A can fetch
+B's `/_matrix/key/v2/server` over real TLS with the private CA (the §1 fix, exercised first,
+because everything after it depends on outbound TLS actually working); registers `@alice` on A and
+`@bob` on B through the real client-server UI-auth dance; alice creates a public room and sends a
+message; **B joins A's room via `hs federation-join-room`, the real make_join/send_join handshake**;
+and finally verifies, by querying A's own client API (not the script's own say-so), that bob really
+is a joined member. Prints a clear summary of what was proven and what a real public join would
+still exercise that this run does not (DNS-based discovery, a publicly trusted CA, another
+implementation's quirks, version negotiation against a server that is not itself) -- see the
+script's own final output for the exact wording, since it is the artifact this file should not
+duplicate and risk drifting from.
+
+Ran twice against two fresh workdirs this session; both runs succeeded identically.
+
+### Verification
+
+```
+cargo fmt -p hs-federation -p hs-cli                                          # applied, no diffs after
+cargo test -p hs-federation                                                   # 124/124 (was 120)
+cargo test -p hs-cli --test federation_reads --test federation_writes --test e2e   # 7+8+9 = 24/24
+cargo test -p hs-loadgen --test real_client                                   # 1/1 (single-server path unaffected)
+bash crates/hs-federation/scripts/two-server-federation.sh                    # succeeds end to end, twice
+```
+
+`cargo clippy -p hs-federation --all-targets -- -D warnings`: **fails**, but not on this crate's
+code -- `crates/hs-http/src/cors.rs` (a different track's crate, with uncommitted, in-progress
+changes present in the working tree at the time of this session, confirmed via `git status`/`git
+diff`) trips `clippy::double_must_use` on a function this session did not touch, and workspace
+clippy lints every crate in the dependency graph, not just the one named with `-p`, unless
+`--no-deps` is passed. `cargo clippy -p hs-federation --all-targets --no-deps -- -D warnings` is
+clean, proving this crate's own code is not the source. Not something this track can or should fix
+(`crates/hs-http/**` is out of this session's ownership); flagged here so the next session does not
+waste time re-diagnosing it, and re-run without `--no-deps` once that other track's work lands or
+is reverted.
 
 ## Sixth session: TLS/CA trust, and the redaction-before-signing bug
 
@@ -871,7 +1056,14 @@ is a complete, tested unit, except the one named gap (`RoomWriteSink` cannot per
 see above) which is honestly reported as a gap, not left half-built. The sixth session's own work
 (TLS/CA config surface, `verify_pdu`'s redaction fix) is likewise complete and fully green within
 this crate; the one thing left genuinely unfinished is outside this crate's ownership -- see item 0
-below and `docs/rfcs/0014-event-signing-must-sign-the-redacted-form.md`.
+below and `docs/rfcs/0014-event-signing-must-sign-the-redacted-form.md`. **RFC-0014 has since been
+applied by track 04** (`crates/hs-room/src/pipeline.rs` now signs the redacted form; confirmed this
+(seventh) session by re-running `cargo test -p hs-cli --test federation_writes` -- 8/8 pass, not
+4/8). The seventh session's own work (the `client_config`/discovery bug fixes,
+`crate::outbound_join`, `hs federation-join-room`, the two-server script) is likewise complete and
+fully green within this crate and `hs-cli`; the one thing left genuinely unfinished is, again,
+outside this crate's ownership -- see `docs/rfcs/0015-outbound-join-needs-a-room-bootstrap-api.md`,
+addressed to track 04.
 
 ## Next (for whoever resumes this track)
 
@@ -879,15 +1071,18 @@ Superseded from earlier sessions' lists (wiring `hs-federation` into `hs serve`,
 `RoomDataSource` adapter, `HttpKeyServerFetcher`, the key-server axum handlers) are all done as of
 the third and fourth sessions and removed from this list. What remains:
 
-0. **(New, urgent, not this track's crate)** `crates/hs-room/src/pipeline.rs` signs outgoing events
-   over their full, unredacted form instead of the redacted one the spec requires -- the same bug
-   this (sixth) session fixed in `verify_pdu`, still live on the *sending* side. Filed as
-   `docs/rfcs/0014-event-signing-must-sign-the-redacted-form.md`, addressed to track 04, with the
-   exact fix shape and the three `hs-cli` test call sites (mechanical, same fix) that need the same
-   correction. Until this lands, `cargo test -p hs-cli --test federation_writes` has 4/8 failing
-   (confirmed, read-only, this session) and any real remote homeserver correctly verifying this
-   server's events (redact-then-check, as `verify_pdu` now does) would reject any event whose
-   content is not fully retained by redaction -- in practice, every ordinary message.
+-1. **(New, urgent, not this track's crate)** `hs-room` needs a room-bootstrap API so a federated
+   join's verified state snapshot can become a real local room, not just a verified-and-discarded
+   one. Filed as `docs/rfcs/0015-outbound-join-needs-a-room-bootstrap-api.md`, addressed to track
+   04, with the exact shape of the needed entry point. Until this lands, `hs
+   federation-join-room`/`crate::outbound_join::join_room` (this session) proves the handshake and
+   every signature real and live, and the resident server genuinely persists the join -- but the
+   joining server's own user can never sync or post into the room. This is the single largest gap
+   standing between this workspace and "two servers, both directions, both send messages."
+0. ~~**(not this track's crate)** `crates/hs-room/src/pipeline.rs` signs outgoing events over their
+   full, unredacted form instead of the redacted one the spec requires~~ -- **fixed by track 04**
+   since the sixth session (confirmed this (seventh) session:
+   `cargo test -p hs-cli --test federation_writes` is 8/8, not 4/8). RFC-0014 is closed.
 1. ~~**`Command::PersistInbound` on `hs-room`'s `RoomActor`**~~ -- built by track 04 between
    sessions (`RoomActor::accept_remote_event`), consumed by the fourth session
    (`RegistryWriteSink`) and, as of this (fifth) session, actually reachable end to end: the
@@ -933,18 +1128,38 @@ the third and fourth sessions and removed from this list. What remains:
 
 ## Blockers
 
-None for this crate's own work -- every deliverable this (sixth) session was asked for is done and
-tested inside `hs-federation`/`hs-config`. **Not a blocker on this track, but a known, accepted,
-documented consequence**: `verify_pdu`'s correctness fix (§5 above) makes 4 of `hs-cli`'s 8
-`federation_writes` tests fail until track 04 applies the companion fix in
-`docs/rfcs/0014-event-signing-must-sign-the-redacted-form.md`. This was a deliberate choice (see
-"Sixth session" §5-6): reverting `verify_pdu` to avoid the collateral failure would mean leaving the
-actual named bug (`send_join` rejecting a real, correctly-signed join) unfixed. The one blocker
-recorded in earlier sessions (`RoomActor::accept_remote_event` needing to exist on `hs-room`) was
-resolved by track 04 between the fourth and fifth sessions.
+None for this crate's own work -- every deliverable this (seventh) session was asked for is done
+and tested inside `hs-federation`/`hs-cli`. Two historical entries, resolved:
+
+- `verify_pdu`'s correctness fix making 4 of `hs-cli`'s 8 `federation_writes` tests fail (sixth
+  session) -- **resolved**: track 04 applied RFC-0014's fix since, confirmed 8/8 this session.
+- `RoomActor::accept_remote_event` needing to exist on `hs-room` -- resolved between the fourth
+  and fifth sessions.
+
+**Current, real blocker for the next milestone ("both directions"), not this session's own work**:
+`hs-room` has no room-bootstrap API (`docs/rfcs/0015-outbound-join-needs-a-room-bootstrap-api.md`),
+so a federated join this server's own user initiates can be fully verified but never durably
+represented locally. Everything up to that boundary is done, tested and proven live; that one gap
+is track 04's, not track 06's, to close.
+
+**Environmental, not this track's**: `cargo clippy -p hs-federation --all-targets -- -D warnings`
+(without `--no-deps`) currently fails on an unrelated, in-progress `crates/hs-http` change (see
+"Seventh session"'s verification section). `hs-federation`'s own code is clean
+(`--no-deps` variant passes); this is not a regression this session introduced and not something
+this track can fix (`crates/hs-http/**` is out of this session's ownership).
 
 ## Interfaces provided
 
+- **`crate::outbound_join::{join_room, RemoteJoinOutcome, OutboundJoinError}`** (new this seventh
+  session): the client-role join handshake -- any track that needs "make this server's user join a
+  room hosted elsewhere" (a future `/join` wiring, once RFC-0015 lands, or a bridge/appservice that
+  needs the same) calls this directly. Returns a fully verified snapshot; persisting it is the
+  caller's job once `hs-room` can (RFC-0015).
+- **`hs federation-join-room` CLI subcommand** (`crates/hs-cli`, new this session): drives
+  `join_room` from a real config file with no storage open. Diagnostic/administrative today; the
+  natural first caller once RFC-0015 lands is `hs-room`'s own client-facing `/join` route (not this
+  CLI command, which would then become redundant with it -- kept anyway as a lower-level tool for
+  debugging a stuck join without a full client).
 - **`crate::client::FederationClient`** (tracks 08, 09, 11 per the brief): `new(...)` takes an
   owned server name, a `SigningKeyPair`, a `ClientConfig`, and `Arc<dyn DestinationStore>` /
   `Arc<dyn WellKnownFetcher>` / `Arc<dyn SrvResolver>` / `Arc<dyn AddrResolver>`; `.send(destination,
@@ -1032,20 +1247,40 @@ resolved by track 04 between the fourth and fifth sessions.
   need the same mechanical redact-then-sign fix already applied twice in this crate's own tests
   this session. Confirmed (read-only) these three, plus the one real-pipeline-dependent test named
   above, are the only `federation_writes` failures caused by this session's `verify_pdu` fix.
-- **`hs-cli`'s `crates/hs-cli/src/federation.rs::client_config`**: to actually honour the new
-  `hs-config` fields end-to-end, needs two more lines reading
-  `config.federation.custom_ca_certificates` (loading each named file's bytes -- the file I/O this
-  crate's `ClientConfig` deliberately does not do itself, see "Sixth session" §2) into
-  `ClientConfig::custom_root_certificates`, and `config.federation.trust_os_root_store` straight
-  into `ClientConfig::trust_os_root_store`. Not done this session (`crates/hs-cli/**` is out of this
-  session's ownership); `..ClientConfig::default()` in the existing conversion function means the
-  server still builds and runs correctly without this -- the new fields just have no effect on a
-  real deployment until it lands, exactly the same shape of gap as the fourth session's `router_v2`
-  mounting note above.
+- ~~**`hs-cli`'s `crates/hs-cli/src/federation.rs::client_config`**: to actually honour the new
+  `hs-config` fields end-to-end, needs two more lines...~~ **Done this (seventh) session** -- see
+  "Seventh session" §1. This is the track's own crate (`crates/hs-cli/**` is in this session's
+  ownership, unlike the sixth session that wrote this item), so it was fixed directly rather than
+  filed as a request to another track.
+- **Track 04, current**: the room-bootstrap API `docs/rfcs/0015-outbound-join-needs-a-room-bootstrap-api.md`
+  asks for -- see "Blockers" above.
 
 ## Decisions made
 
-New this (sixth) session:
+New this (seventh) session:
+
+- **The two-server script uses IP-literal server names (`127.0.0.1:8448`/`127.0.0.1:8449`), not
+  hostnames.** Discovered live: this crate's `AddrResolver` (`hickory-resolver`) does not consult
+  `/etc/hosts`, so a hostname like `"localhost"` resolved through a real, search-domain-configured
+  `/etc/resolv.conf` is not guaranteed to reach `127.0.0.1` -- confirmed on this machine's own
+  network. IP literals bypass discovery entirely (`crate::discovery` step 1) and are exactly as
+  spec-valid a `server_name` as a hostname, so they are the right choice for a script that must be
+  reproducible on any machine's network configuration, not a workaround.
+- **A malformed-CA-file entry is logged and skipped, not a fatal boot error** (`client_config`'s
+  fix, §1): matches `FederationClient::new`'s own existing tolerance for a CA entry that reads but
+  fails to *parse*; a path that cannot even be *read* (typo, permissions) should be equally visible
+  in the log rather than crashing a server that might otherwise boot and serve local users fine.
+- **`hs federation-join-room` opens no storage.** Everything it needs (server name, signing key,
+  federation policy) lives in the config file alone; nothing it produces can be durably persisted
+  yet regardless (RFC-0015), so there is no room store for it to open. Uses
+  `InMemoryDestinationStore` rather than `KvDestinationStore` for the same reason a one-shot
+  command has no backoff state worth persisting across runs.
+- **`join_room` fails closed on the first unverifiable event in `state`/`auth_chain`**, rather than
+  collecting partial results: a resident server that hands back even one event that fails content-
+  hash or signature verification is not a resident worth trusting further for this join, matching
+  `verify_pdu`'s own all-or-nothing contract for a single PDU.
+
+Previously, sixth session:
 
 - **`trust_os_root_store` defaults to `false`.** Full reasoning in the field's own doc comment
   (`hs-config::FederationConfig::trust_os_root_store`) and in "Sixth session" §2 above; recorded
@@ -1260,7 +1495,11 @@ canonical/signing/hashing, `ruma-federation-api` considered-but-not-adopted-for-
 
 ## Shared dependencies added
 
-This (sixth) session: **no new `[workspace.dependencies]` root-`Cargo.toml` entries** -- every
+This (seventh) session: **none.** No `Cargo.toml` in either owned crate (`hs-federation`,
+`hs-cli`) changed; `crate::outbound_join` and `hs federation-join-room` are built entirely from
+types and crates both already depended on.
+
+Sixth session: **no new `[workspace.dependencies]` root-`Cargo.toml` entries** -- every
 crate this session's `hs-federation/Cargo.toml` change touches (`reqwest`'s extra feature;
 `rustls`, `tokio-rustls`, `rustls-pki-types`, `hyper`, `hyper-util`, `http-body-util` as new
 dev-dependencies) was already a workspace-level dependency used by some other crate, so nothing

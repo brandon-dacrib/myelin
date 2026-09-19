@@ -427,10 +427,10 @@ impl RoomDataSource for InMemoryRoomSource {
             .state
             .iter()
             .filter_map(|event| {
-                event
-                    .get("event_id")
-                    .and_then(Value::as_str)
-                    .map(|id| (id.to_owned(), event.clone()))
+                Some((
+                    event_id_for_fixture(event, room.room_version.as_deref())?,
+                    event.clone(),
+                ))
             })
             .collect();
         Ok(StateForJoin {
@@ -438,6 +438,24 @@ impl RoomDataSource for InMemoryRoomSource {
             auth_chain: room.join_auth_chain.clone(),
         })
     }
+}
+
+/// The ID [`InMemoryRoomSource::state_for_join`] uses for a fixture event: the literal
+/// `"event_id"` field if the fixture set one (the convenience every fixture that never signs its
+/// events for real relies on, e.g. `crate::join::tests::room_with_creator`'s `"$create"`-style
+/// tags), or, failing that, the real room-version-appropriate ID `hs_model::Event::parse` derives
+/// (reference hash, for room version 3+) -- what a fixture that builds genuinely hashed and
+/// signed events (so they also pass `crate::inbound::verify_pdu` once round-tripped over the
+/// wire, which a literal, made-up `"event_id"` field would not, since content hashing does not
+/// exclude that key) must use instead, having deliberately left the field out.
+fn event_id_for_fixture(event: &Value, room_version: Option<&str>) -> Option<String> {
+    if let Some(id) = event.get("event_id").and_then(Value::as_str) {
+        return Some(id.to_owned());
+    }
+    let room_version = ruma::RoomVersionId::try_from(room_version?).ok()?;
+    hs_model::Event::parse(event, room_version)
+        .ok()
+        .map(|parsed| parsed.event_id().to_string())
 }
 
 fn extract_ids(events: &[EventJson]) -> Vec<String> {
