@@ -485,18 +485,19 @@ fn build_session_mounts<B: KvBackend>(
 /// store — both constructed `from_auth_state` so the admin surface and the client-server surface
 /// read one backend handle rather than two.
 ///
-/// The audit sink and event bus are still in-memory: an admin action is recorded and streamed to
-/// `GET /api/v1/events` subscribers, but the audit log does not survive a restart. A durable sink
-/// over `hs-tables` is track 15's (`docs/status/15-admin-api-and-modules.md`), and is the one
-/// piece of this state that is not yet real.
-fn admin_state(
+/// The audit sink is durable ([`crate::audit::TablesAuditSink`], over the same backend as every
+/// other store), so who locked an account or promoted an admin survives a restart. The event bus
+/// stays in-process by design: it is a live stream for `GET /api/v1/events` subscribers, not a
+/// record — the record is the audit log.
+fn admin_state<B: KvBackend + 'static>(
     auth: &AuthState,
+    audit: Arc<crate::audit::TablesAuditSink<B>>,
     server_name: &str,
     enabled_components: Vec<String>,
 ) -> hs_admin::router::AdminState {
     hs_admin::router::AdminState::new(
         Arc::new(hs_auth::admin_verifier::AdminTokenVerifier::from_auth_state(auth)),
-        Arc::new(hs_admin::audit::InMemoryAuditSink::new()),
+        audit,
         Arc::new(hs_admin::events::EventBus::new()),
     )
     .with_users(Arc::new(
@@ -721,7 +722,6 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     config: hs_config::Config,
     options: ServeOptions,
 ) -> Result<ServeHandle, ServeError> {
-
     // Wired by the integration lead per docs/status/07-auth-and-identity.md "For track 12":
     // the persistent store replaces the in-memory one, so users, devices and tokens survive a
     // restart. `backend.clone()` is a cheap Arc-backed handle sharing the same open database —
@@ -831,7 +831,15 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         push: push_state,
         media: media_state,
         appservice_ping: appservices.ping_service,
-        admin: admin_state(&auth_state, server_name.as_str(), enabled_components),
+        admin: admin_state(
+            &auth_state,
+            Arc::new(
+                crate::audit::TablesAuditSink::open(backend.clone())
+                    .map_err(|e| ServeError::Sessions(Box::new(e)))?,
+            ),
+            server_name.as_str(),
+            enabled_components,
+        ),
     };
 
     let ready = Arc::new(AtomicBool::new(true));

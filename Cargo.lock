@@ -2234,6 +2234,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "bytes",
  "clap",
  "ed25519-dalek 2.2.0",
  "hex",
@@ -2250,6 +2251,7 @@ dependencies = [
  "hs-model",
  "hs-push",
  "hs-room",
+ "hs-tables",
  "hs-telemetry",
  "hs-user",
  "http",
@@ -2430,6 +2432,7 @@ dependencies = [
  "r2d2_postgres",
  "tempfile",
  "thiserror 2.0.20",
+ "tokio",
  "tracing",
 ]
 
@@ -2466,10 +2469,12 @@ dependencies = [
  "http",
  "icap-rs",
  "image",
+ "ipnet",
  "object_store",
  "prometheus-client",
  "proptest",
  "rand 0.9.5",
+ "regex",
  "reqwest 0.12.28",
  "ruma 0.15.1",
  "schemars 1.2.2",
@@ -2559,6 +2564,7 @@ dependencies = [
 name = "hs-room"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "axum",
  "bytes",
  "hs-auth",

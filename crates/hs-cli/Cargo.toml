@@ -20,6 +20,8 @@ hs-config = { path = "../hs-config" }
 hs-compat = { path = "../hs-compat" }
 hs-auth = { path = "../hs-auth" }
 hs-kv = { path = "../hs-kv" }
+hs-tables = { path = "../hs-tables" }
+bytes = { workspace = true }
 hs-telemetry = { path = "../hs-telemetry" }
 hs-http = { path = "../hs-http" }
 hs-room = { path = "../hs-room" }
