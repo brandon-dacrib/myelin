@@ -6,6 +6,8 @@
 //! includes the parsed Matrix error or raw body for a failed request) rather than a bare
 //! "assertion failed".
 
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, Result, bail};
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::room::MessagesOptions;
@@ -14,7 +16,48 @@ use matrix_sdk::ruma::api::client::account::register::v3::Request as RegisterReq
 use matrix_sdk::ruma::api::client::room::create_room::v3::Request as CreateRoomRequest;
 use matrix_sdk::ruma::api::client::uiaa;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+use matrix_sdk::sync::SyncResponse;
 use matrix_sdk::{Client, RoomMemberships};
+
+/// The Complement `MustSyncUntil` pattern in miniature: repeatedly `/sync`s `client` (chaining
+/// each response's `next_batch` into the next request's `since`, exactly like a real client's
+/// sync loop) until `predicate` accepts a response or `max_wait` elapses. Returns the last
+/// response either way -- the caller decides whether running out the clock is a hard failure
+/// (typing, invites: this crate's own code, expected to work) or a documented, soft-failed gap
+/// (profile-into-membership propagation: diagnosed as another track's bug, not this one's --
+/// see `docs/status/05-sync.md`).
+///
+/// This is the actual point of this session's extension to this scenario: unit tests inside
+/// `hs-user` proved the *pieces* (the typing registry, the wake hook, the token cursor) work in
+/// isolation, but only a real client doing exactly what Complement's `MustSyncUntil` does --
+/// bounded polling of the real long-poll endpoint over a real socket -- can prove the *wake*
+/// actually reaches a second, independent client's blocked `/sync` call.
+async fn sync_until(
+    client: &Client,
+    since: String,
+    max_wait: Duration,
+    mut predicate: impl FnMut(&SyncResponse) -> bool,
+) -> Result<(bool, SyncResponse)> {
+    let deadline = Instant::now() + max_wait;
+    let mut token = since;
+    loop {
+        let response = client
+            .sync_once(
+                SyncSettings::default()
+                    .token(token)
+                    .timeout(Duration::from_millis(1500)),
+            )
+            .await
+            .context("bounded-wait /sync should succeed")?;
+        if predicate(&response) {
+            return Ok((true, response));
+        }
+        if Instant::now() >= deadline {
+            return Ok((false, response));
+        }
+        token = response.next_batch.clone();
+    }
+}
 
 /// Registers a user via `m.login.dummy` UIA (the flow `hs-auth` accepts today, per
 /// `crates/hs-cli/tests/e2e.rs`) and returns the logged-in client.
@@ -324,7 +367,135 @@ pub async fn run(base_url: &str) -> Result<Vec<String>> {
         forward_page.chunk.len()
     );
 
-    // 12. Log out.
+    // 12. Typing: alice sends a typing notice; bob's *next* `/sync` (bounded wait, the same shape
+    // Complement's `MustSyncUntil` uses for `TestTyping`) must see it in `ephemeral.events` for
+    // the room. This is this track's own new work this session (`hs_user::routes::typing`,
+    // `hs_user::hub::SessionHub::set_typing`) -- a hard failure here is a real regression, not a
+    // documented gap, so this step bails like any other.
+    room.typing_notice(true)
+        .await
+        .context("alice's typing notice should succeed")?;
+    let (saw_typing, typing_sync) = sync_until(
+        &bob,
+        bob_sync.next_batch.clone(),
+        Duration::from_secs(10),
+        |response| {
+            response.rooms.joined.get(&room_id).is_some_and(|joined| {
+                joined.ephemeral.iter().any(|raw| {
+                    json_type_and_body(raw.json().get())
+                        .map(|(ty, body)| ty == "m.typing" && body.contains(alice_id.as_str()))
+                        .unwrap_or(false)
+                })
+            })
+        },
+    )
+    .await
+    .context("bob's bounded-wait /sync for alice's typing notice should succeed")?;
+    if !saw_typing {
+        bail!(
+            "bob's /sync never saw alice's typing notice within the bounded wait \
+             (this crate's own code -- not a documented cross-track gap)"
+        );
+    }
+    step!("bob's /sync saw alice's typing notice within the bounded wait");
+
+    // 13. Invite visible in sync *before* the invitee ever joins -- register a third user who
+    // only ever gets invited, and prove their `/sync` shows the room under `rooms.invite` with
+    // stripped state, within a bounded wait. Complement's `TestRoomsInvite` shape.
+    let carol = register(base_url, "loadgen-carol", "a third good passphrase")
+        .await
+        .context("registering carol")?;
+    let carol_id = carol
+        .user_id()
+        .context("carol should have a user_id after registering")?
+        .to_owned();
+    let carol_baseline = carol
+        .sync_once(SyncSettings::default())
+        .await
+        .context("carol's baseline /sync should succeed")?;
+    room.invite_user_by_id(&carol_id)
+        .await
+        .with_context(|| format!("inviting {carol_id} into {room_id} should succeed"))?;
+    let (saw_invite, _) = sync_until(
+        &carol,
+        carol_baseline.next_batch,
+        Duration::from_secs(10),
+        |response| response.rooms.invited.contains_key(&room_id),
+    )
+    .await
+    .context("carol's bounded-wait /sync for her invite should succeed")?;
+    if !saw_invite {
+        bail!(
+            "carol's /sync never saw her invite to {room_id} within the bounded wait \
+             (this crate's own code -- not a documented cross-track gap)"
+        );
+    }
+    step!("carol's /sync saw her invite to {room_id} within the bounded wait");
+
+    // 14. Profile change propagation: alice changes her display name (the `PUT /profile` call
+    // itself, step 8 above); does that change ever reach bob's `/sync` as an updated
+    // `m.room.member` event for alice in the room they share? Per the spec, a profile change
+    // propagates by the server re-stamping the user's `m.room.member` event in every room they
+    // are joined to -- Synapse does this; nothing in this workspace does yet (confirmed: neither
+    // `hs-auth`'s `PUT /profile/{userId}/displayname` nor `hs-room`'s membership code touches an
+    // *existing* membership event on a profile change, only a *new* join/invite/knock reads the
+    // profile at all). This is exactly the shared root cause behind Complement's
+    // `TestDisplayNameUpdate`/`TestAvatarUrlUpdate` cluster -- diagnosed, not fixed here (out of
+    // this track's crates; see `docs/status/05-sync.md` for the full writeup for track 04/07).
+    // Soft-failed like step 8's own profile gap, so this scenario stays green while the gap
+    // remains open elsewhere.
+    match alice
+        .account()
+        .set_display_name(Some("Alice Renamed"))
+        .await
+    {
+        Ok(()) => {
+            let (saw_profile_in_membership, _) = sync_until(
+                &bob,
+                typing_sync.next_batch,
+                Duration::from_secs(5),
+                |response| {
+                    response.rooms.joined.get(&room_id).is_some_and(|joined| {
+                        let (matrix_sdk::sync::State::Before(state_events)
+                        | matrix_sdk::sync::State::After(state_events)) = &joined.state;
+                        state_events.iter().any(|raw| {
+                            json_type_and_body(raw.json().get())
+                                .map(|(ty, body)| {
+                                    ty == "m.room.member" && body.contains("Alice Renamed")
+                                })
+                                .unwrap_or(false)
+                        }) || joined.timeline.events.iter().any(|event| {
+                            event_type_and_body(event)
+                                .map(|(ty, body)| {
+                                    ty == "m.room.member" && body.contains("Alice Renamed")
+                                })
+                                .unwrap_or(false)
+                        })
+                    })
+                },
+            )
+            .await
+            .context("bob's bounded-wait /sync after alice's profile change should succeed")?;
+            if saw_profile_in_membership {
+                step!(
+                    "bob's /sync saw alice's profile change reflected in her m.room.member event"
+                );
+            } else {
+                step!(
+                    "KNOWN BUG (not this track's crates, see docs/status/05-sync.md): alice's \
+                     profile change never reached bob's /sync as an updated m.room.member event \
+                     within the bounded wait"
+                );
+            }
+        }
+        Err(e) => {
+            step!(
+                "KNOWN BUG (not this track's crates): PUT /profile/{{userId}}/displayname failed: {e}"
+            );
+        }
+    }
+
+    // 15. Log out.
     alice
         .matrix_auth()
         .logout()
@@ -346,21 +517,29 @@ pub async fn run(base_url: &str) -> Result<Vec<String>> {
     Ok(log)
 }
 
-/// Extracts `(type, content-as-debug-string)` from a raw timeline event, for the body/type
-/// assertions above. Returns `None` for an event this scenario doesn't need to inspect closely
-/// (never treated as a hard failure by itself; callers report a clear error listing what *was*
-/// found instead).
-fn event_type_and_body(
-    event: &matrix_sdk::deserialized_responses::TimelineEvent,
-) -> Option<(String, String)> {
-    let raw = event.raw();
-    let value: serde_json::Value = serde_json::from_str(raw.json().get()).ok()?;
+/// Extracts `(type, content-as-debug-string)` from a raw event's JSON text. Shared by every
+/// event-shape check in this file (timeline events, `ephemeral` events, `state` events -- three
+/// distinct `matrix-sdk` types that all wrap the same underlying `Raw<T>` JSON), so a single
+/// substring check (`body.contains(...)`) works uniformly regardless of which section of a sync
+/// response an event came from. Returns `None` for an event this scenario doesn't need to inspect
+/// closely (never treated as a hard failure by itself; callers report a clear error listing what
+/// *was* found instead).
+fn json_type_and_body(raw_json: &str) -> Option<(String, String)> {
+    let value: serde_json::Value = serde_json::from_str(raw_json).ok()?;
     let event_type = value.get("type")?.as_str()?.to_owned();
     let body = value
         .get("content")
         .map(|c| c.to_string())
         .unwrap_or_default();
     Some((event_type, body))
+}
+
+/// [`json_type_and_body`], specialized to a timeline event (the shape every pre-existing step in
+/// this scenario already used).
+fn event_type_and_body(
+    event: &matrix_sdk::deserialized_responses::TimelineEvent,
+) -> Option<(String, String)> {
+    json_type_and_body(event.raw().json().get())
 }
 
 fn assert_room_contains_body(

@@ -53,10 +53,23 @@ pub enum UserError {
     #[error("invalid identifier: {0}")]
     InvalidId(String),
 
+    /// A request parameter parsed fine as a string but was not one of the values this endpoint
+    /// accepts -- for example `PUT /presence/{userId}/status`'s `presence` field, which must be
+    /// `"online"`, `"offline"` or `"unavailable"`.
+    #[error("{0}")]
+    InvalidParam(String),
+
     /// A request for one user's own data (account data, filters) named a different `userId` in
     /// its path.
     #[error("{0}")]
     NotSelf(String),
+
+    /// The requester is authenticated, but not allowed to perform this action for a reason other
+    /// than "it isn't their own data" (`NotSelf`, above) -- for example, `PUT
+    /// /rooms/{roomId}/typing/{userId}` from someone who is not currently a joined member of that
+    /// room.
+    #[error("{0}")]
+    Forbidden(String),
 
     /// An internal invariant this crate itself is responsible for maintaining was violated
     /// (should not happen; kept distinct from a client-caused error so a bug here is not
@@ -100,12 +113,12 @@ impl UserError {
             Self::UnknownFilterId(id) => MatrixError::not_found(format!("unknown filter {id:?}")),
             Self::NotFound(msg) => MatrixError::not_found(msg.clone()),
             Self::Room(e) => e.to_matrix_error(),
-            Self::InvalidId(msg) => MatrixError::custom(
+            Self::InvalidId(msg) | Self::InvalidParam(msg) => MatrixError::custom(
                 axum::http::StatusCode::BAD_REQUEST,
                 MatrixErrorCode::InvalidParam,
                 msg.clone(),
             ),
-            Self::NotSelf(msg) => MatrixError::forbidden(msg.clone()),
+            Self::NotSelf(msg) | Self::Forbidden(msg) => MatrixError::forbidden(msg.clone()),
             Self::Store(_)
             | Self::TableCodec(_)
             | Self::Table(_)

@@ -1,6 +1,6 @@
 //! `/sync` v2: full and incremental, long-polling, joined/invited/knocked/left rooms, timeline
-//! with `limited`/`prev_batch`, state, account data, ephemeral events (empty -- not implemented,
-//! see the module docs) and unread notification counts (zero -- track 10 has not landed).
+//! with `limited`/`prev_batch`, state, account data, `m.typing` ephemeral events, top-level
+//! `m.presence` events and unread notification counts (zero -- track 10 has not landed).
 //!
 //! [`build`] is the entry point; `crate::routes::sync` is the thin HTTP wrapper around it (query
 //! parsing, response headers, device-cursor bookkeeping).
@@ -16,12 +16,31 @@
 //! `limit` events (newest-first, then reversed to chronological order) plus full current state,
 //! rather than an empty or wrong-baseline forward page. See [`resume_mode`].
 //!
+//! # `m.typing` and `m.presence` (`crate::typing`, `crate::presence`)
+//!
+//! Both follow the same shape: an in-memory registry owned by [`crate::hub::SessionHub`] (never
+//! persisted -- both are genuinely ephemeral, restart loses them, matching Synapse's own
+//! behavior), a monotonic counter stamped onto whatever changed, and a cursor in [`SyncToken`]
+//! (`typing_seq`, `presence_seq` -- the latter reserved in the token format before either module
+//! existed) that this module compares against to decide "does this response need to mention it".
+//! See `crate::typing`'s module docs for why a global counter, not a per-room/per-user boolean,
+//! and for why expiry is pruned lazily on read rather than by a background timer.
+//!
+//! `m.typing` is scoped per room (only joined members ever see or send it); `m.presence` is
+//! scoped per user, reported to (and gated on) everyone who currently shares a *joined* room with
+//! the user whose presence changed -- the same privacy scope `device_lists.changed`/`left` uses
+//! below, and for the identical reason (`crate::hub::SessionHub::users_sharing_room_with`, which
+//! `shared_users` below now delegates to).
+//!
+//! Presence has no automatic idle/logout-driven transition to `unavailable`/`offline`
+//! (Synapse's own timer-based heuristics) -- a user's presence is exactly what they last set it to
+//! via `PUT /presence/{userId}/status`, forever, until they set it again. Documented here as a
+//! deliberate scope cut (see `docs/status/05-sync.md`), not a silent gap.
+//!
 //! # Not implemented in this pass (present as documented gaps, not silent omissions)
 //!
-//! - **Ephemeral events** (`m.typing`, `m.receipt`): every room's `ephemeral.events` is always
-//!   `[]`. Typing and receipt distribution is listed in this track's brief but was not reached
-//!   this session -- see `docs/status/05-sync.md`.
-//! - **Presence**: the top-level `presence.events` is always `[]`.
+//! - **`m.receipt`**: read-receipt distribution is listed in this track's brief but was not
+//!   reached this session -- `SyncToken::receipts_seq` is reserved for it, unused today.
 //! - **Unread notification counts**: *is* included, per this track's own instructions, shaped
 //!   correctly (`{"highlight_count": 0, "notification_count": 0}`) with both counts hard-zero
 //!   until track 10 (push) lands.
@@ -54,7 +73,7 @@
 //!   strangers) and what makes the field usable at all on a server with more than a handful of
 //!   users.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -287,7 +306,7 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     let store = hub.store();
     let timeline_limit = params.filter.timeline_limit(DEFAULT_TIMELINE_LIMIT);
 
-    let candidate_rooms: BTreeSet<OwnedRoomId> = if is_initial {
+    let mut candidate_rooms: BTreeSet<OwnedRoomId> = if is_initial {
         store
             .list_memberships(user_id)
             .await?
@@ -308,6 +327,30 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         }
         set
     };
+
+    // `m.typing`: gathered up front, against *every* joined room (not just the feed-derived
+    // candidate set above), since a typing-only change never touches the feed at all
+    // (`crate::typing`'s module docs). Any room with something new gets folded into
+    // `candidate_rooms` here so the main loop below renders it even when nothing else changed.
+    let mut typing_by_room: HashMap<OwnedRoomId, Vec<Value>> = HashMap::new();
+    let mut new_typing_seq = baseline.typing_seq;
+    for m in store.list_memberships(user_id).await? {
+        if m.membership != "join" {
+            continue;
+        }
+        let (users, seq) = hub.typing_users(&m.room_id).await;
+        new_typing_seq = new_typing_seq.max(seq);
+        if seq > baseline.typing_seq {
+            candidate_rooms.insert(m.room_id.clone());
+            typing_by_room.insert(
+                m.room_id,
+                vec![json!({
+                    "type": "m.typing",
+                    "content": {"user_ids": users},
+                })],
+            );
+        }
+    }
 
     let mut join = serde_json::Map::new();
     let mut invite = serde_json::Map::new();
@@ -442,12 +485,23 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             }
         }
 
-        let nothing_changed =
-            timeline.events.is_empty() && account_data_json.is_empty() && !force_full_state;
+        // Only a joined room can have typing activity (`typing_by_room` above is only ever
+        // populated for `membership == "join"` rows), so a leave/ban room correctly never has an
+        // entry here.
+        let ephemeral_events = typing_by_room.get(room_id).cloned().unwrap_or_default();
+
+        let nothing_changed = timeline.events.is_empty()
+            && account_data_json.is_empty()
+            && ephemeral_events.is_empty()
+            && !force_full_state;
         if nothing_changed && !is_initial {
             continue;
         }
-        if timeline.events.is_empty() && state_events.is_empty() && account_data_json.is_empty() {
+        if timeline.events.is_empty()
+            && state_events.is_empty()
+            && account_data_json.is_empty()
+            && ephemeral_events.is_empty()
+        {
             continue;
         }
 
@@ -478,7 +532,7 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                             "prev_batch": timeline.prev_batch,
                         },
                         "account_data": {"events": account_data_json},
-                        "ephemeral": {"events": []},
+                        "ephemeral": {"events": ephemeral_events},
                         "unread_notifications": {
                             "highlight_count": 0,
                             "notification_count": 0,
@@ -547,8 +601,12 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         (None, None)
     };
 
+    // Computed once, shared by `device_lists` (below) and `m.presence` (further below): both are
+    // scoped to "everyone `user_id` currently shares a joined room with".
+    let shared = shared_users(hub, user_id).await?;
+
     // `device_lists.changed`/`left`: per spec, only meaningful (and only sent) on an incremental
-    // sync. Scoped to `shared_users` -- see the module docs.
+    // sync. Scoped to `shared` -- see the module docs.
     let (device_lists_json, new_device_list_seq) = if is_initial {
         (None, baseline.device_list_seq)
     } else {
@@ -556,7 +614,6 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         let changed_all =
             DeviceKeyStore::changed_users_since(&**e2e, baseline.device_list_seq, Some(upto))
                 .await?;
-        let shared = shared_users(hub, user_id).await?;
         let changed: Vec<Value> = changed_all
             .iter()
             .filter(|u| shared.contains(*u))
@@ -570,11 +627,39 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         (Some(json!({"changed": changed, "left": left})), upto)
     };
 
+    // `m.presence`: every shared user whose presence record is newer than `baseline.presence_seq`
+    // (or, on an initial sync where there is no baseline to compare against, every shared user
+    // who has a record at all -- the client has seen nothing yet). See the module docs.
+    let mut presence_events: Vec<Value> = Vec::new();
+    let mut new_presence_seq = baseline.presence_seq;
+    for other in &shared {
+        let Some(record) = hub.presence_of(other).await else {
+            continue;
+        };
+        new_presence_seq = new_presence_seq.max(record.seq);
+        if is_initial || record.seq > baseline.presence_seq {
+            let mut content = json!({
+                "presence": record.presence,
+                "last_active_ago": record.last_active_ago_ms(),
+            });
+            if let Some(msg) = &record.status_msg {
+                content["status_msg"] = Value::String(msg.clone());
+            }
+            presence_events.push(json!({
+                "type": "m.presence",
+                "sender": other.as_str(),
+                "content": content,
+            }));
+        }
+    }
+
     let next_token = SyncToken {
         feed_seq: new_feed_seq,
         account_data_seq: new_account_data_seq,
         to_device_seq: new_to_device_seq,
         device_list_seq: new_device_list_seq,
+        typing_seq: new_typing_seq,
+        presence_seq: new_presence_seq,
         ..baseline
     };
 
@@ -595,7 +680,7 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     let mut response = json!({
         "next_batch": next_token.encode(),
         "rooms": rooms,
-        "presence": {"events": []},
+        "presence": {"events": presence_events},
         "account_data": {"events": global_account_data_json},
     });
     if device_id.is_some() {
@@ -619,30 +704,9 @@ async fn shared_users<B: KvBackend + 'static, R: RoomSource<B>>(
     hub: &SessionHub<B, R>,
     user_id: &UserId,
 ) -> Result<BTreeSet<OwnedUserId>, UserError> {
-    let mut shared = BTreeSet::new();
-    for m in hub.store().list_memberships(user_id).await? {
-        if m.membership != "join" {
-            continue;
-        }
-        let handle = hub.rooms().get_or_load(&m.room_id).await?;
-        let members: Vec<String> = handle
-            .query(move |actor| -> Result<Vec<String>, hs_room::RoomError> {
-                Ok(actor
-                    .joined_members()?
-                    .into_iter()
-                    .filter_map(|e| e.header().state_key.clone())
-                    .collect())
-            })
-            .await?;
-        for member in members {
-            if member != user_id.as_str()
-                && let Ok(other) = ruma::UserId::parse(&member)
-            {
-                shared.insert(other);
-            }
-        }
-    }
-    Ok(shared)
+    // Delegates to `SessionHub::users_sharing_room_with`, which needs the identical scope for
+    // `crate::hub::SessionHub::set_presence`'s wake fan-out -- one membership walk, not two.
+    hub.users_sharing_room_with(user_id).await
 }
 
 /// Whether anything has changed for `user_id` since `baseline` -- feed activity, the
@@ -665,7 +729,12 @@ async fn has_new_data<B: KvBackend + 'static, R: RoomSource<B>>(
     }
     // Hot rooms never advance the feed on write (`crate::hub`'s module docs), so their
     // possible new activity would otherwise never wake a long-poll. Check each one directly.
-    for m in store.list_memberships(user_id).await? {
+    // While walking every joined/invited/knocked room anyway, also check typing: unlike
+    // to-device/device-list activity, `crate::hub::SessionHub::set_typing` *does* call this hub's
+    // waker directly, but a lazy expiry (`crate::typing::TypingRegistry::current`'s pruning) has
+    // no explicit wake call at all, so it still needs this same periodic re-check to be noticed.
+    let memberships = store.list_memberships(user_id).await?;
+    for m in &memberships {
         if m.hot_room && matches!(m.membership.as_str(), "join" | "invite" | "knock") {
             let handle = hub.rooms().get_or_load(&m.room_id).await?;
             // Copied out before the closure: `query` requires a `'static` closure, so it may not
@@ -684,6 +753,26 @@ async fn has_new_data<B: KvBackend + 'static, R: RoomSource<B>>(
             if has_more {
                 return Ok(true);
             }
+        }
+        if m.membership == "join" {
+            let (_, typing_seq) = hub.typing_users(&m.room_id).await;
+            if typing_seq > baseline.typing_seq {
+                return Ok(true);
+            }
+        }
+    }
+    // Presence: has anyone `user_id` shares a joined room with (or `user_id` itself) posted a
+    // presence update since `baseline`? Scoped the same way `device_lists` is (see the module
+    // docs) -- an over-broad wake here would just cost an extra response-building pass, same
+    // reasoning as the to-device peek below.
+    let mut presence_watch: Vec<OwnedUserId> =
+        shared_users(hub, user_id).await?.into_iter().collect();
+    presence_watch.push(user_id.to_owned());
+    for other in &presence_watch {
+        if let Some(record) = hub.presence_of(other).await
+            && record.seq > baseline.presence_seq
+        {
+            return Ok(true);
         }
     }
     // `hs-e2e`'s to-device queue and device-list stream have no waker hook into this hub (its
@@ -1303,6 +1392,153 @@ mod tests {
         assert!(
             left.contains(&bob.as_str()),
             "bob left the only room he shared with alice and should be reported: {response}"
+        );
+    }
+
+    /// A typing change appears in the *next* sync's `ephemeral.events` for a joined room, without
+    /// waiting for the long-poll timeout -- `crate::hub::SessionHub::set_typing` wakes the waker
+    /// directly, unlike to-device/device-list activity.
+    #[tokio::test]
+    async fn a_typing_change_wakes_a_long_poll_and_appears_in_ephemeral_events() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+
+        let handle = hub
+            .rooms()
+            .create_room(alice.clone(), CreateRoomRequest::default(), 1)
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+        // The room-creation events were published before `watch_room` subscribed, so this hub
+        // never saw them (`crate::hub::SessionHub`'s module docs, "The discovery gap"); a
+        // follow-up event is what actually backfills alice's own `join` membership into the
+        // store that `list_memberships` (which `has_new_data`'s per-room typing check walks)
+        // reads from -- same pattern `crate::hub::tests` uses for the identical reason.
+        handle
+            .send_event(
+                alice.clone(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"body": "seed"}),
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (_baseline, baseline_token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+
+        // Set typing concurrently with a long-poll blocked well past that point -- proves the
+        // wake is real (`SessionHub::set_typing` calling `notify_waiters` directly), not merely
+        // that a *subsequent* poll would eventually notice it via `E2E_POLL_INTERVAL`.
+        let hub2 = hub.clone();
+        let room_id2 = room_id.clone();
+        let alice2 = alice.clone();
+        let setter = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            hub2.set_typing(&room_id2, &alice2, true, Duration::from_secs(30))
+                .await
+                .unwrap();
+        });
+
+        let mut p = params(Some(baseline_token));
+        p.timeout = Duration::from_secs(5);
+        let started = std::time::Instant::now();
+        let (response, next_token) = build(&hub, &e2e, &alice, p).await.unwrap();
+        setter.await.unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the long poll should have been woken well before its 5s timeout, took {:?}",
+            started.elapsed()
+        );
+        let ephemeral = response["rooms"]["join"][room_id.as_str()]["ephemeral"]["events"]
+            .as_array()
+            .unwrap_or_else(|| panic!("room should be present with ephemeral events: {response}"));
+        assert!(
+            ephemeral.iter().any(|e| e["type"] == "m.typing"
+                && e["content"]["user_ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|u| u == alice.as_str())),
+            "expected an m.typing event naming alice: {ephemeral:?}"
+        );
+        assert!(next_token.typing_seq > 0);
+
+        // A second sync from the new token, with nothing further changed, must not repeat it.
+        let (again, _) = build(&hub, &e2e, &alice, params(Some(next_token)))
+            .await
+            .unwrap();
+        let room_again = &again["rooms"]["join"][room_id.as_str()];
+        assert!(
+            room_again.is_null(),
+            "an already-delivered typing state must not resurface with nothing else changed: \
+             {again}"
+        );
+    }
+
+    /// `m.presence` at the top level: scoped to users sharing a joined room, gated on
+    /// `presence_seq`, and woken immediately (`SessionHub::set_presence`).
+    #[tokio::test]
+    async fn a_presence_change_appears_for_a_shared_room_member_only() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let carol = user_id!("@carol:sync.test").to_owned();
+
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+        handle
+            .membership(
+                bob.clone(),
+                Action::Join,
+                bob.clone(),
+                serde_json::json!({}),
+                2,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (_baseline, bob_token) = build(&hub, &e2e, &bob, params(None)).await.unwrap();
+
+        hub.set_presence(&alice, "online".to_owned(), Some("hi".to_owned()))
+            .await
+            .unwrap();
+        // Carol shares no room with anyone here; her presence must never reach bob.
+        hub.set_presence(&carol, "online".to_owned(), None)
+            .await
+            .unwrap();
+
+        let (response, _) = build(&hub, &e2e, &bob, params(Some(bob_token)))
+            .await
+            .unwrap();
+        let events = response["presence"]["events"].as_array().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e["sender"] == alice.as_str() && e["content"]["presence"] == "online"),
+            "bob shares a room with alice and should see her presence: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e["sender"] == carol.as_str()),
+            "bob shares no room with carol and must not see her presence: {events:?}"
         );
     }
 }

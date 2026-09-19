@@ -20,9 +20,292 @@ Track brief: `docs/workstreams/05-sync.md`. Owner crates: `hs-user` (this sessio
 also covers `crates/hs-loadgen`, the real-client scenario `docs/next-steps.md` item 2 calls "the
 single best test of whether this is a homeserver").
 
-Last updated: 2026-09-19 (session 3: a `/sync`-minted token now works as `GET /messages`'s `from`,
-in both directions, joint with track 04's `hs-room` -- see below. Session 2's E2EE work and
-session 1's real-client-scenario work are preserved unchanged further down.)
+Last updated: 2026-09-19 (session 4: the `MustSyncUntil` cluster -- typing and presence now exist
+and wake a long poll for real, proven against a real `matrix-sdk` client; profile-into-membership
+propagation diagnosed and handed to track 04/07. Sessions 1-3 preserved unchanged further down.)
+
+## Session 4 (2026-09-19): typing, presence, and the `MustSyncUntil` cluster
+
+**Task**: track 14's status file flagged the single largest remaining Complement failure cluster
+as "probably one investigation, not N bugs" -- a broad set of `MustSyncUntil: timed out` failures
+across profile updates, typing, device-list changes, invites, presence-in-sync, room summaries
+and push-rule carryover, all sharing the shape "a change that is not a timeline event should
+appear in the next sync". Also assigned: presence endpoints 404. Scope: `crates/hs-user/**`,
+`crates/hs-loadgen/**` and this file; `hs-room`, `hs-auth`, `hs-federation`, `hs-config`,
+`hs-push`, `hs-cluster` and `hs-cli` were off limits (five other tracks running concurrently).
+
+### The diagnosis: two unrelated causes, not one
+
+Looked at what actually wakes a long-polling `/sync` before touching anything
+(`crate::sync::has_new_data`/`crate::sync::long_poll`, `crate::hub::SessionHub`'s wakers):
+
+1. **`crate::hub::SessionHub::process_room_update`** (driven by `hs_room`'s `RoomUpdate` publish
+   stream) is the *only* thing that ever calls `SessionHub::wake`. It fires for timeline events
+   and membership deltas -- i.e. anything that is, or accompanies, a persisted room event. This
+   covers ordinary messages, joins, invites, kicks, bans, room-state changes (name/topic/etc).
+   **Invites already worked** before this session touched anything -- confirmed live (see "Proof"
+   below): a third user invited but never joined saw `rooms.invite` in a bounded-wait `/sync` with
+   no code change. Complement's `TestRoomsInvite`/federation-package invite failures are therefore
+   *not* this bug; they are either the cross-server TLS/signature issues track 14 and track 06
+   already diagnosed, or a different, not-yet-isolated cause -- **not the same root cause as the
+   rest of this cluster**, contrary to the "probably one investigation" framing. Recorded here so
+   the next person doesn't re-diagnose it as a sync-wake problem.
+2. **Typing and presence had no representation in this crate at all.** `crate::sync`'s module docs
+   said outright: "every room's `ephemeral.events` is always `[]`" and "the top-level
+   `presence.events` is always `[]`". There was no waker hook, no cursor, and (for typing) no
+   route to set the state in the first place -- `PUT /rooms/{roomId}/typing/{userId}` did not
+   exist anywhere in this workspace, confirmed by grep across every crate's `src/routes/mod.rs`.
+   This is the real cause behind `TestTyping`/`TestLeakyTyping`, `TestPresenceSyncDifferentRooms`/
+   `TestSync`'s presence subtests, and the presence-endpoint 404s (`TestPresence`,
+   `TestMembersLocal`). **Fixed this session, entirely within `hs-user`** -- see below.
+3. **Device-list changes, room summaries, and push-rule carryover are three more distinct causes,
+   diagnosed but not fixed here** (out of this track's crates):
+   - `crate::sync::build` already computes `device_lists.changed`/`left` correctly and
+     `has_new_data` already peeks `hs_e2e::store::DeviceKeyStore::current_stream_pos` every
+     `E2E_POLL_INTERVAL` (500ms) -- that machinery was already correct and unchanged this session.
+     Grepped `record_device_list_change` (the only thing that ever bumps that stream): it is
+     called from exactly one place, `crates/hs-e2e/src/routes/cross_signing.rs`. Neither key
+     upload (`/keys/upload`) nor device rename/delete (`hs-auth`'s device routes) call it. A
+     `TestDeviceListUpdates`-style scenario that renames a device or uploads new keys (rather than
+     bootstrapping cross-signing) will never see a stream bump to notice in the first place --
+     **this is track 08's (`hs-e2e`) or track 07's (`hs-auth`) call site, not a sync-side bug.**
+   - Room summaries (`TestRoomSummary`) and push-rule carryover are both simply unbuilt: `/sync`'s
+     `summary` key is hard-coded `{}` (`crate::sync::build`, the `join` bucket's JSON literal), and
+     no push rule has ever appeared in a sync response at all (`TestPushSync`, confirmed
+     separately by track 14). Room summary computation (heroes, joined/invited counts) is squarely
+     this crate's job and is genuinely unbuilt -- recorded here as **not reached this session**,
+     next for track 05. Push-rule carryover on upgrade is track 10's.
+   - Profile updates: see the dedicated section below -- diagnosed in detail, not this crate's fix.
+
+**Conclusion for track 14's framing**: not one investigation. Two causes squarely in this
+crate's ownership (typing, presence -- fixed), one already-working path that was misattributed
+to this cluster (invites), and three more distinct causes in other tracks' crates (device-list
+call sites, room summaries [partially ours, unbuilt], push-rule carryover).
+
+### The fix: `m.typing` and `m.presence`, both wired into the wake path for real
+
+New modules, both in-memory (never persisted -- both are genuinely ephemeral; Synapse doesn't
+persist them either):
+
+- **`crates/hs-user/src/typing.rs`**: `TypingRegistry`, keyed by room. A `typing: true` call
+  inserts a deadline (capped at `MAX_TYPING_TIMEOUT` = 120s regardless of what the client asked
+  for); `typing: false` removes it. A single global monotonic counter is stamped onto whichever
+  room changed -- this is what lets `SyncToken::typing_seq` (new field, see below) answer "has
+  *this* room changed since my last sync" without the token growing per-room. Expiry is pruned
+  *lazily* on read (`TypingRegistry::current`), not by a spawned timer per typing user; a prune
+  that actually removes someone also bumps the counter, so an already-synced client blocked in a
+  long poll is woken by a typing *timeout* the same way it's woken by an explicit `typing: false`.
+- **`crates/hs-user/src/presence.rs`**: `PresenceRegistry`, keyed by user. Same shape (global
+  counter, `SyncToken::presence_seq` -- a field the token format had reserved since session 1,
+  before this module existed). No expiry: a user's presence is exactly what they last set it to,
+  forever, until they set it again (see "Deferred" below).
+- **`crates/hs-user/src/hub.rs`**: `SessionHub::set_typing`/`SessionHub::typing_users`,
+  `SessionHub::set_presence`/`SessionHub::presence_of`, and a new public
+  `SessionHub::users_sharing_room_with` (the same membership walk `crate::sync::shared_users`
+  already did for `device_lists` -- that function now delegates to this instead of duplicating
+  it). Both `set_typing` and `set_presence` **call the hub's existing `Notify` waker directly**
+  for every affected user, immediately -- unlike to-device/device-list activity (which has no
+  waker hook at all and relies on `has_new_data`'s 500ms `E2E_POLL_INTERVAL` peek), a typing or
+  presence change wakes a blocked long poll with no poll-interval lag, proven in
+  `crates/hs-user/src/sync/mod.rs`'s
+  `a_typing_change_wakes_a_long_poll_and_appears_in_ephemeral_events` test (a long poll given a 5s
+  timeout returns in well under 2s when a concurrent task sets typing 50ms in).
+- **`crates/hs-user/src/routes/typing.rs`**: `PUT /rooms/{roomId}/typing/{userId}`. Only the
+  named user may set their own state (`403` otherwise, distinct from a plain "not self" for
+  clarity: new `UserError::Forbidden` variant), and only while actually a joined member of the
+  room (`403` for an invitee, a past member, or a stranger). Checked the path-conflict question
+  the previous (rate-limited, restarted) attempt at this assignment had flagged before dying:
+  `hs-room`'s router registers nothing under `/rooms/{roomId}/typing/...` (grepped its full route
+  list), so this is a genuinely new leaf in `hs-http`'s `Builder`, not a collision.
+- **`crates/hs-user/src/routes/presence.rs`**: `GET`/`PUT /presence/{userId}/status`. `GET` on a
+  user this process has never heard a presence update from returns the spec's implied default
+  (`{"presence": "offline"}`), not `404` -- `404` would require checking `hs-auth`'s user table
+  for existence, which this crate could do (it already depends on `hs-auth` for `UserState::auth`)
+  but was judged not worth doing this session for a value few clients ever branch on; recorded as
+  a scope note, not a silent gap.
+- **`crates/hs-user/src/token.rs`**: `SyncToken` gained `typing_seq` (new field; `presence_seq`
+  already existed, reserved since session 1). Wire version bumped `1` -> `2`
+  (`SyncToken::decode` now rejects a version-1 token outright) -- safe here since every test and
+  every real deployment of this greenfield server restarts from a freshly built binary; no
+  long-lived client ever holds a cross-version token. All property tests, and the two fixed-length
+  tests that encode a raw byte count, updated for the new 7-`u64` payload.
+- **`crates/hs-user/src/sync/mod.rs`**: `build` now gathers each joined room's typing state
+  up front (independent of the feed-derived candidate-room set, since a typing-only change never
+  touches the feed at all) and folds any room with something new into the candidate set so it
+  renders even when nothing else changed; `has_new_data` gained the matching per-room typing check
+  and a presence check scoped to `shared_users` (now `SessionHub::users_sharing_room_with`) plus
+  self. `presence.events` at the top level is populated for every user sharing a joined room with
+  the syncer whose `presence_seq` is newer than the client's baseline (or, on an initial sync,
+  every shared user with any record at all).
+
+### Presence: implemented, with one deliberate cut
+
+Presence is fully implemented (endpoints, sync wake, sync events, privacy scoping identical to
+`device_lists`). **Not implemented**: Synapse's idle/logout-driven automatic transition to
+`unavailable`/`offline` (a background timer watching last-activity). A user's presence is exactly
+what they last explicitly set via `PUT .../presence/{userId}/status`, forever, until they set it
+again. This is a real spec-completeness gap (`TestPresence`-adjacent tests that check idle
+timeout behavior specifically will still fail), but implementing a correct idle-timer subsystem
+in the time available would have crowded out the actual `MustSyncUntil`-cluster fix this session
+was scoped for; recorded here as the next thing to build for presence, not folded in silently.
+
+### Diagnosis for track 04 / track 07: profile changes never reach `/sync`
+
+**Confirmed live with the real client this session** (see "Proof" below, step 14): `PUT
+/profile/{userId}/displayname` now succeeds (track 07 built the route since this crate's last
+session), and reading it straight back via `GET /profile` round-trips correctly. But a second
+user who already shares a room with the profile owner **never sees the change** -- their `/sync`
+never gets an updated `m.room.member` event for that user, no matter how long the bounded wait
+runs. Root cause, confirmed by reading both sides:
+
+- `crates/hs-auth/src/routes/profile.rs`'s `put_displayname`/`put_avatar_url` write only
+  `UserRecord::display_name`/`avatar_url` in `hs-auth`'s own store. Nothing there touches any
+  room's state.
+- `crates/hs-room/src/routes/membership.rs` (per that module's own doc comment, confirmed by
+  reading it) reads a user's profile out of `hs-auth`'s store **only when minting a *new***
+  `m.room.member` event -- i.e. at join/invite/knock time. An *existing* member's already-sent
+  `m.room.member` event is never revisited when their profile changes later.
+
+Per the spec (and Synapse's actual behavior), a profile change is supposed to propagate by the
+server re-sending each affected room's `m.room.member` event with the same membership but updated
+`displayname`/`avatar_url` -- for every room the user is currently joined to. That is a
+room-actor write (a new event, `hs-room`'s territory) triggered by a profile-store write
+(`hs-auth`'s territory), and belongs to whichever of those two tracks owns "iterate a user's
+joined rooms and mint a membership refresh event" -- not to `hs-user`, which only ever consumes
+`hs-room`'s publish stream, never originates room events. **Not fixed here.** This is the direct,
+confirmed cause of Complement's `TestDisplayNameUpdate`, `TestAvatarUrlUpdate`, and
+`user_directory_display_names_test.go`.
+
+### Proof: extended the real-client loadgen scenario (`crates/hs-loadgen/src/scenario.rs`)
+
+Added a `sync_until` helper -- the Complement `MustSyncUntil` pattern in miniature: repeatedly
+`/sync`s a client, chaining `next_batch` into the next `since` exactly like a real client's sync
+loop, until a predicate matches or a bounded wait elapses. Unit tests inside `hs-user` already
+proved the *pieces* work in isolation; only a real client doing exactly what Complement does --
+bounded polling of the real long-poll endpoint over a real socket, from a second, independent
+process's connection -- can prove the *wake* actually reaches another client's blocked `/sync`.
+
+Three new steps (12-14, renumbering the old "12. Log out" to "15"):
+
+- **Step 12 (typing, hard assertion)**: alice sends a typing notice; bob's next bounded-wait
+  `/sync` must see it in `ephemeral.events` within 10s. This is this session's own new code, so a
+  failure here would be a real regression, not a documented gap.
+- **Step 13 (invite-before-join, hard assertion)**: a third user, carol, is invited but never
+  joins; her bounded-wait `/sync` must show the room under `rooms.invite` within 10s. Confirms the
+  "invites already work" half of the diagnosis above with a fresh user who has literally never
+  synced before (the strongest form of the claim).
+- **Step 14 (profile propagation, soft-failed like the existing step 8)**: alice changes her
+  display name again; bob's bounded-wait `/sync` (5s) is checked for an updated `m.room.member`
+  event naming the new display name, in either `state` or `timeline`. Logged as `KNOWN BUG` (not
+  this track's crates) rather than a hard failure, so the scenario stays green while the gap
+  documented above remains open in `hs-auth`/`hs-room`.
+
+**Actual run, `cargo build -p hs-cli --bin hs && cargo test -p hs-loadgen --test real_client --
+--nocapture`** (22 steps, all logged, scenario passed):
+
+```
+registered @loadgen-alice:hs-loadgen.test
+registered @loadgen-bob:hs-loadgen.test
+logged in @loadgen-alice:hs-loadgen.test on a second device via POST /login
+alice created room !mD6FQhVXSN7GmclY79:hs-loadgen.test
+alice invited @loadgen-bob:hs-loadgen.test
+@loadgen-bob:hs-loadgen.test joined !mD6FQhVXSN7GmclY79:hs-loadgen.test
+both clients completed a baseline /sync
+alice sent $H-PGDNJOql5goN8G5IsW-dOPFCWORm0bBeO06eGjAx4 ("hello bob, this is alice")
+bob sent $nnGT2vVRFEvcat44Z2DZMFw9ZNfVLvOzxjdWy__2nYM ("hi alice, bob here")
+bob's incremental /sync saw alice's message
+alice's incremental /sync saw bob's message
+alice's display name round-tripped through GET/PUT /profile
+room name and topic changes appeared in /sync's timeline
+room membership lists both @loadgen-alice:hs-loadgen.test and @loadgen-bob:hs-loadgen.test
+backward /messages page (no `from`, the live end) contains alice's message (10 events)
+backward /messages page, paginated from a token /sync handed back (not /messages itself), contains alice's message (10 events)
+forward /messages page, paginated from a /sync token issued before any messages, contains alice's message (4 events)
+bob's /sync saw alice's typing notice within the bounded wait
+carol's /sync saw her invite to !mD6FQhVXSN7GmclY79:hs-loadgen.test within the bounded wait
+KNOWN BUG (not this track's crates, see docs/status/05-sync.md): alice's profile change never reached bob's /sync as an updated m.room.member event within the bounded wait
+both clients logged out
+post-logout /sync was correctly rejected: the server returned an error: [401 / M_UNKNOWN_TOKEN] 401 Unauthorized M_UNKNOWN_TOKEN: Unrecognised access token
+test matrix_rust_sdk_talks_to_a_real_hs_serve ... ok
+```
+
+Note: step 12 ("alice's display name round-tripped...") now hard-succeeds where session 1's
+writeup recorded it as a `KNOWN BUG` -- track 07 built the route since then. The soft-fail
+wrapper around it is now dead code from this crate's point of view (no observed failure this
+session) but left in place since this crate does not own `hs-auth` and cannot guarantee it stays
+mounted; see "Next" below.
+
+**No regressions**: `cargo test -p hs-loadgen --test real_client_encrypted` still decrypts end to
+end (16 steps, unchanged from session 2's writeup, re-run this session to confirm); `cargo test
+-p hs-user` (60 tests, up from the count before this session's new modules/tests) is green.
+
+### Verification commands run this session
+
+```
+cargo fmt -p hs-user -p hs-loadgen                                    # clean
+cargo clippy -p hs-user -p hs-loadgen --all-targets -- -D warnings    # clean (see note below)
+cargo test -p hs-user                                                 # 60 passed
+cargo build -p hs-cli --bin hs
+cargo test -p hs-loadgen --test real_client -- --nocapture             # 22 steps, passed (above)
+cargo test -p hs-loadgen --test real_client_encrypted -- --nocapture   # 16 steps, passed, unchanged
+```
+
+Note on `cargo clippy ... -D warnings`: this repeatedly failed transiently on an *unrelated*
+pre-existing `unused import`/(briefly) a missing-struct-field compile error in `hs-admin`
+(track 15, actively being edited this session) -- clippy lints every local path dependency, not
+just the `-p` targets, and `hs-admin` is one, exactly the same class of cross-track interference
+session 3's writeup already recorded for `hs-room`. Retried every ~20s; resolved on its own within
+a few attempts each time, same as before. Not this track's bug, not fixed here, recorded so a
+future reader doesn't mistake it for a `hs-user`/`hs-loadgen` regression.
+
+### Decisions made this session
+
+- **`SyncToken`'s wire version bumped 1 -> 2** to add `typing_seq`. A version-1 token now fails to
+  decode. Judged safe (see `token.rs`'s updated module doc) since nothing in this workspace holds
+  a token across a server restart today.
+- **Typing timeout capped at 120s server-side** (`crate::typing::MAX_TYPING_TIMEOUT`), regardless
+  of what a client requests, to bound how long a misbehaving client can pin an entry.
+- **Typing expiry is pruned lazily on read, not by a spawned timer.** A prune that removes
+  someone still bumps the shared counter, so it's indistinguishable from an explicit change for
+  wake purposes. Simpler and cheaper than a timer per typing user; the tradeoff is that "someone
+  stopped typing" is only noticed the next time anything reads that room's typing state (a sync
+  build, or a long poll's 500ms `E2E_POLL_INTERVAL` recheck) rather than the instant the deadline
+  passes -- acceptable since typing timeouts (tens of seconds) are far longer than that interval.
+- **`GET /presence/{userId}/status` requires auth but does not restrict *whose* presence can be
+  queried**, and returns `{"presence": "offline"}` (not `404`) for a user this process has never
+  heard a presence update from. Both are spec-permitted defaults; documented as a scope choice
+  rather than silently relying on it.
+- **No automatic idle/logout-driven presence transitions** (see "Presence" above) -- a deliberate
+  scope cut, not an oversight, given the session's actual assignment.
+- **`hs_user::sync::shared_users` now delegates to a new public `SessionHub::users_sharing_room_with`**
+  rather than duplicating the membership walk a second time for presence's identical privacy
+  scope requirement.
+
+## Interfaces provided (new this session)
+
+- `PUT /rooms/{roomId}/typing/{userId}` (`crate::routes::typing::put_typing`).
+- `GET`/`PUT /presence/{userId}/status` (`crate::routes::presence::get_status`/`put_status`).
+- `SessionHub::set_typing`/`typing_users`, `SessionHub::set_presence`/`presence_of`,
+  `SessionHub::users_sharing_room_with` -- all `pub`, usable by another crate that gets a
+  `SessionHub` handle (none does today; recorded for completeness).
+- Both are additions to the existing `/sync` response shape (`ephemeral.events`, top-level
+  `presence.events`), not new endpoints for any other track to integrate against.
+
+## Interfaces needed (unchanged from session 3 unless noted)
+
+- Still nothing new from another track for this session's work. The profile-propagation gap
+  (above) is a need pointed *at* track 04/07, not a need *of* this track.
+
+## What's next for track 05
+
+1. **Room summaries** (`summary` key, hard-coded `{}` today) -- heroes, joined/invited member
+   counts. Confirmed unbuilt this session (see "Diagnosis" above); squarely this crate's job.
+2. Presence's idle/logout-driven automatic offline transition (see "Presence" above).
+3. `m.receipt` (read receipts) -- `SyncToken::receipts_seq` has been reserved since session 1 and
+   is still unused; the same typing/presence pattern (registry, counter, cursor, wake) applies
+   directly.
+4. If track 04 or track 07 picks up the profile-propagation fix diagnosed above, remove the soft-
+   fail wrapper around loadgen scenario step 14 and assert it hard.
 
 ## Session 3 (2026-09-19): a real client can scroll back after syncing -- joint 04/05
 

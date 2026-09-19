@@ -42,10 +42,18 @@ const PREFIX: &str = "hsu1_";
 /// The current wire version. Bumped whenever the byte layout below changes in a way that is not
 /// backwards-compatible (adding a field at the end, for instance, still needs a version bump: see
 /// [`SyncToken::decode`]'s fixed-length check).
-const VERSION: u8 = 1;
+///
+/// Bumped `1` -> `2` this session to add `typing_seq` (below), for the same reason
+/// `presence_seq`/`receipts_seq` were reserved up front: `m.typing` needed its own independent
+/// cursor once typing distribution was actually implemented (`crate::routes::typing`,
+/// `crate::typing`). A version-1 token now fails to decode (`UnsupportedVersion`), which is
+/// correct and harmless here: every test and every real deployment of this greenfield server
+/// restarts from a freshly built binary, so no long-lived client ever holds a version-1 token
+/// across this change.
+const VERSION: u8 = 2;
 
-/// `1` (version byte) + `6 * 8` (six `u64` fields).
-const PAYLOAD_LEN: usize = 1 + 6 * 8;
+/// `1` (version byte) + `7 * 8` (seven `u64` fields).
+const PAYLOAD_LEN: usize = 1 + 7 * 8;
 
 /// A decoded `/sync` token: the user's feed position plus the independent extension cursors.
 ///
@@ -69,6 +77,9 @@ pub struct SyncToken {
     pub presence_seq: u64,
     /// Cursor into read-receipt updates for rooms this session is in.
     pub receipts_seq: u64,
+    /// Cursor into `m.typing` state changes across this user's joined rooms
+    /// (`crate::typing::TypingRegistry`).
+    pub typing_seq: u64,
 }
 
 impl SyncToken {
@@ -85,6 +96,7 @@ impl SyncToken {
             account_data_seq: 0,
             presence_seq: 0,
             receipts_seq: 0,
+            typing_seq: 0,
         }
     }
 
@@ -99,6 +111,7 @@ impl SyncToken {
         buf.extend_from_slice(&self.account_data_seq.to_be_bytes());
         buf.extend_from_slice(&self.presence_seq.to_be_bytes());
         buf.extend_from_slice(&self.receipts_seq.to_be_bytes());
+        buf.extend_from_slice(&self.typing_seq.to_be_bytes());
         debug_assert_eq!(buf.len(), PAYLOAD_LEN);
         format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(buf))
     }
@@ -127,7 +140,7 @@ impl SyncToken {
         }
         let field = |i: usize| -> u64 {
             let start = 1 + i * 8;
-            // Safe: `bytes.len() == PAYLOAD_LEN == 1 + 6 * 8`, checked above, and `i < 6` for
+            // Safe: `bytes.len() == PAYLOAD_LEN == 1 + 7 * 8`, checked above, and `i < 7` for
             // every call site below, so `start + 8 <= PAYLOAD_LEN` always.
             u64::from_be_bytes(bytes[start..start + 8].try_into().expect("checked length"))
         };
@@ -138,6 +151,7 @@ impl SyncToken {
             account_data_seq: field(3),
             presence_seq: field(4),
             receipts_seq: field(5),
+            typing_seq: field(6),
         })
     }
 }
@@ -263,7 +277,7 @@ mod tests {
     #[test]
     fn decode_rejects_unsupported_version() {
         let mut buf = vec![7u8]; // not VERSION
-        buf.extend_from_slice(&[0u8; 48]);
+        buf.extend_from_slice(&[0u8; 56]);
         let s = format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(buf));
         assert_eq!(
             SyncToken::decode(&s),
@@ -280,6 +294,7 @@ mod tests {
             account_data_seq: 3,
             presence_seq: 4,
             receipts_seq: 5,
+            typing_seq: 6,
         };
         let json = serde_json::to_string(&t).unwrap();
         assert!(json.starts_with('"'));
@@ -306,6 +321,7 @@ mod tests {
             account_data_seq: u64,
             presence_seq: u64,
             receipts_seq: u64,
+            typing_seq: u64,
         ) {
             let original = SyncToken {
                 feed_seq,
@@ -314,6 +330,7 @@ mod tests {
                 account_data_seq,
                 presence_seq,
                 receipts_seq,
+                typing_seq,
             };
             let encoded = original.encode();
             let decoded = SyncToken::decode(&encoded).unwrap();

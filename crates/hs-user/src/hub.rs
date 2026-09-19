@@ -40,9 +40,11 @@ use ruma::{OwnedUserId, RoomId, UserId};
 use tokio::sync::{Mutex, Notify};
 
 use crate::error::UserError;
+use crate::presence::PresenceRegistry;
 use crate::room_source::RoomSource;
 use crate::store::DynUserStore;
 use crate::token::SyncToken;
+use crate::typing::TypingRegistry;
 
 fn membership_of(event: &Event) -> Option<String> {
     event
@@ -166,6 +168,13 @@ pub struct SessionHub<B: KvBackend, R: RoomSource<B>> {
     /// feed alone.
     fan_out_threshold: usize,
     wakers: Mutex<HashMap<OwnedUserId, Arc<Notify>>>,
+    /// In-memory `m.typing` state. See [`crate::typing`]'s module docs for why this lives here
+    /// rather than in `store`: ephemeral, never persisted, and this hub is already the one place
+    /// that both knows how to reach a room's member list and owns the wakers a change needs to
+    /// touch.
+    typing: TypingRegistry,
+    /// In-memory `m.presence` state. See [`crate::presence`]'s module docs.
+    presence: PresenceRegistry,
     _marker: std::marker::PhantomData<fn() -> B>,
 }
 
@@ -189,6 +198,8 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             rooms,
             fan_out_threshold,
             wakers: Mutex::new(HashMap::new()),
+            typing: TypingRegistry::new(),
+            presence: PresenceRegistry::new(),
             _marker: std::marker::PhantomData,
         }
     }
@@ -227,6 +238,106 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         if let Some(waker) = waker {
             waker.notify_waiters();
         }
+    }
+
+    /// `room_id`'s current joined members, parsed as user ids (a state key that fails to parse --
+    /// should not happen for anything this server itself wrote -- is skipped rather than failing
+    /// the whole call). Shared by [`SessionHub::set_typing`] and [`SessionHub::set_presence`]: both
+    /// need "who should be woken by this change", and both mean exactly this.
+    async fn joined_member_ids(&self, room_id: &RoomId) -> Result<Vec<OwnedUserId>, UserError> {
+        let handle = self.rooms.get_or_load(room_id).await?;
+        Ok(handle
+            .query(|actor| {
+                Ok::<_, hs_room::RoomError>(
+                    actor
+                        .joined_members()?
+                        .into_iter()
+                        .filter_map(|e| e.header().state_key.clone())
+                        .filter_map(|s| UserId::parse(&s).ok().map(|u| u.to_owned()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .await?)
+    }
+
+    /// Records `user_id`'s typing state in `room_id` and immediately wakes every joined member's
+    /// long-polling `/sync` -- unlike to-device/device-list activity (`crate::sync`'s module
+    /// docs), typing has a real waker hook, since this hub already has to look up the room's
+    /// member list to know who to update.
+    ///
+    /// # Errors
+    /// Returns [`UserError`] if the room could not be loaded.
+    pub async fn set_typing(
+        &self,
+        room_id: &RoomId,
+        user_id: &UserId,
+        typing: bool,
+        timeout: Duration,
+    ) -> Result<(), UserError> {
+        self.typing.set(room_id, user_id, typing, timeout).await;
+        for member in self.joined_member_ids(room_id).await? {
+            self.wake(&member).await;
+        }
+        Ok(())
+    }
+
+    /// `room_id`'s currently-typing users and this room's typing cursor. See [`crate::typing`].
+    pub async fn typing_users(&self, room_id: &RoomId) -> (Vec<OwnedUserId>, u64) {
+        self.typing.current(room_id).await
+    }
+
+    /// Records `user_id`'s new presence and wakes every user who currently shares a *joined* room
+    /// with them -- the same privacy scope `crate::sync::shared_users` already enforces for
+    /// `device_lists` (a user must not learn about the presence of a stranger they share no room
+    /// with).
+    ///
+    /// # Errors
+    /// Returns [`UserError`] if a shared room could not be loaded.
+    pub async fn set_presence(
+        &self,
+        user_id: &UserId,
+        presence: String,
+        status_msg: Option<String>,
+    ) -> Result<(), UserError> {
+        self.presence.set(user_id, presence, status_msg).await;
+        for other in self.users_sharing_room_with(user_id).await? {
+            self.wake(&other).await;
+        }
+        // A user always sees their own just-set presence on their own next sync too (Synapse
+        // behavior: a client's own `set_presence` call is reflected back to it), so wake the
+        // setter's own long poll as well, not only everyone else's.
+        self.wake(user_id).await;
+        Ok(())
+    }
+
+    /// `user_id`'s current presence record, if this process has ever recorded one.
+    pub async fn presence_of(&self, user_id: &UserId) -> Option<crate::presence::PresenceRecord> {
+        self.presence.get(user_id).await
+    }
+
+    /// Every user (other than `user_id`) currently sharing at least one *joined* room with
+    /// `user_id`. Public (unlike [`SessionHub::joined_member_ids`]) because `crate::sync::shared_users`
+    /// -- which needs the identical scope for `device_lists` -- delegates to this rather than
+    /// duplicating the membership walk.
+    ///
+    /// # Errors
+    /// Returns [`UserError`] if a room could not be loaded.
+    pub async fn users_sharing_room_with(
+        &self,
+        user_id: &UserId,
+    ) -> Result<std::collections::BTreeSet<OwnedUserId>, UserError> {
+        let mut shared = std::collections::BTreeSet::new();
+        for m in self.store.list_memberships(user_id).await? {
+            if m.membership != "join" {
+                continue;
+            }
+            for member in self.joined_member_ids(&m.room_id).await? {
+                if member.as_str() != user_id.as_str() {
+                    shared.insert(member);
+                }
+            }
+        }
+        Ok(shared)
     }
 
     /// Spawns a background task forwarding `handle`'s publish stream

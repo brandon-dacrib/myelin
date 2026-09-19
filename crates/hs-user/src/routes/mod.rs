@@ -6,8 +6,10 @@
 
 pub mod account_data;
 pub mod filter;
+pub mod presence;
 pub mod rooms;
 pub mod sync;
+pub mod typing;
 
 use hs_http::router::{AuthKind, Builder, RouteManifest, RouteMeta, Surface};
 use hs_kv::KvBackend;
@@ -71,6 +73,21 @@ pub fn router<B: KvBackend + 'static, R: RoomSource<B> + 'static>()
             "/user/{userId}/filter/{filterId}",
             filter::get_filter::<B, R>,
             matrix_client("getFilter"),
+        )
+        .put(
+            "/rooms/{roomId}/typing/{userId}",
+            typing::put_typing::<B, R>,
+            matrix_client("setTyping"),
+        )
+        .get(
+            "/presence/{userId}/status",
+            presence::get_status::<B, R>,
+            matrix_client("getPresence"),
+        )
+        .put(
+            "/presence/{userId}/status",
+            presence::put_status::<B, R>,
+            matrix_client("setPresence"),
         )
         .build()
 }
