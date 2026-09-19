@@ -95,6 +95,44 @@ impl<T> Page<T> {
             total: None,
         }
     }
+
+    /// Slices `items` into one page using RFC 0004's offset-shaped cursor convention: cursors are
+    /// plain decimal offsets, the same convention `hs-admin-mock`'s `page_json` documents, not yet
+    /// the opaque keyset cursors a real backing store's own pagination would produce (that needs a
+    /// sort-key fingerprint per resource, which is Phase 1 work once a real store exists to build
+    /// one against). `limit` is clamped to `[1, 500]`; a `cursor` that fails to parse as a decimal
+    /// offset is treated as the first page rather than an error, matching the mock's leniency.
+    pub fn paginate(
+        items: Vec<T>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        include_total: bool,
+    ) -> Self {
+        let limit = limit.unwrap_or(50).clamp(1, 500);
+        let total_len = items.len();
+        let offset = cursor
+            .and_then(|c| c.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(total_len);
+        let end = (offset + limit).min(total_len);
+        let next_cursor = if end < total_len {
+            Some(end.to_string())
+        } else {
+            None
+        };
+        let prev_cursor = if offset > 0 {
+            Some(offset.saturating_sub(limit).to_string())
+        } else {
+            None
+        };
+        let page_items: Vec<T> = items.into_iter().skip(offset).take(end - offset).collect();
+        Self {
+            items: page_items,
+            next_cursor,
+            prev_cursor,
+            total: include_total.then_some(total_len as u64),
+        }
+    }
 }
 
 /// `ResourceRef` (RFC 0004 section 5): an open-enum resource type plus its identifier.
@@ -169,6 +207,26 @@ pub struct Principal {
 impl Principal {
     pub fn has_scope(&self, required: Scope) -> bool {
         any_satisfies(&self.scopes, required)
+    }
+
+    /// Projects this principal onto an [`Actor`] for the audit log and the event stream (RFC 0004
+    /// section 9/10: every recorded mutation names who did it). `ip`/`user_agent` are left unset
+    /// here — no handler in this crate threads a real client IP through yet (see
+    /// `docs/status/15-admin-api-and-modules.md`); a caller with that information can still set it
+    /// with struct-update syntax.
+    pub fn to_actor(&self) -> Actor {
+        Actor {
+            kind: match self.kind {
+                PrincipalKind::User | PrincipalKind::Legacy => ActorKind::User,
+                PrincipalKind::Client => ActorKind::Client,
+                PrincipalKind::ServiceAccount => ActorKind::ServiceAccount,
+            },
+            id: self.id.clone(),
+            display_name: self.display_name.clone(),
+            token_id: self.token_id.clone(),
+            ip: None,
+            user_agent: None,
+        }
     }
 }
 
@@ -430,5 +488,57 @@ mod tests {
     fn new_id_is_ulid_shaped() {
         let id = new_id();
         assert_eq!(id.len(), 26);
+    }
+
+    #[test]
+    fn paginate_first_page_has_next_but_no_prev() {
+        let items: Vec<u32> = (0..10).collect();
+        let page = Page::paginate(items, None, Some(4), false);
+        assert_eq!(page.items, vec![0, 1, 2, 3]);
+        assert_eq!(page.next_cursor, Some("4".to_string()));
+        assert_eq!(page.prev_cursor, None);
+        assert_eq!(page.total, None);
+    }
+
+    #[test]
+    fn paginate_middle_page_has_both_cursors() {
+        let items: Vec<u32> = (0..10).collect();
+        let page = Page::paginate(items, Some("4"), Some(4), true);
+        assert_eq!(page.items, vec![4, 5, 6, 7]);
+        assert_eq!(page.next_cursor, Some("8".to_string()));
+        assert_eq!(page.prev_cursor, Some("0".to_string()));
+        assert_eq!(page.total, Some(10));
+    }
+
+    #[test]
+    fn paginate_last_page_has_no_next() {
+        let items: Vec<u32> = (0..10).collect();
+        let page = Page::paginate(items, Some("8"), Some(4), false);
+        assert_eq!(page.items, vec![8, 9]);
+        assert_eq!(page.next_cursor, None);
+    }
+
+    #[test]
+    fn paginate_unparseable_cursor_is_treated_as_the_start() {
+        let items: Vec<u32> = (0..3).collect();
+        let page = Page::paginate(items, Some("not-a-number"), Some(10), false);
+        assert_eq!(page.items, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn principal_to_actor_maps_legacy_to_user() {
+        let principal = Principal {
+            kind: PrincipalKind::Legacy,
+            id: "@ops:example.org".into(),
+            display_name: Some("Ops".into()),
+            scopes: vec![Scope::AdminWrite],
+            token_id: Some("tok1".into()),
+            expires_at: None,
+            issued_by: None,
+        };
+        let actor = principal.to_actor();
+        assert_eq!(actor.kind, ActorKind::User);
+        assert_eq!(actor.id, "@ops:example.org");
+        assert_eq!(actor.token_id, Some("tok1".into()));
     }
 }
