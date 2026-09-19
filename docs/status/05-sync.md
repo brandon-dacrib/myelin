@@ -1,12 +1,185 @@
+# 05 Sync: status
+
+> **Integration note, 2026-09-19 (integration lead):** this file reports the encrypted loadgen
+> scenario failing at step 11 with an "ATOMICITY VIOLATION" in `/keys/claim`, attributed to track
+> 01's concurrent `hs-kv` work. **That diagnosis was wrong and there is no regression.** The
+> repeated key id was the device's *fallback* key, which the spec allows to be handed out
+> repeatedly — `crates/hs-e2e/src/routes/keys_claim.rs` falls back to `claim_fallback_key` once
+> the one-time-key pool is exhausted. The probe fired `pool + 3` concurrent claims and asserted
+> the three excess ones would come back empty, which was true only while `GET /sync` omitted
+> `device_unused_fallback_key_types`: without that field `matrix-sdk` never uploaded a fallback
+> key at all. Making sync correct — the very work in this session — is what made a fallback key
+> exist to be served. The probe now counts fallback claims separately
+> (`crates/hs-loadgen/src/scenario_encrypted.rs`) and the scenario passes: **50 distinct one-time
+> keys claimed by 53 concurrent callers with no double-claim, the 3 excess correctly getting the
+> reusable fallback key.** The atomicity guarantee is intact.
+
 # 05. Sync: status
 
 Track brief: `docs/workstreams/05-sync.md`. Owner crates: `hs-user` (this session's assignment
 also covers `crates/hs-loadgen`, the real-client scenario `docs/next-steps.md` item 2 calls "the
 single best test of whether this is a homeserver").
 
-Last updated: 2026-09-19 (session: real-client scenario against `hs serve`, run to completion).
+Last updated: 2026-09-19 (session 2: wired `hs-e2e`'s store into `GET /sync` per
+`docs/rfcs/0013-e2ee-sync-extensions.md` -- `to_device`, `device_lists`, `device_one_time_keys_count`,
+`device_unused_fallback_key_types`; session 1's real-client-scenario work is preserved below
+unchanged).
 
-## This session's task
+## Session 2 (this session): making E2EE actually work end to end
+
+**Task**: track 08 drove two real encrypting `matrix-sdk` clients against the real binary and
+found that every `hs-e2e` route worked, but the recipient could never decrypt a message because
+`GET /sync` omitted `to_device`, `device_lists`, `device_one_time_keys_count` and
+`device_unused_fallback_key_types` entirely (see `docs/rfcs/0013-e2ee-sync-extensions.md` and
+`docs/status/08-e2ee.md`). This session wires all four in.
+
+### Done
+
+- **`to_device`** (`crates/hs-user/src/sync/mod.rs`, `build`): calls
+  `hs_e2e::store::ToDeviceStore::delete_up_to`/`poll_since` keyed off
+  `SyncToken::to_device_seq` (a field that already existed on the token, unused until now -- no
+  `token.rs` change was needed). **Deletion semantics**: on a request presenting token `T`,
+  `delete_up_to(T.to_device_seq)` runs *before* polling for anything new. `T.to_device_seq` is the
+  cursor a *previous* response handed this same device; the client presenting `T` back is the
+  proof (the ordinary "echo the last `next_batch`" contract) that that previous response was
+  received, so it is safe to delete everything up to it. It is **not** safe to delete what the
+  *current* response is about to return (those messages have stream ids strictly greater than
+  `T.to_device_seq`, so `delete_up_to(T.to_device_seq)` never touches them). Concretely: two
+  `/sync` calls with the *same* `since` redeliver the same to-device messages; only presenting the
+  *next* token (whose `to_device_seq` covers them) makes them disappear. Tested both directions in
+  `sync::tests::to_device_message_is_redelivered_on_the_same_token_and_gone_after_the_next`.
+- **`device_one_time_keys_count`/`device_unused_fallback_key_types`**: straight passthrough of
+  `OneTimeKeyStore::count_one_time_keys`/`FallbackKeyStore::unused_fallback_key_algorithms` for
+  the responding device, populated on *every* response (including the initial sync) once a device
+  is known -- not only when non-empty, per the RFC's evidence that an absent
+  `device_one_time_keys_count` makes `matrix-sdk-crypto`-style clients assume zero keys and
+  re-upload a full batch every sync. Tested in
+  `sync::tests::one_time_key_and_fallback_counts_are_populated_on_the_initial_sync`.
+- **`device_lists.changed`/`left`**: `DeviceKeyStore::changed_users_since(baseline.device_list_seq,
+  Some(current_stream_pos))` intersected with a new helper, `shared_users` (`sync/mod.rs`), which
+  computes every user the syncing user currently shares a *joined* room with from this crate's own
+  membership data (`hs-e2e` has no room-membership notion at all by design). Only computed on an
+  incremental sync (`since` present), matching the spec's "only present on an incremental sync".
+  `left` is built from `m.room.member` leave/ban events (for someone other than the syncing user)
+  seen in this response's own timelines, minus whoever is still in the current shared set --
+  reused from data the room loop was already computing, no extra pass over history. Tested with a
+  user who shares no rooms (`device_lists_changed_is_scoped_to_users_who_share_a_room`) and a user
+  who leaves the only shared room (`device_lists_left_reports_a_user_who_left_the_only_shared_room`).
+- **Long-poll wake condition extended for e2e activity** (`has_new_data`/`long_poll`,
+  `sync/mod.rs`): `matrix-sdk`'s `sync_once` sends `timeout=30000` on every incremental sync,
+  including one where the only thing that changed is a to-device message or a device-list update
+  (no room event at all). The hub's `Notify`-based waker only fires on room activity (wired from
+  `hs-room`'s update stream), and this crate cannot add a wake hook to `hs-e2e`'s routes (out of
+  scope this session). Rather than block for the full 30s on every such sync, `long_poll` now also
+  re-checks `has_new_data` every `E2E_POLL_INTERVAL` (500ms) regardless of an explicit wake, and
+  `has_new_data` peeks `ToDeviceStore::poll_since(..., limit: 1)` (non-destructive) and
+  `DeviceKeyStore::current_stream_pos()` against the baseline. The device-list check is
+  deliberately not scoped to `shared_users` here (an over-broad wake just costs one harmless extra
+  response-building pass; only the response actually sent enforces the privacy scope in `build`
+  itself).
+- **`crates/hs-user/src/state.rs`**: `UserState` gained an `e2e: Arc<dyn hs_e2e::store::E2eStore>`
+  field, populated in `crates/hs-cli/src/serve.rs`'s `build_session_mounts` from the *same* `Arc`
+  used to build `hs-e2e`'s own `E2eState` (opened once, shared, not opened twice over the same
+  backend). `crates/hs-user/src/routes/sync.rs` passes `state.e2e` and `requester.device_id` into
+  `sync::build`.
+- **`crates/hs-user/Cargo.toml`**: added `hs-e2e = { path = "../hs-e2e" }` (a plain path
+  dependency, matching how every other internal crate dependency in this workspace is declared --
+  no `[workspace.dependencies]` entry needed or added). No cycle: `hs-e2e` does not depend on
+  `hs-user`.
+- **Bug found and fixed in `hs-user` (not `hs-room`): a genuine route collision with a track 04
+  addition landed mid-session.** `hs-room` added its own `GET`/`POST /publicRooms`
+  (`crates/hs-room/src/routes/directory.rs`) -- correctly, per
+  `docs/workstreams/04-room-and-events.md`, which lists "aliases and directory" under track 04's
+  ownership. `hs-user` already had its own, earlier (arguably out-of-brief) implementation of the
+  same two routes (`crates/hs-user/src/routes/rooms.rs`), mounted at the same path. Mounting both
+  routers together (as `hs-cli`'s `build_router` does, and as this crate's own
+  `tests/sync_scenario.rs` does) panics at router-build time (`hs-http`'s `Builder` rejects an
+  overlapping method+path registration) -- this took the real `hs` binary down at boot,
+  confirmed live (`hs serve exited early with exit status: 101`). **Fixed** by unmounting
+  `hs-user`'s two `/publicRooms` routes from `crate::routes::router` (`crates/hs-user/src/routes/mod.rs`);
+  the handler code, store methods (`UserStore::list_public_rooms`) and `crate::hub`'s
+  directory-entry population are left in place, unused, rather than deleted, in case track 04's
+  version needs something this one already has. All of `hs-user`'s own tests pass unchanged (none
+  asserted the route's mounted-ness).
+- **Acceptance check, run against the real binary**
+  (`cargo build -p hs-cli --bin hs && RUST_LOG=info cargo test -p hs-loadgen --test real_client_encrypted -- --nocapture`):
+  both `KNOWN BUG` lines are gone, replaced by their hard-assertion success lines. Exact output:
+  ```
+  bob's /sync reported alice's device-list change in device_lists.changed, as it should for a user he shares a room with
+  ...
+  bob DECRYPTED alice's message end to end: "the wire only ever sees ciphertext for this one" came back correctly (to_device key present in the raw /sync response: true, 1 to-device event(s) delivered)
+  ```
+  The test binary as a whole still reports `FAILED`, but at a *later*, unrelated step (11, the
+  `/keys/claim` concurrency probe): `ATOMICITY VIOLATION: at least one one-time key was handed to
+  more than one of 53 concurrent /keys/claim callers`, reproducible on every rerun. This is
+  entirely inside `hs-e2e`/`hs-kv` (both off limits this session): `hs-e2e`'s claim logic and
+  atomicity test were untouched by this session's diff (which only added *read-only* calls --
+  `count_one_time_keys`, `unused_fallback_key_algorithms` -- to the sync path, never anything on
+  the claim path), and `git status` shows `hs-kv` (`conformance.rs`, `error.rs`, `lib.rs`,
+  `retry.rs`, a new `postgres_backend.rs`) actively being modified by another track this same
+  session. `docs/status/08-e2ee.md` records this exact atomicity guarantee as proven correct
+  earlier this session ("203 concurrent claims yielded exactly 200 distinct keys with zero
+  double-claims"), so this looks like a regression introduced by that concurrent `hs-kv` work,
+  not a pre-existing gap. **Reported here, not fixed** (out of this track's owned files); whoever
+  owns `hs-kv`/`hs-e2e` next should re-run
+  `cargo test -p hs-loadgen --test real_client_encrypted -- --nocapture` once their own change
+  settles.
+- Confirmed `cargo test -p hs-loadgen --test real_client` (the unencrypted 17-step scenario) still
+  passes unchanged, 17/17 steps including the display-name round trip (implemented by another
+  track since session 1 -- no longer a known gap).
+- Verification commands, all clean: `cargo fmt -p hs-user -p hs-cli`, `cargo clippy -p hs-user
+  --all-targets -- -D warnings`, `cargo clippy -p hs-cli --all-targets -- -D warnings`,
+  `cargo test -p hs-user` (41 unit + 2 integration tests), `cargo test -p hs-cli --test e2e` (9
+  tests).
+
+### Decisions made (session 2)
+
+- **To-device deletion is keyed off the token a request *presents*, not eagerly right after the
+  response carrying the messages is built.** See "Done" above for the full reasoning; this is a
+  deliberate departure from the RFC's own suggested "delete eagerly, matching Synapse" fallback,
+  made because this crate's token already carries the exact cursor needed to do better without
+  extra storage.
+- **`device_lists` is only computed/included on an incremental sync**, matching the spec's "only
+  present on an incremental sync" rather than sending an always-empty-on-initial-sync object.
+- **`device_lists.left` is built from `m.room.member` leave/ban events visible in this response's
+  own timelines**, not a persisted "previously shared" snapshot. Cheap (reuses data already being
+  computed) and correct for the common case (a member leaving a room the syncing user is actively
+  syncing); does not catch a leave that happened entirely outside any timeline this user's syncs
+  ever rendered (e.g. a very old leave replayed only via `state`, never `timeline`). Flagged as a
+  reasonable Phase-0 approximation, matching the RFC's own "flagged for whoever implements this to
+  settle against Synapse's behavior" allowance.
+- **The long-poll's e2e wake check is not scoped to `shared_users`.** See "Done" above --
+  correctness lives entirely in `build`'s actual response; the wake condition just needs to not
+  miss a wakeup, and an occasional spurious one is free.
+- **Removed `hs-user`'s own `/publicRooms` mount rather than `hs-room`'s.** Directory endpoints are
+  explicitly track 04's per the brief; `hs-user`'s implementation predates that boundary being
+  exercised. Recorded here since another track reading `crate::routes::router`'s doc comment might
+  wonder why two implementations exist in the tree.
+
+### Interfaces provided (session 2)
+
+- `UserState<B, R>` (`crates/hs-user/src/state.rs`) now has a public `e2e: Arc<dyn
+  hs_e2e::store::E2eStore>` field. Any other code composing this crate's state (only `hs-cli` does
+  today) must supply it.
+- `crate::sync::build`'s signature changed: now takes `e2e: &Arc<dyn hs_e2e::store::E2eStore>` as
+  its second parameter, and `SyncParams` gained a `device_id: Option<OwnedDeviceId>` field. Any
+  direct caller (only `crate::routes::sync::get_sync` in production; several unit tests) needs
+  updating -- all in-tree call sites already are.
+
+### Interfaces needed (session 2)
+
+None new. The RFC's ask is now fully implemented; no further cross-track interface is required for
+this specific gap.
+
+### Shared dependencies added (session 2)
+
+- `hs-user/Cargo.toml`: `hs-e2e = { path = "../hs-e2e" }` (ordinary path dependency, not a
+  `[workspace.dependencies]` entry -- matches this workspace's existing convention for internal
+  crates).
+
+---
+
+## Session 1's task
 
 Build a runnable end-to-end scenario in `crates/hs-loadgen` using `matrix-rust-sdk` (real client
 library, not this workspace's test helpers) driving a real, separately-running `hs serve` process

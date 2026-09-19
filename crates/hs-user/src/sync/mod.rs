@@ -22,25 +22,48 @@
 //!   `[]`. Typing and receipt distribution is listed in this track's brief but was not reached
 //!   this session -- see `docs/status/05-sync.md`.
 //! - **Presence**: the top-level `presence.events` is always `[]`.
-//! - **To-device, device lists, one-time-key counts**: track 08 (E2EE) owns these and has not
-//!   landed a crate yet (no `hs-e2e` exists in this workspace as of this session). Rather than
-//!   fabricate empty placeholders for a wire shape this crate has no way to validate, `build`
-//!   omits `to_device`, `device_lists`, `device_one_time_keys_count` and
-//!   `device_unused_fallback_key_types` entirely; real Matrix clients treat all four as
-//!   optional-and-default-empty when absent. Revisit once track 08's cursors exist --
-//!   `docs/status/05-sync.md`'s "Interfaces needed".
 //! - **Unread notification counts**: *is* included, per this track's own instructions, shaped
 //!   correctly (`{"highlight_count": 0, "notification_count": 0}`) with both counts hard-zero
 //!   until track 10 (push) lands.
+//!
+//! # `to_device`, `device_lists` and key counts (`docs/rfcs/0013-e2ee-sync-extensions.md`)
+//!
+//! All four fields `hs-e2e` (track 08) makes possible are populated here, straight from that
+//! crate's already-tested store traits (`hs_e2e::store`) -- see [`build`]'s body. Two things are
+//! worth recording since they are exactly where a `/sync` implementation goes wrong:
+//!
+//! - **To-device acknowledgement.** [`SyncToken::to_device_seq`] is the cursor a *device* was
+//!   last handed as part of its own `next_batch`. When a request presents token `T` as `since`,
+//!   this crate first calls [`hs_e2e::store::ToDeviceStore::delete_up_to`] with `T.to_device_seq`
+//!   -- deleting only messages already covered by a response the client has *proven* it received
+//!   (by echoing `T` back), never the messages this response is about to hand back (those have
+//!   stream ids strictly greater than `T.to_device_seq` and survive `delete_up_to(T.to_device_seq)`
+//!   untouched). Concretely: a client that calls `/sync` twice with the *same* `since` (a retried
+//!   request, or a client that never advances) gets the same to-device messages both times; only
+//!   presenting the *next* token (whose `to_device_seq` covers them) causes them to be deleted --
+//!   which is why deletion happens at the top of the *next* call, keyed off the token that call
+//!   presents, not eagerly right after this response is built. Deleting eagerly (Synapse's
+//!   documented behavior, and this RFC's original suggestion) trades a small window of guaranteed
+//!   delivery for simplicity; this crate already has the token machinery to do better cheaply, so
+//!   it does.
+//! - **`device_lists.changed`/`left` are scoped to [`shared_users`]**, not every user on the
+//!   server: `hs_e2e::store::DeviceKeyStore::changed_users_since` has no room-membership notion at
+//!   all (by design -- see that trait's module doc), so it is intersected here against the users
+//!   this crate's own membership data says `user_id` currently shares a joined room with. This is
+//!   both the spec's privacy requirement (a user must not learn about devices belonging to
+//!   strangers) and what makes the field usable at all on a server with more than a handful of
+//!   users.
 
 use std::collections::{BTreeSet, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use hs_e2e::store::{DeviceKeyStore, E2eStore, FallbackKeyStore, OneTimeKeyStore, ToDeviceStore};
 use hs_kv::KvBackend;
 use hs_model::Event;
 use hs_room::routes::render::client_event_json;
 use hs_room::timeline::{Direction, PaginationToken};
-use ruma::{OwnedRoomId, RoomId, UserId};
+use ruma::{OwnedDeviceId, OwnedRoomId, OwnedUserId, RoomId, UserId};
 use serde_json::{Value, json};
 
 use crate::error::UserError;
@@ -54,6 +77,12 @@ use crate::token::SyncToken;
 /// otherwise).
 pub const DEFAULT_TIMELINE_LIMIT: usize = 10;
 
+/// The most to-device messages a single `/sync` response will carry for one device. Matches this
+/// crate's `DEFAULT_TIMELINE_LIMIT`-adjacent philosophy of a bounded response; a device with more
+/// than this many queued messages simply gets the rest on its next sync (nothing is lost --
+/// `ToDeviceStore::poll_since`'s returned cursor only advances past what was actually returned).
+pub const TO_DEVICE_LIMIT: usize = 100;
+
 /// Parameters `crate::routes::sync` parses out of the request and hands to [`build`].
 #[derive(Debug, Clone)]
 pub struct SyncParams {
@@ -65,6 +94,12 @@ pub struct SyncParams {
     pub timeout: Duration,
     /// The resolved filter (`crate::filter::resolve`).
     pub filter: SyncFilter,
+    /// The responding device, if the requester is bound to one. Ordinary user sessions always
+    /// are; a handful of exotic callers (e.g. some appservice requests) are not. `None` skips
+    /// `to_device`, `device_one_time_keys_count` and `device_unused_fallback_key_types` entirely
+    /// -- all three are meaningless without a specific device -- but `device_lists` is still
+    /// computed, since it is scoped to the user, not the device.
+    pub device_id: Option<OwnedDeviceId>,
 }
 
 /// Which pagination strategy a room's timeline uses this response, and why. See the module docs.
@@ -229,14 +264,24 @@ fn build_state_section(
 /// Returns [`UserError`] on a store or room-actor failure.
 pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     hub: &SessionHub<B, R>,
+    e2e: &Arc<dyn E2eStore>,
     user_id: &UserId,
     params: SyncParams,
 ) -> Result<(Value, SyncToken), UserError> {
     let baseline = params.since.unwrap_or_else(SyncToken::initial);
     let is_initial = params.since.is_none();
+    let device_id = params.device_id.clone();
 
     if !is_initial {
-        long_poll(hub, user_id, &baseline, params.timeout).await?;
+        long_poll(
+            hub,
+            e2e,
+            user_id,
+            device_id.as_deref(),
+            &baseline,
+            params.timeout,
+        )
+        .await?;
     }
 
     let store = hub.store();
@@ -268,6 +313,11 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     let mut invite = serde_json::Map::new();
     let mut knock = serde_json::Map::new();
     let mut leave = serde_json::Map::new();
+    // Other users' `m.room.member` events (leave/ban) seen in a room's timeline this response
+    // sends -- candidates for `device_lists.left` once intersected with "no longer shared" below.
+    // See the module docs; deliberately built from data this loop already computes, not a second
+    // pass over history.
+    let mut left_candidates: BTreeSet<OwnedUserId> = BTreeSet::new();
 
     for room_id in &candidate_rooms {
         if !params.filter.room_allowed(room_id.as_str()) {
@@ -371,6 +421,27 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             })
             .await?;
 
+        for event in &timeline.events {
+            if event.get("type").and_then(Value::as_str) != Some("m.room.member") {
+                continue;
+            }
+            let Some(state_key) = event.get("state_key").and_then(Value::as_str) else {
+                continue;
+            };
+            if state_key == user_id.as_str() {
+                continue;
+            }
+            let membership = event
+                .get("content")
+                .and_then(|c| c.get("membership"))
+                .and_then(Value::as_str);
+            if matches!(membership, Some("leave") | Some("ban"))
+                && let Ok(other) = ruma::UserId::parse(state_key)
+            {
+                left_candidates.insert(other);
+            }
+        }
+
         let nothing_changed =
             timeline.events.is_empty() && account_data_json.is_empty() && !force_full_state;
         if nothing_changed && !is_initial {
@@ -440,9 +511,70 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         .latest_account_data_seq(user_id)
         .await?
         .max(baseline.account_data_seq);
+
+    // `to_device`: see the module docs for why `delete_up_to(baseline.to_device_seq)` -- keyed
+    // off the token *this* request presented, acknowledging the previous response -- happens
+    // before polling for anything new, not after this response is built.
+    let (to_device_events, new_to_device_seq) = if let Some(device_id) = device_id.as_deref() {
+        ToDeviceStore::delete_up_to(&**e2e, user_id, device_id, baseline.to_device_seq).await?;
+        let (messages, next_cursor) = ToDeviceStore::poll_since(
+            &**e2e,
+            user_id,
+            device_id,
+            baseline.to_device_seq,
+            TO_DEVICE_LIMIT,
+        )
+        .await?;
+        let events: Vec<Value> = messages
+            .into_iter()
+            .map(|m| json!({"sender": m.sender, "type": m.event_type, "content": m.content}))
+            .collect();
+        (events, next_cursor)
+    } else {
+        (Vec::new(), baseline.to_device_seq)
+    };
+
+    // `device_one_time_keys_count`/`device_unused_fallback_key_types`: a straight passthrough,
+    // populated on every response once a device is known (not only when non-empty -- a client
+    // treats an *absent* `device_one_time_keys_count` as "zero keys left", per the spec and
+    // `docs/rfcs/0013-e2ee-sync-extensions.md`'s reproduced evidence of what that omission does).
+    let (otk_counts_json, fallback_types_json) = if let Some(device_id) = device_id.as_deref() {
+        let counts = OneTimeKeyStore::count_one_time_keys(&**e2e, user_id, device_id).await?;
+        let fallback =
+            FallbackKeyStore::unused_fallback_key_algorithms(&**e2e, user_id, device_id).await?;
+        (Some(json!(counts)), Some(json!(fallback)))
+    } else {
+        (None, None)
+    };
+
+    // `device_lists.changed`/`left`: per spec, only meaningful (and only sent) on an incremental
+    // sync. Scoped to `shared_users` -- see the module docs.
+    let (device_lists_json, new_device_list_seq) = if is_initial {
+        (None, baseline.device_list_seq)
+    } else {
+        let upto = DeviceKeyStore::current_stream_pos(&**e2e).await?;
+        let changed_all =
+            DeviceKeyStore::changed_users_since(&**e2e, baseline.device_list_seq, Some(upto))
+                .await?;
+        let shared = shared_users(hub, user_id).await?;
+        let changed: Vec<Value> = changed_all
+            .iter()
+            .filter(|u| shared.contains(*u))
+            .map(|u| Value::String(u.to_string()))
+            .collect();
+        let left: Vec<Value> = left_candidates
+            .iter()
+            .filter(|u| !shared.contains(*u))
+            .map(|u| Value::String(u.to_string()))
+            .collect();
+        (Some(json!({"changed": changed, "left": left})), upto)
+    };
+
     let next_token = SyncToken {
         feed_seq: new_feed_seq,
         account_data_seq: new_account_data_seq,
+        to_device_seq: new_to_device_seq,
+        device_list_seq: new_device_list_seq,
         ..baseline
     };
 
@@ -460,22 +592,68 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         rooms.insert("leave".into(), Value::Object(leave));
     }
 
-    let response = json!({
+    let mut response = json!({
         "next_batch": next_token.encode(),
         "rooms": rooms,
         "presence": {"events": []},
         "account_data": {"events": global_account_data_json},
     });
+    if device_id.is_some() {
+        response["to_device"] = json!({"events": to_device_events});
+        response["device_one_time_keys_count"] = otk_counts_json.unwrap_or_else(|| json!({}));
+        response["device_unused_fallback_key_types"] =
+            fallback_types_json.unwrap_or_else(|| json!([]));
+    }
+    if let Some(device_lists) = device_lists_json {
+        response["device_lists"] = device_lists;
+    }
 
     Ok((response, next_token))
 }
 
-/// Whether anything has changed for `user_id` since `baseline` -- feed activity, or the
-/// account-data counter having advanced. Used both by the long-poll loop's wake condition and
-/// (implicitly, by returning quickly) by a plain non-blocking check.
-async fn has_new_data<B: KvBackend + 'static, R: RoomSource<B>>(
+/// Every user (other than `user_id`) currently sharing at least one *joined* room with
+/// `user_id` -- the scope [`build`]'s `device_lists.changed`/`left` must respect. `hs-e2e` has no
+/// room-membership notion at all (`hs_e2e::store::DeviceKeyStore`'s module doc), so this lives
+/// entirely on this crate's own membership data.
+async fn shared_users<B: KvBackend + 'static, R: RoomSource<B>>(
     hub: &SessionHub<B, R>,
     user_id: &UserId,
+) -> Result<BTreeSet<OwnedUserId>, UserError> {
+    let mut shared = BTreeSet::new();
+    for m in hub.store().list_memberships(user_id).await? {
+        if m.membership != "join" {
+            continue;
+        }
+        let handle = hub.rooms().get_or_load(&m.room_id).await?;
+        let members: Vec<String> = handle
+            .query(move |actor| -> Result<Vec<String>, hs_room::RoomError> {
+                Ok(actor
+                    .joined_members()?
+                    .into_iter()
+                    .filter_map(|e| e.header().state_key.clone())
+                    .collect())
+            })
+            .await?;
+        for member in members {
+            if member != user_id.as_str()
+                && let Ok(other) = ruma::UserId::parse(&member)
+            {
+                shared.insert(other);
+            }
+        }
+    }
+    Ok(shared)
+}
+
+/// Whether anything has changed for `user_id` since `baseline` -- feed activity, the
+/// account-data counter having advanced, or (when `device_id` is known) new to-device messages
+/// or a device-list change. Used both by the long-poll loop's wake condition and (implicitly, by
+/// returning quickly) by a plain non-blocking check.
+async fn has_new_data<B: KvBackend + 'static, R: RoomSource<B>>(
+    hub: &SessionHub<B, R>,
+    e2e: &Arc<dyn E2eStore>,
+    user_id: &UserId,
+    device_id: Option<&ruma::DeviceId>,
     baseline: &SyncToken,
 ) -> Result<bool, UserError> {
     let store = hub.store();
@@ -508,8 +686,34 @@ async fn has_new_data<B: KvBackend + 'static, R: RoomSource<B>>(
             }
         }
     }
+    // `hs-e2e`'s to-device queue and device-list stream have no waker hook into this hub (its
+    // routes are outside this crate -- see the module docs and
+    // `docs/rfcs/0013-e2ee-sync-extensions.md`), so a long-poll can only learn about them by
+    // asking directly. `poll_since` with `limit: 1` is a cheap, non-destructive peek (it does not
+    // delete anything -- only `delete_up_to` does).
+    if let Some(device_id) = device_id {
+        let (peek, _) =
+            ToDeviceStore::poll_since(&**e2e, user_id, device_id, baseline.to_device_seq, 1)
+                .await?;
+        if !peek.is_empty() {
+            return Ok(true);
+        }
+        // Not scoped to `shared_users` here -- an over-broad wake condition just costs an extra,
+        // harmless response-building pass; only the response actually sent out (`build`'s own
+        // `device_lists` computation) enforces the privacy scope.
+        if DeviceKeyStore::current_stream_pos(&**e2e).await? > baseline.device_list_seq {
+            return Ok(true);
+        }
+    }
     Ok(false)
 }
+
+/// How often [`long_poll`] re-checks [`has_new_data`] even without an explicit wake. Needed
+/// because to-device/device-list activity (unlike room activity) has no waker hook into this
+/// hub's `Notify` -- see [`has_new_data`]'s module-doc-adjacent comment. Short enough that an
+/// encrypted message's to-device room-key share is noticed promptly, long enough not to turn a
+/// long-poll into a busy loop.
+const E2E_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// The long-poll loop: waits until [`has_new_data`] is true or `timeout` elapses. Registers
 /// interest on the hub's waker with [`tokio::sync::futures::Notified::enable`] *before* checking,
@@ -517,10 +721,13 @@ async fn has_new_data<B: KvBackend + 'static, R: RoomSource<B>>(
 /// `notify_waiters` call -- `tokio::sync::Notify::notify_waiters` only wakes futures that have
 /// already been polled at least once (registered), so checking the condition first and only then
 /// constructing/polling the `Notified` future would have a lost-wakeup window between the check
-/// and the registration.
+/// and the registration. Also polls every [`E2E_POLL_INTERVAL`] regardless of that wake, since
+/// to-device/device-list changes have no wake hook at all (see [`has_new_data`]).
 async fn long_poll<B: KvBackend + 'static, R: RoomSource<B>>(
     hub: &SessionHub<B, R>,
+    e2e: &Arc<dyn E2eStore>,
     user_id: &UserId,
+    device_id: Option<&ruma::DeviceId>,
     baseline: &SyncToken,
     timeout: Duration,
 ) -> Result<(), UserError> {
@@ -531,7 +738,7 @@ async fn long_poll<B: KvBackend + 'static, R: RoomSource<B>>(
         tokio::pin!(notified);
         notified.as_mut().enable();
 
-        if has_new_data(hub, user_id, baseline).await? {
+        if has_new_data(hub, e2e, user_id, device_id, baseline).await? {
             return Ok(());
         }
 
@@ -539,7 +746,8 @@ async fn long_poll<B: KvBackend + 'static, R: RoomSource<B>>(
         if remaining.is_zero() {
             return Ok(());
         }
-        let _ = tokio::time::timeout(remaining, notified).await;
+        let wait = remaining.min(E2E_POLL_INTERVAL);
+        let _ = tokio::time::timeout(wait, notified).await;
         if Instant::now() >= deadline {
             return Ok(());
         }
@@ -552,6 +760,7 @@ mod tests {
     use crate::room_source::test_support::registry;
     use crate::store::DynUserStore;
     use crate::store::tables::TablesUserStore;
+    use hs_e2e::store::tables::TablesE2eStore;
     use hs_kv::memory::MemoryBackend;
     use hs_room::actor::CreateRoomRequest;
     use hs_room::membership::Action;
@@ -566,18 +775,27 @@ mod tests {
         Arc::new(SessionHub::new(store, rooms, 500))
     }
 
+    /// A throwaway `hs-e2e` store for tests that don't otherwise care about it (most of this
+    /// module's tests): every `build` call needs one, but only the tests under "e2ee sync
+    /// extensions" below actually populate it with anything.
+    fn e2e_store() -> Arc<dyn E2eStore> {
+        Arc::new(TablesE2eStore::open(MemoryBackend::new()).unwrap())
+    }
+
     fn params(since: Option<SyncToken>) -> SyncParams {
         SyncParams {
             since,
             full_state: false,
             timeout: Duration::from_millis(50),
             filter: SyncFilter::none(),
+            device_id: None,
         }
     }
 
     #[tokio::test]
     async fn initial_sync_lists_a_joined_room_with_its_recent_timeline() {
         let hub = hub();
+        let e2e = e2e_store();
         let alice = user_id!("@alice:sync.test").to_owned();
         let handle = hub
             .rooms()
@@ -606,7 +824,7 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let (response, token) = build(&hub, &alice, params(None)).await.unwrap();
+        let (response, token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
         assert!(token.feed_seq > 0);
         let room_id = handle.query(|a| a.room_id().to_owned()).await;
         let room = &response["rooms"]["join"][room_id.as_str()];
@@ -625,6 +843,7 @@ mod tests {
     #[tokio::test]
     async fn a_message_sent_after_a_token_was_issued_appears_in_the_next_incremental_sync() {
         let hub = hub();
+        let e2e = e2e_store();
         let alice = user_id!("@alice:sync.test").to_owned();
         let handle = hub
             .rooms()
@@ -641,7 +860,7 @@ mod tests {
         hub.watch_room(handle.clone()).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        let (_first, token) = build(&hub, &alice, params(None)).await.unwrap();
+        let (_first, token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
         hub.store()
             .record_device_cursor(&alice, "DEV1".into(), token.feed_seq)
             .await
@@ -660,7 +879,9 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let (response, _) = build(&hub, &alice, params(Some(token))).await.unwrap();
+        let (response, _) = build(&hub, &e2e, &alice, params(Some(token)))
+            .await
+            .unwrap();
         let room_id = handle.query(|a| a.room_id().to_owned()).await;
         let events = response["rooms"]["join"][room_id.as_str()]["timeline"]["events"]
             .as_array()
@@ -679,6 +900,7 @@ mod tests {
     #[tokio::test]
     async fn a_token_from_before_a_message_still_returns_that_message() {
         let hub = hub();
+        let e2e = e2e_store();
         let alice = user_id!("@alice:sync.test").to_owned();
         let handle = hub
             .rooms()
@@ -696,7 +918,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         // The token under test, issued before the message exists.
-        let (_early, early_token) = build(&hub, &alice, params(None)).await.unwrap();
+        let (_early, early_token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
 
         handle
             .send_event(
@@ -712,7 +934,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         // Present the *early* token, not the latest one.
-        let (response, _) = build(&hub, &alice, params(Some(early_token)))
+        let (response, _) = build(&hub, &e2e, &alice, params(Some(early_token)))
             .await
             .unwrap();
         let room_id = handle.query(|a| a.room_id().to_owned()).await;
@@ -731,6 +953,7 @@ mod tests {
     #[tokio::test]
     async fn an_invite_appears_in_the_invitees_incremental_sync() {
         let hub = hub();
+        let e2e = e2e_store();
         let alice = user_id!("@alice:sync.test").to_owned();
         let bob = user_id!("@bob:sync.test").to_owned();
         let handle = hub
@@ -739,7 +962,7 @@ mod tests {
             .await
             .unwrap();
         hub.watch_room(handle.clone()).await;
-        let (_bob_first, bob_token) = build(&hub, &bob, params(None)).await.unwrap();
+        let (_bob_first, bob_token) = build(&hub, &e2e, &bob, params(None)).await.unwrap();
 
         handle
             .membership(
@@ -753,7 +976,9 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let (response, _) = build(&hub, &bob, params(Some(bob_token))).await.unwrap();
+        let (response, _) = build(&hub, &e2e, &bob, params(Some(bob_token)))
+            .await
+            .unwrap();
         let room_id = handle.query(|a| a.room_id().to_owned()).await;
         assert!(
             response["rooms"]["invite"].get(room_id.as_str()).is_some(),
@@ -764,6 +989,7 @@ mod tests {
     #[tokio::test]
     async fn incremental_sync_with_nothing_new_returns_no_rooms() {
         let hub = hub();
+        let e2e = e2e_store();
         let alice = user_id!("@alice:sync.test").to_owned();
         let handle = hub
             .rooms()
@@ -772,9 +998,11 @@ mod tests {
             .unwrap();
         hub.watch_room(handle.clone()).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
-        let (_first, token) = build(&hub, &alice, params(None)).await.unwrap();
+        let (_first, token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
 
-        let (response, next) = build(&hub, &alice, params(Some(token))).await.unwrap();
+        let (response, next) = build(&hub, &e2e, &alice, params(Some(token)))
+            .await
+            .unwrap();
         assert_eq!(response["rooms"].as_object().unwrap().len(), 0);
         assert_eq!(next.feed_seq, token.feed_seq);
     }
@@ -782,6 +1010,7 @@ mod tests {
     #[tokio::test]
     async fn filter_rooms_allowlist_excludes_other_rooms() {
         let hub = hub();
+        let e2e = e2e_store();
         let alice = user_id!("@alice:sync.test").to_owned();
         let handle_a = hub
             .rooms()
@@ -823,10 +1052,257 @@ mod tests {
         .unwrap();
         let mut p = params(None);
         p.filter = filter;
-        let (response, _) = build(&hub, &alice, p).await.unwrap();
+        let (response, _) = build(&hub, &e2e, &alice, p).await.unwrap();
         let join = response["rooms"]["join"].as_object().unwrap();
         assert!(join.contains_key(room_a.as_str()));
         let room_b = handle_b.query(|a| a.room_id().to_owned()).await;
         assert!(!join.contains_key(room_b.as_str()));
+    }
+
+    /// `docs/rfcs/0013-e2ee-sync-extensions.md`'s acceptance test, in miniature: a to-device
+    /// message must survive a retried sync that presents the *same* `since` token (the response
+    /// carrying it may never have reached the client), and must be gone once the client presents
+    /// the *next* token -- proof that the response was received. See the module docs for why
+    /// deletion is keyed off the token a request *presents*, not eagerly right after a response
+    /// carrying the message is built.
+    #[tokio::test]
+    async fn to_device_message_is_redelivered_on_the_same_token_and_gone_after_the_next() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let alice_device: ruma::OwnedDeviceId = "ALICEDEV".into();
+
+        let mut baseline_params = params(None);
+        baseline_params.device_id = Some(alice_device.clone());
+        let (_baseline, baseline_token) = build(&hub, &e2e, &alice, baseline_params).await.unwrap();
+
+        ToDeviceStore::send_to_device(
+            &*e2e,
+            &bob,
+            &alice,
+            &alice_device,
+            "m.room_key",
+            serde_json::json!({"session_id": "s1"}),
+        )
+        .await
+        .unwrap();
+
+        let mut p = params(Some(baseline_token));
+        p.device_id = Some(alice_device.clone());
+
+        let (first, next_token) = build(&hub, &e2e, &alice, p.clone()).await.unwrap();
+        let events = first["to_device"]["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "the message should be delivered: {first}");
+        assert_eq!(events[0]["sender"], bob.to_string());
+        assert_eq!(events[0]["type"], "m.room_key");
+
+        // Same token again: the message must still be there.
+        let (retry, _) = build(&hub, &e2e, &alice, p).await.unwrap();
+        assert_eq!(
+            retry["to_device"]["events"].as_array().unwrap().len(),
+            1,
+            "a retried sync with the same since token must redeliver the to-device message: \
+             {retry}"
+        );
+
+        // The next token proves receipt: the message must now be gone, here and later.
+        let mut p2 = params(Some(next_token));
+        p2.device_id = Some(alice_device.clone());
+        let (after, after_token) = build(&hub, &e2e, &alice, p2).await.unwrap();
+        assert!(
+            after["to_device"]["events"].as_array().unwrap().is_empty(),
+            "presenting the next token should not redeliver the message: {after}"
+        );
+
+        let mut p3 = params(Some(after_token));
+        p3.device_id = Some(alice_device);
+        let (again, _) = build(&hub, &e2e, &alice, p3).await.unwrap();
+        assert!(
+            again["to_device"]["events"].as_array().unwrap().is_empty(),
+            "the message must not resurface on a later sync either: {again}"
+        );
+    }
+
+    /// `device_one_time_keys_count`/`device_unused_fallback_key_types` must be populated on every
+    /// response once a device is known -- including the initial sync -- per
+    /// `docs/rfcs/0013-e2ee-sync-extensions.md`: a client treats an *absent*
+    /// `device_one_time_keys_count` as "the server has zero keys", which is what drove the
+    /// unbounded key-reupload behavior that RFC documents.
+    #[tokio::test]
+    async fn one_time_key_and_fallback_counts_are_populated_on_the_initial_sync() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let device: ruma::OwnedDeviceId = "ALICEDEV".into();
+
+        OneTimeKeyStore::upload_one_time_keys(
+            &*e2e,
+            &alice,
+            &device,
+            std::collections::BTreeMap::from([(
+                "signed_curve25519:AAAA".to_owned(),
+                serde_json::json!({"key": "x"}),
+            )]),
+        )
+        .await
+        .unwrap();
+
+        let mut p = params(None);
+        p.device_id = Some(device);
+        let (response, _) = build(&hub, &e2e, &alice, p).await.unwrap();
+        assert_eq!(
+            response["device_one_time_keys_count"]["signed_curve25519"], 1,
+            "one-time-key counts must be present even on an initial sync: {response}"
+        );
+        assert_eq!(
+            response["device_unused_fallback_key_types"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    /// The privacy property this track's brief calls out by name: `device_lists.changed` must
+    /// only ever name a user the syncing user actually shares a room with, never every user whose
+    /// device list happens to have changed on the server.
+    #[tokio::test]
+    async fn device_lists_changed_is_scoped_to_users_who_share_a_room() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let carol = user_id!("@carol:sync.test").to_owned();
+
+        let handle = hub
+            .rooms()
+            .create_room(alice.clone(), CreateRoomRequest::default(), 1)
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+        handle
+            .membership(
+                alice.clone(),
+                Action::Invite,
+                bob.clone(),
+                serde_json::json!({}),
+                2,
+            )
+            .await
+            .unwrap();
+        handle
+            .membership(
+                bob.clone(),
+                Action::Join,
+                bob.clone(),
+                serde_json::json!({}),
+                3,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (_baseline, baseline_token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+
+        // Both bob (shares the room above with alice) and carol (shares nothing with alice) have
+        // a device-list change recorded.
+        DeviceKeyStore::record_device_list_change(&*e2e, &bob)
+            .await
+            .unwrap();
+        DeviceKeyStore::record_device_list_change(&*e2e, &carol)
+            .await
+            .unwrap();
+
+        let (response, _) = build(&hub, &e2e, &alice, params(Some(baseline_token)))
+            .await
+            .unwrap();
+        let changed: Vec<&str> = response["device_lists"]["changed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            changed.contains(&bob.as_str()),
+            "bob shares a room with alice and must be reported: {response}"
+        );
+        assert!(
+            !changed.contains(&carol.as_str()),
+            "carol shares no room with alice and must not be reported: {response}"
+        );
+    }
+
+    /// `device_lists.left`: when a user the syncing user shared a room with leaves it (and shares
+    /// no other room with them), the next incremental sync should report them as left. Built
+    /// entirely from this crate's own room/membership data (`hs-e2e` has no notion of room
+    /// membership at all) -- see the module docs.
+    #[tokio::test]
+    async fn device_lists_left_reports_a_user_who_left_the_only_shared_room() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+        handle
+            .membership(
+                bob.clone(),
+                Action::Join,
+                bob.clone(),
+                serde_json::json!({}),
+                2,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (_baseline, baseline_token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+        // Marks `baseline_token.feed_seq` consumed so the leave below lands in a *new* feed
+        // entry rather than coalescing into the still-unconsumed one from bob's join
+        // (`crate::store::tables`'s module docs) -- mirrors
+        // `a_message_sent_after_a_token_was_issued_appears_in_the_next_incremental_sync` above.
+        hub.store()
+            .record_device_cursor(&alice, "DEV1".into(), baseline_token.feed_seq)
+            .await
+            .unwrap();
+
+        handle
+            .membership(
+                bob.clone(),
+                Action::Leave,
+                bob.clone(),
+                serde_json::json!({}),
+                3,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (response, _) = build(&hub, &e2e, &alice, params(Some(baseline_token)))
+            .await
+            .unwrap();
+        let left: Vec<&str> = response["device_lists"]["left"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            left.contains(&bob.as_str()),
+            "bob left the only room he shared with alice and should be reported: {response}"
+        );
     }
 }

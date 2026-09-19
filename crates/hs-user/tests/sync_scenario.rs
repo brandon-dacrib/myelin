@@ -52,10 +52,12 @@ fn setup() -> (Scenario, Registry, Hub) {
         server_name: ruma::ServerName::parse(SERVER_NAME).expect("a valid server name"),
         ..Default::default()
     });
-    let user_store: DynUserStore = Arc::new(TablesUserStore::open(backend).unwrap());
+    let user_store: DynUserStore = Arc::new(TablesUserStore::open(backend.clone()).unwrap());
     // A high threshold: these tests are about ordinary small-room fan-out-on-write behavior, not
     // the hot-room path (`crate::hub`'s own tests cover that in isolation).
     let hub: Hub = Arc::new(SessionHub::new(user_store, rooms.clone(), 10_000));
+    let e2e: Arc<dyn hs_e2e::store::E2eStore> =
+        Arc::new(hs_e2e::store::tables::TablesE2eStore::open(backend).unwrap());
 
     let room_state = RoomState {
         auth: auth.clone(),
@@ -65,6 +67,7 @@ fn setup() -> (Scenario, Registry, Hub) {
     let user_state = UserState {
         auth: auth.clone(),
         hub: hub.clone(),
+        e2e,
     };
 
     let auth_router = hs_auth::routes::router().with_state(auth);

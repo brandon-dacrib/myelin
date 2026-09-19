@@ -438,6 +438,12 @@ fn build_session_mounts<B: KvBackend>(
 
     let user_store: hs_user::store::DynUserStore =
         Arc::new(hs_user::store::tables::TablesUserStore::open(backend.clone()).map_err(opening)?);
+    // Built once and shared between `user` and `e2e` below (rather than opened twice over the
+    // same backend): `hs-user`'s `GET /sync` needs the same e2e store `hs-e2e`'s own routes use,
+    // per docs/rfcs/0013-e2ee-sync-extensions.md -- both sides must observe the same to-device
+    // queue, device-list stream and key counts.
+    let e2e_store: Arc<dyn hs_e2e::store::E2eStore> =
+        Arc::new(hs_e2e::store::tables::TablesE2eStore::open(backend.clone()).map_err(opening)?);
     let user = UserState {
         auth: auth.clone(),
         hub: Arc::new(hs_user::hub::SessionHub::new(
@@ -445,12 +451,10 @@ fn build_session_mounts<B: KvBackend>(
             rooms.clone(),
             DEFAULT_FAN_OUT_THRESHOLD,
         )),
+        e2e: e2e_store.clone(),
     };
 
-    let e2e = hs_e2e::state::E2eState::new(
-        auth.clone(),
-        Arc::new(hs_e2e::store::tables::TablesE2eStore::open(backend.clone()).map_err(opening)?),
-    );
+    let e2e = hs_e2e::state::E2eState::new(auth.clone(), e2e_store);
 
     let push = hs_push::state::PushState {
         auth: auth.clone(),

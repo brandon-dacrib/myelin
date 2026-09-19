@@ -62,12 +62,14 @@ pub async fn get_sync<B: KvBackend + 'static, R: RoomSource<B> + 'static>(
 
     let (response, token) = sync::build(
         &state.hub,
+        &state.e2e,
         &requester.user_id,
         SyncParams {
             since,
             full_state: query.full_state,
             timeout,
             filter,
+            device_id: requester.device_id.clone(),
         },
     )
     .await?;

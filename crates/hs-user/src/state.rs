@@ -24,6 +24,12 @@ pub struct UserState<B: KvBackend, R: RoomSource<B>> {
     pub auth: AuthState,
     /// The session hub.
     pub hub: Arc<SessionHub<B, R>>,
+    /// `hs-e2e`'s store (device keys, one-time/fallback key counts, device-list stream, to-device
+    /// queue), added this session per `docs/rfcs/0013-e2ee-sync-extensions.md` so `GET /sync`
+    /// (`crate::sync::build`) can populate `to_device`, `device_lists`,
+    /// `device_one_time_keys_count` and `device_unused_fallback_key_types`. `hs-user` depends
+    /// only on `hs_e2e::store`'s trait surface, never its routes or axum state.
+    pub e2e: Arc<dyn hs_e2e::store::E2eStore>,
 }
 
 impl<B: KvBackend, R: RoomSource<B>> Clone for UserState<B, R> {
@@ -31,6 +37,7 @@ impl<B: KvBackend, R: RoomSource<B>> Clone for UserState<B, R> {
         Self {
             auth: self.auth.clone(),
             hub: Arc::clone(&self.hub),
+            e2e: Arc::clone(&self.e2e),
         }
     }
 }
@@ -82,9 +89,12 @@ mod tests {
         let rooms = registry("state.test");
         let store: crate::store::DynUserStore =
             Arc::new(TablesUserStore::open(MemoryBackend::new()).unwrap());
+        let e2e: Arc<dyn hs_e2e::store::E2eStore> =
+            Arc::new(hs_e2e::store::tables::TablesE2eStore::open(MemoryBackend::new()).unwrap());
         let state = UserState {
             auth: AuthState::in_memory(),
             hub: Arc::new(SessionHub::new(store, rooms, 500)),
+            e2e,
         };
         let _ = state.clone();
     }

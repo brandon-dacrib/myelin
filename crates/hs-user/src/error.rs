@@ -63,6 +63,12 @@ pub enum UserError {
     /// misreported as a bad request).
     #[error("internal user session invariant violated: {0}")]
     Internal(String),
+
+    /// `hs-e2e`'s store reported an error while `/sync` was populating `to_device`,
+    /// `device_lists`, `device_one_time_keys_count` or `device_unused_fallback_key_types`
+    /// (`docs/rfcs/0013-e2ee-sync-extensions.md`).
+    #[error("e2e store error: {0}")]
+    E2e(#[from] hs_e2e::store::StoreError),
 }
 
 /// Maps the store's own error enum onto this crate's, variant for variant: a storage failure
@@ -104,7 +110,8 @@ impl UserError {
             | Self::TableCodec(_)
             | Self::Table(_)
             | Self::Codec(_)
-            | Self::Internal(_) => MatrixError::custom(
+            | Self::Internal(_)
+            | Self::E2e(_) => MatrixError::custom(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 MatrixErrorCode::Unknown,
                 self.to_string(),

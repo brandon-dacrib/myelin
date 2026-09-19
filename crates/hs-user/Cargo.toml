@@ -25,6 +25,12 @@ hs-tables = { path = "../hs-tables" }
 hs-auth = { path = "../hs-auth" }
 hs-http = { path = "../hs-http" }
 hs-room = { path = "../hs-room" }
+# Added this session (track 05) per docs/rfcs/0013-e2ee-sync-extensions.md: GET /sync needs
+# hs-e2e's store traits (to-device queue, device-list stream, one-time/fallback key counts) to
+# populate `to_device`, `device_lists`, `device_one_time_keys_count` and
+# `device_unused_fallback_key_types`. hs-user depends only on hs-e2e's storage trait surface
+# (`hs_e2e::store`), never its routes/state.
+hs-e2e = { path = "../hs-e2e" }
 
 [dev-dependencies]
 proptest = { workspace = true }

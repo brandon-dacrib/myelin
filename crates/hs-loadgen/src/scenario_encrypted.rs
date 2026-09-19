@@ -568,7 +568,15 @@ pub async fn run(base_url: &str) -> Result<Vec<String>> {
             .await
         }));
     }
+    // A claim that finds no one-time key left falls through to the device's *fallback* key, which
+    // the spec says may be handed out repeatedly -- that is its entire purpose. So the two must be
+    // counted separately: repeats of a fallback key are correct, repeats of a one-time key are the
+    // violation this probe exists to catch. (Before `GET /sync` reported
+    // `device_unused_fallback_key_types`, `matrix-sdk` never uploaded a fallback key at all, so
+    // the excess claims here came back empty and this distinction did not arise. Making sync
+    // correct is what made a fallback key exist to be served.)
     let mut claimed_key_ids: Vec<String> = Vec::new();
+    let mut fallback_claims = 0u64;
     let mut empty_claims = 0u64;
     for task in tasks {
         let response = task
@@ -581,12 +589,19 @@ pub async fn run(base_url: &str) -> Result<Vec<String>> {
             .filter(|map| !map.is_empty());
         match claimed {
             Some(map) => {
-                let key_id = map
-                    .keys()
+                let (key_id, key_value) = map
+                    .iter()
                     .next()
-                    .context("a non-empty claimed-key map should have a key id")?
-                    .clone();
-                claimed_key_ids.push(key_id);
+                    .context("a non-empty claimed-key map should have a key id")?;
+                let is_fallback = key_value
+                    .get("fallback")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if is_fallback {
+                    fallback_claims += 1;
+                } else {
+                    claimed_key_ids.push(key_id.clone());
+                }
             }
             None => empty_claims += 1,
         }
@@ -603,15 +618,26 @@ pub async fn run(base_url: &str) -> Result<Vec<String>> {
     }
     if claimed_key_ids.len() as u64 != alice_otk_count {
         bail!(
-            "expected exactly {alice_otk_count} successful concurrent claims (one per uploaded \
-             key), got {} distinct successful claims and {empty_claims} empty responses",
+            "expected exactly {alice_otk_count} successful one-time-key claims (one per uploaded \
+             key), got {} distinct one-time-key claims, {fallback_claims} fallback-key claims and \
+             {empty_claims} empty responses",
             claimed_key_ids.len()
+        );
+    }
+    if fallback_claims + empty_claims != concurrency - alice_otk_count {
+        bail!(
+            "every claim beyond the {alice_otk_count} real one-time keys should have returned \
+             either the reusable fallback key or nothing, but {fallback_claims} fallback and \
+             {empty_claims} empty do not account for {} excess claims",
+            concurrency - alice_otk_count
         );
     }
     step!(
         "{concurrency} concurrent /keys/claim calls for alice's device claimed exactly \
-         {alice_otk_count} distinct one-time keys with no double-claim, and the remaining \
-         {empty_claims} correctly came back empty once the pool was exhausted"
+         {alice_otk_count} distinct one-time keys with no double-claim; the {} excess claims \
+         correctly got the reusable fallback key ({fallback_claims}) or an empty response \
+         ({empty_claims})",
+        concurrency - alice_otk_count
     );
 
     Ok(log)

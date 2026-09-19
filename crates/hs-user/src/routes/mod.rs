@@ -19,8 +19,20 @@ fn matrix_client(operation_id: &str) -> RouteMeta {
     RouteMeta::new(Surface::MatrixClient, AuthKind::Matrix).with_operation_id(operation_id)
 }
 
-/// This crate's endpoints and their `routes.json` manifest: `/sync`, `/joined_rooms`,
-/// `/publicRooms`, account data (global and room-scoped) and filters.
+/// This crate's endpoints and their `routes.json` manifest: `/sync`, `/joined_rooms`, account
+/// data (global and room-scoped) and filters.
+///
+/// `/publicRooms` (`crate::routes::rooms::get_public_rooms`/`post_public_rooms`) is deliberately
+/// **not** mounted here as of this session: `docs/workstreams/04-room-and-events.md` lists
+/// "aliases and directory" under track 04's ownership, and `hs-room` has since landed its own
+/// `GET`/`POST /publicRooms` (`crates/hs-room/src/routes/directory.rs`). Mounting both panics at
+/// router-build time (`hs-http`'s `Builder` rejects an overlapping method+path registration) --
+/// discovered this session as a hard boot failure of the real `hs` binary once both routers were
+/// merged in `hs-cli`. This crate's own implementation
+/// (`crate::routes::rooms::{get_public_rooms, post_public_rooms}`, backed by
+/// `crate::store::UserStore::list_public_rooms`/`crate::hub`'s directory-entry population) is left
+/// in place, unmounted, rather than deleted, in case track 04's version turns out to need
+/// something this one already has -- see `docs/status/05-sync.md`.
 pub fn router<B: KvBackend + 'static, R: RoomSource<B> + 'static>()
 -> (axum::Router<UserState<B, R>>, RouteManifest) {
     Builder::new()
@@ -29,16 +41,6 @@ pub fn router<B: KvBackend + 'static, R: RoomSource<B> + 'static>()
             "/joined_rooms",
             rooms::get_joined_rooms::<B, R>,
             matrix_client("getJoinedRooms"),
-        )
-        .get(
-            "/publicRooms",
-            rooms::get_public_rooms::<B, R>,
-            matrix_client("publicRooms"),
-        )
-        .post(
-            "/publicRooms",
-            rooms::post_public_rooms::<B, R>,
-            matrix_client("queryPublicRooms"),
         )
         .get(
             "/user/{userId}/account_data/{type}",
