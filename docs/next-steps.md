@@ -4,7 +4,9 @@ Written 2026-09-19 by the integration lead, replacing the 2026-09-18 version. `P
 
 ## The number that matters now
 
-**Complement ran against this server for the first time on 2026-09-19: 125 assertions pass, 161 fail, 7 skip** on the `csapi` package (30 of 106 top-level tests). Before this, every percentage in this file measured surface area. Now there is an external grade, and the triage by owning track is in `docs/status/14-test-and-conformance.md`.
+**Complement, `csapi` package: 148 assertions pass, 138 fail, 7 skip** (35 of 106 top-level tests), measured 2026-09-19 against commit `576e1e1`. The first run that morning was 125/161; the day's work moved it by 23 assertions. Before any of this, every percentage in this file measured surface area. Now there is an external grade, and the triage by owning track is in `docs/status/14-test-and-conformance.md`.
+
+**Complement's federation package ran for the first time the same day: 5 of 89 tests pass.** That number is real but it is not yet a measurement of this server's federation logic, because almost all of it never got past TLS: this server's outbound client trusts only the ~140 bundled public roots and never reads the OS trust store or any configured CA, so Complement's own test CA is rejected. Synapse has `federation_custom_ca_list` for exactly this; this server has no equivalent. The diagnosis was confirmed by disabling verification and watching 27 signature-verification failures turn into distinct, further-along bugs.
 
 Reproduce it in one command:
 
@@ -67,7 +69,11 @@ With `send_join` persisting and `.well-known` served, the remaining blockers to 
 
 | Gap | Where | Consequence |
 |---|---|---|
-| `/sync` and `/messages` disagree on token format | `hs-user`, `hs-room` | a real client cannot paginate from a sync token |
+| `/keys/changes` cannot parse a sync token | `hs-e2e` | same token mismatch `/messages` had, still open there |
+| No way to trust a private CA | `hs-federation` | cannot federate with any server not using a public root |
+| Presence endpoints 404 | `hs-user` | no presence at all |
+| `/relations`, `/threads`, `/search`, `/upgrade` 404 | `hs-room` | threads and replies do not work for real clients |
+| Push rules absent from `/sync` | `hs-push`, `hs-user` | clients fall back to defaults that are not ours |
 | `/context`'s `state` reads live state, not state at the event | `hs-room` | same bug class as history visibility, one path left |
 | No backfill | `hs-federation` | a join cannot be followed by history |
 | Nothing has ever run two replicas | `hs-cluster` | HA is unexercised outside its own harness |
