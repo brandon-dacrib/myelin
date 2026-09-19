@@ -58,6 +58,23 @@ pub enum KvError {
         /// How many attempts were made.
         attempts: u32,
     },
+
+    /// A backend detected that this transaction has already lost a serializability race
+    /// **before** commit was even attempted. Some backends — PostgreSQL's SSI in particular —
+    /// can report a serialization failure or deadlock on any statement, not only on `COMMIT`,
+    /// unlike the in-memory and Fjall backends, which only ever detect a conflict at commit
+    /// time. Semantically this is identical to a commit-time [`Conflict`] (the transaction was
+    /// discarded and must be retried from scratch), but it is carried through the ordinary
+    /// `Result<T, KvError>` channel that every fallible transaction method already returns,
+    /// since those methods have no `Result<T, Conflict>` variant to report it through.
+    /// [`crate::transact`] retries on this exactly as it does on a commit `Conflict`. Code that
+    /// drives [`crate::KvBackend::begin`] / [`crate::KvBackend::commit`] directly, bypassing
+    /// `transact`, must check for this variant from every fallible transaction method, not only
+    /// for `Conflict` from `commit`.
+    #[error(
+        "transaction conflict (detected before commit): a concurrent transaction committed first"
+    )]
+    MidTransactionConflict,
 }
 
 impl KvError {

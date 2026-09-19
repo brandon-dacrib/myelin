@@ -27,7 +27,11 @@ fn b(s: &str) -> Bytes {
 /// called once per scenario, never shared, so scenarios cannot interfere with each other).
 ///
 /// Panics (via `assert!`) on the first violated guarantee, naming the scenario in the assertion
-/// message.
+/// message. Each scenario function below is also individually `pub`, so a backend that is known
+/// to diverge from one specific scenario (see `docs/status/01-storage-engine.md`'s PostgreSQL
+/// entry for the one known case, a phantom-range guarantee stronger than true serializability)
+/// can still report an honest per-scenario breakdown instead of a single all-or-nothing result
+/// that stops at the first failure.
 pub fn run_conformance_suite<B: KvBackend>(make: impl Fn() -> B) {
     get_put_delete_roundtrip(make());
     multi_get_preserves_order_and_absence(make());
@@ -42,7 +46,8 @@ pub fn run_conformance_suite<B: KvBackend>(make: impl Fn() -> B) {
     read_only_transactions_never_conflict(make());
 }
 
-fn get_put_delete_roundtrip<B: KvBackend>(backend: B) {
+/// Basic get/put/delete round-trip, including that an empty value is present and distinct from absence.
+pub fn get_put_delete_roundtrip<B: KvBackend>(backend: B) {
     let ks = backend.keyspace("t").expect("keyspace");
 
     assert_eq!(
@@ -82,7 +87,8 @@ fn get_put_delete_roundtrip<B: KvBackend>(backend: B) {
     .expect("deleting an absent key is not an error");
 }
 
-fn multi_get_preserves_order_and_absence<B: KvBackend>(backend: B) {
+/// `multi_get` preserves input order and length, with `None` for absent keys.
+pub fn multi_get_preserves_order_and_absence<B: KvBackend>(backend: B) {
     let ks = backend.keyspace("t").expect("keyspace");
     transact(&backend, TransactConfig::default(), |txn| {
         txn.put(&ks, b"a", b"A")?;
@@ -101,7 +107,8 @@ fn multi_get_preserves_order_and_absence<B: KvBackend>(backend: B) {
     );
 }
 
-fn range_boundaries_inclusive_exclusive_reverse_limit<B: KvBackend>(backend: B) {
+/// Range scan boundary handling: inclusive/exclusive bounds, reverse order, and `limit`.
+pub fn range_boundaries_inclusive_exclusive_reverse_limit<B: KvBackend>(backend: B) {
     let ks = backend.keyspace("t").expect("keyspace");
     transact(&backend, TransactConfig::default(), |txn| {
         for k in ["a", "b", "c", "d", "e"] {
@@ -169,7 +176,8 @@ fn range_boundaries_inclusive_exclusive_reverse_limit<B: KvBackend>(backend: B) 
     );
 }
 
-fn snapshot_visibility_is_repeatable_read<B: KvBackend>(backend: B) {
+/// A snapshot's view is fixed at the instant it is taken, unaffected by later commits.
+pub fn snapshot_visibility_is_repeatable_read<B: KvBackend>(backend: B) {
     let ks = backend.keyspace("t").expect("keyspace");
     transact(&backend, TransactConfig::default(), |txn| {
         txn.put(&ks, b"k", b"before")
@@ -196,7 +204,8 @@ fn snapshot_visibility_is_repeatable_read<B: KvBackend>(backend: B) {
     );
 }
 
-fn lost_update_is_prevented<B: KvBackend>(backend: B) {
+/// Two transactions read-modify-write the same key; the second committer must conflict, not silently overwrite.
+pub fn lost_update_is_prevented<B: KvBackend>(backend: B) {
     let ks = backend.keyspace("t").expect("keyspace");
     transact(&backend, TransactConfig::default(), |txn| {
         txn.put(&ks, b"counter", b"0")
@@ -228,7 +237,8 @@ fn lost_update_is_prevented<B: KvBackend>(backend: B) {
     );
 }
 
-fn write_skew_is_prevented<B: KvBackend>(backend: B) {
+/// The classic two-key write-skew anomaly must be rejected by SSI, not allowed through as under plain snapshot isolation.
+pub fn write_skew_is_prevented<B: KvBackend>(backend: B) {
     // Classic write-skew setup: an invariant over two keys (on-call doctors, account balances,
     // ...) that neither transaction violates in isolation but both together would.
     let ks = backend.keyspace("t").expect("keyspace");
@@ -259,7 +269,8 @@ fn write_skew_is_prevented<B: KvBackend>(backend: B) {
     );
 }
 
-fn phantom_insert_inside_a_scanned_range_conflicts<B: KvBackend>(backend: B) {
+/// A key inserted into a range a still-open transaction scanned is a phantom; that transaction's commit must conflict.
+pub fn phantom_insert_inside_a_scanned_range_conflicts<B: KvBackend>(backend: B) {
     let ks = backend.keyspace("t").expect("keyspace");
 
     let mut reader = backend.begin().unwrap();
@@ -278,7 +289,8 @@ fn phantom_insert_inside_a_scanned_range_conflicts<B: KvBackend>(backend: B) {
     );
 }
 
-fn phantom_insert_outside_a_scanned_range_does_not_conflict<B: KvBackend>(backend: B) {
+/// A write outside every range a transaction scanned must not cause that transaction's commit to conflict.
+pub fn phantom_insert_outside_a_scanned_range_does_not_conflict<B: KvBackend>(backend: B) {
     let ks = backend.keyspace("t").expect("keyspace");
 
     let mut reader = backend.begin().unwrap();
@@ -296,7 +308,8 @@ fn phantom_insert_outside_a_scanned_range_does_not_conflict<B: KvBackend>(backen
     );
 }
 
-fn atomic_add_under_contention<B: KvBackend>(backend: B) {
+/// `atomic_add` under real concurrent contention: every increment from every thread lands exactly once.
+pub fn atomic_add_under_contention<B: KvBackend>(backend: B) {
     let ks = backend.keyspace("t").expect("keyspace");
     let threads = 8usize;
     let per_thread = 25i64;
@@ -330,7 +343,8 @@ fn atomic_add_under_contention<B: KvBackend>(backend: B) {
     );
 }
 
-fn watch_wakes_on_write_and_times_out_otherwise<B: KvBackend>(backend: B) {
+/// A watch fires on a write to its key and times out otherwise.
+pub fn watch_wakes_on_write_and_times_out_otherwise<B: KvBackend>(backend: B) {
     let ks = backend.keyspace("t").expect("keyspace");
     let mut idle = backend.watch(&ks, b"idle-key");
     assert_eq!(
@@ -358,7 +372,8 @@ fn watch_wakes_on_write_and_times_out_otherwise<B: KvBackend>(backend: B) {
     handle.join().unwrap();
 }
 
-fn read_only_transactions_never_conflict<B: KvBackend>(backend: B) {
+/// A transaction with no writes has nothing to protect and must always commit successfully.
+pub fn read_only_transactions_never_conflict<B: KvBackend>(backend: B) {
     let ks = backend.keyspace("t").expect("keyspace");
     transact(&backend, TransactConfig::default(), |txn| {
         txn.put(&ks, b"k", b"v")

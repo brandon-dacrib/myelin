@@ -16,6 +16,9 @@ bytes = { workspace = true }
 thiserror = { workspace = true }
 fjall = { workspace = true }
 tracing = { workspace = true }
+postgres = { workspace = true }
+r2d2 = { workspace = true }
+r2d2_postgres = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

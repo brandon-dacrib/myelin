@@ -58,15 +58,23 @@ where
     loop {
         attempt += 1;
         let mut txn = backend.begin()?;
-        let value = f(&mut txn)?;
-        match backend.commit(txn)? {
-            Ok(()) => return Ok(value),
-            Err(crate::error::Conflict) => {
-                if attempt >= config.max_attempts {
-                    return Err(KvError::RetriesExhausted { attempts: attempt });
-                }
-                std::thread::sleep(backoff(&config, attempt));
+        let conflicted = match f(&mut txn) {
+            Ok(value) => match backend.commit(txn)? {
+                Ok(()) => return Ok(value),
+                Err(crate::error::Conflict) => true,
+            },
+            // Some backends (PostgreSQL's SSI) can detect a conflict on any statement, not only
+            // at commit; see `KvError::MidTransactionConflict`. Treat it identically to a
+            // commit-time `Conflict`: the transaction (already discarded by the backend) is
+            // retried from scratch. Every other error stops immediately, unretried.
+            Err(KvError::MidTransactionConflict) => true,
+            Err(e) => return Err(e),
+        };
+        if conflicted {
+            if attempt >= config.max_attempts {
+                return Err(KvError::RetriesExhausted { attempts: attempt });
             }
+            std::thread::sleep(backoff(&config, attempt));
         }
     }
 }

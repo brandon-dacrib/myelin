@@ -130,10 +130,13 @@
 //! - [`fjall_backend::FjallBackend`]: the embedded, single-node production backend (Fjall 3,
 //!   optimistic serializable transactions, one keyspace per table, LZ4 compression, optional
 //!   key-value separation for large values).
+//! - [`postgres_backend::PostgresBackend`]: the clustered production backend (one table per
+//!   keyspace, `SERIALIZABLE` transactions, `REPEATABLE READ READ ONLY` snapshots). See that
+//!   module's docs for the client library choice and what differs from the embedded backends.
 //!
-//! A PostgreSQL backend (the cluster default) and a SlateDB backend (the diskless-cluster option)
-//! are described in `PLAN.md` section 6.5 and are future work on this crate; see
-//! `docs/status/01-storage-engine.md` for what has actually landed.
+//! A SlateDB backend (the diskless-cluster option) is described in `PLAN.md` section 6.5 and is
+//! future work on this crate; see `docs/status/01-storage-engine.md` for what has actually
+//! landed.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -147,6 +150,7 @@ pub mod watch;
 pub mod conformance;
 pub mod fjall_backend;
 pub mod memory;
+pub mod postgres_backend;
 
 pub use error::{Conflict, KvError};
 pub use retry::{TransactConfig, transact};

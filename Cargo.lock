@@ -2678,6 +2678,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "hs-auth",
+ "hs-e2e",
  "hs-http",
  "hs-kv",
  "hs-model",
