@@ -13,7 +13,9 @@ use std::sync::RwLock;
 
 use async_trait::async_trait;
 
-use crate::model::{AdminRoom, AdminUser, ExternalId, ThreePid};
+// `AdminRoom` is defined in `crate::model` but not imported here yet: the `RoomDirectory`
+// trait that will use it is the next slice of this seam (`docs/status/15-admin-api-and-modules.md`).
+use crate::model::{AdminUser, ExternalId, ThreePid};
 
 /// Why a data-source call failed. Mirrors [`crate::auth::AuthError`]'s "only unavailable escapes
 /// as something other than the obvious status" shape: [`SourceError::NotFound`] maps to `404
