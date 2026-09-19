@@ -47,22 +47,24 @@ impl E2eError {
 impl IntoResponse for E2eError {
     fn into_response(self) -> Response {
         let matrix_error = match &self {
-            Self::BadRequest(msg) => {
-                MatrixError::custom(StatusCode::BAD_REQUEST, MatrixErrorCode::InvalidParam, msg.clone())
-            }
+            Self::BadRequest(msg) => MatrixError::custom(
+                StatusCode::BAD_REQUEST,
+                MatrixErrorCode::InvalidParam,
+                msg.clone(),
+            ),
             Self::NotFound(msg) => MatrixError::not_found(msg.clone()),
             Self::Forbidden(msg) => MatrixError::forbidden(msg.clone()),
             Self::WrongBackupVersion { given, current } => MatrixError::custom(
                 StatusCode::FORBIDDEN,
                 MatrixErrorCode::WrongRoomKeysVersion,
-                format!("Wrong backup version: this session is on {given}, the current version is {current}"),
+                format!(
+                    "Wrong backup version: this session is on {given}, the current version is {current}"
+                ),
             ),
             Self::Store(StoreError::NotFound(msg)) => MatrixError::not_found(msg.clone()),
-            Self::Store(StoreError::Conflict(msg)) => MatrixError::custom(
-                StatusCode::CONFLICT,
-                MatrixErrorCode::Unknown,
-                msg.clone(),
-            ),
+            Self::Store(StoreError::Conflict(msg)) => {
+                MatrixError::custom(StatusCode::CONFLICT, MatrixErrorCode::Unknown, msg.clone())
+            }
             Self::Store(StoreError::Backend(msg)) => {
                 tracing::error!(error = %msg, "hs-e2e storage backend error");
                 MatrixError::custom(

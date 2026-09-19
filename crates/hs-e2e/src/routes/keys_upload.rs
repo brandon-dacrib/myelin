@@ -93,7 +93,10 @@ mod tests {
         let store = TablesE2eStore::open(backend).unwrap();
         let state: E2eState<MemoryBackend> = E2eState::new(AuthState::in_memory(), Arc::new(store));
         axum::Router::new()
-            .route("/keys/upload", axum::routing::post(post_keys_upload::<MemoryBackend>))
+            .route(
+                "/keys/upload",
+                axum::routing::post(post_keys_upload::<MemoryBackend>),
+            )
             .with_state(state)
     }
 

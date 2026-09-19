@@ -57,7 +57,12 @@ async fn two_users_upload_query_and_claim_keys() {
         .assert_ok();
 
     let alice_id = scenario.session("alice").unwrap().user_id.clone().unwrap();
-    let alice_device = scenario.session("alice").unwrap().device_id.clone().unwrap();
+    let alice_device = scenario
+        .session("alice")
+        .unwrap()
+        .device_id
+        .clone()
+        .unwrap();
     let bob_id = scenario.session("bob").unwrap().user_id.clone().unwrap();
     let bob_device = scenario.session("bob").unwrap().device_id.clone().unwrap();
 
@@ -82,7 +87,12 @@ async fn two_users_upload_query_and_claim_keys() {
         ),
     );
     let alice_upload = scenario
-        .send(Some("alice"), Method::POST, "/keys/upload", Some(alice_body))
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/keys/upload",
+            Some(alice_body),
+        )
         .await;
     alice_upload.assert_ok();
     assert_eq!(
@@ -126,10 +136,19 @@ async fn two_users_upload_query_and_claim_keys() {
     // --- alice queries bob's keys ---
     let query2_body = obj1("device_keys", obj1(bob_id.clone(), json!([])));
     let query2 = scenario
-        .send(Some("alice"), Method::POST, "/keys/query", Some(query2_body))
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/keys/query",
+            Some(query2_body),
+        )
         .await;
     query2.assert_ok();
-    assert!(query2.json["device_keys"][&bob_id].get(&bob_device).is_some());
+    assert!(
+        query2.json["device_keys"][&bob_id]
+            .get(&bob_device)
+            .is_some()
+    );
 
     // --- bob claims alice's one-time key ---
     let claim_body = obj1(
@@ -140,7 +159,12 @@ async fn two_users_upload_query_and_claim_keys() {
         ),
     );
     let claim = scenario
-        .send(Some("bob"), Method::POST, "/keys/claim", Some(claim_body.clone()))
+        .send(
+            Some("bob"),
+            Method::POST,
+            "/keys/claim",
+            Some(claim_body.clone()),
+        )
         .await;
     claim.assert_ok();
     let claimed_map = claim.json["one_time_keys"][&alice_id][&alice_device]

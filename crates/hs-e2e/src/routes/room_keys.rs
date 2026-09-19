@@ -117,7 +117,9 @@ async fn resolve_read_version<B: KvBackend + 'static>(
         .await?
         .ok_or_else(|| E2eError::NotFound("no such key backup version".to_string()))?;
     if row.deleted {
-        return Err(E2eError::NotFound("key backup version was deleted".to_string()));
+        return Err(E2eError::NotFound(
+            "key backup version was deleted".to_string(),
+        ));
     }
     Ok(number)
 }
@@ -176,7 +178,10 @@ pub async fn post_version<B: KvBackend + 'static>(
 #[derive(Debug, Deserialize)]
 pub struct UpdateVersionBody {
     auth_data: Value,
-    #[allow(dead_code, reason = "accepted for spec compatibility, not currently cross-checked")]
+    #[allow(
+        dead_code,
+        reason = "accepted for spec compatibility, not currently cross-checked"
+    )]
     algorithm: Option<String>,
     version: Option<String>,
 }
@@ -216,7 +221,12 @@ pub async fn delete_version<B: KvBackend + 'static>(
 
 // -- key endpoints -------------------------------------------------------------------------
 
-fn rooms_wrapper(sessions_by_room: std::collections::BTreeMap<String, std::collections::BTreeMap<String, BackupSessionRow>>) -> Value {
+fn rooms_wrapper(
+    sessions_by_room: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, BackupSessionRow>,
+    >,
+) -> Value {
     let mut rooms = Map::new();
     for (room_id, sessions) in sessions_by_room {
         let mut sessions_json = Map::new();
@@ -235,7 +245,10 @@ pub async fn get_keys_all<B: KvBackend + 'static>(
     Query(q): Query<VersionQuery>,
 ) -> Result<Json<Value>, E2eError> {
     let version = resolve_read_version(&state, &requester.user_id, q.version.as_deref()).await?;
-    let sessions = state.store.get_all_sessions(&requester.user_id, version).await?;
+    let sessions = state
+        .store
+        .get_all_sessions(&requester.user_id, version)
+        .await?;
     Ok(Json(rooms_wrapper(sessions)))
 }
 
@@ -312,7 +325,9 @@ pub async fn put_keys_all<B: KvBackend + 'static>(
                 .await?;
         }
     }
-    Ok(Json(write_status(&state, &requester.user_id, version).await?))
+    Ok(Json(
+        write_status(&state, &requester.user_id, version).await?,
+    ))
 }
 
 /// `PUT /room_keys/keys/{roomId}`: `{"sessions": {"<sessionId>": <session>}}`.
@@ -335,7 +350,9 @@ pub async fn put_keys_room<B: KvBackend + 'static>(
             .put_session(&requester.user_id, version, &room_id, session_id, row)
             .await?;
     }
-    Ok(Json(write_status(&state, &requester.user_id, version).await?))
+    Ok(Json(
+        write_status(&state, &requester.user_id, version).await?,
+    ))
 }
 
 /// `PUT /room_keys/keys/{roomId}/{sessionId}`: the session object directly.
@@ -352,7 +369,9 @@ pub async fn put_keys_session<B: KvBackend + 'static>(
         .store
         .put_session(&requester.user_id, version, &room_id, &session_id, row)
         .await?;
-    Ok(Json(write_status(&state, &requester.user_id, version).await?))
+    Ok(Json(
+        write_status(&state, &requester.user_id, version).await?,
+    ))
 }
 
 /// `DELETE /room_keys/keys`.
@@ -366,7 +385,9 @@ pub async fn delete_keys_all<B: KvBackend + 'static>(
         .store
         .delete_all_sessions(&requester.user_id, version)
         .await?;
-    Ok(Json(write_status(&state, &requester.user_id, version).await?))
+    Ok(Json(
+        write_status(&state, &requester.user_id, version).await?,
+    ))
 }
 
 /// `DELETE /room_keys/keys/{roomId}`.
@@ -381,7 +402,9 @@ pub async fn delete_keys_room<B: KvBackend + 'static>(
         .store
         .delete_room_sessions(&requester.user_id, version, &room_id)
         .await?;
-    Ok(Json(write_status(&state, &requester.user_id, version).await?))
+    Ok(Json(
+        write_status(&state, &requester.user_id, version).await?,
+    ))
 }
 
 /// `DELETE /room_keys/keys/{roomId}/{sessionId}`.
@@ -396,5 +419,7 @@ pub async fn delete_keys_session<B: KvBackend + 'static>(
         .store
         .delete_session(&requester.user_id, version, &room_id, &session_id)
         .await?;
-    Ok(Json(write_status(&state, &requester.user_id, version).await?))
+    Ok(Json(
+        write_status(&state, &requester.user_id, version).await?,
+    ))
 }

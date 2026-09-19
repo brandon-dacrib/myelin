@@ -194,7 +194,12 @@ mod tests {
     async fn manifest_covers_every_route_this_module_registers() {
         let (_router, manifest) = router::<MemoryBackend>();
         assert!(manifest.routes.iter().any(|r| r.path == "/keys/upload"));
-        assert!(manifest.routes.iter().any(|r| r.path == "/room_keys/version"));
+        assert!(
+            manifest
+                .routes
+                .iter()
+                .any(|r| r.path == "/room_keys/version")
+        );
         let (_router2, unstable_manifest) = unstable_router::<MemoryBackend>();
         assert!(
             unstable_manifest

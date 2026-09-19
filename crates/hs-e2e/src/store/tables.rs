@@ -97,7 +97,11 @@ fn store_err(e: KvError) -> StoreError {
 /// Bumps a named monotonic counter by one and returns its new value. `key` should already be a
 /// fully tuple-encoded key unique to this counter (typically produced with
 /// [`hs_tables::key::TupleKey::encode`] on a descriptive tuple).
-fn next_counter<W: KvWrite>(txn: &mut W, counters: &W::Keyspace, key: &[u8]) -> Result<u64, KvError> {
+fn next_counter<W: KvWrite>(
+    txn: &mut W,
+    counters: &W::Keyspace,
+    key: &[u8],
+) -> Result<u64, KvError> {
     let next = txn.atomic_add(counters, key, 1)?;
     u64::try_from(next).map_err(|_| to_kv(CounterOverflow))
 }
@@ -308,9 +312,11 @@ impl<B: KvBackend> DeviceKeyStore for TablesE2eStore<B> {
 }
 
 fn split_algo_key(composite: &str) -> Result<(&str, &str), StoreError> {
-    composite
-        .split_once(':')
-        .ok_or_else(|| StoreError::Backend(format!("malformed key id {composite:?}, expected \"algorithm:key_id\"")))
+    composite.split_once(':').ok_or_else(|| {
+        StoreError::Backend(format!(
+            "malformed key id {composite:?}, expected \"algorithm:key_id\""
+        ))
+    })
 }
 
 #[async_trait::async_trait]
@@ -442,7 +448,11 @@ impl<B: KvBackend> FallbackKeyStore for TablesE2eStore<B> {
         }
         transact(&self.backend, TransactConfig::default(), |txn| {
             for (algorithm, key_id, value) in &parsed {
-                let key = (user_id.to_string(), device_id.to_string(), algorithm.clone());
+                let key = (
+                    user_id.to_string(),
+                    device_id.to_string(),
+                    algorithm.clone(),
+                );
                 let row = FallbackRow {
                     key_id: key_id.clone(),
                     key: value.clone(),
@@ -477,7 +487,9 @@ impl<B: KvBackend> FallbackKeyStore for TablesE2eStore<B> {
             if !row.used {
                 row.used = true;
                 let new_bytes = encode_kv(&row)?;
-                self.fallback_keys.put(txn, &key, &new_bytes).map_err(to_kv)?;
+                self.fallback_keys
+                    .put(txn, &key, &new_bytes)
+                    .map_err(to_kv)?;
             }
             Ok(Some((key_id, key_value)))
         })
@@ -518,7 +530,9 @@ impl<B: KvBackend> CrossSigningStore for TablesE2eStore<B> {
         let composite = (user_id.to_string(), key_type.as_str().to_string());
         let value = encode(&key)?;
         transact(&self.backend, TransactConfig::default(), |txn| {
-            self.cross_signing_keys.put(txn, &composite, &value).map_err(to_kv)
+            self.cross_signing_keys
+                .put(txn, &composite, &value)
+                .map_err(to_kv)
         })
         .map_err(store_err)
     }
@@ -586,10 +600,9 @@ impl<B: KvBackend> BackupStore for TablesE2eStore<B> {
                 }
             }
             None => {
-                let prefix = TypedKeyspace::<B::Keyspace, BackupVersionKey>::prefix(&(
-                    user_id.to_string(),
-                ))
-                .reverse();
+                let prefix =
+                    TypedKeyspace::<B::Keyspace, BackupVersionKey>::prefix(&(user_id.to_string(),))
+                        .reverse();
                 for item in self.backup_versions.range(&snap, prefix) {
                     let ((_u, v), value) = item.map_err(|e| StoreError::Backend(e.to_string()))?;
                     let row: BackupVersionRow = decode(&value)?;
@@ -635,10 +648,14 @@ impl<B: KvBackend> BackupStore for TablesE2eStore<B> {
             row.deleted = true;
             row.count = 0;
             let value = encode_kv(&row)?;
-            self.backup_versions.put(txn, &vkey, &value).map_err(to_kv)?;
+            self.backup_versions
+                .put(txn, &vkey, &value)
+                .map_err(to_kv)?;
 
-            let prefix =
-                TypedKeyspace::<B::Keyspace, BackupSessionKey>::prefix(&(user_id.to_string(), version));
+            let prefix = TypedKeyspace::<B::Keyspace, BackupSessionKey>::prefix(&(
+                user_id.to_string(),
+                version,
+            ));
             let to_delete: Vec<BackupSessionKey> = {
                 let mut keys = Vec::new();
                 for item in self.backup_sessions.range(&*txn, prefix) {
@@ -690,13 +707,17 @@ impl<B: KvBackend> BackupStore for TablesE2eStore<B> {
             };
             if replace {
                 let value = encode_kv(&row)?;
-                self.backup_sessions.put(txn, &skey, &value).map_err(to_kv)?;
+                self.backup_sessions
+                    .put(txn, &skey, &value)
+                    .map_err(to_kv)?;
                 if is_new {
                     vrow.count += 1;
                 }
                 vrow.etag += 1;
                 let vvalue = encode_kv(&vrow)?;
-                self.backup_versions.put(txn, &vkey, &vvalue).map_err(to_kv)?;
+                self.backup_versions
+                    .put(txn, &vkey, &vvalue)
+                    .map_err(to_kv)?;
             }
             Ok(replace)
         })
@@ -760,7 +781,9 @@ impl<B: KvBackend> BackupStore for TablesE2eStore<B> {
         for item in self.backup_sessions.range(&snap, prefix) {
             let ((_u, _v, room_id, session_id), value) =
                 item.map_err(|e| StoreError::Backend(e.to_string()))?;
-            out.entry(room_id).or_default().insert(session_id, decode(&value)?);
+            out.entry(room_id)
+                .or_default()
+                .insert(session_id, decode(&value)?);
         }
         Ok(out)
     }
@@ -783,13 +806,20 @@ impl<B: KvBackend> BackupStore for TablesE2eStore<B> {
             let Some(vbytes) = self.backup_versions.get(txn, &vkey).map_err(to_kv)? else {
                 return Err(to_kv(RowMissing(format!("backup version {version}"))));
             };
-            if self.backup_sessions.get(txn, &skey).map_err(to_kv)?.is_some() {
+            if self
+                .backup_sessions
+                .get(txn, &skey)
+                .map_err(to_kv)?
+                .is_some()
+            {
                 self.backup_sessions.delete(txn, &skey).map_err(to_kv)?;
                 let mut vrow: BackupVersionRow = decode_kv(&vbytes)?;
                 vrow.count = vrow.count.saturating_sub(1);
                 vrow.etag += 1;
                 let vvalue = encode_kv(&vrow)?;
-                self.backup_versions.put(txn, &vkey, &vvalue).map_err(to_kv)?;
+                self.backup_versions
+                    .put(txn, &vkey, &vvalue)
+                    .map_err(to_kv)?;
             }
             Ok(())
         })
@@ -828,7 +858,9 @@ impl<B: KvBackend> BackupStore for TablesE2eStore<B> {
                 }
                 vrow.etag += 1;
                 let vvalue = encode_kv(&vrow)?;
-                self.backup_versions.put(txn, &vkey, &vvalue).map_err(to_kv)?;
+                self.backup_versions
+                    .put(txn, &vkey, &vvalue)
+                    .map_err(to_kv)?;
             }
             Ok(())
         })
@@ -841,8 +873,10 @@ impl<B: KvBackend> BackupStore for TablesE2eStore<B> {
             let Some(vbytes) = self.backup_versions.get(txn, &vkey).map_err(to_kv)? else {
                 return Err(to_kv(RowMissing(format!("backup version {version}"))));
             };
-            let prefix =
-                TypedKeyspace::<B::Keyspace, BackupSessionKey>::prefix(&(user_id.to_string(), version));
+            let prefix = TypedKeyspace::<B::Keyspace, BackupSessionKey>::prefix(&(
+                user_id.to_string(),
+                version,
+            ));
             let to_delete: Vec<BackupSessionKey> = {
                 let mut keys = Vec::new();
                 for item in self.backup_sessions.range(&*txn, prefix) {
@@ -858,7 +892,9 @@ impl<B: KvBackend> BackupStore for TablesE2eStore<B> {
             vrow.count = 0;
             vrow.etag += 1;
             let vvalue = encode_kv(&vrow)?;
-            self.backup_versions.put(txn, &vkey, &vvalue).map_err(to_kv)?;
+            self.backup_versions
+                .put(txn, &vkey, &vvalue)
+                .map_err(to_kv)?;
             Ok(())
         })
         .map_err(store_err)
@@ -918,8 +954,10 @@ impl<B: KvBackend> ToDeviceStore for TablesE2eStore<B> {
         let start = Bound::Excluded(Bytes::from(
             (user.to_string(), device.to_string(), since).encode(),
         ));
-        let prefix_end =
-            TypedKeyspace::<B::Keyspace, ToDeviceKey>::prefix(&(user.to_string(), device.to_string()));
+        let prefix_end = TypedKeyspace::<B::Keyspace, ToDeviceKey>::prefix(&(
+            user.to_string(),
+            device.to_string(),
+        ));
         let spec = RangeSpec::new(start, prefix_end.end).limit(limit.max(1));
         let mut out = Vec::new();
         let mut last = since;
@@ -1052,7 +1090,10 @@ mod tests {
             serde_json::json!({"key": "base64key"}),
         );
         s.upload_one_time_keys(&u, &d, keys).await.unwrap();
-        assert_eq!(s.count_one_time_keys(&u, &d).await.unwrap()["signed_curve25519"], 1);
+        assert_eq!(
+            s.count_one_time_keys(&u, &d).await.unwrap()["signed_curve25519"],
+            1
+        );
 
         let claimed = s
             .claim_one_time_key(&u, &d, "signed_curve25519")
@@ -1065,7 +1106,10 @@ mod tests {
             .claim_one_time_key(&u, &d, "signed_curve25519")
             .await
             .unwrap();
-        assert!(second.is_none(), "a claimed key must never be handed out twice");
+        assert!(
+            second.is_none(),
+            "a claimed key must never be handed out twice"
+        );
     }
 
     #[tokio::test]
@@ -1112,11 +1156,12 @@ mod tests {
             .await
             .unwrap();
         assert!(claimed1.is_some());
-        assert!(s
-            .unused_fallback_key_algorithms(&u, &d)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            s.unused_fallback_key_algorithms(&u, &d)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         // Still claimable a second time (reusable).
         let claimed2 = s
             .claim_fallback_key(&u, &d, "signed_curve25519")
@@ -1145,11 +1190,27 @@ mod tests {
             is_verified: true,
             session_data: serde_json::json!({"v": 2}),
         };
-        assert!(s.put_session(&u, version, "!r:x", "s1", worse.clone()).await.unwrap());
-        assert!(s.put_session(&u, version, "!r:x", "s1", better.clone()).await.unwrap());
+        assert!(
+            s.put_session(&u, version, "!r:x", "s1", worse.clone())
+                .await
+                .unwrap()
+        );
+        assert!(
+            s.put_session(&u, version, "!r:x", "s1", better.clone())
+                .await
+                .unwrap()
+        );
         // Attempting to put the worse one back must not replace the better one already stored.
-        assert!(!s.put_session(&u, version, "!r:x", "s1", worse).await.unwrap());
-        let stored = s.get_session(&u, version, "!r:x", "s1").await.unwrap().unwrap();
+        assert!(
+            !s.put_session(&u, version, "!r:x", "s1", worse)
+                .await
+                .unwrap()
+        );
+        let stored = s
+            .get_session(&u, version, "!r:x", "s1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(stored, better);
 
         let (returned_version, vrow) = s.get_version(&u, Some(version)).await.unwrap().unwrap();
@@ -1189,12 +1250,24 @@ mod tests {
         let alice = uid("@alice:example.org");
         let bob = uid("@bob:example.org");
         let bob_device = did("BBBB");
-        s.send_to_device(&alice, &bob, &bob_device, "m.room_key", serde_json::json!({"n": 1}))
-            .await
-            .unwrap();
-        s.send_to_device(&alice, &bob, &bob_device, "m.room_key", serde_json::json!({"n": 2}))
-            .await
-            .unwrap();
+        s.send_to_device(
+            &alice,
+            &bob,
+            &bob_device,
+            "m.room_key",
+            serde_json::json!({"n": 1}),
+        )
+        .await
+        .unwrap();
+        s.send_to_device(
+            &alice,
+            &bob,
+            &bob_device,
+            "m.room_key",
+            serde_json::json!({"n": 2}),
+        )
+        .await
+        .unwrap();
 
         let (msgs, next) = s.poll_since(&bob, &bob_device, 0, 10).await.unwrap();
         assert_eq!(msgs.len(), 2);
@@ -1210,8 +1283,16 @@ mod tests {
         let s = store();
         let alice = uid("@alice:example.org");
         let alice_device = did("AAAA");
-        assert!(!s.check_and_mark_txn(&alice, &alice_device, "txn1").await.unwrap());
-        assert!(s.check_and_mark_txn(&alice, &alice_device, "txn1").await.unwrap());
+        assert!(
+            !s.check_and_mark_txn(&alice, &alice_device, "txn1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            s.check_and_mark_txn(&alice, &alice_device, "txn1")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1227,7 +1308,10 @@ mod tests {
                 .await
                 .unwrap();
             let mut keys = BTreeMap::new();
-            keys.insert("signed_curve25519:K1".to_string(), serde_json::json!({"key": "k"}));
+            keys.insert(
+                "signed_curve25519:K1".to_string(),
+                serde_json::json!({"key": "k"}),
+            );
             store.upload_one_time_keys(&u, &d, keys).await.unwrap();
         }
         let backend = hs_kv::fjall_backend::FjallBackend::open(dir.path()).unwrap();

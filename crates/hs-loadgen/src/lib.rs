@@ -12,11 +12,16 @@
 //!   a free port.
 //! - [`scenario`]: the end-to-end scenario itself (register, log in, room lifecycle, messaging,
 //!   sync, profile, membership, pagination, logout), built on `matrix-sdk`.
+//! - [`scenario_encrypted`]: track 08's encrypted scenario (device/one-time key upload, key
+//!   query, atomic key claim under concurrency, cross-signing, an encrypted room, and a real
+//!   decrypt), built on the same `matrix-sdk` with its `e2e-encryption` feature enabled.
 //!
-//! See `tests/real_client.rs` for the runnable entry point, and
-//! `docs/status/05-sync.md` for what this has found running against the real binary.
+//! See `tests/real_client.rs` and `tests/real_client_encrypted.rs` for the runnable entry points,
+//! and `docs/status/05-sync.md`/`docs/status/08-e2ee.md` for what these have found running
+//! against the real binary.
 
 #![forbid(unsafe_code)]
 
 pub mod harness;
 pub mod scenario;
+pub mod scenario_encrypted;

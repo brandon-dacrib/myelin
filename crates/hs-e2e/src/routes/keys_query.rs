@@ -56,9 +56,11 @@ pub(crate) async fn build_keys_query_response<B: KvBackend + 'static>(
         if user_id.server_name() != server_name {
             continue;
         }
-        let wanted: Option<Vec<String>> = device_filter
-            .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect());
+        let wanted: Option<Vec<String>> = device_filter.as_array().map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        });
 
         let devices = state.store.list_device_keys(user_id).await?;
         let mut per_user = Map::new();

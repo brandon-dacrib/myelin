@@ -432,8 +432,12 @@ pub trait ToDeviceStore: Send + Sync {
 
     /// Deletes every message for `(user, device)` with stream id at most `upto` — called once a
     /// sync response that included them has been acknowledged.
-    async fn delete_up_to(&self, user: &UserId, device: &DeviceId, upto: u64)
-    -> Result<(), StoreError>;
+    async fn delete_up_to(
+        &self,
+        user: &UserId,
+        device: &DeviceId,
+        upto: u64,
+    ) -> Result<(), StoreError>;
 
     /// Idempotency for `PUT /sendToDevice/{eventType}/{txnId}`: returns `true` if this
     /// `(sender_user, sender_device, txn_id)` was already processed (the caller must not enqueue
@@ -449,7 +453,12 @@ pub trait ToDeviceStore: Send + Sync {
 /// The union of every storage trait this crate needs, for callers that want "the e2e store"
 /// without naming each capability individually — mirrors `hs_auth::store::AuthStore`.
 pub trait E2eStore:
-    DeviceKeyStore + OneTimeKeyStore + FallbackKeyStore + CrossSigningStore + BackupStore + ToDeviceStore
+    DeviceKeyStore
+    + OneTimeKeyStore
+    + FallbackKeyStore
+    + CrossSigningStore
+    + BackupStore
+    + ToDeviceStore
 {
 }
 impl<

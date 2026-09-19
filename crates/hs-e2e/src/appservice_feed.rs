@@ -133,19 +133,30 @@ mod tests {
             "signed_curve25519:K1".to_string(),
             serde_json::json!({"key": "x"}),
         );
-        store.upload_one_time_keys(&user, &device, otk).await.unwrap();
+        store
+            .upload_one_time_keys(&user, &device, otk)
+            .await
+            .unwrap();
         let mut fb = std::collections::BTreeMap::new();
         fb.insert(
             "signed_curve25519:FB1".to_string(),
             serde_json::json!({"key": "x", "fallback": true}),
         );
-        store.upload_fallback_keys(&user, &device, fb).await.unwrap();
+        store
+            .upload_fallback_keys(&user, &device, fb)
+            .await
+            .unwrap();
 
         let devices = vec![(user.clone(), device.clone())];
         let counts = one_time_key_counts_for(&store, &devices).await.unwrap();
-        assert_eq!(counts[user.as_str()][device.as_str()]["signed_curve25519"], 1);
+        assert_eq!(
+            counts[user.as_str()][device.as_str()]["signed_curve25519"],
+            1
+        );
 
-        let fallback = unused_fallback_key_types_for(&store, &devices).await.unwrap();
+        let fallback = unused_fallback_key_types_for(&store, &devices)
+            .await
+            .unwrap();
         assert_eq!(
             fallback[user.as_str()][device.as_str()],
             vec!["signed_curve25519".to_string()]

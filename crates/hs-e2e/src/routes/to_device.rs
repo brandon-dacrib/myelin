@@ -65,9 +65,14 @@ pub async fn put_send_to_device<B: KvBackend + 'static>(
                 // Broadcast to every device hs-auth knows about for this user, not just devices
                 // that have uploaded e2e keys -- to-device messages are not exclusively an
                 // encryption feature.
-                let devices = state.auth.store.list_devices(&recipient).await.map_err(|e| {
-                    E2eError::Store(crate::store::StoreError::Backend(e.to_string()))
-                })?;
+                let devices = state
+                    .auth
+                    .store
+                    .list_devices(&recipient)
+                    .await
+                    .map_err(|e| {
+                        E2eError::Store(crate::store::StoreError::Backend(e.to_string()))
+                    })?;
                 for device in devices {
                     state
                         .store

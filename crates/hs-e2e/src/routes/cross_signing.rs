@@ -166,7 +166,11 @@ async fn apply_one_signature<B: KvBackend + 'static>(
         CrossSigningKeyType::SelfSigning,
         CrossSigningKeyType::UserSigning,
     ] {
-        let Some(existing) = state.store.get_cross_signing_key(target_user, key_type).await? else {
+        let Some(existing) = state
+            .store
+            .get_cross_signing_key(target_user, key_type)
+            .await?
+        else {
             continue;
         };
         if cross_signing_key_id(&existing) == Some(key_id) {

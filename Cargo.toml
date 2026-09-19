@@ -47,6 +47,15 @@ fjall = { version = "3", features = ["bytes_1"] }
 tokio-postgres = "0.7"
 deadpool-postgres = "0.14"
 tempfile = "3"
+# Added by track 01 (storage), for the PostgreSQL `KvBackend`: `hs-kv`'s trait is synchronous
+# (mirrors the embedded Fjall backend, which is also blocking), so the backend uses the
+# synchronous `postgres` client (the same rust-postgres project as `tokio-postgres` above, with a
+# small internal per-connection runtime hidden behind a blocking API) plus a synchronous `r2d2`
+# pool, rather than bridging `tokio-postgres`/`deadpool-postgres` across an async/sync boundary
+# inside every trait method. See `docs/status/01-storage-engine.md` for the rationale.
+postgres = "0.19"
+r2d2 = "0.8"
+r2d2_postgres = "0.18"
 object_store = { version = "0.14", features = ["aws"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 http-body-util = "0.1"
@@ -121,12 +130,12 @@ ipnet = "2"
 
 # Added by track 05 (sync): `matrix-rust-sdk` as the real-client driver for `hs-loadgen`'s
 # end-to-end scenario (named for this purpose in `docs/workstreams/14-test-and-conformance.md`).
-# Default features off: `e2e-encryption` (vodozemac) and `sqlite` (native sqlcipher bindings) pull
-# in a lot of build weight this scenario does not need (no encrypted rooms, no persistent store --
-# an in-memory client is fine for a scripted one-shot run), so only a TLS backend is kept (the
-# scenario talks to a local `http://` server, but `matrix-sdk` needs a backend selected to build
-# its HTTP client at all).
-matrix-sdk = { version = "0.19", default-features = false, features = ["rustls-aws-lc-rs"] }
+# Default features off: `sqlite` (native sqlcipher bindings) pulls in build weight this scenario
+# does not need (no persistent store -- an in-memory client is fine for a scripted one-shot run),
+# so only a TLS backend is kept (the scenario talks to a local `http://` server, but `matrix-sdk`
+# needs a backend selected to build its HTTP client at all). `e2e-encryption` (vodozemac) was added
+# by track 08 for `hs-loadgen`'s encrypted scenario (in-memory crypto store; no `sqlite` needed).
+matrix-sdk = { version = "0.19", default-features = false, features = ["rustls-aws-lc-rs", "e2e-encryption"] }
 
 [profile.dev]
 opt-level = 0
