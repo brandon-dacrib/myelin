@@ -59,6 +59,37 @@ pub fn routes() -> Vec<Route> {
     ]
 }
 
+/// The two `/_synapse/admin/v1/register` entries for `hs_auth::synapse_admin_router()`
+/// (`crates/hs-auth/src/routes/synapse_admin.rs`), mirrored by hand for the same reason as
+/// [`routes`] above. Unlike that list these paths are **absolute**: `crate::serve` merges this
+/// fragment at the router root, not under a version prefix, so no prefix is prepended.
+///
+/// `AuthKind::None` is the honest answer even though the endpoint is privileged: the credential
+/// is the HMAC in the request body, not an `Authorization` header, so a manifest consumer must
+/// not be told to send a token. The surface is [`Surface::SynapseAdminCompat`], since this is a
+/// Synapse-compatibility route (`docs/compat/cli-shims.md`) rather than a spec one.
+#[must_use]
+pub fn synapse_admin_routes() -> Vec<Route> {
+    fn compat_route(method: &str, path: &str, operation_id: &str) -> Route {
+        Route {
+            surface: Surface::SynapseAdminCompat,
+            ..route(method, path, AuthKind::None, operation_id)
+        }
+    }
+    vec![
+        compat_route(
+            "GET",
+            "/_synapse/admin/v1/register",
+            "synapseAdminRegisterNonce",
+        ),
+        compat_route(
+            "POST",
+            "/_synapse/admin/v1/register",
+            "synapseAdminRegister",
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,5 +121,23 @@ mod tests {
     #[test]
     fn every_route_is_the_matrix_client_surface() {
         assert!(routes().iter().all(|r| r.surface == Surface::MatrixClient));
+    }
+
+    #[test]
+    fn the_synapse_admin_routes_are_absolute_and_compat_surfaced() {
+        let routes = synapse_admin_routes();
+        assert_eq!(routes.len(), 2);
+        assert!(
+            routes
+                .iter()
+                .all(|r| r.path == "/_synapse/admin/v1/register")
+        );
+        assert!(
+            routes
+                .iter()
+                .all(|r| r.surface == Surface::SynapseAdminCompat)
+        );
+        // The shared secret's HMAC is the credential, not a bearer token.
+        assert!(routes.iter().all(|r| r.auth == AuthKind::None));
     }
 }

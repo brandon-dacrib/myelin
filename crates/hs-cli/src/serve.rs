@@ -172,6 +172,14 @@ fn build_router<B: KvBackend>(
     let auth_router = hs_auth::routes::router().with_state(auth.clone());
     let auth_routes = crate::auth_manifest::routes();
 
+    // `hs-auth`'s shared-secret registration fragment spells its own absolute path
+    // (`/_synapse/admin/v1/register`), so unlike the fragment above it is merged at the root
+    // rather than under the two client-API version prefixes. It is what makes an admin exist at
+    // all: `hs serve` has no other way to set a user's `is_admin` flag, and without that flag no
+    // credential satisfies `hs_auth::admin_verifier::AdminTokenVerifier` below.
+    let synapse_admin_router = hs_auth::synapse_admin_router().with_state(auth.clone());
+    let synapse_admin_routes = crate::auth_manifest::synapse_admin_routes();
+
     let (room_router, room_manifest) = hs_room::routes::router::<B>();
     let room_router = room_router.with_state(mounts.room);
     let room_routes = room_manifest.routes;
@@ -345,6 +353,11 @@ fn build_router<B: KvBackend>(
     manifest.routes.extend(admin_manifest.routes);
     let router = router.merge(admin_router);
 
+    // Same reasoning as the admin router directly above: an absolute path merges onto the
+    // top-level router rather than nesting under a prefix.
+    manifest.routes.extend(synapse_admin_routes);
+    let router = router.merge(synapse_admin_router);
+
     let router = router
         .layer(Extension(well_known))
         .layer(Extension(ready))
@@ -447,12 +460,51 @@ fn build_session_mounts<B: KvBackend>(
     Ok((user, e2e, push))
 }
 
-fn dummy_admin_state() -> hs_admin::router::AdminState {
-    // No real `hs_admin::auth::TokenVerifier` exists yet (`docs/status/15-admin-api-and-modules.md`
-    // "Interfaces needed": track 07 owns that). An empty `StaticVerifier` is the honest stopgap —
-    // every `/api/v1` request is unauthenticated (`401`), which is a correct answer for a server
-    // with no admin tokens configured, not a placeholder pretending to work. See
-    // `docs/status/12-platform-and-kubernetes.md`.
+/// The `/api/v1` state a real `hs serve` runs on: admin credentials are verified against this
+/// server's own user store, and the user-directory operations read from it.
+///
+/// `hs_auth::admin_verifier::AdminTokenVerifier` accepts an ordinary client-server access token
+/// whose user carries `is_admin` (there is no separate admin credential type), and
+/// `hs_auth::admin_directory::AuthStoreUserDirectory` serves `/api/v1/users` from the same open
+/// store — both constructed `from_auth_state` so the admin surface and the client-server surface
+/// read one backend handle rather than two.
+///
+/// The audit sink and event bus are still in-memory: an admin action is recorded and streamed to
+/// `GET /api/v1/events` subscribers, but the audit log does not survive a restart. A durable sink
+/// over `hs-tables` is track 15's (`docs/status/15-admin-api-and-modules.md`), and is the one
+/// piece of this state that is not yet real.
+fn admin_state(
+    auth: &AuthState,
+    server_name: &str,
+    enabled_components: Vec<String>,
+) -> hs_admin::router::AdminState {
+    hs_admin::router::AdminState::new(
+        Arc::new(hs_auth::admin_verifier::AdminTokenVerifier::from_auth_state(auth)),
+        Arc::new(hs_admin::audit::InMemoryAuditSink::new()),
+        Arc::new(hs_admin::events::EventBus::new()),
+    )
+    .with_users(Arc::new(
+        hs_auth::admin_directory::AuthStoreUserDirectory::from_auth_state(auth),
+    ))
+    .with_server_info(hs_admin::model::ServerInfo {
+        name: server_name.to_owned(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        // No build metadata is stamped into the binary yet (no `vergen`/`build.rs`), so this says
+        // so rather than inventing a commit or a date.
+        build: "unstamped".to_owned(),
+        supported_room_versions: hs_model::room_version::known_room_version_ids()
+            .map(str::to_owned)
+            .collect(),
+        enabled_components,
+        contract_version: hs_admin::model::ServerInfo::default().contract_version,
+    })
+}
+
+/// The `/api/v1` state for [`route_manifest`]'s throwaway router: routes are registered the same
+/// way regardless of who can authenticate against them, and this one is never served. An empty
+/// `StaticVerifier` means every request would answer `401`, which is why it must not be used by
+/// [`spawn_serve`] — see [`admin_state`] for the real one.
+fn manifest_only_admin_state() -> hs_admin::router::AdminState {
     hs_admin::router::AdminState::new(
         Arc::new(hs_admin::auth::StaticVerifier::new()),
         Arc::new(hs_admin::audit::InMemoryAuditSink::new()),
@@ -531,7 +583,7 @@ fn throwaway_mounts() -> Mounts<hs_kv::memory::MemoryBackend> {
         push,
         media,
         appservice_ping,
-        admin: dummy_admin_state(),
+        admin: manifest_only_admin_state(),
     }
 }
 
@@ -707,6 +759,31 @@ pub async fn spawn_serve(
         None
     };
 
+    // What `/api/v1/server` reports as enabled: derived from what this process actually mounted
+    // just above, not from a static list — a component that is off must not appear.
+    let mut enabled_components = vec![
+        "client".to_owned(),
+        "media".to_owned(),
+        "sync".to_owned(),
+        "e2ee".to_owned(),
+        "push".to_owned(),
+        "admin-api".to_owned(),
+    ];
+    if federation.is_some() {
+        enabled_components.push("federation".to_owned());
+    }
+    // `list()` reads the registry's own store; a failure there is not worth failing startup for,
+    // so an unreadable registry reports as no appservices rather than as a mounted component.
+    if appservices
+        .registry
+        .list()
+        .map(|rows| !rows.is_empty())
+        .unwrap_or(false)
+    {
+        enabled_components.push("appservices".to_owned());
+    }
+    enabled_components.sort();
+
     let mounts = Mounts {
         room: room_state,
         federation,
@@ -715,7 +792,7 @@ pub async fn spawn_serve(
         push: push_state,
         media: media_state,
         appservice_ping: appservices.ping_service,
-        admin: dummy_admin_state(),
+        admin: admin_state(&auth_state, server_name.as_str(), enabled_components),
     };
 
     let ready = Arc::new(AtomicBool::new(true));
