@@ -15,7 +15,7 @@ cd refs/complement && COMPLEMENT_BASE_IMAGE=complement-hs-reimplement:dev go tes
 
 A cold image build is ~4 minutes; a full `csapi` run is ~15. The federation-heavy top-level `./tests/...` package has still never been run — that is the next session's first move, and it should score better than the number above, which predates the inbound-federation work.
 
-Spec coverage is **125 of 235 routes (53.2%)**: client-server 95/166, server-server **30/36 (83.3%)**. Generated from the manifest the server itself emits, so it cannot overclaim. Registered is still not the same as working — each track's status file says which of its routes are stubs.
+Spec coverage is **127 of 235 routes (54.0%)**: client-server 97/166, server-server **30/36 (83.3%)**. Generated from the manifest the server itself emits, so it cannot overclaim. Registered is still not the same as working — each track's status file says which of its routes are stubs.
 
 ## What works today, verified by running the binary
 
@@ -25,20 +25,23 @@ Not "the tests pass". Each of these was checked against `hs serve` or a real ext
 - **A remote server can join a room here.** `send_join` verifies signature, content hash, shape and the real auth rules, then persists; the join reads back through `/event/{id}` with the remote's own signature intact and appears in the room's state (`crates/hs-cli/tests/federation_writes.rs`). `PUT /send/{txnId}` verifies and stores inbound transactions, idempotently by transaction id.
 - **An operator can administer the server over HTTP.** `hs register --admin` mints a real admin through shared-secret registration; that token gets real data from `/api/v1/me`, `/server`, `/users`, can lock, unlock, deactivate, reactivate and promote users, and every mutation writes one audit entry and publishes one SSE event. A non-admin's token and an anonymous request both get 401.
 - **The management interface renders that data in a browser**, signs in with a real token, and says "not implemented on this server yet" for the operations that answer 501 instead of showing an empty table.
-- **An encrypting client gets everything except the room key.** Device keys, one-time keys, key queries, cross-signing and 203 concurrent atomic one-time-key claims (zero double-claims) all work against a real `matrix-sdk` with encryption on. Decryption still fails — see the top gap below.
+- **Encryption works end to end.** `cargo test -p hs-loadgen --test real_client_encrypted` has one real `matrix-sdk` client encrypt a message and another decrypt it through this server. Device keys, key queries, cross-signing and atomic one-time-key claims under real concurrency (53 callers, 50 distinct keys, zero double-claims, the excess correctly served the reusable fallback key) all hold.
+- **A user who left a private room cannot read it.** History visibility is enforced per event on `/messages`, `/event`, `/context`, `/state` and `/members`; a departed member sees the state as of when they left.
+- **The server runs on PostgreSQL.** `storage.backend: postgres` boots, registers, creates rooms, sends messages, and survives a restart with everything intact.
 - A user registers, restarts the server, and logs in again; a file uploads and downloads byte for byte; `/versions`, `/capabilities`, health, metrics and SIGTERM drain all answer; `.well-known` documents are served when configured and 404 when not.
 
 ## What to do next, in order
 
-### 1. Work down the Complement failures
+### 1. Re-run Complement and get the new number
 
-The list is in `docs/status/14-test-and-conformance.md`, triaged by track. In priority order:
+The 125/161 above was measured before history visibility, the room directory, `/createRoom` validation, `/forget`, profiles, inbound federation and the E2EE sync fields landed. On the targeted subset covering the room fixes, leaf assertions went from 26/53 to 39/53, so the full number has moved — but nobody has measured it. Do that first; a stale headline is worse than no headline.
 
-- **History visibility is not enforced on reads** (track 04, in progress at the time of writing). A user who left a non-world-readable room can still read `/messages` and `/event/{id}`. This is a real privacy bug, not a conformance nicety, and several other failures are downstream timeouts caused by it.
-- **The room directory 404s** (track 04): `PUT /directory/list/room/{roomId}` is unserved, so no room can ever be published and `/publicRooms` is always empty.
-- **`/createRoom` accepts invalid parameters** (track 04) where the spec requires 400.
+Then work down what remains, from `docs/status/14-test-and-conformance.md`:
+
 - **Cross-user `/keys/query` misses devices** and `/keys/claim` returns content that does not match what was uploaded (track 08).
 - **Async media upload (MSC2246) and URL previews are absent** (track 09).
+- **Presence endpoints 404** (track 05).
+- And run the federation-heavy top-level `./tests/...` package, which has still never been run at all.
 
 ### 2. Fix the sync/messages token mismatch
 
