@@ -139,6 +139,9 @@ pub struct ServeOptions {
 ///   `/_matrix/client/v3` and `/_matrix/client/r0` (the historical version alias every Matrix
 ///   client-server API implementation supports, per `docs/compat/cli-shims.md`'s summary table
 ///   and `PLAN.md`).
+/// - `GET /.well-known/matrix/server` and `GET /.well-known/matrix/client`
+///   ([`crate::well_known`]) — always registered, but each answers 404 unless its configuration
+///   field is set, so an operator who does not delegate publishes no document.
 /// - `/health/live`, `/health/ready`, `/metrics`.
 ///
 /// - `hs-room`'s room routes ([`hs_room::routes::router`]), mounted under both `/_matrix/client/v3`
@@ -164,6 +167,7 @@ fn build_router<B: KvBackend>(
     metrics: Arc<Metrics>,
     ready: Arc<AtomicBool>,
     unstable_features: Arc<BTreeMap<String, bool>>,
+    well_known: crate::well_known::WellKnown,
 ) -> (Router, RouteManifest) {
     let auth_router = hs_auth::routes::router().with_state(auth.clone());
     let auth_routes = crate::auth_manifest::routes();
@@ -223,6 +227,18 @@ fn build_router<B: KvBackend>(
             crate::capabilities::get_capabilities,
             RouteMeta::new(Surface::MatrixClient, AuthKind::None)
                 .with_operation_id("getCapabilities"),
+        )
+        .get(
+            "/.well-known/matrix/server",
+            crate::well_known::get_server,
+            RouteMeta::new(Surface::MatrixFederation, AuthKind::None)
+                .with_operation_id("getWellKnownServer"),
+        )
+        .get(
+            "/.well-known/matrix/client",
+            crate::well_known::get_client,
+            RouteMeta::new(Surface::MatrixClient, AuthKind::None)
+                .with_operation_id("getWellKnownClient"),
         )
         .get(
             "/health/live",
@@ -330,6 +346,7 @@ fn build_router<B: KvBackend>(
     let router = router.merge(admin_router);
 
     let router = router
+        .layer(Extension(well_known))
         .layer(Extension(ready))
         .layer(Extension(unstable_features))
         .layer(Extension(metrics.clone()))
@@ -531,6 +548,9 @@ pub fn route_manifest() -> RouteManifest {
         Arc::new(Metrics::new()),
         Arc::new(AtomicBool::new(true)),
         Arc::new(BTreeMap::new()),
+        // Routes are registered unconditionally; whether a `.well-known` document is *served* or
+        // 404s is a runtime decision inside the handler, so the manifest is the same either way.
+        crate::well_known::WellKnown::default(),
     );
     manifest
 }
@@ -703,7 +723,28 @@ pub async fn spawn_serve(
         options.capabilities_config.as_deref(),
     )?);
 
-    let (app, manifest) = build_router(auth_state, mounts, metrics, ready, unstable_features);
+    let well_known = crate::well_known::WellKnown::from_config(&config);
+    if well_known.is_empty() {
+        tracing::info!(
+            "no .well-known documents are published (set server.well_known_server to delegate \
+             federation, server.public_baseurl to advertise a client base URL)"
+        );
+    } else {
+        tracing::info!(
+            server = ?well_known.server,
+            client_base_url = ?well_known.client_base_url,
+            "publishing .well-known discovery documents"
+        );
+    }
+
+    let (app, manifest) = build_router(
+        auth_state,
+        mounts,
+        metrics,
+        ready,
+        unstable_features,
+        well_known,
+    );
 
     if let Some(path) = &options.routes_manifest_path {
         manifest

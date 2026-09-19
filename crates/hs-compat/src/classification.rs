@@ -105,15 +105,15 @@ pub const OPTIONS: &[KeyInfo] = &[
     },
     KeyInfo {
         key: "serve_server_wellknown",
-        classification: Classification::Unsupported,
-        native: "",
-        note: "R-PHASE1 (hs-http). `/.well-known/matrix/*` is planned to be served unconditionally when `public_baseurl` differs from `https://{server_name}`; no opt-out flag yet.",
+        classification: Classification::MappedDiff,
+        native: "`server.well_known_server`",
+        note: "Synapse takes a boolean and derives the advertised value itself; the native field takes the advertised `host[:port]` directly, so `serve_server_wellknown: true` translates to whatever destination that deployment actually delegates to, which the Synapse config alone does not state. Unset means the route 404s (`crates/hs-cli/src/well_known.rs`).",
     },
     KeyInfo {
         key: "extra_well_known_client_content",
         classification: Classification::Unsupported,
         native: "",
-        note: "R-PHASE1 (hs-http), paired with `serve_server_wellknown`.",
+        note: "R-PHASE1. `/.well-known/matrix/client` is served from `server.public_baseurl` (`crates/hs-cli/src/well_known.rs`) but carries only `m.homeserver`; arbitrary extra keys have no native field yet.",
     },
     KeyInfo {
         key: "soft_file_limit",

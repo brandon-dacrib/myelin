@@ -7,6 +7,35 @@ reported 17/235 routes not because the work wasn't done, but because nothing ser
 session mounts all four. See "Mounting hs-room/hs-media/hs-appservice/hs-admin" immediately below;
 everything from "Integration review follow-up" down is the prior session's record, unchanged.
 
+## `.well-known` discovery documents (2026-09-18, integration lead)
+
+Closes the known gap "`GET /.well-known/matrix/server` not served — a deployment that delegates
+its server name cannot be found" from `docs/next-steps.md`.
+
+- **New**: `crates/hs-cli/src/well_known.rs` serves `GET /.well-known/matrix/server`
+  (`{"m.server": "<host[:port]>"}`, from the new `server.well_known_server` config field) and
+  `GET /.well-known/matrix/client` (`{"m.homeserver": {"base_url": ...}}`, from the existing
+  `server.public_baseurl`). Both carry `Access-Control-Allow-Origin: *`; the client one needs it
+  by spec (a web client on another origin is exactly who fetches it).
+- **Absent, not self-referential**: each route answers `404 M_NOT_FOUND` when its config field is
+  unset, rather than serving a document naming this server. A well-known that points at the name
+  it was fetched from is indistinguishable from no document in the spec's resolution order, so
+  serving one only adds a way to fail. Synapse defaults `serve_server_wellknown` to false for the
+  same reason.
+- **Config**: `hs_config::ServerConfig::well_known_server: Option<String>`, validated as a
+  `host[:port]` (a URL or whitespace is rejected at config-load time, not at request time).
+- **Synapse translation table** (`crates/hs-compat/src/classification.rs`): `serve_server_wellknown`
+  moves from `Unsupported` to `MappedDiff` against the new field — Synapse takes a boolean and
+  derives the destination itself, this takes the destination directly, so the translation cannot
+  be automatic and the note says so. `extra_well_known_client_content` stays unsupported: the
+  client document carries only `m.homeserver`.
+- **Verified**: `cargo test -p hs-config` (71 pass), `cargo test -p hs-compat` (42 pass), and the
+  module's own five tests drive the real handlers through an axum router.
+
+The fetching side of this (`crates/hs-federation/src/discovery.rs`) already existed and is what
+makes these documents load-bearing: this server resolves a remote's delegation exactly the way a
+remote now resolves ours.
+
 ## Mounting hs-room, hs-media, hs-appservice and hs-admin; media-scanning startup wiring
 
 **Before**: `crates/hs-cli/src/serve.rs` mounted `GET /_matrix/client/versions`,

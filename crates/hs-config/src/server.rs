@@ -24,6 +24,20 @@ pub struct ServerConfig {
     #[serde(default)]
     pub public_baseurl: Option<String>,
 
+    /// The value this server advertises at `GET /.well-known/matrix/server`:
+    /// the `host[:port]` a remote server should actually connect to for
+    /// federation, when that differs from `server_name`. Corresponds to
+    /// Synapse's `serve_server_wellknown` plus the document Synapse serves
+    /// from it, collapsed into one field: `None` (the default) means the
+    /// route is not served at all — a deployment that does not delegate
+    /// should 404 there, not serve a document pointing at itself, since a
+    /// well-known that names the server name itself is indistinguishable
+    /// from no delegation and only adds a failure mode
+    /// (`crates/hs-federation/src/discovery.rs` implements the resolution
+    /// order this feeds).
+    #[serde(default)]
+    pub well_known_server: Option<String>,
+
     /// Directory holding this server's Ed25519 signing keys. Corresponds to
     /// Synapse's `signing_key_path` (a file here; a directory in our
     /// layout because multiple active keys are normal during rotation).
@@ -50,6 +64,7 @@ impl Default for ServerConfig {
         Self {
             server_name: String::new(),
             public_baseurl: None,
+            well_known_server: None,
             signing_key_path: default_signing_key_path(),
             admin_contact: None,
             report_stats: false,
@@ -79,6 +94,25 @@ impl Validate for ServerConfig {
                 format!("{prefix}.public_baseurl"),
                 format!("{url:?} must start with http:// or https://"),
             );
+        }
+        if let Some(delegate) = &self.well_known_server {
+            let trimmed = delegate.trim();
+            if trimmed.is_empty() {
+                errors.push(
+                    format!("{prefix}.well_known_server"),
+                    "must not be empty (omit the field to not delegate)",
+                );
+            } else if trimmed.contains("://") || trimmed.contains('/') {
+                errors.push(
+                    format!("{prefix}.well_known_server"),
+                    format!("{delegate:?} must be a host[:port], not a URL"),
+                );
+            } else if trimmed.chars().any(char::is_whitespace) {
+                errors.push(
+                    format!("{prefix}.well_known_server"),
+                    format!("{delegate:?} must not contain whitespace"),
+                );
+            }
         }
     }
 }
@@ -117,6 +151,31 @@ mod tests {
         let mut errors = ValidationErrors::new();
         ServerConfig {
             server_name: "matrix.example.org".into(),
+            ..Default::default()
+        }
+        .validate("server", &mut errors);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn rejects_a_well_known_delegation_written_as_a_url() {
+        let mut errors = ValidationErrors::new();
+        ServerConfig {
+            server_name: "example.org".into(),
+            well_known_server: Some("https://matrix.example.org:8448".into()),
+            ..Default::default()
+        }
+        .validate("server", &mut errors);
+        assert_eq!(errors.0.len(), 1);
+        assert_eq!(errors.0[0].path, "server.well_known_server");
+    }
+
+    #[test]
+    fn accepts_a_host_port_well_known_delegation() {
+        let mut errors = ValidationErrors::new();
+        ServerConfig {
+            server_name: "example.org".into(),
+            well_known_server: Some("matrix.example.org:8448".into()),
             ..Default::default()
         }
         .validate("server", &mut errors);

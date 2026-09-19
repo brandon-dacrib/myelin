@@ -24,5 +24,6 @@ pub mod signing_key;
 pub mod storage;
 pub mod synapse_serve;
 pub mod versions;
+pub mod well_known;
 
 pub use cli::{Cli, Command};
