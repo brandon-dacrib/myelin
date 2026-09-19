@@ -7,8 +7,8 @@
 pub mod memory;
 pub mod tables;
 
-use ruma::{OwnedEventId, OwnedRoomId};
 use ruma::push::Action;
+use ruma::{OwnedEventId, OwnedRoomId};
 
 use crate::error::StoreError;
 

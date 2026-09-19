@@ -39,16 +39,19 @@ impl<B: KvBackend> RulesetStore for TablesRulesetStore<B> {
         let Some(bytes) = self.rulesets.get(&snap, &(user_id.to_string(),))? else {
             return Ok(None);
         };
-        let ruleset: Ruleset =
-            serde_json::from_slice(&bytes).map_err(|e| StoreError::Backend(format!("decode ruleset: {e}")))?;
+        let ruleset: Ruleset = serde_json::from_slice(&bytes)
+            .map_err(|e| StoreError::Backend(format!("decode ruleset: {e}")))?;
         Ok(Some(ruleset))
     }
 
     async fn set_ruleset(&self, user_id: &UserId, ruleset: &Ruleset) -> Result<(), StoreError> {
         let key = (user_id.to_string(),);
-        let value = serde_json::to_vec(ruleset).map_err(|e| StoreError::Backend(format!("encode ruleset: {e}")))?;
+        let value = serde_json::to_vec(ruleset)
+            .map_err(|e| StoreError::Backend(format!("encode ruleset: {e}")))?;
         transact(&self.backend, TransactConfig::default(), |txn| {
-            self.rulesets.put(txn, &key, &value).map_err(hs_kv::KvError::backend)
+            self.rulesets
+                .put(txn, &key, &value)
+                .map_err(hs_kv::KvError::backend)
         })
         .map_err(StoreError::from)
     }
@@ -70,9 +73,10 @@ mod tests {
         store.set_ruleset(alice, &ruleset).await.unwrap();
 
         let read_back = store.get_ruleset(alice).await.unwrap().unwrap();
-        assert_eq!(
-            read_back.get(ruma::push::RuleKind::Underride, ".m.rule.message").is_some(),
-            true
+        assert!(
+            read_back
+                .get(ruma::push::RuleKind::Underride, ".m.rule.message")
+                .is_some()
         );
     }
 }

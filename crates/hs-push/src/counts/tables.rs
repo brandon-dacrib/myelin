@@ -59,7 +59,11 @@ impl<B: KvBackend> TablesCountsStore<B> {
 
 #[async_trait::async_trait]
 impl<B: KvBackend> CountsStore for TablesCountsStore<B> {
-    async fn get_room_counts(&self, user_id: &UserId, room_id: &RoomId) -> Result<RoomNotificationCounts, StoreError> {
+    async fn get_room_counts(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+    ) -> Result<RoomNotificationCounts, StoreError> {
         let snap = self.backend.snapshot();
         let prefix = (user_id.to_string(), room_id.to_string());
         let spec = TypedKeyspace::<B::Keyspace, (String, String, String)>::prefix(&prefix);
@@ -70,10 +74,9 @@ impl<B: KvBackend> CountsStore for TablesCountsStore<B> {
             if thread_key.is_empty() {
                 out.main = counts;
             } else {
-                let root: OwnedEventId = thread_key
-                    .as_str()
-                    .try_into()
-                    .map_err(|e| StoreError::Backend(format!("stored thread key is not an event id: {e}")))?;
+                let root: OwnedEventId = thread_key.as_str().try_into().map_err(|e| {
+                    StoreError::Backend(format!("stored thread key is not an event id: {e}"))
+                })?;
                 out.threads.insert(root, counts);
             }
         }
@@ -108,10 +111,17 @@ impl<B: KvBackend> CountsStore for TablesCountsStore<B> {
         .map_err(StoreError::from)
     }
 
-    async fn reset(&self, user_id: &UserId, room_id: &RoomId, scope: Scope<'_>) -> Result<(), StoreError> {
+    async fn reset(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+        scope: Scope<'_>,
+    ) -> Result<(), StoreError> {
         let key = (user_id.to_string(), room_id.to_string(), scope.key_part());
         transact(&self.backend, TransactConfig::default(), |txn| {
-            self.counts.delete(txn, &key).map_err(hs_kv::KvError::backend)
+            self.counts
+                .delete(txn, &key)
+                .map_err(hs_kv::KvError::backend)
         })
         .map_err(StoreError::from)
     }

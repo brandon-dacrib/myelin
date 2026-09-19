@@ -55,7 +55,10 @@ pub struct PushRequester(pub Requester);
 impl<B: KvBackend> FromRequestParts<PushState<B>> for PushRequester {
     type Rejection = hs_http::error::MatrixError;
 
-    async fn from_request_parts(parts: &mut Parts, state: &PushState<B>) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &PushState<B>,
+    ) -> Result<Self, Self::Rejection> {
         let auth_state = AuthState::from_ref(state);
         Requester::from_request_parts(parts, &auth_state)
             .await

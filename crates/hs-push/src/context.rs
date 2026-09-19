@@ -114,8 +114,10 @@ pub fn build_room_ctx(
         .rules()
         .map(|r| r.authorization)
         .unwrap_or(ruma::room_version_rules::AuthorizationRules::V1);
-    let rules = ruma::room_version_rules::RoomPowerLevelsRules::new(&auth_rules, std::iter::empty());
-    let power_levels_ctx = PushConditionPowerLevelsCtx::new(users, users_default, notifications, rules);
+    let rules =
+        ruma::room_version_rules::RoomPowerLevelsRules::new(&auth_rules, std::iter::empty());
+    let power_levels_ctx =
+        PushConditionPowerLevelsCtx::new(users, users_default, notifications, rules);
     ctx.with_power_levels(power_levels_ctx)
 }
 
@@ -153,9 +155,7 @@ mod tests {
         power_levels
             .users
             .insert(ruma::user_id!("@bob:example.org").to_owned(), 100);
-        power_levels
-            .notifications
-            .insert("room".to_owned(), 60);
+        power_levels.notifications.insert("room".to_owned(), 60);
         let input = PushEvaluationInput {
             joined_member_count: 5,
             members: vec![],

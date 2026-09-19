@@ -123,7 +123,10 @@ mod tests {
         let first = store.effective_ruleset(alice).await.unwrap();
         assert!(store.cache().peek(alice).is_some());
         let second = store.effective_ruleset(alice).await.unwrap();
-        assert!(Arc::ptr_eq(&first, &second), "second call should be served from cache");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "second call should be served from cache"
+        );
     }
 
     #[tokio::test]

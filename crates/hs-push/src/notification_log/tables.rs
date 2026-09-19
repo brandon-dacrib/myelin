@@ -69,7 +69,8 @@ impl<B: KvBackend> NotificationLogStore for TablesNotificationLogStore<B> {
             ts_ms,
             read: false,
         };
-        let value = serde_json::to_vec(&row).map_err(|e| StoreError::Backend(format!("encode notification: {e}")))?;
+        let value = serde_json::to_vec(&row)
+            .map_err(|e| StoreError::Backend(format!("encode notification: {e}")))?;
         let seq_key = (user_id.to_string(),);
         transact(&self.backend, TransactConfig::default(), |txn| {
             let current = self
@@ -112,8 +113,8 @@ impl<B: KvBackend> NotificationLogStore for TablesNotificationLogStore<B> {
             if seq <= floor {
                 continue;
             }
-            let row: Row =
-                serde_json::from_slice(&bytes).map_err(|e| StoreError::Backend(format!("decode notification: {e}")))?;
+            let row: Row = serde_json::from_slice(&bytes)
+                .map_err(|e| StoreError::Backend(format!("decode notification: {e}")))?;
             if only_highlight && !row.actions.iter().any(Action::is_highlight) {
                 continue;
             }

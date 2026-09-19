@@ -21,7 +21,9 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use hs_push::compiled::RuleCache;
 use hs_push::engine::{evaluate, flatten_event};
-use hs_push::rulesets::{CachedRulesetStore, RulesetStore, default_ruleset, memory::InMemoryRulesetStore};
+use hs_push::rulesets::{
+    CachedRulesetStore, RulesetStore, default_ruleset, memory::InMemoryRulesetStore,
+};
 use ruma::push::{FlattenedJson, PushConditionRoomCtx};
 use ruma::{UInt, room_id, user_id};
 

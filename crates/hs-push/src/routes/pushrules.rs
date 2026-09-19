@@ -55,7 +55,9 @@ pub async fn get_pushrule<B: KvBackend + 'static>(
 ) -> Result<Json<Value>, hs_http::error::MatrixError> {
     let kind = rule_kind(&kind)?;
     let ruleset = effective(&state, &requester.user_id).await?;
-    let rule = ruleset.get(kind, &rule_id).ok_or_else(|| not_found(&rule_id))?;
+    let rule = ruleset
+        .get(kind, &rule_id)
+        .ok_or_else(|| not_found(&rule_id))?;
     let wire: ruma::api::client::push::PushRule = rule.to_owned().into();
     Ok(Json(serde_json::to_value(wire).unwrap()))
 }
@@ -68,7 +70,9 @@ pub async fn get_pushrule_actions<B: KvBackend + 'static>(
 ) -> Result<Json<Value>, hs_http::error::MatrixError> {
     let kind = rule_kind(&kind)?;
     let ruleset = effective(&state, &requester.user_id).await?;
-    let rule = ruleset.get(kind, &rule_id).ok_or_else(|| not_found(&rule_id))?;
+    let rule = ruleset
+        .get(kind, &rule_id)
+        .ok_or_else(|| not_found(&rule_id))?;
     Ok(Json(json!({ "actions": rule.actions() })))
 }
 
@@ -80,7 +84,9 @@ pub async fn get_pushrule_enabled<B: KvBackend + 'static>(
 ) -> Result<Json<Value>, hs_http::error::MatrixError> {
     let kind = rule_kind(&kind)?;
     let ruleset = effective(&state, &requester.user_id).await?;
-    let rule = ruleset.get(kind, &rule_id).ok_or_else(|| not_found(&rule_id))?;
+    let rule = ruleset
+        .get(kind, &rule_id)
+        .ok_or_else(|| not_found(&rule_id))?;
     Ok(Json(json!({ "enabled": rule.enabled() })))
 }
 
@@ -122,17 +128,21 @@ pub async fn put_pushrule<B: KvBackend + 'static>(
             body.actions,
         )),
         RuleKind::Content => {
-            let pattern = body.pattern.ok_or_else(|| hs_http::error::MatrixError::bad_json("content rules require a pattern"))?;
+            let pattern = body.pattern.ok_or_else(|| {
+                hs_http::error::MatrixError::bad_json("content rules require a pattern")
+            })?;
             NewPushRule::Content(NewPatternedPushRule::new(rule_id, pattern, body.actions))
         }
         RuleKind::Room => {
-            let room_id = <&ruma::RoomId>::try_from(rule_id.as_str())
-                .map_err(|e| hs_http::error::MatrixError::bad_json(format!("invalid room id: {e}")))?;
+            let room_id = <&ruma::RoomId>::try_from(rule_id.as_str()).map_err(|e| {
+                hs_http::error::MatrixError::bad_json(format!("invalid room id: {e}"))
+            })?;
             NewPushRule::Room(NewSimplePushRule::new(room_id.to_owned(), body.actions))
         }
         RuleKind::Sender => {
-            let user_id = <&UserId>::try_from(rule_id.as_str())
-                .map_err(|e| hs_http::error::MatrixError::bad_json(format!("invalid user id: {e}")))?;
+            let user_id = <&UserId>::try_from(rule_id.as_str()).map_err(|e| {
+                hs_http::error::MatrixError::bad_json(format!("invalid user id: {e}"))
+            })?;
             NewPushRule::Sender(NewSimplePushRule::new(user_id.to_owned(), body.actions))
         }
         // `rule_kind` already rejected `_Custom`, and `RuleKind` is `#[non_exhaustive]`, so a
@@ -228,7 +238,11 @@ async fn effective<B: KvBackend + 'static>(
     state: &PushState<B>,
     user_id: &UserId,
 ) -> Result<std::sync::Arc<ruma::push::Ruleset>, hs_http::error::MatrixError> {
-    state.rulesets.effective_ruleset(user_id).await.map_err(store_err)
+    state
+        .rulesets
+        .effective_ruleset(user_id)
+        .await
+        .map_err(store_err)
 }
 
 fn store_err(e: crate::error::StoreError) -> hs_http::error::MatrixError {

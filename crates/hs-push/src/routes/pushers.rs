@@ -3,8 +3,8 @@
 use axum::Json;
 use axum::extract::State;
 use hs_kv::KvBackend;
-use ruma::push::{HttpPusherData, PushFormat};
 use ruma::api::client::push::{EmailPusherData, Pusher, PusherIds, PusherInit, PusherKind};
+use ruma::push::{HttpPusherData, PushFormat};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -15,7 +15,11 @@ pub async fn get_pushers<B: KvBackend + 'static>(
     PushRequester(requester): PushRequester,
     State(state): State<PushState<B>>,
 ) -> Result<Json<Value>, hs_http::error::MatrixError> {
-    let pushers = state.pushers.get_pushers(&requester.user_id).await.map_err(store_err)?;
+    let pushers = state
+        .pushers
+        .get_pushers(&requester.user_id)
+        .await
+        .map_err(store_err)?;
     Ok(Json(json!({ "pushers": pushers })))
 }
 
@@ -36,7 +40,8 @@ pub struct SetPusherBody {
     #[serde(default)]
     data: serde_json::Map<String, Value>,
     #[serde(default)]
-    #[allow(dead_code)] // `append` is accepted but this store has no cross-user pushkey index to
+    #[allow(dead_code)]
+    // `append` is accepted but this store has no cross-user pushkey index to
     // honor the "false replaces any pusher with this pushkey for any user" nuance yet -- see
     // `crate::pushers`'s module docs.
     append: bool,
@@ -68,7 +73,9 @@ pub async fn post_pushers_set<B: KvBackend + 'static>(
                 .data
                 .get("url")
                 .and_then(Value::as_str)
-                .ok_or_else(|| hs_http::error::MatrixError::bad_json("http pushers require data.url"))?
+                .ok_or_else(|| {
+                    hs_http::error::MatrixError::bad_json("http pushers require data.url")
+                })?
                 .to_owned();
             let mut http_data = HttpPusherData::new(url);
             if let Some(format) = body.data.get("format").and_then(Value::as_str) {

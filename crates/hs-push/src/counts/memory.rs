@@ -33,7 +33,11 @@ fn key(user_id: &UserId, room_id: &RoomId, scope: Scope<'_>) -> Key {
 
 #[async_trait::async_trait]
 impl CountsStore for InMemoryCountsStore {
-    async fn get_room_counts(&self, user_id: &UserId, room_id: &RoomId) -> Result<RoomNotificationCounts, StoreError> {
+    async fn get_room_counts(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+    ) -> Result<RoomNotificationCounts, StoreError> {
         let rows = self.rows.read().unwrap();
         let mut out = RoomNotificationCounts::default();
         for ((u, r, thread), counts) in rows.iter() {
@@ -43,10 +47,9 @@ impl CountsStore for InMemoryCountsStore {
             if thread.is_empty() {
                 out.main = *counts;
             } else {
-                let root: OwnedEventId = thread
-                    .as_str()
-                    .try_into()
-                    .map_err(|e| StoreError::Backend(format!("stored thread key is not an event id: {e}")))?;
+                let root: OwnedEventId = thread.as_str().try_into().map_err(|e| {
+                    StoreError::Backend(format!("stored thread key is not an event id: {e}"))
+                })?;
                 out.threads.insert(root, *counts);
             }
         }
@@ -69,8 +72,16 @@ impl CountsStore for InMemoryCountsStore {
         Ok(())
     }
 
-    async fn reset(&self, user_id: &UserId, room_id: &RoomId, scope: Scope<'_>) -> Result<(), StoreError> {
-        self.rows.write().unwrap().remove(&key(user_id, room_id, scope));
+    async fn reset(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+        scope: Scope<'_>,
+    ) -> Result<(), StoreError> {
+        self.rows
+            .write()
+            .unwrap()
+            .remove(&key(user_id, room_id, scope));
         Ok(())
     }
 }

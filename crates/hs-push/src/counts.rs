@@ -94,7 +94,11 @@ impl Scope<'_> {
 pub trait CountsStore: Send + Sync {
     /// Every counted scope for this user in this room, aggregated into [`RoomNotificationCounts`].
     /// A room with no unread notifications returns the all-zero default, not an error.
-    async fn get_room_counts(&self, user_id: &UserId, room_id: &RoomId) -> Result<RoomNotificationCounts, StoreError>;
+    async fn get_room_counts(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+    ) -> Result<RoomNotificationCounts, StoreError>;
 
     /// Increments `scope`'s `notification_count` by one, and its `highlight_count` too if
     /// `highlight` is set. Called exactly once per event per local recipient whose
@@ -112,7 +116,12 @@ pub trait CountsStore: Send + Sync {
     /// called when track 05 tells this crate a read receipt advanced past it (see
     /// `docs/status/10-push.md`'s "Interfaces needed": the receipt-to-reset wiring is track 05's
     /// side of this seam, since 05 owns receipts).
-    async fn reset(&self, user_id: &UserId, room_id: &RoomId, scope: Scope<'_>) -> Result<(), StoreError>;
+    async fn reset(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+        scope: Scope<'_>,
+    ) -> Result<(), StoreError>;
 }
 
 #[cfg(test)]
@@ -161,13 +170,21 @@ mod contract_tests {
         let after_reset = store.get_room_counts(alice, room).await.unwrap();
         assert_eq!(after_reset.main, Counts::default());
         assert_eq!(
-            after_reset.threads.get(thread_root).copied().unwrap().notification_count,
+            after_reset
+                .threads
+                .get(thread_root)
+                .copied()
+                .unwrap()
+                .notification_count,
             1
         );
 
         // Resetting the thread clears it too (and, since it was the last nonzero scope,
         // `threads` goes back to empty rather than keeping a zeroed entry around).
-        store.reset(alice, room, Scope::Thread(thread_root)).await.unwrap();
+        store
+            .reset(alice, room, Scope::Thread(thread_root))
+            .await
+            .unwrap();
         let all_clear = store.get_room_counts(alice, room).await.unwrap();
         assert_eq!(all_clear, RoomNotificationCounts::default());
     }

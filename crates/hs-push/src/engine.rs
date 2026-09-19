@@ -63,7 +63,11 @@ pub fn flatten_event(event_json: &str) -> serde_json::Result<FlattenedJson> {
 /// own sender (`ctx.user_id == event["sender"]`): callers do not need to filter the sender out of
 /// their recipient list themselves, though `crate::compiled`'s hot path still skips the sender up
 /// front to avoid the (cheap but pointless) per-rule check.
-pub async fn evaluate(ruleset: &Ruleset, event: &FlattenedJson, ctx: &PushConditionRoomCtx) -> Option<EvaluationOutcome> {
+pub async fn evaluate(
+    ruleset: &Ruleset,
+    event: &FlattenedJson,
+    ctx: &PushConditionRoomCtx,
+) -> Option<EvaluationOutcome> {
     for rule in ruleset.iter() {
         if !rule.applies(event, ctx).await {
             continue;
@@ -113,7 +117,9 @@ mod tests {
             "room_id": "!spec:example.org",
             "content": {"msgtype": "m.text", "body": "hello"},
         }));
-        let outcome = evaluate(&ruleset, &ev, &ctx).await.expect("a default rule should match");
+        let outcome = evaluate(&ruleset, &ev, &ctx)
+            .await
+            .expect("a default rule should match");
         // `.m.rule.message` (an underride rule) is the lowest-priority catch-all that matches an
         // ordinary text message with no other condition triggered; it notifies without a
         // highlight.
@@ -267,7 +273,9 @@ mod tests {
             "state_key": "",
             "content": {"body": "This room has been replaced"},
         }));
-        let outcome = evaluate(&ruleset, &ev, &ctx).await.expect("tombstone should always notify");
+        let outcome = evaluate(&ruleset, &ev, &ctx)
+            .await
+            .expect("tombstone should always notify");
         assert_eq!(outcome.rule_id, ".m.rule.tombstone");
         assert!(outcome.notify);
     }
@@ -287,7 +295,9 @@ mod tests {
             "state_key": "@alice:example.org",
             "content": {"membership": "invite"},
         }));
-        let outcome = evaluate(&ruleset, &invite_for_alice, &ctx).await.expect("own invite should notify");
+        let outcome = evaluate(&ruleset, &invite_for_alice, &ctx)
+            .await
+            .expect("own invite should notify");
         assert_eq!(outcome.rule_id, ".m.rule.invite_for_me");
 
         let someone_elses_join = event(serde_json::json!({
@@ -321,7 +331,9 @@ mod tests {
                 "m.relates_to": {"rel_type": "m.annotation", "event_id": "$1", "key": "👍"}
             },
         }));
-        let outcome = evaluate(&ruleset, &ev, &ctx).await.expect("reaction rule should match");
+        let outcome = evaluate(&ruleset, &ev, &ctx)
+            .await
+            .expect("reaction rule should match");
         assert_eq!(outcome.rule_id, ".m.rule.reaction");
         assert!(!outcome.notify);
     }
@@ -351,9 +363,10 @@ mod tests {
             "room_id": "!spec:example.org",
             "content": {"msgtype": "m.text", "body": "hi"},
         }));
-        let outcome = evaluate(&ruleset, &ev, &ctx).await.expect("the room rule itself matches");
+        let outcome = evaluate(&ruleset, &ev, &ctx)
+            .await
+            .expect("the room rule itself matches");
         assert_eq!(outcome.rule_id, room.as_str());
         assert!(!outcome.notify);
     }
 }
-

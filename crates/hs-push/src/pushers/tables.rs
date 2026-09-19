@@ -44,8 +44,8 @@ impl<B: KvBackend> PusherStore for TablesPusherStore<B> {
         let mut out = Vec::new();
         for item in self.pushers.range(&snap, spec) {
             let (_, bytes) = item?;
-            let pusher: Pusher =
-                serde_json::from_slice(&bytes).map_err(|e| StoreError::Backend(format!("decode pusher: {e}")))?;
+            let pusher: Pusher = serde_json::from_slice(&bytes)
+                .map_err(|e| StoreError::Backend(format!("decode pusher: {e}")))?;
             out.push(pusher);
         }
         Ok(out)
@@ -53,9 +53,12 @@ impl<B: KvBackend> PusherStore for TablesPusherStore<B> {
 
     async fn set_pusher(&self, user_id: &UserId, pusher: Pusher) -> Result<(), StoreError> {
         let k = key(user_id, &pusher.ids);
-        let value = serde_json::to_vec(&pusher).map_err(|e| StoreError::Backend(format!("encode pusher: {e}")))?;
+        let value = serde_json::to_vec(&pusher)
+            .map_err(|e| StoreError::Backend(format!("encode pusher: {e}")))?;
         transact(&self.backend, TransactConfig::default(), |txn| {
-            self.pushers.put(txn, &k, &value).map_err(hs_kv::KvError::backend)
+            self.pushers
+                .put(txn, &k, &value)
+                .map_err(hs_kv::KvError::backend)
         })
         .map_err(StoreError::from)
     }
@@ -63,7 +66,9 @@ impl<B: KvBackend> PusherStore for TablesPusherStore<B> {
     async fn delete_pusher(&self, user_id: &UserId, ids: &PusherIds) -> Result<(), StoreError> {
         let k = key(user_id, ids);
         transact(&self.backend, TransactConfig::default(), |txn| {
-            self.pushers.delete(txn, &k).map_err(hs_kv::KvError::backend)
+            self.pushers
+                .delete(txn, &k)
+                .map_err(hs_kv::KvError::backend)
         })
         .map_err(StoreError::from)
     }
@@ -80,7 +85,9 @@ mod tests {
     fn sample_pusher(pushkey: &str) -> Pusher {
         PusherInit {
             ids: PusherIds::new(pushkey.to_owned(), "com.example.app".to_owned()),
-            kind: PusherKind::Http(HttpPusherData::new("https://gw.example.org/notify".to_owned())),
+            kind: PusherKind::Http(HttpPusherData::new(
+                "https://gw.example.org/notify".to_owned(),
+            )),
             app_display_name: "Example".to_owned(),
             device_display_name: "Phone".to_owned(),
             profile_tag: None,
@@ -95,7 +102,10 @@ mod tests {
         let alice = user_id!("@alice:example.org");
         let bob = user_id!("@bob:example.org");
 
-        store.set_pusher(alice, sample_pusher("key-1")).await.unwrap();
+        store
+            .set_pusher(alice, sample_pusher("key-1"))
+            .await
+            .unwrap();
         store.set_pusher(bob, sample_pusher("key-2")).await.unwrap();
 
         let alice_pushers = store.get_pushers(alice).await.unwrap();

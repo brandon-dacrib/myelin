@@ -31,6 +31,15 @@
 //!   [`state::PushRequester`], the `hs-auth` `Requester` bridge.
 //! - [`error`]: [`error::StoreError`], mirroring `hs_auth::store::StoreError`'s shape.
 
+#![allow(
+    clippy::result_large_err,
+    reason = "MatrixError is the workspace's standard Matrix-shaped error response type (hs-http). \
+              It is 144 bytes, over clippy's 128-byte threshold, so every handler returning \
+              `Result<_, MatrixError>` trips this lint; crates/hs-appservice/src/routes.rs and \
+              crates/hs-admin/src/router.rs carry the same allow per call site. The real fix is to \
+              shrink MatrixError itself (its `extra` map is the bulk of it), which is an hs-http \
+              change touching every crate and wants its own pass."
+)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 

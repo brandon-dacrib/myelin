@@ -45,8 +45,13 @@ impl Default for RetryPolicy {
 }
 
 fn backoff(policy: &RetryPolicy, attempt: u32) -> Duration {
-    let scale = 1u32.checked_shl(attempt.saturating_sub(1).min(20)).unwrap_or(u32::MAX);
-    policy.base_backoff.saturating_mul(scale).min(policy.max_backoff)
+    let scale = 1u32
+        .checked_shl(attempt.saturating_sub(1).min(20))
+        .unwrap_or(u32::MAX);
+    policy
+        .base_backoff
+        .saturating_mul(scale)
+        .min(policy.max_backoff)
 }
 
 /// Why [`HttpPusherClient::notify`] failed to deliver a notification.
@@ -111,7 +116,11 @@ impl HttpPusherClient {
     /// # Errors
     /// [`NotifyError::ClientError`] on a `4xx` (not retried); [`NotifyError::Exhausted`] if every
     /// attempt up to `RetryPolicy::max_attempts` failed.
-    pub async fn notify(&self, gateway_url: &str, notification: &Notification) -> Result<Vec<String>, NotifyError> {
+    pub async fn notify(
+        &self,
+        gateway_url: &str,
+        notification: &Notification,
+    ) -> Result<Vec<String>, NotifyError> {
         let body = NotifyRequestBody { notification };
         let mut attempt = 0u32;
         let mut last_reason: String;
@@ -151,8 +160,8 @@ impl HttpPusherClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use axum::Router;
     use axum::response::IntoResponse;
@@ -238,7 +247,10 @@ mod tests {
         let url = serve(router).await;
 
         let client = HttpPusherClient::new(fast_retry());
-        let err = client.notify(&url, &sample_notification()).await.unwrap_err();
+        let err = client
+            .notify(&url, &sample_notification())
+            .await
+            .unwrap_err();
         assert!(matches!(err, NotifyError::Exhausted { attempts: 4, .. }));
         assert_eq!(attempts.load(Ordering::SeqCst), 4);
     }
@@ -260,8 +272,21 @@ mod tests {
         let url = serve(router).await;
 
         let client = HttpPusherClient::new(fast_retry());
-        let err = client.notify(&url, &sample_notification()).await.unwrap_err();
-        assert!(matches!(err, NotifyError::ClientError { status: StatusCode::BAD_REQUEST, .. }));
-        assert_eq!(attempts.load(Ordering::SeqCst), 1, "a 4xx must not be retried");
+        let err = client
+            .notify(&url, &sample_notification())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            NotifyError::ClientError {
+                status: StatusCode::BAD_REQUEST,
+                ..
+            }
+        ));
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a 4xx must not be retried"
+        );
     }
 }
