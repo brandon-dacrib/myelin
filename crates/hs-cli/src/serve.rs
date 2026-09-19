@@ -348,6 +348,18 @@ fn build_router<B: KvBackend>(
     }
 
     if legacy_media_enabled {
+        // MSC2246's async upload splits across two prefixes: `create` reserves a content URI under
+        // `/_matrix/media/v1`, while the later fill-in `PUT` uses `v3` like every other legacy
+        // media route. Serving `create` only under `v3` is why it 404'd. Clone the state before
+        // the legacy mount below moves it.
+        let (media_v1_router, media_v1_manifest) = hs_media::router::v1_router::<B>();
+        let media_v1_router = media_v1_router.with_state(mounts.media.clone());
+        builder = builder.merge_router(
+            "/_matrix/media/v1",
+            media_v1_router,
+            media_v1_manifest.routes,
+        );
+
         let (legacy_router, legacy_manifest) = hs_media::router::legacy_router::<B>();
         let legacy_router = legacy_router.with_state(mounts.media);
         builder = builder.merge_router("/_matrix/media/v3", legacy_router, legacy_manifest.routes);
@@ -774,6 +786,29 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         options.media_scanning_config.as_deref(),
         &metrics,
     )?;
+
+    // A content scan in `defer` or `quarantine` mode records its intent durably before the scan
+    // task starts, so a crash cannot lose the verdict — but nothing resolves those rows on its
+    // own. Sweep them once at startup. Spawned rather than awaited: a slow or unreachable scanner
+    // must not hold up binding a listener, and an unresolved item stays unservable meanwhile,
+    // which is the safe direction to fail.
+    {
+        let repository = media_state.repository.clone();
+        tokio::spawn(async move {
+            match repository.resume_pending_scans().await {
+                Ok(0) => {}
+                Ok(count) => {
+                    tracing::info!(
+                        count,
+                        "resumed content scans left pending by a previous run"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(%error, "could not resume pending content scans");
+                }
+            }
+        });
+    }
 
     // Federation is mounted over the same open backend and stores every other surface uses, so a
     // remote server reading `/state` sees exactly what a local client reading `/messages` sees.
