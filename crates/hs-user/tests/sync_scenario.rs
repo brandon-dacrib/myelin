@@ -341,3 +341,162 @@ async fn a_sync_token_issued_before_a_message_returns_it_even_after_unrelated_ac
         response.json
     );
 }
+
+/// The cross-track fix this session exists for: `GET /rooms/{roomId}/messages` (`hs-room`,
+/// track 04) accepting a token minted by `/sync` (this crate's `hsu1_...`), the exact token every
+/// real Matrix client has in hand right after syncing and hands straight to `/messages` to scroll
+/// back -- and Complement's `room_messages_test.go` does the same (`TestSendAndFetchMessage`
+/// feeds a bare `/sync` `next_batch` into `/messages?from=`). Before this session, `hs-room`'s
+/// `PaginationToken::from_str` rejected this shape outright with `400 M_INVALID_PARAM`.
+///
+/// Pagination boundaries are exclusive of the token's own position (matching this crate's
+/// existing room-scoped `timeline.prev_batch`, `crate::sync::build_incremental_timeline`'s doc
+/// comment): a token minted right after observing message M pages *backward* to whatever is
+/// older than M, and *forward* to whatever is newer than M -- never M itself, since the client
+/// already has M from the sync response that handed it the token. This test sends an older and a
+/// newer message around one sync token and checks each direction finds the right one.
+#[tokio::test]
+async fn messages_accepts_a_token_minted_by_sync_in_both_directions() {
+    let (mut s, rooms, hub) = setup();
+    s.register("alice", "alice", "hunter2-alice")
+        .await
+        .assert_ok();
+
+    let create = s
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    create.assert_ok();
+    let room_id = create.str_field("room_id").to_owned();
+    let handle = rooms
+        .get_or_load(&ruma::RoomId::parse(&room_id).unwrap())
+        .await
+        .unwrap();
+    hub.watch_room(handle).await;
+    settle().await;
+
+    s.send(
+        Some("alice"),
+        Method::PUT,
+        &format!("/rooms/{room_id}/send/m.room.message/txn-older"),
+        Some(json!({"msgtype": "m.text", "body": "older message"})),
+    )
+    .await
+    .assert_status(StatusCode::OK);
+    settle().await;
+
+    // The token under test: minted by `/sync`, right after observing "older message" and nothing
+    // else -- exactly what a real client presents to `/messages` next.
+    let baseline = s.sync("alice").await;
+    baseline.assert_ok();
+    let baseline_token = baseline.str_field("next_batch").to_owned();
+
+    s.send(
+        Some("alice"),
+        Method::PUT,
+        &format!("/rooms/{room_id}/send/m.room.message/txn-newer"),
+        Some(json!({"msgtype": "m.text", "body": "newer message"})),
+    )
+    .await
+    .assert_status(StatusCode::OK);
+    settle().await;
+
+    let after = s
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/sync?since={baseline_token}&timeout=0"),
+            None,
+        )
+        .await;
+    after.assert_ok();
+    let after_token = after.str_field("next_batch").to_owned();
+
+    // dir=f from the token minted *before* "newer message": walking forward must find it.
+    let forward = s
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/rooms/{room_id}/messages?dir=f&from={baseline_token}"),
+            None,
+        )
+        .await;
+    forward.assert_ok();
+    let forward_chunk = forward.json["chunk"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        forward_chunk
+            .iter()
+            .any(|e| e["content"]["body"] == "newer message"),
+        "paginating forward from a pre-message /sync token should find the message: {}",
+        forward.json
+    );
+    assert!(
+        !forward_chunk
+            .iter()
+            .any(|e| e["content"]["body"] == "older message"),
+        "forward pagination must not re-return the message already covered by the token: {}",
+        forward.json
+    );
+
+    // dir=b from the token minted *after* "newer message": walking backward must find "older
+    // message" (older than the token), not re-return "newer message" (already covered by it).
+    let backward = s
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/rooms/{room_id}/messages?dir=b&from={after_token}"),
+            None,
+        )
+        .await;
+    backward.assert_ok();
+    let backward_chunk = backward.json["chunk"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        backward_chunk
+            .iter()
+            .any(|e| e["content"]["body"] == "older message"),
+        "paginating backward from a post-message /sync token should find the earlier message: {}",
+        backward.json
+    );
+    assert!(
+        !backward_chunk
+            .iter()
+            .any(|e| e["content"]["body"] == "newer message"),
+        "backward pagination must not re-return the message already covered by the token: {}",
+        backward.json
+    );
+
+    // A token minted by `/messages` itself (this endpoint's own `end`) must still work exactly as
+    // before -- the "don't break what worked" half of this session's brief.
+    let room_local_token = backward.json["end"].as_str().map(str::to_owned);
+    let room_local_token = room_local_token.expect("a non-empty page returns a continuation token");
+    let continued = s
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/rooms/{room_id}/messages?dir=b&from={room_local_token}"),
+            None,
+        )
+        .await;
+    continued.assert_ok();
+
+    // And an outright malformed token (neither format) is still a clean 400, not a panic or a
+    // silently-ignored constraint.
+    s.send(
+        Some("alice"),
+        Method::GET,
+        &format!("/rooms/{room_id}/messages?dir=b&from=garbage-not-a-token"),
+        None,
+    )
+    .await
+    .assert_status(StatusCode::BAD_REQUEST);
+}

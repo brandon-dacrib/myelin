@@ -124,6 +124,10 @@ pub async fn run(base_url: &str) -> Result<Vec<String>> {
         .sync_once(SyncSettings::default())
         .await
         .context("alice's baseline /sync (establishing a `since` token) should succeed")?;
+    // Kept for step 11's forward-pagination proof, below: `alice_baseline.next_batch` itself gets
+    // moved into a `SyncSettings::token(...)` call a few lines down, so this needs to be cloned
+    // out now while it's still whole.
+    let alice_baseline_token = alice_baseline.next_batch.clone();
     let bob_baseline = bob
         .sync_once(SyncSettings::default())
         .await
@@ -248,7 +252,14 @@ pub async fn run(base_url: &str) -> Result<Vec<String>> {
     }
     step!("room membership lists both {alice_id} and {bob_id}");
 
-    // 11. Paginate /messages.
+    // 11. Paginate /messages -- first with no `from` at all (the live end), then, the real point
+    // of this step, with the token `/sync` handed back. This is the exact sequence every real
+    // Matrix client performs (sync, then scroll back from the token that sync gave it), and
+    // exactly what this session's cross-track fix (`hs-user`/`hs-room`) exists for: before it,
+    // `hs-room`'s `/messages` only understood its own room-local pagination token and rejected
+    // `hs-user`'s `/sync` token (`hsu1_...`) outright with `400 M_INVALID_PARAM`. Complement's own
+    // `room_messages_test.go` (`TestSendAndFetchMessage` and siblings) does the same thing with a
+    // bare `next_batch`.
     let page = room
         .messages(MessagesOptions::backward())
         .await
@@ -262,8 +273,55 @@ pub async fn run(base_url: &str) -> Result<Vec<String>> {
         bail!("expected alice's message in a backward /messages page, got bodies: {bodies:?}");
     }
     step!(
-        "backward /messages page contains alice's message ({} events)",
+        "backward /messages page (no `from`, the live end) contains alice's message ({} events)",
         page.chunk.len()
+    );
+
+    // dir=b from `alice_sync_2.next_batch` (a `/sync` token, minted well after alice's original
+    // message -- the rename/topic sync from step 9): must page backward far enough to find it.
+    let sync_token_page = room
+        .messages(MessagesOptions::backward().from(alice_sync_2.next_batch.as_str()))
+        .await
+        .context("GET /messages?dir=b with a token minted by /sync should succeed")?;
+    let sync_token_bodies: Vec<String> = sync_token_page
+        .chunk
+        .iter()
+        .filter_map(|event| event_type_and_body(event).map(|(_, body)| body))
+        .collect();
+    if !sync_token_bodies.iter().any(|b| b.contains(alice_message)) {
+        bail!(
+            "expected alice's message in a backward /messages page paginated from a /sync token, \
+             got bodies: {sync_token_bodies:?}"
+        );
+    }
+    step!(
+        "backward /messages page, paginated from a token /sync handed back (not /messages \
+         itself), contains alice's message ({} events)",
+        sync_token_page.chunk.len()
+    );
+
+    // dir=f from `alice_baseline_token` (a `/sync` token minted *before* alice's message was ever
+    // sent): must page forward far enough to find it -- the same shape as
+    // `TestSendAndFetchMessage`'s `dir=f&from=<pre-message next_batch>`.
+    let forward_page = room
+        .messages(MessagesOptions::forward().from(alice_baseline_token.as_str()))
+        .await
+        .context("GET /messages?dir=f with a token minted by /sync should succeed")?;
+    let forward_bodies: Vec<String> = forward_page
+        .chunk
+        .iter()
+        .filter_map(|event| event_type_and_body(event).map(|(_, body)| body))
+        .collect();
+    if !forward_bodies.iter().any(|b| b.contains(alice_message)) {
+        bail!(
+            "expected alice's message in a forward /messages page paginated from a pre-message \
+             /sync token, got bodies: {forward_bodies:?}"
+        );
+    }
+    step!(
+        "forward /messages page, paginated from a /sync token issued before any messages, \
+         contains alice's message ({} events)",
+        forward_page.chunk.len()
     );
 
     // 12. Log out.

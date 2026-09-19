@@ -42,6 +42,7 @@ use tokio::sync::{Mutex, Notify};
 use crate::error::UserError;
 use crate::room_source::RoomSource;
 use crate::store::DynUserStore;
+use crate::token::SyncToken;
 
 fn membership_of(event: &Event) -> Option<String> {
     event
@@ -101,6 +102,54 @@ fn public_directory_entry<B: KvBackend>(
     }))
 }
 
+/// Implements [`hs_room::registry::GlobalTokenResolver`] by decoding a raw string as this crate's
+/// own [`SyncToken`] and resolving its `feed_seq` via
+/// [`crate::store::UserStore::room_pos_as_of`] -- the exact lookup `crate::sync::resume_mode`
+/// uses to resume an incremental sync's own timeline from the same token, so pagination and
+/// `/sync` resumption agree on what a given token means. Falls back to the user's last recorded
+/// membership-changing position for the room (mirroring `resume_mode`'s own fallback for a room
+/// with no feed entry at or before the token -- a brand new room, or one that has been "hot",
+/// this module's own doc comment, for as long as the user has been a member) before finally
+/// reporting "recognized, but no position" (see [`hs_room::registry::GlobalTokenResolver::resolve`]'s
+/// three-way return). Installed by [`SessionHub::new`]; see that constructor's doc comment for
+/// why installation happens there rather than in `hs-cli`.
+struct FeedTokenResolver {
+    store: DynUserStore,
+}
+
+#[async_trait::async_trait]
+impl hs_room::registry::GlobalTokenResolver for FeedTokenResolver {
+    async fn resolve(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+        raw: &str,
+    ) -> Result<Option<Option<i64>>, hs_room::RoomError> {
+        let Ok(token) = SyncToken::decode(raw) else {
+            return Ok(None); // Not one of ours either -- let the caller report the real error.
+        };
+        let to_internal = |e: crate::store::StoreError| hs_room::RoomError::Internal(e.to_string());
+        if let Some(pos) = self
+            .store
+            .room_pos_as_of(user_id, room_id, token.feed_seq)
+            .await
+            .map_err(to_internal)?
+        {
+            return Ok(Some(Some(pos)));
+        }
+        if let Some(membership) = self
+            .store
+            .get_membership(user_id, room_id)
+            .await
+            .map_err(to_internal)?
+            && membership.room_pos > 0
+        {
+            return Ok(Some(Some(membership.room_pos)));
+        }
+        Ok(Some(None))
+    }
+}
+
 /// The per-process hub: one [`crate::store::UserStore`] shared by every user, a [`RoomSource`]
 /// for querying room member lists, and the in-memory wakers `/sync` long-polls block on.
 ///
@@ -122,8 +171,19 @@ pub struct SessionHub<B: KvBackend, R: RoomSource<B>> {
 
 impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     /// Builds a hub over `store` (durable state) and `rooms` (how to reach a room's actor).
+    ///
+    /// As a side effect, installs a [`FeedTokenResolver`] on `rooms` via
+    /// [`RoomSource::install_global_token_resolver`] (a no-op for any `R` that doesn't override
+    /// it) -- see that trait method and [`hs_room::registry::GlobalTokenResolver`]'s doc comment
+    /// for why this is done *here*, as a side effect of this crate's own, already-unchanged
+    /// construction path, rather than as a step `hs-cli` has to remember to call: it makes a
+    /// token minted by this crate's `/sync` work as `hs-room`'s `GET /messages`'s `from` in the
+    /// real server without either crate's wiring code (in `hs-cli`) needing to change.
     #[must_use]
     pub fn new(store: DynUserStore, rooms: R, fan_out_threshold: usize) -> Self {
+        rooms.install_global_token_resolver(Arc::new(FeedTokenResolver {
+            store: store.clone(),
+        }));
         Self {
             store,
             rooms,

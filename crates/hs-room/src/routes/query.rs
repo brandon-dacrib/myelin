@@ -288,6 +288,13 @@ pub struct MessagesQuery {
 ///
 /// Each event in `chunk` carries `unsigned.m.relations` if it has children
 /// (`crate::relations::bundle`).
+///
+/// `from`, if present, is tried first as this crate's own
+/// [`PaginationToken`]; if that fails to parse, [`crate::registry::RoomRegistry::global_token_resolver`]
+/// (if one is installed) gets a chance to recognize a different token format instead of an
+/// outright `400` -- see [`crate::registry::GlobalTokenResolver`]'s doc comment for why this
+/// indirection exists (in production, `hs-user` installs one so this endpoint accepts a token
+/// minted by `/sync`, matching every real Matrix client's ordinary sync-then-paginate flow).
 pub async fn get_messages<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_id): Path<String>,
@@ -300,11 +307,26 @@ pub async fn get_messages<B: KvBackend + 'static>(
         .as_deref()
         .and_then(Direction::from_query)
         .unwrap_or(Direction::Backward);
-    let from = query
-        .from
-        .as_deref()
-        .map(str::parse::<PaginationToken>)
-        .transpose()?;
+    let from = match query.from.as_deref() {
+        None => None,
+        Some(raw) => match raw.parse::<PaginationToken>() {
+            Ok(token) => Some(token),
+            Err(_) => match state.rooms.global_token_resolver() {
+                Some(resolver) => {
+                    match resolver.resolve(&requester.user_id, &room_id, raw).await? {
+                        // Not shaped like the resolver's own tokens either: neither format
+                        // matched, so this really is an invalid token.
+                        None => return Err(RoomError::InvalidPaginationToken),
+                        // One of the resolver's own tokens, but no position for this room --
+                        // treat exactly like an absent `from` (see the trait doc comment).
+                        Some(None) => None,
+                        Some(Some(pos)) => Some(PaginationToken::new(pos, direction)),
+                    }
+                }
+                None => return Err(RoomError::InvalidPaginationToken),
+            },
+        },
+    };
     let limit = query.limit.unwrap_or(10).min(1000);
 
     // A non-existent room reports the same `403 M_FORBIDDEN` as "you aren't a member of the

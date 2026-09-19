@@ -101,6 +101,12 @@ pub fn router<B: KvBackend + 'static>() -> (axum::Router<RoomState<B>>, RouteMan
             query::get_joined_members::<B>,
             matrix_client("getJoinedMembersByRoom"),
         )
+        // `from=` accepts either this crate's own room-local `PaginationToken` *or* a global
+        // token minted by another crate's own sync (e.g. `hs-user`'s `hsu1_...`), resolved via
+        // `state.rooms`'s optional `registry::GlobalTokenResolver` hook -- see that trait's doc
+        // comment and `docs/status/05-sync.md`'s "Decisions made" for the full design writeup of
+        // why this indirection exists (this crate cannot depend on whoever mints the global
+        // token without creating a cycle).
         .get(
             "/rooms/{roomId}/messages",
             query::get_messages::<B>,

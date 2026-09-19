@@ -2,11 +2,11 @@
 //! See `crate::protocol`'s module docs, "The hot-state cache and its eviction policy".
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use hs_kv::KvBackend;
-use ruma::OwnedRoomId;
+use ruma::{OwnedRoomId, RoomId, UserId};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
@@ -19,6 +19,51 @@ use crate::protocol::RoomUpdate;
 struct Entry<B: KvBackend> {
     handle: RoomActorHandle<B>,
     last_used: Instant,
+}
+
+/// A hook `GET /rooms/{roomId}/messages` (`crate::routes::query::get_messages`) calls when a
+/// `from` token is not shaped like this crate's own [`crate::timeline::PaginationToken`], to ask
+/// whoever mints a *different* opaque token format (in this workspace, `hs-user`'s `/sync`
+/// `hsu1_...` token) whether it recognizes `raw` and, if so, what room-local position it
+/// corresponds to for this user.
+///
+/// # Why this indirection exists
+///
+/// A real Matrix client's ordinary "sync, then paginate backward from where the sync left off"
+/// flow hands `/messages` a token minted by `/sync`, and Complement's own test suite does the
+/// same (`room_messages_test.go`'s `TestSendAndFetchMessage` and siblings feed a bare `/sync`
+/// `next_batch` straight into `/messages?from=`). Resolving that token into a room-local position
+/// needs whatever per-user bookkeeping the minting crate keeps (for `hs-user`, its own durable
+/// per-user feed, `crate::store::UserStore::room_pos_as_of` in that crate) -- data this crate has
+/// no way to reach without depending on the crate that owns it, which would be a cycle (`hs-user`
+/// already depends on `hs-room` for exactly the reverse reason: it renders room timelines using
+/// this crate's own `RoomActor`). Defining this trait *here* and letting the token-minting crate
+/// implement and [`RoomRegistry::install_global_token_resolver`] it at construction time avoids
+/// the cycle in both directions: this crate never names `hs-user` or its token format, and the
+/// installing crate never needs `hs-cli` (or anything else) to change how it wires this crate's
+/// state together -- see `docs/status/05-sync.md`'s "Decisions made" for the full writeup,
+/// including why a single shared wire format across both crates was rejected instead.
+#[async_trait::async_trait]
+pub trait GlobalTokenResolver: Send + Sync {
+    /// Attempts to resolve `raw` for `user_id` reading `room_id`.
+    ///
+    /// Returns:
+    /// - `Ok(None)` if `raw` is not shaped like a token this resolver mints at all -- the caller
+    ///   should fall through to treating `raw` as invalid (neither format matched), not silently
+    ///   drop the constraint.
+    /// - `Ok(Some(None))` if `raw` *is* one of this resolver's own tokens, but does not resolve to
+    ///   any specific room-local position for this room (for example: a token issued before this
+    ///   user's session ever observed the room). The caller should treat this the same as an
+    ///   altogether absent `from` -- paginate from the live end/start -- never as an error, since
+    ///   the token is valid, just uninformative for this particular room.
+    /// - `Ok(Some(Some(pos)))` if `raw` resolves to room-local position `pos`.
+    /// - `Err` only for a genuine backing-store failure, never for "not my format".
+    async fn resolve(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+        raw: &str,
+    ) -> Result<Option<Option<i64>>, RoomError>;
 }
 
 /// The registry: `room_id -> RoomActorHandle`, loaded on first access and dropped after
@@ -37,6 +82,11 @@ pub struct RoomRegistry<B: KvBackend> {
     /// Every resident room's updates, fanned into one stream. See
     /// [`RoomRegistry::subscribe_global`] and `docs/rfcs/0012-room-registry-global-updates.md`.
     global: tokio::sync::broadcast::Sender<RoomUpdate>,
+    /// See [`GlobalTokenResolver`] and [`RoomRegistry::install_global_token_resolver`]. Unset
+    /// (`None`) means no other crate has installed one -- `crate::routes::query::get_messages`
+    /// then treats a `from` token that isn't this crate's own format as a hard error, same as
+    /// before this hook existed.
+    global_token_resolver: OnceLock<Arc<dyn GlobalTokenResolver>>,
 }
 
 impl<B: KvBackend + 'static> RoomRegistry<B> {
@@ -56,7 +106,30 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             identity,
             rooms: Mutex::new(HashMap::new()),
             global,
+            global_token_resolver: OnceLock::new(),
         })
+    }
+
+    /// Installs the [`GlobalTokenResolver`] this registry's `GET /messages` handler consults for
+    /// a `from` token that is not this crate's own [`crate::timeline::PaginationToken`] format.
+    /// Idempotent past the first call: a second install is silently ignored (logged, not
+    /// panicked) rather than risking a surprising resolver swap under a server that somehow
+    /// constructs its wiring twice -- one registry is expected to have exactly one installer for
+    /// the lifetime of the process. See [`GlobalTokenResolver`]'s doc comment for who calls this
+    /// and why.
+    pub fn install_global_token_resolver(&self, resolver: Arc<dyn GlobalTokenResolver>) {
+        if self.global_token_resolver.set(resolver).is_err() {
+            tracing::warn!(
+                "a global token resolver was already installed on this room registry; ignoring \
+                 the second install"
+            );
+        }
+    }
+
+    /// The installed [`GlobalTokenResolver`], if any.
+    #[must_use]
+    pub fn global_token_resolver(&self) -> Option<&Arc<dyn GlobalTokenResolver>> {
+        self.global_token_resolver.get()
     }
 
     /// The handle for `room_id`, loading it from the store if it is not already resident.

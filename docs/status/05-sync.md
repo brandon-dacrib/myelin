@@ -20,12 +20,239 @@ Track brief: `docs/workstreams/05-sync.md`. Owner crates: `hs-user` (this sessio
 also covers `crates/hs-loadgen`, the real-client scenario `docs/next-steps.md` item 2 calls "the
 single best test of whether this is a homeserver").
 
-Last updated: 2026-09-19 (session 2: wired `hs-e2e`'s store into `GET /sync` per
-`docs/rfcs/0013-e2ee-sync-extensions.md` -- `to_device`, `device_lists`, `device_one_time_keys_count`,
-`device_unused_fallback_key_types`; session 1's real-client-scenario work is preserved below
-unchanged).
+Last updated: 2026-09-19 (session 3: a `/sync`-minted token now works as `GET /messages`'s `from`,
+in both directions, joint with track 04's `hs-room` -- see below. Session 2's E2EE work and
+session 1's real-client-scenario work are preserved unchanged further down.)
 
-## Session 2 (this session): making E2EE actually work end to end
+## Session 3 (2026-09-19): a real client can scroll back after syncing -- joint 04/05
+
+**Task**: every real Matrix client's ordinary flow is sync, then paginate backward from the token
+`/sync` just handed it. `hs-user`'s `/sync` mints `hsu1_...` tokens; `hs-room`'s
+`GET /rooms/{roomId}/messages?from=` parsed only its own room-local `crate::timeline::PaginationToken`
+(`<f|b><room_pos>`) and rejected `hsu1_...` outright with `400 M_INVALID_PARAM`. Complement's own
+`room_messages_test.go` hits exactly this (`TestSendAndFetchMessage` and several `TestLeftRoomFixture`
+subtests feed a bare `/sync` `next_batch` straight into `/messages?from=`), and track 04's own
+session-4 status writeup flagged it as a joint 04/05 design question, not a quick patch (see that
+file's "What is left"/"Interfaces needed"). Scope for this session: `crates/hs-user/**`,
+`crates/hs-room/**`, `crates/hs-loadgen/**` and this file, per the joint-session brief; `hs-cli`,
+`hs-e2e`, `hs-media`, `hs-kv` and `hs-cluster` were off limits (other tracks in flight there).
+
+### The decision, made before implementing it
+
+**Two token formats stay, with an explicit, tested conversion at the boundary -- not one shared
+wire format.** What each format encodes, and why merging them was rejected:
+
+- `hs-user`'s `/sync` token (`crate::token::SyncToken`, `hsu1_...`) encodes a **per-user** position
+  (`feed_seq`, an index into that one user's own coalesced, cross-room feed) plus five small
+  independent cursors (to-device, device-list, account-data, presence, receipts). It is
+  deliberately *not* a vector of per-room positions -- `crate::token`'s own module doc explains why
+  at length: a token that grew with the number of rooms a user is in would defeat the point of an
+  opaque, constant-size token a client stores and echoes back. This is not a Phase-0 shortcut to
+  revisit; it is the whole reason `/sync` scales to a power user with thousands of rooms.
+- `hs-room`'s pagination token (`crate::timeline::PaginationToken`, e.g. `b42`) encodes a
+  **room-local** timeline position (`room_pos`, an `i64` the room's own actor assigns, monotonic
+  *within that room only*, unrelated to any other room's numbering) plus a direction. This is what
+  `RoomActor::paginate`'s `BTreeMap`-backed timeline actually indexes by, and it has no notion of
+  "which user" at all -- pagination position is the same for every reader of a room.
+- **These are genuinely different axes, not two encodings of the same fact.** A `feed_seq` cannot
+  be turned into a `room_pos` by decoding bytes differently; it requires per-user, per-room
+  bookkeeping (`crate::store::UserStore::room_pos_as_of`, `hs-user`'s own durable feed) that
+  `hs-room` has no reason to duplicate and no way to reach without depending on `hs-user` --  which
+  would be a cycle, since `hs-user` already depends on `hs-room` (to render room timelines via
+  `hs_room::actor::RoomActor` inside `/sync` itself). Making the two crates mint literally the same
+  wire format was therefore not just extra work but architecturally backwards: it would mean
+  either baking a per-room position vector into `/sync`'s token (the exact bloat `SyncToken`'s
+  design rejects) or making `hs-room`'s pagination carry `hs-user`'s five unrelated cursors for no
+  reason a room-only reader would ever need.
+- **What resolves the mismatch: `hs-room`'s `GET /messages` now takes an optional hook**
+  (`hs_room::registry::GlobalTokenResolver`, installed on `RoomRegistry` via the new
+  `install_global_token_resolver`) that a token-minting crate can implement to translate its own
+  opaque string into a room-local position, without either crate depending on the other's types.
+  `hs-room` defines the trait (it is the *consumer*: `crate::routes::query::get_messages` tries its
+  own `PaginationToken::from_str` first, and only on failure asks the installed resolver "do you
+  recognize this token, and if so, what room-local position does it mean for this user in this
+  room?"). `hs-user` implements it (`crate::hub::FeedTokenResolver`, decoding `SyncToken` and
+  calling `UserStore::room_pos_as_of`, with the same membership-position fallback
+  `crate::sync::resume_mode` already uses for a room with no feed entry at or before the token) and
+  installs one on every `SessionHub::new` call -- see "How it gets wired into the real server"
+  below for why that particular call site, not `hs-cli`, does the installing.
+- **Rejected alternative: move `GET /messages` into `hs-user` entirely.** Tried first, actually --
+  `hs-user` already has everything needed (a `RoomSource<B>` over the same `RoomRegistry`, plus its
+  own feed store) to re-implement the handler by calling `hs-room`'s already-`pub` `RoomActor`
+  primitives (`can_read_room`, `paginate`, `event_visible_to`, `relation_bundle`) directly, the way
+  `crate::sync::build_incremental_timeline` already does for `/sync`'s own room timelines. This
+  was abandoned once it broke `crates/hs-room/tests/scenario.rs`, which builds and drives
+  `hs_room::routes::router()` **standalone** (no `hs-user` merged in) and asserts on `/messages`
+  directly -- unmounting the route from `hs-room`'s own router to move it elsewhere would have
+  meant either breaking that test suite outright or rewriting it to pull in `hs-user`, a much
+  larger and riskier change for a session scoped to a token-format mismatch. The
+  `GlobalTokenResolver` hook gets the same practical result (a token minted by `/sync` works
+  against `/messages`) without moving the route or touching `hs-room`'s own test harness at all --
+  `cargo test -p hs-room` still exercises the exact same router it always has, 48/48 green.
+- **What happens to tokens already issued by a running server.** Nothing breaks, in either
+  direction: an already-issued `hs-room`-native `PaginationToken` string (`b42`) still parses via
+  `PaginationToken::from_str` first, exactly as before this session, and never reaches the resolver
+  at all. An already-issued `hs-user` `SyncToken` (`hsu1_...`) that could not previously be used
+  against `/messages` now can; nothing that used to work stops working, and there is no wire-format
+  version bump on either side (`SyncToken`'s own `VERSION` byte and `PaginationToken`'s own shape
+  are both untouched). A token that matches neither format still gets the same `400
+  M_INVALID_PARAM: invalid pagination token` it always did.
+- **Pagination boundary semantics: exclusive of the resolved position, in both directions**,
+  matching the *existing* room-scoped `timeline.prev_batch` `/sync` already hands out
+  (`crate::sync::build_incremental_timeline`'s `PaginationToken::new(resume_pos, Backward)`, never
+  changed by this session). A token minted right after a client observed message M pages backward
+  to whatever is *older* than M and forward to whatever is *newer*, never re-returning M itself --
+  the client already has M from the sync response that handed it the token. Verified directly in
+  `crates/hs-user/tests/sync_scenario.rs::messages_accepts_a_token_minted_by_sync_in_both_directions`
+  (below).
+
+### Implementation
+
+- **`crates/hs-room/src/registry.rs`**: new `GlobalTokenResolver` trait (`async fn resolve(&self,
+  user_id, room_id, raw: &str) -> Result<Option<Option<i64>>, RoomError>` -- outer `None` means "not
+  my token format", `Some(None)` means "my format, but no position for this room", `Some(Some(pos))`
+  is a resolved room-local position), a new `OnceLock<Arc<dyn GlobalTokenResolver>>` field on
+  `RoomRegistry`, and `RoomRegistry::install_global_token_resolver`/`global_token_resolver`. Added
+  `async-trait` to `hs-room`'s own `[dependencies]` (already in the workspace's
+  `[workspace.dependencies]`, just not previously used by this crate -- noted under "Shared
+  dependencies added").
+- **`crates/hs-room/src/routes/query.rs::get_messages`**: `from` is tried as `PaginationToken`
+  first (unchanged behavior for a token this endpoint or `/sync`'s room-scoped `prev_batch` already
+  mints); on parse failure, if a resolver is installed, its three-way answer is used (not
+  recognized -> `400`; recognized but unresolved -> treated as an absent `from`; resolved ->
+  a `PaginationToken` at that position, in the requested direction). No behavior change at all when
+  no resolver is installed (a test harness that constructs `RoomRegistry` directly and never touches
+  `hs-user`, like `crates/hs-room/tests/scenario.rs`, sees exactly the pre-session behavior).
+- **`crates/hs-user/src/room_source.rs`**: `RoomSource<B>` gained a new trait method,
+  `install_global_token_resolver`, defaulted to a no-op (a test double that never touches
+  `hs-room`'s HTTP layer has nothing to install it on) and overridden for `Arc<RoomRegistry<B>>` to
+  forward to `RoomRegistry::install_global_token_resolver`.
+- **`crates/hs-user/src/hub.rs`**: new private `FeedTokenResolver` implementing
+  `hs_room::registry::GlobalTokenResolver` by decoding `raw` as a `SyncToken` and resolving via
+  `UserStore::room_pos_as_of`, falling back to the user's last recorded membership position for the
+  room (mirroring `crate::sync::resume_mode`'s own fallback), then finally "recognized, no
+  position". `SessionHub::new` now installs one of these on `rooms` (its `RoomSource<B>`) as a
+  side effect of construction.
+- **How it gets wired into the real server, without touching `hs-cli`.** This session's brief
+  forbids editing `crates/hs-cli` (other tracks in flight there), and `RoomState<B>`/`UserState<B,
+  R>` are both constructed by call sites inside `hs-cli` that this session cannot change the
+  arity of. Installing the resolver as a side effect of `SessionHub::new(store, rooms,
+  fan_out_threshold)` -- a function whose call site in `hs-cli` (`build_session_mounts`) already
+  passes it the exact same `Arc<RoomRegistry<B>>` (as `rooms`, monomorphizing `R`) that gets handed
+  to `RoomState<B>` right next to it -- means the wiring happens automatically the moment `hs-cli`'s
+  existing, completely unmodified code runs. This mirrors the workspace's established "leave a
+  clear seam, don't require a coordinated edit" convention (the same one that resolved the
+  `/publicRooms` collision between these two crates last session): the fix is entirely inside
+  `hs-user`'s and `hs-room`'s own crates, and the real server picks it up with no `hs-cli` change
+  at all -- confirmed by `cargo build -p hs-cli --bin hs` succeeding unchanged and the loadgen
+  proof below running against that exact binary.
+
+### Proof
+
+**Fast, in-process proof** (`crates/hs-user/tests/sync_scenario.rs::messages_accepts_a_token_minted_by_sync_in_both_directions`,
+new this session): sends an older message, takes a `/sync` token, sends a newer message, takes
+another `/sync` token, then: `dir=f` from the pre-newer-message token finds the newer message and
+not the older one; `dir=b` from the post-newer-message token finds the older message and not the
+newer one (see "Pagination boundary semantics" above for why each direction excludes exactly the
+message it does); a token minted by `/messages` itself still works (backward compatibility); an
+outright malformed token still gets a clean `400`, not a panic. All pass.
+
+**Real-client proof against the actual binary**, per this session's mandate ("prove it with the
+real client, not a unit test"). `crates/hs-loadgen`'s scenario (`crates/hs-loadgen/src/scenario.rs`,
+step 11) previously paginated `/messages` with `MessagesOptions::backward()` and no `from` at all
+(`from: None` sends no `from` query parameter whatsoever -- the exact gap that let this bug survive
+every previous session's run of this scenario, since it never actually exercised token parsing).
+Extended to page using the token `alice_sync_2.next_batch` (minted by a real `/sync` call, after
+alice's message, the room rename and the topic change) for `dir=b`, and a token captured before any
+message was sent (`alice_baseline_token`, cloned out before its original binding was consumed by an
+earlier `SyncSettings::token(...)` call) for `dir=f`.
+
+Run with:
+```
+cargo build -p hs-cli --bin hs
+cargo test -p hs-loadgen --test real_client -- --nocapture
+```
+
+Relevant step lines from an actual run (19/19 steps, full log has every step):
+```
+- backward /messages page (no `from`, the live end) contains alice's message (10 events)
+- backward /messages page, paginated from a token /sync handed back (not /messages itself), contains alice's message (10 events)
+- forward /messages page, paginated from a /sync token issued before any messages, contains alice's message (4 events)
+```
+
+### Verification, all clean this session
+
+```
+cargo fmt -p hs-user -p hs-room -p hs-loadgen
+cargo clippy -p hs-user -p hs-room -p hs-loadgen --all-targets -- -D warnings
+cargo test -p hs-room                                    # 48/48 (38 lib/unit + 10 scenario), unchanged count
+cargo test -p hs-user                                    # 41 lib/unit + 3 sync_scenario (was 2; +1 new), all green
+cargo build -p hs-cli --bin hs
+cargo test -p hs-loadgen --test real_client -- --nocapture              # 19/19 steps (was 17; +2 new)
+cargo test -p hs-loadgen --test real_client_encrypted -- --nocapture    # unchanged, still green -- see its own
+                                                                          # step list: E2EE end-to-end decryption
+                                                                          # and the 53-caller /keys/claim atomicity
+                                                                          # probe both still pass, confirming this
+                                                                          # session did not regress track 08's work.
+```
+
+`cargo test -p hs-cli --test e2e` **could not be run to completion this session**: `hs-cli`'s own
+lib fails to compile independent of anything touched here (`crates/hs-cli/src/audit.rs`, a new,
+untracked file another track is actively adding concurrently, has a genuine type error at its own
+`highest_sequence` -- `TupleKey::decode` called with a `&(u64, String)` where it wants `&[u8]`).
+Confirmed not caused by this session: nothing in this session's diff touches `hs-cli` at all (out
+of scope per this session's brief), and `cargo build -p hs-cli --bin hs` succeeded cleanly earlier
+in this same session, before that file's concurrent edit landed. Whoever owns `hs-cli`/the admin
+audit log next should rerun `cargo test -p hs-cli --test e2e` once `audit.rs` compiles again --
+nothing in this session's own testing gives any reason to expect it to fail.
+
+### Bonus items (from the joint session's "if you have time" list): not reached
+
+Both remaining items on track 04's own "What is left" -- `GET /context`'s `state` field still
+reading live current state instead of state pinned to the target event, and `hs-user`'s
+`hub.rs::public_directory_entry` inferring "public" from the join rule instead of calling
+`RoomRegistry::is_directory_public` -- were explicitly lower priority than the token-format fix
+and its proof, and were not reached this session given the time the token-format design question
+and the `hs-cli` compile blocker above took to resolve and verify. Both remain open; see track 04's
+own status file for the exact fix each implies (`RoomActor::state_at_event` for the first;
+`RoomRegistry::is_directory_public`, already `pub`, for the second).
+
+### Interfaces provided (session 3)
+
+- `hs_room::registry::GlobalTokenResolver` (new trait) and
+  `RoomRegistry::{install_global_token_resolver, global_token_resolver}` (new methods) -- any
+  crate that mints its own opaque pagination-adjacent token and wants `hs-room`'s `/messages` to
+  accept it can implement this trait and install one, the same way `hs-user` now does.
+- `hs_user::room_source::RoomSource::install_global_token_resolver` (new trait method, defaulted):
+  any future alternate `RoomSource<B>` implementation (a federation or cluster-forwarding shim,
+  per that trait's own module doc) inherits the no-op default unless it overrides it.
+
+### Interfaces needed (session 3)
+
+None new from this session's own work. Track 04's two still-open items above remain on that
+track's "Interfaces needed" list, unchanged by this session.
+
+### Decisions made (session 3)
+
+See "The decision, made before implementing it" above for the full writeup (two token formats,
+explicit resolver-hook conversion at the boundary, rejected alternatives, and what happens to
+already-issued tokens). Additionally:
+
+- **The resolver is installed by `SessionHub::new`, not by a new step in `hs-cli`.** See "How it
+  gets wired into the real server" above -- this session could not edit `hs-cli` at all, so the
+  wiring had to be a side effect of a call site `hs-cli` already makes unchanged.
+- **`crates/hs-room/tests/scenario.rs` was left completely untouched.** It was the deciding
+  argument against moving `/messages` into `hs-user` -- see "Rejected alternative" above.
+
+### Shared dependencies added (session 3)
+
+- `hs-room/Cargo.toml`: `async-trait.workspace = true` (already present in the root
+  `[workspace.dependencies]`; not previously used by this crate). Needed for
+  `GlobalTokenResolver`'s `#[async_trait::async_trait]`.
+
+---
+
+## Session 2: making E2EE actually work end to end
 
 **Task**: track 08 drove two real encrypting `matrix-sdk` clients against the real binary and
 found that every `hs-e2e` route worked, but the recipient could never decrypt a message because

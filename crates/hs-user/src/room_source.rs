@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use hs_kv::KvBackend;
 use hs_room::actor::RoomActorHandle;
-use hs_room::registry::RoomRegistry;
+use hs_room::registry::{GlobalTokenResolver, RoomRegistry};
 use ruma::RoomId;
 
 /// Errors [`RoomSource::get_or_load`] can return. A thin, `Send`-safe wrapper around
@@ -34,12 +34,23 @@ pub trait RoomSource<B: KvBackend + 'static>: Send + Sync {
     /// Returns [`RoomSourceError::RoomNotFound`] if the room does not exist, or any error the
     /// underlying source's load path can return.
     async fn get_or_load(&self, room_id: &RoomId) -> Result<RoomActorHandle<B>, RoomSourceError>;
+
+    /// Wires up `resolver` so `hs-room`'s `GET /messages` can resolve a token minted by this
+    /// crate's own `/sync` (see [`GlobalTokenResolver`]'s doc comment for the full "why").
+    /// Default no-op: only a source backed by a real `hs_room::registry::RoomRegistry` (the
+    /// production case, and the one override below) has anywhere to put this; a test double that
+    /// never calls `hs-room`'s HTTP layer at all has no need for it.
+    fn install_global_token_resolver(&self, _resolver: Arc<dyn GlobalTokenResolver>) {}
 }
 
 #[async_trait::async_trait]
 impl<B: KvBackend + 'static> RoomSource<B> for Arc<RoomRegistry<B>> {
     async fn get_or_load(&self, room_id: &RoomId) -> Result<RoomActorHandle<B>, RoomSourceError> {
         RoomRegistry::get_or_load(self, room_id).await
+    }
+
+    fn install_global_token_resolver(&self, resolver: Arc<dyn GlobalTokenResolver>) {
+        RoomRegistry::install_global_token_resolver(self, resolver);
     }
 }
 
