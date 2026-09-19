@@ -311,7 +311,7 @@ async fn send_rejects_a_pdu_with_a_tampered_signature() {
 }
 
 #[tokio::test]
-async fn send_reports_the_persistence_gap_for_a_genuinely_new_event_not_a_501() {
+async fn send_rejects_a_new_event_whose_auth_events_do_not_authorize_it() {
     let harness = Harness::new().await;
     let (room_id, _event_id) = harness.room_with_a_message().await;
 
@@ -354,9 +354,19 @@ async fn send_reports_the_persistence_gap_for_a_genuinely_new_event_not_a_501() 
     assert_eq!(pdus.len(), 1);
     let (_, result) = pdus.iter().next().unwrap();
     let error = result.get("error").and_then(Value::as_str).unwrap_or("");
+    // This PDU is correctly hashed and signed, so it gets past `verify_pdu` -- and then fails for
+    // the right reason. It cites no `m.room.create` in its `auth_events` (it cites nothing at
+    // all), so the auth rules refuse it. Before `RoomActor::accept_remote_event` existed this
+    // test asserted a "cannot yet persist" message instead, because nothing downstream of
+    // verification ran at all; that wall is gone, and what a bad event now meets is the real
+    // rules.
     assert!(
-        error.contains("cannot yet persist"),
-        "expected the documented persistence-gap message, got: {response}"
+        error.contains("m.room.create") || error.contains("auth"),
+        "expected an authorization failure naming what was wrong, got: {response}"
+    );
+    assert!(
+        !error.contains("cannot yet persist"),
+        "the persistence gap is closed; this message should no longer appear: {response}"
     );
 }
 
@@ -388,7 +398,7 @@ async fn make_join_builds_a_real_template_against_the_real_room() {
 }
 
 #[tokio::test]
-async fn send_join_v2_validates_for_real_and_reports_the_persistence_gap() {
+async fn send_join_v2_persists_the_join_and_it_is_readable_afterwards() {
     let harness = Harness::new().await;
     let (room_id, _event_id) = harness.room_with_a_message().await;
 
@@ -429,15 +439,42 @@ async fn send_join_v2_validates_for_real_and_reports_the_persistence_gap() {
             &signed,
         )
         .await;
-    // Real validation (signature, hash, shape, authorization against real current state) all
-    // succeed; only persistence is the honest remaining gap. This *is* a 501 (a fair status for
-    // "this action is understood and valid but this server cannot carry it out yet"), but -- the
-    // point of this test -- it is a *distinct*, specific errcode, not the old blanket seam's
-    // generic `M_NOT_IMPLEMENTED`: a caller (or a test) can tell "this route doesn't exist yet"
-    // apart from "this specific join was valid and still could not be persisted".
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(
-        response["errcode"], "M_HS_INBOUND_INGESTION_UNSUPPORTED",
-        "expected the documented persistence-gap errcode, not the generic seam one: {response}"
+    // The whole path now runs: signature, content hash, shape, the sender's server matching the
+    // requester, authorization against real current state, and -- new -- persistence through
+    // `RoomActor::accept_remote_event`. This test used to assert a 501 with a distinct errcode
+    // because the last step had nowhere to go.
+    assert_eq!(status, StatusCode::OK, "{response}");
+
+    // The join is not merely acknowledged: a remote's join is now real state on this server, and
+    // the read side agrees. `/event/{id}` serves the event back, and it is the *same* event --
+    // the bytes a remote signed, not a re-authored copy with our own signature on it.
+    let joined_event_id = event.event_id().to_string();
+    let (status, fetched) = harness
+        .signed_get(&format!("/event/{joined_event_id}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "the join should be readable: {fetched}");
+    let stored = &fetched["pdus"][0];
+    assert_eq!(stored["type"], "m.room.member");
+    assert_eq!(stored["state_key"], format!("@bob:{REMOTE}"));
+    assert_eq!(stored["content"]["membership"], "join");
+    assert!(
+        stored["signatures"][REMOTE].is_object(),
+        "the remote's own signature must survive storage byte-for-byte: {fetched}"
     );
+
+    // And it is state, not just a timeline entry: the room's current state names bob as joined.
+    let (status, state) = harness
+        .signed_get(&format!("/state/{room_id}?event_id={joined_event_id}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{state}");
+    let has_bob = state["pdus"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|pdu| {
+            pdu["type"] == "m.room.member"
+                && pdu["state_key"] == format!("@bob:{REMOTE}")
+                && pdu["content"]["membership"] == "join"
+        });
+    assert!(has_bob, "bob's join should be in the room's state: {state}");
 }

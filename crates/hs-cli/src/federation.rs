@@ -628,7 +628,7 @@ impl<B: KvBackend + 'static> hs_federation::inbound::RoomWriteSink for RegistryW
         &self,
         room_id: &str,
         event_id: &str,
-        _event_json: &Value,
+        event_json: &Value,
     ) -> Result<hs_federation::inbound::WriteOutcome, hs_federation::inbound::WriteRejected> {
         use hs_federation::inbound::{WriteOutcome, WriteRejected};
 
@@ -648,12 +648,39 @@ impl<B: KvBackend + 'static> hs_federation::inbound::RoomWriteSink for RegistryW
         if known {
             return Ok(WriteOutcome::AlreadyKnown);
         }
-        Err(WriteRejected {
-            error: "this server cannot yet persist a newly received federation event into its \
-                    own room store: hs-room's RoomActor has no API to accept an already-signed \
-                    event from another server (see docs/status/06-federation.md)"
-                .to_owned(),
-        })
+
+        // The event has already had its content hash and signature checked by
+        // `hs_federation::inbound::verify_pdu` before reaching this sink -- that is the contract
+        // `hs_room::actor::RoomActor::accept_remote_event` documents for its caller, and it
+        // deliberately does not redo that work. What it does do is authorize the event against
+        // the state its own `auth_events` imply and the state resolved from its `prev_events`,
+        // then store it byte-identically, signatures and all.
+        let room_version = handle.query(|actor| actor.room_version().clone()).await;
+        let event = hs_model::Event::parse(event_json, room_version).map_err(|e| WriteRejected {
+            error: format!("event is not parseable at this room's version: {e}"),
+        })?;
+
+        match handle.accept_remote_event(event).await {
+            Ok(hs_room::actor::RemoteEventOutcome::Stored(_)) => Ok(WriteOutcome::Stored),
+            Ok(hs_room::actor::RemoteEventOutcome::AlreadyKnown) => Ok(WriteOutcome::AlreadyKnown),
+            // A missing ancestor is not a rejection of this event: it means this server has a hole
+            // in the DAG and must backfill before the event can be authorized at all. It is
+            // reported distinctly so a remote (and our own logs) can tell the two apart -- the
+            // backfill-then-retry loop itself is still track 06's to build.
+            Err(hs_room::RoomError::MissingAncestors(ids)) => Err(WriteRejected {
+                error: format!(
+                    "missing {} ancestor event(s) this server has not backfilled yet: {}",
+                    ids.len(),
+                    ids.iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }),
+            Err(e) => Err(WriteRejected {
+                error: e.to_string(),
+            }),
+        }
     }
 }
 

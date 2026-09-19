@@ -1,5 +1,17 @@
 # 06 Federation: status
 
+> **Integration note, 2026-09-19 (integration lead):** the gap this file describes below as "the
+> one gap this session could not close" — no way to persist a newly received foreign event — is
+> **closed**. Track 04 added `hs_room::actor::RoomActor::accept_remote_event`, and
+> `hs_cli::federation::RegistryWriteSink` now calls it, so `PUT /send/{txnId}` and `send_join`
+> both store events for real. `crates/hs-cli/tests/federation_writes.rs` proves it against a real
+> signed request: a remote's join is persisted, readable back through `/event/{id}` with the
+> remote's own signature intact, and present in the room's state. `MissingAncestors` is reported
+> distinctly from a rejection, so "I must backfill first" never looks like "this event is
+> unauthorized"; the backfill-then-retry loop itself is still this track's to build. The two tests
+> that asserted the gap were rewritten to assert what now happens instead.
+
+
 Updated: 2026-09-18 (fourth session -- the write session: `/send` and the join handshake are real
 now, not seams; see "Fourth session: `/send`, `make_join`/`send_join`, and the v2 mount fix" below).
 Previously updated: 2026-09-18 (third session, the mounting session; see "Mounted into `hs serve`"
