@@ -81,7 +81,6 @@ pub fn layer(origins: &[String]) -> CorsLayer {
 /// The spec also requires that `OPTIONS` never run an endpoint's own logic. `CorsLayer` answers
 /// preflight requests itself before the inner service is called, which satisfies that by
 /// construction.
-#[must_use]
 pub fn matrix_layer() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::any())

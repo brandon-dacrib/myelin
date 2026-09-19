@@ -399,6 +399,12 @@ fn build_router<B: KvBackend>(
     let router = router.merge(synapse_admin_router);
 
     let router = router
+        // Without this a browser client cannot talk to this server at all: it fails every
+        // request after the preflight and shows only opaque network errors. Found by pointing
+        // Element Web at it. The policy is the spec's own (wildcard origin, the five methods, the
+        // three headers), and is deliberately not the admin API's same-origin default — see
+        // `hs_http::cors::matrix_layer`.
+        .layer(hs_http::cors::matrix_layer())
         .layer(Extension(well_known))
         .layer(Extension(ready))
         .layer(Extension(unstable_features))
@@ -537,6 +543,7 @@ fn build_session_mounts<B: KvBackend>(
 fn admin_state<B: KvBackend + 'static>(
     auth: &AuthState,
     audit: Arc<crate::audit::TablesAuditSink<B>>,
+    rooms: &Arc<hs_room::registry::RoomRegistry<B>>,
     server_name: &str,
     enabled_components: Vec<String>,
 ) -> hs_admin::router::AdminState {
@@ -548,6 +555,12 @@ fn admin_state<B: KvBackend + 'static>(
     .with_users(Arc::new(
         hs_auth::admin_directory::AuthStoreUserDirectory::from_auth_state(auth),
     ))
+    // Until this, every `/api/v1/rooms*` operation answered an honest 503 saying no room source
+    // was wired. It is wired now, and blocking a room through the admin API stops its very next
+    // message.
+    .with_rooms(Arc::new(hs_room::admin::RoomRegistryDirectory::new(
+        rooms.clone(),
+    )))
     .with_server_info(hs_admin::model::ServerInfo {
         name: server_name.to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -946,6 +959,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
                 crate::audit::TablesAuditSink::open(backend.clone())
                     .map_err(|e| ServeError::Sessions(Box::new(e)))?,
             ),
+            &rooms,
             server_name.as_str(),
             enabled_components,
         ),
@@ -957,6 +971,18 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // DAG (`docs/status/03-cluster.md`'s two-replica experiment). Inert in single-node mode
     // (`config.cluster.single_node`, the default) — this matches today's behavior exactly.
     let cluster_handles = crate::cluster::start(&config, backend.clone()).await?;
+
+    // The routing gate above stops two replicas both building a room actor, which is what closed
+    // the silent split-brain. This is the belt-and-braces underneath it: the fence is read inside
+    // the same transaction the write commits in, so a handoff that races the gate's ownership
+    // check still cannot land a write. Inert in single-node mode, which is why it is installed
+    // unconditionally.
+    rooms.install_fencing(Arc::new(hs_room::fencing::RoomFencing {
+        ownership: cluster_handles.cluster.ownership().clone(),
+        layout: cluster_handles.layout.clone(),
+        cluster_store: hs_cluster::store::ClusterStore::open(backend.clone())
+            .map_err(|e| ServeError::Sessions(Box::new(e)))?,
+    }));
 
     let ready = Arc::new(AtomicBool::new(true));
     let unstable_features = Arc::new(versions::load_unstable_features(

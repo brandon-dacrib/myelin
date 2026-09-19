@@ -5,12 +5,14 @@
 //!
 //! Reported honestly against what `hs serve` actually mounts today
 //! (`crates/hs-cli/src/serve.rs::build_router`): `m.change_password` is `true` (`POST
-//! /account/password` is `hs-auth`'s own route and is mounted). `m.set_displayname`,
-//! `m.set_avatar_url` and `m.3pid_changes` are `false` — no profile or 3PID-management HTTP
-//! routes are mounted yet, even though `hs-auth::store::UserStore` has `bind_threepid` at the
-//! storage-trait level (nothing exposes it over HTTP). Update this alongside `crate::versions`'s
-//! `unstable_features` as more routers get mounted here, and note the addition in
-//! `docs/status/12-platform-and-kubernetes.md`.
+//! /account/password` is `hs-auth`'s own route and is mounted). `m.set_displayname` and
+//! `m.set_avatar_url` are `true` — `PUT /profile/{userId}/displayname` and `.../avatar_url` are
+//! mounted, persist, and propagate into membership events. They kept reporting `false` for a
+//! while after those routes landed, which a real client reads as "this server will not let me
+//! change my name": a capability claim is only worth anything if it tracks the routes, so change
+//! both together. `m.3pid_changes` is still `false` — `hs_auth::store::UserStore` has
+//! `bind_threepid` at the storage-trait level and nothing exposes it over HTTP. Update this
+//! alongside `crate::versions`'s `unstable_features` as more routers get mounted here.
 //!
 //! # `m.room_versions`
 //!
@@ -52,8 +54,8 @@ pub async fn get_capabilities() -> Json<Value> {
     Json(json!({
         "capabilities": {
             "m.change_password": {"enabled": true},
-            "m.set_displayname": {"enabled": false},
-            "m.set_avatar_url": {"enabled": false},
+            "m.set_displayname": {"enabled": true},
+            "m.set_avatar_url": {"enabled": true},
             "m.3pid_changes": {"enabled": false},
             "m.room_versions": {
                 "default": DEFAULT_ROOM_VERSION,
@@ -68,10 +70,14 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn reports_change_password_enabled_and_profile_routes_absent() {
+    async fn reports_what_is_actually_mounted() {
         let Json(body) = get_capabilities().await;
         assert_eq!(body["capabilities"]["m.change_password"]["enabled"], true);
-        assert_eq!(body["capabilities"]["m.set_displayname"]["enabled"], false);
+        // Both profile routes are mounted and work; claiming otherwise tells a client it cannot
+        // change its display name when it can.
+        assert_eq!(body["capabilities"]["m.set_displayname"]["enabled"], true);
+        assert_eq!(body["capabilities"]["m.set_avatar_url"]["enabled"], true);
+        // No 3PID management is exposed over HTTP.
         assert_eq!(body["capabilities"]["m.3pid_changes"]["enabled"], false);
     }
 
