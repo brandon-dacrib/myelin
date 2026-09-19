@@ -1,10 +1,307 @@
 # 03 Cluster: status
 
-Updated: 2026-09-18 (integration-review follow-up: strengthened the chaos suite's headline test,
-verified by mutation testing; added mesh connection pooling and its own tests; assessed and
-deferred Kubernetes `Lease` membership).
+> **Integration note, 2026-09-19 (integration lead): reproduced independently, with one
+> correction.** The silent DAG fork in answer 3 is real and reproduces exactly: two replicas on
+> one PostgreSQL, five concurrent sends through each, every request `200` — then `/messages` on
+> replica A returns only A's five messages and on replica B only B's five, permanently, with no
+> error ever surfaced to any client. Room *state* created on A is visible on B immediately (B
+> served the room's `m.room.name` correctly), which makes the fork harder to notice, not easier:
+> a client sees a working room that silently drops half its traffic.
+>
+> **The correction is to answer 1.** Two replicas do *not* always start cleanly. Started
+> simultaneously against an empty database, one of them dies at boot:
+>
+> ```
+> NOTICE: schema "public" already exists, skipping
+> hs serve: storage backend error: backend error: db error
+> ```
+>
+> Started staggered — A first, then B once the schema exists — B starts fine, which is presumably
+> how the experiment below was run. So there is a **cold-start schema race**: concurrent
+> `CREATE`-style setup against a fresh database is not idempotent under concurrency, and the loser
+> exits with an error that says nothing useful ("db error" — no SQLSTATE, no statement, no table
+> name). Two separate defects to fix: the race itself (create the schema in a single transaction
+> that tolerates a concurrent creator, or take an advisory lock around setup), and the diagnostics,
+> since an operator rolling out two pods at once would see only "db error" and have nothing to act
+> on. Neither is a `hs-cluster` defect — both live in `hs-kv`'s postgres backend.
 
-## Integration review follow-up (this update)
+
+Updated: 2026-09-19 (two-replica experiment: `hs serve` run twice against one real PostgreSQL
+database for the first time in this project's life. Result: both processes start cleanly and
+share user/auth/room-state data perfectly, but concurrent writes to the same room silently fork
+the room's event DAG into two permanently divergent branches, one per replica, with zero errors
+returned to any client. No `hs-cluster` code defect was found or fixed; the crate's own machinery
+was never invoked, because nothing calls it. Full transcript and root-cause below.)
+
+## Two-replica experiment (2026-09-19)
+
+**Goal.** Find out what actually happens when two `hs serve` processes run against one PostgreSQL
+database, rather than reasoning about it. This is the first time any second real process has
+existed in this project; `hs-cluster`'s ownership/lease/fencing/mesh machinery has so far only run
+inside its own in-process chaos harness against simulated peers.
+
+**Setup, exact commands:**
+
+```sh
+docker run --rm -d --name hs-cluster-pg -e POSTGRES_PASSWORD=hspg -p 5435:5432 postgres:17
+# waited for: docker exec hs-cluster-pg pg_isready -U postgres   (ready after 4s)
+cargo build -p hs-cli --bin hs
+
+cd /tmp/hs-cluster-exp
+hs generate-config --server-name cluster.example.org -o a.yaml
+# edited: storage.backend: postgres (host 127.0.0.1, port 5435, database postgres, user postgres,
+#   password hspg, tls false); listeners[0].bind_addresses: ['127.0.0.1'], port: 18030;
+#   auth.enable_registration: true, auth.registration_shared_secret: cluster-secret;
+#   server.signing_key_path: ./signing-keys-dir (a directory, not a file -- see finding 0 below)
+cp a.yaml b.yaml   # only the listener port differs: 18031
+hs generate-signing-key -o signing-keys-dir/cluster.example.org.signing.key   # shared by both
+
+hs serve -c a.yaml > a.log 2>&1 &
+hs serve -c b.yaml > b.log 2>&1 &
+```
+
+**Finding 0 (config gotcha, not a cluster bug, worth recording anyway).** `server.signing_key_path`
+must be a *directory* (Synapse's layout, one key file scanned non-recursively); pointing it at a
+plain file the way `hs generate-signing-key -o <file>` naturally suggests silently falls back to
+"no ed25519 signing key found; generating an ephemeral one for this process only" -- each replica
+would then sign events with a *different* key, undetected, unless you read the log. Not a
+multi-replica-specific bug (a single misconfigured replica has the exact same problem), but it is
+the kind of thing that is easy to get wrong precisely when standing up a second replica for the
+first time, since a fresh single-node deployment never previously had reason to persist and share
+a signing key across processes. Fixed in the experiment by pointing both configs at the same
+directory.
+
+### 1. Do both processes even start against one database?
+
+**Yes, cleanly. No lock, no schema race, no keyspace collision.** Both replicas ran the exact same
+migration/`CREATE TABLE IF NOT EXISTS`-style startup path concurrently; each of the ~55 `NOTICE:
+relation "..." already exists, skipping` lines in `b.log` is the second replica finding the first
+replica's schema already there and treating it as a no-op, not an error:
+
+```
+[...] INFO postgres::config: NOTICE: schema "public" already exists, skipping
+[...] INFO postgres::config: NOTICE: relation "kv_hs_auth.users" already exists, skipping
+[... 53 more identical NOTICE lines ...]
+[...] INFO hs_cli::serve: no .well-known documents are published (...)
+[...] INFO hs_cli::cli: listening addr=127.0.0.1:18030
+```
+
+Both processes reached `listening` within milliseconds of each other and stayed up. There is
+**no cluster-awareness whatsoever** at this point: `hs_config::ClusterConfig` is parsed (the
+generated config has a `cluster:` section, `single_node: true` by default) but `grep cluster
+crates/hs-cli/src/serve.rs` returns nothing -- `hs-cluster` is not a dependency of `hs-cli` at all
+today. Each replica is a fully independent, un-coordinated single-node server that happens to
+point at the same Postgres database. That is the actual starting condition for everything below.
+
+### 2. Register on A, login on B, create a room on A -- does B see it?
+
+**Yes, immediately, in every case tried.**
+
+```
+$ hs register -u alice -p hunter2pass -k cluster-secret -v http://127.0.0.1:18030
+@alice:cluster.example.org
+access_token: syt_YWxpY2U_QoJpzztdgKyTXOvgnGFP_1O4ixA
+
+$ curl -X POST http://127.0.0.1:18031/_matrix/client/v3/login -d '{"type":"m.login.password",
+  "identifier":{"type":"m.id.user","user":"alice"},"password":"hunter2pass"}'
+{"user_id":"@alice:cluster.example.org","access_token":"syt_...","device_id":"4TXjCPgIQv"}
+```
+
+Login on B succeeded on the first try with no delay. `createRoom` on A
+(`!2F9ujP5FINRZKb6WWR:cluster.example.org`), then a fresh `/sync` on B, showed the room fully
+joined with complete state (`m.room.create`, membership, power levels, join rules, history
+visibility) on the very next request. This is expected, not surprising: auth/user data and room
+state reads are plain point reads/writes against the shared Postgres tables with no per-replica
+cache in front of them, so both replicas trivially see the same committed rows. This part of "two
+replicas, one database" works with **zero cluster-awareness code**, which is exactly why the next
+question is the one that matters.
+
+### 3. Send messages to the same room through both replicas at once
+
+**This is where it breaks, and it breaks silently: the room's event DAG forks into two permanently
+divergent branches, one per replica, and every single write reports success.**
+
+Fired 20 concurrent `PUT /rooms/{room}/send/m.room.message/{txn}` requests through A and 20 through
+B at the same time, same room, same user (`alice`, logged in separately on each replica):
+
+```
+for i in $(seq 1 20); do
+  curl -X PUT ".../18030/_matrix/client/v3/rooms/$ENC/send/m.room.message/txnA-$i" ... &
+  curl -X PUT ".../18031/_matrix/client/v3/rooms/$ENC/send/m.room.message/txnB-$i" ... &
+done; wait
+```
+
+**All 40 requests returned `200` with a distinct, well-formed `event_id`. Zero errors, zero
+retries visible to the client.** `select count(*) from kv_room_events` afterward: 47 rows (7 room
+state events + 40 messages) -- every event really was written to Postgres, none lost or
+overwritten at the row level.
+
+But `GET /messages?dir=b&limit=100` on A returns exactly the 7 state events plus **A's own 20
+messages** (`from A #1`..`#20`) -- none of B's. The identical call on B returns the 7 state events
+plus **B's own 20 messages** -- none of A's:
+
+```
+A's /messages: 27 events, 20 messages, bodies = {from A #1 .. from A #20}
+B's /messages: 27 events, 20 messages, bodies = {from B #1 .. from B #20}
+```
+
+A fresh `/sync` on each replica confirms this is not a `/messages`-pagination artifact: A's
+timeline tail is entirely `from A #*` events, B's is entirely `from B #*` events. **Two clients
+talking to the same room through different replicas now see two different, non-overlapping
+message histories, permanently, with no error ever surfaced.** This is worse than a lost write or
+a visible conflict -- it is a silent, self-consistent split-brain per replica.
+
+**Root cause, found by reading the code the experiment pointed at (`crates/hs-room/src/actor.rs`,
+read-only -- this file belongs to track 04, not edited):**
+
+- `RoomActor::send_event` (line 570) computes `prev_events` from `self.forward_extremities_vec()`
+  -- **the actor's own in-memory field**, not a fresh read of a shared "current extremities" row.
+- `RoomActor::persist` (line 884) opens a `transact(&self.backend, ..., |txn| { ... })` block that
+  deletes `old_extremities` (again, read from `self.forward_extremities`, in memory) and inserts
+  the new event as the sole forward extremity. **The transaction never reads any shared row to
+  validate that `self.forward_extremities` is still current** -- there is nothing in this
+  transaction a concurrent writer's commit could conflict with, because the write set never
+  includes anything the other replica's write set also touches in a way `hs-kv`'s SSI would catch
+  (each replica deletes *its own* believed-old extremity and inserts *its own* new one; A deleting
+  `create-event` and inserting `A#1` does not conflict with B deleting `create-event` and inserting
+  `B#1` under snapshot isolation, since after both commit the row for `create-event` is deleted by
+  both harmlessly and two different new rows exist -- exactly the fork observed).
+- `self.forward_extremities` and `self.events` (used for `is_first`) are populated once when the
+  `RoomActor` is constructed and mutated only by that same process's own successful persists. A
+  `RoomActor` living inside replica A's process has **no mechanism at all** to learn that replica
+  B's in-process `RoomActor` for the same room just moved the extremity out from under it. Every
+  subsequent event A sends cites A's last-known (increasingly stale, from the room's true
+  perspective) extremity, and vice versa for B -- hence two clean, internally-consistent, mutually
+  invisible chains.
+
+This is precisely the failure mode the brief's fencing design exists to prevent ("Two processes
+both believing they own a room is precisely what the lease and fencing machinery exists to
+prevent"), but fencing alone would not have been sufficient here even if `RoomActor::persist`
+called `Fence::check`: fencing stops a *stale* owner from committing after ownership has moved, by
+aborting its transaction. It does not, by itself, stop *two current, un-coordinated* actors from
+each successfully writing non-conflicting deltas that are individually valid but jointly wrong.
+The actual fix has to be architectural, and it is the one `hs-cluster` was built for: **only the
+shard owner may ever construct a `RoomActor` for a room it owns; every other replica must forward
+the request over the mesh to the owner instead of handling it locally.** With that in place, fencing
+is still required as the belt-and-braces check inside the owner's own transaction (a network
+partition can make a replica believe it is still the owner after it no longer is), but the primary
+defense is "there is only ever one live `RoomActor` for a given room, host on the shard owner." See
+"Wiring the integration lead must add" below for exactly what that requires.
+
+### 4. Kill A mid-write -- does B carry on? Manual recovery needed?
+
+**B carries on immediately and completely, no manual recovery of any kind.**
+
+```
+# fired 30 sequential writes through A in the background, killed -9 partway through
+$ kill -9 <A's pid>
+{"event_id":"..."}   # 4 succeeded before the kill
+{"event_id":"..."}
+{"event_id":"..."}
+{"event_id":"..."}
+curl: (52) Empty reply from server   # the in-flight request when A died
+
+$ curl http://127.0.0.1:18030/_matrix/client/versions
+curl: (7) Failed to connect to 127.0.0.1 port 18030: Couldn't connect to server
+
+$ curl -X PUT http://127.0.0.1:18031/.../send/m.room.message/afterkill-1 -d '...'
+{"event_id":"$XVqtc2LK2YfAxZioLFT6voJi1WzoIctsE8DNyOgxZK4"}   # B, unaffected
+```
+
+Checked PostgreSQL immediately after the kill for anything A might have left dangling
+(`select pid, state, query from pg_stat_activity`, `select count(*) from pg_locks`): every
+remaining backend was `idle` (not `idle in transaction`), the terminal `query` on the ones that had
+run one was `COMMIT` or `ROLLBACK`, and there were no abandoned locks. `r2d2`'s pooled connections
+on A's side were simply closed by the OS when the process died, and PostgreSQL's own crash-safety
+(a `SIGKILL`led client's uncommitted work is never durable) meant there was nothing to clean up.
+**This part requires no cluster machinery at all** -- it is a property of every client of a
+transactional database, not something `hs-cluster` earns credit for or needs to fix. The one
+caveat: this says nothing about whether *B* now has to do anything about whatever shard(s) A used
+to "own" (informally, since ownership is not wired in) -- with real ownership wired in, this is
+exactly the case the lease TTL and failover chaos test
+(`failover_completes_within_configured_ttl`) already covers, just never exercised against a real
+second process until now.
+
+### Summary of the four answers
+
+| # | Question | Answer |
+|---|---|---|
+| 1 | Both processes start against one DB? | Yes, cleanly. No lock/schema-race/keyspace collision. Zero cluster-awareness is invoked either way -- `hs-cluster` is not wired into `hs-cli` at all. |
+| 2 | Register on A, login/see room on B? | Yes, immediately, for both auth data and room state reads. Plain shared-Postgres point reads/writes need no cluster code. |
+| 3 | Concurrent messages to the same room via both replicas? | **Silent, permanent fork of the room's event DAG.** Every write reports success; no error, no duplicate, no lost row at the storage level -- but each replica's in-memory `RoomActor` diverges from the other's immediately and never reconciles. Two clients see two different message histories in the same room, forever. |
+| 4 | Kill A mid-write -- does B carry on? | Yes, instantly, no manual recovery. PostgreSQL's own transactional guarantees handle this without any cluster involvement. |
+
+**No `hs-cluster` code was changed as a result of this experiment.** The crate's own machinery
+(`Ownership`, `Fence`, `ClusterStore`, the mesh) was not exercised at all, because nothing calls it
+today -- `hs-cli`, `hs-room` and `hs-user` all still behave exactly as a single-node server would,
+regardless of what `cluster.single_node` is set to in config. The chaos suite's own claim ("no two
+replicas ever write the same shard") remains true *of the toy actor the chaos suite itself uses*,
+which does call `Fence::check` on every append; it says nothing about `hs-room`'s real actor, which
+calls it zero times. This is not a regression in this session -- it is the expected, previously
+undemonstrated state of integration, now demonstrated for the first time with two real processes
+instead of reasoned about.
+
+## Wiring the integration lead must add
+
+None of this is inside `crates/hs-cluster`; all of it is `hs-cli` (`serve.rs`, `storage.rs`) plus
+one hook into `hs-room`'s (track 04's) room actor. Concretely, in order:
+
+1. **At `hs serve` startup, after storage opens and before the listener binds:** construct a
+   `hs_cluster::Cluster`. If `config.cluster.single_node` is `true`, call
+   `Cluster::single_node(ReplicaId::new(<derive an id, e.g. hostname:pid or a configured value>))`
+   -- this is inert and changes nothing (matches today's behavior exactly, so this step alone is
+   safe to land first with no functional change). If `false`, build an
+   `hs_cluster::config::ClusterConfig` from `hs_config::ClusterConfig`
+   (`crates/hs-config/src/cluster.rs`) and call
+   `hs_cluster::Cluster::start(cluster_config, backend.clone()).await`, where `backend` is the same
+   `hs_kv::KvBackend` `storage.rs` already opened. **Note the config shapes do not line up
+   one-to-one today** and there is no existing conversion function in either crate: `hs_config::
+   ClusterConfig` has `room_shards`/`user_shards` but no `federation`/`appservice` shard counts
+   (`hs_cluster::types::ShardLayout` needs all four), and has no replica identity, mesh advertise
+   address, zone, or handoff settings (all process-level facts, not YAML). Deliberately not built
+   in this pass on the `hs-cluster` side: it would mean guessing at `hs_config::MeshConfig`'s TLS
+   field shape (`crates/hs-config/src/listeners.rs::TlsConfig`) without being able to compile
+   against it from this crate (adding `hs-config` as a dependency of `hs-cluster` is possible per
+   this track's ownership rules, but building and testing that conversion needs a compile against
+   the real, currently-in-flux `hs-config` types a wiring PR can verify directly). Whoever writes
+   this should feel free to add `hs-config` as a path dependency of `hs-cluster` and put the
+   conversion in `hs_cluster::config` if that ends up the more natural home than `hs-cli`.
+2. **Hold the `Cluster` (or at least `Arc<dyn hs_cluster::Ownership>`) somewhere every request
+   handler can reach it** (probably the same shared app state `storage.rs`'s backend already lives
+   in).
+3. **Before a request handler constructs or looks up a `RoomActor` for a room** (the call sites
+   above, `crates/hs-room/src/actor.rs`, are the ones that matter, but the gate belongs at the
+   `hs-cli` routing layer, not inside `hs-room`): compute
+   `shard = cluster_config.layout.room_shard(&room_id)`, then check
+   `ownership.is_mine(shard)`. If false: **do not construct or touch a local `RoomActor` for that
+   room at all** -- forward the request over `hs_cluster::mesh::Forwarder` to
+   `ownership.owner_of(shard)` instead (the mesh server/forwarder/envelope/idempotency-key
+   machinery for this already exists and is tested; only the call site is missing). This is the
+   change that actually prevents the fork in answer 3 -- it is what makes "only one replica ever
+   holds a `RoomActor` for a given room" true.
+4. **Inside `RoomActor::persist`'s existing `transact(...)` closure** (track 04's file,
+   `crates/hs-room/src/actor.rs:884`, cited here only so the hook is easy to find, not to prescribe
+   04's internals): call `fence.check(txn, cluster_store.shard_keyspace())` as the *last* read
+   before the closure returns `Ok`, where `fence` is the `hs_cluster::Fence` the caller obtained
+   from `ownership.fence(shard)` at the top of the request (per the interface already documented
+   under "Interfaces provided" below). This is the belt-and-braces check for the case step 3's
+   routing gate raced with a real ownership handoff (a network partition, a rolling update) between
+   the moment `is_mine` was checked and the moment the transaction commits. Fencing alone (without
+   step 3) does **not** fix answer 3's fork, since two simultaneously-current owners never trip a
+   fence at all -- both steps are required together, not either in isolation.
+5. **Readiness and shutdown**: point track 12's `/health/ready` at `Cluster::ready()` and call
+   `Cluster::drain(deadline)` on `SIGTERM` before the listener stops accepting, per RFC 0001 section
+   10 and this crate's existing `Drainable` trait -- not exercised by this experiment (no rolling
+   update was attempted), but it is the same shape of gap: the trait exists and is tested in
+   isolation, nothing in `hs-cli` calls it yet.
+
+None of steps 1-5 require a new `hs-cluster` capability; every method named above
+(`Cluster::single_node`, `Cluster::start`, `Ownership::is_mine`, `Ownership::owner_of`,
+`Ownership::fence`, `ShardLayout::room_shard`, `Forwarder`, `Fence::check`, `Cluster::ready`,
+`Cluster::drain`) is implemented, tested and frozen today (see "Interfaces provided" below). The
+gap this experiment found is entirely that nothing in `hs-cli` or `hs-room` calls any of them yet.
+
+## Integration review follow-up (2026-09-18)
 
 An integration pass mutation-tested `Fence::check` by making it unconditionally return `Ok` (i.e.
 disabling fencing entirely) and ran the chaos suite. Only `a_partitioned_replica_cannot_write_after_being_fenced`
