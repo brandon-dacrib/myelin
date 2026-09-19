@@ -8,10 +8,12 @@ publish.workspace = true
 description = "Requester middleware, legacy login/UIA/registration, tokens, devices, password hashing and the native OAuth 2.0 issuer (design). Track 07: see docs/workstreams/07-auth-and-identity.md"
 
 [dependencies]
+hs-admin = { path = "../hs-admin" }
 hs-config = { path = "../hs-config" }
 hs-kv = { path = "../hs-kv" }
 hs-tables = { path = "../hs-tables" }
 bytes = { workspace = true }
+time = { workspace = true }
 ruma = { workspace = true }
 axum = { workspace = true }
 http = { workspace = true }

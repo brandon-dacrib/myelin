@@ -16,6 +16,8 @@
 //!   ([`reauth`]) built on it.
 //! - The legacy client-server auth endpoints ([`routes`]): `/login`, `/logout`, `/refresh`,
 //!   `/register`, `/account/*`, `/devices*`.
+//! - [`admin_verifier::AdminTokenVerifier`]: the `hs_admin::auth::TokenVerifier` implementation
+//!   `hs serve` wires into the admin API, over this crate's own user/token storage.
 //!
 //! The native OAuth 2.0 authorization server is design-only for now:
 //! `docs/rfcs/0003-native-oauth-issuer.md`.
@@ -23,6 +25,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod admin_verifier;
 pub mod appservice;
 pub mod clock;
 pub mod config;
