@@ -17,17 +17,21 @@
 //! scope for this crate). A `PUT` for a remote user id is also `M_FORBIDDEN` since it can never
 //! equal the local requester's own id.
 //!
-//! # Why this lives in `hs-auth`, not `hs-room`
+//! # This module owns the storage write; `hs-room` owns mounting the `PUT`s
 //!
-//! Profile data (`UserRecord::display_name`/`avatar_url`, see `crate::store`) is account data
-//! keyed by user id, not room state -- the same shape as `/account/whoami` and the device
-//! endpoints this crate already owns, and it needs no room context to read or write. `hs-room`
-//! (which depends on this crate already) reads it back out through
-//! `AuthState::store`/`UserStore::get_user` when it builds `m.room.member` content for a new
-//! join/invite/knock -- see `hs_room::routes::membership`'s module doc for that side of the
-//! propagation. Keeping the storage and the read/write HTTP surface in the same crate as the
-//! `UserRecord` they operate on avoids a second crate needing write access to `hs-auth`'s store
-//! internals.
+//! `put_displayname`/`put_avatar_url` below are the actual `UserRecord` write and every
+//! validation rule around it (self-only, 404 for an unknown user, body shape) -- that part still
+//! lives here, since profile data is account data keyed by user id, not room state, the same
+//! shape as `/account/whoami` and the device endpoints this crate already owns. But **this
+//! crate's own router no longer calls these two functions**: a `PUT` to either path is served by
+//! `hs_room::routes::profile`, which calls straight back into the two functions below for the
+//! write and then re-stamps the user's `m.room.member` event in every room they are joined to --
+//! the fan-out `hs-auth` cannot do itself, since it cannot depend on `hs-room` (the reverse
+//! already holds: `hs-room` depends on `hs-auth` for exactly this store, plus reads it directly at
+//! join/invite/knock time -- see `hs_room::routes::membership`'s module doc). `get_profile`/
+//! `get_displayname`/`get_avatar_url` need no room context and are still routed from here
+//! unchanged. See `hs_room::routes::profile`'s module doc for the full design, including why the
+//! two routers can both mount paths under `/profile/{userId}/...` without colliding.
 
 use axum::Json;
 use axum::extract::{Path, State};

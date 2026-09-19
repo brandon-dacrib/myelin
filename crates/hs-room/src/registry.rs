@@ -317,6 +317,15 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
         crate::actor::list_published_room_ids(&self.backend, &self.tables)
     }
 
+    /// Every room `user_id` currently holds `join` membership in, without loading each room's
+    /// actor first. See [`crate::actor::rooms_joined_by_user`].
+    ///
+    /// # Errors
+    /// Returns [`RoomError::Store`] on a storage failure.
+    pub fn rooms_joined_by_user(&self, user_id: &UserId) -> Result<Vec<OwnedRoomId>, RoomError> {
+        crate::actor::rooms_joined_by_user(&self.backend, &self.tables, user_id)
+    }
+
     /// Drops every resident actor idle longer than `max_idle`. Intended to be called
     /// periodically (see [`RoomRegistry::spawn_eviction_sweeper`]); safe to call directly in
     /// tests for a deterministic assertion instead of waiting on a timer.

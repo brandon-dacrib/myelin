@@ -741,6 +741,76 @@ impl<B: KvBackend> RoomActor<B> {
         Ok(event)
     }
 
+    /// Re-stamps `user`'s own `m.room.member` event with a fresh `displayname`/`avatar_url`,
+    /// keeping every other field (`membership`, `is_direct`, `reason`, ...) exactly as it was.
+    /// This is the room-actor half of profile-change propagation
+    /// (`crates/hs-room/src/routes/profile.rs`): per the spec (and Synapse's
+    /// `ProfileHandler._update_join_states`), a display name or avatar change is only visible to
+    /// other members because the server re-sends this event in every room the user is joined to --
+    /// see that module's doc comment for the full design and why the caller lives in this crate
+    /// rather than `hs-auth`, which owns the profile write itself.
+    ///
+    /// Returns `Ok(None)` without sending anything if `user`'s current membership in this room is
+    /// not `join` (defensive: the caller is expected to only call this for rooms
+    /// [`rooms_joined_by_user`] returned, but membership can change between that read and this
+    /// call landing). Goes through the ordinary [`RoomActor::send_event`] path, so an unchanged
+    /// profile (nothing actually different from the current event's content) is a no-op that
+    /// returns the existing event rather than minting a new one --
+    /// [`RoomActor::idempotent_state_reuse`] already gives this for free.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::State`] if reading the current membership event fails, or any error
+    /// [`RoomActor::send_event`] can return.
+    pub fn refresh_own_profile(
+        &mut self,
+        user: &UserId,
+        display_name: Option<String>,
+        avatar_url: Option<String>,
+        now_ms: i64,
+    ) -> Result<Option<Event>, RoomError> {
+        if self.prior_membership(user)? != PriorState::Join {
+            return Ok(None);
+        }
+        let mut content = self
+            .state_event("m.room.member", user.as_str())?
+            .and_then(|existing| existing.json().get("content"))
+            .map(|v| {
+                serde_json::from_slice::<serde_json::Value>(&v.to_canonical_bytes())
+                    .unwrap_or(serde_json::Value::Null)
+            })
+            .unwrap_or(serde_json::Value::Null);
+        if !content.is_object() {
+            content = serde_json::json!({});
+        }
+        let map = content
+            .as_object_mut()
+            .expect("forced to an object just above");
+        match display_name {
+            Some(name) => {
+                map.insert("displayname".to_owned(), serde_json::Value::String(name));
+            }
+            None => {
+                map.remove("displayname");
+            }
+        }
+        match avatar_url {
+            Some(url) => {
+                map.insert("avatar_url".to_owned(), serde_json::Value::String(url));
+            }
+            None => {
+                map.remove("avatar_url");
+            }
+        }
+        let event = self.membership_action(
+            user.to_owned(),
+            Action::Join,
+            user.to_owned(),
+            content,
+            now_ms,
+        )?;
+        Ok(Some(event))
+    }
+
     /// `POST /rooms/{roomId}/forget`: marks `user` as having forgotten this room -- see
     /// [`RoomActor::can_read_room`] for what that then blocks. Ported from the spec's documented
     /// rule (`refs/matrix-spec/data/api/client-server/leaving.yaml`, Apache-2.0): a currently
@@ -957,6 +1027,23 @@ impl<B: KvBackend> RoomActor<B> {
             .unwrap_or(serde_json::Value::Null);
         let relation = relations::relation_of(&content);
 
+        // Computed up front (rather than alongside `membership_deltas` below, which runs after
+        // the KV transaction commits) so the `Tables::joined_rooms` write can happen *inside* that
+        // same transaction: `Some((target, true))` means the target's new membership is `join`
+        // (index them), `Some((target, false))` means it changed away from `join` (remove them),
+        // `None` means this event is not an `m.room.member` event at all.
+        let member_join_index_update: Option<(String, bool)> = if event.header().event_type
+            == "m.room.member"
+            && let Some(state_key) = &event.header().state_key
+        {
+            content
+                .get("membership")
+                .and_then(serde_json::Value::as_str)
+                .map(|m| (state_key.clone(), m == "join"))
+        } else {
+            None
+        };
+
         let is_first = self.events.is_empty();
         let room_meta_bytes = if is_first {
             Some(
@@ -1039,6 +1126,19 @@ impl<B: KvBackend> RoomActor<B> {
                         b"",
                     )
                     .map_err(to_kv)?;
+            }
+            if let Some((target, is_join)) = &member_join_index_update {
+                if *is_join {
+                    self.tables
+                        .joined_rooms
+                        .put(txn, &(target.clone(), room_sn), b"")
+                        .map_err(to_kv)?;
+                } else {
+                    self.tables
+                        .joined_rooms
+                        .delete(txn, &(target.clone(), room_sn))
+                        .map_err(to_kv)?;
+                }
             }
             Ok(event_sn)
         })
@@ -2327,6 +2427,39 @@ pub fn list_published_room_ids<B: KvBackend>(
     Ok(out)
 }
 
+/// Every room `user_id` currently holds `join` membership in, per [`persist`][RoomActor::persist]'s
+/// `Tables::joined_rooms` index -- a prefix scan keyed by `user_id`, so this never loads (or even
+/// enumerates) any room this user is *not* in. Used by profile-change propagation
+/// (`crates/hs-room/src/routes/profile.rs`) to find which rooms need their `m.room.member` event
+/// re-stamped with a fresh `displayname`/`avatar_url`.
+///
+/// # Errors
+/// Returns [`RoomError::Store`]/[`RoomError::Table`] on a storage failure, or
+/// [`RoomError::Internal`] if a room's ID cannot be resolved back from its interned `RoomSn`
+/// (should not happen: every entry in this keyspace was written by [`RoomActor::persist`] right
+/// after interning that same room).
+pub fn rooms_joined_by_user<B: KvBackend>(
+    backend: &B,
+    tables: &Tables<B>,
+    user_id: &UserId,
+) -> Result<Vec<OwnedRoomId>, RoomError> {
+    let snapshot = backend.snapshot();
+    let prefix = hs_tables::keyspace::TypedKeyspace::<B::Keyspace, crate::persist::UserJoinedRoomKey>::prefix(
+        &(user_id.to_string(),),
+    );
+    let mut out = Vec::new();
+    for item in tables.joined_rooms.range(&snapshot, prefix) {
+        let ((_, room_sn), _) = item?;
+        let Some(room_id_bytes) = tables.room_sn.resolve(&snapshot, room_sn)? else {
+            continue;
+        };
+        let room_id =
+            String::from_utf8(room_id_bytes).map_err(|e| RoomError::Internal(e.to_string()))?;
+        out.push(OwnedRoomId::try_from(room_id).map_err(|e| RoomError::Internal(e.to_string()))?);
+    }
+    Ok(out)
+}
+
 #[derive(Debug)]
 struct AliasInUse;
 impl std::fmt::Display for AliasInUse {
@@ -2436,6 +2569,24 @@ impl<B: KvBackend> RoomActorHandle<B> {
     {
         self.with_actor(move |actor| actor.membership_action(sender, action, target, extra, now_ms))
             .await
+    }
+
+    /// `RoomActor::refresh_own_profile`: re-stamps `user`'s `m.room.member` event in this room
+    /// with a fresh profile.
+    pub async fn refresh_own_profile(
+        &self,
+        user: OwnedUserId,
+        display_name: Option<String>,
+        avatar_url: Option<String>,
+        now_ms: i64,
+    ) -> Result<Option<Event>, RoomError>
+    where
+        B: 'static,
+    {
+        self.with_actor(move |actor| {
+            actor.refresh_own_profile(&user, display_name, avatar_url, now_ms)
+        })
+        .await
     }
 
     /// `POST /rooms/{roomId}/forget` (`RoomActor::forget`).

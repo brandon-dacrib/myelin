@@ -66,7 +66,9 @@ impl<B: KvBackend> FromRequestParts<RoomState<B>> for RoomRequester {
 /// error-type freeze). This crate is built against `hs-http`'s (the frozen one every other track's
 /// handlers use, per this track's own instructions), so every place `hs-auth` hands back its own
 /// error type needs this one conversion.
-fn auth_error_to_matrix_error(e: hs_auth::error::MatrixError) -> hs_http::error::MatrixError {
+pub(crate) fn auth_error_to_matrix_error(
+    e: hs_auth::error::MatrixError,
+) -> hs_http::error::MatrixError {
     // `hs-auth`'s `MatrixError` does not expose whether `soft_logout` was set (it is folded into
     // a private `extra` map with no public accessor); this conversion therefore loses that one
     // bit for a rejected `Requester` extraction on this crate's routes. Worth revisiting if a

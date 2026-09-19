@@ -2,10 +2,224 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
-Last updated: 2026-09-19 (session 5: an urgent cross-track signing bug fixed first
-(`docs/rfcs/0014-event-signing-must-sign-the-redacted-form.md`), then `/threads`, `/upgrade`,
-idempotent state/join, `unsigned.transaction_id`, and a precise diagnosis of the `/forget`
-sync-left regression and of why `/relations`/`/threads` still 404 in a real deployment).
+Last updated: 2026-09-19 (session 6: two "a change never reaches other users" bugs closed, spanning
+`hs-room`, `hs-auth` and `hs-e2e` in one sitting -- profile-change propagation into
+`m.room.member`, and the missing device-list-change call sites in device rename/delete and key
+upload).
+
+## Session 6 (2026-09-19): profile-change propagation, and the missing device-list call sites
+
+**Assignment** (explicit cross-track scope for this session only: `crates/hs-room/**`,
+`crates/hs-auth/**`, `crates/hs-e2e/**` and both this file and `docs/status/07-auth-and-identity.md`
+-- no other crate touched, no Docker, no git). Track 05's "Session 4" (`docs/status/05-sync.md`)
+diagnosed both bugs live against a real client and named the exact gaps; this session closes both.
+
+### 1. A profile change now reaches every room the user is joined to
+
+**The bug, exactly as track 05 diagnosed it**: `PUT /profile/{userId}/displayname`/`avatar_url`
+(`crates/hs-auth/src/routes/profile.rs`) wrote only `UserRecord::display_name`/`avatar_url` in
+`hs-auth`'s own store. `hs-room` (`crates/hs-room/src/routes/membership.rs`) only ever read a
+user's profile into a *new* `m.room.member` event at join/invite/knock time -- an already-sent
+membership event was never revisited, so a rename was invisible to everyone else forever. Track
+05's real-client loadgen scenario carried this as a `KNOWN BUG` line.
+
+**Why this needed three crates' worth of thinking even though only two crates changed code.**
+`hs-auth` cannot depend on `hs-room` (`hs-room` already depends on `hs-auth`, for `AuthState` and
+to read profiles at join time; the reverse would be a cycle), so whichever crate *writes* the
+profile has no way to reach the per-room actors that need to re-stamp their membership event.
+Two designs were considered:
+
+- A hook on `AuthState` (the same shape as `RoomRegistry::GlobalTokenResolver`/
+  `E2eState::SyncTokenResolver`, and the same shape this session used for the *device-list* half
+  below), installed by whichever crate has both an `AuthState` and a `RoomRegistry` in hand. The
+  problem: no such call site exists today for rooms the way `E2eState::new(auth, e2e_store)` exists
+  for e2e -- `RoomState` is built as a plain struct literal directly in `hs-cli`'s `serve.rs`
+  (`RoomState { auth: auth_state.clone(), rooms: rooms.clone(), identity }`), not through a
+  constructor function this crate owns. Making that a constructor to hook into would need an
+  `hs-cli` edit, which was out of scope this session (another agent holds that crate).
+- **Chosen instead**: move the *write* endpoints (`PUT /profile/{userId}/displayname`/`avatar_url`
+  only -- the `GET`s stay in `hs-auth`, they need no room context) into `hs-room`'s own router,
+  which already embeds a full `AuthState` via `RoomState`. The new handler
+  (`crates/hs-room/src/routes/profile.rs`) calls straight back into `hs-auth`'s own
+  `put_displayname`/`put_avatar_url` for the actual store write (unchanged, still tested directly
+  in `hs-auth`), then fans the room refresh out. `hs-auth`'s router
+  (`crates/hs-auth/src/routes/mod.rs`) simply stopped registering a `PUT` for those two paths. Both
+  routers are still merged at the same `/_matrix/client/{v3,r0}` prefixes in `hs-cli`'s `serve.rs`,
+  **completely unchanged** -- this mirrors the `GET`/`POST /publicRooms` split session 4 already
+  recorded between this crate and `hs-user` (different HTTP methods/paths from different crates'
+  routers merged at the same prefix coexist without collision; only an identical method *and* path
+  registered twice panics at router-build time). Confirmed empirically, not just by precedent: the
+  real `hs` binary builds and serves correctly with both changes in place (see "Proof" below).
+
+**The room-actor half** (`crates/hs-room/src/actor.rs`): `RoomActor::refresh_own_profile(user,
+display_name, avatar_url, now_ms)` reads the user's current `m.room.member` content, overwrites
+only `displayname`/`avatar_url` (removing the key if the new value is `None`), and re-sends it
+through the existing `membership_action(Join)` path -- the exact "re-send join while already
+joined" mechanism `crate::routes::membership`'s doc comment already described as a manual escape
+hatch; this just automates it. Returns `Ok(None)` (sends nothing) if the user is not currently
+`join`ed in that room. Goes through `RoomActor::idempotent_state_reuse` for free, so a rename that
+does not actually change anything for a given room (a second identical `PUT`) sends no event.
+
+**Finding "every room this user is joined to" without scanning every room on the server.** This
+crate never had such an index (session 4's status file explicitly noted the gap: "no
+`list_all_room_ids`, unlike the room directory's `list_published_room_ids`"). New durable index:
+`Tables::joined_rooms`, a `(user_id, RoomSn) -> b""` keyspace (`crates/hs-room/src/persist.rs`),
+maintained inside the *same* KV transaction `RoomActor::persist` already writes every event
+through -- one extra `put`/`delete` per `m.room.member` event, keyed on whether its new membership
+is `join`. `crate::actor::rooms_joined_by_user`/`RoomRegistry::rooms_joined_by_user` answer the
+query with a prefix scan (order-preserving tuple-key encoding means `(user_id,)` is a genuine byte
+prefix of `(user_id, RoomSn)` -- verified against `hs-tables`' own encoding scheme, not assumed).
+
+**What a rename costs for a user in many rooms** (the brief's explicit ask): the HTTP response
+never waits on the fan-out. `crate::routes::profile::put_displayname`/`put_avatar_url` write the
+profile and return as soon as `hs-auth`'s own handler returns; the room-by-room re-stamp runs on a
+detached `tokio::spawn`ed background task, which itself bounds its own concurrency to
+`MAX_CONCURRENT_ROOM_REFRESHES = 16` rooms at a time via a `tokio::sync::Semaphore` rather than
+locking every joined room's actor at once. A user in a thousand rooms produces a thousand cheap,
+mostly-idle spawned tasks (each just awaiting a permit), not a thousand-way concurrent burst of KV
+transactions -- and each individual room's refresh is one idempotent `send_event`-shaped write, so
+running the whole fan-out twice (two rapid profile changes) is safe. Chose a fixed cap over
+scaling with room count deliberately: bounding concurrency, not maximizing throughput, was the
+point.
+
+**Tests**: `crates/hs-room/src/routes/profile.rs`'s own module
+(`put_displayname_refreshes_membership_in_every_joined_room` -- end-to-end through the real
+handler and a real second room member, polling up to 5s for the background fan-out to land;
+`put_displayname_with_no_joined_rooms_is_a_no_op_fanout`; `put_displayname_for_another_user_is_still_forbidden`,
+confirming `hs-auth`'s `403` still surfaces unchanged through the wrapper). `cargo test -p hs-room
+--lib`: 50 passed (up from 47); `cargo test -p hs-room --test scenario`: still 11 passed, unchanged.
+
+**Proof against the real thing** (per this session's exact instructions):
+```
+cargo build -p hs-cli --bin hs
+cargo test -p hs-loadgen --test real_client -- --nocapture
+```
+The scenario's step 14 (previously `KNOWN BUG (not this track's crates, see
+docs/status/05-sync.md): alice's profile change never reached bob's /sync as an updated
+m.room.member event within the bounded wait`) now reads:
+```
+bob's /sync saw alice's profile change reflected in her m.room.member event
+```
+**The `KNOWN BUG` line is gone.** `cargo test -p hs-loadgen --test real_client_encrypted --
+--nocapture` still passes all 16 steps unchanged (no regression from either fix in this session).
+
+### 2. Device-list changes are now recorded from every call site that changes a device
+
+**The bug, exactly as diagnosed**: `record_device_list_change` (`hs_e2e::store::DeviceKeyStore`)
+was called from exactly one place, cross-signing bootstrap
+(`crates/hs-e2e/src/routes/cross_signing.rs`). Neither an ordinary `/keys/upload` (identity key
+upload -- the common case) nor `hs-auth`'s device rename/delete ever bumped the stream, so another
+user's client never learned a device appeared, was renamed, or vanished.
+
+**The same cross-crate shape as above, solved the same way `hs-e2e` already solves it for its own
+sync-token problem.** `hs-auth` cannot depend on `hs-e2e` (`hs-e2e` already depends on `hs-auth`).
+New `DeviceListChangeNotifier` trait and hook on `AuthState`
+(`crates/hs-auth/src/state.rs`) -- installed by `hs_e2e::state::E2eState::new` as a side effect of
+construction (`crates/hs-e2e/src/state.rs`'s `AuthDeviceListNotifier` adapter, wrapping this
+crate's real `Arc<dyn E2eStore>`). **No `hs-cli` change needed**: `E2eState::new(auth.clone(),
+e2e_store)` is already the one call site in `serve.rs` with both an `AuthState` and an `Arc<dyn
+E2eStore>` in hand, already called unchanged before this session. Full writeup of this half (the
+`hs-auth` side of the hook, its tests) is in `docs/status/07-auth-and-identity.md`'s new "Session
+6" section, since it is squarely that crate's surface even though this session made the edit.
+
+**The three missing call sites, all now wired**:
+- `crates/hs-auth/src/routes/devices.rs`: `put_device` (both the ordinary rename branch and the
+  MSC4190 appservice-create branch), `delete_device`, and `post_delete_devices` (one notification
+  for the whole batch, not one per device -- see that file's own comment) all call the new
+  `AuthState::notify_device_list_changed` after their store mutation succeeds.
+- `crates/hs-e2e/src/routes/keys_upload.rs`: `post_keys_upload` now calls
+  `store.record_device_list_change` after `upload_device_keys` succeeds -- scoped to a request that
+  actually included `device_keys` (identity keys), not a one-time/fallback-key-only top-up, which
+  changes available key material but not what the device *is*. Matches Synapse's own
+  `_upload_keys`, which only calls `notify_device_update` on the device-keys branch.
+
+**Tests**: `crates/hs-auth/src/routes/devices.rs` gained a `RecordingNotifier` test double and six
+new tests covering rename, MSC4190 create, delete, "UIA not yet satisfied does not notify", bulk
+delete (exactly one notification), and "empty bulk-delete list does not notify". `cargo test -p
+hs-auth`: 181 passed (up from 175). `crates/hs-e2e/src/state.rs` gained
+`constructing_e2e_state_wires_auth_state_notifications_into_this_crate_store` (the real,
+non-mocked wiring: an `AuthState::notify_device_list_changed` call with no reference to `hs-e2e`
+anywhere at the call site reaches this crate's real `TablesE2eStore`) and
+`notify_is_a_no_op_before_any_e2e_state_installs_a_notifier`. `crates/hs-e2e/src/routes/keys_upload.rs`
+gained `uploading_device_keys_bumps_the_device_list_stream` and
+`uploading_only_one_time_keys_does_not_bump_the_device_list_stream`. `cargo test -p hs-e2e`: 36
+passed across all four test binaries (up from 27+ baseline; no regressions in
+`complement_regressions.rs`, `otk_concurrency.rs` or `scenario.rs`).
+
+**Proof against the real thing**: `cargo test -p hs-loadgen --test real_client_encrypted --
+--nocapture` (which does a real, unscripted `/keys/upload` for both clients, not a synthetic
+fixture) still passes all 16 steps, including "bob's `/sync` reported alice's device-list change in
+`device_lists.changed`" -- that assertion was already passing before this session (bootstrapping
+cross-signing, the one pre-existing call site, is also part of that scenario), so it does not by
+itself prove the *new* call sites fire; the new unit tests above are what prove that directly,
+since `real_client`/`real_client_encrypted` do not currently script a bare key upload or a device
+rename/delete as a scenario step. Recorded as a gap for whichever session next extends the loadgen
+scenarios, not fixed here (`hs-loadgen` was explicitly off limits to edit this session, per the
+assignment -- only running it was allowed).
+
+### How to verify (session 6)
+
+```
+cargo fmt -p hs-room -p hs-auth -p hs-e2e
+cargo clippy -p hs-room --all-targets --no-deps -- -D warnings
+cargo clippy -p hs-auth --all-targets --no-deps -- -D warnings
+cargo clippy -p hs-e2e --all-targets --no-deps -- -D warnings
+cargo test -p hs-room --lib      # 50 passed
+cargo test -p hs-room --test scenario   # 11 passed
+cargo test -p hs-auth             # 181 passed
+cargo test -p hs-e2e              # 36 passed across 4 binaries
+cargo build -p hs-cli --bin hs
+cargo test -p hs-loadgen --test real_client -- --nocapture             # KNOWN BUG line gone
+cargo test -p hs-loadgen --test real_client_encrypted -- --nocapture   # unchanged, still green
+```
+
+Used `--no-deps` on clippy for the same reason session 5's writeup recorded: other tracks' crates
+in the same dependency graph can transiently fail `-D warnings` on their own unrelated lints while
+being actively edited in parallel; `--no-deps` scopes enforcement to the crate actually requested.
+Not observed to be a real problem this session (both plain and `--no-deps` clippy invocations were
+clean when tried), noted here defensively since sessions 4 and 5 both hit it.
+
+### Interfaces provided (new this session)
+
+- **`hs_room::actor::rooms_joined_by_user`/`RoomRegistry::rooms_joined_by_user`**: every room a
+  user currently holds `join` membership in, via a prefix scan over the new
+  `Tables::joined_rooms` index -- no other crate needs this today, but it is the kind of query
+  `hs-user`'s own "does this user have any rooms at all" checks might eventually want instead of
+  re-deriving it.
+- **`hs_room::actor::RoomActor::refresh_own_profile`/`RoomActorHandle::refresh_own_profile`**:
+  re-stamps a user's own `m.room.member` event with a fresh profile, a no-op if they are not
+  currently joined.
+- **`hs_auth::state::DeviceListChangeNotifier`/`AuthState::install_device_list_notifier`/
+  `notify_device_list_changed`**: the hook other tracks' crates should use if they ever need to
+  learn about a device mutation from `hs-auth`'s own routes without `hs-auth` depending on them --
+  same pattern as `RoomRegistry::GlobalTokenResolver`/`E2eState::SyncTokenResolver`.
+
+### Interfaces needed
+
+Nothing new from this session. Everything already listed in session 5's "Interfaces needed"
+(pagination-token format mismatch between `hs-user` and this crate, `forgotten`/directory-publish
+query surfaces for `hs-user`) is unchanged.
+
+### Decisions made this session
+
+- **The profile write endpoints (`PUT` only) moved from `hs-auth`'s router to `hs-room`'s**, while
+  the underlying `UserRecord` write logic and its own tests stay in `hs-auth`, called into
+  directly. Chosen over an `AuthState` hook (the pattern used for device-list changes, item 2)
+  because no existing call site in `hs-cli` builds both an `AuthState` and a `RoomRegistry`
+  together the way `E2eState::new` builds an `AuthState` and an `E2eStore` together -- inventing
+  one would have needed an `hs-cli` edit, out of scope this session.
+- **`Tables::joined_rooms` is maintained inside `RoomActor::persist`'s existing transaction**, not
+  as a separate write after the fact, so it can never observe a torn state relative to the
+  `m.room.member` event it derives from.
+- **The background profile-refresh fan-out is capped at 16 concurrent rooms**, a fixed constant
+  rather than scaling with the user's room count -- see "What a rename costs" above.
+- **`post_delete_devices` sends one device-list notification per batch, not per device.**
+- **`/keys/upload` only bumps the device-list stream when the request includes `device_keys`**,
+  not for a one-time/fallback-key-only top-up -- matches Synapse's own `_upload_keys` behavior and
+  the actual semantics (a device's *identity* changed, not just its available key material).
+- **No `hs-cli` edit was made or needed for either fix.** Both hooks are installed by an existing,
+  unchanged call site inside a crate this session already owned (`hs-room`'s own router
+  registration for item 1; `hs-e2e`'s `E2eState::new` for item 2).
 
 ## Session 5 (2026-09-19): signing fix, `/threads`, `/upgrade`, idempotency, `unsigned.transaction_id`
 

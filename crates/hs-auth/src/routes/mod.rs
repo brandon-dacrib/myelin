@@ -56,14 +56,17 @@ pub fn router() -> Router<AuthState> {
         )
         .route("/delete_devices", post(devices::post_delete_devices))
         .route("/profile/{userId}", get(profile::get_profile))
+        // `PUT` for both of these lives in `hs-room`'s router instead
+        // (`crates/hs-room/src/routes/profile.rs`), merged at the same prefix in `hs-cli`'s
+        // `serve.rs` -- see that module's doc comment for why. It calls straight back into
+        // `profile::put_displayname`/`put_avatar_url` below for the actual store write, so those
+        // functions stay exactly as they were, just no longer reachable from *this* crate's own
+        // router.
         .route(
             "/profile/{userId}/displayname",
-            get(profile::get_displayname).put(profile::put_displayname),
+            get(profile::get_displayname),
         )
-        .route(
-            "/profile/{userId}/avatar_url",
-            get(profile::get_avatar_url).put(profile::put_avatar_url),
-        )
+        .route("/profile/{userId}/avatar_url", get(profile::get_avatar_url))
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ pub mod aliases;
 pub mod create_room;
 pub mod directory;
 pub mod membership;
+pub mod profile;
 pub mod query;
 pub mod redact;
 pub mod relations;
@@ -233,6 +234,20 @@ pub fn router<B: KvBackend + 'static>() -> (axum::Router<RoomState<B>>, RouteMan
             "/publicRooms",
             directory::post_public_rooms::<B>,
             matrix_client("queryPublicRooms"),
+        )
+        // `hs-auth`'s router (`crates/hs-auth/src/routes/mod.rs`) still serves the `GET`s for
+        // both these paths (unauthenticated profile reads need no room context); only the writes
+        // are here, so this crate's own room-membership refresh can run in the same request. See
+        // `crate::routes::profile`'s module docs for why.
+        .put(
+            "/profile/{userId}/displayname",
+            profile::put_displayname::<B>,
+            matrix_client("setDisplayName"),
+        )
+        .put(
+            "/profile/{userId}/avatar_url",
+            profile::put_avatar_url::<B>,
+            matrix_client("setAvatarUrl"),
         )
         .build()
 }

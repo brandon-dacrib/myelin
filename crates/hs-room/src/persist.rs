@@ -30,6 +30,19 @@ pub type RoomMetaKey = (hs_model::RoomSn,);
 /// "published" a simple presence check with no value to decode.
 pub type PublicRoomKey = (hs_model::RoomSn,);
 
+/// `(user_id, RoomSn) -> b""`: presence means `user_id`'s current membership in that room is
+/// `join`. Maintained by [`crate::actor::RoomActor::persist`] alongside every `m.room.member`
+/// event it writes (inserted when the new membership is `join`, deleted otherwise), so
+/// [`crate::actor::rooms_joined_by_user`] can answer "every room this user is joined to" with a
+/// prefix scan instead of loading (or even knowing about) every room this server hosts. This is
+/// the index profile-change propagation needs: re-stamping a user's `m.room.member` event in
+/// every room they are joined to (`crates/hs-room/src/routes/profile.rs`) is only tractable
+/// without it by scanning every room on the server, which does not scale and (per
+/// `docs/status/04-room-and-events.md`, session 4) this crate has never had a way to do anyway.
+/// Keyed by `user_id` first (not `RoomSn` first) specifically so a prefix scan over one user's
+/// entries is a contiguous range, independent of how many *other* users are also indexed.
+pub type UserJoinedRoomKey = (String, hs_model::RoomSn);
+
 /// One event as stored durably: enough to reconstruct an [`hs_model::event::Event`] (via
 /// [`hs_model::event::Event::parse`] on `json`) plus the room-local bookkeeping
 /// [`hs_model::event::EventHeader`] does not carry.
@@ -85,6 +98,9 @@ pub struct Tables<B: KvBackend> {
     /// `(RoomSn,) -> b""`: the published room directory (`crate::registry::RoomRegistry`'s
     /// `set_directory_visibility`/`list_published_rooms`).
     pub public_rooms: TypedKeyspace<B::Keyspace, PublicRoomKey>,
+    /// `(user_id, RoomSn) -> b""`: every room a user currently holds `join` membership in. See
+    /// [`UserJoinedRoomKey`].
+    pub joined_rooms: TypedKeyspace<B::Keyspace, UserJoinedRoomKey>,
 }
 
 impl<B: KvBackend> Tables<B> {
@@ -105,6 +121,7 @@ impl<B: KvBackend> Tables<B> {
             room_meta: TypedKeyspace::new(backend.keyspace("room_meta")?),
             relations: TypedKeyspace::new(backend.keyspace("room_relations")?),
             public_rooms: TypedKeyspace::new(backend.keyspace("room_public_directory")?),
+            joined_rooms: TypedKeyspace::new(backend.keyspace("room_joined_by_user")?),
         })
     }
 }

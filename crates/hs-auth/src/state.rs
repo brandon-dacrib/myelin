@@ -1,7 +1,9 @@
 //! [`AuthState`]: the axum shared state every handler and the [`crate::middleware`] extractor in
 //! this crate runs against.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+use ruma::UserId;
 
 use crate::appservice::{AppserviceRegistry, InMemoryAppserviceRegistry};
 use crate::clock::{Clock, SystemClock};
@@ -9,6 +11,23 @@ use crate::config::AuthConfig;
 use crate::ratelimit::{InMemoryRateLimiter, RateLimiter};
 use crate::store::AuthStore;
 use crate::store::memory::InMemoryAuthStore;
+
+/// A hook this crate's device routes (`crate::routes::devices`: rename, delete, bulk delete) call
+/// whenever a device identity change should be visible to other users' device-list tracking
+/// (`/keys/changes`, `/sync`'s `device_lists`). `hs-auth` cannot depend on `hs-e2e` (`hs-e2e`
+/// already depends on `hs-auth` for `AuthState`/`Requester`; the reverse would be a cycle), so
+/// this trait is defined here and `hs-e2e` installs a real implementation via
+/// [`AuthState::install_device_list_notifier`] when it builds its own state
+/// (`hs_e2e::state::E2eState::new`) — mirroring `hs_room::registry::RoomRegistry`'s
+/// `GlobalTokenResolver` and `hs_e2e::state::E2eState`'s own `SyncTokenResolver`, the same shape
+/// of problem solved twice already elsewhere in this workspace. Unset (no installer) means
+/// nothing else in this process cares about device-list changes, in which case the notify calls
+/// below are silent no-ops -- exactly like those two other hooks when nothing has installed them.
+#[async_trait::async_trait]
+pub trait DeviceListChangeNotifier: Send + Sync {
+    /// Records that `user_id`'s device list changed (a device was renamed, added or removed).
+    async fn notify_device_list_changed(&self, user_id: &UserId);
+}
 
 /// Everything a handler needs: storage, the appservice registry, rate limiting, config and a
 /// clock, all behind `Arc` so `AuthState` itself is cheap to clone (axum requires `State<S>: Clone`).
@@ -24,6 +43,19 @@ pub struct AuthState {
     pub config: Arc<AuthConfig>,
     /// The time source, overridden in tests.
     pub clock: Arc<dyn Clock>,
+    /// See [`DeviceListChangeNotifier`] and [`AuthState::install_device_list_notifier`].
+    /// `Arc`-wrapped around the `OnceLock` (not a bare `OnceLock` field) so every clone of this
+    /// state produced by axum's per-request `Clone` -- and every clone taken before installation,
+    /// such as the one `hs-room`'s `RoomState` embeds -- shares the same cell: installing the
+    /// notifier once, on any clone, makes it visible to all of them, the same reasoning
+    /// `hs_e2e::state::E2eState::sync_token_resolver`'s doc comment gives for its identical field.
+    // `pub(crate)`, not private: several of this crate's own test modules (`crate::middleware`)
+    // build a variant `AuthState` via struct-update syntax (`AuthState { appservices: ..,
+    // ..state }`) from a sibling module, which needs every field nameable from within the crate,
+    // not just this one's own module. External crates still cannot name this field directly (only
+    // `pub` fields can be set from outside `hs-auth`); they go through
+    // [`AuthState::install_device_list_notifier`] regardless.
+    pub(crate) device_list_notifier: Arc<OnceLock<Arc<dyn DeviceListChangeNotifier>>>,
 }
 
 impl AuthState {
@@ -39,6 +71,7 @@ impl AuthState {
             rate_limiter: Arc::new(InMemoryRateLimiter::unlimited()),
             config: Arc::new(AuthConfig::default()),
             clock: Arc::new(SystemClock),
+            device_list_notifier: Arc::new(OnceLock::new()),
         }
     }
 
@@ -79,6 +112,36 @@ impl AuthState {
     #[must_use]
     pub fn server_name(&self) -> &ruma::ServerName {
         &self.config.server_name
+    }
+
+    /// Installs the [`DeviceListChangeNotifier`] `crate::routes::devices`' rename/delete/bulk
+    /// delete handlers call after mutating a device. Idempotent past the first call: a second
+    /// install is silently ignored (logged, not panicked), matching
+    /// `hs_room::registry::RoomRegistry::install_global_token_resolver`'s same convention -- one
+    /// state is expected to have exactly one installer for the lifetime of the process.
+    pub fn install_device_list_notifier(&self, notifier: Arc<dyn DeviceListChangeNotifier>) {
+        if self.device_list_notifier.set(notifier).is_err() {
+            tracing::warn!(
+                "a device-list change notifier was already installed on this auth state; \
+                 ignoring the second install"
+            );
+        }
+    }
+
+    /// The installed [`DeviceListChangeNotifier`], if any.
+    #[must_use]
+    pub fn device_list_notifier(&self) -> Option<&Arc<dyn DeviceListChangeNotifier>> {
+        self.device_list_notifier.get()
+    }
+
+    /// Calls the installed [`DeviceListChangeNotifier`], if any -- a silent no-op otherwise (no
+    /// other crate cares about device-list changes in this process, for example a test that never
+    /// constructs `hs-e2e`'s state at all). Handlers call this instead of checking
+    /// [`AuthState::device_list_notifier`] themselves.
+    pub async fn notify_device_list_changed(&self, user_id: &UserId) {
+        if let Some(notifier) = self.device_list_notifier() {
+            notifier.notify_device_list_changed(user_id).await;
+        }
     }
 }
 

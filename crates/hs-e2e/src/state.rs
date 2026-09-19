@@ -83,12 +83,45 @@ pub struct E2eState<B: KvBackend> {
     _backend: std::marker::PhantomData<B>,
 }
 
+/// Implements `hs-auth`'s [`hs_auth::state::DeviceListChangeNotifier`] over this crate's own
+/// [`E2eStore`], so `hs-auth`'s device rename/delete routes
+/// (`crates/hs-auth/src/routes/devices.rs`) can bump this crate's device-list stream without
+/// `hs-auth` depending on this crate at all. Installed once per [`E2eState::new`] call -- see
+/// that constructor's doc comment.
+struct AuthDeviceListNotifier {
+    store: Arc<dyn E2eStore>,
+}
+
+#[async_trait::async_trait]
+impl hs_auth::state::DeviceListChangeNotifier for AuthDeviceListNotifier {
+    async fn notify_device_list_changed(&self, user_id: &UserId) {
+        if let Err(error) = self.store.record_device_list_change(user_id).await {
+            tracing::warn!(
+                %user_id,
+                %error,
+                "could not record a device-list change from hs-auth's device routes"
+            );
+        }
+    }
+}
+
 impl<B: KvBackend> E2eState<B> {
     /// Builds an `E2eState` around an already-open store and an existing [`AuthState`] (sharing
     /// its appservice registry, rate limiter and clock with whatever other crate's state also
     /// embeds it in the same process).
+    ///
+    /// As a side effect, installs this crate's [`hs_auth::state::DeviceListChangeNotifier`] onto
+    /// `auth` (see [`AuthDeviceListNotifier`]) -- this is the one call site in the whole workspace
+    /// that has both an [`AuthState`] and an `Arc<dyn E2eStore>` in hand at once, which is exactly
+    /// what `hs-auth`'s device rename/delete routes need without `hs-auth` ever depending on this
+    /// crate. `AuthState::install_device_list_notifier` is idempotent past its first call, so
+    /// constructing more than one `E2eState` around clones of the *same* `AuthState` (which does
+    /// not happen in `hs-cli`'s `serve.rs` today, but would in a test that built two) is safe.
     #[must_use]
     pub fn new(auth: AuthState, store: Arc<dyn E2eStore>) -> Self {
+        auth.install_device_list_notifier(Arc::new(AuthDeviceListNotifier {
+            store: store.clone(),
+        }));
         Self {
             auth,
             store,
@@ -159,7 +192,9 @@ fn auth_error_to_matrix_error(e: hs_auth::error::MatrixError) -> hs_http::error:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::DeviceKeyStore;
     use hs_kv::memory::MemoryBackend;
+    use ruma::user_id;
 
     #[test]
     fn e2e_state_is_cloneable() {
@@ -167,5 +202,39 @@ mod tests {
         let store = crate::store::tables::TablesE2eStore::open(backend).unwrap();
         let state: E2eState<MemoryBackend> = E2eState::new(AuthState::in_memory(), Arc::new(store));
         let _ = state.clone();
+    }
+
+    /// The whole point of `AuthDeviceListNotifier`: an `AuthState::notify_device_list_changed`
+    /// call reaches this crate's own device-list stream, through nothing but the hook
+    /// `E2eState::new` installs -- no direct reference to `E2eState` or this crate's store type at
+    /// the call site, exactly the shape `hs-auth`'s device rename/delete routes use.
+    #[tokio::test]
+    async fn constructing_e2e_state_wires_auth_state_notifications_into_this_crate_store() {
+        let backend = MemoryBackend::new();
+        let store = Arc::new(crate::store::tables::TablesE2eStore::open(backend).unwrap());
+        let auth = AuthState::in_memory();
+        let _state: E2eState<MemoryBackend> = E2eState::new(auth.clone(), store.clone());
+
+        let user = user_id!("@alice:example.org");
+        assert_eq!(store.current_stream_pos().await.unwrap(), 0);
+
+        // This is the exact call `hs-auth`'s `crate::routes::devices` handlers make -- no
+        // knowledge of `hs-e2e` or its store anywhere in that call.
+        auth.notify_device_list_changed(user).await;
+
+        assert!(store.current_stream_pos().await.unwrap() > 0);
+        let changed = store.changed_users_since(0, None).await.unwrap();
+        assert!(changed.contains(user));
+    }
+
+    /// Without any `E2eState` ever having been constructed, `notify_device_list_changed` is a
+    /// silent no-op (no installed notifier) -- confirms `hs-auth`'s device routes cannot panic or
+    /// error just because nothing in the process cares about device lists.
+    #[tokio::test]
+    async fn notify_is_a_no_op_before_any_e2e_state_installs_a_notifier() {
+        let auth = AuthState::in_memory();
+        let user = user_id!("@alice:example.org");
+        // Must simply return, not panic -- there is nothing else to assert here.
+        auth.notify_device_list_changed(user).await;
     }
 }

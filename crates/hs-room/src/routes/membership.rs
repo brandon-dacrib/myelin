@@ -15,16 +15,18 @@
 //! query federation for a remote profile) -- their membership event carries no profile fields,
 //! same as before this change.
 //!
-//! **Not implemented**: rewriting a user's already-sent `m.room.member` event in every room they
-//! are currently joined to whenever their profile changes (Synapse's fuller behavior, via
-//! `ProfileHandler.on_profile_update`/`_update_join_states`). What *is* implemented instead: the
-//! join transition table (`crate::membership::TRANSITIONS`) allows [`Action::Join`] again from
-//! [`crate::membership::PriorState::Join`] as a harmless re-send, so a client that wants its
-//! already-joined membership event updated with a fresh profile can call
-//! `POST /rooms/{roomId}/join` (or `/join/{roomIdOrAlias}`) again and get a new `m.room.member`
-//! event carrying the current profile. No automatic per-room fan-out happens on
-//! `PUT /profile/{userId}/displayname`/`avatar_url` itself. Documented as a known scope
-//! narrowing in `docs/status/04-room-and-events.md` rather than left implicit.
+//! **Rewriting a user's already-sent `m.room.member` event in every room they are currently
+//! joined to whenever their profile changes** (Synapse's fuller behavior, via
+//! `ProfileHandler.on_profile_update`/`_update_join_states`) **is now implemented**, in
+//! `crate::routes::profile` (`PUT /profile/{userId}/displayname`/`avatar_url`, mounted from this
+//! crate's router rather than `hs-auth`'s -- see that module's doc comment for why and for the
+//! full design). It reuses exactly the mechanism this module already had for a different reason:
+//! the join transition table (`crate::membership::TRANSITIONS`) allows [`Action::Join`] again from
+//! [`crate::membership::PriorState::Join`] as a harmless re-send
+//! (`RoomActor::refresh_own_profile` calls `membership_action` the same way `act_join` below
+//! does), so a client that wants its already-joined membership event updated with a fresh profile
+//! can *also* still get one for free by calling `POST /rooms/{roomId}/join` again -- both paths
+//! converge on the same idempotent re-send.
 
 use axum::Json;
 use axum::extract::{Path, State};

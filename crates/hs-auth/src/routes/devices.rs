@@ -118,12 +118,18 @@ pub async fn put_device(
                 last_seen_ip: None,
             })
             .await?;
+        state.notify_device_list_changed(&requester.user_id).await;
         return Ok(Json(json!({})));
     }
     state
         .store
         .set_display_name(&requester.user_id, &device_id, display_name)
         .await?;
+    // A rename is a device-list change too (client-server API "Device list tracking": any change
+    // to a device's identity, not only its keys, must be visible to other users' `/keys/changes`
+    // and `/sync` `device_lists`) -- see `docs/status/04-room-and-events.md` for why this call
+    // site was missing before this session.
+    state.notify_device_list_changed(&requester.user_id).await;
     Ok(Json(json!({})))
 }
 
@@ -162,6 +168,7 @@ pub async fn delete_device(
         .store
         .delete_device(&requester.user_id, &device_id)
         .await?;
+    state.notify_device_list_changed(&requester.user_id).await;
     Ok(Json(json!({})).into_response())
 }
 
@@ -185,6 +192,7 @@ pub async fn post_delete_devices(
         })
         .unwrap_or_default();
 
+    let mut any_deleted = false;
     for raw in device_ids {
         let device_id: ruma::OwnedDeviceId = raw.into();
         state
@@ -195,6 +203,13 @@ pub async fn post_delete_devices(
             .store
             .delete_device(&requester.user_id, &device_id)
             .await?;
+        any_deleted = true;
+    }
+    // One notification for the whole batch, not one per device: every device belongs to the same
+    // user, so the device-list stream only needs to know "something about this user's devices
+    // changed", not how many times.
+    if any_deleted {
+        state.notify_device_list_changed(&requester.user_id).await;
     }
     Ok(Json(json!({})).into_response())
 }
@@ -202,12 +217,40 @@ pub async fn post_delete_devices(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::DeviceListChangeNotifier;
     use crate::store::UserRecord;
     use axum::http::StatusCode;
-    use ruma::{device_id, user_id};
+    use ruma::{OwnedUserId, device_id, user_id};
+    use std::sync::Mutex as StdMutex;
+
+    /// Records every user id it was notified about, so tests can assert exactly which handlers
+    /// call [`AuthState::notify_device_list_changed`] and with which user -- standing in for
+    /// `hs-e2e`'s real `AuthDeviceListNotifier` (`crates/hs-e2e/src/state.rs`), which this crate
+    /// cannot reference directly (`hs-e2e` depends on `hs-auth`, not the reverse).
+    #[derive(Default)]
+    struct RecordingNotifier(StdMutex<Vec<OwnedUserId>>);
+
+    #[async_trait::async_trait]
+    impl DeviceListChangeNotifier for RecordingNotifier {
+        async fn notify_device_list_changed(&self, user_id: &ruma::UserId) {
+            self.0.lock().unwrap().push(user_id.to_owned());
+        }
+    }
+
+    fn state_with_recording_notifier() -> (AuthState, std::sync::Arc<RecordingNotifier>) {
+        let state = AuthState::in_memory();
+        let notifier = std::sync::Arc::new(RecordingNotifier::default());
+        state.install_device_list_notifier(notifier.clone());
+        (state, notifier)
+    }
 
     async fn state_with_device() -> (AuthState, Requester, ruma::OwnedDeviceId) {
-        let state = AuthState::in_memory();
+        state_with_device_using(AuthState::in_memory()).await
+    }
+
+    async fn state_with_device_using(
+        state: AuthState,
+    ) -> (AuthState, Requester, ruma::OwnedDeviceId) {
         let uid = user_id!("@alice:example.org").to_owned();
         state
             .store
@@ -432,5 +475,90 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn put_device_rename_notifies_the_device_list_hook() {
+        let (state, notifier) = state_with_recording_notifier();
+        let (state, requester, did) = state_with_device_using(state).await;
+        let Json(_) = put_device(
+            State(state),
+            requester.clone(),
+            Path(did.to_string()),
+            Json(json!({"display_name": "renamed"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(notifier.0.lock().unwrap().as_slice(), &[requester.user_id]);
+    }
+
+    #[tokio::test]
+    async fn put_device_creating_a_device_for_an_msc4190_appservice_also_notifies() {
+        let (state, notifier) = state_with_recording_notifier();
+        let uid = user_id!("@bridge_alice:example.org").to_owned();
+        state
+            .store
+            .create_user(UserRecord::new(uid.clone(), 0))
+            .await
+            .unwrap();
+        let requester = msc4190_appservice_requester(uid.clone());
+        let Json(_) = put_device(
+            State(state),
+            requester,
+            Path("NEWDEV".to_string()),
+            Json(json!({"display_name": "puppeted device"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(notifier.0.lock().unwrap().as_slice(), &[uid]);
+    }
+
+    #[tokio::test]
+    async fn delete_device_notifies_the_device_list_hook() {
+        let (state, notifier) = state_with_recording_notifier();
+        let (state, requester, did) = state_with_device_using(state).await;
+        delete_device(
+            State(state),
+            requester.clone(),
+            Path(did.to_string()),
+            body_bytes(json!({"auth": {"type": "m.login.dummy"}})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(notifier.0.lock().unwrap().as_slice(), &[requester.user_id]);
+    }
+
+    /// A rejected `DELETE` (UIA not yet satisfied) must not notify -- nothing changed yet.
+    #[tokio::test]
+    async fn delete_device_does_not_notify_when_uia_is_not_yet_satisfied() {
+        let (state, notifier) = state_with_recording_notifier();
+        let (state, requester, did) = state_with_device_using(state).await;
+        delete_device(State(state), requester, Path(did.to_string()), Bytes::new())
+            .await
+            .unwrap();
+        assert!(notifier.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_devices_notifies_the_device_list_hook_exactly_once() {
+        let (state, notifier) = state_with_recording_notifier();
+        let (state, requester, did) = state_with_device_using(state).await;
+        let body = json!({"auth": {"type": "m.login.dummy"}, "devices": [did.to_string()]});
+        post_delete_devices(State(state), requester.clone(), body_bytes(body))
+            .await
+            .unwrap();
+        assert_eq!(notifier.0.lock().unwrap().as_slice(), &[requester.user_id]);
+    }
+
+    /// An empty device list has nothing to notify about.
+    #[tokio::test]
+    async fn bulk_delete_devices_with_an_empty_list_does_not_notify() {
+        let (state, notifier) = state_with_recording_notifier();
+        let (state, requester, _did) = state_with_device_using(state).await;
+        let body = json!({"auth": {"type": "m.login.dummy"}, "devices": []});
+        post_delete_devices(State(state), requester, body_bytes(body))
+            .await
+            .unwrap();
+        assert!(notifier.0.lock().unwrap().is_empty());
     }
 }

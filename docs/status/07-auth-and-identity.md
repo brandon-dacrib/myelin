@@ -2,7 +2,60 @@
 
 Track brief: `docs/workstreams/07-auth-and-identity.md`. Owner crate: `hs-auth`.
 
-Last updated: 2026-09-19 (session 5, completed its assignment — see "Session 5" below).
+Last updated: 2026-09-19 (session 6 -- **not a regular track-07 session**: track 04 (room and
+events) was given a one-off cross-track assignment spanning `hs-room`, `hs-auth` and `hs-e2e` in
+the same sitting, to fix two "a change never reaches other users" bugs. This file's own "Session
+6" section below covers only the `hs-auth` half of that work; see `docs/status/04-room-and-events.md`
+for the full report, including the `hs-room` and `hs-e2e` sides.).
+
+## Session 6 (2026-09-19, run by track 04): device-list notifier hook
+
+**Not a track-07 session** -- run by track 04 under an explicit cross-track assignment (see
+`docs/status/04-room-and-events.md`'s "Session 6" for the full writeup, both crates). Recorded
+here too per this file's own convention of being the place other tracks look for `hs-auth`'s
+current state.
+
+**What changed in this crate**: `crates/hs-auth/src/state.rs` gained a new
+`DeviceListChangeNotifier` trait and an `Arc<OnceLock<Arc<dyn DeviceListChangeNotifier>>>` field on
+`AuthState` (`device_list_notifier`, `pub(crate)` -- see its doc comment for why not fully
+private), plus `AuthState::install_device_list_notifier`/`notify_device_list_changed`. This is the
+same hook shape `hs_room::registry::RoomRegistry::GlobalTokenResolver` and
+`hs_e2e::state::E2eState::SyncTokenResolver` already established twice elsewhere in this
+workspace, for the identical reason: `hs-auth` cannot depend on `hs-e2e` (the reverse already
+holds), so the crate that mutates a device (`crates/hs-auth/src/routes/devices.rs`: `put_device`
+rename and MSC4190 create, `delete_device`, `post_delete_devices`) cannot call `hs-e2e`'s
+`DeviceKeyStore::record_device_list_change` directly. It calls the new
+`AuthState::notify_device_list_changed` instead, which is a silent no-op until something installs
+a real notifier.
+
+**Who installs it**: `hs-e2e`'s `E2eState::new` (`crates/hs-e2e/src/state.rs`), as a side effect of
+construction -- see that crate's own notes for the adapter (`AuthDeviceListNotifier`). No
+`hs-cli` change was needed or made: `E2eState::new(auth.clone(), e2e_store)` is already the one
+call site in `hs-cli`'s `serve.rs` that has both an `AuthState` and an `Arc<dyn E2eStore>` in hand,
+and it was already being called, unchanged, before this session.
+
+**Tests added** (`crates/hs-auth/src/routes/devices.rs`, using a `RecordingNotifier` test double
+since this crate cannot reference `hs-e2e`'s real one): `put_device_rename_notifies_the_device_list_hook`,
+`put_device_creating_a_device_for_an_msc4190_appservice_also_notifies`,
+`delete_device_notifies_the_device_list_hook`,
+`delete_device_does_not_notify_when_uia_is_not_yet_satisfied` (a rejected UIA challenge must not
+notify -- nothing changed yet), `bulk_delete_devices_notifies_the_device_list_hook_exactly_once`
+(one notification for a whole batch, not one per device) and
+`bulk_delete_devices_with_an_empty_list_does_not_notify`. `cargo test -p hs-auth`: 181 passed (up
+from 175), `cargo clippy -p hs-auth --all-targets --no-deps -- -D warnings`: clean.
+
+**Decisions made this session (in this crate)**:
+- `device_list_notifier` is `pub(crate)`, not private: `crate::middleware`'s own test module
+  builds variant `AuthState`s via struct-update syntax (`AuthState { appservices: .., ..state }`)
+  from a sibling module, which needs the field nameable from within the crate. External crates
+  still cannot set it directly (only `pub` fields can be set from outside `hs-auth`) and go through
+  `install_device_list_notifier` regardless.
+- `post_delete_devices` sends exactly one notification for the whole batch (not one per device
+  deleted) -- every device in one call belongs to the same user, so the device-list stream only
+  needs "this user's devices changed", not a count.
+- `put_device`'s MSC4190 appservice-create branch notifies too, not only the ordinary rename
+  branch -- a bridge creating a puppeted device via that path is exactly the "a device appeared"
+  case `/keys/changes` exists to report.
 
 ## Session 5 summary (read this first)
 
