@@ -16,6 +16,7 @@ pub mod account;
 pub mod devices;
 pub mod login;
 pub mod logout;
+pub mod profile;
 pub mod refresh;
 pub mod register;
 pub mod synapse_admin;
@@ -54,6 +55,15 @@ pub fn router() -> Router<AuthState> {
                 .delete(devices::delete_device),
         )
         .route("/delete_devices", post(devices::post_delete_devices))
+        .route("/profile/{userId}", get(profile::get_profile))
+        .route(
+            "/profile/{userId}/displayname",
+            get(profile::get_displayname).put(profile::put_displayname),
+        )
+        .route(
+            "/profile/{userId}/avatar_url",
+            get(profile::get_avatar_url).put(profile::put_avatar_url),
+        )
 }
 
 #[cfg(test)]

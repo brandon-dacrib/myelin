@@ -142,6 +142,34 @@ impl UserStore for InMemoryAuthStore {
         Ok(())
     }
 
+    async fn set_profile_display_name(
+        &self,
+        user_id: &UserId,
+        display_name: Option<String>,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock();
+        let user = inner
+            .users
+            .get_mut(user_id)
+            .ok_or_else(|| StoreError::NotFound(user_id.to_string()))?;
+        user.display_name = display_name;
+        Ok(())
+    }
+
+    async fn set_profile_avatar_url(
+        &self,
+        user_id: &UserId,
+        avatar_url: Option<String>,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock();
+        let user = inner
+            .users
+            .get_mut(user_id)
+            .ok_or_else(|| StoreError::NotFound(user_id.to_string()))?;
+        user.avatar_url = avatar_url;
+        Ok(())
+    }
+
     async fn bind_threepid(
         &self,
         user_id: &UserId,

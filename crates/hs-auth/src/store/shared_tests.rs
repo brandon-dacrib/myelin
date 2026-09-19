@@ -123,6 +123,51 @@ pub(crate) async fn set_password_hash_on_missing_user_is_not_found<S: AuthStore>
     assert!(matches!(err, Err(StoreError::NotFound(_))));
 }
 
+/// `UserStore::set_profile_display_name`/`set_profile_avatar_url` round-trip through
+/// `get_user`, and are unset (`None`) on a freshly created account -- distinct from
+/// `DeviceStore::set_display_name`, which this test does not touch.
+pub(crate) async fn profile_fields_round_trip<S: AuthStore>(s: &S) {
+    let uid = user_id!("@profile:example.org").to_owned();
+    s.create_user(UserRecord::new(uid.clone(), 1))
+        .await
+        .unwrap();
+
+    let fresh = s.get_user(&uid).await.unwrap().unwrap();
+    assert_eq!(fresh.display_name, None);
+    assert_eq!(fresh.avatar_url, None);
+
+    s.set_profile_display_name(&uid, Some("Alice".to_string()))
+        .await
+        .unwrap();
+    s.set_profile_avatar_url(&uid, Some("mxc://example.org/abc".to_string()))
+        .await
+        .unwrap();
+
+    let got = s.get_user(&uid).await.unwrap().unwrap();
+    assert_eq!(got.display_name.as_deref(), Some("Alice"));
+    assert_eq!(got.avatar_url.as_deref(), Some("mxc://example.org/abc"));
+
+    // Clearing sets the field back to `None`, it does not error.
+    s.set_profile_display_name(&uid, None).await.unwrap();
+    let cleared = s.get_user(&uid).await.unwrap().unwrap();
+    assert_eq!(cleared.display_name, None);
+    assert_eq!(cleared.avatar_url.as_deref(), Some("mxc://example.org/abc"));
+}
+
+pub(crate) async fn set_profile_fields_on_missing_user_is_not_found<S: AuthStore>(s: &S) {
+    let err = s
+        .set_profile_display_name(user_id!("@ghost:example.org"), Some("x".to_string()))
+        .await;
+    assert!(matches!(err, Err(StoreError::NotFound(_))));
+    let err = s
+        .set_profile_avatar_url(
+            user_id!("@ghost:example.org"),
+            Some("mxc://x/y".to_string()),
+        )
+        .await;
+    assert!(matches!(err, Err(StoreError::NotFound(_))));
+}
+
 pub(crate) async fn device_and_token_lifecycle<S: AuthStore>(s: &S) {
     let uid = user_id!("@bob:example.org").to_owned();
     let did = device_id!("DEV1").to_owned();
@@ -462,6 +507,8 @@ pub(crate) async fn run_all<S: AuthStore>(make_store: impl Fn() -> S) {
     is_localpart_available_reflects_existing_users(&make_store()).await;
     user_flag_setters_round_trip(&make_store()).await;
     set_password_hash_on_missing_user_is_not_found(&make_store()).await;
+    profile_fields_round_trip(&make_store()).await;
+    set_profile_fields_on_missing_user_is_not_found(&make_store()).await;
     device_and_token_lifecycle(&make_store()).await;
     device_display_name_and_seen_round_trip(&make_store()).await;
     set_display_name_on_missing_device_is_not_found(&make_store()).await;

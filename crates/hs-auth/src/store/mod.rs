@@ -66,6 +66,18 @@ pub struct UserRecord {
     pub shadow_banned: bool,
     /// Creation time, milliseconds since the Unix epoch.
     pub created_at_ms: u64,
+    /// The user's global profile display name (`GET`/`PUT /profile/{userId}/displayname`),
+    /// copied into new `m.room.member` events by track 04's room actor. **Not** the same thing as
+    /// [`DeviceRecord::display_name`] (a per-device, client-set label shown in a device-manager
+    /// UI) or [`DeviceStore::set_display_name`] (that field's setter) -- this is the user's
+    /// account-wide profile name shown to other users in rooms. Set with
+    /// [`UserStore::set_profile_display_name`], never with the device setter, and vice versa;
+    /// the two are unrelated fields on unrelated records that happen to share an English name.
+    pub display_name: Option<String>,
+    /// The user's global profile avatar `mxc://` URI (`GET`/`PUT /profile/{userId}/avatar_url`),
+    /// copied into new `m.room.member` events the same way as [`UserRecord::display_name`]. Set
+    /// with [`UserStore::set_profile_avatar_url`].
+    pub avatar_url: Option<String>,
 }
 
 impl UserRecord {
@@ -82,6 +94,8 @@ impl UserRecord {
             suspended: false,
             shadow_banned: false,
             created_at_ms,
+            display_name: None,
+            avatar_url: None,
         }
     }
 }
@@ -204,6 +218,27 @@ pub trait UserStore: Send + Sync {
         &self,
         user_id: &ruma::UserId,
         deactivated: bool,
+    ) -> Result<(), StoreError>;
+
+    /// Sets or clears the user's global profile display name
+    /// ([`UserRecord::display_name`]). Errors with [`StoreError::NotFound`] if the user does not
+    /// exist.
+    ///
+    /// Distinct from [`DeviceStore::set_display_name`], which renames one *device*, not the
+    /// user's profile; the two names were chosen to read unambiguously side by side at any call
+    /// site (`user_store.set_profile_display_name(...)` vs `device_store.set_display_name(...)`).
+    async fn set_profile_display_name(
+        &self,
+        user_id: &ruma::UserId,
+        display_name: Option<String>,
+    ) -> Result<(), StoreError>;
+
+    /// Sets or clears the user's global profile avatar ([`UserRecord::avatar_url`]). Errors with
+    /// [`StoreError::NotFound`] if the user does not exist.
+    async fn set_profile_avatar_url(
+        &self,
+        user_id: &ruma::UserId,
+        avatar_url: Option<String>,
     ) -> Result<(), StoreError>;
 
     /// Binds a third-party identifier (`medium` is `"email"` or `"msisdn"`) to a user, for

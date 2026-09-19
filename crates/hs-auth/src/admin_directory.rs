@@ -13,20 +13,22 @@
 //! - `device_count` (the length of [`crate::store::DeviceStore::list_devices`]'s result) and
 //!   `last_seen_at` (the max of those devices' `last_seen_ms`, formatted the same way
 //!   `created_at` is).
+//! - `display_name`, `avatar_url`: [`crate::store::UserRecord::display_name`]/`avatar_url`
+//!   directly, now that the profile endpoints (`GET`/`PUT /profile/{userId}/...`) populate them.
 //!
 //! Left at [`hs_admin::model::AdminUser::default`]:
 //!
 //! - `room_count`, `media_count`: this crate has no view onto rooms (track 04) or media (track
 //!   09). Wiring those in is those tracks' data-source seam to add, not this one's -- see
 //!   `docs/status/07-auth-and-identity.md`'s "Interfaces needed".
-//! - `display_name`, `avatar_url`, `user_type`, `consent_version`, `appservice_id`: none of these
-//!   exist on `UserRecord` yet (profile data is track 04's territory; user-type categorization
-//!   and appservice attribution are Phase 1/2 gaps noted in this crate's own status file).
+//! - `user_type`, `consent_version`, `appservice_id`: user-type categorization and appservice
+//!   attribution are Phase 1/2 gaps noted in this crate's own status file.
 //! - `erased`: account erasure is a Phase 1/2 lifecycle feature this crate has not built yet (see
 //!   this track's brief's "account lifecycle" line).
 //!
-//! [`hs_admin::sources::UserFilter::q`] is therefore matched against `user_id` only -- there is no
-//! display name to search against here yet.
+//! [`hs_admin::sources::UserFilter::q`] is matched against `user_id` only -- not the display
+//! name -- unchanged by this pass; the free-text filter could reasonably grow to search
+//! `display_name` too, but no caller has asked for that yet.
 
 use std::sync::Arc;
 
@@ -70,6 +72,8 @@ impl AuthStoreUserDirectory {
             .map(format_rfc3339_ms);
         Ok(AdminUser {
             user_id: record.user_id.to_string(),
+            display_name: record.display_name.clone(),
+            avatar_url: record.avatar_url.clone(),
             admin: record.is_admin,
             deactivated: record.deactivated,
             locked: record.locked,
@@ -229,6 +233,33 @@ mod tests {
         assert_eq!(user.created_at, "1970-01-01T00:00:01.000Z");
         assert_eq!(user.room_count, 0);
         assert_eq!(user.media_count, 0);
+    }
+
+    #[tokio::test]
+    async fn get_user_reflects_profile_fields() {
+        let store = InMemoryAuthStore::new();
+        let uid = ruma::user_id!("@profiled:example.org");
+        store
+            .create_user(UserRecord::new(uid.to_owned(), 1))
+            .await
+            .unwrap();
+        store
+            .set_profile_display_name(uid, Some("Profiled".to_string()))
+            .await
+            .unwrap();
+        store
+            .set_profile_avatar_url(uid, Some("mxc://example.org/av".to_string()))
+            .await
+            .unwrap();
+
+        let directory = directory_with(store);
+        let user = directory
+            .get_user("@profiled:example.org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(user.display_name.as_deref(), Some("Profiled"));
+        assert_eq!(user.avatar_url.as_deref(), Some("mxc://example.org/av"));
     }
 
     #[tokio::test]

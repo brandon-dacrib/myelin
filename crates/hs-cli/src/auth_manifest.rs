@@ -56,6 +56,14 @@ pub fn routes() -> Vec<Route> {
         route("PUT", "/devices/{deviceId}", Matrix, "updateDevice"),
         route("DELETE", "/devices/{deviceId}", Matrix, "deleteDevice"),
         route("POST", "/delete_devices", Matrix, "deleteDevices"),
+        // Profiles (`crates/hs-auth/src/routes/profile.rs`): a `GET` is unauthenticated per the
+        // spec — any user may read any user's profile, including over federation — while a `PUT`
+        // is authenticated and may only target the caller's own account.
+        route("GET", "/profile/{userId}", NoAuth, "getUserProfile"),
+        route("GET", "/profile/{userId}/displayname", NoAuth, "getDisplayName"),
+        route("PUT", "/profile/{userId}/displayname", Matrix, "setDisplayName"),
+        route("GET", "/profile/{userId}/avatar_url", NoAuth, "getAvatarUrl"),
+        route("PUT", "/profile/{userId}/avatar_url", Matrix, "setAvatarUrl"),
     ]
 }
 
@@ -96,10 +104,24 @@ mod tests {
 
     #[test]
     fn mirrors_the_expected_route_count() {
-        // One entry per `.route(...)` call in `hs_auth::routes::router()`: 10 distinct paths, 3
-        // of which (`/login`, `/devices/{deviceId}`, plus the method-combining ones) carry more
-        // than one method, for 16 (method, path) pairs total.
-        assert_eq!(routes().len(), 16);
+        // One entry per `(method, path)` pair `hs_auth::routes::router()` registers: 16 for the
+        // auth and device surface, plus 5 for profiles.
+        assert_eq!(routes().len(), 21);
+    }
+
+    #[test]
+    fn a_profile_read_needs_no_token_but_a_write_does() {
+        let all = routes();
+        let get = all
+            .iter()
+            .find(|r| r.method == "GET" && r.path == "/profile/{userId}/displayname")
+            .expect("the profile read is mirrored");
+        assert_eq!(get.auth, AuthKind::None);
+        let put = all
+            .iter()
+            .find(|r| r.method == "PUT" && r.path == "/profile/{userId}/displayname")
+            .expect("the profile write is mirrored");
+        assert_eq!(put.auth, AuthKind::Matrix);
     }
 
     #[test]

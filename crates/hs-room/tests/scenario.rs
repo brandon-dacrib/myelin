@@ -364,3 +364,187 @@ async fn ban_prevents_rejoin_until_unbanned() {
         .await;
     rejoin_after_unban.assert_ok();
 }
+
+/// A user's profile (`PUT /profile/{userId}/displayname`, `PUT .../avatar_url`, both `hs-auth`
+/// routes merged into the same router as this crate's room routes here -- see `app()`'s module
+/// doc) is copied into their own `m.room.member` content at the moment a new membership event is
+/// sent: joining, being invited, and knocking. Exercises the same propagation path
+/// `crate::routes::membership`'s module doc describes, end to end over real HTTP through both
+/// crates' real routers, not just this crate's own unit tests.
+#[tokio::test]
+async fn profile_propagates_into_join_invite_and_knock_membership_content() {
+    let mut scenario = Scenario::new(app());
+    scenario
+        .register("alice", "alice", "correct horse battery staple")
+        .await
+        .assert_ok();
+    scenario
+        .register("bob", "bob", "hunter2official")
+        .await
+        .assert_ok();
+    scenario
+        .register("carol", "carol", "another passphrase")
+        .await
+        .assert_ok();
+
+    // Bob sets his profile before joining anything.
+    scenario
+        .send(
+            Some("bob"),
+            Method::PUT,
+            "/profile/@bob:example.org/displayname",
+            Some(json!({"displayname": "Bob T. Builder"})),
+        )
+        .await
+        .assert_ok();
+    scenario
+        .send(
+            Some("bob"),
+            Method::PUT,
+            "/profile/@bob:example.org/avatar_url",
+            Some(json!({"avatar_url": "mxc://example.org/bob-avatar"})),
+        )
+        .await
+        .assert_ok();
+
+    let created = scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    created.assert_ok();
+    let room_id = created.str_field("room_id").to_string();
+
+    // --- join carries the target's profile ---
+    scenario
+        .send(
+            Some("bob"),
+            Method::POST,
+            &format!("/rooms/{room_id}/join"),
+            Some(json!({})),
+        )
+        .await
+        .assert_ok();
+
+    let bob_member = scenario
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/rooms/{room_id}/state/m.room.member/@bob:example.org"),
+            None,
+        )
+        .await;
+    bob_member.assert_ok();
+    assert_eq!(bob_member.json["displayname"], "Bob T. Builder");
+    assert_eq!(
+        bob_member.json["avatar_url"],
+        "mxc://example.org/bob-avatar"
+    );
+
+    // A user with no profile set at all gets a membership event with neither field, not
+    // `null`-valued ones.
+    let alice_member = scenario
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/rooms/{room_id}/state/m.room.member/@alice:example.org"),
+            None,
+        )
+        .await;
+    alice_member.assert_ok();
+    assert!(alice_member.json.get("displayname").is_none());
+    assert!(alice_member.json.get("avatar_url").is_none());
+
+    // --- invite carries the target's profile too ---
+    scenario
+        .send(
+            Some("carol"),
+            Method::PUT,
+            "/profile/@carol:example.org/displayname",
+            Some(json!({"displayname": "Carol"})),
+        )
+        .await
+        .assert_ok();
+    let private = scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({"preset": "private_chat"})),
+        )
+        .await;
+    private.assert_ok();
+    let private_room_id = private.str_field("room_id").to_string();
+    scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            &format!("/rooms/{private_room_id}/invite"),
+            Some(json!({"user_id": "@carol:example.org"})),
+        )
+        .await
+        .assert_ok();
+
+    let carol_member = scenario
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/rooms/{private_room_id}/state/m.room.member/@carol:example.org"),
+            None,
+        )
+        .await;
+    carol_member.assert_ok();
+    assert_eq!(carol_member.json["displayname"], "Carol");
+
+    // --- a profile change is not retroactive, but re-sending join picks up the new one ---
+    scenario
+        .send(
+            Some("bob"),
+            Method::PUT,
+            "/profile/@bob:example.org/displayname",
+            Some(json!({"displayname": "Bobby"})),
+        )
+        .await
+        .assert_ok();
+
+    let still_old = scenario
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/rooms/{room_id}/state/m.room.member/@bob:example.org"),
+            None,
+        )
+        .await;
+    still_old.assert_ok();
+    assert_eq!(
+        still_old.json["displayname"], "Bob T. Builder",
+        "a profile change must not retroactively edit an already-sent membership event"
+    );
+
+    scenario
+        .send(
+            Some("bob"),
+            Method::POST,
+            &format!("/rooms/{room_id}/join"),
+            Some(json!({})),
+        )
+        .await
+        .assert_ok();
+
+    let updated = scenario
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/rooms/{room_id}/state/m.room.member/@bob:example.org"),
+            None,
+        )
+        .await;
+    updated.assert_ok();
+    assert_eq!(
+        updated.json["displayname"], "Bobby",
+        "re-sending join must pick up the new profile"
+    );
+}

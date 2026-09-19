@@ -2,7 +2,168 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
-Last updated: 2026-09-18 (session 1, first pass on a previously untouched crate).
+Last updated: 2026-09-18 (session 2, user profiles).
+
+## Session 2 (2026-09-18): user profiles
+
+A real `matrix-rust-sdk` client (`cargo test -p hs-loadgen --test real_client`) had exactly one
+soft-failing step: no route in the whole workspace mounted `/_matrix/client/v3/profile/{userId}/...`.
+This session closed that gap. Scope for this session was **`crates/hs-auth/**`,
+`crates/hs-room/**` and this status file only** -- `hs-cli`, `hs-federation` and `hs-admin` were
+off limits (other tracks in flight), and none needed editing to make this real end to end (see
+"Why no `hs-cli` change was needed" below).
+
+### What is real
+
+- **Storage** (`crates/hs-auth/src/store/mod.rs`): `UserRecord` gained `display_name: Option<String>`
+  and `avatar_url: Option<String>` (both `None` by default). `UserStore` gained
+  `set_profile_display_name`/`set_profile_avatar_url`. **Naming decision**: deliberately not
+  `set_display_name`, because `DeviceStore::set_display_name` already exists (renames a device,
+  not a profile) -- the `profile_` prefix on the `UserStore` methods makes the two unambiguous at
+  any call site (`user_store.set_profile_display_name(...)` cannot be mistaken for
+  `device_store.set_display_name(...)`, and vice versa). Implemented in both
+  `store/memory.rs::InMemoryAuthStore` and `store/tables.rs::TablesAuthStore` (the latter via the
+  existing `update_user` read-modify-write helper, no new keyspace). Covered in
+  `store/shared_tests.rs::profile_fields_round_trip` and
+  `set_profile_fields_on_missing_user_is_not_found`, run against both backends by the existing
+  `run_all` harness.
+- **`GET /api/v1/users` no longer reports `display_name: null` for everyone**:
+  `crates/hs-auth/src/admin_directory.rs::to_admin_user` now fills `AdminUser::display_name`/
+  `avatar_url` from the same `UserRecord` fields (test:
+  `admin_directory::tests::get_user_reflects_profile_fields`).
+- **Routes**, in `crates/hs-auth/src/routes/profile.rs`, added to the existing
+  `hs_auth::routes::router()` fragment (see "Why hs-auth, not hs-room" below):
+  - `GET /profile/{userId}` -- combined document, unauthenticated.
+  - `GET /profile/{userId}/displayname`, `PUT /profile/{userId}/displayname`.
+  - `GET /profile/{userId}/avatar_url`, `PUT /profile/{userId}/avatar_url`.
+  - Spec rules, each with a dedicated test in `routes/profile.rs`'s `tests` module: `PUT` for
+    another user's id is `403 M_FORBIDDEN` (`put_displayname_for_another_user_is_forbidden`,
+    `put_avatar_url_for_another_user_is_forbidden`); `GET` for an unknown user is
+    `404 M_NOT_FOUND` (`get_profile_unknown_user_is_not_found`); `GET` takes no `Requester` at all
+    (`get_displayname_unauthenticated_still_works_after_put`), `PUT` does; an unset field is
+    omitted from the JSON body, never sent as `null` (`get_profile_omits_unset_fields`,
+    asserts the body is exactly `{}`).
+- **Propagation** (`crates/hs-room/src/routes/membership.rs`): `extra()`, the function that builds
+  the non-`membership` fields of a new `m.room.member` event's content, now looks up the target's
+  profile via `RoomState::auth.store` (an `hs_auth::store::UserStore`, already reachable --
+  `hs-room` already depended on `hs-auth`) and merges `displayname`/`avatar_url` in for
+  `Action::Join`, `Action::Invite` and `Action::Knock` -- the three actions where the event's own
+  target is the person whose profile it is. A missing profile field is omitted, matching the
+  routes' own rule. Proved with a new end-to-end scenario test,
+  `crates/hs-room/tests/scenario.rs::profile_propagates_into_join_invite_and_knock_membership_content`,
+  which runs both crates' real routers merged together (the existing `app()` helper already did
+  this) and checks: join carries the joiner's `displayname`/`avatar_url`; a user with no profile
+  gets neither field; invite carries the invitee's profile; a profile change does **not**
+  retroactively edit an already-sent membership event; re-sending join (allowed by
+  `crate::membership::TRANSITIONS` as a no-op resend from `PriorState::Join`) picks up the new
+  profile.
+- **What propagation explicitly does not do** (per the brief's instruction to say so plainly):
+  changing a profile does **not** rewrite that user's `m.room.member` event in every room they are
+  already joined to (Synapse's `ProfileHandler._update_join_states` behavior). The only way to get
+  an updated profile into an existing join's membership event is for the client to send that join
+  action again, which the transition table already allowed as a harmless resend before this
+  session and required no new code. No automatic per-room fan-out runs on
+  `PUT /profile/.../displayname` or `avatar_url`. This is a deliberate scope narrowing, not an
+  oversight -- revisit if a client is found that expects live profile propagation without
+  resending its own join.
+- **Real-client proof**: `cargo build -p hs-cli --bin hs && cargo test -p hs-loadgen --test
+  real_client -- --nocapture`. Step 8's line, previously `KNOWN BUG: PUT/GET
+  /_matrix/client/v3/profile/.../displayname return 404`, now reads:
+
+  ```
+  - alice's display name round-tripped through GET/PUT /profile
+  ```
+
+  All 17 scenario steps pass; full run:
+
+  ```
+  hs-loadgen scenario completed 17 steps:
+    - registered @loadgen-alice:hs-loadgen.test
+    - registered @loadgen-bob:hs-loadgen.test
+    - logged in @loadgen-alice:hs-loadgen.test on a second device via POST /login
+    - alice created room !pYFUmjKftNeDDimdRK:hs-loadgen.test
+    - alice invited @loadgen-bob:hs-loadgen.test
+    - @loadgen-bob:hs-loadgen.test joined !pYFUmjKftNeDDimdRK:hs-loadgen.test
+    - both clients completed a baseline /sync
+    - alice sent $aXgp0NZZnQn2JETYI5I1dJg_uS2nR8lHZCqCMRicnOo ("hello bob, this is alice")
+    - bob sent $oReZJ-UGUniQmnmIjH6S_F2jvAFQR4YPtqqsBzvpWYQ ("hi alice, bob here")
+    - bob's incremental /sync saw alice's message
+    - alice's incremental /sync saw bob's message
+    - alice's display name round-tripped through GET/PUT /profile
+    - room name and topic changes appeared in /sync's timeline
+    - room membership lists both @loadgen-alice:hs-loadgen.test and @loadgen-bob:hs-loadgen.test
+    - backward /messages page contains alice's message (10 events)
+    - both clients logged out
+    - post-logout /sync was correctly rejected: ... M_UNKNOWN_TOKEN ...
+  test matrix_rust_sdk_talks_to_a_real_hs_serve ... ok
+  ```
+
+### Why `hs-auth`, not `hs-room`
+
+Profile data (`UserRecord::display_name`/`avatar_url`) is account data keyed by user id, not room
+state -- the same shape as `/account/whoami` and the device endpoints `hs-auth` already owns, and
+reading or writing it needs no room context. `hs-room` (which already depends on `hs-auth`) reads
+it back out through `AuthState::store` when building new membership content, the same way it
+already reaches into `hs-auth` for the `Requester` extractor. Keeping the storage and its HTTP
+surface in one crate avoided a second crate needing write access to `hs-auth`'s store internals.
+
+### Why no `hs-cli` change was needed, and what is stale because of that
+
+`hs-auth`'s router (`crates/hs-auth/src/routes/mod.rs::router()`) returns a plain
+`axum::Router<AuthState>`, **not** an `hs_http::router::Builder` pair with a `RouteManifest` --
+that was already true before this session (see that module's own doc comment: manifest generation
+for this crate's routes is hand-mirrored elsewhere). `hs-cli`'s `serve.rs` (`build_router`) already
+calls `hs_auth::routes::router().with_state(auth.clone())` and merges that *exact* `axum::Router`
+value under both `/_matrix/client/v3` and `/_matrix/client/r0` via
+`Builder::merge_router`. Adding the five new `.route(...)` calls to that same `router()` function
+(which this session's edit to `crates/hs-auth/src/routes/mod.rs` did) means they are mounted and
+served live by any binary that calls `hs_auth::routes::router()` -- including `hs serve` -- with
+**no `hs-cli` edit required**. That is exactly how the real-client proof above worked without
+touching an off-limits crate.
+
+The cost: `merge_router`'s *manifest* argument for this fragment is
+`crate::auth_manifest::routes()` in `hs-cli` (a hand-mirrored `Vec<Route>`, off limits this
+session), which this session's five new routes are **not** in. `routes.json` (and anything that
+diffs against it) will under-report `hs-auth`'s surface until that list is updated. **For the
+integration lead or track 07/14**: add these five entries to `crates/hs-cli/src/auth_manifest.rs`'s
+`routes()`, matching the existing entries' shape (`Surface::MatrixClient`, `operation_id` a
+reasonable spec-style name, `rate_limited: false` matching the rest of that file's account/device
+entries):
+
+| method | path | auth | suggested operation_id |
+|---|---|---|---|
+| GET | `/profile/{userId}` | `AuthKind::None` | `getUserProfile` |
+| GET | `/profile/{userId}/displayname` | `AuthKind::None` | `getDisplayName` |
+| PUT | `/profile/{userId}/displayname` | `AuthKind::Matrix` | `setDisplayName` |
+| GET | `/profile/{userId}/avatar_url` | `AuthKind::None` | `getAvatarUrl` |
+| PUT | `/profile/{userId}/avatar_url` | `AuthKind::Matrix` | `setAvatarUrl` |
+
+### Verify
+
+```
+cargo fmt -p hs-room -p hs-auth
+cargo clippy -p hs-room -p hs-auth --all-targets -- -D warnings
+cargo test -p hs-room -p hs-auth
+cargo build -p hs-cli --bin hs && cargo test -p hs-loadgen --test real_client -- --nocapture
+```
+
+All green as of this session: `hs-auth` 165 tests (was ~150; added `profile.rs`'s 9,
+`shared_tests`'s 2, `admin_directory`'s 1), `hs-room` 28 unit/property tests + 4 scenario tests
+(was 3; added `profile_propagates_into_join_invite_and_knock_membership_content`).
+
+### Decisions made this session (in addition to the ones below, carried from session 1)
+
+- `UserStore::set_profile_display_name`/`set_profile_avatar_url` naming, to avoid collision with
+  `DeviceStore::set_display_name` -- see "What is real" above.
+- Profile routes live in `hs-auth`, not `hs-room` -- see "Why `hs-auth`, not `hs-room`" above.
+- Propagation is snapshot-at-send-time only, with no automatic rewrite of already-joined rooms on
+  a profile change -- see "What propagation explicitly does not do" above.
+- `hs-auth`'s `router()` was extended in place rather than adding a second, `Builder`-based
+  fragment, specifically so no `hs-cli` edit was needed this session -- see "Why no `hs-cli`
+  change was needed" above. This does leave `routes.json` stale for these five routes until
+  `hs-cli/src/auth_manifest.rs` is updated (table above).
+
+## Session 1 (2026-09-18): first pass on a previously untouched crate
 
 ## Done
 

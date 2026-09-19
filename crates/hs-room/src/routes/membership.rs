@@ -1,4 +1,30 @@
 //! Membership endpoints: join, leave, forget, invite, kick, ban, unban, knock.
+//!
+//! # Profile propagation
+//!
+//! Per the spec, `displayname`/`avatar_url` on an `m.room.member` event are a snapshot of the
+//! target user's profile *at the time the event was sent*, not a live reference -- a later
+//! profile change does not retroactively edit past membership events. [`extra`] reads the
+//! target's current profile (`hs_auth::store::UserRecord::display_name`/`avatar_url`, via
+//! `RoomState::auth`'s embedded `AuthState::store`) and merges it into the `m.room.member`
+//! content for [`Action::Join`], [`Action::Invite`] and [`Action::Knock`] -- the three actions
+//! that put the *target's own* profile into their own membership event. A local user's profile
+//! lookup is a synchronous, in-process call to `hs-auth`'s store (both crates already share the
+//! same store in `hs serve`'s single-process deployment); a remote user's profile is simply
+//! whatever `get_user` returns for them locally, which is `None` today (this crate does not
+//! query federation for a remote profile) -- their membership event carries no profile fields,
+//! same as before this change.
+//!
+//! **Not implemented**: rewriting a user's already-sent `m.room.member` event in every room they
+//! are currently joined to whenever their profile changes (Synapse's fuller behavior, via
+//! `ProfileHandler.on_profile_update`/`_update_join_states`). What *is* implemented instead: the
+//! join transition table (`crate::membership::TRANSITIONS`) allows [`Action::Join`] again from
+//! [`crate::membership::PriorState::Join`] as a harmless re-send, so a client that wants its
+//! already-joined membership event updated with a fresh profile can call
+//! `POST /rooms/{roomId}/join` (or `/join/{roomIdOrAlias}`) again and get a new `m.room.member`
+//! event carrying the current profile. No automatic per-room fan-out happens on
+//! `PUT /profile/{userId}/displayname`/`avatar_url` itself. Documented as a known scope
+//! narrowing in `docs/status/04-room-and-events.md` rather than left implicit.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -36,13 +62,32 @@ fn target_user(body: &Value, requester: &ruma::UserId) -> Result<ruma::OwnedUser
     }
 }
 
-fn extra(body: &Value) -> Value {
+/// Builds the extra `m.room.member` content fields beyond `membership` itself: the client-supplied
+/// `reason`/`join_authorised_via_users_server`, plus -- for [`Action::Join`], [`Action::Invite`]
+/// and [`Action::Knock`] -- the target's current profile. See the module docs for exactly what
+/// this does and does not cover.
+async fn extra<B: hs_kv::KvBackend + 'static>(
+    state: &RoomState<B>,
+    action: Action,
+    target: &ruma::UserId,
+    body: &Value,
+) -> Value {
     let mut out = json!({});
     if let Some(reason) = body.get("reason") {
         out["reason"] = reason.clone();
     }
     if let Some(via) = body.get("join_authorised_via_users_server") {
         out["join_authorised_via_users_server"] = via.clone();
+    }
+    if matches!(action, Action::Join | Action::Invite | Action::Knock)
+        && let Ok(Some(profile)) = state.auth.store.get_user(target).await
+    {
+        if let Some(name) = profile.display_name {
+            out["displayname"] = Value::String(name);
+        }
+        if let Some(avatar) = profile.avatar_url {
+            out["avatar_url"] = Value::String(avatar);
+        }
     }
     out
 }
@@ -57,8 +102,9 @@ async fn act<B: KvBackend + 'static>(
 ) -> Result<Response, RoomError> {
     let room_id = parse_room_id(room_id)?;
     let handle = state.rooms.get_or_load(&room_id).await?;
+    let content = extra(state, action, &target, body).await;
     handle
-        .membership(sender, action, target, extra(body), now_ms())
+        .membership(sender, action, target, content, now_ms())
         .await?;
     Ok(Json(json!({})).into_response())
 }
@@ -77,8 +123,9 @@ async fn act_join<B: KvBackend + 'static>(
 ) -> Result<Response, RoomError> {
     let room_id = parse_room_id(room_id)?;
     let handle = state.rooms.get_or_load(&room_id).await?;
+    let content = extra(state, Action::Join, &sender, body).await;
     handle
-        .membership(sender.clone(), Action::Join, sender, extra(body), now_ms())
+        .membership(sender.clone(), Action::Join, sender, content, now_ms())
         .await?;
     Ok(Json(json!({ "room_id": room_id })).into_response())
 }

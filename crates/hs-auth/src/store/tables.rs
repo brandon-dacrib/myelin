@@ -253,6 +253,24 @@ impl<B: KvBackend> UserStore for TablesAuthStore<B> {
             .await
     }
 
+    async fn set_profile_display_name(
+        &self,
+        user_id: &UserId,
+        display_name: Option<String>,
+    ) -> Result<(), StoreError> {
+        self.update_user(user_id, |u| u.display_name = display_name.clone())
+            .await
+    }
+
+    async fn set_profile_avatar_url(
+        &self,
+        user_id: &UserId,
+        avatar_url: Option<String>,
+    ) -> Result<(), StoreError> {
+        self.update_user(user_id, |u| u.avatar_url = avatar_url.clone())
+            .await
+    }
+
     async fn bind_threepid(
         &self,
         user_id: &UserId,
