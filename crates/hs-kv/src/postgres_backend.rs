@@ -293,6 +293,159 @@ fn is_serialization_conflict(err: &postgres::Error) -> bool {
     )
 }
 
+/// Wraps a `postgres::Error` so its [`fmt::Display`] carries PostgreSQL's own SQLSTATE code and
+/// message — and, when present, `DETAIL`/`HINT`/schema/table/constraint — instead of collapsing to
+/// `postgres::Error`'s own generic top-level text.
+///
+/// This exists because of a real incident, not speculatively: `postgres::Error`'s `Display` impl
+/// is keyed on a coarse internal `Kind` (`Io`, `Db`, `Closed`, ...), and for `Kind::Db` — i.e.
+/// *every* error PostgreSQL itself reports, which is the overwhelming majority of what this
+/// backend's DDL/DML calls can fail with — that `Display` is the fixed string `"db error"`,
+/// full stop. The actual SQLSTATE, message, detail and hint live one level down, in
+/// `postgres::Error::as_db_error()`'s `DbError`, which nothing upstream of this wrapper ever
+/// looked at: `KvError::Backend`'s own `Display` (`"backend error: {0}"`) just renders whatever
+/// `Display` its boxed source already produces. An operator debugging a real deployment failure
+/// (see the status file: two `hs serve` replicas racing on first-boot schema creation) saw
+/// `storage backend error: backend error: db error` — completely actionable-free — because of
+/// exactly this. Every call site in this module that produces a `postgres::Error` now converts it
+/// with [`pg_error`], which uses this wrapper, instead of the crate-wide, generic
+/// [`KvError::backend`].
+#[derive(Debug)]
+struct PgErrorDetail(postgres::Error);
+
+impl fmt::Display for PgErrorDetail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0.as_db_error() {
+            Some(db_err) => {
+                // `DbError`'s own `Display` already renders `"{severity}: {message}"` plus
+                // `DETAIL`/`HINT` when present, but — bizarrely, given the type's whole purpose —
+                // never the SQLSTATE code itself, so it's prepended here.
+                write!(f, "[{}] {db_err}", db_err.code().code())?;
+                if let Some(schema) = db_err.schema() {
+                    write!(f, " (schema: {schema})")?;
+                }
+                if let Some(table) = db_err.table() {
+                    write!(f, " (table: {table})")?;
+                }
+                if let Some(constraint) = db_err.constraint() {
+                    write!(f, " (constraint: {constraint})")?;
+                }
+                Ok(())
+            }
+            // Not a server-reported error (e.g. a connection, TLS, or DSN-parse failure) — there
+            // is no `DbError` to unpack, but the top-level `Display` is at least not the
+            // uninformative `"db error"` text for these `Kind`s, so it's used as-is; `source()`
+            // (if any) is still reachable through this wrapper's own `Error::source`, for anything
+            // that walks the chain (e.g. `anyhow`, `tracing_error`, or a future caller of this
+            // crate).
+            None => write!(f, "{}", self.0),
+        }
+    }
+}
+
+impl std::error::Error for PgErrorDetail {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
+/// Converts a `postgres::Error` into a [`KvError::Backend`] that preserves PostgreSQL's own
+/// SQLSTATE code and message (see [`PgErrorDetail`]). Used at every call site in this module that
+/// handles a `postgres::Error` directly; call sites that only see an `r2d2::Error` (a pool/connect
+/// failure) cannot use this; see the module docs ("Concurrent setup") for why.
+fn pg_error(e: postgres::Error) -> KvError {
+    KvError::backend(PgErrorDetail(e))
+}
+
+/// A simple, deterministic 64-bit hash (FNV-1a), used only to turn a schema/table name into a
+/// `pg_advisory_xact_lock` key (see [`create_if_not_exists_race_free`]). Not a cryptographic hash
+/// and not meant to be one — it only needs to give two processes racing to create the *same*
+/// schema or table the same lock key. `std::collections::hash_map::DefaultHasher` was deliberately
+/// not used here: its algorithm is explicitly documented as unspecified and may change between
+/// Rust releases or even between runs (`RandomState`'s seed), and two `hs serve` replicas racing
+/// at boot are not guaranteed to be the same build in every deployment shape (a rolling upgrade
+/// mid-flight, for one) — this hash must be stable across processes and time for the lock to work
+/// at all.
+fn advisory_lock_key(name: &str) -> i64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in name.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    // `pg_advisory_xact_lock` takes a signed `bigint`; reinterpreting the bits (not truncating)
+    // keeps the full 64-bit hash space as the lock-key space.
+    hash as i64
+}
+
+/// Runs a `CREATE ... IF NOT EXISTS` DDL statement (`create_sql`) in a way that is safe against
+/// another connection doing the exact same thing at the exact same time — the normal "N replicas
+/// of `hs serve` roll out simultaneously against an empty database" Kubernetes case, and a real
+/// incident: starting two replicas *simultaneously* against a fresh database killed one of them at
+/// boot with a bare `db error` (see [`PgErrorDetail`] for why that message itself was uninformative,
+/// separately fixed), because `CREATE SCHEMA IF NOT EXISTS` is well known **not** to be atomic in
+/// PostgreSQL — the existence check and the creation are two separate steps, and two sessions
+/// racing can both observe "does not exist" and both attempt the `CREATE`, with the loser getting a
+/// real `duplicate_schema`/`duplicate_table` error instead of the silent no-op its name implies.
+/// Starting the replicas staggered (so the schema already exists by the time the second one opens)
+/// never showed the bug, which is exactly why it is a concurrency bug and not a logic bug.
+///
+/// Two layers of defense, both real, not redundant for show:
+///
+/// 1. **`pg_advisory_xact_lock(lock_key)`** serializes every caller trying to create the *same*
+///    named object: the lock is held only for this one transaction and releases automatically at
+///    `COMMIT`/`ROLLBACK`, so a second caller blocks until the first has either created the object
+///    or given up, then proceeds with an accurate, no-longer-racing view of whether it exists. This
+///    is the layer that actually prevents the race in the overwhelming majority of cases, and the
+///    reason two replicas serialize at boot instead of both hitting the database at once.
+/// 2. **The loser's SQLSTATE (`duplicate_object_code`) is still caught and treated as success**,
+///    not propagated, in case the lock is ever bypassed (a differently-versioned instance not
+///    taking this lock during a rolling upgrade, an operator running raw DDL by hand, or simply
+///    because relying on "the lock always works" to justify skipping this check is exactly the kind
+///    of assumption the brief warned against). Belt and suspenders, on purpose: `IF NOT EXISTS`
+///    being non-atomic is documented PostgreSQL behavior, not a hypothetical this backend gets to
+///    assume away just because it also takes a lock.
+fn create_if_not_exists_race_free(
+    conn: &mut postgres::Client,
+    lock_key: i64,
+    create_sql: &str,
+    duplicate_object_code: SqlState,
+) -> Result<(), postgres::Error> {
+    conn.batch_execute("BEGIN")?;
+    let outcome = conn
+        .execute("SELECT pg_advisory_xact_lock($1)", &[&lock_key])
+        .and_then(|_rows| conn.batch_execute(create_sql));
+    match outcome {
+        Ok(()) => conn.batch_execute("COMMIT"),
+        // Lost the race despite the lock (or the lock was bypassed): the object exists now, which
+        // is exactly the end state `IF NOT EXISTS` was asked to guarantee — not an error. Checked
+        // empirically, not assumed: with the lock removed, forcing this exact race (see the status
+        // file's "verification" section) showed PostgreSQL raises `23505 unique_violation` against
+        // the system catalog's own unique index (`pg_namespace_nspname_index` /
+        // `pg_class_relname_nsp_index`), **not** the seemingly-obvious `duplicate_schema`/
+        // `duplicate_table` (`42P06`/`42P07`) — those only fire for the ordinary, non-concurrent
+        // "you asked to create something that was already committed before your transaction
+        // began" case. A real race loses at the physical index-insert step, which is a
+        // `UNIQUE_VIOLATION`, so both codes are accepted here; `duplicate_object_code` is kept as
+        // an explicit parameter (not folded into a constant) so each call site still states which
+        // semantic "already exists" error it expects in the non-racing case.
+        Err(e)
+            if e.code() == Some(&duplicate_object_code)
+                || e.code() == Some(&SqlState::UNIQUE_VIOLATION) =>
+        {
+            // The transaction is already aborted server-side (PostgreSQL aborts the whole
+            // transaction on any statement error), so roll it back explicitly rather than relying
+            // on `COMMIT`'s implicit-rollback-in-an-aborted-transaction behavior.
+            conn.batch_execute("ROLLBACK")
+        }
+        Err(e) => {
+            let _ = conn.batch_execute("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
 /// How long a write inside a [`PgTxn`] will wait on a row another open (uncommitted) transaction
 /// is holding before giving up. See the module docs: without this, `put`/`delete` would use
 /// PostgreSQL's normal row-lock **wait**, which blocks until the other transaction ends — the
@@ -356,7 +509,7 @@ impl PostgresBackend {
     /// schema could not be created.
     pub fn open(dsn: &str, schema: &str) -> Result<Self, KvError> {
         validate_ident(schema)?;
-        let config: postgres::Config = dsn.parse().map_err(KvError::backend)?;
+        let config: postgres::Config = dsn.parse().map_err(pg_error)?;
         // See the module docs ("Execution model"): building the pool and taking its first
         // connection both may dial PostgreSQL, which the synchronous `postgres` crate does by
         // driving a hidden Tokio runtime — never safe to do on the caller's own thread, since
@@ -376,8 +529,16 @@ impl PostgresBackend {
                 .map_err(KvError::backend)?;
             {
                 let mut conn = pool.get().map_err(KvError::backend)?;
-                conn.batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""))
-                    .map_err(KvError::backend)?;
+                // See `create_if_not_exists_race_free`'s docs ("Concurrent setup"): two `hs serve`
+                // replicas booting simultaneously against a fresh database both racing on this
+                // exact statement is a real, seen-in-practice failure, not a hypothetical.
+                create_if_not_exists_race_free(
+                    &mut conn,
+                    advisory_lock_key(&format!("hs_kv_schema:{schema}")),
+                    &format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""),
+                    SqlState::DUPLICATE_SCHEMA,
+                )
+                .map_err(pg_error)?;
             }
             Ok(Self {
                 inner: Arc::new(Inner {
@@ -405,7 +566,7 @@ impl PostgresBackend {
         run_isolated(move || {
             let mut conn = pool.get().map_err(KvError::backend)?;
             conn.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
-                .map_err(KvError::backend)
+                .map_err(pg_error)
         })
     }
 }
@@ -460,7 +621,7 @@ impl PgSnapshot {
     ) -> Result<T, KvError> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         match &mut *state {
-            SnapState::Ready(conn) => run_isolated(move || f(conn)).map_err(KvError::backend),
+            SnapState::Ready(conn) => run_isolated(move || f(conn)).map_err(pg_error),
             SnapState::Failed(msg) => Err(KvError::backend(DeferredError(msg.clone()))),
         }
     }
@@ -516,7 +677,7 @@ impl PgTxn {
                 *guard = None;
                 Err(KvError::MidTransactionConflict)
             }
-            Err(e) => Err(KvError::backend(e)),
+            Err(e) => Err(pg_error(e)),
         }
     }
 }
@@ -841,10 +1002,16 @@ impl KvBackend for PostgresBackend {
         let q = qualified.clone();
         run_isolated(move || {
             let mut conn = pool.get().map_err(KvError::backend)?;
-            conn.batch_execute(&format!(
-                "CREATE TABLE IF NOT EXISTS {q} (k bytea PRIMARY KEY, v bytea NOT NULL)"
-            ))
-            .map_err(KvError::backend)
+            // See `create_if_not_exists_race_free`'s docs ("Concurrent setup"): the same
+            // simultaneous-replicas race that hits schema creation in `open` can just as easily
+            // hit table creation here, the first time two replicas both open the same keyspace.
+            create_if_not_exists_race_free(
+                &mut conn,
+                advisory_lock_key(&format!("hs_kv_table:{q}")),
+                &format!("CREATE TABLE IF NOT EXISTS {q} (k bytea PRIMARY KEY, v bytea NOT NULL)"),
+                SqlState::DUPLICATE_TABLE,
+            )
+            .map_err(pg_error)
         })?;
         cache.insert(name.to_owned(), qualified.clone());
         Ok(PgKeyspace {
@@ -863,9 +1030,16 @@ impl KvBackend for PostgresBackend {
             Ok(mut conn) => {
                 match conn.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY") {
                     Ok(()) => SnapState::Ready(Box::new(conn)),
-                    Err(e) => SnapState::Failed(e.to_string()),
+                    // `PgErrorDetail`, not a bare `e.to_string()`: a real `postgres::Error` here
+                    // (not the `r2d2::Error` below) would otherwise collapse to the uninformative
+                    // `"db error"` for any server-reported failure — see `PgErrorDetail`'s docs.
+                    Err(e) => SnapState::Failed(PgErrorDetail(e).to_string()),
                 }
             }
+            // `r2d2::Error`, not `postgres::Error`: no SQLSTATE/message to recover here, since
+            // `r2d2` itself already discarded the structured connect error into a plain `String`
+            // before this closure ever saw it (see the module docs, "Concurrent setup" /
+            // `PgErrorDetail`'s docs) — `.to_string()` is already the most detail available.
             Err(e) => SnapState::Failed(e.to_string()),
         });
         PgSnapshot {
@@ -884,7 +1058,7 @@ impl KvBackend for PostgresBackend {
             conn.batch_execute(&format!(
                 "BEGIN ISOLATION LEVEL SERIALIZABLE; SET LOCAL lock_timeout = '{WRITE_LOCK_TIMEOUT}'"
             ))
-            .map_err(KvError::backend)?;
+            .map_err(pg_error)?;
             Ok::<_, KvError>(conn)
         })?;
         Ok(PgTxn {
@@ -928,7 +1102,7 @@ impl KvBackend for PostgresBackend {
                 if is_serialization_conflict(&e) {
                     Ok(Err(Conflict))
                 } else {
-                    Err(KvError::backend(e))
+                    Err(pg_error(e))
                 }
             }
         }

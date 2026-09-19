@@ -297,6 +297,108 @@ fn postgres_keyspace_name_with_a_dotted_crate_prefix_round_trips() {
     reopened.drop_schema_for_test().expect("cleanup");
 }
 
+/// The concurrency bug this test is named for, found against a real deployment: **starting two
+/// `hs serve` replicas *simultaneously* against a fresh, empty database killed one of them at
+/// boot**, with `storage backend error: backend error: db error` (see `PgErrorDetail`'s docs in
+/// `postgres_backend.rs` for why that message itself carried no actionable detail — fixed
+/// separately). Started staggered instead — replica A first, then B once the schema already
+/// existed — B always started cleanly, which is exactly what makes this a concurrency bug and not
+/// a logic bug: `CREATE SCHEMA`/`CREATE TABLE ... IF NOT EXISTS` is well known **not** to be atomic
+/// in PostgreSQL (the existence check and the creation are two separate steps), so two sessions can
+/// both observe "does not exist" and both attempt the `CREATE`, with the loser getting a real
+/// `duplicate_schema`/`duplicate_table` error instead of the silent no-op its name implies.
+///
+/// This test drives exactly that shape with two real threads and a `Barrier` to bring them as
+/// close to simultaneous as `std::thread` allows: both race to open a [`PostgresBackend`] (which
+/// creates the schema) against the *same brand-new schema name*, then race again to open the
+/// *same* keyspace on top of that (which creates its table — the second place this exact bug could
+/// hit, and did, since `PostgresBackend::keyspace` runs the identical `CREATE ... IF NOT EXISTS`
+/// pattern). Both threads must succeed both times, every iteration — this is the two-replicas
+/// cold-start case the fix (`create_if_not_exists_race_free`, an advisory-lock-guarded `CREATE`
+/// with an explicit fallback for the documented non-atomicity) was written for.
+///
+/// Run in a loop, not once: a race test that only runs a single time and happens to pass proves
+/// very little, since the actual overlap window at the database is narrow and depends on
+/// scheduling this test cannot fully control. This was run against a real `postgres:17` container
+/// several times as its own outer loop too (see the status file for the exact count and result),
+/// not just this test's internal 20 iterations, since the whole point is that the bug did not
+/// reproduce on every attempt even before the fix — a single green run was never going to be
+/// convincing either way.
+#[test]
+fn postgres_two_replicas_opening_the_same_fresh_schema_simultaneously_both_succeed() {
+    use hs_kv::KvBackend as _;
+
+    let Some(dsn) = reachable_dsn() else {
+        return;
+    };
+
+    const ITERATIONS: usize = 20;
+    for i in 0..ITERATIONS {
+        let schema = format!("{}_race{i}", fresh_schema_name());
+
+        let schema_barrier = std::sync::Barrier::new(2);
+        let (opened_a, opened_b) = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                schema_barrier.wait();
+                PostgresBackend::open(&dsn, &schema)
+            });
+            let b = scope.spawn(|| {
+                schema_barrier.wait();
+                PostgresBackend::open(&dsn, &schema)
+            });
+            (
+                a.join().expect("replica A's open() thread did not panic"),
+                b.join().expect("replica B's open() thread did not panic"),
+            )
+        });
+        let backend_a = opened_a.unwrap_or_else(|e| {
+            panic!(
+                "iteration {i}: replica A failed to open a schema being created simultaneously \
+                 by replica B: {e}"
+            )
+        });
+        let backend_b = opened_b.unwrap_or_else(|e| {
+            panic!(
+                "iteration {i}: replica B failed to open a schema being created simultaneously \
+                 by replica A: {e}"
+            )
+        });
+
+        // Race again on the table `keyspace()` creates — the same failure mode, one layer down.
+        let keyspace_barrier = std::sync::Barrier::new(2);
+        let (keyspace_a, keyspace_b) = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                keyspace_barrier.wait();
+                backend_a.keyspace("hs_auth.users")
+            });
+            let b = scope.spawn(|| {
+                keyspace_barrier.wait();
+                backend_b.keyspace("hs_auth.users")
+            });
+            (
+                a.join()
+                    .expect("replica A's keyspace() thread did not panic"),
+                b.join()
+                    .expect("replica B's keyspace() thread did not panic"),
+            )
+        });
+        keyspace_a.unwrap_or_else(|e| {
+            panic!(
+                "iteration {i}: replica A failed to open a table being created simultaneously by \
+                 replica B: {e}"
+            )
+        });
+        keyspace_b.unwrap_or_else(|e| {
+            panic!(
+                "iteration {i}: replica B failed to open a table being created simultaneously by \
+                 replica A: {e}"
+            )
+        });
+
+        backend_a.drop_schema_for_test().expect("cleanup");
+    }
+}
+
 /// Opens a fresh [`PostgresBackend`], writes a key inside a real transaction, reads it back
 /// through a snapshot, and drops everything — every one of those steps is a real, blocking
 /// `postgres`/`r2d2` call. Shared by the two tests below, which differ only in whether an ambient

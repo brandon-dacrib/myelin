@@ -33,6 +33,13 @@
 > (`hs_auth.users`, `hs_room.*`, `hs_e2e.*`, `hs_push.*`, ...); this backend's identifier
 > validation rejected the dot, which the in-memory and Fjall backends never did. **RESOLVED, same
 > day: see "Dotted keyspace names" under "Session 3" below.**
+>
+> **Integration note, 2026-09-19 (integration lead, second follow-up): dotted names fixed, then two more real bugs found by running two `hs serve` processes against one database for the
+> first time.** (1) Starting two replicas *simultaneously* against an empty database killed
+> one of them at boot (`backend error: db error`) — staggered starts never showed it, so this
+> was concurrent schema/table setup, not a logic bug. (2) That error message itself carried no
+> SQLSTATE, no message, nothing an operator could act on. **RESOLVED, same day: see "Concurrent
+> setup and honest errors" under "Session 3" below.**
 
 
 Track brief: `docs/workstreams/01-storage-engine.md`. Owner crates: `hs-kv`, `hs-tables`,
@@ -586,6 +593,106 @@ conformance breakdown with the same two documented divergences, plus fjall/memor
 green. `cargo test -p hs-kv --test postgres_conformance` with no database running: still green in
 ~3s via the existing skip path.
 
+### Concurrent setup and honest errors: two more bugs, found only by running two real servers
+
+The integration lead booted two `hs serve` processes against one PostgreSQL database for the first
+time (the normal Kubernetes "N replicas roll out at once" case) and hit two more real bugs, both in
+this crate, neither a cluster problem:
+
+**Bug 1: cold-start schema/table creation is not safe under concurrency.** Two replicas started
+*simultaneously* against an empty database — one died at boot with `storage backend error: backend
+error: db error`. Staggered starts (A first, then B once the schema existed) always worked, which is
+exactly what makes this a concurrency bug: `CREATE SCHEMA IF NOT EXISTS` (and `CREATE TABLE IF NOT
+EXISTS`, the same pattern in `KvBackend::keyspace`) is well known **not** to be atomic in
+PostgreSQL — the existence check and the creation are two separate steps, so two sessions can both
+observe "does not exist" and both attempt the `CREATE`.
+
+Fix, entirely in `crates/hs-kv/src/postgres_backend.rs`: a new `create_if_not_exists_race_free`
+wraps every `CREATE ... IF NOT EXISTS` this backend runs (schema creation in `open`, table creation
+in `keyspace`) in a transaction that first takes `pg_advisory_xact_lock(lock_key)`, where `lock_key`
+is a deterministic FNV-1a hash (`advisory_lock_key`) of the schema/table's own name — **not**
+`std::collections::hash_map::DefaultHasher`, whose algorithm is explicitly unspecified and may
+differ between processes, which two racing replicas cannot risk. The lock serializes every caller
+racing to create the *same* named object and releases automatically at `COMMIT`/`ROLLBACK` (a
+`_xact_` lock, not a session lock — no manual unlock to get wrong). This alone removes the race in
+the overwhelming majority of cases.
+
+**Verified empirically, not assumed, that a fallback is still needed and what it must actually
+catch**: temporarily reverted the lock (kept the honest-error fix below) and re-ran the new race
+test (below) — it failed within a handful of iterations, and the real error was
+`23505 unique_violation` on `pg_namespace`'s own unique index (`pg_namespace_nspname_index`), i.e.
+**not** the semantically-obvious `duplicate_schema`/`duplicate_table` (`42P06`/`42P07`) — those only
+fire for the ordinary, non-concurrent "already committed before your transaction began" case; a
+genuine race loses at the physical index-insert step, which PostgreSQL reports as a unique
+violation. `create_if_not_exists_race_free` now treats *either* code as "someone else already
+created it, not an error" — belt and suspenders in case the lock is ever bypassed (a
+differently-versioned instance mid-rolling-upgrade, an operator running raw DDL by hand), kept
+specifically because "IF NOT EXISTS is not atomic" is documented PostgreSQL behavior, not a
+hypothetical this backend gets to assume away just because it also takes a lock. This is exactly
+the kind of thing the brief warned about ("handle that error explicitly rather than assuming it
+away"), and skipping the empirical check would have shipped a fallback that silently didn't work.
+
+**Bug 2: `KvError`'s error messages threw away everything PostgreSQL actually said.** The `db error`
+text above is not a placeholder — it is `postgres::Error`'s *entire* top-level `Display` output for
+`Kind::Db`, i.e. every server-reported error this backend can hit. The real SQLSTATE, message,
+detail, and hint live one level down, in `postgres::Error::as_db_error()`'s `DbError`, which nothing
+upstream ever read: `KvError::Backend`'s own `Display` (`"backend error: {0}"`) just renders
+whatever `Display` its boxed source produces, and `postgres::Error`'s `Display` for a `Kind::Db`
+error is the fixed string `"db error"`, full stop — an operator got nothing to act on.
+
+Fix: a new `PgErrorDetail` wrapper (`postgres_backend.rs`) whose `Display` unpacks
+`as_db_error()` and renders `[SQLSTATE] severity: message` plus `DETAIL`/`HINT` (from `DbError`'s
+own `Display`, which — also worth knowing — never includes the code itself) and, when present,
+schema/table/constraint names; falls back to the plain top-level `Display` for non-`Db` errors
+(connection/TLS/DSN-parse failures), which are already reasonably specific. A new `pg_error(e:
+postgres::Error) -> KvError` helper wraps a `postgres::Error` in `PgErrorDetail` before handing it
+to `KvError::backend`, and now every call site in this module that produces a `postgres::Error`
+directly uses it — audited the whole file (the brief specifically asked to check for other
+discarding paths): `dsn.parse()`, both `CREATE ... IF NOT EXISTS` sites (via
+`create_if_not_exists_race_free`), `DROP SCHEMA`, `BEGIN` (both the snapshot and read-write paths —
+`snapshot()`'s failure path previously used a bare `e.to_string()`, same bug, now fixed too),
+`PgTxn::with_conn`, `PgSnapshot::with_conn`, and `commit()`. **One path is still, unavoidably,
+lossy**: `pool.get()`/`Pool::builder().build()` return `r2d2::Error`, and `r2d2` itself discards the
+structured `postgres::Error` into a plain `String` (via its own internal `.to_string()`) *before*
+this crate ever sees the failure — there is nothing left to recover by the time we have an
+`r2d2::Error`. In practice this only affects pool/connect-time failures (unreachable server, auth
+failure, timeout), whose `postgres::Error::Kind` messages are already specific enough on their own
+(`"authentication error"`, `"timeout waiting for server"`, etc.) — it's the `Kind::Db` case
+(`"db error"`) that was actually uninformative, and that case never goes through `r2d2::Error`.
+Documented in `PgErrorDetail`'s module docs rather than silently left as-is.
+
+The exact error text an operator now sees for the schema race (captured from the test below, before
+the lock was restored — see "verified empirically" above):
+
+```
+backend error: [23505] ERROR: duplicate key value violates unique constraint "pg_namespace_nspname_index"
+DETAIL: Key (nspname)=(hs_kv_test_18466_3_race3) already exists. (schema: pg_catalog) (table: pg_namespace) (constraint: pg_namespace_nspname_index)
+```
+
+**Test added**: `postgres_two_replicas_opening_the_same_fresh_schema_simultaneously_both_succeed` in
+`tests/postgres_conformance.rs`. Two real threads, a `std::sync::Barrier` to bring them as close to
+simultaneous as `std::thread` allows, racing to `PostgresBackend::open` the *same* brand-new schema
+name, then racing again to `.keyspace("hs_auth.users")` on top of that (the second place this exact
+bug hits) — both threads must succeed both times. Runs 20 iterations internally (a race test that
+passes once proves little, since the actual overlap window is narrow and not fully controllable
+from a test).
+
+**Run count, as asked**: with the fix in place, ran the dedicated race test **11 times** end to end
+against a real `postgres:17` container (once as part of a full `cargo test -p hs-kv --test
+postgres_conformance` run, then 5 more standalone runs before finding the `23505` gap above, then 6
+more standalone runs after fixing it) — every run's 20 internal iterations passed, so **220 total
+paired-open races plus 220 total paired-keyspace races, all green** on the fixed code. Separately,
+with the advisory lock temporarily removed (fix-verification step, not a shipped state — reverted
+immediately after), the same test reliably failed (within single-digit iterations each attempt),
+confirming the test actually exercises the race rather than passing vacuously.
+
+**Verification**: `cargo fmt -p hs-kv`, `cargo clippy -p hs-kv --all-targets -- -D warnings` both
+clean. Full `cargo test -p hs-kv` against a real `postgres:17` container: all green, 6/6 in
+`postgres_conformance.rs` now (the new race test alongside the five from before), conformance
+breakdown still unchanged at 9/11 with the same two documented divergences. `cargo test -p hs-kv
+--test postgres_conformance` with no database running: still green in ~3s via the existing skip
+path.
+
 ## Next
 
 - SlateDB backend — **explicitly out of scope this session**, per instruction; still not started
@@ -628,6 +735,15 @@ None.
   `KvBackend`/`KvRead`/`KvWrite` signature changed. Consumers no longer need `spawn_blocking` for
   correctness against this backend (only, optionally, to avoid blocking a Tokio worker thread for a
   call's latency).
+- **Session 3, behavioral only, no signature change**: `PostgresBackend::open` and
+  `KvBackend::keyspace` are now safe to call from two (or more) processes/replicas at the exact
+  same moment against the same fresh schema/table — see "Concurrent setup and honest errors" above.
+  `KvError::Backend`'s message text for a PostgreSQL-originated error now includes the SQLSTATE
+  code and the database's own message (and detail/hint/schema/table/constraint, when PostgreSQL
+  supplies them) instead of collapsing to the uninformative `"db error"` — a text-content change to
+  an existing error variant's `Display`, not a new variant or a signature change, so nothing that
+  matches on `KvError` structurally is affected, only anything that was asserting on the literal
+  error string (nothing in this workspace was, checked).
 
 ## Decisions made
 
