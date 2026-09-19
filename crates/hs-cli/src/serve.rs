@@ -43,7 +43,7 @@ use hs_user::state::UserState;
 
 use crate::config_bridge;
 use crate::metrics_layer::track_metrics;
-use crate::storage::{self, OpenedStorage};
+use crate::storage::{self};
 use crate::versions;
 
 /// Errors starting the server.
@@ -656,7 +656,11 @@ pub struct ServeHandle {
     pub addrs: Vec<SocketAddr>,
     shutdown_tx: watch::Sender<bool>,
     join: tokio::task::JoinHandle<()>,
-    _storage: OpenedStorage,
+    /// Keeps the opened storage backend alive for as long as the server is: Fjall holds an
+    /// exclusive lock on its data directory and the Postgres backend owns a connection pool, and
+    /// dropping either while listeners are still serving would take the store out from under
+    /// them. Type-erased because [`ServeHandle`] is not generic over the backend.
+    _storage: Box<dyn std::any::Any + Send + Sync>,
 }
 
 impl ServeHandle {
@@ -695,9 +699,28 @@ pub async fn spawn_serve(
         return Err(ServeError::NoListeners);
     }
 
-    let opened_storage = storage::open_storage(&config.storage)?;
-    let storage::OpenedStorage::Embedded(backend) = &opened_storage;
-    let backend = backend.clone();
+    // One generic server, instantiated per backend. `spawn_serve_with_backend` is generic over
+    // `B: KvBackend`, so both arms below get the same server built over a different store rather
+    // than two code paths that could drift apart; the cost is that it is monomorphized twice.
+    match storage::open_storage(&config.storage)? {
+        storage::OpenedStorage::Embedded(backend) => {
+            spawn_serve_with_backend(backend, config, options).await
+        }
+        storage::OpenedStorage::Postgres(backend) => {
+            spawn_serve_with_backend(backend, config, options).await
+        }
+    }
+}
+
+/// [`spawn_serve`]'s body, over whichever `hs-kv` backend the configuration opened.
+///
+/// # Errors
+/// See [`ServeError`].
+async fn spawn_serve_with_backend<B: KvBackend + 'static>(
+    backend: B,
+    config: hs_config::Config,
+    options: ServeOptions,
+) -> Result<ServeHandle, ServeError> {
 
     // Wired by the integration lead per docs/status/07-auth-and-identity.md "For track 12":
     // the persistent store replaces the in-memory one, so users, devices and tokens survive a
@@ -908,7 +931,7 @@ pub async fn spawn_serve(
         addrs,
         shutdown_tx,
         join,
-        _storage: opened_storage,
+        _storage: Box::new(backend.clone()),
     })
 }
 

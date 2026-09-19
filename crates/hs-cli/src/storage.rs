@@ -1,12 +1,11 @@
 //! Opens the `hs-kv` storage backend a native config selects.
 //!
-//! Seam gap (see `docs/status/12-platform-and-kubernetes.md`): `hs_config::StorageConfig` has
-//! three variants (`Embedded`, `Postgres`, `Slatedb`), but as of this writing `hs-kv`
-//! (owned by track 01) only ships [`hs_kv::memory::MemoryBackend`] and
-//! [`hs_kv::fjall_backend::FjallBackend`] — there is no PostgreSQL or SlateDB `KvBackend` yet.
-//! `hs serve` can therefore only actually open storage for `StorageConfig::Embedded`; the other
-//! two variants are accepted by config validation (they are valid *configuration*) but fail at
-//! this step with a clear, actionable error rather than silently falling back to something else.
+//! `hs_config::StorageConfig` has three variants. Two of them open: `Embedded`
+//! ([`hs_kv::fjall_backend::FjallBackend`]) and `Postgres`
+//! ([`hs_kv::postgres_backend::PostgresBackend`], which passes the same `hs-kv` conformance suite
+//! — see `docs/status/01-storage-engine.md` for the two documented divergences and what they mean
+//! for range-scan fencing). `Slatedb` has no `hs-kv` implementation and fails here with a clear,
+//! actionable error rather than silently falling back to something else.
 //!
 //! A second, deeper gap this module cannot paper over: even for `Embedded`, nothing downstream
 //! consumes the opened [`hs_kv::fjall_backend::FjallBackend`] yet. `hs-auth`'s
@@ -27,13 +26,43 @@ use std::path::Path;
 pub enum StorageOpenError {
     /// `storage.backend` selected a backend `hs-kv` does not implement yet.
     #[error(
-        "storage.backend = {backend:?} has no hs-kv implementation yet (only the embedded Fjall \
-         backend is wired up in `hs serve` today); see docs/status/12-platform-and-kubernetes.md"
+        "storage.backend = {backend:?} has no hs-kv implementation yet (embedded and postgres \
+         are wired up in `hs serve` today); see docs/status/01-storage-engine.md"
     )]
     BackendNotImplemented {
-        /// The backend name, for the error message (`"postgres"` or `"slatedb"`).
+        /// The backend name, for the error message (`"slatedb"`).
         backend: &'static str,
     },
+    /// The PostgreSQL database could not be opened.
+    #[error("failed to open the postgres storage backend at {host}:{port}/{database}: {source}")]
+    Postgres {
+        /// The configured host, for the error message.
+        host: String,
+        /// The configured port.
+        port: u16,
+        /// The configured database name.
+        database: String,
+        /// The underlying `hs-kv` error.
+        #[source]
+        source: hs_kv::KvError,
+    },
+    /// The PostgreSQL backend was opened from inside a Tokio runtime, which it cannot survive.
+    #[error(
+        "the hs-kv postgres backend cannot be opened from inside a Tokio runtime: its client (the \
+         synchronous `postgres` crate) drives its own internal runtime with `block_on`, which \
+         panics with \"Cannot start a runtime from within a runtime\" on a thread that already \
+         has one. `hs serve` is async, so every storage call would hit this. Tracked in \
+         docs/status/01-storage-engine.md; until the backend dispatches its work onto its own \
+         threads, `storage.backend: postgres` cannot serve. Use `embedded` for now."
+    )]
+    PostgresInsideRuntime,
+    /// `storage.postgres.tls` was set, which this backend cannot honour.
+    #[error(
+        "storage.postgres.tls is set, but the hs-kv postgres backend connects without TLS \
+         (NoTls) and would silently send credentials in the clear. Terminate TLS in front of \
+         PostgreSQL, or unset this field to acknowledge a plaintext connection."
+    )]
+    PostgresTlsUnsupported,
     /// The embedded Fjall database could not be opened.
     #[error("failed to open the embedded storage backend at {path:?}: {source}")]
     Fjall {
@@ -50,12 +79,15 @@ pub enum StorageOpenError {
 pub enum OpenedStorage {
     /// The embedded Fjall backend, opened at its configured data directory.
     Embedded(hs_kv::fjall_backend::FjallBackend),
+    /// The PostgreSQL backend, connected to its configured database.
+    Postgres(hs_kv::postgres_backend::PostgresBackend),
 }
 
 impl std::fmt::Debug for OpenedStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OpenedStorage::Embedded(_) => f.write_str("OpenedStorage::Embedded(..)"),
+            OpenedStorage::Postgres(_) => f.write_str("OpenedStorage::Postgres(..)"),
         }
     }
 }
@@ -63,21 +95,55 @@ impl std::fmt::Debug for OpenedStorage {
 /// Opens the storage backend `config.storage` selects.
 ///
 /// # Errors
-/// Returns [`StorageOpenError::BackendNotImplemented`] for `postgres` or `slatedb` (no `hs-kv`
-/// backend exists for either yet), or [`StorageOpenError::Fjall`] if the embedded backend's data
-/// directory could not be opened.
+/// Returns [`StorageOpenError::BackendNotImplemented`] for `slatedb` (no `hs-kv` backend exists
+/// for it), [`StorageOpenError::Fjall`] if the embedded backend's data directory could not be
+/// opened, or [`StorageOpenError::Postgres`]/[`StorageOpenError::PostgresTlsUnsupported`] for the
+/// PostgreSQL backend.
 pub fn open_storage(config: &hs_config::StorageConfig) -> Result<OpenedStorage, StorageOpenError> {
     match config {
         hs_config::StorageConfig::Embedded(embedded) => {
             open_embedded(&embedded.data_dir).map(OpenedStorage::Embedded)
         }
-        hs_config::StorageConfig::Postgres(_) => Err(StorageOpenError::BackendNotImplemented {
-            backend: "postgres",
-        }),
+        hs_config::StorageConfig::Postgres(pg) => open_postgres(pg).map(OpenedStorage::Postgres),
         hs_config::StorageConfig::Slatedb(_) => {
             Err(StorageOpenError::BackendNotImplemented { backend: "slatedb" })
         }
     }
+}
+
+/// Opens the PostgreSQL backend from its configured connection fields.
+///
+/// `tls` is refused rather than ignored: the backend connects with `NoTls`, so honouring the flag
+/// silently would send credentials in the clear on a connection the operator asked to encrypt.
+/// `schema` is fixed to `"public"` — `PostgresBackend::open` takes it as a parameter, but
+/// `hs_config::PostgresStorageConfig` has no field for it yet. `pool_size` is likewise not
+/// plumbed through (the backend fixes its own pool size); both are noted in
+/// `docs/status/01-storage-engine.md`.
+fn open_postgres(
+    config: &hs_config::storage::PostgresStorageConfig,
+) -> Result<hs_kv::postgres_backend::PostgresBackend, StorageOpenError> {
+    if config.tls {
+        return Err(StorageOpenError::PostgresTlsUnsupported);
+    }
+    // Refuse deliberately rather than panicking deep inside the client. Found by booting `hs
+    // serve` against a real PostgreSQL: the backend's conformance tests all pass because they run
+    // in plain `#[test]` functions, and the failure only exists once something async opens it.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err(StorageOpenError::PostgresInsideRuntime);
+    }
+    let password = config.password.as_str().unwrap_or_default();
+    let dsn = format!(
+        "host={} port={} dbname={} user={} password={}",
+        config.host, config.port, config.database, config.user, password
+    );
+    hs_kv::postgres_backend::PostgresBackend::open(&dsn, "public").map_err(|source| {
+        StorageOpenError::Postgres {
+            host: config.host.clone(),
+            port: config.port,
+            database: config.database.clone(),
+            source,
+        }
+    })
 }
 
 fn open_embedded(path: &Path) -> Result<hs_kv::fjall_backend::FjallBackend, StorageOpenError> {
@@ -103,7 +169,9 @@ mod tests {
                 data_dir: dir.path().to_owned(),
             });
         let opened = open_storage(&config).unwrap();
-        let OpenedStorage::Embedded(backend) = opened;
+        let OpenedStorage::Embedded(backend) = opened else {
+            panic!("an embedded config must open the embedded backend");
+        };
         // Prove the handle actually works: open a keyspace and do a trivial round trip.
         use hs_kv::KvBackend as _;
         let ks = backend.keyspace("healthcheck").unwrap();
@@ -115,24 +183,59 @@ mod tests {
         assert!(backend.commit(txn).unwrap().is_ok());
     }
 
+    fn postgres_config(tls: bool) -> hs_config::StorageConfig {
+        hs_config::StorageConfig::Postgres(hs_config::storage::PostgresStorageConfig {
+            // Deliberately unroutable: this test is about which error comes back, not about
+            // reaching a database. A real-database test lives in `hs-kv`'s own conformance suite.
+            host: "127.0.0.1".into(),
+            port: 1,
+            database: "hs".into(),
+            user: "hs".into(),
+            password: hs_config::SecretString::default(),
+            password_file: None,
+            pool_size: 10,
+            tls,
+        })
+    }
+
     #[test]
-    fn postgres_backend_is_reported_as_not_implemented() {
-        let config =
-            hs_config::StorageConfig::Postgres(hs_config::storage::PostgresStorageConfig {
-                host: "db".into(),
-                port: 5432,
-                database: "hs".into(),
-                user: "hs".into(),
-                password: hs_config::SecretString::default(),
-                password_file: None,
-                pool_size: 10,
-                tls: false,
-            });
+    fn postgres_tls_is_refused_rather_than_silently_ignored() {
+        // The backend connects with `NoTls`. Honouring `tls: true` by ignoring it would send the
+        // password in the clear on a connection the operator explicitly asked to encrypt.
+        let err = open_storage(&postgres_config(true)).unwrap_err();
+        assert!(matches!(err, StorageOpenError::PostgresTlsUnsupported));
+    }
+
+    #[test]
+    fn an_unreachable_postgres_reports_where_it_tried_to_connect() {
+        let err = open_storage(&postgres_config(false)).unwrap_err();
+        match err {
+            StorageOpenError::Postgres {
+                host,
+                port,
+                database,
+                ..
+            } => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(port, 1);
+                assert_eq!(database, "hs");
+            }
+            other => panic!("expected a Postgres open failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slatedb_is_still_reported_as_not_implemented() {
+        let config = hs_config::StorageConfig::Slatedb(hs_config::storage::SlatedbStorageConfig {
+            bucket_url: "s3://bucket/prefix".into(),
+            shard_count: 16,
+            lease_duration: "30s".parse().expect("30s is a valid duration"),
+        });
         let err = open_storage(&config).unwrap_err();
         assert!(matches!(
             err,
             StorageOpenError::BackendNotImplemented {
-                backend: "postgres"
+                backend: "slatedb"
             }
         ));
     }

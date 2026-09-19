@@ -1,5 +1,25 @@
 # 01 Storage engine: status
 
+> **Integration note, 2026-09-19 (integration lead): the Postgres backend cannot serve yet, and
+> the conformance suite could not have told us.** Wiring it into `hs serve` and booting against a
+> real PostgreSQL 17 panics immediately: `Cannot start a runtime from within a runtime`
+> (`postgres-0.19.14/src/connection.rs:66`). The synchronous `postgres` client drives its own
+> internal Tokio runtime with `block_on`, which panics on any thread that already has one — and
+> `hs serve` is async, so this hits at open and would hit on every storage call thereafter. Every
+> conformance test passes because they are plain `#[test]` functions with no ambient runtime; this
+> failure only exists once something async opens the backend, which is the only way it will ever
+> be used in production.
+>
+> `crates/hs-cli/src/storage.rs` now detects an ambient runtime and refuses with an explanatory
+> error rather than panicking, and the rest of the wiring (config → DSN, the `OpenedStorage`
+> variant, `spawn_serve` generic over the backend, TLS refused rather than ignored) is in place
+> and tested, so the only thing between this and a working multi-node deployment is the client
+> strategy. The fix is for `PostgresBackend` to own its execution: dispatch every operation onto
+> its own dedicated thread(s) with no ambient runtime, or move to `tokio-postgres` driven on a
+> runtime handle the backend controls. Whichever is chosen, the acceptance test is booting
+> `hs serve` with `storage.backend: postgres` and registering a user — not the conformance suite.
+
+
 Track brief: `docs/workstreams/01-storage-engine.md`. Owner crates: `hs-kv`, `hs-tables`,
 `hs-search` (not started).
 
