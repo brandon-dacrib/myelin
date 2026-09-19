@@ -45,6 +45,15 @@ pub struct FederationState {
     pub write_sink: Arc<dyn RoomWriteSink>,
     /// Idempotency cache for `/send` transactions, keyed by `(origin, txnId)`.
     pub transactions: Arc<dyn TransactionStore>,
+    /// Fetches ancestor events from a remote server when an inbound event cites a
+    /// `prev_events`/`auth_events` entry this server does not hold
+    /// (`hs_room::RoomError::MissingAncestors`). `None` disables backfill entirely: `/send` still
+    /// accepts events whose ancestors are already held, but a genuine gap is reported as a
+    /// per-event error immediately instead of triggering any outbound calls. See `crate::backfill`.
+    pub ancestor_fetcher: Option<Arc<dyn crate::backfill::AncestorFetcher>>,
+    /// Bounds applied to every backfill resolution attempt. See `crate::backfill` for what an
+    /// attacker can and cannot cost this server by dangling a missing-ancestor chain.
+    pub backfill_limits: crate::backfill::BackfillLimits,
 }
 
 fn matrix_federation(operation_id: &str) -> RouteMeta {
@@ -152,6 +161,8 @@ mod tests {
                 "not supported",
             )),
             transactions: Arc::new(crate::inbound::InMemoryTransactionStore::new()),
+            ancestor_fetcher: None,
+            backfill_limits: crate::backfill::BackfillLimits::default(),
         }
     }
 

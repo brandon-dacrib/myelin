@@ -48,6 +48,8 @@ async fn send(
         state.write_sink.as_ref(),
         &ctx.key_cache,
         state.transactions.as_ref(),
+        state.ancestor_fetcher.as_deref(),
+        &state.backfill_limits,
     )
     .await
     {
@@ -115,6 +117,8 @@ mod tests {
             allow_device_name_lookup_over_federation: false,
             write_sink: std::sync::Arc::new(StaticWriteSink::new(Vec::new(), "not supported yet")),
             transactions: std::sync::Arc::new(InMemoryTransactionStore::new()),
+            ancestor_fetcher: None,
+            backfill_limits: crate::backfill::BackfillLimits::default(),
         }
     }
 

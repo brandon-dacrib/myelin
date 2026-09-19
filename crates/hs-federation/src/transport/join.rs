@@ -260,6 +260,8 @@ mod tests {
             allow_device_name_lookup_over_federation: false,
             write_sink: std::sync::Arc::new(StaticWriteSink::new(Vec::new(), "cannot persist yet")),
             transactions: std::sync::Arc::new(InMemoryTransactionStore::new()),
+            ancestor_fetcher: None,
+            backfill_limits: crate::backfill::BackfillLimits::default(),
         }
     }
 

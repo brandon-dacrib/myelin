@@ -161,6 +161,33 @@ pub enum WriteOutcome {
 #[derive(Debug, Clone)]
 pub struct WriteRejected {
     pub error: String,
+    /// The event IDs of ancestors (`prev_events`/`auth_events`) this server does not hold, if
+    /// that is why the event was rejected. **Empty** for every other kind of rejection (bad
+    /// signature, failed authorization, unknown room, ...) -- callers (`crate::backfill`) use
+    /// this, not string-matching on [`WriteRejected::error`], to decide whether a gap is worth
+    /// trying to close.
+    pub missing_ancestors: Vec<String>,
+}
+
+impl WriteRejected {
+    /// An ordinary rejection with nothing to backfill.
+    #[must_use]
+    pub fn other(message: impl Into<String>) -> Self {
+        Self {
+            error: message.into(),
+            missing_ancestors: Vec::new(),
+        }
+    }
+
+    /// A rejection because `missing` ancestors are not held by this server yet -- the one kind of
+    /// rejection [`crate::backfill::resolve_missing_ancestors`] can act on.
+    #[must_use]
+    pub fn missing_ancestors(missing: Vec<String>, message: impl Into<String>) -> Self {
+        Self {
+            error: message.into(),
+            missing_ancestors: missing,
+        }
+    }
 }
 
 /// The write half of "accept a federation event", shared by `/send`'s per-PDU processing and
@@ -215,9 +242,7 @@ impl RoomWriteSink for StaticWriteSink {
         if self.known.contains(event_id) {
             return Ok(WriteOutcome::AlreadyKnown);
         }
-        Err(WriteRejected {
-            error: self.reject_message.clone(),
-        })
+        Err(WriteRejected::other(self.reject_message.clone()))
     }
 }
 
@@ -271,14 +296,23 @@ impl TransactionStore for InMemoryTransactionStore {
 /// known-`(origin, txn_id)` transaction from cache, otherwise verifies and applies each PDU in
 /// order and records the response for future replays.
 ///
+/// A PDU rejected for missing ancestors (`WriteRejected::missing_ancestors` non-empty) is not
+/// immediately reported as an error: if `ancestor_fetcher` is supplied, the gap is closed via
+/// [`crate::backfill::resolve_missing_ancestors`] against `origin` (the server that sent us this
+/// transaction) and the PDU is retried exactly once before falling back to reporting an error.
+/// This is the loop described in `docs/status/06-federation.md`: it turns "an event arrived before
+/// its history" into "an event arrived, and now so did its history" whenever the gap is small
+/// enough and the peer cooperative enough to close within `backfill_limits`.
+///
 /// EDUs are parsed for structural validity ([`crate::edu::parse_edu`]) and otherwise ignored: no
 /// EDU handler (presence, typing, receipts, device lists, to-device, signing-key updates) exists
 /// yet.
 ///
 /// # Errors
 /// Returns [`TransactionError::TooManyPdus`]/[`TransactionError::TooManyEdus`] if the transaction
-/// exceeds the resource-limits table; never fails for a problem with an individual PDU, which is
-/// reported per-event in the returned map instead.
+/// exceeds the resource-limits table; never fails for a problem with an individual PDU (including
+/// a backfill attempt that gives up), which is reported per-event in the returned map instead.
+#[allow(clippy::too_many_arguments)]
 pub async fn process_transaction(
     origin: &str,
     txn_id: &str,
@@ -287,6 +321,8 @@ pub async fn process_transaction(
     sink: &dyn RoomWriteSink,
     key_cache: &DynRemoteKeyCache,
     transactions: &dyn TransactionStore,
+    ancestor_fetcher: Option<&dyn crate::backfill::AncestorFetcher>,
+    backfill_limits: &crate::backfill::BackfillLimits,
 ) -> Result<Value, TransactionError> {
     if let Some(cached) = transactions.get(origin, txn_id).await {
         return Ok(cached);
@@ -347,6 +383,46 @@ pub async fn process_transaction(
         match sink.accept_verified_event(room_id, &event_id, &value).await {
             Ok(_) => {
                 results.insert(event_id, serde_json::json!({}));
+            }
+            Err(rejected)
+                if !rejected.missing_ancestors.is_empty() && ancestor_fetcher.is_some() =>
+            {
+                let fetcher = ancestor_fetcher.expect("checked Some above");
+                let outcome = crate::backfill::resolve_missing_ancestors(
+                    origin,
+                    room_id,
+                    &room_version,
+                    rejected.missing_ancestors.clone(),
+                    fetcher,
+                    key_cache,
+                    sink,
+                    backfill_limits,
+                )
+                .await;
+                match outcome {
+                    Ok(()) => match sink.accept_verified_event(room_id, &event_id, &value).await {
+                        Ok(_) => {
+                            results.insert(event_id, serde_json::json!({}));
+                        }
+                        Err(still_rejected) => {
+                            results.insert(
+                                event_id,
+                                serde_json::json!({"error": still_rejected.error}),
+                            );
+                        }
+                    },
+                    Err(gave_up) => {
+                        results.insert(
+                            event_id,
+                            serde_json::json!({
+                                "error": format!(
+                                    "{}; backfill attempt to close it {gave_up}",
+                                    rejected.error
+                                )
+                            }),
+                        );
+                    }
+                }
             }
             Err(rejected) => {
                 results.insert(event_id, serde_json::json!({"error": rejected.error}));
@@ -552,6 +628,8 @@ mod tests {
             &sink,
             &cache,
             &store,
+            None,
+            &crate::backfill::BackfillLimits::default(),
         )
         .await
         .unwrap_err();
@@ -579,6 +657,8 @@ mod tests {
             &sink,
             &cache,
             &store,
+            None,
+            &crate::backfill::BackfillLimits::default(),
         )
         .await
         .unwrap();
@@ -608,6 +688,8 @@ mod tests {
             &sink,
             &cache,
             &store,
+            None,
+            &crate::backfill::BackfillLimits::default(),
         )
         .await
         .unwrap();
@@ -657,6 +739,8 @@ mod tests {
             &sink,
             &cache,
             &store,
+            None,
+            &crate::backfill::BackfillLimits::default(),
         )
         .await
         .unwrap();
@@ -668,6 +752,8 @@ mod tests {
             &sink,
             &cache,
             &store,
+            None,
+            &crate::backfill::BackfillLimits::default(),
         )
         .await
         .unwrap();

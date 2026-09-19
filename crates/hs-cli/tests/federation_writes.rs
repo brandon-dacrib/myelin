@@ -17,7 +17,8 @@
 //!   accept an already-signed foreign event. See `crates/hs-federation/src/inbound.rs` and
 //!   `crates/hs-federation/src/join.rs`'s module docs, and `docs/status/06-federation.md`.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -29,6 +30,7 @@ use hs_model::signing::SigningKeyPair;
 use hs_room::identity::HomeserverIdentity;
 use hs_room::registry::RoomRegistry;
 use serde_json::Value;
+use tokio::net::TcpListener;
 use tower::ServiceExt as _;
 
 const US: &str = "local.example";
@@ -69,16 +71,37 @@ impl hs_federation::keys::KeyServerFetcher for TwoServerKeys {
 struct Harness {
     router_v1: axum::Router,
     router_v2: axum::Router,
+    remote_name: String,
     remote_key: SigningKeyPair,
+    us_signing_key: SigningKeyPair,
     rooms: Arc<RoomRegistry<MemoryBackend>>,
 }
 
 impl Harness {
     async fn new() -> Self {
+        Self::build(REMOTE.to_string(), None).await
+    }
+
+    /// Like [`Harness::new`], but wires a real [`hs_federation::client::FederationClient`] as the
+    /// state's `ancestor_fetcher`, pointed (via the explicit-port destination form, exactly as
+    /// `crates/hs-federation/src/client.rs`'s own tests do) at a "remote" server the caller binds
+    /// to `127.0.0.1:{port}` -- for the backfill tests below, which need this server to actually
+    /// make an outbound `/backfill` call, not just accept a `/send` transaction.
+    ///
+    /// The remote's identity is `localhost:{port}` (a valid, explicit-port Matrix server name):
+    /// this both bypasses well-known/SRV discovery (there is no real DNS for it to resolve) and
+    /// is what every signed request in these tests uses as `origin`, so the transaction's origin
+    /// and the backfill client's destination are, correctly, the same string a real deployment
+    /// would use.
+    async fn with_backfill_peer(port: u16) -> Self {
+        Self::build(format!("localhost:{port}"), Some(port)).await
+    }
+
+    async fn build(remote_name: String, backfill_port: Option<u16>) -> Self {
         let backend = MemoryBackend::new();
         let identity = HomeserverIdentity::for_tests(US);
-        let us_keys =
-            hs_federation::keys::OwnSigningKeys::from_keys(vec![(*identity.signing_key).clone()]);
+        let us_signing_key = (*identity.signing_key).clone();
+        let us_keys = hs_federation::keys::OwnSigningKeys::from_keys(vec![us_signing_key.clone()]);
         let rooms = Arc::new(RoomRegistry::open(backend.clone(), identity).expect("registry"));
 
         let user_store: hs_user::store::DynUserStore = Arc::new(
@@ -93,6 +116,25 @@ impl Harness {
 
         let remote_key = SigningKeyPair::generate("a_remote");
         let remote_keys = hs_federation::keys::OwnSigningKeys::from_keys(vec![remote_key.clone()]);
+
+        let ancestor_fetcher: Option<Arc<dyn hs_federation::backfill::AncestorFetcher>> =
+            backfill_port.map(|_port| {
+                let client = hs_federation::client::FederationClient::new(
+                    US,
+                    us_signing_key.clone(),
+                    hs_federation::client::ClientConfig {
+                        scheme: "http",
+                        ..hs_federation::client::ClientConfig::default()
+                    },
+                    Arc::new(hs_federation::destination_store::InMemoryDestinationStore::new()),
+                    Arc::new(NoWellKnown),
+                    Arc::new(NoSrv),
+                    Arc::new(FixedAddr(std::net::IpAddr::V4(
+                        std::net::Ipv4Addr::LOCALHOST,
+                    ))),
+                );
+                Arc::new(client) as Arc<dyn hs_federation::backfill::AncestorFetcher>
+            });
 
         let state = hs_federation::transport::FederationState {
             own_server_name: Arc::from(US),
@@ -110,12 +152,14 @@ impl Harness {
             allow_device_name_lookup_over_federation: true,
             write_sink: Arc::new(hs_cli::federation::RegistryWriteSink::new(rooms.clone())),
             transactions: Arc::new(hs_federation::inbound::InMemoryTransactionStore::new()),
+            ancestor_fetcher,
+            backfill_limits: hs_federation::backfill::BackfillLimits::default(),
         };
 
         let fetcher = TwoServerKeys {
             us_name: US.to_string(),
             us_keys,
-            remote_name: REMOTE.to_string(),
+            remote_name: remote_name.clone(),
             remote_keys,
         };
         let key_cache: Arc<hs_federation::keys::DynRemoteKeyCache> =
@@ -140,7 +184,9 @@ impl Harness {
         Self {
             router_v1,
             router_v2,
+            remote_name,
             remote_key,
+            us_signing_key,
             rooms,
         }
     }
@@ -155,7 +201,7 @@ impl Harness {
         let auth = hs_federation::xmatrix::sign_request(
             "PUT",
             &uri,
-            REMOTE,
+            &self.remote_name,
             US,
             Some(body),
             &self.remote_key,
@@ -184,9 +230,15 @@ impl Harness {
 
     async fn signed_get(&self, path: &str) -> (StatusCode, Value) {
         let uri = format!("/_matrix/federation/v1{path}");
-        let auth =
-            hs_federation::xmatrix::sign_request("GET", &uri, REMOTE, US, None, &self.remote_key)
-                .expect("signing");
+        let auth = hs_federation::xmatrix::sign_request(
+            "GET",
+            &uri,
+            &self.remote_name,
+            US,
+            None,
+            &self.remote_key,
+        )
+        .expect("signing");
         let request = Request::builder()
             .method("GET")
             .uri(&uri)
@@ -207,6 +259,22 @@ impl Harness {
     /// Creates a public, world-readable room owned by a local user with one message in it.
     /// Returns `(room_id, message_event_id)`.
     async fn room_with_a_message(&self) -> (String, String) {
+        let (room_id, message) = self.room_with_a_message_event().await;
+        (room_id, message.event_id().to_string())
+    }
+
+    /// Like [`Harness::room_with_a_message`], but also returns the message's real `depth` --
+    /// needed to construct a well-formed synthetic descendant event for the backfill tests below.
+    async fn room_with_a_message_and_depth(&self) -> (String, String, i64) {
+        let (room_id, message) = self.room_with_a_message_event().await;
+        (
+            room_id,
+            message.event_id().to_string(),
+            message.header().depth,
+        )
+    }
+
+    async fn room_with_a_message_event(&self) -> (String, hs_model::Event) {
         let creator = ruma::UserId::parse(format!("@alice:{US}")).unwrap();
         let handle = self
             .rooms
@@ -243,7 +311,42 @@ impl Harness {
             .await
             .expect("message");
         let room_id = handle.query(|actor| actor.room_id().to_string()).await;
-        (room_id, message.event_id().to_string())
+        (room_id, message)
+    }
+
+    /// The event IDs a plain `m.room.message` from alice must cite as `auth_events` for this
+    /// server's default room version (11, where `room_create_event_id_as_room_id` is *false* --
+    /// only room version 12 changed that -- so `m.room.create` is, perhaps counter-intuitively,
+    /// still part of the selection alongside `m.room.power_levels` and alice's own
+    /// `m.room.member`). Used by the backfill tests below to hand-construct synthetic descendant
+    /// events that pass real authorization once persisted. Order: `(create, power_levels,
+    /// member)`.
+    async fn message_auth_event_ids(&self, room_id: &str) -> (String, String, String) {
+        let parsed = ruma::RoomId::parse(room_id).unwrap();
+        let handle = self.rooms.get_or_load(&parsed).await.unwrap();
+        let alice = format!("@alice:{US}");
+        handle
+            .query(move |actor| {
+                let state = actor.full_state().expect("room has state");
+                let find = |event_type: &str, state_key: Option<&str>| {
+                    state
+                        .iter()
+                        .find(|e| {
+                            e.header().event_type == event_type
+                                && state_key
+                                    .is_none_or(|k| e.header().state_key.as_deref() == Some(k))
+                        })
+                        .unwrap_or_else(|| panic!("room has {event_type}"))
+                        .event_id()
+                        .to_string()
+                };
+                (
+                    find("m.room.create", None),
+                    find("m.room.power_levels", None),
+                    find("m.room.member", Some(&alice)),
+                )
+            })
+            .await
     }
 
     /// The exact wire-form PDU JSON for an event this server already holds, fetched the way a
@@ -254,6 +357,78 @@ impl Harness {
         let _ = room_id;
         body["pdus"][0].clone()
     }
+}
+
+/// Always reports no `.well-known` -- the backfill tests' "remote" is addressed by its explicit
+/// port, which bypasses discovery entirely, but a fetcher must still exist to build the client.
+struct NoWellKnown;
+#[async_trait]
+impl hs_federation::discovery::WellKnownFetcher for NoWellKnown {
+    async fn fetch(&self, _hostname: &str) -> hs_federation::discovery::WellKnownOutcome {
+        hs_federation::discovery::WellKnownOutcome::Absent {
+            cache_for: std::time::Duration::from_secs(60),
+        }
+    }
+}
+
+/// Always reports no SRV records, for the same reason as [`NoWellKnown`].
+struct NoSrv;
+#[async_trait]
+impl hs_federation::discovery::SrvResolver for NoSrv {
+    async fn lookup_srv(&self, _service: &str, _hostname: &str) -> Vec<(String, u16)> {
+        Vec::new()
+    }
+}
+
+/// Resolves every hostname to the one fixed address the test's own axum server listens on.
+struct FixedAddr(std::net::IpAddr);
+#[async_trait]
+impl hs_federation::discovery::AddrResolver for FixedAddr {
+    async fn resolve_addr(&self, _hostname: &str) -> Vec<std::net::IpAddr> {
+        vec![self.0]
+    }
+}
+
+/// Builds and signs a synthetic `m.room.message`, exactly the way a real homeserver would: real
+/// content hash, real signature, real canonical-JSON round-trip. Used by the backfill tests below
+/// to construct events this server has never seen, with a real, checkable dependency chain.
+#[allow(clippy::too_many_arguments)]
+fn build_signed_message(
+    signing_key: &SigningKeyPair,
+    room_id: &str,
+    sender: &str,
+    prev_events: Vec<String>,
+    auth_events: Vec<String>,
+    depth: i64,
+    origin_server_ts: i64,
+    body: &str,
+) -> Value {
+    let mut object = to_canonical_object(
+        &serde_json::json!({
+            "type": "m.room.message",
+            "room_id": room_id,
+            "sender": sender,
+            "origin_server_ts": origin_server_ts,
+            "depth": depth,
+            "content": {"msgtype": "m.text", "body": body},
+            "prev_events": prev_events,
+            "auth_events": auth_events,
+        }),
+        true,
+    )
+    .unwrap();
+    let hash = hs_model::hash::content_hash_base64(&object);
+    object.insert(
+        "hashes".to_owned(),
+        CanonicalJsonValue::Object(
+            [("sha256".to_owned(), CanonicalJsonValue::String(hash))]
+                .into_iter()
+                .collect(),
+        ),
+    );
+    let server = ruma::ServerName::parse(sender.split_once(':').unwrap().1).unwrap();
+    hs_model::signing::sign_object(&mut object, &server, signing_key).unwrap();
+    serde_json::from_slice(&CanonicalJsonValue::Object(object).to_canonical_bytes()).unwrap()
 }
 
 #[tokio::test]
@@ -452,7 +627,11 @@ async fn send_join_v2_persists_the_join_and_it_is_readable_afterwards() {
     let (status, fetched) = harness
         .signed_get(&format!("/event/{joined_event_id}"))
         .await;
-    assert_eq!(status, StatusCode::OK, "the join should be readable: {fetched}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the join should be readable: {fetched}"
+    );
     let stored = &fetched["pdus"][0];
     assert_eq!(stored["type"], "m.room.member");
     assert_eq!(stored["state_key"], format!("@bob:{REMOTE}"));
@@ -467,14 +646,203 @@ async fn send_join_v2_persists_the_join_and_it_is_readable_afterwards() {
         .signed_get(&format!("/state/{room_id}?event_id={joined_event_id}"))
         .await;
     assert_eq!(status, StatusCode::OK, "{state}");
-    let has_bob = state["pdus"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|pdu| {
-            pdu["type"] == "m.room.member"
-                && pdu["state_key"] == format!("@bob:{REMOTE}")
-                && pdu["content"]["membership"] == "join"
-        });
+    let has_bob = state["pdus"].as_array().unwrap().iter().any(|pdu| {
+        pdu["type"] == "m.room.member"
+            && pdu["state_key"] == format!("@bob:{REMOTE}")
+            && pdu["content"]["membership"] == "join"
+    });
     assert!(has_bob, "bob's join should be in the room's state: {state}");
+}
+
+/// Binds a minimal "remote federation server" to a real loopback TCP port: an axum catch-all that
+/// answers every request with whatever is currently in `body` (mutable after the peer starts, so
+/// a test can spawn it before it knows the exact JSON it wants to serve), ignoring path, method,
+/// and any `Authorization` header. Good enough to stand in for a peer this server's real
+/// `hs_federation::client::FederationClient` dials over real HTTP -- what matters for these tests
+/// is what *this* server does with the response, not that the peer itself is a faithful federation
+/// implementation.
+async fn spawn_configurable_backfill_peer() -> (u16, Arc<Mutex<Value>>, tokio::task::JoinHandle<()>)
+{
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = Arc::new(Mutex::new(serde_json::json!({ "pdus": [] })));
+    let body_for_app = body.clone();
+    let app = axum::Router::new().route(
+        "/{*rest}",
+        axum::routing::any(move || {
+            let body = body_for_app.clone();
+            async move {
+                let current = body.lock().unwrap().clone();
+                axum::Json(current)
+            }
+        }),
+    );
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (port, body, handle)
+}
+
+/// **The backfill loop, end to end** (`docs/next-steps.md` item 4): a remote sends an event (`m2`)
+/// whose `prev_events` cites an event (`m1`) this server has never seen. `RoomActor::persist`
+/// reports `RoomError::MissingAncestors`, and this server fetches exactly the missing event from
+/// the "remote" over a real, signed HTTP `/backfill` request, verifies it the same way any inbound
+/// PDU is verified, persists it, then retries `m2` -- which now succeeds because its one missing
+/// ancestor is no longer missing.
+#[tokio::test]
+async fn send_backfills_a_missing_ancestor_then_accepts_the_original_event() {
+    let (port, peer_body, _peer_handle) = spawn_configurable_backfill_peer().await;
+    let harness = Harness::with_backfill_peer(port).await;
+
+    let (room_id, base_event_id, base_depth) = harness.room_with_a_message_and_depth().await;
+    let (create_id, power_id, member_id) = harness.message_auth_event_ids(&room_id).await;
+    let alice = format!("@alice:{US}");
+
+    let m1 = build_signed_message(
+        &harness.us_signing_key,
+        &room_id,
+        &alice,
+        vec![base_event_id],
+        vec![create_id.clone(), power_id.clone(), member_id.clone()],
+        base_depth + 1,
+        10_000,
+        "m1 (fetched via backfill, never sent directly)",
+    );
+    let m1_id = hs_model::Event::parse(&m1, ruma::RoomVersionId::V11)
+        .unwrap()
+        .event_id()
+        .to_string();
+
+    let m2 = build_signed_message(
+        &harness.us_signing_key,
+        &room_id,
+        &alice,
+        vec![m1_id.clone()],
+        vec![create_id, power_id, member_id],
+        base_depth + 2,
+        11_000,
+        "m2 (cites m1, which this server has never seen)",
+    );
+
+    // The peer's canned response: exactly the one event that closes the gap, nothing more --
+    // proves this server asks for, and is satisfied by, the minimum necessary, not a bulk history
+    // dump.
+    *peer_body.lock().unwrap() = serde_json::json!({ "pdus": [m1] });
+
+    let body = serde_json::json!({ "pdus": [m2], "edus": [] });
+    let (status, response) = harness.signed_put(false, "/send/txn-backfill", &body).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let pdus = response["pdus"].as_object().unwrap();
+    assert_eq!(pdus.len(), 1, "{response}");
+    let (_, result) = pdus.iter().next().unwrap();
+    assert_eq!(
+        result,
+        &serde_json::json!({}),
+        "expected the original event to be accepted once backfill closed the gap: {response}"
+    );
+
+    // Not just acknowledged: `m1` -- fetched via backfill, never sent directly -- is itself now
+    // real, durable state on this server.
+    let (status, fetched_m1) = harness.signed_get(&format!("/event/{m1_id}")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the backfilled ancestor should have been persisted: {fetched_m1}"
+    );
+    assert_eq!(
+        fetched_m1["pdus"][0]["content"]["body"],
+        "m1 (fetched via backfill, never sent directly)"
+    );
+}
+
+/// A hostile (or merely broken) remote answers every `/backfill` call with exactly one
+/// freshly-fabricated event whose own `prev_events` names a *new*, still-missing ancestor -- an
+/// endless chain that never bottoms out in anything this server already holds. This server must
+/// give up cleanly once `hs_federation::backfill::BackfillLimits::default().max_rounds`
+/// round-trips have happened, not chase the chain forever.
+#[tokio::test]
+async fn send_gives_up_when_the_remote_serves_an_endless_backfill_chain() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let harness = Harness::with_backfill_peer(port).await;
+
+    let (room_id, _base_event_id, base_depth) = harness.room_with_a_message_and_depth().await;
+    let (create_id, power_id, member_id) = harness.message_auth_event_ids(&room_id).await;
+    let alice = format!("@alice:{US}");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_app = calls.clone();
+    let signing_key_for_app = harness.us_signing_key.clone();
+    let room_id_for_app = room_id.clone();
+    let create_id_for_app = create_id.clone();
+    let power_id_for_app = power_id.clone();
+    let member_id_for_app = member_id.clone();
+    let alice_for_app = alice.clone();
+    let app = axum::Router::new().route(
+        "/{*rest}",
+        axum::routing::any(move || {
+            let calls = calls_for_app.clone();
+            let signing_key = signing_key_for_app.clone();
+            let room_id = room_id_for_app.clone();
+            let create_id = create_id_for_app.clone();
+            let power_id = power_id_for_app.clone();
+            let member_id = member_id_for_app.clone();
+            let alice = alice_for_app.clone();
+            async move {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                // Every response points to a brand-new, still-missing ancestor: this "remote"
+                // never converges, no matter how many times it is asked. It never gets far enough
+                // for authorization to even run (ancestor presence is checked first), so the
+                // auth_events here do not need to be exhaustively correct -- only shaped like a
+                // real event.
+                let never_ends = format!("$never-ends-{n}");
+                let event = build_signed_message(
+                    &signing_key,
+                    &room_id,
+                    &alice,
+                    vec![never_ends],
+                    vec![create_id, power_id, member_id],
+                    -(n as i64),
+                    20_000 + n as i64,
+                    "endless",
+                );
+                axum::Json(serde_json::json!({ "pdus": [event] }))
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let m2 = build_signed_message(
+        &harness.us_signing_key,
+        &room_id,
+        &alice,
+        vec!["$initial-gap".to_owned()],
+        vec![create_id, power_id, member_id],
+        base_depth + 1,
+        30_000,
+        "cites a gap that never closes",
+    );
+
+    let body = serde_json::json!({ "pdus": [m2], "edus": [] });
+    let (status, response) = harness.signed_put(false, "/send/txn-runaway", &body).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let pdus = response["pdus"].as_object().unwrap();
+    assert_eq!(pdus.len(), 1, "{response}");
+    let (_, result) = pdus.iter().next().unwrap();
+    let error = result.get("error").and_then(Value::as_str).unwrap_or("");
+    assert!(
+        error.contains("backfill") || error.contains("round"),
+        "expected the transaction to report a clean backfill give-up, got: {response}"
+    );
+
+    // Bounded: exactly `max_rounds` requests reached the hostile peer, not one per hop of the
+    // (literally endless) chain it kept offering.
+    let limits = hs_federation::backfill::BackfillLimits::default();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        limits.max_rounds,
+        "expected exactly max_rounds requests to the hostile peer"
+    );
 }

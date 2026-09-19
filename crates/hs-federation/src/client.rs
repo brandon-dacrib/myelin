@@ -343,6 +343,39 @@ impl FederationClient {
         })
     }
 
+    /// The outbound half of `/backfill`: fetches up to `limit` PDUs walking backwards from
+    /// `from_event_ids` from `destination`, reusing [`FederationClient::send`] for the signed
+    /// request rather than a second X-Matrix client. The server side of this same endpoint lives
+    /// in `crate::transport::read_routes`; `crate::backfill::resolve_missing_ancestors` is this
+    /// method's real caller.
+    ///
+    /// The returned events are **not verified** -- callers must run each one through
+    /// `crate::inbound::verify_pdu` before trusting anything about it, exactly as for any other
+    /// inbound PDU.
+    ///
+    /// # Errors
+    /// See [`ClientError`].
+    pub async fn backfill(
+        &self,
+        destination: &str,
+        room_id: &str,
+        from_event_ids: &[String],
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>, ClientError> {
+        let mut path = format!("/_matrix/federation/v1/backfill/{room_id}?limit={limit}");
+        for id in from_event_ids {
+            path.push_str("&v=");
+            path.push_str(id);
+        }
+        let response = self.send(destination, "GET", &path, None).await?;
+        Ok(response
+            .body
+            .get("pdus")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
     /// Returns a pooled `reqwest::Client` pinned (via `.resolve()`) so that connecting to
     /// `outcome.server.tls_server_name` actually opens a TCP connection to
     /// `outcome.server.connect_host`'s resolved address, while TLS SNI / the HTTP `Host` header
@@ -619,6 +652,51 @@ mod tests {
         );
         assert_eq!(r1.unwrap().status, 200);
         assert_eq!(r2.unwrap().status, 200);
+    }
+
+    #[tokio::test]
+    async fn backfill_sends_a_signed_get_and_parses_the_pdus() {
+        let peer = FakeFederationPeer::new("peer.example.org");
+        peer.queue_response(hs_testkit::fake_federation::CannedResponse::ok(
+            serde_json::json!({ "pdus": [{"type": "m.room.message"}] }),
+        ));
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = peer.router();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let config = ClientConfig {
+            scheme: "http",
+            ..ClientConfig::default()
+        };
+        let client = client_for_port(addr.port(), config);
+
+        let pdus = client
+            .backfill(
+                &format!("localhost:{}", addr.port()),
+                "!r:example.org",
+                &["$missing".to_string()],
+                50,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pdus, vec![serde_json::json!({"type": "m.room.message"})]);
+
+        // The request that reached the fake peer is a real, signed GET at the exact path
+        // `crate::transport::read_routes::backfill` parses (`v=`/`limit=` query params).
+        let requests = peer.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "GET");
+        assert!(
+            requests[0]
+                .path
+                .starts_with("/_matrix/federation/v1/backfill/!r:example.org")
+        );
+        assert!(requests[0].path.contains("v=$missing"));
+        assert!(requests[0].path.contains("limit=50"));
+        handle.abort();
     }
 
     #[test]

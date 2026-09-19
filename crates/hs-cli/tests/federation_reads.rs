@@ -84,6 +84,8 @@ impl Harness {
             allow_device_name_lookup_over_federation: true,
             write_sink: Arc::new(hs_cli::federation::RegistryWriteSink::new(rooms.clone())),
             transactions: Arc::new(hs_federation::inbound::InMemoryTransactionStore::new()),
+            ancestor_fetcher: None,
+            backfill_limits: hs_federation::backfill::BackfillLimits::default(),
         };
 
         let remote_key = SigningKeyPair::generate("a_remote");

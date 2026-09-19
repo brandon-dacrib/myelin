@@ -175,6 +175,8 @@ mod tests {
                 "not supported",
             )),
             transactions: Arc::new(crate::inbound::InMemoryTransactionStore::new()),
+            ancestor_fetcher: None,
+            backfill_limits: crate::backfill::BackfillLimits::default(),
         }
     }
 

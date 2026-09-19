@@ -510,6 +510,8 @@ mod tests {
                 "not supported",
             )),
             transactions: Arc::new(crate::inbound::InMemoryTransactionStore::new()),
+            ancestor_fetcher: None,
+            backfill_limits: crate::backfill::BackfillLimits::default(),
         };
         build().with_state(state)
     }
@@ -528,6 +530,8 @@ mod tests {
                 "not supported",
             )),
             transactions: Arc::new(crate::inbound::InMemoryTransactionStore::new()),
+            ancestor_fetcher: None,
+            backfill_limits: crate::backfill::BackfillLimits::default(),
         };
         let response = router
             .with_state(state)
@@ -612,6 +616,8 @@ mod tests {
                 "not supported",
             )),
             transactions: Arc::new(crate::inbound::InMemoryTransactionStore::new()),
+            ancestor_fetcher: None,
+            backfill_limits: crate::backfill::BackfillLimits::default(),
         };
         let router = build();
         let header = signed_header("anyone.example.org", "GET", "/publicRooms");

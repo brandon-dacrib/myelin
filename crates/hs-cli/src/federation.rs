@@ -633,14 +633,10 @@ impl<B: KvBackend + 'static> hs_federation::inbound::RoomWriteSink for RegistryW
         use hs_federation::inbound::{WriteOutcome, WriteRejected};
 
         let Some(handle) = self.handle(room_id).await else {
-            return Err(WriteRejected {
-                error: "unknown room".to_owned(),
-            });
+            return Err(WriteRejected::other("unknown room"));
         };
         let Ok(parsed_event_id) = ruma::EventId::parse(event_id) else {
-            return Err(WriteRejected {
-                error: "malformed event id".to_owned(),
-            });
+            return Err(WriteRejected::other("malformed event id"));
         };
         let known = handle
             .query(move |actor| actor.event_by_id(&parsed_event_id).is_some())
@@ -656,30 +652,32 @@ impl<B: KvBackend + 'static> hs_federation::inbound::RoomWriteSink for RegistryW
         // the state its own `auth_events` imply and the state resolved from its `prev_events`,
         // then store it byte-identically, signatures and all.
         let room_version = handle.query(|actor| actor.room_version().clone()).await;
-        let event = hs_model::Event::parse(event_json, room_version).map_err(|e| WriteRejected {
-            error: format!("event is not parseable at this room's version: {e}"),
+        let event = hs_model::Event::parse(event_json, room_version).map_err(|e| {
+            WriteRejected::other(format!(
+                "event is not parseable at this room's version: {e}"
+            ))
         })?;
 
         match handle.accept_remote_event(event).await {
             Ok(hs_room::actor::RemoteEventOutcome::Stored(_)) => Ok(WriteOutcome::Stored),
             Ok(hs_room::actor::RemoteEventOutcome::AlreadyKnown) => Ok(WriteOutcome::AlreadyKnown),
             // A missing ancestor is not a rejection of this event: it means this server has a hole
-            // in the DAG and must backfill before the event can be authorized at all. It is
-            // reported distinctly so a remote (and our own logs) can tell the two apart -- the
-            // backfill-then-retry loop itself is still track 06's to build.
-            Err(hs_room::RoomError::MissingAncestors(ids)) => Err(WriteRejected {
-                error: format!(
-                    "missing {} ancestor event(s) this server has not backfilled yet: {}",
-                    ids.len(),
-                    ids.iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            }),
-            Err(e) => Err(WriteRejected {
-                error: e.to_string(),
-            }),
+            // in the DAG and must backfill before the event can be authorized at all. The IDs are
+            // carried structurally (not just interpolated into the message) so
+            // `hs_federation::backfill::resolve_missing_ancestors` can act on them directly rather
+            // than parsing this string back apart.
+            Err(hs_room::RoomError::MissingAncestors(ids)) => {
+                let id_strings: Vec<String> = ids.iter().map(ToString::to_string).collect();
+                Err(WriteRejected::missing_ancestors(
+                    id_strings.clone(),
+                    format!(
+                        "missing {} ancestor event(s) this server has not backfilled yet: {}",
+                        id_strings.len(),
+                        id_strings.join(", ")
+                    ),
+                ))
+            }
+            Err(e) => Err(WriteRejected::other(e.to_string())),
         }
     }
 }
@@ -902,6 +900,12 @@ pub fn build_mount<B: KvBackend + 'static>(
             .allow_device_name_lookup_over_federation,
         write_sink: Arc::new(RegistryWriteSink::new(rooms)),
         transactions: Arc::new(hs_federation::inbound::InMemoryTransactionStore::new()),
+        // The same client this mount uses for every other outbound call: `FederationClient`
+        // implements `AncestorFetcher` directly (`crate::backfill`'s doc), so a missing-ancestor
+        // gap is closed against the same signing key, backoff state and concurrency limits as any
+        // other request to that destination.
+        ancestor_fetcher: Some(client.clone() as Arc<dyn hs_federation::backfill::AncestorFetcher>),
+        backfill_limits: hs_federation::backfill::BackfillLimits::default(),
     };
 
     let x_matrix = Arc::new(hs_federation::xmatrix::XMatrixContext {
@@ -1014,6 +1018,8 @@ pub fn manifest_only_mount() -> (
             "manifest-only mount",
         )),
         transactions: Arc::new(hs_federation::inbound::InMemoryTransactionStore::new()),
+        ancestor_fetcher: None,
+        backfill_limits: hs_federation::backfill::BackfillLimits::default(),
     };
     let key_cache: Arc<hs_federation::keys::DynRemoteKeyCache> =
         Arc::new(hs_federation::keys::RemoteKeyCache::new(
