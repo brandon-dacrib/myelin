@@ -2,11 +2,259 @@
 
 Track brief: `docs/workstreams/07-auth-and-identity.md`. Owner crate: `hs-auth`.
 
-Last updated: 2026-09-19 (session 6 -- **not a regular track-07 session**: track 04 (room and
-events) was given a one-off cross-track assignment spanning `hs-room`, `hs-auth` and `hs-e2e` in
-the same sitting, to fix two "a change never reaches other users" bugs. This file's own "Session
-6" section below covers only the `hs-auth` half of that work; see `docs/status/04-room-and-events.md`
-for the full report, including the `hs-room` and `hs-e2e` sides.).
+Last updated: 2026-09-19 (session 7: audited the login handshake against a real browser client
+(Element Web was being pointed at this server for the first time in the same integration window),
+found and fixed a real case-sensitivity bug in `POST /login`, re-confirmed `/capabilities` is still
+unfixed (held by another track this session), checked for Element-Web findings in
+`docs/status/16-management-web-interface.md` (none landed as of this write-up), and designed
+(without implementing) a UIA session-correlation scheme left open at the end of session 5).
+
+## Session 7 (2026-09-19): login handshake audit for a real browser client
+
+Assignment: make the front door correct for a real client (Element Web, being pointed at this
+server for the first time by another agent in this same session). In order: (1) audit `GET`/`POST
+/login`'s shapes, `refresh_token` handling, `device_id`/`initial_device_display_name`, and the
+soft-logout path against the spec and Complement; (2) re-confirm and document the `/capabilities`
+auth gap (handler lives in `hs-cli`, held by another agent this session, not touched); (3) fold in
+anything `docs/status/16-management-web-interface.md`'s Element-Web session reports about
+login/devices/tokens/capabilities; (4) if budget remained, design the UIA session-correlation fix
+session 5 left open.
+
+**Read for this audit**: `refs/matrix-spec/data/api/client-server/login.yaml` (full request/
+response schema, including the `well_known`/`home_server`/`expires_in_ms` optional fields and the
+three required response fields `user_id`/`access_token`/`device_id`), `refs/matrix-spec/data/api/
+client-server/whoami.yaml`, and `refs/synapse/synapse/handlers/auth.py` (`validate_login`,
+`_find_user_id_and_pwd_hash`, `get_supported_login_types`) and `refs/synapse/synapse/rest/admin/
+users.py`'s `UserRegisterServlet.on_POST` (the shared-secret admin registration handler, for item
+4 below). No `matrix-js-sdk` or Element checkout exists under `refs/` (checked: `ls refs/` has no
+`matrix-js-sdk`/`element*` entry) — spec text, Synapse's real behavior, and the task's own
+description of what a real client calls first were the sources of truth instead.
+
+### 1. Real bug found and fixed: `POST /login` did not match usernames case-insensitively
+
+**This is a real gap, not a guess, and it is exactly the shape of bug the task warned about**:
+plausible-looking code that is subtly wrong. `crates/hs-auth/src/routes/register.rs::register_user`
+(session 5) ASCII-lowercases a client-supplied `username` before creating the account, per the
+spec's own stated rationale (`refs/matrix-spec/content/appendices.md`, "User Identifiers": "we
+chose to disallow upper-case characters because we do not consider it valid to have two user IDs
+which differ only in case... requiring homeservers to downcase usernames when creating user IDs for
+new users"). **But `POST /login` never lower-cased its side of the comparison** — `resolve_password_
+login` and `identifier_to_user_id` both called `UserId::parse_with_server_name` directly on
+whatever case the client sent. Register a user as `"alice"` (or type `"Alice"` and have it silently
+downcased at registration) and then try to log back in typing `"Alice"` — a completely ordinary
+thing for a human to type, or for a phone keyboard's `autocapitalize` to do to the first letter of a
+login field — and the account is not found: generic `403 M_FORBIDDEN`, "Invalid username or
+password". To a browser client this is indistinguishable from a genuinely wrong password: exactly
+the "login error" failure mode the task described, and it would have been invisible to
+`matrix-rust-sdk`'s own loadgen test, which always logs in with the exact case it registered with.
+
+Confirmed this is not a hypothetical: `refs/synapse/synapse/handlers/auth.py::AuthHandler.
+_find_user_id_and_pwd_hash` explicitly calls `self.store.get_users_by_id_case_insensitive(user_id)`
+and accepts the sole (case-insensitive) match — real Synapse's login path *is* case-insensitive,
+specifically to handle exactly this. This crate's own version needs none of Synapse's ambiguity
+resolution (multiple case-variant matches, preferring an exact one) because registration already
+forbids case-variant duplicates (`register_user`'s lower-cased availability check) — there can be
+at most one account for any given case-insensitive localpart, so lower-casing the login attempt can
+only land on that one account or none.
+
+**Fix** (`crates/hs-auth/src/routes/login.rs`): new `lowercase_localpart_for_login(raw: &str) ->
+String` — ASCII-lowercases just the localpart portion of a user identifier, leaving any `@`/
+`:server` structure and the server name's own case untouched (handles a bare localpart, a full
+`@local:server` mxid, and — deliberately not touched — the server name half, since server names are
+their own case-preserving namespace this fix has no evidence needs normalizing). Applied at both
+call sites that resolve a client-typed username to a `UserId` for password login: the deprecated
+bare `user` field in `resolve_password_login`, and the `m.id.user` (`UserIdentifier::Matrix`) branch
+of `identifier_to_user_id`. **Not** applied to `m.id.thirdparty`/`m.id.phone` (3PID lookups are
+already exact-match against a bound address, not a localpart), to `com.devture.shared_secret_auth`
+or `m.login.application_service` (both are bridge/appservice protocols where the caller already
+knows the exact mxid it's asserting, not a human typing a login form), and not to the appservice
+`user_id` masquerade query parameter in `crate::middleware` (same reasoning).
+
+New tests (`crates/hs-auth/src/routes/login.rs`):
+`password_login_with_different_case_localpart_succeeds` (registers `@alice:...`, logs in with
+`"Alice"`), `password_login_with_deprecated_user_field_and_different_case_succeeds` (`"BOB"` against
+a `@bob:...` account via the deprecated bare `user` field), `password_login_with_a_full_mxid_in_a_
+different_case_succeeds` (`"@Carol:example.org"`, full mxid form, not just a bare localpart).
+
+**Related, smaller fix found while checking for the same bug class elsewhere**: the same
+case-mismatch was present in the *other* place this crate mints an account from a client-supplied
+username — `crates/hs-auth/src/routes/synapse_admin.rs::post_register` (the shared-secret admin
+registration protocol, session 4). It parsed `UserId::parse_with_server_name(req.username.as_str(),
+...)` directly, so an operator running `hs register --admin -u Ops ...` would get an account at
+`@Ops:...` (grammar-valid at that endpoint since `validate_localpart`'s strict-grammar check is not
+applied there — this endpoint trusts the operator, not a public registration form) while `/register`
+and (as of this session) `/login` both assume every account's localpart is already lower-case. That
+mismatch would silently create two different accounts if the same name were later typed in a
+lower-case login form. **Fixed**: lower-case `req.username` before the `UserId::parse_with_server_
+name` call, same one-line pattern as `register_user`. Critically, this had to be done *after* MAC
+verification and using a separate variable, not by mutating `req.username` itself: the MAC is
+computed over the exact bytes the admin tool sent, unmodified — confirmed against
+`refs/synapse/synapse/rest/admin/users.py`'s `UserRegisterServlet.on_POST`, which builds the HMAC
+from `body["username"].encode("utf-8")` (raw) and only lower-cases afterward, solely for the
+`UserID` it constructs (`localpart=body["username"].lower()`). Lower-casing before MAC verification
+would have broken every admin tool that computes the MAC the standard way (including this
+project's own `hs register --admin`, per `docs/status/16-management-web-interface.md`'s session
+which used exactly this flow to mint `@ops:test.local`). New test:
+`a_mixed_case_username_is_lowercased_but_the_mac_stays_over_the_original_bytes` (MAC computed over
+literal `"MixedCase"`, asserts the created account is `@mixedcase:example.org`).
+
+Verification: `cargo test -p hs-auth` — **185 passed** (up from 181 at the end of session 6), 0
+failed. `cargo fmt -p hs-auth` and `cargo clippy -p hs-auth --all-targets -- -D warnings` both
+clean.
+
+### Everything else audited in the login handshake: no further defects found
+
+- **`GET /login` flow list** (`get_login_types`): matches `refs/matrix-spec/data/api/client-server/
+  login.yaml`'s `LoginFlow` schema (`{"type": "..."}` objects in a `flows` array); `m.login.
+  password` and `m.login.token` are always offered, `com.devture.shared_secret_auth` only when
+  configured. `m.login.application_service` is correctly *not* advertised (appservices don't need
+  to discover it; matches Synapse's own `get_login_types`, which excludes it from the public list
+  too). Nothing here would confuse a browser client rendering a password form.
+- **`POST /login` request shape**: `device_id`, `initial_device_display_name`, `refresh_token` are
+  all read directly off the raw JSON body (not through `ruma`'s typed request, which does not carry
+  `refresh_token` in the version this crate uses) before the body is separately deserialized as a
+  `LoginInfo` for the type-specific fields — confirmed this two-pass parse doesn't silently drop or
+  duplicate any field the spec lists in `login.yaml`'s request schema.
+- **`POST /login` response shape**: has all three spec-required fields (`user_id`, `access_token`,
+  `device_id`) and both optional ones this crate supports (`refresh_token`, `expires_in_ms`) only
+  when applicable. Does **not** send `home_server` (deprecated, spec says clients should derive it
+  from `user_id` instead) or `well_known` (optional; this server has no additional client config to
+  hand back beyond what `.well-known/matrix/client` — owned elsewhere — already serves). Neither
+  omission blocks a spec-conformant client: `login.yaml`'s `required` list is exactly the three
+  fields present.
+- **`refresh_token` handling**: `POST /login`'s `refresh` boolean and `POST /refresh`'s rotation
+  (reuse detection revoking the whole device session, old access token revoked immediately) were
+  already covered by session 1/RFC 0002; re-read `crates/hs-auth/src/routes/refresh.rs` end to end
+  this session and found no defect — response shape (`access_token` required, `refresh_token`/
+  `expires_in_ms` optional) matches the spec's `POST /refresh` schema the same way `/login`'s does.
+- **`device_id`/`initial_device_display_name`**: `crate::session::create_session` auto-generates a
+  device id when none is given (`ruma::DeviceId::new()`), reuses an existing device's row (and
+  preserves its display name) when the client supplies one that already exists, and sets the
+  display name only on first creation — matches `login.yaml`'s "If this does not correspond to a
+  known client device, a new device will be created... Ignored if `device_id` corresponds to a known
+  device" wording exactly.
+- **Soft-logout path**: `crate::middleware`'s `M_UNKNOWN_TOKEN` handling already sets `soft_logout:
+  true` specifically for an *expired* token (vs. `false` for a token that's simply unrecognized),
+  matching the spec's soft-logout semantics ("safe to keep local room state"); re-read
+  `crates/hs-auth/src/error.rs`'s `unknown_token`/`user_locked` and `crate::middleware`'s call sites
+  this session and found this unchanged from session 1's design — still correct, no fix needed.
+- **`GET /account/whoami`**: response shape matches `refs/matrix-spec/data/api/client-server/
+  whoami.yaml` exactly (`user_id` required; `device_id`, `is_guest` both optional/omittable, both
+  present here). No defect.
+- **`GET`/`PUT`/`DELETE /devices`**: `device_json`'s shape (`device_id`, `display_name`,
+  `last_seen_ip`, `last_seen_ts`) matches the spec's `Device`/`Devices` schemas. No defect.
+
+### 2. `/capabilities` auth: still not fixed, unchanged from session 5, and re-confirmed this session
+
+Per this session's explicit instruction, `crates/hs-cli/src/capabilities.rs` is held by another
+agent and was not touched. Re-read it this session to confirm the gap is still live (not fixed by
+whoever holds that crate yet): `get_capabilities()` still takes zero extractors and is still
+presumably mounted on unit-state `Builder::<()>` per session 5's read of `serve.rs` (not re-read
+this session — not my crate, and session 5's exact diff below is still the correct fix regardless of
+line-number drift). **The fix required, verbatim from session 5, still stands and needs no update**:
+
+1. `crates/hs-cli/src/capabilities.rs`: change `get_capabilities`'s signature to
+   `pub async fn get_capabilities(_requester: hs_auth::middleware::AllowGuest) -> Json<Value>`
+   (guests included, matching Synapse's `CapabilitiesRestServlet.on_GET`'s `allow_guest=True`).
+2. `crates/hs-cli/src/serve.rs`: `get_capabilities` can no longer be registered on `Builder::<()>`;
+   build a small `Router<AuthState>` for it (clone `auth` before the `ping_router` line consumes it
+   by value) and merge it onto the built router the same way `synapse_admin_router` is merged,
+   changing both routes' `AuthKind` from `None` to `Matrix`.
+3. Any `hs-cli` test asserting `/capabilities` works unauthenticated needs a token added.
+
+This crate (`hs-auth`) needs **no new code** for this fix — `hs_auth::middleware::AllowGuest` and
+`hs_auth::AuthState` already exist and are already exported at the paths the fix uses. Confirmed
+again this session: `refs/matrix-spec/data/api/client-server/capabilities.yaml`'s `security:
+accessTokenBearer` and Complement's `apidoc_server_capabilities_test.go`'s "GET /v3/capabilities is
+not public" both still name this as a real gap, and it directly matches the task's framing: a real
+browser client calls `/capabilities` immediately after login, and an anonymous 200 (today's
+behavior) instead of a 401 is wrong regardless of whether Element Web itself branches on the
+difference.
+
+### 3. Element-Web findings (`docs/status/16-management-web-interface.md`): none had landed as of this write-up
+
+Checked `docs/status/16-management-web-interface.md` in full at the start of this session and again
+at the end (`stat -f "%Sm"` on the file before finishing: unchanged at `Sep 19 00:19:43`, i.e. still
+the "real-server mode" session that predates the Element-Web run this session's instructions
+described). That file's content is about the **admin management web interface** (`web/`, signing in
+an *operator* with an admin token against `/api/v1/...`), not Element Web — a different application
+entirely, and as of this check it records nothing about a separate Element-Web session's findings
+either. Nothing in it names `/login`, `/devices`, tokens or `/capabilities` as broken in a way this
+session hadn't already independently found (see items 1-2 above) or that belongs to another track
+(e.g. its own `RealSignIn` component's OAuth-issuer wishlist item, which is 07's future native OAuth
+work, not the legacy login path this session audited). **Whoever picks this track up next should
+re-check that file** — the Element-Web session this assignment described may report findings after
+this session ends, and per this task's framing, "real evidence beats any guess about what a client
+needs": if that file later names a `/login`/`/devices`/`/capabilities`/token defect, treat it as
+higher-priority ground truth than anything re-derived from the spec alone.
+
+### 4. UIA session-correlation design (session 5's open item): designed, deliberately not implemented
+
+Session 5 left open: Complement's `apidoc_register_test.go` "Registration without a session fails"
+wants a stricter rule than this server (and Synapse, Dendrite, Conduit) implements — once a UIA
+session has been issued for a dance, omitting the `session` id on a later call in that same dance
+should be rejected, not silently given a fresh session. Session 5 called the honest fix "a design
+change, not a patch" because the current design cannot tell "no session was ever issued for this
+exact dance" apart from "a session was issued and the client is now omitting it" from the request
+alone (`session_id_for` in `crates/hs-auth/src/uia.rs` only ever looks at the `session` field the
+client happens to send).
+
+**The design**: add a `correlation_key: Option<String>` to `UiaStore::create_session`/lookup,
+computed by the route handler (not `uia::advance` itself, which has no route-specific context) from
+whatever data identifies "this dance" for that endpoint — e.g. a stable hash of the registration
+`username` for `POST /register`, or the target `device_id` for `DELETE /devices/{deviceId}`. Extend
+`session_id_for` to accept `correlation_key: Option<&str>` alongside `requested: Option<&str>`: when
+`requested` is `None`, look up the store for any live (non-expired, incomplete) session already
+carrying that correlation key. If one exists, the client has necessarily already been handed a
+session id for this exact dance (sessions are only ever created inside `session_id_for`, and every
+creation path returns the id in the response) — so the omission is now provably deliberate or a real
+mistake, not just "the client's normal single-round-trip shortcut," and a `400 M_UNKNOWN` ("a
+session is required to continue this authentication") is the correct answer at that point. If no
+matching live session exists, create a fresh one exactly as today — so the ordinary single-round-trip
+pattern (`username`/`password`/`auth: {"type": "m.login.dummy"}` sent all at once, no prior call)
+is completely unaffected, because on that first call no session with that correlation key exists yet.
+
+**Why this is not implemented, on purpose, and is not "smaller than it looked" in the way that
+matters**: the sizing was never the problem — the design above is a genuinely small diff (one new
+optional store field, one new store lookup method, one new `session_id_for` parameter, one call site
+per UIA-gated route to compute a correlation key). The problem is what it *does*: it makes retrying
+an interrupted registration strictly less safe for a real client. A client that sends `username`/
+`password`/`auth: {"type": "m.login.dummy"}` and never receives a response (dropped connection,
+timeout, backgrounded app) has no way to know a session was minted server-side, and — correctly per
+the current spec-compliant behavior every reference server implements — retries with the same
+username/password and no session id, expecting a fresh attempt. Under this design, that retry would
+now fail with "a session is required," even though the account may never have been created, and the
+client has no session id to supply because it never saw one. This is precisely the tradeoff Synapse,
+Dendrite and Conduit all decline to make (Complement's own test comment: "historically did not
+enforce this requirement strictly"), and there is no evidence a real client (Element Web included)
+needs the stricter behavior — the task's own description of what a browser client does on first
+contact never exercises a retried-without-a-response registration. Implementing it would trade a
+small amount of code for a real regression in retry-safety, to satisfy one aspirational Complement
+assertion no reference server passes. **Recommendation: leave this unimplemented**, matching
+session 5's original call, now with the concrete design on record (above) in case a future session
+has evidence this tradeoff is worth making anyway (e.g. if a differential-testing session against
+real Synapse someday finds Synapse quietly changed this).
+
+### Files touched this session
+
+- `crates/hs-auth/src/routes/login.rs` — `lowercase_localpart_for_login` (new), applied in
+  `resolve_password_login` and `identifier_to_user_id`; 3 new tests.
+- `crates/hs-auth/src/routes/synapse_admin.rs` — `post_register` lower-cases the username used for
+  `UserId::parse_with_server_name` (after MAC verification, on a separate variable); 1 new test.
+- `docs/status/07-auth-and-identity.md` — this section.
+
+No other files touched. No new dependency, no new `[workspace.dependencies]` entry.
+
+### Verification (all run from `/Users/brandon/Documents/git/matrix-reimplement`)
+
+- `cargo fmt -p hs-auth` — clean.
+- `cargo clippy -p hs-auth --all-targets -- -D warnings` — clean.
+- `cargo test -p hs-auth` — **185 passed** (up from 181), 0 failed.
+- `cargo build -p hs-cli --bin hs` — clean (another track's crate; built to confirm this session's
+  `hs-auth` changes don't break it, per this session's own verification instructions).
+- `cargo test -p hs-loadgen --test real_client` — **passes** (1 test, `ok`); the same expected
+  `ERROR`-level SDK log noise session 5 already documented (account-data 404s on a fresh account, a
+  final expected 401 from a revoked token), no new failures.
 
 ## Session 6 (2026-09-19, run by track 04): device-list notifier hook
 

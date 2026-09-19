@@ -125,6 +125,35 @@ pub async fn post_login(
     Ok(login_response(&user_id, session).into_response())
 }
 
+/// ASCII-lowercases just the localpart portion of a user identifier a client typed for login,
+/// leaving any `@`/`:server` structure and the server name's own case untouched.
+///
+/// Mirrors `routes::register::register_user`'s username lowercasing (see that function's doc
+/// comment for the spec citation, `appendices.md`'s "User Identifiers": homeservers are expected
+/// to downcase usernames so no two accounts differ only by case) on the *login* side too, not just
+/// registration. Without this, a login attempt fails with the generic "Invalid username or
+/// password" whenever a user (or a browser's `autocapitalize` on a mobile keyboard, or simply a
+/// user who typed their name the way they'd write it) sends the localpart in a different case than
+/// the lower-cased form it was actually registered under -- exactly the class of "looks fine,
+/// subtly wrong" gap this endpoint is otherwise fully tested against. Confirmed this is real
+/// Synapse behavior, not just a registration-time nicety: `refs/synapse/synapse/handlers/
+/// auth.py::AuthHandler._find_user_id_and_pwd_hash` explicitly calls
+/// `get_users_by_id_case_insensitive` and accepts the sole case-insensitive match. This ASCII-only
+/// version needs none of that function's ambiguity resolution (multiple case-variant matches,
+/// preferring an exact one) because this crate already forbids case-variant duplicates at
+/// registration time (`register.rs::register_user` lower-cases before its availability check) --
+/// there is at most one account for any given case-insensitive localpart, so lower-casing the
+/// login attempt can only ever land on that one account or none.
+fn lowercase_localpart_for_login(raw: &str) -> String {
+    match raw.strip_prefix('@') {
+        Some(rest) => match rest.split_once(':') {
+            Some((localpart, server)) => format!("@{}:{server}", localpart.to_ascii_lowercase()),
+            None => format!("@{}", rest.to_ascii_lowercase()),
+        },
+        None => raw.to_ascii_lowercase(),
+    }
+}
+
 async fn resolve_password_login(
     state: &AuthState,
     p: &ruma::api::client::session::login::v3::Password,
@@ -133,8 +162,11 @@ async fn resolve_password_login(
     let user_id = if let Some(identifier) = &p.identifier {
         identifier_to_user_id(state, identifier).await?
     } else if let Some(user) = &p.user {
-        UserId::parse_with_server_name(user.as_str(), state.server_name())
-            .map_err(|_| MatrixError::forbidden(INVALID_USERNAME_OR_PASSWORD))?
+        UserId::parse_with_server_name(
+            lowercase_localpart_for_login(user.as_str()),
+            state.server_name(),
+        )
+        .map_err(|_| MatrixError::forbidden(INVALID_USERNAME_OR_PASSWORD))?
     } else {
         return Err(MatrixError::missing_param("Missing user identifier"));
     };
@@ -166,10 +198,11 @@ async fn identifier_to_user_id(
     identifier: &UserIdentifier,
 ) -> Result<OwnedUserId, MatrixError> {
     match identifier {
-        UserIdentifier::Matrix(m) => {
-            UserId::parse_with_server_name(m.user.as_str(), state.server_name())
-                .map_err(|_| MatrixError::forbidden(INVALID_USERNAME_OR_PASSWORD))
-        }
+        UserIdentifier::Matrix(m) => UserId::parse_with_server_name(
+            lowercase_localpart_for_login(m.user.as_str()),
+            state.server_name(),
+        )
+        .map_err(|_| MatrixError::forbidden(INVALID_USERNAME_OR_PASSWORD)),
         UserIdentifier::Email(e) => threepid_user_id(state, "email", &e.address).await,
         UserIdentifier::Msisdn(m) => threepid_user_id(state, "msisdn", &m.number).await,
         UserIdentifier::PhoneNumber(p) => {
@@ -356,6 +389,54 @@ mod tests {
     async fn password_login_with_deprecated_user_field_succeeds() {
         let state = state_with_password_user(user_id!("@bob:example.org"), "hunter2").await;
         let body = json!({"type": "m.login.password", "user": "bob", "password": "hunter2"});
+        let response = post_login(
+            State(state),
+            HeaderMap::new(),
+            Query(HashMap::new()),
+            Json(body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn password_login_with_different_case_localpart_succeeds() {
+        // The account is stored (as it would be after `register_user`'s lower-casing) under the
+        // lower-case localpart; the client logs in typing a capitalized version, as a browser
+        // autocapitalize or a user typing their name naturally might.
+        let state = state_with_password_user(user_id!("@alice:example.org"), "hunter2").await;
+        let body = json!({"type": "m.login.password", "identifier": {"type": "m.id.user", "user": "Alice"}, "password": "hunter2"});
+        let response = post_login(
+            State(state),
+            HeaderMap::new(),
+            Query(HashMap::new()),
+            Json(body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn password_login_with_deprecated_user_field_and_different_case_succeeds() {
+        let state = state_with_password_user(user_id!("@bob:example.org"), "hunter2").await;
+        let body = json!({"type": "m.login.password", "user": "BOB", "password": "hunter2"});
+        let response = post_login(
+            State(state),
+            HeaderMap::new(),
+            Query(HashMap::new()),
+            Json(body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn password_login_with_a_full_mxid_in_a_different_case_succeeds() {
+        let state = state_with_password_user(user_id!("@carol:example.org"), "hunter2").await;
+        let body = json!({"type": "m.login.password", "identifier": {"type": "m.id.user", "user": "@Carol:example.org"}, "password": "hunter2"});
         let response = post_login(
             State(state),
             HeaderMap::new(),

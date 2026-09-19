@@ -98,7 +98,20 @@ async fn post_register(
 
     state.config.password_policy.validate(&req.password)?;
 
-    let user_id = UserId::parse_with_server_name(req.username.as_str(), state.server_name())
+    // Lower-case only for the `UserId` we actually create/look up, exactly as `routes::
+    // register.rs::register_user` does for `POST /register` -- see that function's doc comment
+    // for the spec citation. The MAC was already verified above over `req.username`'s original
+    // bytes (`verify_registration_request`) and must stay that way: Synapse's own
+    // `UserRegisterServlet.on_POST` computes the MAC over the raw, un-lower-cased username
+    // (`refs/synapse/synapse/rest/admin/users.py`: `username = body["username"].encode("utf-8")`
+    // feeds the HMAC at line ~666) and only lower-cases afterward, purely for the `UserID` it
+    // constructs (`localpart=body["username"].lower()`, line ~720) -- so lower-casing here, after
+    // MAC verification, matches the real protocol rather than guessing at it. Without this, an
+    // admin registering "Ops" through this endpoint and a client later logging in as "ops" (now
+    // case-insensitive per `routes::login`) would silently create two different accounts instead
+    // of the one the operator meant.
+    let lowercased_username = req.username.to_ascii_lowercase();
+    let user_id = UserId::parse_with_server_name(lowercased_username.as_str(), state.server_name())
         .map_err(|_| {
             MatrixError::invalid_username(format!(
                 "'{}' is not a valid user ID localpart",
@@ -250,6 +263,49 @@ mod tests {
             .await
             .unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_mixed_case_username_is_lowercased_but_the_mac_stays_over_the_original_bytes() {
+        // The MAC is computed over "MixedCase", the exact bytes the caller sent -- matching real
+        // Synapse (`refs/synapse/synapse/rest/admin/users.py`: the HMAC is built from
+        // `body["username"].encode("utf-8")` before that same handler lower-cases the username for
+        // the `UserID` it constructs). If this crate ever changed to hash the lower-cased form
+        // instead, this test would start failing with an HMAC mismatch, which is exactly the
+        // regression it exists to catch.
+        let state = state_with_secret();
+        let app: Router<()> = router().with_state(state.clone());
+
+        let (_, nonce_body) = get_nonce(&app).await;
+        let nonce = nonce_body["nonce"].as_str().unwrap().to_string();
+        let mac = compute_mac(
+            SECRET.as_bytes(),
+            &nonce,
+            "MixedCase",
+            "hunter22pass",
+            false,
+            None,
+        );
+        let body = json!({
+            "nonce": nonce,
+            "username": "MixedCase",
+            "password": "hunter22pass",
+            "admin": false,
+            "mac": mac,
+        });
+        let (status, response) = post(&app, body).await;
+        assert_eq!(status, StatusCode::OK, "response was {response:?}");
+        assert_eq!(response["user_id"], "@mixedcase:example.org");
+
+        let user = state
+            .store
+            .get_user(ruma::user_id!("@mixedcase:example.org"))
+            .await
+            .unwrap();
+        assert!(
+            user.is_some(),
+            "account should exist under the lower-cased id"
+        );
     }
 
     #[tokio::test]
