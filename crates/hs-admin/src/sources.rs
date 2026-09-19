@@ -13,12 +13,13 @@ use std::sync::RwLock;
 
 use async_trait::async_trait;
 
-use crate::model::AdminUser;
+use crate::model::{AdminRoom, AdminUser, ExternalId, ThreePid};
 
 /// Why a data-source call failed. Mirrors [`crate::auth::AuthError`]'s "only unavailable escapes
 /// as something other than the obvious status" shape: [`SourceError::NotFound`] maps to `404
 /// not-found`, [`SourceError::Unavailable`] to `503 unavailable`, [`SourceError::Invalid`] to
-/// `400 validation-failed` (see [`SourceError::to_problem`]).
+/// `400 validation-failed`, [`SourceError::Conflict`] to `409 conflict` (see
+/// [`SourceError::to_problem`]).
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {
     #[error("not found")]
@@ -27,6 +28,8 @@ pub enum SourceError {
     Unavailable(String),
     #[error("invalid request: {0}")]
     Invalid(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
 }
 
 impl SourceError {
@@ -40,8 +43,37 @@ impl SourceError {
             SourceError::Invalid(detail) => {
                 hs_http::Problem::validation_failed().with_detail(detail.clone())
             }
+            SourceError::Conflict(detail) => {
+                hs_http::Problem::conflict().with_detail(detail.clone())
+            }
         }
     }
+}
+
+/// A `users.create` request (the OpenAPI `UserCreate` schema): either `localpart` or a full
+/// `user_id` is expected to be set (validated by the handler, not this struct); which one a real
+/// implementation needs is a detail of how it resolves a homeserver domain, which this crate does
+/// not own — see [`UserDirectory::create_user`]'s doc comment.
+#[derive(Debug, Clone, Default)]
+pub struct UserCreateRequest {
+    pub localpart: Option<String>,
+    pub user_id: Option<String>,
+    pub password: Option<String>,
+    pub display_name: Option<String>,
+    pub admin: bool,
+    pub user_type: Option<String>,
+    pub threepids: Vec<ThreePid>,
+    pub external_ids: Vec<ExternalId>,
+}
+
+/// The match criteria `users.lookup` accepts (the OpenAPI operation's `medium`+`address` /
+/// `provider`+`external_id` query parameter pairs). Exactly one variant per call; the handler is
+/// responsible for rejecting a request that names neither pair (`400 validation-failed`) before
+/// calling [`UserDirectory::lookup_user`].
+#[derive(Debug, Clone)]
+pub enum UserLookupQuery {
+    Threepid { medium: String, address: String },
+    ExternalId { provider: String, external_id: String },
 }
 
 /// Filters for `GET /users` (RFC 0004 section 4.2 / the OpenAPI `users.list` operation).
@@ -58,6 +90,14 @@ pub struct UserFilter {
 
 /// The user-directory seam `hs-admin`'s `/users` handlers call. Implemented by track 07 against
 /// its real user store; [`InMemoryUserDirectory`] below is a fake for this crate's own tests.
+///
+/// `create_user`/`lookup_user`/`check_localpart_available` were added in session 6, after 07 had
+/// already implemented the first five methods against its real store. Adding them as *required*
+/// methods would have broken that implementation's build the moment this crate's `Cargo.lock`
+/// picked it up; each ships a default body answering `SourceError::Unavailable` (session 6's
+/// handlers turn that into an honest `503`, never a fake `200`) so an existing implementor keeps
+/// compiling untouched and only needs to override the methods it actually wants to back with real
+/// data. See `docs/status/15-admin-api-and-modules.md` "Decisions made".
 #[async_trait]
 pub trait UserDirectory: Send + Sync + 'static {
     async fn get_user(&self, user_id: &str) -> Result<Option<AdminUser>, SourceError>;
@@ -65,6 +105,34 @@ pub trait UserDirectory: Send + Sync + 'static {
     async fn set_admin(&self, user_id: &str, admin: bool) -> Result<(), SourceError>;
     async fn set_locked(&self, user_id: &str, locked: bool) -> Result<(), SourceError>;
     async fn set_deactivated(&self, user_id: &str, deactivated: bool) -> Result<(), SourceError>;
+
+    /// Creates a new user (`users.create`). A real implementation resolves `request.localpart`
+    /// (plus its own homeserver domain, which this crate does not know) or `request.user_id` into
+    /// a full Matrix user id; `SourceError::Invalid` for a request naming neither or naming both
+    /// inconsistently, `SourceError::Conflict` if the user already exists.
+    async fn create_user(&self, request: UserCreateRequest) -> Result<AdminUser, SourceError> {
+        let _ = request;
+        Err(SourceError::Unavailable(
+            "this user directory does not support creating users yet".to_string(),
+        ))
+    }
+
+    /// Looks up a user by 3PID or external id (`users.lookup`). `Ok(None)` for "no such user",
+    /// distinct from `SourceError::NotFound`, matching `get_user`'s convention.
+    async fn lookup_user(&self, query: UserLookupQuery) -> Result<Option<AdminUser>, SourceError> {
+        let _ = query;
+        Err(SourceError::Unavailable(
+            "this user directory does not support lookup by 3PID or external id yet".to_string(),
+        ))
+    }
+
+    /// Whether `localpart` is free to register (`users.availability`).
+    async fn check_localpart_available(&self, localpart: &str) -> Result<bool, SourceError> {
+        let _ = localpart;
+        Err(SourceError::Unavailable(
+            "this user directory does not support availability checks yet".to_string(),
+        ))
+    }
 }
 
 /// An in-memory [`UserDirectory`] for this crate's own handler tests. Not a production

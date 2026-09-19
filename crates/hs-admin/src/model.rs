@@ -265,6 +265,54 @@ pub struct AdminUser {
     pub media_count: u64,
 }
 
+/// The OpenAPI `Room` schema: one row of `GET /rooms` and the body of `GET /rooms/{room_id}`,
+/// `.../block`, `.../unblock`, `.../make-admin`. Field-for-field match with that schema. Served by
+/// whatever implements [`crate::sources::RoomDirectory`] (track 04's real implementation, or
+/// [`crate::sources::InMemoryRoomDirectory`] for tests).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminRoom {
+    pub room_id: String,
+    pub name: Option<String>,
+    pub topic: Option<String>,
+    pub avatar_url: Option<String>,
+    pub canonical_alias: Option<String>,
+    pub joined_members_count: u64,
+    pub local_members_count: u64,
+    pub state_events_count: u64,
+    pub version: String,
+    pub creator: Option<String>,
+    pub encrypted: bool,
+    pub join_rule: String,
+    pub guest_access: String,
+    pub history_visibility: String,
+    pub federatable: bool,
+    pub public: bool,
+    pub room_type: Option<String>,
+    pub blocked: bool,
+    pub blocked_reason: Option<String>,
+    pub tombstoned: bool,
+    pub replacement_room_id: Option<String>,
+    pub forgotten: bool,
+}
+
+/// The OpenAPI `ThreePid` schema, used by `users.create`'s request body and `users.lookup`'s
+/// match criteria.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ThreePid {
+    pub medium: String,
+    pub address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added_at: Option<String>,
+}
+
+/// The OpenAPI `ExternalId` schema, used by `users.create`'s request body and `users.lookup`'s
+/// match criteria.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExternalId {
+    pub provider: String,
+    pub external_id: String,
+}
+
 /// The static, operator-configured parts of the OpenAPI `ServerInfo` schema: everything except
 /// `uptime_ms`, which [`AdminState`](crate::router::AdminState) computes per-request from its
 /// start time rather than storing. See [`ServerInfo::with_uptime_ms`].
@@ -642,6 +690,14 @@ mod tests {
         assert_eq!(user.user_id, "");
         assert!(!user.admin);
         assert_eq!(user.device_count, 0);
+    }
+
+    #[test]
+    fn admin_room_default_is_well_formed() {
+        let room = AdminRoom::default();
+        assert_eq!(room.room_id, "");
+        assert!(!room.blocked);
+        assert_eq!(room.joined_members_count, 0);
     }
 
     #[test]
