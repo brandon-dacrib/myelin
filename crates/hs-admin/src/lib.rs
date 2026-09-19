@@ -9,7 +9,10 @@
 //! - [`audit`]: the [`audit::AuditSink`] trait and an in-memory implementation.
 //! - [`events`]: the SSE event bus (publish, subscribe, replay buffer).
 //! - [`operations`]: the operation table generated alongside `openapi/openapi.yaml`.
-//! - [`router`]: the axum router skeleton built from that table.
+//! - [`router`]: the axum router built from that table (real handlers for a first slice of
+//!   operations, `501` for the rest).
+//! - [`sources`]: consumer-defined data-source traits (`UserDirectory`, ...) the real handlers
+//!   call, implemented elsewhere and wired onto [`router::AdminState`].
 //! - [`assets`]: serves the management interface's built assets at `/admin/`.
 //! - [`openapi`]: the embedded OpenAPI document.
 //!
@@ -25,3 +28,4 @@ pub mod model;
 pub mod openapi;
 pub mod operations;
 pub mod router;
+pub mod sources;

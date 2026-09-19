@@ -239,6 +239,117 @@ pub enum PrincipalKind {
     Legacy,
 }
 
+/// The OpenAPI `User` schema (`crates/hs-admin/openapi/openapi.yaml`): one row of `GET /users`
+/// and the body of `GET /users/{user_id}`. Field-for-field match with that schema. Served by
+/// whatever implements [`crate::sources::UserDirectory`] (track 07's real implementation, or
+/// [`crate::sources::InMemoryUserDirectory`] for tests).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminUser {
+    pub user_id: String,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub admin: bool,
+    pub deactivated: bool,
+    pub erased: bool,
+    pub locked: bool,
+    pub suspended: bool,
+    pub shadow_banned: bool,
+    pub user_type: Option<String>,
+    pub consent_version: Option<String>,
+    pub appservice_id: Option<String>,
+    /// RFC 3339 millisecond-precision UTC (RFC 0004 D15.2).
+    pub created_at: String,
+    pub last_seen_at: Option<String>,
+    pub device_count: u64,
+    pub room_count: u64,
+    pub media_count: u64,
+}
+
+/// The static, operator-configured parts of the OpenAPI `ServerInfo` schema: everything except
+/// `uptime_ms`, which [`AdminState`](crate::router::AdminState) computes per-request from its
+/// start time rather than storing. See [`ServerInfo::with_uptime_ms`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerInfo {
+    pub name: String,
+    pub version: String,
+    pub build: String,
+    pub supported_room_versions: Vec<String>,
+    pub enabled_components: Vec<String>,
+    pub contract_version: String,
+}
+
+impl Default for ServerInfo {
+    fn default() -> Self {
+        Self {
+            name: "hs".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            build: "dev".to_string(),
+            supported_room_versions: Vec::new(),
+            enabled_components: Vec::new(),
+            contract_version: "1.0".to_string(),
+        }
+    }
+}
+
+impl ServerInfo {
+    /// The full `GET /server` response body: this value's static fields plus `uptime_ms`
+    /// computed at request time.
+    pub fn with_uptime_ms(&self, uptime_ms: u64) -> ServerInfoResponse {
+        ServerInfoResponse {
+            name: self.name.clone(),
+            version: self.version.clone(),
+            build: self.build.clone(),
+            supported_room_versions: self.supported_room_versions.clone(),
+            enabled_components: self.enabled_components.clone(),
+            uptime_ms,
+            contract_version: self.contract_version.clone(),
+        }
+    }
+}
+
+/// The OpenAPI `ServerInfo` schema as actually served (includes `uptime_ms`; see [`ServerInfo`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerInfoResponse {
+    pub name: String,
+    pub version: String,
+    pub build: String,
+    pub supported_room_versions: Vec<String>,
+    pub enabled_components: Vec<String>,
+    pub uptime_ms: u64,
+    pub contract_version: String,
+}
+
+/// The OpenAPI `ServerHealth` schema. `status` is one of `ok`, `degraded`, `down`; `checks` maps
+/// a check name to a free-text status (`"ok"`, `"unknown"`, or a failure description). A check
+/// whose backing source is not wired is reported as `"unknown"`, never as `"ok"` (RFC 0004
+/// doesn't specify this precisely; see `docs/status/15-admin-api-and-modules.md` "Decisions
+/// made").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerHealth {
+    pub status: String,
+    pub checks: std::collections::BTreeMap<String, String>,
+}
+
+impl ServerHealth {
+    /// Builds a `ServerHealth` from a set of individual check results: `status` is `"ok"` when
+    /// every check is `"ok"`, `"down"` when any check reports `"down"`, and `"degraded"`
+    /// otherwise (for example, one or more checks are `"unknown"` because their source isn't
+    /// wired yet).
+    pub fn from_checks(checks: std::collections::BTreeMap<String, String>) -> Self {
+        let status = if checks.values().any(|v| v == "down") {
+            "down"
+        } else if checks.values().all(|v| v == "ok") {
+            "ok"
+        } else {
+            "degraded"
+        };
+        Self {
+            status: status.to_string(),
+            checks,
+        }
+    }
+}
+
 /// `Task` (RFC 0004 section 3.7): the admin face of a long-running operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
@@ -523,6 +634,49 @@ mod tests {
         let items: Vec<u32> = (0..3).collect();
         let page = Page::paginate(items, Some("not-a-number"), Some(10), false);
         assert_eq!(page.items, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn admin_user_default_is_well_formed() {
+        let user = AdminUser::default();
+        assert_eq!(user.user_id, "");
+        assert!(!user.admin);
+        assert_eq!(user.device_count, 0);
+    }
+
+    #[test]
+    fn server_info_with_uptime_carries_static_fields() {
+        let info = ServerInfo::default();
+        let response = info.with_uptime_ms(1234);
+        assert_eq!(response.uptime_ms, 1234);
+        assert_eq!(response.contract_version, info.contract_version);
+    }
+
+    #[test]
+    fn server_health_is_ok_only_when_every_check_is_ok() {
+        let mut checks = std::collections::BTreeMap::new();
+        checks.insert("audit".to_string(), "ok".to_string());
+        checks.insert("users".to_string(), "ok".to_string());
+        let health = ServerHealth::from_checks(checks);
+        assert_eq!(health.status, "ok");
+    }
+
+    #[test]
+    fn server_health_is_degraded_when_a_check_is_unknown() {
+        let mut checks = std::collections::BTreeMap::new();
+        checks.insert("audit".to_string(), "ok".to_string());
+        checks.insert("users".to_string(), "unknown".to_string());
+        let health = ServerHealth::from_checks(checks);
+        assert_eq!(health.status, "degraded");
+    }
+
+    #[test]
+    fn server_health_is_down_when_any_check_is_down() {
+        let mut checks = std::collections::BTreeMap::new();
+        checks.insert("audit".to_string(), "down".to_string());
+        checks.insert("users".to_string(), "ok".to_string());
+        let health = ServerHealth::from_checks(checks);
+        assert_eq!(health.status, "down");
     }
 
     #[test]
