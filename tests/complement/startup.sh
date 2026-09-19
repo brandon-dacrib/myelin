@@ -57,6 +57,20 @@ listeners:
 auth:
   enable_registration: true
   enable_legacy_login: true
+federation:
+  # Complement's containers and synthetic federation-test doubles present certificates signed by
+  # its own generated CA (/complement/ca/ca.crt, trusted into the OS store above) or are reached
+  # over private Docker/host-internal addresses. Neither is trusted by hs-federation's outbound
+  # `reqwest` client as built (rustls-tls's webpki-roots backend never reads the OS trust store,
+  # so step 1's update-ca-certificates is a no-op for it; there is also no config surface yet for
+  # an extra trusted-CA list, unlike Synapse's federation_custom_ca_list). Synapse's own Complement
+  # config (refs/synapse/docker/complement/conf/workers-shared-extra.yaml.j2) resolves the
+  # equivalent two problems with federation_custom_ca_list + federation_ip_range_blacklist: []; the
+  # first has no equivalent here yet (see docs/status/14-test-and-conformance.md), so
+  # verify_certificates: false is the closest available substitute for this harness only -- a real
+  # deployment should keep the default `true` and add proper CA trust instead.
+  verify_certificates: false
+  ip_range_blocklist: []
 EOF
 
 # ---- 4. TLS termination in front of the plaintext hs listener ---------------------------------

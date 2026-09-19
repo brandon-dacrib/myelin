@@ -218,9 +218,7 @@ mod tests {
         let err = open_storage(&config).unwrap_err();
         assert!(matches!(
             err,
-            StorageOpenError::BackendNotImplemented {
-                backend: "slatedb"
-            }
+            StorageOpenError::BackendNotImplemented { backend: "slatedb" }
         ));
     }
 }

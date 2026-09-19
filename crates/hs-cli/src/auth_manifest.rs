@@ -60,10 +60,30 @@ pub fn routes() -> Vec<Route> {
         // spec — any user may read any user's profile, including over federation — while a `PUT`
         // is authenticated and may only target the caller's own account.
         route("GET", "/profile/{userId}", NoAuth, "getUserProfile"),
-        route("GET", "/profile/{userId}/displayname", NoAuth, "getDisplayName"),
-        route("PUT", "/profile/{userId}/displayname", Matrix, "setDisplayName"),
-        route("GET", "/profile/{userId}/avatar_url", NoAuth, "getAvatarUrl"),
-        route("PUT", "/profile/{userId}/avatar_url", Matrix, "setAvatarUrl"),
+        route(
+            "GET",
+            "/profile/{userId}/displayname",
+            NoAuth,
+            "getDisplayName",
+        ),
+        route(
+            "PUT",
+            "/profile/{userId}/displayname",
+            Matrix,
+            "setDisplayName",
+        ),
+        route(
+            "GET",
+            "/profile/{userId}/avatar_url",
+            NoAuth,
+            "getAvatarUrl",
+        ),
+        route(
+            "PUT",
+            "/profile/{userId}/avatar_url",
+            Matrix,
+            "setAvatarUrl",
+        ),
     ]
 }
 

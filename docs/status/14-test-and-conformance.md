@@ -1,6 +1,224 @@
 # 14 Test and conformance (integration lead): status
 
-## Complement: the honest number (2026-09-18, this session)
+## Re-measurement (2026-09-19, this session): csapi moved, federation ran for the first time
+
+Per `docs/next-steps.md` item 1: the 2026-09-18 numbers below predate history-visibility
+enforcement, the room directory, `/createRoom` validation, `/forget`, profiles, inbound
+federation, E2EE sync fields and PostgreSQL. This session re-measured against a pinned commit
+(built first, before anything else, so the measurement isn't chasing a moving working tree):
+
+**`git rev-parse HEAD` at build time: `576e1e1a72d2be1147a33c3865333d7165ca69db`.**
+
+### 1. `csapi`, before vs. after
+
+| Run | Commit | Leaf-level (every assertion) | Top-level (Go `func Test*`) |
+|---|---|---|---|
+| 2026-09-18 (session 1, run 2) | untracked, ~`6d6d7be` | 293 total: 125 pass, 161 fail, 7 skip | 106 total: 30 pass, 74 fail, 2 skip |
+| **2026-09-19 (this session)** | **`576e1e1`** | **293 total: 148 pass, 138 fail, 7 skip** | **106 total: 35 pass, 69 fail, 2 skip** |
+
+Leaf pass rate: 42.7% → 50.5%. Top-level: 28.3% → 33.0%. Reproduction (unchanged from
+2026-09-18, confirmed still exact):
+
+```bash
+./tests/complement/build.sh complement-hs-reimplement:dev   # ~10-19 min this session (see below)
+cd refs/complement && COMPLEMENT_BASE_IMAGE=complement-hs-reimplement:dev \
+  go test -v -timeout 30m ./tests/csapi/...                 # ~14 min
+```
+
+Cross-check: the same commit's image, run again a few minutes later as part of the full
+`./tests/...` sweep below (16 Go packages racing for the same 10 cores, so a noisier
+measurement), landed at 146/142/7 leaf and 34/70/2 top — within 2 assertions of the dedicated
+run above. That's ordinary integration-test flake (timing-sensitive `MustSyncUntil` polling under
+load), not a harness bug; the dedicated single-package run is the one to trust as the headline
+number.
+
+**Wall-clock, for budgeting the next session:** image build 10m17s cold (first build this
+session) and 18m50s on a rebuild later in the session — both slower than 2026-09-18's ~4 min,
+because five other tracks' agents were running concurrent `cargo`/`docker build` on the same
+10-core box the whole time (confirmed: `ps` showed a second, simultaneous `complement-hs-e2ee:dev`
+build throughout). Budget 10-20 min per image build here, not 4. `csapi` alone: ~14 min (815s).
+The full `./tests/...` sweep (16 packages): 16m32s wall clock (parallel package execution, so
+per-package times sum to more than that).
+
+### 2. The federation package, run for the first time
+
+`./tests/...` (not just `./tests/csapi/...`) was run against the same pinned image. It recurses
+into every Go package under `tests/`, so one invocation covered `tests/csapi` (above),
+`tests/msc2836` and 13 other `tests/mscNNNN` packages, and — the actual target — the top-level
+`tests` package (two-homeserver federation blueprints, direct messaging, knocking, media,
+restricted rooms; 90 `func Test*`, one of which, `TestMain`, is the test-binary entrypoint and not
+a real test, leaving 89).
+
+**Top-level `tests` package: 89 real tests, 5 pass / 84 fail / 0 skip. Leaf-level: 186
+assertions, 41 pass / 139 fail / 6 skip.** This is the first number that has ever existed for this
+package. The five passes are real and worth naming because they're exactly what you'd expect to
+survive the bug below: `TestInboundFederationKeys` (a pure key-fetch test, no outbound trust
+needed), `TestWriteMDirectAccountData` and `TestMSC4291RoomIDAsHashOfCreateEvent` (single-server,
+no real federation), `TestKnockRoomsInPublicRoomsDirectory(InMSC3787Room)` (local directory
+listing).
+
+**Root cause of the other 84, diagnosed and confirmed, not just observed:** `hs-federation`'s
+outbound HTTP client (`crates/hs-federation/src/client.rs::client_for`) cannot validate any
+certificate that isn't in the public root bundle. The workspace's `reqwest` dependency
+(`Cargo.toml` line 90: `features = ["json", "rustls-tls"]`) pulls in `rustls-tls-webpki-roots`,
+which trusts only ~140 baked-in public CAs and — unlike a native-roots or platform-verifier
+backend — never reads the OS trust store. `tests/complement/startup.sh` already runs
+`update-ca-certificates` to trust Complement's generated CA system-wide (right thing to do), but
+that step is a no-op for this specific TLS stack. `federation.verify_certificates` defaults to
+`true` (correct, matches Synapse's own default), and there is no equivalent of Synapse's
+`federation_custom_ca_list` to add Complement's CA as an extra trusted root — that config surface
+does not exist anywhere in `hs-config`/`hs-federation` today (confirmed by grep). The evidence
+trail: `TestSyncTimelineGap` (csapi) and 27 federation-package failures show
+`M_UNAUTHORIZED: signature verification failed` on `make_join`/`send_join`/profile-query calls to
+a synthetic or second-homeserver peer, and the raw container logs show the matching cause 24
+times: `http: TLS handshake error from 127.0.0.1:PORT: remote error: tls: unknown certificate
+authority` — our outbound client rejecting the peer's Complement-CA-signed certificate. Confirmed
+against `refs/synapse/docker/complement/conf/workers-shared-extra.yaml.j2`: Synapse's own
+Complement config sets `federation_custom_ca_list: [/complement/ca/ca.crt]` *and*
+`federation_ip_range_blacklist: []` — the second one matters too, since this server's default
+`ip_range_blocklist` (`172.16.0.0/12` among others) covers the private ranges Docker's bridge
+network and `host.docker.internal` commonly live in.
+
+**Validated, not just theorized.** Added a harness-only workaround to `tests/complement/startup.sh`
+(the file this track owns) — `federation.verify_certificates: false` and
+`federation.ip_range_blocklist: []` in the generated `config.yaml`, matching the *effect* of
+Synapse's Complement config since there's no `custom_ca_list` equivalent to reach for — rebuilt,
+and re-ran the three tests above that had failed with the TLS symptom
+(`TestOutboundFederationSend`, `TestInboundFederationRejectsEventsWithRejectedAuthEvents`,
+`TestFederationRoomsInvite`). **All three still fail, but the TLS error is gone in all three**,
+replaced by distinct, further-along failures: a real PDU signature-verification rejection
+(`M_BAD_JSON: signature from host.docker.internal:1024/ed25519:... does not verify` on
+`send_join` — a second, different bug, see track 06 below), cross-server room-alias-join 404s, and
+the same `MustSyncUntil` timeout cluster #1 below. This is strong evidence the TLS gap was gating
+the *majority* of the 84 failures, but the rebuilt image no longer corresponds to the pinned
+commit (the working tree had moved under five concurrent agents by rebuild time, confirmed by an
+18m50s rebuild instead of a cached few-hundred-ms one), so **no corrected top-level federation
+number is claimed here** — only that one exists to be measured, and re-running the full
+`./tests/...` sweep with this harness fix in place, against a freshly pinned commit, is the
+single highest-value thing the next session can do. The harness fix itself is left in place
+(it's in-scope, `tests/complement/startup.sh`, and makes every future federation run meaningful
+instead of universally TLS-blocked); `verify_certificates: false` is called out in the file's own
+comment as a test-only substitute for real CA trust, not a production recommendation.
+
+### 3. Updated triage by owning track (replaces the 2026-09-18 list below)
+
+**Track 04 (room-and-events) — closed since 2026-09-18:** history-visibility enforcement, room
+directory (`TestPublicRooms` now passes, not in either failing list), `/createRoom` parameter
+validation, `/forget` membership validation are all gone from the failing list as originally
+reported. **New, found this session:**
+- `/forget` now fails differently: `TestRoomForget` — "Did not expect room X in left" (a `/sync`
+  `left` section regression, not the original 200-vs-400 bug).
+- State/membership idempotency: `TestRoomCreationReportsEventsToMyself` — setting the same state
+  twice, or joining twice, mints a *new* event ID both times instead of being a no-op.
+- `unsigned.transaction_id` never populated on the sender's own echo
+  (`TestTxnInEvent`/`TestTxnScopeOnLocalEcho`/`TestTxnIdWithRefreshToken`).
+- `/relations/{eventId}` and `/threads` both 404 (`TestRelations`, `TestThreadsEndpoint`) — not
+  built yet.
+- `/upgrade` 404 (`TestPushRuleRoomUpgrade`, `TestSearch`'s upgrade step) — not built yet.
+- `/search` 404 (`TestSearch`) — not built yet.
+- Room alias/canonical-alias validation gaps: `PUT canonical_alias` on a nonexistent alias
+  returns 200 (want 400); `GET /aliases` on a room the caller isn't in returns 200 with the list
+  (want 403); `DELETE /directory/room/{alias}` by a non-owner returns 200 (want 403).
+- `GET .../state/m.room.power_levels` omits the `ban` key when a client asks for the raw
+  content; `format=event` on `/state/m.room.member` omits the `sender` wrapper; `/joined_members`
+  omits `avatar_url` and doesn't 403 after the caller has left.
+- `/messages?filter={"contains_url":true}` doesn't filter (`TestRoomImageRoundtrip`: 8 events
+  back, want 1).
+- `membership_on_events_test.go`: per-event `unsigned`/membership tagging comes back empty where
+  the test expects `leave`/`join`.
+- Oversized event body: `M_BAD_JSON`/400 returned where the spec test wants 413
+  (`invalid_test.go`).
+
+**Track 05 (sync, also owns presence) — the single largest remaining cluster, new this
+session:** a broad set of `MustSyncUntil: timed out` failures across almost every test that
+depends on an incremental `/sync` reflecting a change made moments earlier: profile updates
+(`TestAvatarUrlUpdate`, `TestDisplayNameUpdate`, `user_directory_display_names_test.go`), typing
+EDUs (`TestTyping`, `TestLeakyTyping`), device-list changes surfacing in sync
+(`TestDeviceListUpdates`), ignored-users filtering (`TestInviteFromIgnoredUsersDoesNotAppearInSync`),
+invites (`TestRoomsInvite`, federation package's `TestFederationRoomsInvite`), presence-in-sync
+(`TestPresenceSyncDifferentRooms`, `TestSync`'s presence subtests), room summaries
+(`TestRoomSummary`), threaded receipts, invite-rejection (`TestLeaveEventInviteRejection`), and
+push-rule-carryover-on-upgrade. This is numerically the biggest single bucket in the whole run —
+worth its own investigation rather than filing as N separate bugs. Also still present:
+presence endpoints 404 (`TestPresence`, `TestMembersLocal`); `filter` doesn't reject invalid
+room/sender IDs (`TestFilter`, want 4xx got 200); no push rules ever appear in a sync response
+(`TestPushSync`). **Confirmed unresolved from 2026-09-18:** the `hsu1_...` sync-token vs.
+`/messages`/`/keys/changes` pagination-token mismatch (`TestLeftRoomFixture`,
+`TestSendAndFetchMessage`, `TestRoomMessagesLazyLoading(LocalUser)`, `TestKeyChangesLocal`) — this
+is `docs/next-steps.md` item 2, already tracked, not new.
+
+**Track 06 (federation) — mixed.** The good news: `send_join`/`/send`/`make_join` are real and,
+per section 2 above, once the harness's TLS gap is worked around, get *past* the TLS failure into
+real protocol territory. The bad news, newly surfaced by that same workaround: `send_join` can
+reject a legitimately-signed join with `M_BAD_JSON: signature ... does not verify`
+(`federation_room_event_auth_test.go`) — a genuine remaining signature/canonical-JSON bug, not the
+TLS one. **The TLS/CA gap itself (section 2) is this track's (or `hs-config`'s) to close
+properly**: add a `federation.custom_ca_list`-equivalent config option and/or switch the
+`reqwest` build to a native-roots or platform-verifier backend so `update-ca-certificates`
+(already run by this harness) actually takes effect for outbound federation TLS. Also
+`ip_range_blocklist`'s production-safe default currently blocks the private ranges any
+multi-container or Complement-style deployment needs — Synapse ships `federation_ip_range_
+blacklist: []` in its own Complement config for the same reason; this project has no equivalent
+override path other than what this session added to the test harness.
+
+**Track 08 (e2ee) — unresolved, with a discrepancy worth a fresh look.** Cross-user `/keys/query`
+still returns an empty `device_keys` map for a same-server second user
+(`upload_keys_test.go:138`). Malformed-shape rejection (`{"device_id": true}` instead of an array)
+returns 200 where 400 is expected, for *both* `/keys/upload` and `/keys/query`
+(`TestUploadKey`, `TestKeysQueryWithDeviceIDAsObjectFails`) — notable because
+`crates/hs-e2e/src/routes/keys_query.rs`'s own doc comment says this exact Complement test is
+handled ("this server rejects it outright, matching the spec and Complement's
+`TestKeysQueryWithDeviceIDAsObjectFails`"), and a static read of `build_keys_query_response`
+agrees it should 400 on a `Value::Object` device filter — but the live run says otherwise. Worth
+checking whether the code doing the rejecting is actually being reached (routing, an extractor
+ordering issue, or a stale build) before assuming the comment is simply wrong. `/keys/claim`
+ordering also still returns the wrong slot's content (`TestKeyClaimOrdering`) — unresolved from
+2026-09-18.
+
+**Track 09 (media) — narrower than 2026-09-18 reported, one wiring fix away.** Async upload
+(MSC2246) IS implemented and mounted now (`hs_media::router::authenticated_router`'s `/create` at
+`/_matrix/client/v1/media/create`, `legacy_router`'s at `/_matrix/media/v3/create`) — but
+Complement's own `CSAPI.CreateMedia` helper (`refs/complement/client/client.go:97`, unmodified
+upstream) calls the older unstable path `POST /_matrix/media/v1/create`, which this server mounts
+nowhere (`TestAsyncUpload`, all sub-cases, 404). This reads like a one-line additional route
+mount, not a rebuild of the feature. URL preview genuinely doesn't exist yet
+(`GET /_matrix/media/v3/preview_url` 404, `TestUrlPreview`) — `docs/rfcs/0006-url-previews.md` is
+design-only, matching 2026-09-18.
+
+**Track 07 (auth) — several small validation gaps, some new detail.** `/register/available`
+doesn't reject an invalid username shape (200 `available:true`, want 400); registration UIA flow
+returns 401 instead of 400 for "no session provided" and 200 instead of 401 for
+"auth-requires-session"; mixed-case usernames aren't lower-cased on register
+(`@user-UPPER` stored verbatim, want `@user-upper`). `GET /capabilities` doesn't require auth
+(200 with no token, want 401). `DELETE /device/{deviceId}` with a malformed body returns 400
+where UIA should be attempted first (401) — unresolved from 2026-09-18. `GET
+/_matrix/client/v3/devices` after a multi-device logout still shows one extra device — unresolved
+from 2026-09-18.
+
+**Track 10 (push) — new detail.** `/sync` never includes push rules in any form
+(`push_test.go`: "no pushrules found in sync response" on every subtest) — worth checking whether
+this is a `hs-push` gap or a `hs-user`/`hs-room` sync-wiring gap (the account-data-shaped push
+rules payload has to reach `/sync` through the same actor the `MustSyncUntil` cluster above lives
+in, so these may share a cause).
+
+### 4. Blacklist decision
+
+**No entries added.** `blacklist.txt` stays empty. Every failure this session examined is either
+a bug (something the code is trying and failing to do — e.g., `/keys/query`'s own doc comment
+disagreeing with its own behavior) or a feature this project's own docs describe as future work,
+not declined work (`/search`, `/threads`, `/relations`, URL previews, presence, room upgrades all
+appear as owned, planned surface in their tracks' briefs; none carries a "we've decided not to
+build this" note anywhere in `docs/`). The two candidates that *are* documented as deliberate,
+conscious cuts — `hs-e2e`'s unenforced cross-signing signature verification and its skipped UIA
+re-auth on `/keys/device_signing/upload` (both called "cut-for-time, not oversight" in
+`docs/status/08-e2ee.md`) — have no matching failure in either Complement run this session, so
+blacklisting them now would be speculative, not justified by an observed failure. If a future run
+surfaces a test that fails specifically because of one of those two documented cuts, that's the
+first honest blacklist entry.
+
+---
+
+## Complement: the honest number (2026-09-18, this session) [superseded by the section above]
 
 **The image builds and Complement runs against it.** This had never happened before this session
 (`Dockerfile.template` referenced a crate named `hs-server` that never existed; the real binary is
@@ -270,9 +488,20 @@ state.
 
 ## Next
 
-- **Complement is now real** (see the top of this file): rerun `./tests/complement/build.sh &&
-  cd refs/complement && go test ./tests/csapi/...` against current HEAD, then run the full
-  top-level `./tests/...` package (federation-heavy) which this session didn't have time for.
+- **Highest value: re-run the top-level federation `tests` package** with the
+  `verify_certificates: false` / `ip_range_blocklist: []` harness fix now in `startup.sh`, against
+  a freshly pinned commit (build first, record `git rev-parse HEAD`, exactly as this session did).
+  Expect a large jump from 5/89 — the fix removed the dominant blocker in a 3-test spot check —
+  but the number has never been measured with the fix in place; do not guess it, measure it.
+  Budget ~20 min for the image build (contended) and ~15-20 min for the run.
+  A real fix belongs in `hs-federation`/`hs-config` (a `federation.custom_ca_list` equivalent, or
+  switching the workspace `reqwest` feature set off pure `webpki-roots`), not permanently in this
+  harness — see this file's "Complement" section above.
+- Chase the `MustSyncUntil` timeout cluster (track 05) — it's the single largest bucket in this
+  session's csapi run and appears again in the federation package; likely one or a small number
+  of root causes given how many unrelated-looking tests share the exact same symptom.
+- Re-run `csapi` again once track 04/05/07/08/09's items from this session's triage land, the same
+  way this session re-ran 2026-09-18's number.
 - Fill in the still-`TODO` `tests/sytest/plugins/hs-reimplement/lib/SyTest/Homeserver/
   HsReimplement.pm` the same way `tests/complement/`'s scaffold was filled in this session (real
   `hs` binary, real config) — Sytest's own CPAN dependencies still aren't installed in this
@@ -362,6 +591,21 @@ own end-to-end run.
   recorder matching the minimal shape any future mailer trait needs, rather than carrying a real
   SMTP implementation as a dependency on a shared, resource-constrained machine for a feature no
   crate sends mail through yet.
+- **`tests/complement/startup.sh` now sets `federation.verify_certificates: false` and
+  `federation.ip_range_blocklist: []`** in the generated `config.yaml` (2026-09-19). This is a
+  test-harness-only workaround for a real gap in `hs-federation`/`hs-config` (no
+  `federation_custom_ca_list` equivalent, and `reqwest`'s `rustls-tls` feature never reads the OS
+  trust store `update-ca-certificates` populates) — see this file's "Complement" section above for
+  the full diagnosis. Matches the *effect* of Synapse's own Complement config
+  (`federation_custom_ca_list` + `federation_ip_range_blacklist: []`) without the mechanism, since
+  this project doesn't have that mechanism yet. Flagged in the script's own comment as not a
+  production recommendation; the real fix is track 06/`hs-config`'s to build, at which point this
+  workaround should be replaced with a proper `custom_ca_list` entry pointing at
+  `/complement/ca/ca.crt` (matching Synapse) rather than disabling verification outright.
+- **No `blacklist.txt` entries added this session** despite 138+139 failing assertions across two
+  packages: every failure traced to either an active bug or documented future work, not a
+  conscious "we will not implement this." See this file's "Blacklist decision" section above for
+  the two candidates considered and rejected as unjustified without a matching failure.
 
 ## Shared dependencies added
 
@@ -387,8 +631,16 @@ cargo run -p hs-spec-coverage -- --spec-dir refs/matrix-spec/data/api   # 0/235 
 python3 -m unittest discover -s tests/differential/tests -v   # 14 tests
 python3 tests/differential/run_differential.py                # clean skip, exit 0
 
-# Complement / Sytest / oracle scaffolds (all clean-skip without their respective dependencies):
-./tests/complement/build.sh; ./tests/complement/run_cluster.sh
+# Complement (real as of 2026-09-18/19; ~10-20 min image build under contention, ~14 min per
+# csapi run, ~15-20 min for the top-level federation `tests` package):
+./tests/complement/build.sh complement-hs-reimplement:dev
+cd refs/complement && COMPLEMENT_BASE_IMAGE=complement-hs-reimplement:dev \
+  go test -v -timeout 30m ./tests/csapi/...          # csapi: 148 pass / 138 fail / 7 skip (leaf)
+cd refs/complement && COMPLEMENT_BASE_IMAGE=complement-hs-reimplement:dev \
+  go test -v -timeout 30m ./tests/...                # everything, incl. federation; ~16-20 min
+
+# Sytest / oracle scaffolds (clean-skip without their respective dependencies):
+./tests/complement/run_cluster.sh
 ./tests/sytest/run_sytest.sh
 ./tests/oracle/run_oracle.sh
 
