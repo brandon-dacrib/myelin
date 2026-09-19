@@ -80,6 +80,7 @@ use std::time::{Duration, Instant};
 use hs_e2e::store::{DeviceKeyStore, E2eStore, FallbackKeyStore, OneTimeKeyStore, ToDeviceStore};
 use hs_kv::KvBackend;
 use hs_model::Event;
+use hs_push::rulesets::RulesetStore;
 use hs_room::routes::render::client_event_json;
 use hs_room::timeline::{Direction, PaginationToken};
 use ruma::{OwnedDeviceId, OwnedRoomId, OwnedUserId, RoomId, UserId};
@@ -275,6 +276,85 @@ fn build_state_section(
         .collect())
 }
 
+/// Builds the `summary` key of a joined room's `/sync` entry (the spec's "Room Summary"): always
+/// `m.joined_member_count`/`m.invited_member_count`, plus `m.heroes` -- up to five other members'
+/// user IDs, lexicographically ordered for a deterministic response -- when (and only when) the
+/// room has neither `m.room.name` nor `m.room.canonical_alias` set. Heroes exist purely so a
+/// client can synthesize a name for a room that has none of its own; a room that already has a
+/// name or alias gets an empty `m.heroes` list, matching every real client's own precedence (own
+/// name/alias always wins, heroes are a last resort) and saving the (cheap but pointless) work of
+/// picking candidates nobody will use. Ordering heroes lexicographically rather than by "oldest
+/// membership" (Synapse's own tiebreak) is a documented simplification -- see
+/// `docs/status/05-sync.md` -- since nothing in this crate tracks per-member join order today and
+/// the spec does not mandate a particular order.
+///
+/// # Errors
+/// Returns [`hs_room::RoomError`] if the state store fails.
+fn build_room_summary(
+    actor: &hs_room::actor::RoomActor<impl KvBackend>,
+    user_id: &UserId,
+) -> Result<Value, hs_room::RoomError> {
+    let mut joined_member_count = 0u64;
+    let mut invited_member_count = 0u64;
+    let mut hero_candidates: BTreeSet<String> = BTreeSet::new();
+    for member in actor.members()? {
+        let event = client_event_json(member);
+        let Some(state_key) = event.get("state_key").and_then(Value::as_str) else {
+            continue;
+        };
+        let membership = event
+            .get("content")
+            .and_then(|c| c.get("membership"))
+            .and_then(Value::as_str);
+        match membership {
+            Some("join") => {
+                joined_member_count += 1;
+                if state_key != user_id.as_str() {
+                    hero_candidates.insert(state_key.to_owned());
+                }
+            }
+            Some("invite") => {
+                invited_member_count += 1;
+                if state_key != user_id.as_str() {
+                    hero_candidates.insert(state_key.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let has_own_name = |event_type: &str, field: &str| -> Result<bool, hs_room::RoomError> {
+        Ok(actor
+            .state_event(event_type, "")?
+            .map(client_event_json)
+            .and_then(|e| {
+                e.get("content")
+                    .and_then(|c| c.get(field))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .is_some_and(|s| !s.is_empty()))
+    };
+    let already_named =
+        has_own_name("m.room.name", "name")? || has_own_name("m.room.canonical_alias", "alias")?;
+
+    let heroes: Vec<Value> = if already_named {
+        Vec::new()
+    } else {
+        hero_candidates
+            .into_iter()
+            .take(5)
+            .map(Value::String)
+            .collect()
+    };
+
+    Ok(json!({
+        "m.heroes": heroes,
+        "m.joined_member_count": joined_member_count,
+        "m.invited_member_count": invited_member_count,
+    }))
+}
+
 /// Builds a full `/sync` v2 response for `user_id`, long-polling as needed. Returns the response
 /// JSON and the [`SyncToken`] its `next_batch` carries (the caller records the device cursor;
 /// see the module docs and `crate::routes::sync`).
@@ -425,7 +505,7 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             .map(|a| json!({"type": a.event_type, "content": a.content}))
             .collect();
 
-        let (timeline, state_events) = handle
+        let (timeline, state_events, summary) = handle
             .query(move |actor| {
                 let timeline = match resume {
                     ResumeMode::Incremental(pos) => {
@@ -460,7 +540,8 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                         &user_id_owned,
                     )?
                 };
-                Ok::<_, hs_room::RoomError>((timeline, state))
+                let summary = build_room_summary(actor, &user_id_owned)?;
+                Ok::<_, hs_room::RoomError>((timeline, state, summary))
             })
             .await?;
 
@@ -522,6 +603,29 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                 );
             }
             _ => {
+                // `unread_notifications`/`unread_thread_notifications`
+                // (`docs/status/10-push.md`'s "Interfaces provided"): a direct, side-effect-free
+                // keyed lookup, safe to call unconditionally for every room already being
+                // emitted. Stays the hard-zero placeholder until `hs-cli` installs a store via
+                // `SessionHub::install_counts_store` -- see that method's doc comment.
+                let room_counts = match hub.counts_store() {
+                    Some(counts) => counts.get_room_counts(user_id, room_id).await?,
+                    None => hs_push::counts::RoomNotificationCounts::default(),
+                };
+                let totals = room_counts.totals();
+                let thread_counts: serde_json::Map<String, Value> = room_counts
+                    .threads
+                    .iter()
+                    .map(|(thread_root, c)| {
+                        (
+                            thread_root.to_string(),
+                            json!({
+                                "highlight_count": c.highlight_count,
+                                "notification_count": c.notification_count,
+                            }),
+                        )
+                    })
+                    .collect();
                 join.insert(
                     bucket_key,
                     json!({
@@ -534,11 +638,11 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                         "account_data": {"events": account_data_json},
                         "ephemeral": {"events": ephemeral_events},
                         "unread_notifications": {
-                            "highlight_count": 0,
-                            "notification_count": 0,
+                            "highlight_count": totals.highlight_count,
+                            "notification_count": totals.notification_count,
                         },
-                        "unread_thread_notifications": {},
-                        "summary": {},
+                        "unread_thread_notifications": thread_counts,
+                        "summary": summary,
                     }),
                 );
             }
@@ -555,10 +659,29 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             .filter(|a| a.changed_seq > baseline.account_data_seq)
             .collect()
     };
-    let global_account_data_json: Vec<Value> = global_account_data
+    let mut global_account_data_json: Vec<Value> = global_account_data
         .iter()
         .map(|a| json!({"type": a.event_type, "content": a.content}))
         .collect();
+
+    // `m.push_rules` (`docs/status/10-push.md`'s "Interfaces provided"): always included on an
+    // initial sync, included on an incremental one only when the ruleset actually changed since
+    // `baseline`. No-op (never emitted, `push_rules_seq` never advances) until `hs-cli` installs
+    // a store via `SessionHub::install_push_rules_store` -- see that method's doc comment for the
+    // exact call this needs.
+    let new_push_rules_seq = match hub.push_rules_store() {
+        Some(rulesets) => {
+            let push_rules = rulesets.account_data_for_sync(user_id).await?;
+            if is_initial || push_rules.changed_seq > baseline.push_rules_seq {
+                global_account_data_json.push(json!({
+                    "type": "m.push_rules",
+                    "content": push_rules.content,
+                }));
+            }
+            push_rules.changed_seq.max(baseline.push_rules_seq)
+        }
+        None => baseline.push_rules_seq,
+    };
 
     let new_feed_seq = store.latest_feed_seq(user_id).await?.max(baseline.feed_seq);
     let new_account_data_seq = store
@@ -660,6 +783,7 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         device_list_seq: new_device_list_seq,
         typing_seq: new_typing_seq,
         presence_seq: new_presence_seq,
+        push_rules_seq: new_push_rules_seq,
         ..baseline
     };
 
@@ -725,6 +849,16 @@ async fn has_new_data<B: KvBackend + 'static, R: RoomSource<B>>(
         return Ok(true);
     }
     if store.latest_account_data_seq(user_id).await? > baseline.account_data_seq {
+        return Ok(true);
+    }
+    // `m.push_rules`: a rule change should wake a blocked long-poll the same way any other
+    // account-data change does. `store()` bypasses `CachedRulesetStore`'s cache -- fine here,
+    // this is a cheap counter read, not the full ruleset (`docs/status/10-push.md`'s "Interfaces
+    // provided"). No-op (never wakes) until `hs-cli` installs a store via
+    // `SessionHub::install_push_rules_store` -- see that method's doc comment.
+    if let Some(push_rules) = hub.push_rules_store()
+        && push_rules.store().changed_seq(user_id).await? > baseline.push_rules_seq
+    {
         return Ok(true);
     }
     // Hot rooms never advance the feed on write (`crate::hub`'s module docs), so their
@@ -1540,5 +1674,217 @@ mod tests {
             !events.iter().any(|e| e["sender"] == carol.as_str()),
             "bob shares no room with carol and must not see her presence: {events:?}"
         );
+    }
+
+    /// `docs/status/10-push.md`'s "Interfaces provided": an initial sync always carries
+    /// `m.push_rules` once a store is installed, and a never-customized user's `push_rules_seq`
+    /// stays `0` -- see `crate::token`'s doc comment on why `0` means "never changed".
+    #[tokio::test]
+    async fn push_rules_are_carried_on_an_initial_sync_once_a_store_is_installed() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let rulesets = Arc::new(hs_push::rulesets::CachedRulesetStore::new(
+            hs_push::rulesets::tables::TablesRulesetStore::open(MemoryBackend::new()).unwrap(),
+        ));
+        hub.install_push_rules_store(rulesets);
+
+        let (response, token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+        let events = response["account_data"]["events"].as_array().unwrap();
+        assert!(
+            events.iter().any(|e| e["type"] == "m.push_rules"),
+            "an initial sync should carry m.push_rules once a store is installed: {events:?}"
+        );
+        assert_eq!(
+            token.push_rules_seq, 0,
+            "a never-customized user's change-seq stays 0"
+        );
+    }
+
+    /// The change-seq gate: an incremental sync omits `m.push_rules` while the baseline is
+    /// current, and includes it again the moment the ruleset actually changes.
+    #[tokio::test]
+    async fn push_rules_only_repeat_on_an_incremental_sync_once_the_ruleset_changes() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let rulesets = Arc::new(hs_push::rulesets::CachedRulesetStore::new(
+            hs_push::rulesets::tables::TablesRulesetStore::open(MemoryBackend::new()).unwrap(),
+        ));
+        hub.install_push_rules_store(rulesets.clone());
+
+        let (_first, token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+        let (second, token2) = build(&hub, &e2e, &alice, params(Some(token)))
+            .await
+            .unwrap();
+        let events = second["account_data"]["events"].as_array().unwrap();
+        assert!(
+            !events.iter().any(|e| e["type"] == "m.push_rules"),
+            "an unchanged ruleset must not repeat on an incremental sync: {events:?}"
+        );
+
+        let mut edited = hs_push::rulesets::default_ruleset(&alice);
+        edited
+            .set_enabled(ruma::push::RuleKind::Underride, ".m.rule.message", false)
+            .unwrap();
+        rulesets.set_ruleset(&alice, &edited).await.unwrap();
+
+        let (third, token3) = build(&hub, &e2e, &alice, params(Some(token2)))
+            .await
+            .unwrap();
+        let events = third["account_data"]["events"].as_array().unwrap();
+        assert!(
+            events.iter().any(|e| e["type"] == "m.push_rules"),
+            "a changed ruleset should reappear on the next incremental sync: {events:?}"
+        );
+        assert!(token3.push_rules_seq > 0);
+    }
+
+    /// `docs/status/10-push.md`'s other half of the seam: `unread_notifications` reports whatever
+    /// `CountsStore::get_room_counts` returns, verbatim, once a store is installed -- no
+    /// independent computation on this crate's side.
+    #[tokio::test]
+    async fn unread_notifications_reflect_an_installed_counts_store() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+        // The room-creation events were published before `watch_room` subscribed
+        // (`crate::hub::SessionHub`'s module docs, "The discovery gap"), so a follow-up event is
+        // what actually backfills alice's own `join` membership into this hub -- same pattern
+        // `filter_rooms_allowlist_excludes_other_rooms` (above) documents and relies on.
+        handle
+            .send_event(
+                alice.clone(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"body": "seed"}),
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+
+        let counts: Arc<dyn hs_push::counts::CountsStore> = Arc::new(
+            hs_push::counts::tables::TablesCountsStore::open(MemoryBackend::new()).unwrap(),
+        );
+        counts
+            .record_notification(&alice, &room_id, hs_push::counts::Scope::Main, true)
+            .await
+            .unwrap();
+        hub.install_counts_store(counts);
+
+        let (response, _) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+        let room = &response["rooms"]["join"][room_id.as_str()];
+        assert_eq!(room["unread_notifications"]["notification_count"], 1);
+        assert_eq!(room["unread_notifications"]["highlight_count"], 1);
+    }
+
+    /// The motivating case named in this track's status file: a room with no `m.room.name`
+    /// carries heroes (excluding the syncing user) and accurate join/invite counts.
+    #[tokio::test]
+    async fn room_summary_reports_heroes_and_counts_for_an_unnamed_room() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+        handle
+            .membership(
+                alice.clone(),
+                Action::Invite,
+                bob.clone(),
+                serde_json::json!({}),
+                2,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (response, _) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        let summary = &response["rooms"]["join"][room_id.as_str()]["summary"];
+        assert_eq!(summary["m.joined_member_count"], 1);
+        assert_eq!(summary["m.invited_member_count"], 1);
+        let heroes = summary["m.heroes"].as_array().unwrap();
+        assert!(
+            heroes.iter().any(|h| h == bob.as_str()),
+            "bob should be a hero candidate: {heroes:?}"
+        );
+        assert!(
+            !heroes.iter().any(|h| h == alice.as_str()),
+            "heroes must exclude the syncing user: {heroes:?}"
+        );
+    }
+
+    /// A room with its own name needs no heroes -- see [`build_room_summary`]'s doc comment.
+    #[tokio::test]
+    async fn room_summary_has_no_heroes_once_the_room_has_its_own_name() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    name: Some("Room".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+        // See `unread_notifications_reflect_an_installed_counts_store`'s identical comment: a
+        // follow-up event is what backfills alice's own `join` membership into this hub.
+        handle
+            .send_event(
+                alice.clone(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"body": "seed"}),
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (response, _) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        let summary = &response["rooms"]["join"][room_id.as_str()]["summary"];
+        assert!(
+            summary["m.heroes"].as_array().unwrap().is_empty(),
+            "a named room needs no heroes: {summary}"
+        );
+        assert_eq!(summary["m.joined_member_count"], 1);
     }
 }

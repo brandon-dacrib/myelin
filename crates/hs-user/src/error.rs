@@ -82,6 +82,12 @@ pub enum UserError {
     /// (`docs/rfcs/0013-e2ee-sync-extensions.md`).
     #[error("e2e store error: {0}")]
     E2e(#[from] hs_e2e::store::StoreError),
+
+    /// `hs-push`'s ruleset or counts store reported an error while `/sync` was populating
+    /// `m.push_rules` account data or `unread_notifications`/`unread_thread_notifications`
+    /// (`docs/status/10-push.md`'s "Interfaces provided").
+    #[error("push store error: {0}")]
+    Push(#[from] hs_push::error::StoreError),
 }
 
 /// Maps the store's own error enum onto this crate's, variant for variant: a storage failure
@@ -124,7 +130,8 @@ impl UserError {
             | Self::Table(_)
             | Self::Codec(_)
             | Self::Internal(_)
-            | Self::E2e(_) => MatrixError::custom(
+            | Self::E2e(_)
+            | Self::Push(_) => MatrixError::custom(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 MatrixErrorCode::Unknown,
                 self.to_string(),

@@ -30,11 +30,14 @@
 //! near-mechanical addition this implies for `crates/hs-cli/src/serve.rs`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use hs_kv::KvBackend;
 use hs_model::Event;
+use hs_push::counts::CountsStore;
+use hs_push::rulesets::CachedRulesetStore;
+use hs_push::rulesets::tables::TablesRulesetStore;
 use hs_room::protocol::RoomUpdate;
 use ruma::{OwnedUserId, RoomId, UserId};
 use tokio::sync::{Mutex, Notify};
@@ -152,6 +155,31 @@ impl hs_room::registry::GlobalTokenResolver for FeedTokenResolver {
     }
 }
 
+/// Implements [`hs_e2e::state::SyncTokenResolver`] for `GET /keys/changes`: decodes `raw` as this
+/// crate's own [`SyncToken`] and reports its `device_list_seq` field directly, with no store
+/// lookup at all -- unlike [`FeedTokenResolver`] (which needs `crate::store::UserStore` to turn a
+/// `feed_seq` into a room-local position), a device-list stream position *is* one of the token's
+/// own fields verbatim, so decoding the token answers the question outright. `user_id` is unused
+/// (a `SyncToken` carries no user scope of its own; the caller already knows whose token this is
+/// from the authenticated request), kept only to satisfy the trait signature.
+///
+/// Installed by [`SessionHub::install_device_list_token_resolver`] -- see that method's doc
+/// comment for why installation is a separate call rather than a side effect of
+/// [`SessionHub::new`] the way [`FeedTokenResolver`] is (this one needs an `E2eState` handle that
+/// `new` does not take).
+struct DeviceListTokenResolver;
+
+#[async_trait::async_trait]
+impl hs_e2e::state::SyncTokenResolver for DeviceListTokenResolver {
+    async fn resolve_device_list_position(
+        &self,
+        _user_id: &UserId,
+        raw: &str,
+    ) -> Result<Option<u64>, hs_e2e::error::E2eError> {
+        Ok(SyncToken::decode(raw).ok().map(|t| t.device_list_seq))
+    }
+}
+
 /// The per-process hub: one [`crate::store::UserStore`] shared by every user, a [`RoomSource`]
 /// for querying room member lists, and the in-memory wakers `/sync` long-polls block on.
 ///
@@ -175,6 +203,15 @@ pub struct SessionHub<B: KvBackend, R: RoomSource<B>> {
     typing: TypingRegistry,
     /// In-memory `m.presence` state. See [`crate::presence`]'s module docs.
     presence: PresenceRegistry,
+    /// `hs-push`'s cached ruleset store, if installed (see
+    /// [`SessionHub::install_push_rules_store`]). `None` until installed -- `/sync` then omits
+    /// `m.push_rules` entirely, exactly today's (pre-push-rules) behavior, rather than failing.
+    push_rules: OnceLock<Arc<CachedRulesetStore<TablesRulesetStore<B>>>>,
+    /// `hs-push`'s notification-count store, if installed (see
+    /// [`SessionHub::install_counts_store`]). `None` until installed -- `/sync` then reports
+    /// `unread_notifications`/`unread_thread_notifications` as the hard-zero placeholder it
+    /// always has, rather than failing.
+    counts: OnceLock<Arc<dyn CountsStore>>,
     _marker: std::marker::PhantomData<fn() -> B>,
 }
 
@@ -200,6 +237,8 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             wakers: Mutex::new(HashMap::new()),
             typing: TypingRegistry::new(),
             presence: PresenceRegistry::new(),
+            push_rules: OnceLock::new(),
+            counts: OnceLock::new(),
             _marker: std::marker::PhantomData,
         }
     }
@@ -216,6 +255,58 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     #[must_use]
     pub fn rooms(&self) -> &R {
         &self.rooms
+    }
+
+    /// Installs the `hs-push` ruleset store `/sync` consults for `m.push_rules` account data
+    /// (`docs/status/10-push.md`'s "Interfaces provided"). Idempotent past the first call, same
+    /// convention as [`hs_room::registry::RoomRegistry::install_global_token_resolver`] and
+    /// `hs_e2e::state::E2eState::install_sync_token_resolver`: a second install is logged and
+    /// ignored rather than panicking.
+    ///
+    /// Not called by [`SessionHub::new`] (unlike [`FeedTokenResolver`]'s install) because the
+    /// `Arc` this needs is built by `hs-cli`'s `build_session_mounts` *alongside* (not before)
+    /// the call that builds this hub -- see `docs/status/05-sync.md` for the exact call site and
+    /// line this needs added once `hs-cli` is free to change.
+    pub fn install_push_rules_store(&self, store: Arc<CachedRulesetStore<TablesRulesetStore<B>>>) {
+        if self.push_rules.set(store).is_err() {
+            tracing::warn!("a push-rules store was already installed on this hub; ignoring");
+        }
+    }
+
+    /// The installed push-rules store, if any -- see [`SessionHub::install_push_rules_store`].
+    #[must_use]
+    pub fn push_rules_store(&self) -> Option<&Arc<CachedRulesetStore<TablesRulesetStore<B>>>> {
+        self.push_rules.get()
+    }
+
+    /// Installs the `hs-push` notification-count store `/sync` consults for
+    /// `unread_notifications`/`unread_thread_notifications` (`docs/status/10-push.md`'s
+    /// "Interfaces provided"). Same idempotent-install convention as
+    /// [`SessionHub::install_push_rules_store`].
+    pub fn install_counts_store(&self, store: Arc<dyn CountsStore>) {
+        if self.counts.set(store).is_err() {
+            tracing::warn!("a counts store was already installed on this hub; ignoring");
+        }
+    }
+
+    /// The installed counts store, if any -- see [`SessionHub::install_counts_store`].
+    #[must_use]
+    pub fn counts_store(&self) -> Option<&Arc<dyn CountsStore>> {
+        self.counts.get()
+    }
+
+    /// Installs this crate's [`DeviceListTokenResolver`] on `e2e`'s `GET /keys/changes` hook, so
+    /// a `from`/`to` value that is one of this crate's own `/sync` tokens (rather than a plain
+    /// decimal stream position) resolves instead of `400`ing -- see
+    /// [`hs_e2e::state::SyncTokenResolver`]'s doc comment for why this indirection exists and
+    /// [`DeviceListTokenResolver`] for why resolving it needs no store access at all.
+    ///
+    /// Not a side effect of [`SessionHub::new`] for the same reason
+    /// [`SessionHub::install_push_rules_store`] isn't: the `E2eState` this needs is built by
+    /// `hs-cli`'s `build_session_mounts` as a sibling of this hub, not an input to it -- see
+    /// `docs/status/05-sync.md` for the exact call site and line this needs added.
+    pub fn install_device_list_token_resolver(&self, e2e: &hs_e2e::state::E2eState<B>) {
+        e2e.install_sync_token_resolver(Arc::new(DeviceListTokenResolver));
     }
 
     /// The waker a long-polling `/sync` call should register interest on *before* checking
@@ -669,5 +760,72 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(membership.hot_room);
+    }
+
+    /// [`SessionHub::install_device_list_token_resolver`] installs a resolver on the given
+    /// [`hs_e2e::state::E2eState`] that decodes this crate's own [`SyncToken`] and reports its
+    /// `device_list_seq` field verbatim -- the exact contract `GET /keys/changes`
+    /// (`crates/hs-e2e/src/routes/keys_changes.rs`) needs from
+    /// [`hs_e2e::state::SyncTokenResolver::resolve_device_list_position`].
+    #[tokio::test]
+    async fn device_list_token_resolver_decodes_a_sync_token_and_rejects_anything_else() {
+        let (hub, _rooms) = hub(500);
+        let e2e_state = hs_e2e::state::E2eState::new(
+            hs_auth::state::AuthState::in_memory(),
+            StdArc::new(hs_e2e::store::tables::TablesE2eStore::open(MemoryBackend::new()).unwrap()),
+        );
+        hub.install_device_list_token_resolver(&e2e_state);
+
+        let alice = user_id!("@alice:hub.test");
+        let resolver = e2e_state
+            .sync_token_resolver()
+            .expect("a resolver should now be installed");
+
+        let token = SyncToken {
+            device_list_seq: 42,
+            ..SyncToken::initial()
+        };
+        let resolved = resolver
+            .resolve_device_list_position(alice, &token.encode())
+            .await
+            .unwrap();
+        assert_eq!(resolved, Some(42));
+
+        let not_ours = resolver
+            .resolve_device_list_position(alice, "not-one-of-our-tokens")
+            .await
+            .unwrap();
+        assert_eq!(
+            not_ours, None,
+            "a string that isn't one of our tokens must be reported as unrecognized, not 0"
+        );
+    }
+
+    /// [`SessionHub::install_push_rules_store`]/[`SessionHub::install_counts_store`] are
+    /// idempotent past the first call (mirroring
+    /// `hs_room::registry::RoomRegistry::install_global_token_resolver`'s convention): a second
+    /// install is ignored, the first-installed store stays authoritative.
+    #[tokio::test]
+    async fn a_second_install_of_the_push_rules_or_counts_store_is_ignored() {
+        let (hub, _rooms) = hub(500);
+        let first = StdArc::new(hs_push::rulesets::CachedRulesetStore::new(
+            hs_push::rulesets::tables::TablesRulesetStore::open(MemoryBackend::new()).unwrap(),
+        ));
+        hub.install_push_rules_store(first.clone());
+        let second = StdArc::new(hs_push::rulesets::CachedRulesetStore::new(
+            hs_push::rulesets::tables::TablesRulesetStore::open(MemoryBackend::new()).unwrap(),
+        ));
+        hub.install_push_rules_store(second);
+        assert!(StdArc::ptr_eq(hub.push_rules_store().unwrap(), &first,));
+
+        let first_counts: StdArc<dyn hs_push::counts::CountsStore> = StdArc::new(
+            hs_push::counts::tables::TablesCountsStore::open(MemoryBackend::new()).unwrap(),
+        );
+        hub.install_counts_store(first_counts.clone());
+        let second_counts: StdArc<dyn hs_push::counts::CountsStore> = StdArc::new(
+            hs_push::counts::tables::TablesCountsStore::open(MemoryBackend::new()).unwrap(),
+        );
+        hub.install_counts_store(second_counts);
+        assert!(StdArc::ptr_eq(hub.counts_store().unwrap(), &first_counts));
     }
 }

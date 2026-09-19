@@ -25,12 +25,20 @@ hs-tables = { path = "../hs-tables" }
 hs-auth = { path = "../hs-auth" }
 hs-http = { path = "../hs-http" }
 hs-room = { path = "../hs-room" }
-# Added this session (track 05) per docs/rfcs/0013-e2ee-sync-extensions.md: GET /sync needs
-# hs-e2e's store traits (to-device queue, device-list stream, one-time/fallback key counts) to
-# populate `to_device`, `device_lists`, `device_one_time_keys_count` and
-# `device_unused_fallback_key_types`. hs-user depends only on hs-e2e's storage trait surface
-# (`hs_e2e::store`), never its routes/state.
+# Added session 4 (track 05) per docs/rfcs/0013-e2ee-sync-extensions.md: GET /sync needs hs-e2e's
+# store traits (to-device queue, device-list stream, one-time/fallback key counts) to populate
+# `to_device`, `device_lists`, `device_one_time_keys_count` and
+# `device_unused_fallback_key_types`. Session 5 (this one) additionally implements
+# `hs_e2e::state::SyncTokenResolver` (crate::hub::DeviceListTokenResolver) so a token this crate
+# mints resolves as a `GET /keys/changes` `from`/`to` value -- see that trait's own doc comment in
+# `crates/hs-e2e/src/state.rs`. Still never depends on hs-e2e's routes.
 hs-e2e = { path = "../hs-e2e" }
+# Added this session (track 05) per docs/status/10-push.md's "Interfaces provided": `/sync` needs
+# `hs-push`'s cached ruleset store (for `m.push_rules` account data) and its `CountsStore` trait
+# object (for `unread_notifications`/`unread_thread_notifications`). Present in this crate's own
+# `[dependencies]` already (not `[workspace.dependencies]`), matching every other internal
+# path-dependency in this file.
+hs-push = { path = "../hs-push" }
 
 [dev-dependencies]
 proptest = { workspace = true }

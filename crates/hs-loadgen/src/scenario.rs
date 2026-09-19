@@ -177,6 +177,27 @@ pub async fn run(base_url: &str) -> Result<Vec<String>> {
         .context("bob's baseline /sync (establishing a `since` token) should succeed")?;
     step!("both clients completed a baseline /sync");
 
+    // `hs-user` (track 05) always carries `m.push_rules` as global account data on every sync
+    // once `hs-push`'s (track 10) ruleset store is installed on the session hub
+    // (`crate::hub::SessionHub::install_push_rules_store`) -- see `docs/status/05-sync.md`. That
+    // install call is `hs-cli`'s to make (`crates/hs-cli/src/serve.rs`'s
+    // `build_session_mounts`), not this crate's, so this is a soft check like the profile-
+    // propagation one below: it proves the seam end to end once wired, and names the gap rather
+    // than failing the whole scenario while it is still open.
+    let saw_push_rules = alice_baseline.account_data.iter().any(|raw| {
+        json_type_and_body(raw.json().get()).is_some_and(|(ty, _)| ty == "m.push_rules")
+    });
+    if saw_push_rules {
+        step!("alice's baseline /sync carried m.push_rules global account data");
+    } else {
+        step!(
+            "KNOWN BUG (not this track's crates -- see docs/status/05-sync.md): hs-user's \
+             m.push_rules support is implemented but hs-cli's build_session_mounts has not yet \
+             wired hs-push's ruleset store onto the session hub, so alice's baseline /sync did \
+             not carry m.push_rules"
+        );
+    }
+
     // 6. Send messages both ways.
     let alice_message = "hello bob, this is alice";
     let alice_send = room

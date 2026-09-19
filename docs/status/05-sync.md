@@ -20,9 +20,234 @@ Track brief: `docs/workstreams/05-sync.md`. Owner crates: `hs-user` (this sessio
 also covers `crates/hs-loadgen`, the real-client scenario `docs/next-steps.md` item 2 calls "the
 single best test of whether this is a homeserver").
 
-Last updated: 2026-09-19 (session 4: the `MustSyncUntil` cluster -- typing and presence now exist
-and wake a long poll for real, proven against a real `matrix-sdk` client; profile-into-membership
-propagation diagnosed and handed to track 04/07. Sessions 1-3 preserved unchanged further down.)
+Last updated: 2026-09-19 (session 5: `m.push_rules`/`unread_notifications` consume track 10's
+seam, `GET /keys/changes` resolves this crate's own tokens, and `summary` (heroes + member counts)
+is no longer hardcoded `{}`. Sessions 1-4 preserved unchanged further down.)
+
+## Session 5 (2026-09-19): the three things sync still owed -- push rules, `/keys/changes`, room summaries
+
+**Task**: three gaps this crate's own status file and track 10's had already named as squarely
+this track's to close, all with the other half already built: track 10 (`hs-push`) built
+`account_data_for_sync`/`get_room_counts` and documented the exact recipe in
+`docs/status/10-push.md`'s "Interfaces provided"; track 08 (`hs-e2e`) built the
+`SyncTokenResolver` hook on `GET /keys/changes` and documented it in
+`crates/hs-e2e/src/state.rs`; room summaries were this crate's own "What's next" item 1 from
+session 4. Scope: `crates/hs-user/**`, `crates/hs-loadgen/**` and this file --
+`crates/hs-e2e`, `crates/hs-push`, `crates/hs-room`, `crates/hs-auth` and `crates/hs-cli` were off
+limits (another agent working across the first three; `hs-cli` held by another agent too).
+
+### 1. `m.push_rules` and `unread_notifications`/`unread_thread_notifications`
+
+Implemented exactly to track 10's documented recipe, with one structural choice made to avoid
+touching `hs-cli` (off limits this session, see "hs-cli wiring needed" below):
+
+- **`SyncToken` gained `push_rules_seq: u64`, wire version `2` -> `3`** (`crates/hs-user/src/token.rs`),
+  following the file's own precedent for the `1`->`2` bump that added `typing_seq`: `PAYLOAD_LEN`
+  grew from `1 + 7*8` to `1 + 8*8`, `encode`/`decode` extended, every test's struct literal updated
+  (`initial_is_all_zero`, `json_round_trips_as_a_string`, the `round_trips_for_arbitrary_field_values`
+  proptest, `decode_rejects_unsupported_version`'s zero-padding length). A version-3 token is the
+  only kind this build now accepts, same "no long-lived client crosses a version bump" reasoning
+  as the earlier bump.
+- **`SessionHub` (`crates/hs-user/src/hub.rs`) gained two `OnceLock`-backed, idempotently-installable
+  stores**, mirroring the existing `hs_e2e::state::E2eState::sync_token_resolver`/
+  `hs_room::registry::RoomRegistry`'s `GlobalTokenResolver` convention exactly (install once, a
+  second install is logged and ignored, absent-by-default means "behave exactly as before this
+  session"):
+  - `install_push_rules_store(Arc<hs_push::rulesets::CachedRulesetStore<hs_push::rulesets::tables::TablesRulesetStore<B>>>)` /
+    `push_rules_store() -> Option<&Arc<...>>`
+  - `install_counts_store(Arc<dyn hs_push::counts::CountsStore>)` / `counts_store() -> Option<&Arc<dyn CountsStore>>`
+  - **Why a `OnceLock` method, not a `SessionHub::new` parameter** (unlike `FeedTokenResolver`,
+    which *is* installed inside `new`): the `Arc`s these need are built by `hs-cli`'s
+    `build_session_mounts` *after* `user` (this hub) already exists -- `push` is constructed later
+    in that same function, over the same backend. Making these installs opt-in calls rather than
+    constructor arguments means `hs-cli` needed **zero** changes for this session's work to compile
+    and every existing test/caller to keep working unchanged; only *using* the feature in the real
+    server needs the three-line addition documented below.
+- **`crate::sync::build`** (`crates/hs-user/src/sync/mod.rs`): computes `push_rules_for_sync` once
+  per response via `hub.push_rules_store()`, pushes `{"type": "m.push_rules", "content": ...}`
+  into the same `global_account_data_json` vec the existing account-data path already builds
+  (unconditionally on an initial sync, gated on `changed_seq > baseline.push_rules_seq` on an
+  incremental one), and threads `push_rules_seq: new_push_rules_seq` into the outgoing token via
+  `.max(baseline.push_rules_seq)` -- the identical shape `new_account_data_seq` already used.
+  `crate::sync::has_new_data` (the long-poll wake check) gained the matching
+  `push_rules.store().changed_seq(user_id).await? > baseline.push_rules_seq` branch, reading
+  through the cache via `CachedRulesetStore::store()` exactly as track 10's recipe specified. Per
+  room, the hardcoded `"unread_notifications": {"highlight_count": 0, "notification_count": 0}`
+  and `"unread_thread_notifications": {}` are now `hub.counts_store()`'s
+  `get_room_counts(user_id, room_id).await?.totals()` and a real per-thread map, falling back to
+  the same all-zero `RoomNotificationCounts::default()` when no store is installed.
+- **`UserError` gained `Push(#[from] hs_push::error::StoreError)`**, mapped to `500` like every
+  other backend-failure variant (`crates/hs-user/src/error.rs`) -- `hs-push`'s stores can now fail
+  a `/sync` build the same way `hs-e2e`'s already could.
+
+### 2. `GET /keys/changes` resolves this crate's own `/sync` tokens
+
+`crates/hs-e2e/src/routes/keys_changes.rs`'s `resolve_stream_pos` already tries a plain decimal
+first, then falls back to `E2eState::sync_token_resolver()`'s installed
+`hs_e2e::state::SyncTokenResolver` if any. Added `crate::hub::DeviceListTokenResolver` (a
+zero-field unit struct -- no store lookup needed at all, unlike `FeedTokenResolver`: a device-list
+stream position *is* one of `SyncToken`'s own fields verbatim, so decoding the token answers the
+question outright) implementing that trait, and `SessionHub::install_device_list_token_resolver(&self,
+e2e: &hs_e2e::state::E2eState<B>)` to install it. Same "not a `new` side effect" reasoning as the
+push-rules stores above: the `E2eState` this needs is a sibling of this hub in `hs-cli`'s
+construction, not an input to it.
+
+### 3. Room summaries (`summary`, previously hardcoded `{}`)
+
+`crate::sync::build_room_summary` (`crates/hs-user/src/sync/mod.rs`, new function): walks
+`actor.members()` once per room, counting `join`/`invite` memberships into
+`m.joined_member_count`/`m.invited_member_count` and collecting non-self join/invite user IDs into
+a `BTreeSet` for `m.heroes`. **Heroes are only populated when the room has neither `m.room.name`
+nor `m.room.canonical_alias` set** (checked via two `actor.state_event(...)` calls) -- mirrors
+Synapse's own reasoning (heroes exist purely so a client can synthesize a name; a room that
+already has one needs none) and every real client's own name precedence. Wired into the existing
+per-room `handle.query(move |actor| ...)` closure that already builds `timeline`/`state` (now
+returns a 3-tuple), so no extra room-actor round trip.
+
+**Documented simplification**: heroes are ordered lexicographically by user ID (via the `BTreeSet`),
+not by "oldest membership" (Synapse's own tiebreak, which needs per-member join-order bookkeeping
+this crate does not have and the spec does not mandate). Up to 5 heroes, matching the spec's own
+example count.
+
+### Tests added (7 new, `crates/hs-user`: 60 -> 67 unit tests; `sync_scenario.rs` unchanged at 3)
+
+- `token::tests`: existing tests extended for the new field/version rather than new tests (every
+  struct literal and length constant updated).
+- `sync::tests::push_rules_are_carried_on_an_initial_sync_once_a_store_is_installed`
+- `sync::tests::push_rules_only_repeat_on_an_incremental_sync_once_the_ruleset_changes` (proves the
+  change-seq gate in both directions: silent when unchanged, reappears after `set_ruleset`)
+- `sync::tests::unread_notifications_reflect_an_installed_counts_store`
+- `sync::tests::room_summary_reports_heroes_and_counts_for_an_unnamed_room` (also asserts the
+  syncing user is excluded from her own heroes list)
+- `sync::tests::room_summary_has_no_heroes_once_the_room_has_its_own_name`
+- `hub::tests::device_list_token_resolver_decodes_a_sync_token_and_rejects_anything_else`
+- `hub::tests::a_second_install_of_the_push_rules_or_counts_store_is_ignored`
+
+Two of the new sync tests initially flaked against the documented "discovery gap" (`crate::hub`'s
+module docs: a room's *creation* update publishes before `watch_room` subscribes to it, so a room
+with no follow-up event after `watch_room` never gets a membership record) -- fixed by adding a
+trivial follow-up `send_event` after `watch_room`, the same pattern
+`filter_rooms_allowlist_excludes_other_rooms` (an existing test) already documents and relies on.
+Not a bug in this session's new code; a pre-existing test-harness gotcha this session's tests
+tripped over like several before them.
+
+### `hs-cli` wiring needed (not made this session -- `hs-cli` was off limits)
+
+`crates/hs-cli/src/serve.rs`'s `build_session_mounts` builds `user`, `e2e` and `push` in that
+order over one shared backend, but never connects them. Add exactly this, immediately before that
+function's `Ok((user, e2e, push))`:
+
+```rust
+// hs-user (track 05) consumes hs-push's stores and hs-e2e's state once all three exist here.
+user.hub.install_push_rules_store(push.rulesets.clone());
+user.hub.install_counts_store(push.counts.clone());
+user.hub.install_device_list_token_resolver(&e2e);
+```
+
+All three methods are `pub`, idempotent, and take exactly the types `user`/`push`/`e2e` already
+hold in that function (`Arc<CachedRulesetStore<TablesRulesetStore<B>>>`, `Arc<dyn CountsStore>`,
+`&E2eState<B>`) -- no new imports needed beyond what `hs-cli` already has. Until this lands, `/sync`
+behaves exactly as it did before this session (no `m.push_rules`, hardcoded-zero
+`unread_notifications`, `GET /keys/changes` still 400s on an `hsu1_...` token) -- verified via the
+loadgen scenario below, which logs this as a named `KNOWN BUG` rather than failing.
+
+### Verification
+
+```
+cargo fmt -p hs-user -p hs-loadgen                                    # clean
+cargo clippy -p hs-user -p hs-loadgen --all-targets -- -D warnings    # clean
+cargo test -p hs-user                                                 # 67 unit + 3 integration = 70 passed
+cargo build -p hs-cli --bin hs                                        # compiles unchanged (no hs-cli edits)
+cargo test -p hs-loadgen --test real_client -- --nocapture            # 23 steps, passed (below)
+cargo test -p hs-loadgen --test real_client_encrypted -- --nocapture  # 16 steps, passed, still decrypts
+```
+
+**`real_client` run** (23 steps, up from 22 -- the new push-rules step added; note step 15, profile
+propagation, now *hard*-succeeds where session 4 logged it as `KNOWN BUG`: track 04/07 fixed it
+since, unrelated to this session):
+
+```
+registered @loadgen-alice:hs-loadgen.test
+registered @loadgen-bob:hs-loadgen.test
+logged in @loadgen-alice:hs-loadgen.test on a second device via POST /login
+alice created room !nCRsAl5JRnhZw6gvng:hs-loadgen.test
+alice invited @loadgen-bob:hs-loadgen.test
+@loadgen-bob:hs-loadgen.test joined !nCRsAl5JRnhZw6gvng:hs-loadgen.test
+both clients completed a baseline /sync
+KNOWN BUG (not this track's crates -- see docs/status/05-sync.md): hs-user's m.push_rules support is implemented but hs-cli's build_session_mounts has not yet wired hs-push's ruleset store onto the session hub, so alice's baseline /sync did not carry m.push_rules
+alice sent $-X7ivLZcx1kcmJPL1K3sDHt8CUx_UDp3sKsGmU3UrBk ("hello bob, this is alice")
+bob sent $g6gVZA-8b_n0A1_dlHhI02_myEec_HsrYn_zIwg9T-k ("hi alice, bob here")
+bob's incremental /sync saw alice's message
+alice's incremental /sync saw bob's message
+alice's display name round-tripped through GET/PUT /profile
+room name and topic changes appeared in /sync's timeline
+room membership lists both @loadgen-alice:hs-loadgen.test and @loadgen-bob:hs-loadgen.test
+backward /messages page (no `from`, the live end) contains alice's message (10 events)
+backward /messages page, paginated from a token /sync handed back (not /messages itself), contains alice's message (10 events)
+forward /messages page, paginated from a /sync token issued before any messages, contains alice's message (5 events)
+bob's /sync saw alice's typing notice within the bounded wait
+carol's /sync saw her invite to !nCRsAl5JRnhZw6gvng:hs-loadgen.test within the bounded wait
+bob's /sync saw alice's profile change reflected in her m.room.member event
+both clients logged out
+post-logout /sync was correctly rejected: the server returned an error: [401 / M_UNKNOWN_TOKEN] 401 Unauthorized M_UNKNOWN_TOKEN: Unrecognised access token
+test matrix_rust_sdk_talks_to_a_real_hs_serve ... ok
+```
+
+**`real_client_encrypted` run**: unchanged shape, 16 steps, still decrypts end to end (last line:
+"53 concurrent /keys/claim calls for alice's device claimed exactly 50 distinct one-time keys with
+no double-claim..."). `GET /keys/changes` against a real `hsu1_...` token was not added as a
+loadgen step this session: `matrix-rust-sdk` does not expose a way to drive that endpoint directly
+through its own sync loop, and without the `hs-cli` wiring above the resolver is not reachable in
+the real server anyway. The resolver's own correctness is covered by
+`hub::tests::device_list_token_resolver_decodes_a_sync_token_and_rejects_anything_else`.
+
+### Decisions made this session
+
+- **Push-rules and counts stores install via idempotent `SessionHub` methods (`OnceLock`), not
+  `SessionHub::new` parameters.** Keeps this session's entire diff inside `hs-user`/`hs-loadgen`
+  with zero `hs-cli` changes required to compile (`hs-cli` was off limits) -- see "hs-cli wiring
+  needed" above for the three lines still needed to *activate* the feature in a real server.
+- **`push_rules_seq`'s wire-format precedent (version bump, not a backward-compatible append)
+  followed exactly**, per `token.rs`'s own documented reasoning: this is a greenfield server, no
+  client holds a token across a restart.
+- **Heroes ordered lexicographically, not by join order.** Documented simplification (see "3. Room
+  summaries" above) -- the spec does not mandate an order and this crate tracks no per-member join
+  sequence today.
+- **Heroes computed only for an unnamed/unaliased room**, not unconditionally. Matches Synapse's
+  own behavior and avoids pointless work for the common case (most rooms have a name).
+- Two new tests needed a trivial seeding event after `watch_room` to avoid the pre-existing
+  "discovery gap" test-harness race (see "Tests added" above) -- not a new production bug, a test
+  fixture detail already documented and worked around elsewhere in this same file.
+
+### Interfaces provided (new this session)
+
+- `SessionHub::install_push_rules_store`/`push_rules_store`,
+  `SessionHub::install_counts_store`/`counts_store`, `SessionHub::install_device_list_token_resolver`
+  (`crates/hs-user/src/hub.rs`) -- all `pub`, all no-ops until called, all consumed today only by
+  `hs-cli`'s wiring (not yet added -- see "hs-cli wiring needed" above).
+- `crate::hub::DeviceListTokenResolver` implements `hs_e2e::state::SyncTokenResolver`, and
+  `m.push_rules`/populated `unread_notifications`/`unread_thread_notifications`/`summary` are new
+  content in `/sync`'s existing response shape, not new endpoints.
+
+### Interfaces needed
+
+- **From `hs-cli`**: the three-line wiring in `build_session_mounts` above. Nothing else.
+- The profile-propagation gap this crate flagged in session 4 is now fixed (see the `real_client`
+  run above, step "bob's /sync saw alice's profile change..." now hard-succeeding) -- track 04/07's
+  doing, not this session's; recorded here since session 4's own "Interfaces needed" named it as an
+  open ask *of* those tracks.
+
+### What's next for track 05
+
+1. `m.receipt` (read receipts) -- `SyncToken::receipts_seq` has been reserved since session 1 and
+   is still unused; the typing/presence/push-rules pattern (registry or store, counter, cursor,
+   wake) applies directly. `hs-push`'s `CountsStore::reset` is the documented call a receipt
+   advancing past a notifying event should trigger (`docs/status/10-push.md`'s `counts.rs` module
+   doc) -- not wired yet since receipts themselves don't exist.
+2. Presence's idle/logout-driven automatic offline transition (deferred since session 4, unchanged
+   scope cut).
+3. Once `hs-cli` adds the three-line wiring above, flip this session's loadgen `KNOWN BUG` step for
+   `m.push_rules` to a hard assertion.
 
 ## Session 4 (2026-09-19): typing, presence, and the `MustSyncUntil` cluster
 

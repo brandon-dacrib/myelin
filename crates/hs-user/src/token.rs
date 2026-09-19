@@ -43,17 +43,23 @@ const PREFIX: &str = "hsu1_";
 /// backwards-compatible (adding a field at the end, for instance, still needs a version bump: see
 /// [`SyncToken::decode`]'s fixed-length check).
 ///
-/// Bumped `1` -> `2` this session to add `typing_seq` (below), for the same reason
+/// Bumped `1` -> `2` in an earlier session to add `typing_seq`, for the same reason
 /// `presence_seq`/`receipts_seq` were reserved up front: `m.typing` needed its own independent
 /// cursor once typing distribution was actually implemented (`crate::routes::typing`,
-/// `crate::typing`). A version-1 token now fails to decode (`UnsupportedVersion`), which is
-/// correct and harmless here: every test and every real deployment of this greenfield server
-/// restarts from a freshly built binary, so no long-lived client ever holds a version-1 token
-/// across this change.
-const VERSION: u8 = 2;
+/// `crate::typing`).
+///
+/// Bumped `2` -> `3` this session to add `push_rules_seq` (below), following the identical
+/// precedent: `m.push_rules` needed its own independent cursor once track 10's ruleset seam
+/// landed (`docs/status/10-push.md`'s "Interfaces provided" -- `hs_push::rulesets::RulesetStore`'s
+/// own per-user monotonic change-seq, exactly the shape `account_data_seq` and `typing_seq`
+/// already use). A version-N token now fails to decode (`UnsupportedVersion`) for any N below the
+/// current one, which is correct and harmless here: every test and every real deployment of this
+/// greenfield server restarts from a freshly built binary, so no long-lived client ever holds a
+/// stale-version token across a version bump.
+const VERSION: u8 = 3;
 
-/// `1` (version byte) + `7 * 8` (seven `u64` fields).
-const PAYLOAD_LEN: usize = 1 + 7 * 8;
+/// `1` (version byte) + `8 * 8` (eight `u64` fields).
+const PAYLOAD_LEN: usize = 1 + 8 * 8;
 
 /// A decoded `/sync` token: the user's feed position plus the independent extension cursors.
 ///
@@ -80,6 +86,16 @@ pub struct SyncToken {
     /// Cursor into `m.typing` state changes across this user's joined rooms
     /// (`crate::typing::TypingRegistry`).
     pub typing_seq: u64,
+    /// Cursor into this user's push-rules change-seq
+    /// (`hs_push::rulesets::RulesetStore::changed_seq`) -- compared against the *current*
+    /// change-seq to decide whether an incremental sync needs to carry `m.push_rules` again.
+    /// `0` (this field's value in [`SyncToken::initial`]) always means "never customized",
+    /// matching `RulesetStore::changed_seq`'s own "0 forever for a never-customized user"
+    /// convention (`docs/status/10-push.md`), so a brand-new user's first sync compares `0 > 0`
+    /// (false) and correctly omits `m.push_rules` on their first *incremental* sync unless they
+    /// had already changed their rules -- initial syncs always send it regardless, per
+    /// `crate::sync`'s own is-initial branch.
+    pub push_rules_seq: u64,
 }
 
 impl SyncToken {
@@ -97,6 +113,7 @@ impl SyncToken {
             presence_seq: 0,
             receipts_seq: 0,
             typing_seq: 0,
+            push_rules_seq: 0,
         }
     }
 
@@ -112,6 +129,7 @@ impl SyncToken {
         buf.extend_from_slice(&self.presence_seq.to_be_bytes());
         buf.extend_from_slice(&self.receipts_seq.to_be_bytes());
         buf.extend_from_slice(&self.typing_seq.to_be_bytes());
+        buf.extend_from_slice(&self.push_rules_seq.to_be_bytes());
         debug_assert_eq!(buf.len(), PAYLOAD_LEN);
         format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(buf))
     }
@@ -140,7 +158,7 @@ impl SyncToken {
         }
         let field = |i: usize| -> u64 {
             let start = 1 + i * 8;
-            // Safe: `bytes.len() == PAYLOAD_LEN == 1 + 7 * 8`, checked above, and `i < 7` for
+            // Safe: `bytes.len() == PAYLOAD_LEN == 1 + 8 * 8`, checked above, and `i < 8` for
             // every call site below, so `start + 8 <= PAYLOAD_LEN` always.
             u64::from_be_bytes(bytes[start..start + 8].try_into().expect("checked length"))
         };
@@ -152,6 +170,7 @@ impl SyncToken {
             presence_seq: field(4),
             receipts_seq: field(5),
             typing_seq: field(6),
+            push_rules_seq: field(7),
         })
     }
 }
@@ -242,6 +261,8 @@ mod tests {
         assert_eq!(t.account_data_seq, 0);
         assert_eq!(t.presence_seq, 0);
         assert_eq!(t.receipts_seq, 0);
+        assert_eq!(t.typing_seq, 0);
+        assert_eq!(t.push_rules_seq, 0);
     }
 
     #[test]
@@ -277,7 +298,7 @@ mod tests {
     #[test]
     fn decode_rejects_unsupported_version() {
         let mut buf = vec![7u8]; // not VERSION
-        buf.extend_from_slice(&[0u8; 56]);
+        buf.extend_from_slice(&[0u8; 64]);
         let s = format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(buf));
         assert_eq!(
             SyncToken::decode(&s),
@@ -295,6 +316,7 @@ mod tests {
             presence_seq: 4,
             receipts_seq: 5,
             typing_seq: 6,
+            push_rules_seq: 7,
         };
         let json = serde_json::to_string(&t).unwrap();
         assert!(json.starts_with('"'));
@@ -322,6 +344,7 @@ mod tests {
             presence_seq: u64,
             receipts_seq: u64,
             typing_seq: u64,
+            push_rules_seq: u64,
         ) {
             let original = SyncToken {
                 feed_seq,
@@ -331,6 +354,7 @@ mod tests {
                 presence_seq,
                 receipts_seq,
                 typing_seq,
+                push_rules_seq,
             };
             let encoded = original.encode();
             let decoded = SyncToken::decode(&encoded).unwrap();
