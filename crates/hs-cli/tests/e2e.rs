@@ -19,12 +19,20 @@
 use serde_json::json;
 
 fn test_config(port: u16, data_dir: &std::path::Path) -> hs_config::Config {
+    // `media.storage.path` is set explicitly, not left at its default. That default is the
+    // *relative* `./media-store` (`hs_config::MediaStorageBackend::Default`), which for a test is
+    // the crate's working directory — so every media upload in this file used to write real bytes
+    // into the repository, which is how 15 test artifacts ended up committed once already (see
+    // `docs/next-steps.md`'s known-gaps table). Pointing it inside the same tempdir as the
+    // storage backend means the files go away with the test.
+    let media_dir = data_dir.join("media");
     let yaml = format!(
         "server:\n  server_name: example.org\n\
          listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health, metrics]\n\
          storage:\n  backend: embedded\n  data_dir: {:?}\n\
+         media:\n  storage:\n    backend: local\n    path: {:?}\n\
          auth:\n  enable_registration: true\n",
-        data_dir
+        data_dir, media_dir
     );
     hs_config::Config::from_yaml(&yaml).unwrap()
 }
