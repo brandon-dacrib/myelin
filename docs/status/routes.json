@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-19T03:33:12.719Z",
+  "generated_at": "2026-09-19T05:04:51.808Z",
   "routes": [
     {
       "method": "GET",
@@ -94,6 +94,22 @@
       "path": "/_matrix/client/r0/devices/{deviceId}",
       "surface": "matrix-client",
       "operation_id": "updateDevice",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/r0/directory/list/room/{roomId}",
+      "surface": "matrix-client",
+      "operation_id": "getRoomVisibilityOnDirectory",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/r0/directory/list/room/{roomId}",
+      "surface": "matrix-client",
+      "operation_id": "setRoomVisibilityOnDirectory",
       "auth": "matrix",
       "rate_limited": false
     },
@@ -934,6 +950,22 @@
       "path": "/_matrix/client/v3/devices/{deviceId}",
       "surface": "matrix-client",
       "operation_id": "updateDevice",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "GET",
+      "path": "/_matrix/client/v3/directory/list/room/{roomId}",
+      "surface": "matrix-client",
+      "operation_id": "getRoomVisibilityOnDirectory",
+      "auth": "matrix",
+      "rate_limited": false
+    },
+    {
+      "method": "PUT",
+      "path": "/_matrix/client/v3/directory/list/room/{roomId}",
+      "surface": "matrix-client",
+      "operation_id": "setRoomVisibilityOnDirectory",
       "auth": "matrix",
       "rate_limited": false
     },
