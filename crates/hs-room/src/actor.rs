@@ -69,6 +69,35 @@ pub struct InitialStateEvent {
     pub content: serde_json::Value,
 }
 
+/// The result of [`RoomActor::state_at_event`]: the room's state as of immediately *after* one
+/// event, plus the auth chain input a caller answering `/state` or `/state_ids` needs alongside
+/// it.
+///
+/// This is *S′(event)* in the spec's notation (see `hs_state::api::StateStore`'s module docs,
+/// "`state_at` returns the state after the event") -- exactly what `/state_ids`' `pdu_ids` and
+/// `auth_chain_ids` and `/state`'s `pdus`/`auth_chain` want for an explicit `event_id` query
+/// parameter, for *any* event this actor knows, not only the newest one in the timeline. Before
+/// this existed, `hs-room` only tracked one flat current-state map with no history, so the only
+/// event whose state could be answered correctly was the timeline's head (see
+/// `crates/hs-cli/src/federation.rs`'s module doc for the refusal this replaces).
+#[derive(Debug, Clone)]
+pub struct StateAtEvent {
+    /// Every event that is part of the room's state as of immediately after the queried event,
+    /// one per `(event_type, state_key)`. This is `/state_ids`' `pdu_ids` (or `/state`'s `pdus`,
+    /// once rendered).
+    pub state: Vec<Event>,
+    /// The auth chain of `state`: every event reachable by following `auth_events` transitively
+    /// from any event in `state`. This is `/state_ids`' `auth_chain_ids` -- note it deliberately
+    /// does **not** include `state`'s own events unless another `state` event's ancestor chain
+    /// also reaches them, which is normal (`m.room.create` is both part of the state and the
+    /// ancestor of nearly everything else, so it legitimately appears in both `state` and
+    /// `auth_chain`; callers building `/state`'s combined `auth_chain` field, which by convention
+    /// *does* include the state events themselves, add `state` back in -- see
+    /// `crates/hs-cli/src/federation.rs`'s `current_state_with_auth_chain` for the existing
+    /// precedent this mirrors).
+    pub auth_chain: Vec<Event>,
+}
+
 /// The synchronous room actor. Not `Send`-safe to hold across an `.await` (it borrows nothing
 /// async), which is exactly why [`RoomActorHandle`] runs its methods inside
 /// `tokio::task::spawn_blocking`. See `crate::protocol`'s module docs for the full design.
@@ -1061,6 +1090,61 @@ impl<B: KvBackend> RoomActor<B> {
             .collect())
     }
 
+    /// The room's state as of immediately after `event_id` (`hs_state::api::StateStore::state_at`
+    /// already answers exactly this for any event this actor has ingested -- state history was
+    /// never the gap; nothing before this method surfaced it), plus the auth chain of that state.
+    /// `Ok(None)` if this actor does not know `event_id`.
+    ///
+    /// This works for *any* known event, not just the timeline's newest -- unlike
+    /// [`RoomActor::full_state`] (which is always the *current* resolved state), this takes a root
+    /// from `self.store.state_at(sn)` for the specific event asked about. Every event this actor
+    /// has ever persisted or replayed on load was fed to `self.store` via `feed_store`
+    /// (`RoomActor::persist`, `RoomActor::absorb_loaded_event`), so `state_at` has a root for it
+    /// regardless of how long ago it stopped being the timeline head.
+    ///
+    /// The auth chain is computed via [`hs_state::api::StateStore::auth_chain_difference`] with a
+    /// deliberately empty second set: `auth_chain_difference(&[roots, []])` reduces to exactly the
+    /// union of `roots`' ancestors, because the coverage of an empty root list is empty on every
+    /// chain, which makes the "symmetric difference" formula degenerate into "everything reachable
+    /// from `roots` and nothing more" (see `hs_state::chain_cover::ChainCoverIndex::coverage`'s
+    /// doc comment for the primitive this is built from). This crate did not need a new
+    /// `hs-state` method to answer "the auth chain of a state map" because the existing trait
+    /// already expresses it, just not under an obvious name -- see this crate's status file for a
+    /// note that a direct `auth_chain_of(&[EventSn]) -> Vec<EventSn>` on `StateStore` would read
+    /// better at the call site, if track 02 has budget.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::State`] if the state store fails.
+    pub fn state_at_event(&self, event_id: &EventId) -> Result<Option<StateAtEvent>, RoomError> {
+        let Some(&sn) = self.event_id_index.get(event_id) else {
+            return Ok(None);
+        };
+        let root = self
+            .store
+            .state_at(sn)
+            .map_err(|e| RoomError::State(e.to_string()))?;
+        let diff = self
+            .store
+            .diff(self.store.empty_root(), root)
+            .map_err(|e| RoomError::State(e.to_string()))?;
+        let state_sns: Vec<EventSn> = diff.added.values().copied().collect();
+        let state: Vec<Event> = state_sns
+            .iter()
+            .filter_map(|s| self.events.get(s).cloned())
+            .collect();
+
+        let auth_chain_sns = self
+            .store
+            .auth_chain_difference(&[state_sns, Vec::new()])
+            .map_err(|e| RoomError::State(e.to_string()))?;
+        let auth_chain: Vec<Event> = auth_chain_sns
+            .iter()
+            .filter_map(|s| self.events.get(s).cloned())
+            .collect();
+
+        Ok(Some(StateAtEvent { state, auth_chain }))
+    }
+
     /// One event by ID, if this actor holds it (its own room's events only).
     #[must_use]
     pub fn event_by_id(&self, event_id: &EventId) -> Option<&Event> {
@@ -1653,6 +1737,137 @@ mod tests {
                 .iter()
                 .any(|e| e.header().event_type == "m.room.message")
         );
+    }
+
+    /// The topic's `content` in `events`, if `m.room.topic` is present.
+    fn topic_of<'a>(events: impl IntoIterator<Item = &'a Event>) -> Option<String> {
+        events
+            .into_iter()
+            .find(|e| e.header().event_type == "m.room.topic")
+            .and_then(|e| e.json().get("content"))
+            .and_then(hs_model::canonical::CanonicalJsonValue::as_object)
+            .and_then(|c| c.get("topic"))
+            .and_then(hs_model::canonical::CanonicalJsonValue::as_str)
+            .map(str::to_owned)
+    }
+
+    /// The core claim item 1 of `docs/next-steps.md` asks for: given a room with several state
+    /// changes, the state *as of* an early event must differ from current state in exactly the
+    /// way it should -- not merely "differ", but differ by precisely the events that actually
+    /// changed between the two points, and nothing else. Also exercises that this answers for an
+    /// event that is not the timeline head (a later, non-state message is sent last), and that the
+    /// accompanying auth chain is populated and sane.
+    #[test]
+    fn state_at_event_reconstructs_history_not_just_current_state() {
+        let mut actor = room("public_chat");
+
+        // Two topic changes on the same state key: the room's state immediately after the first
+        // must show "first topic"; immediately after the second (which is also current state,
+        // since nothing else touches the topic afterwards) must show "second topic".
+        let first_topic = actor
+            .send_event(
+                user_id!("@alice:hs1").to_owned(),
+                "m.room.topic".to_owned(),
+                Some(String::new()),
+                serde_json::json!({"topic": "first topic"}),
+                None,
+                2,
+            )
+            .unwrap();
+        let second_topic = actor
+            .send_event(
+                user_id!("@alice:hs1").to_owned(),
+                "m.room.topic".to_owned(),
+                Some(String::new()),
+                serde_json::json!({"topic": "second topic"}),
+                None,
+                3,
+            )
+            .unwrap();
+        // A non-state event sent last, so the timeline head is not a state event at all -- the
+        // gap this closes is specifically "answer for any known event", not just "the newest
+        // state event".
+        actor
+            .send_event(
+                user_id!("@alice:hs1").to_owned(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"body": "hi"}),
+                None,
+                4,
+            )
+            .unwrap();
+
+        let at_first = actor
+            .state_at_event(first_topic.event_id())
+            .unwrap()
+            .expect("the first topic event is known to this actor");
+        assert_eq!(
+            topic_of(at_first.state.iter()).as_deref(),
+            Some("first topic"),
+            "state immediately after the first topic change must show that change, not a later one"
+        );
+
+        let at_second = actor
+            .state_at_event(second_topic.event_id())
+            .unwrap()
+            .expect("the second topic event is known to this actor");
+        assert_eq!(
+            topic_of(at_second.state.iter()).as_deref(),
+            Some("second topic")
+        );
+
+        let current = actor.full_state().unwrap();
+        assert_eq!(
+            topic_of(current.iter().copied()).as_deref(),
+            Some("second topic"),
+            "current state must match the state right after the second (most recent) topic change"
+        );
+
+        // Exactly one event differs each way between "state after the first topic change" and
+        // "current state": the first topic event is replaced by the second. Every other state
+        // event (create, the creator's join, power levels, join rules, history visibility, guest
+        // access) is unchanged and must appear in both sets identically -- proving this is a real
+        // historical reconstruction (a targeted swap of one entry), not current state relabeled
+        // or a coincidentally-similar recomputation.
+        let ids_at_first: BTreeSet<OwnedEventId> =
+            at_first.state.iter().map(|e| e.event_id().to_owned()).collect();
+        let ids_current: BTreeSet<OwnedEventId> =
+            current.iter().map(|e| e.event_id().to_owned()).collect();
+        let only_in_first: Vec<_> = ids_at_first.difference(&ids_current).collect();
+        let only_in_current: Vec<_> = ids_current.difference(&ids_at_first).collect();
+        assert_eq!(only_in_first, vec![first_topic.event_id()]);
+        assert_eq!(only_in_current, vec![second_topic.event_id()]);
+        assert_eq!(
+            ids_at_first.len(),
+            ids_current.len(),
+            "the two state maps must be the same size (a swap, not an addition/removal)"
+        );
+
+        // The auth chain input that goes with the early state: every ordinary state event's
+        // ancestors include the room's create event, and, being an ancestor rather than a member
+        // of the state map itself, `m.room.create` shows up in `auth_chain` even though it is
+        // also separately present in `state` -- the overlap this module's doc comment documents
+        // as expected.
+        assert!(
+            at_first
+                .auth_chain
+                .iter()
+                .any(|e| e.header().event_type == "m.room.create"),
+            "the auth chain of any ordinary state event must reach the room's create event"
+        );
+        assert!(
+            at_first
+                .state
+                .iter()
+                .any(|e| e.header().event_type == "m.room.create"),
+            "m.room.create is legitimately in both `state` and `auth_chain`"
+        );
+
+        // An event this actor has never heard of answers `None`, not an error and not a
+        // best-effort guess.
+        let unknown = ruma::EventId::parse("$totally-unknown-event:hs1").unwrap();
+        assert!(actor.state_at_event(&unknown).unwrap().is_none());
     }
 
     #[test]
