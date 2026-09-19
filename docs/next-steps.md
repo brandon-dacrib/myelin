@@ -34,46 +34,44 @@ Not "the tests pass". Each of these was checked against `hs serve` or a real ext
 
 ## What to do next, in order
 
-### 1. Re-run Complement and get the new number
+### 1. Re-measure, because almost everything moved
 
-The 125/161 above was measured before history visibility, the room directory, `/createRoom` validation, `/forget`, profiles, inbound federation and the E2EE sync fields landed. On the targeted subset covering the room fixes, leaf assertions went from 26/53 to 39/53, so the full number has moved — but nobody has measured it. Do that first; a stale headline is worse than no headline.
+The 148/293 csapi headline and the 5/89 federation number both predate a dozen landings, several of which were the *named causes* of the failures they counted: outbound signing was spec-wrong and is fixed, private-CA trust exists, and threads, relations, room upgrade, typing, presence, room summaries, push rules in sync, profile propagation, device-list notifications and the v1 mount all landed after that run. A stale headline is worse than no headline, and nothing else on this list can be prioritised honestly until the number is current.
 
-Then work down what remains, from `docs/status/14-test-and-conformance.md`:
+Run both packages against a pinned commit:
 
-- **Cross-user `/keys/query` misses devices** and `/keys/claim` returns content that does not match what was uploaded (track 08).
-- **Async media upload (MSC2246) and URL previews are absent** (track 09).
-- **Presence endpoints 404** (track 05).
-- And run the federation-heavy top-level `./tests/...` package, which has still never been run at all.
+```
+./tests/complement/build.sh complement-hs-reimplement:dev
+cd refs/complement && COMPLEMENT_BASE_IMAGE=complement-hs-reimplement:dev go test -v -timeout 30m ./tests/csapi/...
+cd refs/complement && COMPLEMENT_BASE_IMAGE=complement-hs-reimplement:dev go test -v -timeout 30m ./tests/...
+```
 
-### 2. Fix the sync/messages token mismatch
+The federation package is the interesting one: its previous run was almost entirely a TLS wall, and the harness still works around that with `verify_certificates: false`. Now that `federation.custom_ca_certificates` exists, try the harness *without* the workaround as well, and see whether real CA trust carries it.
 
-`hs-user`'s sync tokens (`hsu1_...`) are rejected by `hs-room`'s `PaginationToken`, so `GET /messages?from=<a sync token>` fails for any real client — which is exactly what a client does when scrolling back after a sync. This is the largest remaining cross-track gap and it needs a design decision, not a patch: one token format, or a documented conversion at the boundary. Complement failures in the room-messages tests trace back to it.
+### 2. Join a real public room, and point Element Web at it
 
-### 3. Re-measure, because a great deal changed
+This is the test of whether this is a Matrix server, and for the first time every known blocker is gone: `send_join` persists, backfill resolves missing ancestors, `.well-known` is served, signing is spec-correct, and a private CA can be trusted. Expect the attempt itself to expose things no suite covers — that has been true every time a real client was pointed at this server. `matrix-rust-sdk` is the scripted check; a browser is the honest one.
 
-Everything below item 1's list moved after the last Complement run. Since
-then: outbound signing was found to be spec-wrong and fixed, private-CA
-trust landed, threads, relations, room upgrade, typing, presence, room
-summaries, push rules in sync, profile propagation, device-list
-notifications, five Synapse admin shims, and the room router mounted at
-the v1 prefix it needed. Several of those were the direct causes of named
-Complement failures. Nobody has measured the result.
+### 3. Wire the seams other tracks finished
 
-### 4. Two replicas: done, with one gap
+Each of these is a crate with a working implementation on one side and nothing calling it:
 
-Two replicas on one PostgreSQL used to fork a room's history silently. They no longer do: a shard gate forwards or refuses any request for a room this replica does not own, verified by reproducing the original experiment — both replicas now return the same ten messages where each previously returned only its own five.
+- **`RoomDirectory`** — the admin API's room operations answer a real 503 because nothing implements the trait. The contract is written on the trait itself in `crates/hs-admin/src/sources.rs`; the implementation belongs in `hs-room`.
+- **URL-preview config** — `hs-media` hardcodes timeout, fetch size and cache lifetime; the fields now exist in `hs-config` (`docs/status/13-*.md` names the two-line change).
+- **Synapse admin shims** — five real read-only routes exist in `hs-compat` and nothing mounts them (`docs/status/13-*.md` has the merge lines).
+- **Readiness on drain** — `hs serve` drains the cluster on SIGTERM but never flips the readiness flag false first, so a pod can keep taking traffic through its drain window.
 
-The gap left: `/createRoom` is not gated, because the room id does not exist when the request arrives, so the replica that handles it builds the first actor locally regardless of who will own the shard. Every later request is gated correctly. Fencing inside the write path is also still unwired — not needed for the bug that was fixed, since routing now guarantees one live actor per room, but it is the belt-and-braces against a stale ownership read racing a real handoff.
+### 4. Finish the cluster story
 
-Postgres `tls` is refused rather than ignored, and `pool_size` is not plumbed through.
+Two replicas no longer fork a room's history. Two gaps remain, both recorded in `docs/status/03-cluster.md`: `/createRoom` is not shard-gated, because the room id does not exist when the request arrives; and `RoomActor::persist` never calls `Fence::check`, which is the belt-and-braces against a stale ownership read racing a real handoff. Neither is needed for the bug that was fixed, both are needed before anyone trusts this under failover.
 
-### 4. Backfill, so a join can be more than a join
+### 5. Bridges, end to end
 
-Inbound events that cite ancestors this server does not hold are refused with a distinct `MissingAncestors` error naming the event IDs. The backfill-then-retry loop that would resolve them is not built. Until it is, joining a real public room will get through the handshake and then stall on the first event whose history we lack.
+Still never done, and it is one of the project's stated priorities. `crates/hs-bridge-conformance` asserts transaction shapes against a fake bridge, which proves the suite is self-consistent, not that it is right. Docker works: run `mautrix-irc` against a local IRC server pointed at this server, and run the conformance suite against Synapse as a control — if Synapse fails an assertion this suite makes, the suite is wrong.
 
-### 5. Try a real public room, and Element Web
+### 6. The smaller honest gaps
 
-With `send_join` persisting and `.well-known` served, the remaining blockers to joining a real public federated room are item 4 and whatever the attempt itself exposes. Point Element Web at the server too — `matrix-rust-sdk` is the scripted check, a browser client is the honest one.
+`/search` needs a cross-room index the per-room actor model has no place for, and is the last of the four 404ing endpoints. `web/`'s Vitest workers time out on this machine and its unit tests have never been run — that is unverified, not passing. Sytest has never run (CPAN dependencies absent). `cargo fuzz` targets type-check but have never executed (no nightly toolchain).
 
 ## Known gaps, honestly held
 
