@@ -11,6 +11,7 @@
   "scripts": {
     "dev": "vite",
     "dev:mock": "VITE_HS_MOCK=1 vite",
+    "dev:real": "vite --port 4180",
     "build": "npm run generate:client && tsc -b && vite build",
     "build:mock": "npm run generate:client && tsc -b && VITE_HS_MOCK=1 vite build --outDir dist-mock",
     "preview": "vite preview",
@@ -24,6 +25,7 @@
     "test:watch": "vitest",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",
+    "test:e2e:real": "playwright test --config playwright.real.config.ts",
     "storybook": "storybook dev -p 6006",
     "build:storybook": "storybook build -o storybook-static",
     "mock:openapi": "node scripts/check-openapi.mjs"

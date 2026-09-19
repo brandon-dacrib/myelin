@@ -9,6 +9,7 @@ import {
   type BridgeTypeRenderResult,
 } from "@/api/bridges";
 import { useClusterStatus } from "@/api/dashboard";
+import { classifyError } from "@/api/problem";
 import { hasScope } from "@/lib/auth";
 import { newIdempotencyKey } from "@/api/client";
 import { StepRail } from "./StepRail";
@@ -20,11 +21,21 @@ import { ReviewStep } from "./steps/ReviewStep";
 import { WIZARD_STEPS, initialWizardState, defaultsForKind, type WizardStep } from "./wizard-state";
 import { stashCreatedArtifacts } from "./created-artifacts-store";
 
-interface Problem {
-  type?: string;
-  title?: string;
-  detail?: string;
-  instance?: string;
+/**
+ * Turns a thrown `create`/`render` mutation error into the message `ReviewStep` shows.
+ * `unwrap` (`api/problem.ts`) means every such error is an `ApiProblemError` carrying a real
+ * RFC 9457 `Problem`, not the raw body a bare `throw error` used to produce — classify it
+ * instead of casting, so a 501/503 says so honestly rather than "did not accept this bridge".
+ */
+function wizardErrorMessage(err: unknown, fallback: string): string {
+  const { kind, problem } = classifyError(err);
+  if (kind === "not-implemented") {
+    return problem?.detail ?? "This isn't implemented on this server yet.";
+  }
+  if (kind === "unavailable") {
+    return problem?.detail ?? "This isn't connected to a data source on this server yet.";
+  }
+  return problem?.detail ?? problem?.title ?? fallback;
 }
 
 /** `/bridges/new` — flows.md flow 1: add a bridge. */
@@ -95,9 +106,8 @@ export function AddBridgeWizardPage() {
           navigate({ to: "/bridges/$bridgeId/created", params: { bridgeId: createdId } });
         },
         onError: (err: unknown) => {
-          const problem = err as Problem;
-          const status = (err as { status?: number })?.status;
-          if (problem?.type?.includes("conflict") || status === 409) {
+          const { problem } = classifyError(err);
+          if (problem?.type?.includes("conflict") || problem?.status === 409) {
             // The real Problem schema has no structured "which resource
             // conflicts" field (RFC 9457's `instance` identifies the
             // request, not reliably the pre-existing conflicting resource),
@@ -115,12 +125,10 @@ export function AddBridgeWizardPage() {
   }
 
   const createErrorMessage = create.isError
-    ? ((create.error as Problem)?.detail ??
-      (create.error as Problem)?.title ??
-      "The server did not accept this bridge.")
+    ? wizardErrorMessage(create.error, "The server did not accept this bridge.")
     : undefined;
   const renderErrorMessage = render.isError
-    ? ((render.error as Problem)?.detail ?? "Couldn't render the registration preview.")
+    ? wizardErrorMessage(render.error, "Couldn't render the registration preview.")
     : undefined;
 
   if (!hasScope("bridges:write")) {

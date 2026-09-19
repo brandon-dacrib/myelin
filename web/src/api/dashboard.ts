@@ -26,14 +26,14 @@
  */
 import { useQuery } from "@tanstack/react-query";
 import { api } from "./client";
+import { unwrap } from "./problem";
 
 export function useStatisticsOverview() {
   return useQuery({
     queryKey: ["statistics-overview"],
     queryFn: async () => {
-      const { data, error } = await api.GET("/statistics/overview");
-      if (error) throw error;
-      return data;
+      const result = await api.GET("/statistics/overview");
+      return unwrap(result);
     },
     refetchInterval: 30_000,
   });
@@ -43,9 +43,8 @@ export function useServerInfo() {
   return useQuery({
     queryKey: ["server-info"],
     queryFn: async () => {
-      const { data, error } = await api.GET("/server");
-      if (error) throw error;
-      return data;
+      const result = await api.GET("/server");
+      return unwrap(result);
     },
     staleTime: 60_000,
   });
@@ -55,9 +54,8 @@ export function useClusterStatus() {
   return useQuery({
     queryKey: ["cluster-status"],
     queryFn: async () => {
-      const { data, error } = await api.GET("/cluster");
-      if (error) throw error;
-      return data;
+      const result = await api.GET("/cluster");
+      return unwrap(result);
     },
     staleTime: 30_000,
   });
@@ -67,11 +65,10 @@ export function useFederationDestinations(limit = 50) {
   return useQuery({
     queryKey: ["federation-destinations", limit],
     queryFn: async () => {
-      const { data, error } = await api.GET("/federation/destinations", {
+      const result = await api.GET("/federation/destinations", {
         params: { query: { limit } },
       });
-      if (error) throw error;
-      return data;
+      return unwrap(result);
     },
     refetchInterval: 30_000,
   });
@@ -81,9 +78,8 @@ export function useRecentAuditEntries(limit = 5) {
   return useQuery({
     queryKey: ["audit-log-recent", limit],
     queryFn: async () => {
-      const { data, error } = await api.GET("/audit-log", { params: { query: { limit } } });
-      if (error) throw error;
-      return data;
+      const result = await api.GET("/audit-log", { params: { query: { limit } } });
+      return unwrap(result);
     },
     refetchInterval: 30_000,
   });

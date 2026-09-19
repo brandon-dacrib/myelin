@@ -7,7 +7,8 @@ import { Badge } from "@/components/ui/badge/Badge";
 import { Input } from "@/components/ui/input/Input";
 import { DataTable, type Column } from "@/components/ui/table/DataTable";
 import { EmptyState } from "@/components/ui/empty-state/EmptyState";
-import { ErrorState, ForbiddenState } from "@/components/ui/error-state/ErrorState";
+import { ForbiddenState } from "@/components/ui/error-state/ErrorState";
+import { QueryProblemState } from "@/components/QueryProblemState";
 import { hasScope } from "@/lib/auth";
 
 /** `/rooms` — flows.md flow 3: understand a room. */
@@ -17,7 +18,7 @@ export function RoomsPage() {
   const [queryInput, setQueryInput] = useState(search.q ?? "");
   const canRead = hasScope("admin:read");
 
-  const { data, isLoading, isError, refetch } = useRooms({
+  const { data, isLoading, isError, error, refetch } = useRooms({
     q: search.q,
     cursor: search.cursor,
     limit: 20,
@@ -117,7 +118,7 @@ export function RoomsPage() {
 
       {isError && (
         <div className="mt-6">
-          <ErrorState title="Couldn't load rooms" onRetry={() => refetch()} />
+          <QueryProblemState error={error} resource="rooms" scope="admin:read" onRetry={() => refetch()} />
         </div>
       )}
 

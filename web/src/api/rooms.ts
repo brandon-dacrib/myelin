@@ -1,6 +1,7 @@
 /** Rooms (flows.md flow 3), against the real `/rooms` resources in `crates/hs-admin/openapi/openapi.yaml`. */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, newIdempotencyKey } from "./client";
+import { unwrap } from "./problem";
 import type { components } from "./schema";
 
 export type Room = components["schemas"]["Room"];
@@ -19,9 +20,8 @@ export function useRooms(filters: RoomListFilters) {
   return useQuery({
     queryKey: ["rooms", filters],
     queryFn: async () => {
-      const { data, error } = await api.GET("/rooms", { params: { query: filters } });
-      if (error) throw error;
-      return data;
+      const result = await api.GET("/rooms", { params: { query: filters } });
+      return unwrap(result);
     },
     refetchInterval: 30_000,
   });
@@ -32,11 +32,10 @@ export function useRoom(roomId: string | undefined) {
     queryKey: ["room", roomId],
     enabled: Boolean(roomId),
     queryFn: async () => {
-      const { data, error } = await api.GET("/rooms/{room_id}", {
+      const result = await api.GET("/rooms/{room_id}", {
         params: { path: { room_id: roomId! } },
       });
-      if (error) throw error;
-      return data;
+      return unwrap(result);
     },
   });
 }
@@ -46,11 +45,10 @@ export function useRoomMembers(roomId: string | undefined) {
     queryKey: ["room-members", roomId],
     enabled: Boolean(roomId),
     queryFn: async () => {
-      const { data, error } = await api.GET("/rooms/{room_id}/members", {
+      const result = await api.GET("/rooms/{room_id}/members", {
         params: { path: { room_id: roomId! }, query: { limit: 50 } },
       });
-      if (error) throw error;
-      return data;
+      return unwrap(result);
     },
   });
 }
@@ -64,12 +62,11 @@ export function useBlockRoom() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async ({ roomId, reason }: { roomId: string; reason?: string }) => {
-      const { data, error } = await api.POST("/rooms/{room_id}/block", {
+      const result = await api.POST("/rooms/{room_id}/block", {
         params: { path: { room_id: roomId }, header: { "Idempotency-Key": newIdempotencyKey() } },
         body: reason ? { reason } : undefined,
       });
-      if (error) throw error;
-      return data;
+      return unwrap(result);
     },
     onSuccess: (_data, { roomId }) => invalidateRoom(qc, roomId),
   });
@@ -79,11 +76,10 @@ export function useUnblockRoom() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async (roomId: string) => {
-      const { data, error } = await api.POST("/rooms/{room_id}/unblock", {
+      const result = await api.POST("/rooms/{room_id}/unblock", {
         params: { path: { room_id: roomId }, header: { "Idempotency-Key": newIdempotencyKey() } },
       });
-      if (error) throw error;
-      return data;
+      return unwrap(result);
     },
     onSuccess: (_data, roomId) => invalidateRoom(qc, roomId),
   });
@@ -93,11 +89,10 @@ export function useMakeRoomAdmin() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async (roomId: string) => {
-      const { data, error } = await api.POST("/rooms/{room_id}/make-admin", {
+      const result = await api.POST("/rooms/{room_id}/make-admin", {
         params: { path: { room_id: roomId }, header: { "Idempotency-Key": newIdempotencyKey() } },
       });
-      if (error) throw error;
-      return data;
+      return unwrap(result);
     },
     onSuccess: (_data, roomId) => invalidateRoom(qc, roomId),
   });

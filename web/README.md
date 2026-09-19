@@ -18,7 +18,8 @@ draft, is now only a fallback used if the real file is ever absent.
 
 | Command                                    | What it does                                                                                                                                                                            |
 | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `npm run dev`                              | Vite dev server against the real admin API at `/api/v1` (needs a running homeserver).                                                                                                   |
+| `npm run dev`                              | Vite dev server against the real admin API at `/api/v1` (needs a running homeserver on the same origin, e.g. once embedded). Sign in with a real admin's username/password or access token — see "Real-server mode" below.                                                                                                   |
+| `npm run dev:real`                         | Same, on a fixed port (4180) so `playwright.real.config.ts` can drive it; combine with `VITE_HS_API_PROXY_TARGET` (below) to point at a real `hs serve` running elsewhere without CORS/embedding.                                       |
 | `npm run dev:mock`                         | Vite dev server with MSW mocking the admin API. Sign in with either button on the landing screen; "read-only" demonstrates the permissions model.                                       |
 | `npm run build`                            | Regenerates the typed client, typechecks, and builds the production bundle to `dist/` (served by the homeserver at `/admin/`, or standalone with a `config.json` next to `index.html`). |
 | `npm run build:mock`                       | Same, but bundles the MSW mock worker and builds to `dist-mock/` — used by `npm run preview:mock` and the Playwright suite.                                                             |
@@ -29,6 +30,7 @@ draft, is now only a fallback used if the real file is ever absent.
 | `npm run typecheck`                        | `tsc -b`, no emit.                                                                                                                                                                      |
 | `npm run test` / `npm run test:watch`      | Vitest unit and component tests (jsdom, Testing Library, MSW).                                                                                                                          |
 | `npm run test:e2e` / `npm run test:e2e:ui` | Playwright end-to-end tests (`e2e/`) against `npm run preview:mock`; axe (`@axe-core/playwright`) runs at every step of every flow.                                                     |
+| `npm run test:e2e:real`                    | Playwright tests (`e2e-real/`) against a **real, running `hs serve`** (`playwright.real.config.ts`). Skipped entirely unless `HS_REAL_SERVER_URL` is set; see "Real-server mode" below. |
 | `npm run storybook`                        | Storybook dev server for every primitive component (`src/components/ui/`), with the `a11y` addon running axe on each story.                                                             |
 | `npm run build:storybook`                  | Static Storybook build to `storybook-static/`.                                                                                                                                          |
 | `npm run check`                            | `lint && typecheck && test && build` — run this (or at least lint+typecheck+test) after every change; do not proceed past a failure.                                                    |
@@ -59,12 +61,49 @@ src/
                      remaining information-architecture sections not yet built
   routes.tsx          the route tree (TanStack Router, code-based, every page lazy-loaded
                      via lazyRouteComponent for route-level code splitting)
-e2e/                 Playwright specs: add-bridge.spec.ts (flows.md flow 1 end to end),
-                     bridges-list.spec.ts (nested-interactive-element regression coverage,
-                     desktop and phone viewport), users-rooms-federation.spec.ts
+e2e/                 Playwright specs against the mock (npm run test:e2e): add-bridge.spec.ts
+                     (flows.md flow 1 end to end), bridges-list.spec.ts (nested-interactive-
+                     element regression coverage, desktop and phone viewport),
+                     users-rooms-federation.spec.ts, degrade-honestly.spec.ts (501/503/403
+                     treatment, forced via window.__hsAdminMock.setForceProblem)
+e2e-real/            Playwright specs against a real hs serve (npm run test:e2e:real) —
+                     see "Real-server mode" below
 mocks/openapi.yaml   this track's own OpenAPI draft; fallback only, see Requirements above
 scripts/             generate-client.mjs, check-openapi.mjs, check-contrast.mjs
 ```
+
+## Real-server mode
+
+The app talks to the real admin API whenever it isn't built/run in mock mode (`VITE_HS_MOCK`
+unset): API calls go to same-origin `/api/v1`, which is exactly what `hs serve` serves once the
+embedded build is wired in (see `docs/status/16-management-web-interface.md`, "The embedded
+build", for the one-line `assets.rs` swap — not this track's crate to edit). There is no separate
+admin login (`hs_auth::admin_verifier::AdminTokenVerifier`'s module doc): sign in with a username
+and password, or paste an access token, belonging to a user with `is_admin` set. Most of the 142
+admin API operations still answer RFC 9457 `501`/`503` on a fresh checkout — the app says so
+plainly wherever that happens (`src/components/QueryProblemState.tsx`), not a stuck spinner, an
+empty table, or a red error.
+
+To drive a real, already-running `hs serve` from this repo without the embedded build:
+
+```
+VITE_HS_API_PROXY_TARGET=http://127.0.0.1:8098 npm run dev:real   # proxies /api, /_matrix, /_synapse
+```
+
+Then open `http://localhost:4180/admin/` and sign in. To run the Playwright suite against it
+instead of clicking around:
+
+```
+HS_REAL_SERVER_URL=http://127.0.0.1:8098 \
+HS_REAL_ADMIN_TOKEN=syt_...  \
+  npm run test:e2e:real -- --retries 1
+```
+
+`HS_REAL_ADMIN_TOKEN` is optional — without it, only the always-available "sign-in rejects an
+unrecognized token" case runs (see `e2e-real/real-server.spec.ts`'s doc comment for why). Minting
+an admin token: `hs generate-config`, hand-add `admin` to a listener's `resources`, set
+`auth.registration_shared_secret`, `hs generate-signing-key`, `hs serve -c config.yaml`, then
+`hs register <url> -u <user> -p <password> -k <secret> --admin -v`.
 
 ## What is and is not built yet
 

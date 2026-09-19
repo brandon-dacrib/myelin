@@ -18,7 +18,8 @@ import {
 import { Button } from "@/components/ui/button/Button";
 import { Badge } from "@/components/ui/badge/Badge";
 import { Dialog, DialogTrigger, DialogClose, DialogContent } from "@/components/ui/dialog/Dialog";
-import { ErrorState, ForbiddenState } from "@/components/ui/error-state/ErrorState";
+import { ForbiddenState } from "@/components/ui/error-state/ErrorState";
+import { QueryProblemState } from "@/components/QueryProblemState";
 import { SkeletonText } from "@/components/ui/skeleton/Skeleton";
 import { CopyableId } from "@/components/CopyableId";
 import { RelativeTime } from "@/components/RelativeTime";
@@ -41,14 +42,19 @@ export function BridgeDetailPage() {
   const navigate = useNavigate();
   const [revealTokens, setRevealTokens] = useState(false);
   const [activeTab, setActiveTab] = useState<(typeof TABS)[number]>("overview");
-  const { data: bridge, isLoading, isError, refetch } = useAppservice(bridgeId);
+  const { data: bridge, isLoading, isError, error, refetch } = useAppservice(bridgeId);
   const { data: health } = useAppserviceHealth(bridgeId);
-  const { data: backlog } = useAppserviceBacklog(bridgeId);
+  const {
+    data: backlog,
+    isError: backlogIsError,
+    error: backlogError,
+  } = useAppserviceBacklog(bridgeId);
   const canWrite = hasScope("bridges:write");
-  const { data: registration, isError: registrationError } = useAppserviceRegistration(
-    bridgeId,
-    activeTab === "registration" && canWrite,
-  );
+  const {
+    data: registration,
+    isError: registrationIsError,
+    error: registrationError,
+  } = useAppserviceRegistration(bridgeId, activeTab === "registration" && canWrite);
 
   const pause = usePauseAppservice();
   const resume = useResumeAppservice();
@@ -75,7 +81,7 @@ export function BridgeDetailPage() {
   if (isError || !bridge) {
     return (
       <div className="p-6">
-        <ErrorState title="Couldn't load this bridge" onRetry={() => refetch()} />
+        <QueryProblemState error={error} resource="this bridge" onRetry={() => refetch()} />
       </div>
     );
   }
@@ -213,9 +219,13 @@ export function BridgeDetailPage() {
             <Fact
               label="Backlog"
               value={
-                (backlog?.items.length ?? 0) === 0
-                  ? "No backlog"
-                  : `${pendingBacklog.length} pending, ${deadLettered.length} dead-lettered`
+                backlogIsError ? (
+                  <QueryProblemState error={backlogError} resource="the backlog" compact />
+                ) : (backlog?.items.length ?? 0) === 0 ? (
+                  "No backlog"
+                ) : (
+                  `${pendingBacklog.length} pending, ${deadLettered.length} dead-lettered`
+                )
               }
             />
             <Fact label="Last ping" value={<RelativeTime at={health?.last_ping_at} />} />
@@ -253,8 +263,8 @@ export function BridgeDetailPage() {
         <Content value="registration" className="py-6">
           {!canWrite ? (
             <ForbiddenState scope="bridges:write" />
-          ) : registrationError ? (
-            <p className="text-sm text-danger">Couldn't load the registration.</p>
+          ) : registrationIsError ? (
+            <QueryProblemState error={registrationError} resource="the registration" />
           ) : !registration ? (
             <SkeletonText lines={3} />
           ) : (
@@ -285,7 +295,9 @@ export function BridgeDetailPage() {
         </Content>
 
         <Content value="transactions" className="py-6">
-          {(backlog?.items.length ?? 0) === 0 ? (
+          {backlogIsError ? (
+            <QueryProblemState error={backlogError} resource="transactions" />
+          ) : (backlog?.items.length ?? 0) === 0 ? (
             <p className="text-sm text-text-muted">No pending or dead-lettered transactions.</p>
           ) : (
             <>

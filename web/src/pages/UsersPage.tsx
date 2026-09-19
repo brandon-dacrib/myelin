@@ -7,7 +7,8 @@ import { Badge } from "@/components/ui/badge/Badge";
 import { Input } from "@/components/ui/input/Input";
 import { DataTable, type Column } from "@/components/ui/table/DataTable";
 import { EmptyState } from "@/components/ui/empty-state/EmptyState";
-import { ErrorState, ForbiddenState } from "@/components/ui/error-state/ErrorState";
+import { ForbiddenState } from "@/components/ui/error-state/ErrorState";
+import { QueryProblemState } from "@/components/QueryProblemState";
 import { RelativeTime } from "@/components/RelativeTime";
 import { hasScope } from "@/lib/auth";
 
@@ -18,7 +19,7 @@ export function UsersPage() {
   const [queryInput, setQueryInput] = useState(search.q ?? "");
   const canRead = hasScope("admin:read");
 
-  const { data, isLoading, isError, refetch } = useUsers({
+  const { data, isLoading, isError, error, refetch } = useUsers({
     q: search.q,
     cursor: search.cursor,
     limit: 20,
@@ -139,7 +140,7 @@ export function UsersPage() {
 
       {isError && (
         <div className="mt-6">
-          <ErrorState title="Couldn't load users" onRetry={() => refetch()} />
+          <QueryProblemState error={error} resource="users" scope="admin:read" onRetry={() => refetch()} />
         </div>
       )}
 

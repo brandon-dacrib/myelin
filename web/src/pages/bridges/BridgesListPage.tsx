@@ -14,7 +14,8 @@ import { Badge } from "@/components/ui/badge/Badge";
 import { Select } from "@/components/ui/select/Select";
 import { DataTable, type Column, type SortState } from "@/components/ui/table/DataTable";
 import { EmptyState } from "@/components/ui/empty-state/EmptyState";
-import { ErrorState, ForbiddenState } from "@/components/ui/error-state/ErrorState";
+import { ForbiddenState } from "@/components/ui/error-state/ErrorState";
+import { QueryProblemState } from "@/components/QueryProblemState";
 import { toast } from "@/components/ui/toast/toast-store";
 import { hasScope } from "@/lib/auth";
 import { bridgeHealthMeta, healthKeyOf } from "@/lib/bridge-state";
@@ -44,7 +45,7 @@ export function BridgesListPage() {
 
   // Every hook below runs unconditionally regardless of scope (rules of
   // hooks); the scope gate only affects what is rendered, further down.
-  const { data, isLoading, isError, refetch } = useAppservices({
+  const { data, isLoading, isError, error, refetch } = useAppservices({
     cursor: search.cursor,
     limit: 20,
   });
@@ -200,7 +201,7 @@ export function BridgesListPage() {
 
       {isError && (
         <div className="mt-6">
-          <ErrorState title="Couldn't load bridges" onRetry={() => refetch()} />
+          <QueryProblemState error={error} resource="bridges" scope="bridges:read" onRetry={() => refetch()} />
         </div>
       )}
 

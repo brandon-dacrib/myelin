@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, type ReactNode } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { CheckCircle2, TriangleAlert, CircleX } from "lucide-react";
 import {
@@ -9,8 +9,9 @@ import {
   useRecentAuditEntries,
 } from "@/api/dashboard";
 import { useAppservices, deriveDisplayName } from "@/api/bridges";
+import { classifyError } from "@/api/problem";
 import { Badge } from "@/components/ui/badge/Badge";
-import { ErrorState } from "@/components/ui/error-state/ErrorState";
+import { QueryProblemState } from "@/components/QueryProblemState";
 import { SkeletonText, Skeleton } from "@/components/ui/skeleton/Skeleton";
 import { RelativeTime } from "@/components/RelativeTime";
 import { navigateToHref } from "@/lib/navigate-href";
@@ -45,8 +46,15 @@ export function DashboardPage() {
     cluster.isLoading ||
     appservices.isLoading ||
     federation.isLoading;
-  const isError =
-    stats.isError || server.isError || cluster.isError || appservices.isError || federation.isError;
+
+  // Deliberately no single page-wide `isError` gate: against a real server, `/server` (this
+  // page's uptime/version tiles) may well answer while `/statistics/overview`, `/cluster`,
+  // `/appservices` and `/federation/destinations` all still 501 (only /me, /server,
+  // /server/health, /users and /users/{id} are real as of this writing). Each section below
+  // renders what it has and reports its own gap honestly instead of the whole page going blank
+  // because one of six independent queries failed (docs/status/16-management-web-interface.md,
+  // "Degrade honestly").
+  const attentionSourcesFailed = stats.isError && appservices.isError && federation.isError;
 
   const unhealthyBridges = useMemo(
     () => (appservices.data?.items ?? []).filter((b) => b.health !== "healthy" && !b.paused),
@@ -103,23 +111,7 @@ export function DashboardPage() {
     <div className="mx-auto max-w-[90rem] p-6">
       <h1 className="text-xl text-text">Overview</h1>
 
-      {isError && (
-        <div className="mt-6">
-          <ErrorState
-            title="Couldn't load the overview"
-            onRetry={() => {
-              stats.refetch();
-              server.refetch();
-              cluster.refetch();
-              appservices.refetch();
-              federation.refetch();
-            }}
-          />
-        </div>
-      )}
-
-      {!isError && (
-        <div className="mt-6 flex flex-col gap-8">
+      <div className="mt-6 flex flex-col gap-8">
           {/* Attention */}
           <section aria-labelledby="attention-heading">
             <h2 id="attention-heading" className="text-md font-medium text-text">
@@ -131,13 +123,26 @@ export function DashboardPage() {
                   <SkeletonText lines={3} />
                 </div>
               )}
-              {!isLoading && attention.length === 0 && (
+              {!isLoading && attentionSourcesFailed && (
+                <QueryProblemState
+                  error={stats.error ?? appservices.error ?? federation.error}
+                  resource="what needs attention"
+                  compact
+                  onRetry={() => {
+                    stats.refetch();
+                    appservices.refetch();
+                    federation.refetch();
+                  }}
+                />
+              )}
+              {!isLoading && !attentionSourcesFailed && attention.length === 0 && (
                 <p className="flex items-center gap-2 p-4 text-sm text-text-muted">
                   <CheckCircle2 size={16} aria-hidden="true" className="text-success" />
                   Nothing needs your attention.
                 </p>
               )}
               {!isLoading &&
+                !attentionSourcesFailed &&
                 attention.map((item, i) => {
                   const Icon = item.severity === "danger" ? CircleX : TriangleAlert;
                   return (
@@ -179,19 +184,65 @@ export function DashboardPage() {
                 ))}
               {!isLoading && (
                 <>
-                  <Tile label="Version" value={server.data?.version ?? "—"} />
+                  <Tile
+                    label="Version"
+                    value={
+                      server.isError ? <TileProblem error={server.error} /> : (server.data?.version ?? "—")
+                    }
+                  />
                   <Tile
                     label="Uptime"
                     value={
-                      server.data?.uptime_ms != null ? formatUptime(server.data.uptime_ms) : "—"
+                      server.isError ? (
+                        <TileProblem error={server.error} />
+                      ) : server.data?.uptime_ms != null ? (
+                        formatUptime(server.data.uptime_ms)
+                      ) : (
+                        "—"
+                      )
                     }
                   />
-                  <Tile label="Mode" value={singleNode ? "Single node" : "Cluster"} />
-                  <Tile label="Users" value={(stats.data?.users_count ?? 0).toLocaleString()} />
-                  <Tile label="Rooms" value={(stats.data?.rooms_count ?? 0).toLocaleString()} />
+                  <Tile
+                    label="Mode"
+                    value={
+                      cluster.isError ? (
+                        <TileProblem error={cluster.error} />
+                      ) : singleNode ? (
+                        "Single node"
+                      ) : (
+                        "Cluster"
+                      )
+                    }
+                  />
+                  <Tile
+                    label="Users"
+                    value={
+                      stats.isError ? (
+                        <TileProblem error={stats.error} />
+                      ) : (
+                        (stats.data?.users_count ?? 0).toLocaleString()
+                      )
+                    }
+                  />
+                  <Tile
+                    label="Rooms"
+                    value={
+                      stats.isError ? (
+                        <TileProblem error={stats.error} />
+                      ) : (
+                        (stats.data?.rooms_count ?? 0).toLocaleString()
+                      )
+                    }
+                  />
                   <Tile
                     label="Daily active users"
-                    value={(stats.data?.daily_active_users ?? 0).toLocaleString()}
+                    value={
+                      stats.isError ? (
+                        <TileProblem error={stats.error} />
+                      ) : (
+                        (stats.data?.daily_active_users ?? 0).toLocaleString()
+                      )
+                    }
                   />
                 </>
               )}
@@ -205,7 +256,19 @@ export function DashboardPage() {
                 Bridges
               </h2>
               <ul className="mt-3 flex flex-col gap-2">
+                {!isLoading && appservices.isError && (
+                  <li>
+                    <QueryProblemState
+                      error={appservices.error}
+                      resource="bridges"
+                      scope="bridges:read"
+                      compact
+                      onRetry={() => appservices.refetch()}
+                    />
+                  </li>
+                )}
                 {!isLoading &&
+                  !appservices.isError &&
                   appservices.data?.items.map((b) => {
                     const meta = bridgeHealthMeta[healthKeyOf(b)];
                     return (
@@ -225,7 +288,7 @@ export function DashboardPage() {
                       </li>
                     );
                   })}
-                {!isLoading && appservices.data?.items.length === 0 && (
+                {!isLoading && !appservices.isError && appservices.data?.items.length === 0 && (
                   <p className="text-sm text-text-muted">No bridges yet.</p>
                 )}
               </ul>
@@ -237,7 +300,18 @@ export function DashboardPage() {
                 Federation
               </h2>
               <div className="mt-3 flex gap-3">
+                {!isLoading && federation.isError && (
+                  <QueryProblemState
+                    error={federation.error}
+                    resource="federation destinations"
+                    scope="admin:read"
+                    compact
+                    onRetry={() => federation.refetch()}
+                    className="w-full"
+                  />
+                )}
                 {!isLoading &&
+                  !federation.isError &&
                   (
                     [
                       {
@@ -283,7 +357,19 @@ export function DashboardPage() {
               Recent audit
             </h2>
             <ul className="mt-3 divide-y divide-border rounded-md border border-border bg-surface">
+              {!isLoading && auditLog.isError && (
+                <li>
+                  <QueryProblemState
+                    error={auditLog.error}
+                    resource="the audit log"
+                    scope="admin:read"
+                    compact
+                    onRetry={() => auditLog.refetch()}
+                  />
+                </li>
+              )}
               {!isLoading &&
+                !auditLog.isError &&
                 auditLog.data?.items.map((entry) => (
                   <li
                     key={entry.id}
@@ -300,26 +386,33 @@ export function DashboardPage() {
                     </span>
                   </li>
                 ))}
-              {!isLoading && (auditLog.data?.items.length ?? 0) === 0 && (
+              {!isLoading && !auditLog.isError && (auditLog.data?.items.length ?? 0) === 0 && (
                 <li className="px-4 py-2.5 text-sm text-text-muted">
                   No changes recorded yet. Every action taken here is logged.
                 </li>
               )}
             </ul>
           </section>
-        </div>
-      )}
+      </div>
     </div>
   );
 }
 
-function Tile({ label, value }: { label: string; value: string }) {
+function Tile({ label, value }: { label: string; value: ReactNode }) {
   return (
     <div className="rounded-md border border-border bg-surface p-4">
       <p className="text-xs text-text-muted">{label}</p>
-      <p className="mt-1 text-2xl text-text">{value}</p>
+      <div className="mt-1 text-2xl text-text">{value}</div>
     </div>
   );
+}
+
+/** A tile-sized "not implemented"/"not available" marker, for a health tile whose one source
+ * query failed while the rest of the dashboard loaded fine. */
+function TileProblem({ error }: { error: unknown }) {
+  const { kind } = classifyError(error);
+  const label = kind === "not-implemented" ? "Not implemented" : kind === "unavailable" ? "Unavailable" : "Unknown";
+  return <span className="text-sm font-normal text-text-faint">{label}</span>;
 }
 
 function formatUptime(ms: number): string {

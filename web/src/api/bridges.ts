@@ -27,6 +27,7 @@
  */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, newIdempotencyKey } from "./client";
+import { unwrap } from "./problem";
 import type { components } from "./schema";
 
 export type AppService = components["schemas"]["AppService"];
@@ -69,9 +70,8 @@ export function useAppservices(filters: AppserviceListFilters) {
   return useQuery({
     queryKey: ["appservices", filters],
     queryFn: async () => {
-      const { data, error } = await api.GET("/appservices", { params: { query: filters } });
-      if (error) throw error;
-      return data;
+      const result = await api.GET("/appservices", { params: { query: filters } });
+      return unwrap(result);
     },
     refetchInterval: 30_000,
   });
@@ -82,9 +82,8 @@ export function useAppservice(id: string | undefined) {
     queryKey: ["appservice", id],
     enabled: Boolean(id),
     queryFn: async () => {
-      const { data, error } = await api.GET("/appservices/{id}", { params: { path: { id: id! } } });
-      if (error) throw error;
-      return data;
+      const result = await api.GET("/appservices/{id}", { params: { path: { id: id! } } });
+      return unwrap(result);
     },
     refetchInterval: 15_000,
   });
@@ -95,11 +94,10 @@ export function useAppserviceHealth(id: string | undefined) {
     queryKey: ["appservice-health", id],
     enabled: Boolean(id),
     queryFn: async () => {
-      const { data, error } = await api.GET("/appservices/{id}/health", {
+      const result = await api.GET("/appservices/{id}/health", {
         params: { path: { id: id! } },
       });
-      if (error) throw error;
-      return data;
+      return unwrap(result);
     },
     refetchInterval: 15_000,
   });
@@ -110,11 +108,10 @@ export function useAppserviceBacklog(id: string | undefined, limit = 50) {
     queryKey: ["appservice-backlog", id],
     enabled: Boolean(id),
     queryFn: async () => {
-      const { data, error } = await api.GET("/appservices/{id}/backlog", {
+      const result = await api.GET("/appservices/{id}/backlog", {
         params: { path: { id: id! }, query: { limit } },
       });
-      if (error) throw error;
-      return data;
+      return unwrap(result);
     },
     refetchInterval: 15_000,
   });
@@ -125,12 +122,11 @@ export function useAppserviceRegistration(id: string | undefined, enabled: boole
     queryKey: ["appservice-registration", id],
     enabled: Boolean(id) && enabled,
     queryFn: async () => {
-      const { data, error } = await api.GET("/appservices/{id}/registration", {
+      const result = await api.GET("/appservices/{id}/registration", {
         params: { path: { id: id! } },
         headers: { Accept: "application/json" },
       });
-      if (error) throw error;
-      return data as Record<string, unknown>;
+      return unwrap(result) as Record<string, unknown>;
     },
   });
 }
@@ -139,9 +135,8 @@ export function useBridgeTypes() {
   return useQuery({
     queryKey: ["bridge-types"],
     queryFn: async () => {
-      const { data, error } = await api.GET("/bridge-types", { params: { query: { limit: 50 } } });
-      if (error) throw error;
-      return data.items;
+      const result = await api.GET("/bridge-types", { params: { query: { limit: 50 } } });
+      return unwrap(result).items;
     },
     staleTime: Infinity,
   });
@@ -151,12 +146,11 @@ export function useBridgeTypes() {
 export function useRenderBridgeType() {
   return useMutation({
     mutationFn: async ({ type, values }: { type: string; values: Record<string, unknown> }) => {
-      const { data, error } = await api.POST("/bridge-types/{type}/render", {
+      const result = await api.POST("/bridge-types/{type}/render", {
         params: { path: { type } },
         body: values,
       });
-      if (error) throw error;
-      return data;
+      return unwrap(result);
     },
   });
 }
@@ -175,7 +169,7 @@ export function useCreateAppservice() {
       registrationYaml,
       idempotencyKey,
     }: CreateAppserviceVariables) => {
-      const { data, error } = await api.POST("/appservices", {
+      const result = await api.POST("/appservices", {
         params: { header: { "Idempotency-Key": idempotencyKey } },
         // `AppServiceCreate.registration` is an untyped OpenAPI `object`
         // (openapi-typescript emits `Record<string, never>` for it); the
@@ -186,8 +180,7 @@ export function useCreateAppservice() {
           registration_yaml: registrationYaml,
         },
       });
-      if (error) throw error;
-      return data;
+      return unwrap(result);
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["appservices"] }),
   });
@@ -203,11 +196,10 @@ export function usePauseAppservice() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async (id: string) => {
-      const { data, error } = await api.POST("/appservices/{id}/pause", {
+      const result = await api.POST("/appservices/{id}/pause", {
         params: { path: { id }, header: { "Idempotency-Key": newIdempotencyKey() } },
       });
-      if (error) throw error;
-      return data;
+      return unwrap(result);
     },
     onSuccess: (_data, id) => invalidateAfterAction(qc, id),
   });
@@ -217,11 +209,10 @@ export function useResumeAppservice() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async (id: string) => {
-      const { data, error } = await api.POST("/appservices/{id}/resume", {
+      const result = await api.POST("/appservices/{id}/resume", {
         params: { path: { id }, header: { "Idempotency-Key": newIdempotencyKey() } },
       });
-      if (error) throw error;
-      return data;
+      return unwrap(result);
     },
     onSuccess: (_data, id) => invalidateAfterAction(qc, id),
   });
@@ -231,11 +222,10 @@ export function useRotateAppserviceTokens() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async (id: string) => {
-      const { data, error } = await api.POST("/appservices/{id}/rotate-tokens", {
+      const result = await api.POST("/appservices/{id}/rotate-tokens", {
         params: { path: { id }, header: { "Idempotency-Key": newIdempotencyKey() } },
       });
-      if (error) throw error;
-      return data;
+      return unwrap(result);
     },
     onSuccess: (_data, id) => {
       invalidateAfterAction(qc, id);
@@ -248,12 +238,11 @@ export function useReplayAppserviceBacklog() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async (id: string) => {
-      const { data, error } = await api.POST("/appservices/{id}/replay", {
+      const result = await api.POST("/appservices/{id}/replay", {
         params: { path: { id }, header: { "Idempotency-Key": newIdempotencyKey() } },
         body: {},
       });
-      if (error) throw error;
-      return data;
+      return unwrap(result);
     },
     onSuccess: (_data, id) => qc.invalidateQueries({ queryKey: ["appservice-backlog", id] }),
   });
@@ -263,8 +252,8 @@ export function useDeleteAppservice() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async (id: string) => {
-      const { error } = await api.DELETE("/appservices/{id}", { params: { path: { id } } });
-      if (error) throw error;
+      const result = await api.DELETE("/appservices/{id}", { params: { path: { id } } });
+      unwrap(result);
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["appservices"] }),
   });

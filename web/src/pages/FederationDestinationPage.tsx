@@ -4,8 +4,9 @@ import { ChevronLeft } from "lucide-react";
 import { useFederationDestination, useResetFederationDestination } from "@/api/federation";
 import { Button } from "@/components/ui/button/Button";
 import { Badge } from "@/components/ui/badge/Badge";
-import { ErrorState, ForbiddenState } from "@/components/ui/error-state/ErrorState";
+import { ForbiddenState } from "@/components/ui/error-state/ErrorState";
 import { SkeletonText } from "@/components/ui/skeleton/Skeleton";
+import { QueryProblemState } from "@/components/QueryProblemState";
 import { CopyableId } from "@/components/CopyableId";
 import { RelativeTime } from "@/components/RelativeTime";
 import { toast } from "@/components/ui/toast/toast-store";
@@ -14,7 +15,13 @@ import { hasScope } from "@/lib/auth";
 /** `/federation/:serverName` — flows.md flow 4 step 3. */
 export function FederationDestinationPage() {
   const { serverName } = useParams({ from: "/federation/$serverName" });
-  const { data: destination, isLoading, isError, refetch } = useFederationDestination(serverName);
+  const {
+    data: destination,
+    isLoading,
+    isError,
+    error,
+    refetch,
+  } = useFederationDestination(serverName);
   const canWrite = hasScope("admin:write");
   const reset = useResetFederationDestination();
 
@@ -37,7 +44,7 @@ export function FederationDestinationPage() {
   if (isError || !destination) {
     return (
       <div className="p-6">
-        <ErrorState title="Couldn't load this destination" onRetry={() => refetch()} />
+        <QueryProblemState error={error} resource="this destination" onRetry={() => refetch()} />
       </div>
     );
   }

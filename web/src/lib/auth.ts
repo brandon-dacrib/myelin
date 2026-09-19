@@ -1,16 +1,31 @@
 /**
- * Authentication against track 07's OAuth issuer (authorization code + PKCE,
- * admin scopes), per docs/design/information-architecture.md #2 and the
- * brief's day-one work ("authentication against a mocked issuer").
+ * Authentication.
  *
- * Track 07 has not started (see its status file); there is no real issuer to
- * point `oauth4webapi` at yet. Until then this module is backed by the mock
- * issuer's `/oauth2/token` endpoint (src/mocks/handlers.ts), which issues a
- * bearer token carrying a scope set chosen at sign-in. The public surface
- * (`getAccessToken`, `hasScope`, `signIn`, `signOut`) is what the rest of the
- * app depends on, so swapping the mock for a real `oauth4webapi` PKCE flow
- * later does not touch call sites.
+ * Track 07's native OAuth issuer (authorization code + PKCE, admin scopes,
+ * docs/design/information-architecture.md #2) is still Phase 1/2 design-only
+ * work (see its status file) — there is no authorization-code flow to point
+ * `oauth4webapi` at yet. What track 07 *has* shipped, and what this module
+ * uses for real-server sign-in, is `hs_auth::admin_verifier::AdminTokenVerifier`:
+ * "there is no separate admin login" — a normal Matrix `syt_...` access
+ * token belonging to a user with `is_admin: true` is, itself, the admin
+ * credential. `signInWithToken`/`signInWithPassword` below are that: paste a
+ * token, or sign in with a username and password (which is just
+ * `POST /_matrix/client/v3/login`, same as any Matrix client), and this
+ * module verifies it by calling `GET /api/v1/me` — the same call the rest of
+ * the app would eventually get a 401/403 from anyway, so "is this token
+ * good, and is it an admin's" is answered once, honestly, at sign-in instead
+ * of on the first page that happens to need a scope.
+ *
+ * In mock mode (`VITE_HS_MOCK=1`, e2e and `npm run dev:mock`) `signIn` below
+ * still talks to the mock issuer's `/oauth2/token` endpoint
+ * (`src/mocks/handlers.ts`) so the test suite doesn't need a running server
+ * or a real admin account. `MOCK_MODE` is what `SignIn.tsx` uses to choose
+ * which form to show.
  */
+export const MOCK_MODE = import.meta.env.VITE_HS_MOCK === "1";
+
+/** Thrown by the real-mode sign-in functions with a message already fit to show the operator. */
+export class AuthSignInError extends Error {}
 
 const SESSION_KEY = "hs-admin:session";
 
@@ -113,6 +128,100 @@ export async function signIn(scopes: Scope[] = [...ALL_SCOPES]): Promise<Session
   persist(current);
   notify();
   return current;
+}
+
+/**
+ * Verifies `accessToken` against the real `/api/v1/me` (deliberately a plain `fetch`, not the
+ * shared `api` client in `api/client.ts`: that client auto-attaches the *current* session's
+ * token via `getAccessToken()`, which is exactly wrong here — we're verifying a *candidate*
+ * token before there is a current session). On success, `Principal.scopes` becomes the session's
+ * scopes: `AdminTokenVerifier` grants a legacy admin token both `admin:read` and `admin:write`
+ * unconditionally (`hs_auth::admin_verifier` module doc), so a successful call always means full
+ * access today, but reading real scopes back rather than assuming them is what makes this
+ * forward-compatible with the native OAuth issuer's finer-grained tokens later.
+ */
+export async function signInWithToken(accessToken: string): Promise<Session> {
+  const token = accessToken.trim();
+  if (!token) throw new AuthSignInError("Enter an access token.");
+
+  let res: Response;
+  try {
+    res = await fetch("/api/v1/me", { headers: { Authorization: `Bearer ${token}` } });
+  } catch {
+    throw new AuthSignInError(
+      "Couldn't reach the server. Check that it's running and this page can reach /api/v1.",
+    );
+  }
+
+  if (res.status === 401) {
+    throw new AuthSignInError("That token wasn't recognized, or has expired.");
+  }
+  if (res.status === 403) {
+    throw new AuthSignInError(
+      "That token is valid but isn't a server administrator's (needs is_admin set).",
+    );
+  }
+  if (res.status === 503) {
+    throw new AuthSignInError("The server isn't ready to verify tokens yet (503). Try again shortly.");
+  }
+  if (!res.ok) {
+    throw new AuthSignInError(`Sign-in failed (HTTP ${res.status}).`);
+  }
+
+  const principal = (await res.json()) as {
+    id: string;
+    display_name?: string;
+    scopes: string[];
+  };
+
+  current = {
+    accessToken: token,
+    operator: { name: principal.display_name ?? principal.id, subject: principal.id },
+    scopes: principal.scopes as Scope[],
+  };
+  persist(current);
+  notify();
+  return current;
+}
+
+/**
+ * Signs in with a username and password through the ordinary Matrix client-server login
+ * (`POST /_matrix/client/v3/login`, `m.login.password`) — the same call any Matrix client makes,
+ * since "there is no separate admin login" (this track's brief). The resulting access token is
+ * then verified the same way `signInWithToken` verifies a pasted one; a login that succeeds for a
+ * non-admin user still fails sign-in here with the same 403 message.
+ */
+export async function signInWithPassword(username: string, password: string): Promise<Session> {
+  if (!username.trim() || !password) {
+    throw new AuthSignInError("Enter a username and password.");
+  }
+
+  let res: Response;
+  try {
+    res = await fetch("/_matrix/client/v3/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        type: "m.login.password",
+        identifier: { type: "m.id.user", user: username.trim() },
+        password,
+      }),
+    });
+  } catch {
+    throw new AuthSignInError(
+      "Couldn't reach the server. Check that it's running and this page can reach /_matrix.",
+    );
+  }
+
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string; errcode?: string };
+    throw new AuthSignInError(
+      body.error ?? `Sign-in failed (${body.errcode ?? `HTTP ${res.status}`}).`,
+    );
+  }
+
+  const body = (await res.json()) as { access_token: string };
+  return signInWithToken(body.access_token);
 }
 
 export function signOut(): void {

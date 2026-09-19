@@ -1,6 +1,7 @@
 /** Users (flows.md flow 2), against the real `/users` resources in `crates/hs-admin/openapi/openapi.yaml`. */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, newIdempotencyKey } from "./client";
+import { unwrap } from "./problem";
 import type { components } from "./schema";
 
 export type User = components["schemas"]["User"];
@@ -20,9 +21,8 @@ export function useUsers(filters: UserListFilters) {
   return useQuery({
     queryKey: ["users", filters],
     queryFn: async () => {
-      const { data, error } = await api.GET("/users", { params: { query: filters } });
-      if (error) throw error;
-      return data;
+      const result = await api.GET("/users", { params: { query: filters } });
+      return unwrap(result);
     },
     refetchInterval: 30_000,
   });
@@ -33,11 +33,10 @@ export function useUser(userId: string | undefined) {
     queryKey: ["user", userId],
     enabled: Boolean(userId),
     queryFn: async () => {
-      const { data, error } = await api.GET("/users/{user_id}", {
+      const result = await api.GET("/users/{user_id}", {
         params: { path: { user_id: userId! } },
       });
-      if (error) throw error;
-      return data;
+      return unwrap(result);
     },
   });
 }
@@ -47,11 +46,10 @@ export function useUserDevices(userId: string | undefined) {
     queryKey: ["user-devices", userId],
     enabled: Boolean(userId),
     queryFn: async () => {
-      const { data, error } = await api.GET("/users/{user_id}/devices", {
+      const result = await api.GET("/users/{user_id}/devices", {
         params: { path: { user_id: userId! }, query: { limit: 50 } },
       });
-      if (error) throw error;
-      return data;
+      return unwrap(result);
     },
   });
 }
@@ -72,12 +70,11 @@ function useUserAction(
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async ({ userId, reason }: { userId: string; reason?: string }) => {
-      const { data, error } = await api.POST(path, {
+      const result = await api.POST(path, {
         params: { path: { user_id: userId }, header: { "Idempotency-Key": newIdempotencyKey() } },
         body: { reason, notify: false },
       });
-      if (error) throw error;
-      return data;
+      return unwrap(result);
     },
     onSuccess: (_data, { userId }) => invalidateUser(qc, userId),
   });
@@ -101,12 +98,11 @@ export function useDeactivateUser() {
       erase?: boolean;
       reason?: string;
     }) => {
-      const { data, error } = await api.POST("/users/{user_id}/deactivate", {
+      const result = await api.POST("/users/{user_id}/deactivate", {
         params: { path: { user_id: userId }, header: { "Idempotency-Key": newIdempotencyKey() } },
         body: { erase, reason },
       });
-      if (error) throw error;
-      return data;
+      return unwrap(result);
     },
     onSuccess: (_data, { userId }) => invalidateUser(qc, userId),
   });

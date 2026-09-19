@@ -14,8 +14,9 @@ import {
 import { Button } from "@/components/ui/button/Button";
 import { Badge } from "@/components/ui/badge/Badge";
 import { Dialog, DialogTrigger, DialogClose, DialogContent } from "@/components/ui/dialog/Dialog";
-import { ErrorState, ForbiddenState } from "@/components/ui/error-state/ErrorState";
+import { ForbiddenState } from "@/components/ui/error-state/ErrorState";
 import { SkeletonText } from "@/components/ui/skeleton/Skeleton";
+import { QueryProblemState } from "@/components/QueryProblemState";
 import { CopyableId } from "@/components/CopyableId";
 import { RelativeTime } from "@/components/RelativeTime";
 import { toast } from "@/components/ui/toast/toast-store";
@@ -24,8 +25,13 @@ import { hasScope } from "@/lib/auth";
 /** `/users/:id` — flows.md flow 2 steps 2-5: understand and act on a user. */
 export function UserDetailPage() {
   const { userId } = useParams({ from: "/users/$userId" });
-  const { data: user, isLoading, isError, refetch } = useUser(userId);
-  const { data: devices } = useUserDevices(userId);
+  const { data: user, isLoading, isError, error, refetch } = useUser(userId);
+  const {
+    data: devices,
+    isError: devicesIsError,
+    error: devicesError,
+    refetch: refetchDevices,
+  } = useUserDevices(userId);
   const canWrite = hasScope("admin:write");
   const canModerate = hasScope("moderation:write");
 
@@ -55,7 +61,7 @@ export function UserDetailPage() {
   if (isError || !user) {
     return (
       <div className="p-6">
-        <ErrorState title="Couldn't load this user" onRetry={() => refetch()} />
+        <QueryProblemState error={error} resource="this user" onRetry={() => refetch()} />
       </div>
     );
   }
@@ -244,7 +250,13 @@ export function UserDetailPage() {
           </dl>
 
           <h2 className="mt-8 text-md font-medium text-text">Sessions</h2>
-          {(devices?.items.length ?? 0) === 0 ? (
+          {devicesIsError ? (
+            <QueryProblemState
+              error={devicesError}
+              resource="this user's sessions"
+              onRetry={() => refetchDevices()}
+            />
+          ) : (devices?.items.length ?? 0) === 0 ? (
             <p className="mt-3 text-sm text-text-muted">No devices.</p>
           ) : (
             <ul className="mt-3 divide-y divide-border rounded-md border border-border">

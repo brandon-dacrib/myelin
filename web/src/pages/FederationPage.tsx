@@ -6,7 +6,8 @@ import type { Destination } from "@/api/federation";
 import { Badge } from "@/components/ui/badge/Badge";
 import { DataTable, type Column } from "@/components/ui/table/DataTable";
 import { EmptyState } from "@/components/ui/empty-state/EmptyState";
-import { ErrorState, ForbiddenState } from "@/components/ui/error-state/ErrorState";
+import { ForbiddenState } from "@/components/ui/error-state/ErrorState";
+import { QueryProblemState } from "@/components/QueryProblemState";
 import { RelativeTime } from "@/components/RelativeTime";
 import { hasScope } from "@/lib/auth";
 
@@ -23,7 +24,7 @@ function destinationStatus(d: Destination): {
 export function FederationPage() {
   const navigate = useNavigate();
   const canRead = hasScope("admin:read");
-  const { data, isLoading, isError, refetch } = useFederationDestinations(50);
+  const { data, isLoading, isError, error, refetch } = useFederationDestinations(50);
 
   const rows = useMemo(() => {
     const items = data?.items ?? [];
@@ -90,7 +91,12 @@ export function FederationPage() {
 
       {isError && (
         <div className="mt-6">
-          <ErrorState title="Couldn't load federation destinations" onRetry={() => refetch()} />
+          <QueryProblemState
+            error={error}
+            resource="federation destinations"
+            scope="admin:read"
+            onRetry={() => refetch()}
+          />
         </div>
       )}
 

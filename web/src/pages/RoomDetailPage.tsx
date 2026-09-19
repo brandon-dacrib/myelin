@@ -11,8 +11,9 @@ import {
 import { Button } from "@/components/ui/button/Button";
 import { Badge } from "@/components/ui/badge/Badge";
 import { Dialog, DialogTrigger, DialogClose, DialogContent } from "@/components/ui/dialog/Dialog";
-import { ErrorState, ForbiddenState } from "@/components/ui/error-state/ErrorState";
+import { ForbiddenState } from "@/components/ui/error-state/ErrorState";
 import { SkeletonText } from "@/components/ui/skeleton/Skeleton";
+import { QueryProblemState } from "@/components/QueryProblemState";
 import { CopyableId } from "@/components/CopyableId";
 import { toast } from "@/components/ui/toast/toast-store";
 import { hasScope } from "@/lib/auth";
@@ -20,8 +21,13 @@ import { hasScope } from "@/lib/auth";
 /** `/rooms/:id` — flows.md flow 3 steps 2-7: understand and act on a room. */
 export function RoomDetailPage() {
   const { roomId } = useParams({ from: "/rooms/$roomId" });
-  const { data: room, isLoading, isError, refetch } = useRoom(roomId);
-  const { data: members } = useRoomMembers(roomId);
+  const { data: room, isLoading, isError, error, refetch } = useRoom(roomId);
+  const {
+    data: members,
+    isError: membersIsError,
+    error: membersError,
+    refetch: refetchMembers,
+  } = useRoomMembers(roomId);
   const canModerate = hasScope("moderation:write");
   const canWrite = hasScope("admin:write");
 
@@ -48,7 +54,7 @@ export function RoomDetailPage() {
   if (isError || !room) {
     return (
       <div className="p-6">
-        <ErrorState title="Couldn't load this room" onRetry={() => refetch()} />
+        <QueryProblemState error={error} resource="this room" onRetry={() => refetch()} />
       </div>
     );
   }
@@ -161,7 +167,13 @@ export function RoomDetailPage() {
           </dl>
 
           <h2 className="mt-8 text-md font-medium text-text">Members</h2>
-          {(members?.items.length ?? 0) === 0 ? (
+          {membersIsError ? (
+            <QueryProblemState
+              error={membersError}
+              resource="this room's members"
+              onRetry={() => refetchMembers()}
+            />
+          ) : (members?.items.length ?? 0) === 0 ? (
             <p className="mt-3 text-sm text-text-muted">No members loaded.</p>
           ) : (
             <ul className="mt-3 divide-y divide-border rounded-md border border-border">
