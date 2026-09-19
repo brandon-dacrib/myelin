@@ -10,7 +10,10 @@ use hs_model::canonical::CanonicalJsonValue;
 use hs_model::ids::{EventSn, RoomSn};
 use hs_model::room_version::{self, RoomIdFormat, RoomVersionRules};
 use hs_state::api::StateStore;
+use hs_state::auth::{self, AuthEventRef, IncomingEvent};
+use hs_state::error::AuthError;
 use hs_state::kv_store::ProductionStateStore;
+use hs_state::state_fetch::FlatState;
 use ruma::{
     EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomAliasId, RoomId, RoomVersionId, UserId,
 };
@@ -96,6 +99,38 @@ pub struct StateAtEvent {
     /// `crates/hs-cli/src/federation.rs`'s `current_state_with_auth_chain` for the existing
     /// precedent this mirrors).
     pub auth_chain: Vec<Event>,
+}
+
+/// Outcome of [`RoomActor::accept_remote_event`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteEventOutcome {
+    /// This actor already held an event with this ID; accepting it again was a no-op -- no
+    /// re-authorization, no second timeline entry, no second publish. The normal shape of a
+    /// retried federation transaction or an event that arrives by more than one path.
+    AlreadyKnown,
+    /// Newly authorized and durably persisted, at this room-local [`EventSn`].
+    Stored(EventSn),
+}
+
+/// Reads the event ID a `m.room.redaction` event redacts, from either wire shape: the top-level
+/// `redacts` field (room versions 3 and later) or `content.redacts` (room versions 1-2, and
+/// mirrored onto the top level by some senders). Used only to populate
+/// [`hs_state::auth::IncomingEvent::redacts`] for the pre-v3 special-case redaction check
+/// (`hs_state::auth::check_room_redaction`); every other check ignores this field entirely.
+fn extract_redacts(event: &Event) -> Option<OwnedEventId> {
+    let top = event
+        .json()
+        .get("redacts")
+        .and_then(CanonicalJsonValue::as_str);
+    let nested = event
+        .json()
+        .get("content")
+        .and_then(CanonicalJsonValue::as_object)
+        .and_then(|c| c.get("redacts"))
+        .and_then(CanonicalJsonValue::as_str);
+    top.or(nested)
+        .and_then(|s| EventId::parse(s).ok())
+        .map(|id| id.to_owned())
 }
 
 /// The synchronous room actor. Not `Send`-safe to hold across an `.await` (it borrows nothing
@@ -592,6 +627,168 @@ impl<B: KvBackend> RoomActor<B> {
             Some("knock") => PriorState::Knock,
             _ => PriorState::None,
         })
+    }
+
+    /// Accepts an already hash- and signature-verified, foreign [`Event`] and persists it exactly
+    /// as received -- the entry point `docs/design/04-room-actor-protocol.md` names
+    /// `Command::PersistInbound` and `docs/status/06-federation.md` names as the one gap standing
+    /// between this server and real inbound federation. Unlike [`RoomActor::send_event`] /
+    /// [`RoomActor::send_event_citing`] (which *build and sign a new* locally-originated event),
+    /// this method builds nothing and signs nothing: `event`'s ID, `hashes` and `signatures`
+    /// round-trip byte-identically into storage, because every other homeserver in the room will
+    /// recompute and check them.
+    ///
+    /// # What the caller must already have done
+    /// **Content hash and signature verification are the caller's job, not this method's.** The
+    /// intended caller is `hs_federation::inbound::verify_pdu` (via its `RoomWriteSink` seam);
+    /// this method trusts that `event` already passed that check and does not redo it. This
+    /// method adds exactly three things on top: idempotency, ancestor presence, and Matrix event
+    /// authorization.
+    ///
+    /// # Authorization: which of the spec's three snapshots this checks
+    /// The server-server spec's "Checks performed on receipt of a PDU" runs event authorization
+    /// against three different state snapshots. This method implements the first two -- both
+    /// **hard** rejections -- and does not implement the third:
+    ///
+    /// 1. **Implemented** -- *the state implied by the event's own `auth_events`*: builds a
+    ///    [`FlatState`] directly from the bodies of the events `event.auth_events` names (exactly
+    ///    those events, not a state-store resolution) and runs [`auth::check_event_auth`] against
+    ///    it, after [`auth::check_auth_events_selection`] confirms the selection itself is the one
+    ///    the spec's auth-events-selection algorithm would have produced against this room's
+    ///    actual current state.
+    /// 2. **Implemented** -- *the state before the event*: resolves this room's state at
+    ///    `event`'s own `prev_events` (via [`StateStore::current_state`], the same resolution
+    ///    [`RoomActor::send_event_citing`] authorizes newly-built events against) and runs
+    ///    [`auth::check_event_auth`] against that.
+    /// 3. **Not implemented** -- *the room's current state at receipt time*: the spec treats a
+    ///    failure here as a **soft failure** (the event is still stored, just excluded from some
+    ///    views/forward-extremity consideration), which needs a persisted-but-excluded event
+    ///    representation this crate does not have. Every rejection this method produces is
+    ///    therefore a hard rejection.
+    ///
+    /// A failure of either implemented check means the event is **refused outright and not
+    /// persisted at all** (`RoomError::Forbidden`) -- this session's documented choice over
+    /// storing it with a rejected flag (`hs_model::event::EventFlags` already has one, unused
+    /// here): nothing yet reads a "stored but rejected" event back out, so storing one would be
+    /// silent dead weight. Revisit once soft-fail support needs the flag.
+    ///
+    /// # Idempotency and ordering
+    /// Receiving the same `event.event_id()` twice returns [`RemoteEventOutcome::AlreadyKnown`]
+    /// without repeating auth or storage work -- the normal shape of a retried `/send` transaction
+    /// or an event that arrives by both `/send` and backfill. An event whose `prev_events` or
+    /// `auth_events` name an ancestor this actor does not hold is
+    /// [`RoomError::MissingAncestors`]: the ordinary federation case of an event arriving before
+    /// its history has been backfilled. This method never fetches anything itself (no network
+    /// access from `hs-room`) -- closing that gap is track 06's backfill, not a retry loop here.
+    ///
+    /// # Errors
+    /// [`RoomError::MissingAncestors`] if a cited `prev_events`/`auth_events` entry is not held by
+    /// this actor; [`RoomError::Forbidden`] if authorization rejects the event; [`RoomError::State`]
+    /// if the state store fails; [`RoomError::Store`] on a storage failure persisting the event.
+    pub fn accept_remote_event(&mut self, event: Event) -> Result<RemoteEventOutcome, RoomError> {
+        if self.event_id_index.contains_key(event.event_id()) {
+            return Ok(RemoteEventOutcome::AlreadyKnown);
+        }
+
+        let prev_ids = pipeline::decode_event_ids(event.json().get("prev_events"));
+        let auth_ids = pipeline::decode_event_ids(event.json().get("auth_events"));
+
+        let mut missing = Vec::new();
+        let mut prev_sns = Vec::with_capacity(prev_ids.len());
+        for id in &prev_ids {
+            match self.event_id_index.get(id) {
+                Some(&sn) => prev_sns.push(sn),
+                None => missing.push(id.clone()),
+            }
+        }
+        let mut auth_sns = Vec::with_capacity(auth_ids.len());
+        for id in &auth_ids {
+            match self.event_id_index.get(id) {
+                Some(&sn) => auth_sns.push(sn),
+                None => missing.push(id.clone()),
+            }
+        }
+        if !missing.is_empty() {
+            return Err(RoomError::MissingAncestors(missing));
+        }
+
+        {
+            let mut auth_flat = FlatState::new();
+            let mut auth_event_refs = Vec::with_capacity(auth_sns.len());
+            for &sn in &auth_sns {
+                let e = self
+                    .events
+                    .get(&sn)
+                    .ok_or_else(|| RoomError::Internal("auth event not in hot cache".into()))?;
+                let content = e
+                    .json()
+                    .get("content")
+                    .and_then(CanonicalJsonValue::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                auth_flat.insert(
+                    e.header().event_type.clone(),
+                    e.header().state_key.clone().unwrap_or_default(),
+                    e.header().sender.clone(),
+                    content,
+                );
+                auth_event_refs.push(AuthEventRef {
+                    event_type: &e.header().event_type,
+                    state_key: e.header().state_key.as_deref().unwrap_or(""),
+                    rejected: e.header().flags.is_rejected(),
+                });
+            }
+
+            let content_obj = event
+                .json()
+                .get("content")
+                .and_then(CanonicalJsonValue::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let redacts_owned = extract_redacts(&event);
+            let only_prev_is_create = prev_sns.len() == 1
+                && self
+                    .events
+                    .get(&prev_sns[0])
+                    .is_some_and(|e| e.header().event_type == "m.room.create");
+
+            let incoming = IncomingEvent {
+                event_type: &event.header().event_type,
+                sender: AsRef::<UserId>::as_ref(&event.header().sender),
+                room_id: Some(&self.room_id),
+                state_key: event.header().state_key.as_deref(),
+                content: &content_obj,
+                prev_event_count: prev_sns.len(),
+                only_prev_event_is_room_create: only_prev_is_create,
+                event_id: Some(event.event_id()),
+                redacts: redacts_owned.as_deref(),
+            };
+
+            let state_before = self.state_view(&prev_sns)?;
+            let create_lookup = || {
+                state_before
+                    .event_for("m.room.create", "")
+                    .map(|found| found.is_some())
+                    .map_err(|e| AuthError::reject(e.to_string()))
+            };
+            auth::check_auth_events_selection(
+                &self.rules,
+                &incoming,
+                &auth_event_refs,
+                create_lookup,
+            )
+            .map_err(RoomError::from)?;
+
+            auth::check_event_auth(&self.rules, &incoming, &auth_flat).map_err(|e| {
+                RoomError::Forbidden(format!("auth-events-implied state rejected event: {e}"))
+            })?;
+            auth::check_event_auth(&self.rules, &incoming, &state_before.state_fetch()).map_err(
+                |e| RoomError::Forbidden(format!("state-before-the-event rejected event: {e}")),
+            )?;
+        }
+
+        let event_sn = self.persist(event)?;
+        Ok(RemoteEventOutcome::Stored(event_sn))
     }
 
     /// Persists a built, authorized event: interns it, writes the event record, timeline entry,
@@ -1635,6 +1832,19 @@ impl<B: KvBackend> RoomActorHandle<B> {
         .await
     }
 
+    /// `crate::protocol`'s `Command::PersistInbound`: accepts an already-verified, foreign
+    /// [`Event`] and persists it byte-identically. See [`RoomActor::accept_remote_event`] for
+    /// exactly what this authorizes, refuses, and the caller's own hash/signature-verification
+    /// obligation. This is the seam `hs_federation::inbound::RoomWriteSink` is meant to call
+    /// through, one directly-owned `RoomActorHandle` per room.
+    pub async fn accept_remote_event(&self, event: Event) -> Result<RemoteEventOutcome, RoomError>
+    where
+        B: 'static,
+    {
+        self.with_actor(move |actor| actor.accept_remote_event(event))
+            .await
+    }
+
     /// Reads the room under the lock, off the async executor thread.
     pub async fn query<T, F>(&self, f: F) -> T
     where
@@ -2238,5 +2448,260 @@ mod tests {
             .redact_txn(alice, None, "txn-2", first.event_id().to_owned(), None, 5)
             .unwrap();
         assert_eq!(redact_first.event_id(), redact_retried.event_id());
+    }
+
+    // --- `RoomActor::accept_remote_event`: the "join a real public room over federation" gap ---
+
+    /// Builds a `m.room.message`, hashed and signed exactly the way `hs_federation::inbound`'s
+    /// `verify_pdu` would hand one to `RoomActor::accept_remote_event` -- but built and signed
+    /// entirely independently of `crate::pipeline::build_and_authorize` (which both builds *and*
+    /// authorizes, and therefore cannot construct an event that fails authorization). `sender`'s
+    /// `auth_events` are exactly this room's current `m.room.create` and `m.room.power_levels`
+    /// (never a `m.room.member` entry for `sender`, matching what a real sender selects when it
+    /// has none) -- valid if `sender` is joined, and deliberately unauthorized if not.
+    fn build_remote_message(
+        actor: &RoomActor<MemoryBackend>,
+        sender: &UserId,
+        remote_server: &ruma::ServerName,
+        remote_key: &hs_model::signing::SigningKeyPair,
+        body: &str,
+    ) -> Event {
+        use hs_model::canonical::{CanonicalJsonObject, CanonicalJsonValue, to_canonical_object};
+        use hs_model::{hash, signing};
+
+        let create = actor.state_event("m.room.create", "").unwrap().unwrap();
+        let power_levels = actor
+            .state_event("m.room.power_levels", "")
+            .unwrap()
+            .unwrap();
+        // Mirrors `crate::pipeline::select_auth_events`: `m.room.member(sender)` is only in the
+        // wanted set if it actually has a value in current state -- present when `sender` has
+        // ever joined/been invited/etc, absent (correctly) when `sender` is a stranger like
+        // `accept_remote_event_rejects_an_unauthorized_sender_...`'s `eve`.
+        let sender_member = actor.state_event("m.room.member", sender.as_str()).unwrap();
+        let prev_sns = actor.forward_extremities_vec();
+        let prev_refs = actor.refs_for(&prev_sns).unwrap();
+        let depth = prev_refs.iter().map(|r| r.depth).max().map_or(1, |d| d + 1);
+
+        let mut object = serde_json::Map::new();
+        object.insert("type".into(), serde_json::json!("m.room.message"));
+        object.insert("sender".into(), serde_json::json!(sender.as_str()));
+        object.insert(
+            "room_id".into(),
+            serde_json::json!(actor.room_id().as_str()),
+        );
+        object.insert("origin_server_ts".into(), serde_json::json!(2_i64));
+        object.insert("depth".into(), serde_json::json!(depth));
+        object.insert(
+            "content".into(),
+            serde_json::json!({"msgtype": "m.text", "body": body}),
+        );
+        object.insert(
+            "prev_events".into(),
+            serde_json::json!(
+                prev_refs
+                    .iter()
+                    .map(|r| r.event_id.to_string())
+                    .collect::<Vec<_>>()
+            ),
+        );
+        let mut auth_event_ids = vec![
+            create.event_id().to_string(),
+            power_levels.event_id().to_string(),
+        ];
+        if let Some(member) = sender_member {
+            auth_event_ids.push(member.event_id().to_string());
+        }
+        object.insert("auth_events".into(), serde_json::json!(auth_event_ids));
+
+        let mut canonical = to_canonical_object(&serde_json::Value::Object(object), true).unwrap();
+        let content_hash = hash::content_hash_base64(&canonical);
+        canonical.insert(
+            "hashes".to_owned(),
+            CanonicalJsonValue::Object(CanonicalJsonObject::from([(
+                "sha256".to_owned(),
+                CanonicalJsonValue::String(content_hash),
+            )])),
+        );
+        signing::sign_object(&mut canonical, remote_server, remote_key).unwrap();
+        let final_bytes = CanonicalJsonValue::Object(canonical).to_canonical_bytes();
+        let final_value: serde_json::Value = serde_json::from_slice(&final_bytes).unwrap();
+        Event::parse(&final_value, RoomVersionId::V11).unwrap()
+    }
+
+    /// Deliverable 4's core claim: a remote event round-trips byte-identically (its `event_id`
+    /// still hashes correctly after storage) and reaches both the timeline and the publish stream
+    /// `hs-user`'s feeds subscribe to.
+    #[test]
+    fn accept_remote_event_round_trips_byte_identically_and_reaches_publish_stream() {
+        let mut actor = room("public_chat");
+        let bob = user_id!("@bob:remote.example");
+        // Bob joins through the ordinary membership pipeline (a public room needs no invite) --
+        // this is what a real federated join would have already produced in this room's state;
+        // `accept_remote_event` only ever reads the room's *already-persisted* state; it does not
+        // care how bob got there.
+        actor
+            .membership_action(
+                bob.to_owned(),
+                Action::Join,
+                bob.to_owned(),
+                serde_json::json!({}),
+                2,
+            )
+            .unwrap();
+
+        let mut rx = actor.subscribe();
+
+        let remote_key = hs_model::signing::SigningKeyPair::generate("1");
+        let remote_server = ruma::ServerName::parse("remote.example").unwrap();
+        let remote_event = build_remote_message(
+            &actor,
+            bob,
+            &remote_server,
+            &remote_key,
+            "hello from a real federation event",
+        );
+        let original_bytes = remote_event.canonical_bytes().clone();
+        let event_id = remote_event.event_id().to_owned();
+
+        let outcome = actor.accept_remote_event(remote_event.clone()).unwrap();
+        assert!(matches!(outcome, RemoteEventOutcome::Stored(_)));
+
+        // Byte-identical: not rebuilt, not re-signed.
+        let stored = actor.event_by_id(&event_id).unwrap();
+        assert_eq!(stored.canonical_bytes(), &original_bytes);
+        assert_eq!(stored.event_id(), &*event_id);
+
+        // Reached the timeline.
+        let (events, _) = actor.paginate(None, Direction::Backward, 1);
+        assert_eq!(events[0].event_id(), &*event_id);
+
+        // Reached the publish stream a local user's sync feed subscribes to
+        // (`docs/workstreams/README.md`'s week-8 seam).
+        let update = rx.try_recv().unwrap();
+        assert_eq!(update.event_id, event_id);
+    }
+
+    /// Deliverable 3: receiving the same remote event twice is a no-op, not a duplicate or an
+    /// error.
+    #[test]
+    fn accept_remote_event_replay_is_a_no_op() {
+        let mut actor = room("public_chat");
+        let bob = user_id!("@bob:remote.example");
+        actor
+            .membership_action(
+                bob.to_owned(),
+                Action::Join,
+                bob.to_owned(),
+                serde_json::json!({}),
+                2,
+            )
+            .unwrap();
+
+        let remote_key = hs_model::signing::SigningKeyPair::generate("1");
+        let remote_server = ruma::ServerName::parse("remote.example").unwrap();
+        let remote_event =
+            build_remote_message(&actor, bob, &remote_server, &remote_key, "sent once");
+
+        let first = actor.accept_remote_event(remote_event.clone()).unwrap();
+        assert!(matches!(first, RemoteEventOutcome::Stored(_)));
+        let count_after_first = actor
+            .paginate(None, Direction::Backward, usize::MAX)
+            .0
+            .len();
+
+        let second = actor.accept_remote_event(remote_event).unwrap();
+        assert_eq!(second, RemoteEventOutcome::AlreadyKnown);
+        let count_after_second = actor
+            .paginate(None, Direction::Backward, usize::MAX)
+            .0
+            .len();
+
+        assert_eq!(
+            count_after_first, count_after_second,
+            "replaying the same event must not add a second timeline entry"
+        );
+    }
+
+    /// Deliverable 2: a remote event whose sender never joined the room must fail authorization,
+    /// be refused outright, and never become visible in the timeline.
+    ///
+    /// This is also this session's mutation test (see the status file): with either
+    /// `auth::check_event_auth` call in `RoomActor::accept_remote_event` short-circuited to
+    /// `Ok(())`, this test fails -- confirmed by hand, then reverted.
+    #[test]
+    fn accept_remote_event_rejects_an_unauthorized_sender_and_it_never_becomes_visible() {
+        let mut actor = room("public_chat");
+        let eve = user_id!("@eve:remote.example");
+        let remote_key = hs_model::signing::SigningKeyPair::generate("1");
+        let remote_server = ruma::ServerName::parse("remote.example").unwrap();
+        let bad_event = build_remote_message(
+            &actor,
+            eve,
+            &remote_server,
+            &remote_key,
+            "i was never a member of this room",
+        );
+        let bad_event_id = bad_event.event_id().to_owned();
+
+        let err = actor.accept_remote_event(bad_event).unwrap_err();
+        assert!(
+            matches!(err, RoomError::Forbidden(_)),
+            "expected Forbidden, got {err:?}"
+        );
+        assert!(actor.event_by_id(&bad_event_id).is_none());
+        let (events, _) = actor.paginate(None, Direction::Backward, usize::MAX);
+        assert!(events.iter().all(|e| e.event_id() != &*bad_event_id));
+    }
+
+    /// Deliverable 3: an event whose `prev_events` this actor does not hold is the ordinary
+    /// federation "needs backfill" case, not a hard rejection and not a panic -- named with its
+    /// own distinct error so a caller (track 06) can tell it apart from a genuine authorization
+    /// failure.
+    #[test]
+    fn accept_remote_event_with_unknown_prev_events_is_a_distinct_error() {
+        use hs_model::canonical::{CanonicalJsonObject, CanonicalJsonValue, to_canonical_object};
+        use hs_model::{hash, signing};
+
+        let mut actor = room("public_chat");
+        let alice = user_id!("@alice:hs1");
+        let remote_key = hs_model::signing::SigningKeyPair::generate("1");
+        let remote_server = ruma::ServerName::parse("hs1").unwrap();
+
+        let mut object = serde_json::Map::new();
+        object.insert("type".into(), serde_json::json!("m.room.message"));
+        object.insert("sender".into(), serde_json::json!(alice.as_str()));
+        object.insert(
+            "room_id".into(),
+            serde_json::json!(actor.room_id().as_str()),
+        );
+        object.insert("origin_server_ts".into(), serde_json::json!(99_i64));
+        object.insert("depth".into(), serde_json::json!(99_i64));
+        object.insert("content".into(), serde_json::json!({"body": "orphan"}));
+        object.insert(
+            "prev_events".into(),
+            serde_json::json!(["$doesnotexist:remote.example"]),
+        );
+        object.insert("auth_events".into(), serde_json::json!([]));
+
+        let mut canonical = to_canonical_object(&serde_json::Value::Object(object), true).unwrap();
+        let content_hash = hash::content_hash_base64(&canonical);
+        canonical.insert(
+            "hashes".to_owned(),
+            CanonicalJsonValue::Object(CanonicalJsonObject::from([(
+                "sha256".to_owned(),
+                CanonicalJsonValue::String(content_hash),
+            )])),
+        );
+        signing::sign_object(&mut canonical, &remote_server, &remote_key).unwrap();
+        let final_bytes = CanonicalJsonValue::Object(canonical).to_canonical_bytes();
+        let final_value: serde_json::Value = serde_json::from_slice(&final_bytes).unwrap();
+        let orphan = Event::parse(&final_value, RoomVersionId::V11).unwrap();
+
+        let err = actor.accept_remote_event(orphan).unwrap_err();
+        assert!(
+            matches!(err, RoomError::MissingAncestors(_)),
+            "expected MissingAncestors, got {err:?}"
+        );
     }
 }

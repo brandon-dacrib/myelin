@@ -2,7 +2,189 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
-Last updated: 2026-09-18 (session 2, user profiles).
+Last updated: 2026-09-18 (session 3, `RoomActor::accept_remote_event` -- the `Command::PersistInbound`
+gap).
+
+## Session 3 (2026-09-18): `RoomActor::accept_remote_event` -- persisting an event this server did not create
+
+**What this closes.** `docs/status/06-federation.md`'s "the one gap this session could not
+close": track 06 landed real inbound federation (`PUT /_matrix/federation/v1/send/{txnId}`
+verifying content hashes and signatures, and `make_join`/`send_join`), but every one of those
+paths bottomed out at a wall -- `RoomActor` could only build-and-sign *new*, locally-originated
+events (`send_event`/`send_event_citing`). There was no entry point that took an already-signed
+foreign `hs_model::Event` and stored it as-is. This session adds that entry point. Scope for this
+session was **`crates/hs-room/**` and this status file only** -- `hs-federation`, `hs-cli`,
+`hs-admin`, `hs-auth`, `hs-user` and `hs-loadgen` were off limits (other tracks in flight); wiring
+this into `hs_federation::inbound::RoomWriteSink` is the integration lead's or track 06's next
+step, not done here.
+
+### The entry point
+
+```rust
+// crates/hs-room/src/actor.rs
+
+pub enum RemoteEventOutcome {
+    AlreadyKnown,
+    Stored(EventSn),
+}
+
+impl<B: KvBackend> RoomActor<B> {
+    pub fn accept_remote_event(&mut self, event: Event) -> Result<RemoteEventOutcome, RoomError>;
+}
+
+// Async, serialized wrapper -- the one to actually call from another task/crate:
+impl<B: KvBackend> RoomActorHandle<B> {
+    pub async fn accept_remote_event(&self, event: Event) -> Result<RemoteEventOutcome, RoomError>;
+}
+```
+
+**What the caller must already have done.** Content hash and signature verification are the
+*caller's* job, not this method's. The intended caller is `hs_federation::inbound::verify_pdu`
+(which already produces a parsed, hash- and signature-checked `hs_model::Event`), reached through
+`hs_federation::inbound::RoomWriteSink::accept_verified_event(room_id: &str, event_id: &str,
+event_json: &Value)`. That trait hands back JSON, not an `Event` -- the caller (whatever `hs-cli`
+type implements `RoomWriteSink` around a `RoomActorHandle`) needs to re-parse `event_json` via
+`hs_model::Event::parse(event_json, room_version)` (cheap: it is the same canonical bytes
+`verify_pdu` already validated) before calling `RoomActorHandle::accept_remote_event`. This method
+trusts that `event` already passed hash/signature verification and does not redo either check.
+
+**What it authorizes -- exactly two of the spec's three snapshots.** The server-server spec's
+"Checks performed on receipt of a PDU" runs event authorization against three different state
+snapshots. This method implements the first two, both as **hard** rejections, and does not
+implement the third:
+
+1. **Implemented -- the state implied by the event's own `auth_events`.** Builds a
+   `hs_state::state_fetch::FlatState` directly from the bodies of the events `event.auth_events`
+   names (exactly those events, not a state-store resolution) and runs
+   `hs_state::auth::check_event_auth` against it, after `check_auth_events_selection` confirms the
+   selection itself is what the spec's auth-events-selection algorithm would have produced against
+   this room's actual current state.
+2. **Implemented -- the state before the event.** Resolves this room's state at `event`'s own
+   `prev_events` (via `hs_state::api::StateStore::current_state`, the same resolution
+   `RoomActor::send_event_citing` already authorizes newly-built events against) and runs
+   `check_event_auth` against that.
+3. **Not implemented -- the room's current state at receipt time.** The spec treats a failure here
+   as a **soft failure** (the event is still stored, just excluded from some views and from
+   forward-extremity consideration), which needs a persisted-but-excluded event representation
+   this crate does not have yet (`hs_model::event::EventFlags` does have an `is_rejected` bit
+   already, but nothing reads a "stored but rejected" event back out). Do not read this method as
+   implementing soft-fail: every rejection it produces is a hard one.
+
+**What each outcome/error means for the caller:**
+
+- `Ok(RemoteEventOutcome::AlreadyKnown)` -- this actor already held an event with this ID; nothing
+  was re-authorized or re-persisted. Maps cleanly onto `RoomWriteSink`'s own
+  `WriteOutcome::AlreadyKnown`.
+- `Ok(RemoteEventOutcome::Stored(EventSn))` -- newly authorized and durably persisted, reached the
+  timeline and the publish stream. Maps onto `WriteOutcome::Stored`.
+- `Err(RoomError::MissingAncestors(Vec<OwnedEventId>))` -- `event`'s `prev_events` or
+  `auth_events` name an ancestor this actor does not hold. **The ordinary federation case of an
+  event arriving before its history has been backfilled, not a protocol violation** -- this method
+  never fetches anything itself (no network access from `hs-room`), so the caller (track 06) is
+  expected to backfill the named IDs and retry, not to treat this as a rejection. Deliberately a
+  distinct variant from `Forbidden` so a `RoomWriteSink` implementation can tell "go backfill and
+  retry" apart from "do not retry, this event is bad".
+- `Err(RoomError::Forbidden(String))` -- authorization rejected the event against one of the two
+  implemented snapshots. **Refused outright: not persisted at all** (see the "hard rejection"
+  decision below). The message names which snapshot failed (`"auth-events-implied state rejected
+  event: ..."` or `"state-before-the-event rejected event: ..."`).
+- `Err(RoomError::State(String))` / `Err(RoomError::Store(_))` -- the state store or the underlying
+  KV store failed; not this event's fault.
+
+### Decisions made this session
+
+- **A rejected remote event is refused outright, not stored with a rejected flag.** Both
+  authorization failures return `Err` before any KV write happens. The alternative the brief
+  offered (store it, marked rejected) would need a code path that reads "stored but rejected"
+  events back out (for the third snapshot's soft-fail semantics, for `/state_ids`'
+  `auth_chain_ids` including rejected events, etc.) -- nothing in this crate does that yet, so
+  storing one would be dead weight with no consumer. Revisit together with soft-fail support.
+- **Only two of the three spec snapshots are checked** (auth-events-implied, state-before); the
+  third (current-state-at-receipt, soft-fail) is not implemented -- see above. Do not build
+  anything downstream that assumes soft-fail exists.
+- **`RoomActor::persist` (the existing build-then-persist path's second half) needed no changes at
+  all.** Reading it closely: it already takes a plain `Event` and writes it byte-identically
+  (`event.canonical_bytes()` into `PersistedEvent.json`, `event.event_id()` for indexing,
+  `decode_event_ids(event.json().get("prev_events"))` for extremity bookkeeping) -- it never
+  assumed the event was locally built. `accept_remote_event` reuses it unchanged as the "mechanical
+  half" the brief asked for; the only new code is the idempotency check, ancestor-presence check,
+  and the two authorization calls in front of it.
+- **Missing `auth_events`, not just missing `prev_events`, is folded into the same
+  `RoomError::MissingAncestors`.** Both indicate the same thing from this actor's point of view
+  ("I don't have some ancestor this event cites, backfill me"); a caller does not need to
+  distinguish them to decide what to do next (fetch the missing IDs and retry).
+- **`extract_redacts`** (a small free function in `actor.rs`) reads `content.redacts` (room
+  versions 1-2) or the top-level `redacts` field (room versions 3+) to populate
+  `IncomingEvent::redacts`, needed only by the pre-v3 `m.room.redaction` special-case check. This
+  duplicates a few lines of logic `crate::pipeline` does not currently expose as a standalone
+  function; not worth a shared helper for three lines, noted here in case track 02 adds one.
+
+### Tests (`crates/hs-room/src/actor.rs`, `mod tests`)
+
+Four new tests, all passing, plus every pre-existing test still green (32 lib + 4 scenario tests,
+`cargo test -p hs-room`):
+
+- `accept_remote_event_round_trips_byte_identically_and_reaches_publish_stream` -- builds a
+  `m.room.message` signed with a signing key and server name **distinct from this actor's own
+  identity** (proving `accept_remote_event` neither re-signs nor re-authors it), for a sender
+  (`@bob:remote.example`) who joined the room through the ordinary membership pipeline first.
+  Asserts: `Stored(_)`; the stored event's `canonical_bytes()` are byte-identical to the
+  pre-storage bytes; it appears at the head of `paginate(Backward)`; a subscriber to
+  `RoomActor::subscribe()` (the same broadcast stream `hs-user`'s feeds consume) receives a
+  `RoomUpdate` naming this event.
+- `accept_remote_event_replay_is_a_no_op` -- accepts the same built event twice; asserts the
+  second call returns `AlreadyKnown` and the timeline length is unchanged (no duplicate).
+- `accept_remote_event_rejects_an_unauthorized_sender_and_it_never_becomes_visible` -- builds the
+  same shape of event for a sender (`@eve:remote.example`) who never joined; asserts `Err(Forbidden(_))`,
+  and that the event is absent from both `event_by_id` and the timeline. **This is also this
+  session's mutation test**: both `check_event_auth` calls in `accept_remote_event` were replaced
+  with no-ops (`let _ = &auth_flat; let _ = &state_before;`), this test was confirmed to fail
+  (`Stored(EventSn(7))` instead of the expected rejection), and the real checks were then restored
+  -- `cargo test -p hs-room` is green again with them back. Full before/after transcript is in this
+  session's tool history; not reproduced here, but the mutation and revert both happened.
+- `accept_remote_event_with_unknown_prev_events_is_a_distinct_error` -- an event citing a
+  `prev_events` ID this actor never persisted; asserts `Err(MissingAncestors(_))` specifically (not
+  `Forbidden`, not a panic).
+
+All four tests build their PDUs by hand (canonicalize, hash, sign, `Event::parse`) rather than
+through `crate::pipeline::build_and_authorize`, deliberately: that function *builds and authorizes
+in one step*, so it cannot produce an event that later fails authorization -- exactly the shape
+needed to prove `accept_remote_event`'s own authorization actually runs.
+
+### Verify
+
+```
+cargo fmt -p hs-room -- --check
+cargo clippy -p hs-room --all-targets -- -D warnings
+cargo test -p hs-room
+cargo build -p hs-cli --bin hs && cargo test -p hs-loadgen --test real_client -- --nocapture
+```
+
+All green as of this session: `hs-room` 32 lib tests (was 28; added the four above) + 4 scenario
+tests; `hs-loadgen`'s real-client regression net still passes all 17 steps unchanged (this session
+added no client-server-visible behavior, only an internal entry point nothing yet calls).
+
+### What is next (for track 06 / the integration lead)
+
+1. In `hs-cli` (off limits this session): implement `hs_federation::inbound::RoomWriteSink` for a
+   type wrapping `hs_room::registry::RoomRegistry`/`RoomActorHandle`:
+   `accept_verified_event(room_id, event_id, event_json)` should look up (or load) the room's
+   `RoomActorHandle`, `hs_model::Event::parse(event_json, room_version)`, and call
+   `handle.accept_remote_event(event).await`, mapping `RemoteEventOutcome`/`RoomError` onto
+   `WriteOutcome`/`WriteRejected` (a `RoomError::MissingAncestors` should probably become a
+   distinct `WriteRejected` message telling the caller which IDs to backfill, or a new
+   `RoomWriteSink` outcome variant if track 06 wants a first-class one -- that trait is track 06's
+   to extend).
+2. Backfill (`/backfill`, `/get_missing_events`) is still track 06's job entirely; this session
+   only makes `hs-room` refuse cleanly (not panic, not silently drop) when it is missing.
+3. Soft-fail (the third auth snapshot) and rejected-but-stored events, if/when something downstream
+   needs them (e.g. `/state_ids`'s `auth_chain_ids` wanting to include rejected events, or a client
+   wanting to see an event that soft-failed for it specifically but not for others).
+4. `send_join`'s persistence step (`crates/hs-federation/src/join.rs`, per that crate's own module
+   docs) is a second, obvious caller of this same entry point once wired -- it already calls
+   `RoomActor::send_event_citing` for events *it* builds; the remote room's existing history it
+   receives via `send_join`'s response should go through `accept_remote_event` instead of being
+   silently accepted as already-trusted.
 
 ## Session 2 (2026-09-18): user profiles
 
@@ -243,6 +425,8 @@ Nothing left mid-implementation; everything above is complete for the scope it c
 - `Command::PersistInbound` (the federation-facing seam named in
   `docs/design/04-room-actor-protocol.md`) is not implemented; this is deliberate per this track's
   instructions ("Do not implement federation... leave a clear seam"). Track 06 is the consumer.
+  **Closed in session 3**: see `RoomActor::accept_remote_event`/`RoomActorHandle::accept_remote_event`
+  at the top of this file.
 - The hot-state cache holds a room's *entire* event history in memory for the actor's lifetime
   (Phase 0 scope decision, documented on `RoomActor`'s `events` field); a bounded recent-timeline
   window with KV fallback for older events is the natural next step once memory pressure on large
@@ -260,6 +444,12 @@ None. Everything this pass needed from other tracks (`hs-kv`, `hs-tables`, `hs-m
 
 - `hs_room::actor::{RoomActor, RoomActorHandle, CreateRoomRequest, InitialStateEvent}`: the room
   actor and its async handle.
+- `hs_room::actor::{RoomActor, RoomActorHandle}::accept_remote_event` /
+  `hs_room::actor::RemoteEventOutcome` (session 3): the `Command::PersistInbound` seam -- persists
+  an already-verified foreign `hs_model::Event` byte-identically. See this file's session 3 section
+  for the exact contract (what the caller must have verified, what each outcome/error means).
+  **Track 06**: this is the entry point `RoomWriteSink::accept_verified_event` should call through
+  from `hs-cli`.
 - `hs_room::protocol::RoomUpdate` (plus `ChangedStateKey`, `MembershipDelta`): the publish stream
   named in `docs/workstreams/README.md`'s week-8 seam. `RoomActorHandle::subscribe()` returns a
   `tokio::sync::broadcast::Receiver<RoomUpdate>`. **Tracks 05, 06, 10, 11**: this is frozen enough
@@ -292,9 +482,13 @@ None. Everything this pass needed from other tracks (`hs-kv`, `hs-tables`, `hs-m
   ownership routing eventually requires (forwarding a request to the replica that owns a room);
   nothing about `RoomActorHandle`'s public API should need to change for that, but it has not been
   exercised against a real multi-replica scenario.
-- **06 (federation)**: `Command::PersistInbound` is the named seam; not implemented. See
-  `docs/design/04-room-actor-protocol.md` section 2 and the RFC's section 2 for exactly what
-  federation-driven forks need from `hs-state` that this pass's workaround does not provide.
+- **06 (federation)**: `Command::PersistInbound` is now `RoomActorHandle::accept_remote_event`
+  (session 3, top of this file) -- implement `hs_federation::inbound::RoomWriteSink` in `hs-cli`
+  against it. `docs/design/04-room-actor-protocol.md` section 2 and the RFC's section 2 still apply
+  for what federation-driven *forks* need from `hs-state` beyond what session 3's workaround
+  provides (session 3 reuses the same single-writer state-view machinery `send_event_citing`
+  already used for the fork it can construct; a real multi-server fork arriving in quick
+  succession over federation is not yet covered by this crate's own test suite).
 - **10 (push)**: `RoomUpdate::push_evaluation_inputs` is an empty placeholder; tell this track the
   concrete shape once designed and it is a small, additive change to `RoomActor::persist`.
 - **14 (test/conformance)**: Complement `csapi` room tests and differential tests against Synapse

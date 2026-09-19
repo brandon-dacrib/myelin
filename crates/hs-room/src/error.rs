@@ -71,6 +71,14 @@ pub enum RoomError {
     /// misreported as a client error upstream).
     #[error("internal room actor invariant violated: {0}")]
     Internal(String),
+
+    /// [`crate::actor::RoomActor::accept_remote_event`]: the event names a `prev_events` or
+    /// `auth_events` entry this actor does not hold. The ordinary federation case of an event
+    /// arriving before its ancestors have been backfilled -- not a hard protocol violation, and
+    /// deliberately distinct from [`RoomError::Forbidden`] so a caller (track 06) can tell "go
+    /// backfill these IDs and retry" apart from "this event is rejected, do not retry".
+    #[error("missing {0:?}: backfill required before this event can be authorized")]
+    MissingAncestors(Vec<ruma::OwnedEventId>),
 }
 
 impl RoomError {
@@ -97,6 +105,11 @@ impl RoomError {
                 axum::http::StatusCode::BAD_REQUEST,
                 MatrixErrorCode::InvalidParam,
                 "invalid pagination token",
+            ),
+            Self::MissingAncestors(_) => MatrixError::custom(
+                axum::http::StatusCode::CONFLICT,
+                MatrixErrorCode::Other("M_MISSING_PREV_EVENTS".to_owned()),
+                self.to_string(),
             ),
             Self::Signing(_)
             | Self::Redaction(_)
