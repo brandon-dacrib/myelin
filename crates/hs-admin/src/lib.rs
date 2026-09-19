@@ -8,6 +8,7 @@
 //! - [`auth`]: the [`auth::TokenVerifier`] trait track 07 implements, and scope enforcement.
 //! - [`audit`]: the [`audit::AuditSink`] trait and an in-memory implementation.
 //! - [`events`]: the SSE event bus (publish, subscribe, replay buffer).
+//! - [`idempotency`]: the in-process `Idempotency-Key` cache mutating handlers use.
 //! - [`operations`]: the operation table generated alongside `openapi/openapi.yaml`.
 //! - [`router`]: the axum router built from that table (real handlers for a first slice of
 //!   operations, `501` for the rest).
@@ -24,6 +25,7 @@ pub mod assets;
 pub mod audit;
 pub mod auth;
 pub mod events;
+pub mod idempotency;
 pub mod model;
 pub mod openapi;
 pub mod operations;

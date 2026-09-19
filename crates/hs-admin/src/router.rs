@@ -11,21 +11,30 @@
 //! `openapi.yaml` regardless of which operations are real yet — registering a real handler never
 //! changes an operation's `(method, path)`.
 
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::sse::{Event as AxumSseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
+use futures::stream::Stream;
 use hs_http::router::{AuthKind, Builder, RouteManifest, RouteMeta, Surface};
+use hs_http::{Problem, ValidationError};
 use serde::Deserialize;
+use serde_json::json;
 
-use crate::audit::AuditSink;
+use crate::audit::{AuditFilter, AuditSink};
 use crate::auth::{ScopeDecision, TokenVerifier, require_scope};
-use crate::events::EventBus;
-use crate::model::{Page, Scope, ServerHealth, ServerInfo};
+use crate::events::{EventBus, ReplayOutcome};
+use crate::idempotency::{IdempotencyStore, Replay, StoredResponse};
+use crate::model::{
+    AuditChange, AuditEntry, AuditOutcome, Event, Page, Principal, ResourceRef, Scope,
+    ServerHealth, ServerInfo,
+};
 use crate::operations::{OperationDef, load as load_operations};
-use crate::sources::{UserDirectory, UserFilter};
+use crate::sources::{SourceError, UserDirectory, UserFilter};
 
 /// Everything an `hs-admin` handler needs. Cloned per-request by axum (cheap: everything inside
 /// is an `Arc`, a plain value type, or `Copy`).
@@ -47,6 +56,10 @@ pub struct AdminState {
     /// integration lead wires a real implementation with [`AdminState::with_users`]; the two user
     /// handlers answer `503 unavailable` rather than faking data or hiding behind a `404`.
     pub users: Option<Arc<dyn UserDirectory>>,
+    /// The `Idempotency-Key` cache every mutating handler that declares it consults (see
+    /// [`crate::idempotency`]). Always present (never `None`): a client is never told its
+    /// idempotency key was ignored.
+    pub idempotency: Arc<IdempotencyStore>,
 }
 
 impl AdminState {
@@ -63,6 +76,7 @@ impl AdminState {
             server_info: ServerInfo::default(),
             started_at: Instant::now(),
             users: None,
+            idempotency: Arc::new(IdempotencyStore::new()),
         }
     }
 
@@ -125,6 +139,14 @@ const REAL_HANDLERS: &[&str] = &[
     "server.health",
     "users.list",
     "users.get",
+    "users.update",
+    "users.lock",
+    "users.unlock",
+    "users.deactivate",
+    "users.reactivate",
+    "audit_log.list",
+    "audit_log.get",
+    "events.stream",
 ];
 
 /// The `503 unavailable` problem a handler answers when its backing [`crate::sources`] trait
@@ -320,6 +342,842 @@ async fn users_get(
     }
 }
 
+// -------------------------------------------------------------------------------------------
+// user mutations: lock, unlock, deactivate, reactivate, update (RFC 0004 sections 9/10, brief
+// deliverable 1). Every one of these writes exactly one AuditEntry (`record_mutation`) and
+// publishes exactly one Event before answering — never a mutation that "succeeds" silently.
+// -------------------------------------------------------------------------------------------
+
+/// The body of `POST .../lock`, `.../unlock` and `.../reactivate` (OpenAPI `ReasonRequest`).
+/// `notify` is accepted (so a well-formed request body is never rejected) but not yet acted on:
+/// no notification source exists to send through.
+#[derive(Debug, Default, Deserialize)]
+struct ReasonRequest {
+    reason: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    notify: Option<bool>,
+}
+
+/// The body of `POST .../deactivate` (OpenAPI's inline schema): like [`ReasonRequest`] plus
+/// `erase`, which this server cannot yet honor (no eraser is wired to [`UserDirectory`]).
+#[derive(Debug, Default, Deserialize)]
+struct DeactivateRequest {
+    erase: Option<bool>,
+    reason: Option<String>,
+}
+
+/// Which boolean field on [`crate::model::AdminUser`] a toggle handler flips. Kept as an enum
+/// (rather than a closure over `dyn UserDirectory`) because async closures are not yet stable and
+/// boxing a future for three call sites would add more machinery than this saves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToggleField {
+    Locked,
+    Deactivated,
+}
+
+impl ToggleField {
+    fn pointer(self) -> &'static str {
+        match self {
+            ToggleField::Locked => "/locked",
+            ToggleField::Deactivated => "/deactivated",
+        }
+    }
+
+    fn current(self, user: &crate::model::AdminUser) -> bool {
+        match self {
+            ToggleField::Locked => user.locked,
+            ToggleField::Deactivated => user.deactivated,
+        }
+    }
+
+    async fn apply(
+        self,
+        users: &dyn UserDirectory,
+        user_id: &str,
+        value: bool,
+    ) -> Result<(), SourceError> {
+        match self {
+            ToggleField::Locked => users.set_locked(user_id, value).await,
+            ToggleField::Deactivated => users.set_deactivated(user_id, value).await,
+        }
+    }
+}
+
+/// Parses `body` as JSON, or returns `T::default()` for an empty body (every mutation handled
+/// here declares its request body optional). A non-empty body that fails to parse is a `400
+/// validation-failed` problem, not a panic or a silent default.
+// `Problem` is a large-ish value type (an RFC 9457 body plus extension members); boxing it would
+// mean unwrapping a `Box<Problem>` at every one of this function's call sites for no real benefit
+// here (it is returned once per request, not in a hot loop).
+#[allow(clippy::result_large_err)]
+fn parse_optional_json<T: serde::de::DeserializeOwned + Default>(
+    body: &[u8],
+) -> Result<T, Problem> {
+    if body.is_empty() {
+        return Ok(T::default());
+    }
+    serde_json::from_slice(body)
+        .map_err(|e| Problem::validation_failed().with_detail(format!("invalid JSON body: {e}")))
+}
+
+/// The `idempotency-key` header, if the client sent one.
+fn idempotency_key(headers: &HeaderMap) -> Option<&str> {
+    headers.get("idempotency-key").and_then(|v| v.to_str().ok())
+}
+
+/// Rebuilds an axum [`Response`] from a [`StoredResponse`], marking it as a replay so a client
+/// (or a test) can tell the mutation did not run again.
+fn replay_response(stored: StoredResponse) -> Response {
+    axum::http::Response::builder()
+        .status(stored.status)
+        .header(axum::http::header::CONTENT_TYPE, stored.content_type)
+        .header("idempotency-replayed", "true")
+        .body(axum::body::Body::from(stored.body))
+        .unwrap_or_else(|_| Problem::internal().into_response())
+}
+
+/// Appends one [`AuditEntry`] and publishes one matching [`Event`] for a successful mutation —
+/// the single place every handler below calls so "a mutation writes an audit entry and an event"
+/// cannot be forgotten per-handler. A failed audit write fails the request with `503` (RFC 0004
+/// section 9), returned as `Err` for the caller to answer with directly.
+// See the identical justification on `parse_optional_json` above: `Response` is returned once
+// per request here, not on a hot path, so boxing it would only add noise at every call site.
+#[allow(clippy::result_large_err)]
+async fn record_mutation(
+    state: &AdminState,
+    principal: &Principal,
+    action: &str,
+    event_type: &str,
+    target: ResourceRef,
+    changes: Vec<AuditChange>,
+    event_data: serde_json::Value,
+) -> Result<(), Response> {
+    let actor = principal.to_actor();
+    let mut entry = AuditEntry::new(
+        action,
+        actor.clone(),
+        target.clone(),
+        AuditOutcome::success(200),
+    );
+    entry.changes = changes;
+    state
+        .audit
+        .append(entry)
+        .await
+        .map_err(|e| e.to_problem().into_response())?;
+    state.events.publish(
+        Event::new(event_type, event_data)
+            .with_resource(target)
+            .with_actor(actor),
+    );
+    Ok(())
+}
+
+/// Shared body for `users.lock`, `users.unlock` and `users.reactivate`: idempotency handling,
+/// fetch-before, apply, fetch-after, audit + event, and the JSON response. `users.deactivate`
+/// uses the same shape but validates its own richer body first (see [`users_deactivate`]).
+#[allow(clippy::too_many_arguments)]
+async fn toggle_user_and_record(
+    state: &AdminState,
+    headers: &HeaderMap,
+    raw_body: &[u8],
+    principal: Principal,
+    user_id: String,
+    instance: String,
+    operation_id: &str,
+    event_type: &str,
+    field: ToggleField,
+    target_value: bool,
+    reason: Option<String>,
+) -> Response {
+    let Some(users) = &state.users else {
+        return source_unavailable("user directory", &instance);
+    };
+
+    if let Some(key) = idempotency_key(headers) {
+        match state.idempotency.check(operation_id, key, raw_body) {
+            Replay::Same(stored) => return replay_response(stored),
+            Replay::Mismatch => {
+                return Problem::idempotency_key_payload_mismatch()
+                    .with_instance(instance)
+                    .into_response();
+            }
+            Replay::Fresh => {}
+        }
+    }
+
+    let before = match users.get_user(&user_id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            return Problem::not_found()
+                .with_detail(format!("no such user: {user_id}"))
+                .with_instance(instance)
+                .into_response();
+        }
+        Err(e) => return e.to_problem().with_instance(instance).into_response(),
+    };
+
+    let already_set = field.current(&before) == target_value;
+    if !already_set && let Err(e) = field.apply(users.as_ref(), &user_id, target_value).await {
+        return e.to_problem().with_instance(instance).into_response();
+    }
+
+    let updated = match users.get_user(&user_id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => before.clone(),
+        Err(e) => return e.to_problem().with_instance(instance).into_response(),
+    };
+
+    let mut changes = Vec::new();
+    if !already_set {
+        changes.push(AuditChange {
+            pointer: field.pointer().to_string(),
+            from: Some(json!(!target_value)),
+            to: Some(json!(target_value)),
+        });
+    }
+    let event_data = match &reason {
+        Some(r) => json!({ "reason": r }),
+        None => json!({}),
+    };
+
+    if let Err(resp) = record_mutation(
+        state,
+        &principal,
+        operation_id,
+        event_type,
+        ResourceRef::new("user", user_id.clone()),
+        changes,
+        event_data,
+    )
+    .await
+    {
+        return resp;
+    }
+
+    let response_body = serde_json::to_vec(&updated).unwrap_or_default();
+    if let Some(key) = idempotency_key(headers) {
+        state.idempotency.record(
+            operation_id,
+            key,
+            raw_body,
+            StoredResponse {
+                status: 200,
+                content_type: "application/json".to_string(),
+                body: response_body.clone(),
+            },
+        );
+    }
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        response_body,
+    )
+        .into_response()
+}
+
+/// `POST /api/v1/users/{user_id}/lock` (`moderation:write`).
+async fn users_lock(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let instance = format!("/api/v1/users/{user_id}/lock");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::ModerationWrite),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(principal) => {
+            let reason: ReasonRequest = match parse_optional_json(&body) {
+                Ok(v) => v,
+                Err(p) => return p.with_instance(instance).into_response(),
+            };
+            toggle_user_and_record(
+                &state,
+                &headers,
+                &body,
+                principal,
+                user_id,
+                instance,
+                "users.lock",
+                "user.locked",
+                ToggleField::Locked,
+                true,
+                reason.reason,
+            )
+            .await
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `POST /api/v1/users/{user_id}/unlock` (`moderation:write`).
+async fn users_unlock(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let instance = format!("/api/v1/users/{user_id}/unlock");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::ModerationWrite),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(principal) => {
+            let reason: ReasonRequest = match parse_optional_json(&body) {
+                Ok(v) => v,
+                Err(p) => return p.with_instance(instance).into_response(),
+            };
+            toggle_user_and_record(
+                &state,
+                &headers,
+                &body,
+                principal,
+                user_id,
+                instance,
+                "users.unlock",
+                "user.unlocked",
+                ToggleField::Locked,
+                false,
+                reason.reason,
+            )
+            .await
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `POST /api/v1/users/{user_id}/reactivate` (`admin:write`).
+async fn users_reactivate(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let instance = format!("/api/v1/users/{user_id}/reactivate");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminWrite),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(principal) => {
+            let reason: ReasonRequest = match parse_optional_json(&body) {
+                Ok(v) => v,
+                Err(p) => return p.with_instance(instance).into_response(),
+            };
+            toggle_user_and_record(
+                &state,
+                &headers,
+                &body,
+                principal,
+                user_id,
+                instance,
+                "users.reactivate",
+                "user.reactivated",
+                ToggleField::Deactivated,
+                false,
+                reason.reason,
+            )
+            .await
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `POST /api/v1/users/{user_id}/deactivate` (`admin:write`). `erase: true` is rejected with a
+/// `400 validation-failed` naming `/erase` rather than silently deactivating without erasing:
+/// no eraser is wired to [`UserDirectory`] yet, and a caller who asked for erasure and got a
+/// quiet no-op would believe data was gone that is not.
+async fn users_deactivate(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let instance = format!("/api/v1/users/{user_id}/deactivate");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminWrite),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(principal) => {
+            let request: DeactivateRequest = match parse_optional_json(&body) {
+                Ok(v) => v,
+                Err(p) => return p.with_instance(instance).into_response(),
+            };
+            if request.erase == Some(true) {
+                return Problem::validation_failed()
+                    .with_detail("erasure is not implemented yet")
+                    .with_errors(vec![ValidationError::new(
+                        "/erase",
+                        "this server cannot erase user data yet; deactivate without erase",
+                    )])
+                    .with_instance(instance)
+                    .into_response();
+            }
+            toggle_user_and_record(
+                &state,
+                &headers,
+                &body,
+                principal,
+                user_id,
+                instance,
+                "users.deactivate",
+                "user.deactivated",
+                ToggleField::Deactivated,
+                true,
+                request.reason,
+            )
+            .await
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// The OpenAPI `UserUpdate` schema, read as `Option<Value>` per field (rather than `Option<T>`)
+/// so presence can be distinguished from absence: `{"display_name": null}` and `{}` must be told
+/// apart, since only the former is a (rejected) attempt to change a field this server cannot
+/// change yet.
+#[derive(Debug, Default, Deserialize)]
+struct UserUpdateRequest {
+    #[serde(default)]
+    display_name: Option<serde_json::Value>,
+    #[serde(default)]
+    avatar_url: Option<serde_json::Value>,
+    #[serde(default)]
+    admin: Option<serde_json::Value>,
+    #[serde(default)]
+    user_type: Option<serde_json::Value>,
+}
+
+/// A weak-or-strong ETag derived from a user's own fields (RFC 0004's `If-Match` parameter),
+/// stable across requests as long as nothing about the user has changed.
+fn etag_for_user(user: &crate::model::AdminUser) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_vec(user)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    format!("\"{:x}\"", hasher.finish())
+}
+
+/// Strips a weak-validator prefix and surrounding quotes so `"abc"` and `W/"abc"` compare equal.
+fn normalize_etag(raw: &str) -> &str {
+    raw.trim().trim_start_matches("W/").trim_matches('"')
+}
+
+/// `PATCH /api/v1/users/{user_id}` (`admin:write`): today, only the `admin` field has a data
+/// source that can change it ([`UserDirectory::set_admin`]). Any other field present in the
+/// request body — even set to its current value, even `null` — is a `400 validation-failed`
+/// naming that field, rather than a `200` that silently ignored it.
+async fn users_update(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let instance = format!("/api/v1/users/{user_id}");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminWrite),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(principal) => {
+            let Some(users) = &state.users else {
+                return source_unavailable("user directory", &instance);
+            };
+            let request: UserUpdateRequest = match parse_optional_json(&body) {
+                Ok(v) => v,
+                Err(p) => return p.with_instance(instance).into_response(),
+            };
+
+            let mut errors = Vec::new();
+            if request.display_name.is_some() {
+                errors.push(ValidationError::new(
+                    "/display_name",
+                    "no data source can change this field yet",
+                ));
+            }
+            if request.avatar_url.is_some() {
+                errors.push(ValidationError::new(
+                    "/avatar_url",
+                    "no data source can change this field yet",
+                ));
+            }
+            if request.user_type.is_some() {
+                errors.push(ValidationError::new(
+                    "/user_type",
+                    "no data source can change this field yet",
+                ));
+            }
+            let admin_value = match &request.admin {
+                None => None,
+                Some(serde_json::Value::Bool(b)) => Some(*b),
+                Some(_) => {
+                    errors.push(ValidationError::new("/admin", "must be a boolean"));
+                    None
+                }
+            };
+            if !errors.is_empty() {
+                return Problem::validation_failed()
+                    .with_detail("one or more fields in the request cannot be applied")
+                    .with_errors(errors)
+                    .with_instance(instance)
+                    .into_response();
+            }
+
+            let current = match users.get_user(&user_id).await {
+                Ok(Some(u)) => u,
+                Ok(None) => {
+                    return Problem::not_found()
+                        .with_detail(format!("no such user: {user_id}"))
+                        .with_instance(instance)
+                        .into_response();
+                }
+                Err(e) => return e.to_problem().with_instance(instance).into_response(),
+            };
+
+            if let Some(if_match) = headers
+                .get(axum::http::header::IF_MATCH)
+                .and_then(|v| v.to_str().ok())
+            {
+                let current_etag = etag_for_user(&current);
+                if normalize_etag(if_match) != normalize_etag(&current_etag) {
+                    return Problem::precondition_failed()
+                        .with_detail("If-Match does not match the current resource")
+                        .with_instance(instance)
+                        .into_response();
+                }
+            }
+
+            let mut changes = Vec::new();
+            if let Some(new_admin) = admin_value
+                && new_admin != current.admin
+            {
+                if let Err(e) = users.set_admin(&user_id, new_admin).await {
+                    return e.to_problem().with_instance(instance).into_response();
+                }
+                changes.push(AuditChange {
+                    pointer: "/admin".to_string(),
+                    from: Some(json!(current.admin)),
+                    to: Some(json!(new_admin)),
+                });
+            }
+
+            let updated = match users.get_user(&user_id).await {
+                Ok(Some(u)) => u,
+                Ok(None) => current.clone(),
+                Err(e) => return e.to_problem().with_instance(instance).into_response(),
+            };
+
+            if let Err(resp) = record_mutation(
+                &state,
+                &principal,
+                "users.update",
+                "user.updated",
+                ResourceRef::new("user", user_id.clone()),
+                changes,
+                json!({ "admin": updated.admin }),
+            )
+            .await
+            {
+                return resp;
+            }
+
+            let etag = etag_for_user(&updated);
+            (
+                StatusCode::OK,
+                [(axum::http::header::ETAG, etag)],
+                axum::Json(updated),
+            )
+                .into_response()
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// audit log (RFC 0004 section 9, brief deliverable 3)
+// -------------------------------------------------------------------------------------------
+
+/// A large-but-finite cap on how many entries `audit_log_list` asks [`AuditSink::query`] for
+/// before slicing with [`Page::paginate`]. `AuditSink::query` itself takes a limit rather than a
+/// cursor, so this is the widest single fetch this handler ever performs; a store holding more
+/// than this many matching entries would need real keyset pagination pushed into the trait, which
+/// is future work once a real (non-in-memory) `AuditSink` exists to design it against.
+const AUDIT_QUERY_FETCH_LIMIT: usize = 10_000;
+
+#[derive(Debug, Default, Deserialize)]
+struct AuditLogQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+    include_total: Option<bool>,
+    actor: Option<String>,
+    action: Option<String>,
+    target_type: Option<String>,
+    target_id: Option<String>,
+    outcome: Option<String>,
+    recorded_after: Option<String>,
+    recorded_before: Option<String>,
+    /// Accepted per the OpenAPI `Sort` parameter (`-recorded_at` default, `recorded_at`
+    /// ascending); only these two exact values are honoured.
+    sort: Option<String>,
+}
+
+/// `GET /api/v1/audit-log` (`admin:read`).
+async fn audit_log_list(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Query(query): Query<AuditLogQuery>,
+) -> Response {
+    let instance = "/api/v1/audit-log";
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let outcome_success = match query.outcome.as_deref() {
+                None => None,
+                Some("success") => Some(true),
+                Some("failure") => Some(false),
+                Some(other) => {
+                    return Problem::validation_failed()
+                        .with_errors(vec![ValidationError::new(
+                            "param:outcome",
+                            format!("must be 'success' or 'failure', got '{other}'"),
+                        )])
+                        .with_instance(instance)
+                        .into_response();
+                }
+            };
+            let filter = AuditFilter {
+                actor: query.actor.clone(),
+                action: query.action.clone(),
+                target_type: query.target_type.clone(),
+                target_id: query.target_id.clone(),
+                outcome_success,
+                recorded_after: query.recorded_after.clone(),
+                recorded_before: query.recorded_before.clone(),
+                cursor: None,
+                limit: AUDIT_QUERY_FETCH_LIMIT,
+            };
+            match state.audit.query(&filter).await {
+                Ok(mut entries) => {
+                    if query.sort.as_deref() == Some("recorded_at") {
+                        entries.reverse();
+                    }
+                    let page = Page::paginate(
+                        entries,
+                        query.cursor.as_deref(),
+                        query.limit,
+                        query.include_total.unwrap_or(false),
+                    );
+                    axum::Json(page).into_response()
+                }
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `GET /api/v1/audit-log/{id}` (`admin:read`).
+async fn audit_log_get(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let instance = format!("/api/v1/audit-log/{id}");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => match state.audit.get(&id).await {
+            Ok(Some(entry)) => axum::Json(entry).into_response(),
+            Ok(None) => Problem::not_found()
+                .with_detail(format!("no such audit entry: {id}"))
+                .with_instance(instance)
+                .into_response(),
+            Err(e) => e.to_problem().with_instance(instance).into_response(),
+        },
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// event stream (RFC 0004 section 10, brief deliverable 3)
+// -------------------------------------------------------------------------------------------
+
+/// The subset of `GET /events`'s query parameters this handler filters on. `types`/`resource_*`
+/// are read from repeated `key=value` pairs (see [`events_stream`]) rather than
+/// `axum::extract::Query<T>` into a struct, since `serde_urlencoded` does not reliably collect a
+/// repeated `types=a&types=b` into a `Vec<String>` field.
+struct EventFilter {
+    types: Vec<String>,
+    resource_type: Option<String>,
+    resource_id: Option<String>,
+}
+
+impl EventFilter {
+    fn matches(&self, event: &Event) -> bool {
+        if !self.types.is_empty() && !self.types.iter().any(|p| type_matches(p, &event.r#type)) {
+            return false;
+        }
+        if let Some(rt) = &self.resource_type
+            && event.resource.as_ref().map(|r| &r.r#type) != Some(rt)
+        {
+            return false;
+        }
+        if let Some(rid) = &self.resource_id
+            && event.resource.as_ref().map(|r| &r.id) != Some(rid)
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// Whether `event_type` matches `pattern`, where `pattern` is either an exact type or a
+/// `prefix.*` glob (RFC 0004 section 10).
+fn type_matches(pattern: &str, event_type: &str) -> bool {
+    match pattern.strip_suffix(".*") {
+        Some(prefix) => event_type == prefix || event_type.starts_with(&format!("{prefix}.")),
+        None => pattern == event_type,
+    }
+}
+
+/// Renders one [`Event`] as an axum SSE frame.
+fn sse_frame(event: &Event) -> AxumSseEvent {
+    AxumSseEvent::default()
+        .id(event.id.clone())
+        .event(event.r#type.clone())
+        .data(serde_json::to_string(event).unwrap_or_default())
+}
+
+/// `GET /api/v1/events` (`admin:read`): replays the buffer (honoring `Last-Event-ID` or
+/// `?last_event_id=`), emitting `stream.reset` first when the client is behind or its id is
+/// unrecognized, then streams live events, filtered by `types`/`resource_type`/`resource_id` and
+/// interspersed with a keepalive comment every 15 seconds (RFC 0004 section 10). This is the same
+/// behavior `hs-admin-mock`'s `sse_events` proved against the same [`EventBus`]; this handler
+/// additionally honors `stream.reset` and the query filters, which the mock does not.
+async fn events_stream(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Response {
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let mut types = Vec::new();
+            let mut resource_type = None;
+            let mut resource_id = None;
+            let mut last_event_id_query = None;
+            for (k, v) in pairs {
+                match k.as_str() {
+                    "types" => types.push(v),
+                    "resource_type" => resource_type = Some(v),
+                    "resource_id" => resource_id = Some(v),
+                    "last_event_id" => last_event_id_query = Some(v),
+                    _ => {}
+                }
+            }
+            let last_event_id = headers
+                .get("last-event-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+                .or(last_event_id_query);
+
+            let (outcome, backlog) = state.events.replay_since(last_event_id.as_deref());
+            let mut rx = state.events.subscribe();
+            let filter = EventFilter {
+                types,
+                resource_type,
+                resource_id,
+            };
+
+            let hello = Event::new(
+                "stream.hello",
+                json!({
+                    "server": state.server_info.name,
+                    "contract": state.server_info.contract_version,
+                    "replica": "single",
+                    "buffer_oldest_id": state.events.oldest_id(),
+                }),
+            );
+            let reset =
+                matches!(outcome, ReplayOutcome::Behind | ReplayOutcome::Unknown).then(|| {
+                    Event::new(
+                        "stream.reset",
+                        json!({"reason": "behind", "oldest_available": state.events.oldest_id()}),
+                    )
+                });
+
+            let stream = async_stream::stream! {
+                yield Ok(sse_frame(&hello));
+                if let Some(reset) = reset {
+                    yield Ok(sse_frame(&reset));
+                }
+                for event in backlog.into_iter().filter(|e| filter.matches(e)) {
+                    yield Ok(sse_frame(&event));
+                }
+                loop {
+                    match rx.recv().await {
+                        Ok(event) if filter.matches(&event) => yield Ok(sse_frame(&event)),
+                        Ok(_) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            };
+
+            let stream: std::pin::Pin<
+                Box<dyn Stream<Item = Result<AxumSseEvent, std::convert::Infallible>> + Send>,
+            > = Box::pin(stream);
+
+            Sse::new(stream)
+                .keep_alive(
+                    KeepAlive::new()
+                        .interval(Duration::from_secs(15))
+                        .text("keepalive"),
+                )
+                .into_response()
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance("/api/v1/events").into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance("/api/v1/events").into_response(),
+    }
+}
+
 async fn serve_openapi_yaml(State(state): State<AdminState>) -> Response {
     (
         StatusCode::OK,
@@ -421,6 +1279,14 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         "server.health" => builder.add(method, &full_path, server_health, meta),
         "users.list" => builder.add(method, &full_path, users_list, meta),
         "users.get" => builder.add(method, &full_path, users_get, meta),
+        "users.update" => builder.add(method, &full_path, users_update, meta),
+        "users.lock" => builder.add(method, &full_path, users_lock, meta),
+        "users.unlock" => builder.add(method, &full_path, users_unlock, meta),
+        "users.deactivate" => builder.add(method, &full_path, users_deactivate, meta),
+        "users.reactivate" => builder.add(method, &full_path, users_reactivate, meta),
+        "audit_log.list" => builder.add(method, &full_path, audit_log_list, meta),
+        "audit_log.get" => builder.add(method, &full_path, audit_log_get, meta),
+        "events.stream" => builder.add(method, &full_path, events_stream, meta),
         other => unreachable!(
             "{other} is listed in REAL_HANDLERS but register_real_operation doesn't know it"
         ),
@@ -824,5 +1690,597 @@ mod tests {
                 "REAL_HANDLERS names {op_id}, which is not in the operation table"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // user mutations: every one of these asserts both the audit entry (via GET /audit-log) and
+    // the published event (by subscribing to the same EventBus before the request), per the
+    // brief's "a mutation that succeeds but records nothing is the failure mode to avoid".
+    // -----------------------------------------------------------------------------------------
+
+    async fn body_bytes(response: Response) -> bytes::Bytes {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+    }
+
+    async fn audit_entries_for_action(router: &axum::Router, action: &str) -> Vec<AuditEntry> {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/audit-log?action={action}"))
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_bytes(response).await;
+        let page: Page<AuditEntry> = serde_json::from_slice(&body).unwrap();
+        page.items
+    }
+
+    #[tokio::test]
+    async fn users_lock_writes_audit_and_event_and_flips_locked() {
+        let state = state_with_users();
+        let mut rx = state.events.subscribe();
+        let (router, _manifest) = build_router(state);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/users/%40alice%3Aexample.org/lock")
+                    .header("authorization", "Bearer admin-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"reason":"spam"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let user: crate::model::AdminUser =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert!(user.locked);
+
+        let event = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("an event should be published")
+            .unwrap();
+        assert_eq!(event.r#type, "user.locked");
+        assert_eq!(event.resource.unwrap().id, "@alice:example.org");
+        assert_eq!(event.actor.unwrap().id, "@ops:example.org");
+
+        let entries = audit_entries_for_action(&router, "users.lock").await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].target.id, "@alice:example.org");
+        assert_eq!(entries[0].changes.len(), 1);
+        assert_eq!(entries[0].changes[0].pointer, "/locked");
+    }
+
+    #[tokio::test]
+    async fn users_unlock_writes_audit_and_event_and_flips_locked_back() {
+        let state = state_with_users();
+        let mut rx = state.events.subscribe();
+        let (router, _manifest) = build_router(state);
+
+        // Lock first so unlock has something to flip.
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/users/%40alice%3Aexample.org/lock")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/users/%40alice%3Aexample.org/unlock")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let user: crate::model::AdminUser =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert!(!user.locked);
+
+        let event = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("an event should be published")
+            .unwrap();
+        assert_eq!(event.r#type, "user.unlocked");
+
+        let entries = audit_entries_for_action(&router, "users.unlock").await;
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn users_deactivate_writes_audit_and_event() {
+        let state = state_with_users();
+        let mut rx = state.events.subscribe();
+        let (router, _manifest) = build_router(state);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/users/%40alice%3Aexample.org/deactivate")
+                    .header("authorization", "Bearer admin-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"reason":"requested"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let user: crate::model::AdminUser =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert!(user.deactivated);
+
+        let event = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("an event should be published")
+            .unwrap();
+        assert_eq!(event.r#type, "user.deactivated");
+
+        let entries = audit_entries_for_action(&router, "users.deactivate").await;
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn users_deactivate_rejects_explicit_erase() {
+        let (router, _manifest) = build_router(state_with_users());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/users/%40alice%3Aexample.org/deactivate")
+                    .header("authorization", "Bearer admin-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"erase":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let problem: hs_http::Problem =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert!(problem.errors.iter().any(|e| e.pointer == "/erase"));
+    }
+
+    #[tokio::test]
+    async fn users_reactivate_writes_audit_and_event() {
+        let state = state_with_users();
+        let mut rx = state.events.subscribe();
+        let (router, _manifest) = build_router(state);
+
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/users/%40alice%3Aexample.org/deactivate")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/users/%40alice%3Aexample.org/reactivate")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let user: crate::model::AdminUser =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert!(!user.deactivated);
+
+        let event = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("an event should be published")
+            .unwrap();
+        assert_eq!(event.r#type, "user.reactivated");
+
+        let entries = audit_entries_for_action(&router, "users.reactivate").await;
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn users_update_admin_flag_writes_audit_and_event_and_sets_etag() {
+        let state = state_with_users();
+        let mut rx = state.events.subscribe();
+        let (router, _manifest) = build_router(state);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/users/%40alice%3Aexample.org")
+                    .header("authorization", "Bearer admin-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"admin":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(axum::http::header::ETAG).is_some());
+        let user: crate::model::AdminUser =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert!(user.admin);
+
+        let event = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("an event should be published")
+            .unwrap();
+        assert_eq!(event.r#type, "user.updated");
+
+        let entries = audit_entries_for_action(&router, "users.update").await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].changes[0].pointer, "/admin");
+    }
+
+    #[tokio::test]
+    async fn users_update_rejects_a_field_no_source_can_change_yet() {
+        let (router, _manifest) = build_router(state_with_users());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/users/%40alice%3Aexample.org")
+                    .header("authorization", "Bearer admin-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"display_name":"New Name"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let problem: hs_http::Problem =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert!(problem.errors.iter().any(|e| e.pointer == "/display_name"));
+    }
+
+    #[tokio::test]
+    async fn users_update_if_match_mismatch_is_412() {
+        let (router, _manifest) = build_router(state_with_users());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/users/%40alice%3Aexample.org")
+                    .header("authorization", "Bearer admin-token")
+                    .header("content-type", "application/json")
+                    .header("if-match", "\"not-the-real-etag\"")
+                    .body(Body::from(r#"{"admin":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    #[tokio::test]
+    async fn users_update_if_match_with_the_current_etag_succeeds() {
+        let state = state_with_users();
+        let users_source = state.users.clone().unwrap();
+        let (router, _manifest) = build_router(state);
+
+        let alice = users_source
+            .get_user("@alice:example.org")
+            .await
+            .unwrap()
+            .unwrap();
+        let etag = super::etag_for_user(&alice);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/users/%40alice%3Aexample.org")
+                    .header("authorization", "Bearer admin-token")
+                    .header("content-type", "application/json")
+                    .header("if-match", etag)
+                    .body(Body::from(r#"{"admin":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Idempotency-Key
+    // -----------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn idempotency_key_replays_the_first_response_without_repeating_the_mutation() {
+        let (router, _manifest) = build_router(state_with_users());
+        let make_request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/users/%40alice%3Aexample.org/lock")
+                .header("authorization", "Bearer admin-token")
+                .header("idempotency-key", "retry-1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"reason":"spam"}"#))
+                .unwrap()
+        };
+
+        let first = router.clone().oneshot(make_request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert!(first.headers().get("idempotency-replayed").is_none());
+
+        let second = router.clone().oneshot(make_request()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            second.headers().get("idempotency-replayed").unwrap(),
+            "true"
+        );
+
+        // The mutation must not have run twice: exactly one audit entry.
+        let entries = audit_entries_for_action(&router, "users.lock").await;
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_reused_with_a_different_body_is_a_mismatch() {
+        let (router, _manifest) = build_router(state_with_users());
+        let first = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/users/%40alice%3Aexample.org/lock")
+                    .header("authorization", "Bearer admin-token")
+                    .header("idempotency-key", "retry-2")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"reason":"spam"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/users/%40alice%3Aexample.org/lock")
+                    .header("authorization", "Bearer admin-token")
+                    .header("idempotency-key", "retry-2")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"reason":"a different reason"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // audit log endpoints
+    // -----------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn audit_log_get_returns_the_recorded_entry() {
+        let (router, _manifest) = build_router(state_with_users());
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/users/%40alice%3Aexample.org/lock")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let entries = audit_entries_for_action(&router, "users.lock").await;
+        let id = entries[0].id.clone();
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/audit-log/{id}"))
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let entry: AuditEntry = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(entry.id, id);
+    }
+
+    #[tokio::test]
+    async fn audit_log_get_missing_id_is_404() {
+        let (router, _manifest) = build_router(state_with_users());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/audit-log/nonexistent")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn audit_log_list_rejects_an_unknown_outcome_value() {
+        let (router, _manifest) = build_router(state_with_users());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/audit-log?outcome=sideways")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // event stream
+    // -----------------------------------------------------------------------------------------
+
+    /// Pulls one SSE frame off `body` with a short timeout, so a test never hangs waiting on a
+    /// stream that (by design) never closes on its own.
+    async fn next_sse_frame(body: &mut Body) -> String {
+        use http_body_util::BodyExt;
+        let frame = tokio::time::timeout(Duration::from_millis(500), body.frame())
+            .await
+            .expect("an SSE frame should arrive promptly")
+            .expect("the stream should not end")
+            .expect("the frame should not be an error");
+        let data = frame.into_data().expect("frame should carry data");
+        String::from_utf8(data.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn events_stream_sends_a_hello_frame_first() {
+        let (router, _manifest) = build_router(test_state());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/events")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(content_type.starts_with("text/event-stream"));
+        let mut body = response.into_body();
+        let frame = next_sse_frame(&mut body).await;
+        assert!(frame.contains("event: stream.hello"));
+    }
+
+    #[tokio::test]
+    async fn events_stream_replays_the_backlog_after_last_event_id() {
+        let state = test_state();
+        let first = state
+            .events
+            .publish(Event::new("user.locked", serde_json::json!({})));
+        state
+            .events
+            .publish(Event::new("user.unlocked", serde_json::json!({})));
+        let (router, _manifest) = build_router(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/events")
+                    .header("authorization", "Bearer admin-token")
+                    .header("last-event-id", first.id.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut body = response.into_body();
+        let hello = next_sse_frame(&mut body).await;
+        assert!(hello.contains("event: stream.hello"));
+        let replayed = next_sse_frame(&mut body).await;
+        assert!(replayed.contains("event: user.unlocked"));
+    }
+
+    #[tokio::test]
+    async fn events_stream_filters_the_backlog_by_type() {
+        let state = test_state();
+        state
+            .events
+            .publish(Event::new("user.locked", serde_json::json!({})));
+        state
+            .events
+            .publish(Event::new("room.created", serde_json::json!({})));
+        let (router, _manifest) = build_router(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/events?types=user.*")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut body = response.into_body();
+        let hello = next_sse_frame(&mut body).await;
+        assert!(hello.contains("stream.hello"));
+        let only_match = next_sse_frame(&mut body).await;
+        assert!(only_match.contains("event: user.locked"));
+    }
+
+    #[tokio::test]
+    async fn events_stream_a_too_old_last_event_id_gets_a_stream_reset_first() {
+        let state = test_state();
+        // capacity 1: publishing "b" evicts "a", so resuming from "a" is "behind".
+        let state = AdminState {
+            events: Arc::new(EventBus::with_capacity(1)),
+            ..state
+        };
+        let a = state.events.publish(Event::new("a", serde_json::json!({})));
+        state.events.publish(Event::new("b", serde_json::json!({})));
+        let (router, _manifest) = build_router(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/events")
+                    .header("authorization", "Bearer admin-token")
+                    .header("last-event-id", a.id.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut body = response.into_body();
+        let hello = next_sse_frame(&mut body).await;
+        assert!(hello.contains("stream.hello"));
+        let reset = next_sse_frame(&mut body).await;
+        assert!(reset.contains("event: stream.reset"));
     }
 }
