@@ -1236,6 +1236,43 @@ mod tests {
         assert!(check_room_create(&event, &RoomVersionRules::V12).is_ok());
     }
 
+    /// v12 rule 1.4 (`refs/matrix-spec/content/rooms/v12.md#authorisation-rules`): `content.
+    /// additional_creators`, if present, must be an array of valid user IDs.
+    #[test]
+    fn v12_create_event_rejects_invalid_additional_creators() {
+        let sender = user("@a:hs1");
+
+        let not_an_array = obj(json!({"additional_creators": "@b:hs1"}));
+        let mut event = IncomingEvent::new("m.room.create", &sender, None, Some(""), &not_an_array);
+        event.prev_event_count = 0;
+        assert!(check_room_create(&event, &RoomVersionRules::V12).is_err());
+
+        let bad_entry = obj(json!({"additional_creators": ["not a user id"]}));
+        let mut event = IncomingEvent::new("m.room.create", &sender, None, Some(""), &bad_entry);
+        event.prev_event_count = 0;
+        assert!(check_room_create(&event, &RoomVersionRules::V12).is_err());
+    }
+
+    /// The mirror of the above: a well-formed `additional_creators` array of valid user IDs is
+    /// accepted. v11 does not know this field at all, and a v11 create event carrying it is still
+    /// accepted -- `additional_creators` is simply inert content for room versions before 12,
+    /// exactly like any other extra key a client happened to include.
+    #[test]
+    fn v12_create_event_accepts_valid_additional_creators() {
+        let sender = user("@a:hs1");
+        let content = obj(json!({"additional_creators": ["@b:hs1", "@c:hs2"]}));
+        let mut event = IncomingEvent::new("m.room.create", &sender, None, Some(""), &content);
+        event.prev_event_count = 0;
+        assert!(check_room_create(&event, &RoomVersionRules::V12).is_ok());
+
+        let content_v11 = obj(json!({"additional_creators": ["@b:hs1"]}));
+        let rid = room_id("!r:hs1");
+        let mut event =
+            IncomingEvent::new("m.room.create", &sender, Some(&rid), Some(""), &content_v11);
+        event.prev_event_count = 0;
+        assert!(check_room_create(&event, &RoomVersionRules::V11).is_ok());
+    }
+
     #[test]
     fn v1_create_event_requires_creator_field() {
         let content = obj(json!({}));
@@ -1312,6 +1349,70 @@ mod tests {
             check_auth_events_selection(&RoomVersionRules::V11, &event, &refs, no_create_lookup)
                 .unwrap_err();
         assert!(err.0.contains("m.room.create"));
+    }
+
+    /// v12 rule 3.2 (`refs/matrix-spec/content/rooms/v12.md#authorisation-rules`): "In this room
+    /// version, `m.room.create` MUST NOT be selected." An `m.room.create` entry in `auth_events`
+    /// is therefore rejected outright, unlike room versions 1-11 where it is *required*
+    /// (`auth_events_selection_requires_create_event_pre_v12` above) -- the exact negative-of-the-
+    /// negative pairing the brief asks for: what a v11 room must have, a v12 room must not.
+    #[test]
+    fn v12_auth_events_selection_rejects_room_create_entry() {
+        let content = obj(json!({"body": "hi"}));
+        let sender = user("@a:hs1");
+        let event = IncomingEvent::new("m.room.message", &sender, None, None, &content);
+        let refs = vec![
+            AuthEventRef {
+                event_type: "m.room.power_levels",
+                state_key: "",
+                rejected: false,
+            },
+            AuthEventRef {
+                event_type: "m.room.member",
+                state_key: "@a:hs1",
+                rejected: false,
+            },
+            AuthEventRef {
+                event_type: "m.room.create",
+                state_key: "",
+                rejected: false,
+            },
+        ];
+        let err =
+            check_auth_events_selection(&RoomVersionRules::V12, &event, &refs, no_create_lookup)
+                .unwrap_err();
+        assert!(err.0.contains("m.room.create"), "got: {}", err.0);
+    }
+
+    /// v12 rule 2: instead of an `auth_events` entry, the create event is found via the room ID
+    /// itself (`room_id` *is* the create event's ID). `check_auth_events_selection` models this as
+    /// a caller-supplied lookup, called only for room version 12+; it must reject when the lookup
+    /// reports the create event missing or rejected, exactly as the pre-v12 path rejects when no
+    /// `m.room.create` entry is present in `auth_events`.
+    #[test]
+    fn v12_auth_events_selection_rejects_when_room_create_lookup_fails() {
+        let content = obj(json!({"body": "hi"}));
+        let sender = user("@a:hs1");
+        let event = IncomingEvent::new("m.room.message", &sender, None, None, &content);
+        let refs = vec![
+            AuthEventRef {
+                event_type: "m.room.power_levels",
+                state_key: "",
+                rejected: false,
+            },
+            AuthEventRef {
+                event_type: "m.room.member",
+                state_key: "@a:hs1",
+                rejected: false,
+            },
+        ];
+        let err = check_auth_events_selection(&RoomVersionRules::V12, &event, &refs, || Ok(false))
+            .unwrap_err();
+        assert!(err.0.contains("m.room.create"), "got: {}", err.0);
+        assert!(
+            check_auth_events_selection(&RoomVersionRules::V12, &event, &refs, no_create_lookup)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1530,6 +1631,239 @@ mod tests {
             &content,
         );
         assert!(check_event_auth(&rules, &event, &state).is_ok());
+    }
+
+    /// The other direction of creator immunity: a non-creator, however powerful, can never ban or
+    /// kick a creator. `refs/matrix-spec/content/rooms/v12.md`, client considerations: "Room
+    /// creators have infinitely high power level and cannot be specified in the
+    /// `m.room.power_levels` event, nor can they be changed after the room is created" -- a
+    /// creator's *target*-side power level (used in the ban/kick rules' `target_power <
+    /// sender_power` check) must also be infinite, not just their *sender*-side power level, or
+    /// this half of immunity would silently not hold.
+    #[test]
+    fn v12_non_creator_cannot_ban_or_kick_creator_regardless_of_power() {
+        let rules = RoomVersionRules::V12;
+        let creator = user("@creator:hs1");
+        let member = user("@member:hs1");
+        let mut state = FlatState::new();
+        state.insert("m.room.create", "", creator.clone(), obj(json!({})));
+        state.insert(
+            "m.room.member",
+            creator.as_str(),
+            creator.clone(),
+            obj(json!({"membership": "join"})),
+        );
+        state.insert(
+            "m.room.member",
+            member.as_str(),
+            creator.clone(),
+            obj(json!({"membership": "join"})),
+        );
+        // The most power a non-creator can legally hold: at the ban/kick level itself.
+        state.insert(
+            "m.room.power_levels",
+            "",
+            creator.clone(),
+            obj(json!({
+                "users": {member.as_str(): 100},
+                "ban": 50, "kick": 50, "redact": 50, "invite": 0,
+                "users_default": 0, "events_default": 0, "state_default": 50,
+            })),
+        );
+        state.insert(
+            "m.room.join_rules",
+            "",
+            creator.clone(),
+            obj(json!({"join_rule": "public"})),
+        );
+
+        for membership in ["ban", "leave"] {
+            let content = obj(json!({"membership": membership}));
+            let event = IncomingEvent::new(
+                "m.room.member",
+                &member,
+                None,
+                Some(creator.as_str()),
+                &content,
+            );
+            assert!(
+                check_event_auth(&rules, &event, &state).is_err(),
+                "member should not be able to {membership} the creator"
+            );
+        }
+    }
+
+    /// v12 rule 10.4: a `m.room.power_levels` event's `users` map must never name a creator, even
+    /// on the room's very first power-levels event (the "no previous power_levels event: always
+    /// allow" shortcut in rule 10.5 comes *after* this check in the spec's rule ordering, and
+    /// `check_room_power_levels` preserves that order).
+    #[test]
+    fn v12_power_levels_event_naming_creator_in_users_is_rejected() {
+        let rules = RoomVersionRules::V12;
+        let creator = user("@creator:hs1");
+        let mut state = FlatState::new();
+        state.insert("m.room.create", "", creator.clone(), obj(json!({})));
+        state.insert(
+            "m.room.member",
+            creator.as_str(),
+            creator.clone(),
+            obj(json!({"membership": "join"})),
+        );
+        state.insert(
+            "m.room.join_rules",
+            "",
+            creator.clone(),
+            obj(json!({"join_rule": "public"})),
+        );
+
+        // No m.room.power_levels event exists yet: this would otherwise hit the "always allow the
+        // first one" shortcut, but naming the creator must still be rejected.
+        let content = obj(json!({
+            "users": {creator.as_str(): 100},
+            "ban": 50, "kick": 50, "redact": 50, "invite": 0,
+            "users_default": 0, "events_default": 0, "state_default": 50,
+        }));
+        let event = IncomingEvent::new("m.room.power_levels", &creator, None, Some(""), &content);
+        assert!(check_event_auth(&rules, &event, &state).is_err());
+
+        // Now with a valid (creator-free) power_levels event already in state: replacing it with
+        // one that names the creator is still rejected, even though the creator's infinite power
+        // would otherwise let them change anything else about this event.
+        state.insert(
+            "m.room.power_levels",
+            "",
+            creator.clone(),
+            obj(json!({
+                "users": {},
+                "ban": 50, "kick": 50, "redact": 50, "invite": 0,
+                "users_default": 0, "events_default": 0, "state_default": 50,
+            })),
+        );
+        assert!(check_event_auth(&rules, &event, &state).is_err());
+    }
+
+    /// MSC4289's `additional_creators`: a co-creator named there is a full creator too -- infinite
+    /// power, and immune to being banned by anyone (including the original creator).
+    #[test]
+    fn v12_additional_creator_is_also_immune() {
+        let rules = RoomVersionRules::V12;
+        let creator = user("@creator:hs1");
+        let co_creator = user("@co-creator:hs1");
+        let member = user("@member:hs1");
+        let mut state = FlatState::new();
+        state.insert(
+            "m.room.create",
+            "",
+            creator.clone(),
+            obj(json!({"additional_creators": [co_creator.as_str()]})),
+        );
+        for u in [&creator, &co_creator, &member] {
+            state.insert(
+                "m.room.member",
+                u.as_str(),
+                creator.clone(),
+                obj(json!({"membership": "join"})),
+            );
+        }
+        state.insert(
+            "m.room.power_levels",
+            "",
+            creator.clone(),
+            obj(json!({
+                "users": {member.as_str(): 100},
+                "ban": 50, "kick": 50, "redact": 50, "invite": 0,
+                "users_default": 0, "events_default": 0, "state_default": 50,
+            })),
+        );
+        state.insert(
+            "m.room.join_rules",
+            "",
+            creator.clone(),
+            obj(json!({"join_rule": "public"})),
+        );
+
+        // The powerful non-creator member cannot ban the co-creator.
+        let content = obj(json!({"membership": "ban"}));
+        let event = IncomingEvent::new(
+            "m.room.member",
+            &member,
+            None,
+            Some(co_creator.as_str()),
+            &content,
+        );
+        assert!(check_event_auth(&rules, &event, &state).is_err());
+
+        // The co-creator, despite never appearing in m.room.power_levels at all, can ban the
+        // powerful member (infinite power beats 100).
+        let content = obj(json!({"membership": "ban"}));
+        let event = IncomingEvent::new(
+            "m.room.member",
+            &co_creator,
+            None,
+            Some(member.as_str()),
+            &content,
+        );
+        assert!(check_event_auth(&rules, &event, &state).is_ok());
+    }
+
+    /// The negative control the brief asks for: proves creator immunity is a v12-and-later
+    /// property, not something that leaked backward into v11's auth path. In v11, a creator whose
+    /// own `m.room.power_levels` entry has been set low is kickable like anyone else -- there is
+    /// no `explicitly_privilege_room_creators` rule to stop it.
+    #[test]
+    fn v11_creator_has_no_special_immunity_and_can_be_kicked() {
+        let rules = RoomVersionRules::V11;
+        let creator = user("@creator:hs1");
+        let member = user("@member:hs1");
+        let mut state = FlatState::new();
+        state.insert(
+            "m.room.create",
+            "",
+            creator.clone(),
+            obj(json!({"room_version": "11"})),
+        );
+        state.insert(
+            "m.room.member",
+            creator.as_str(),
+            creator.clone(),
+            obj(json!({"membership": "join"})),
+        );
+        state.insert(
+            "m.room.member",
+            member.as_str(),
+            creator.clone(),
+            obj(json!({"membership": "join"})),
+        );
+        // The creator has demoted themselves to the floor; the member outranks them.
+        state.insert(
+            "m.room.power_levels",
+            "",
+            creator.clone(),
+            obj(json!({
+                "users": {creator.as_str(): 0, member.as_str(): 100},
+                "ban": 50, "kick": 50, "redact": 50, "invite": 0,
+                "users_default": 0, "events_default": 0, "state_default": 50,
+            })),
+        );
+        state.insert(
+            "m.room.join_rules",
+            "",
+            creator.clone(),
+            obj(json!({"join_rule": "public"})),
+        );
+
+        let content = obj(json!({"membership": "leave"}));
+        let event = IncomingEvent::new(
+            "m.room.member",
+            &member,
+            None,
+            Some(creator.as_str()),
+            &content,
+        );
+        assert!(
+            check_event_auth(&rules, &event, &state).is_ok(),
+            "a v11 creator with a low power_levels entry must be kickable like anyone else"
+        );
     }
 
     #[test]

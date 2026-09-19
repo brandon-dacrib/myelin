@@ -452,6 +452,35 @@ mod tests {
         assert_eq!(rules.state_res, StateResolutionVersion::V2 { v2_1: true });
     }
 
+    /// `refs/matrix-spec/content/rooms/v12.md` puts redaction, event IDs, canonical JSON and
+    /// signing-key validity under a literal "Unchanged from v11" heading, each just transcluding
+    /// v11's own fragment. This asserts that literally: v12's `redaction` rules are v11's, field
+    /// for field (not merely "close" or "compatible") -- the redaction algorithm itself is
+    /// untouched by MSC4289/MSC4291.
+    #[test]
+    fn v12_redaction_rules_are_unchanged_from_v11() {
+        assert_eq!(
+            RoomVersionRules::V12.redaction,
+            RoomVersionRules::V11.redaction
+        );
+        // Likewise event ID format ("Event IDs", transcluded from v4) and the strict-canonical-
+        // JSON / signing-key-validity gates ("Canonical JSON" from v6, "Signing key validity
+        // period" from v5): none of these are in the "considerations" v12 lists as changed, and
+        // none differ from v11's values here.
+        assert_eq!(
+            RoomVersionRules::V12.event_id_format,
+            RoomVersionRules::V11.event_id_format
+        );
+        assert_eq!(
+            RoomVersionRules::V12.strict_canonical_json,
+            RoomVersionRules::V11.strict_canonical_json
+        );
+        assert_eq!(
+            RoomVersionRules::V12.enforce_key_validity,
+            RoomVersionRules::V11.enforce_key_validity
+        );
+    }
+
     #[test]
     fn v1_uses_state_res_v1() {
         assert_eq!(

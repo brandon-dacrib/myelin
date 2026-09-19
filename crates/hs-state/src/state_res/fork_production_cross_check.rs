@@ -232,7 +232,7 @@ proptest! {
 
     #[test]
     fn production_store_matches_oracle_and_ruma_on_random_forks(
-        version_idx in 0usize..4,
+        version_idx in 0usize..5,
         actions_a in prop::collection::vec(action_strategy(), 0..3),
         actions_b in prop::collection::vec(action_strategy(), 0..3),
     ) {

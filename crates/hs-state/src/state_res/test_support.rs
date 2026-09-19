@@ -261,5 +261,10 @@ pub(crate) fn versions() -> Vec<RoomVersionId> {
         RoomVersionId::V6,
         RoomVersionId::V8,
         RoomVersionId::V11,
+        // Room version 12: state resolution v2.1 (MSC4297) rather than plain v2 -- see this
+        // track's status file, "State resolution v2.1" for what changes and why exercising it
+        // here (rather than only via hand-built scenarios) is the actual evidence for whether
+        // v2.1 changes v2's *observable* behavior on these fork shapes.
+        RoomVersionId::V12,
     ]
 }

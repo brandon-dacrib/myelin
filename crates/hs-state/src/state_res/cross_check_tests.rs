@@ -18,7 +18,7 @@ proptest! {
 
     #[test]
     fn oracle_agrees_with_ruma_backed_v2_on_random_forks(
-        version_idx in 0usize..4,
+        version_idx in 0usize..5,
         actions_a in prop::collection::vec(action_strategy(), 0..3),
         actions_b in prop::collection::vec(action_strategy(), 0..3),
     ) {
