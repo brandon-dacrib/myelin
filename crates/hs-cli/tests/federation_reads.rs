@@ -138,6 +138,33 @@ impl Harness {
         (status, body)
     }
 
+    async fn signed_post(&self, path: &str, body: Value) -> (StatusCode, Value) {
+        let uri = format!("/_matrix/federation/v1{path}");
+        let auth = hs_federation::xmatrix::sign_request(
+            "POST",
+            &uri,
+            REMOTE,
+            US,
+            Some(&body),
+            &self.remote_key,
+        )
+        .expect("signing");
+        let request = Request::builder()
+            .method("POST")
+            .uri(&uri)
+            .header("Authorization", auth)
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let response = self.router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, body)
+    }
+
     /// The room's `m.room.create` event ID, read from the room itself. It cannot be read off a
     /// federation response: a PDU for any room version this server creates carries no `event_id`
     /// field, by design -- the recipient computes it from the reference hash.
@@ -390,4 +417,65 @@ async fn the_auth_chain_of_an_event_is_the_events_it_transitively_cites() {
         !chain.iter().any(|e| e["event_id"] == message_id.as_str()),
         "an event is not part of its own auth chain"
     );
+}
+
+/// `/get_missing_events` answers oldest-first, the order the events actually happened in.
+///
+/// The walk that finds them runs backwards from what the caller has, so the natural order is
+/// newest-first — and a requesting server replays the batch into its own DAG assuming the
+/// opposite. Complement reads `*ev.StateKey()` off the first entry: when that is a message rather
+/// than a state event it dereferences a nil pointer, which kills the Go test binary and silently
+/// discards every test scheduled after it. That is why the whole federation suite has been run
+/// with `-skip TestInboundCanReturnMissingEvents`.
+#[tokio::test]
+async fn missing_events_come_back_oldest_first() {
+    let harness = Harness::new().await;
+    let (room_id, message_id) = harness.room_with_a_message(true).await;
+    let create_id = harness.create_event_id(&room_id).await;
+
+    let (status, body) = harness
+        .signed_post(
+            &format!("/get_missing_events/{room_id}"),
+            serde_json::json!({
+                "earliest_events": [create_id],
+                "latest_events": [message_id],
+                "limit": 10,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let events = body["events"].as_array().expect("events");
+    assert!(
+        !events.is_empty(),
+        "the gap between the create event and the message is not empty: {body}"
+    );
+
+    let depths: Vec<i64> = events
+        .iter()
+        .map(|e| e["depth"].as_i64().expect("every PDU carries a depth"))
+        .collect();
+    let mut sorted = depths.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        depths, sorted,
+        "events must be ordered by depth ascending, oldest first: {depths:?}"
+    );
+
+    // The specific shape Complement asserts on: the first event out of the gap after
+    // `m.room.create` is the creator's own join, a state event. A response whose first entry has
+    // no state key is what crashes it.
+    assert_eq!(
+        events[0]["type"], "m.room.member",
+        "the oldest event after the create is the creator's join: {events:?}"
+    );
+    assert!(
+        events[0]["state_key"].is_string(),
+        "the first event must have a state key, or Complement dereferences nil: {events:?}"
+    );
+
+    // Neither bound is echoed back: the caller said it has both.
+    for event in events {
+        assert_ne!(event["type"], "m.room.create", "{event}");
+    }
 }

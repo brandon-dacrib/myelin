@@ -865,3 +865,64 @@ async fn the_key_server_publishes_a_self_signed_key_and_federation_requires_sign
 
     handle.shutdown().await;
 }
+
+/// Complement's `TestUnknownEndpoints`, against the real assembled router: an endpoint this
+/// server does not have must answer a JSON Matrix error, not axum's empty-bodied 404. A client
+/// library that always decodes the error shape fails on the decode rather than on the status, and
+/// a bridge cannot tell "this server does not implement that" from "the network ate it".
+///
+/// It lives here rather than in `hs-http` because what it checks is that the fallback was applied
+/// *after* every route and every merge — a unit test of the fallback itself cannot see that, and
+/// getting the order wrong silently leaves half the router on the default.
+#[tokio::test]
+async fn an_endpoint_this_server_does_not_have_answers_a_json_matrix_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(reserve_ephemeral_port(), dir.path());
+    let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
+        .await
+        .expect("server should boot");
+    let base = handle.base_url();
+    let client = reqwest::Client::new();
+
+    // The four prefixes Complement asks about, plus a bare unknown one.
+    for path in [
+        "/_matrix/unknown",
+        "/_matrix/client/unknown",
+        "/_matrix/client/v3/room/unknown",
+        "/_matrix/federation/v1/unknown",
+        "/_matrix/key/v2/unknown",
+        "/_matrix/media/v3/unknown",
+    ] {
+        let response = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .unwrap_or_else(|e| panic!("{path} did not answer JSON: {e}"));
+        assert_eq!(body["errcode"], "M_UNRECOGNIZED", "{path}");
+    }
+
+    // A path that exists, with a method it does not serve, is 405 rather than 404 — the
+    // distinction tells a client "you have the wrong verb", not "upgrade your server".
+    let response = client
+        .put(format!("{base}/_matrix/client/v3/login"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["errcode"], "M_UNRECOGNIZED");
+
+    // The admin API keeps its own contract: RFC 9457, not a Matrix errcode.
+    let response = client
+        .get(format!("{base}/api/v1/nonsense"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(body.get("errcode").is_none(), "{body}");
+    assert!(body["type"].is_string(), "{body}");
+
+    handle.shutdown().await;
+}

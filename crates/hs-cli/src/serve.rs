@@ -409,6 +409,13 @@ fn build_router<B: KvBackend>(
     manifest.routes.extend(shim_routes);
     let router = router.merge(shim_router);
 
+    // Last, after every route and every merge: axum's `method_not_allowed_fallback` attaches to
+    // the `MethodRouter`s registered before it, so anything merged afterwards would keep the
+    // empty-bodied default. Turns an unknown endpoint into `404 M_UNRECOGNIZED` and a known path
+    // called with the wrong method into `405 M_UNRECOGNIZED`, in whichever error shape the path's
+    // API speaks -- see `hs_http::fallback`.
+    let router = hs_http::fallback::apply(router);
+
     let router = router
         // Without this a browser client cannot talk to this server at all: it fails every
         // request after the preflight and shows only opaque network errors. Found by pointing

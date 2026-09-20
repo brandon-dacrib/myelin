@@ -409,7 +409,7 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
             // event it received cites parents it has never seen.
             let mut seen: HashSet<String> = earliest.clone();
             let mut queue: VecDeque<String> = latest.iter().cloned().collect();
-            let mut found = Vec::new();
+            let mut found: Vec<&hs_model::Event> = Vec::new();
             while let Some(id) = queue.pop_front() {
                 if found.len() >= limit {
                     break;
@@ -421,7 +421,7 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
                     continue;
                 };
                 if !latest.contains(&id) {
-                    found.push(full_pdu(event));
+                    found.push(event);
                 }
                 for prev in prev_event_ids(event) {
                     if !seen.contains(&prev) {
@@ -429,7 +429,23 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
                     }
                 }
             }
-            Ok(found)
+            // The walk above runs backwards, so `found` is newest-first -- but the response has
+            // to be oldest-first, the order the events happened in. A requesting server replays
+            // them into its own DAG, and one that reads the first entry as the earliest of the
+            // batch gets the wrong event: Complement reads `*ev.StateKey()` off it and
+            // dereferences a nil pointer when it is a message rather than a state event, which
+            // kills the whole Go test binary and silently discards every test after it.
+            //
+            // Depth, then event ID, because depth alone is not a total order: two events on
+            // forked branches share one, and the response must still be stable for a caller
+            // comparing two servers' answers.
+            found.sort_by(|a, b| {
+                a.header()
+                    .depth
+                    .cmp(&b.header().depth)
+                    .then_with(|| a.event_id().as_str().cmp(b.event_id().as_str()))
+            });
+            Ok(found.into_iter().map(full_pdu).collect())
         })
         .await
     }

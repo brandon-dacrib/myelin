@@ -50,6 +50,7 @@ pub fn routes() -> Vec<Route> {
         route("GET", "/register/available", NoAuth, "registerAvailable"),
         route("POST", "/account/password", Matrix, "changePassword"),
         route("POST", "/account/deactivate", Matrix, "deactivateAccount"),
+        route("GET", "/account/3pid", Matrix, "getAccount3PIDs"),
         route("GET", "/password_policy", NoAuth, "passwordPolicy"),
         route("GET", "/devices", Matrix, "getDevices"),
         route("GET", "/devices/{deviceId}", Matrix, "getDevice"),
@@ -124,9 +125,9 @@ mod tests {
 
     #[test]
     fn mirrors_the_expected_route_count() {
-        // One entry per `(method, path)` pair `hs_auth::routes::router()` registers: 16 for the
+        // One entry per `(method, path)` pair `hs_auth::routes::router()` registers: 17 for the
         // auth and device surface, plus 5 for profiles.
-        assert_eq!(routes().len(), 21);
+        assert_eq!(routes().len(), 22);
     }
 
     #[test]
