@@ -113,6 +113,9 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         }
-        assert!(ready, "the cluster never reported ready after its heartbeat");
+        assert!(
+            ready,
+            "the cluster never reported ready after its heartbeat"
+        );
     }
 }

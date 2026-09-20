@@ -194,6 +194,30 @@ async fn settle(step: Duration, rounds: u32) {
     }
 }
 
+/// Like [`settle`], but stops as soon as `condition` holds and reports whether it ever did.
+///
+/// Use this before asserting on anything a background task produces. A fixed round count assumes
+/// the acquisition loop gets far enough within however many times the runtime chooses to poll it,
+/// which holds on an idle machine and does not on a contended CI runner — three of the tests in
+/// this file failed there while passing locally every time, all of them waiting for the same
+/// thing: the initial claim of a share of the shards.
+async fn settle_until(
+    step: Duration,
+    max_rounds: u32,
+    mut condition: impl FnMut() -> bool,
+) -> bool {
+    for _ in 0..max_rounds {
+        if condition() {
+            return true;
+        }
+        tokio::time::advance(step).await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+    }
+    condition()
+}
+
 /// Tries to append to `shard` on whichever of `replicas` currently believes it owns it. Returns
 /// `None` if no replica currently claims ownership (a transient gap during failover).
 fn append_via_current_owner<B: KvBackend>(
@@ -354,7 +378,13 @@ async fn failover_completes_within_configured_ttl() {
     let (b, _handle_b) = KvOwnership::start(test_config("hs-1", layout), backend.clone())
         .await
         .unwrap();
-    settle(Duration::from_millis(60), 6).await;
+    assert!(
+        settle_until(Duration::from_millis(60), 60, || layout
+            .all_shards()
+            .any(|s| a.is_mine(s)))
+        .await,
+        "hs-0 never claimed a shard"
+    );
 
     let shard = layout
         .all_shards()
@@ -431,7 +461,13 @@ async fn drain_hands_off_to_a_live_peer_before_stopping() {
     let (b, _handle_b) = KvOwnership::start(test_config("hs-1", layout), backend.clone())
         .await
         .unwrap();
-    settle(Duration::from_millis(60), 8).await;
+    assert!(
+        settle_until(Duration::from_millis(60), 60, || layout
+            .all_shards()
+            .any(|s| a.is_mine(s)))
+        .await,
+        "hs-0 never claimed a share of the shards"
+    );
 
     let a_owned_before: Vec<_> = layout.all_shards().filter(|s| a.is_mine(*s)).collect();
     assert!(
@@ -482,7 +518,13 @@ async fn a_partitioned_replica_cannot_write_after_being_fenced() {
     let (b, _handle_b) = KvOwnership::start(test_config("hs-1", layout), real_backend.clone())
         .await
         .unwrap();
-    settle(Duration::from_millis(60), 6).await;
+    assert!(
+        settle_until(Duration::from_millis(60), 60, || layout
+            .all_shards()
+            .any(|s| a.is_mine(s)))
+        .await,
+        "hs-0 never claimed a shard to be fenced from"
+    );
 
     let shard = layout
         .all_shards()
