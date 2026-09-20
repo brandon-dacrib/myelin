@@ -806,6 +806,24 @@ pub async fn spawn_serve(
     config: hs_config::Config,
     options: ServeOptions,
 ) -> Result<ServeHandle, ServeError> {
+    let storage = storage::open_storage(&config.storage)?;
+    spawn_serve_with_storage(storage, config, options).await
+}
+
+/// [`spawn_serve`] over a backend somebody else already opened.
+///
+/// `hs serve` takes this path, because by the time it has a configuration to serve it has already
+/// had to open the database: that is where the configuration lives (`crate::bootstrap`). Opening
+/// it a second time here would not merely be wasteful — the embedded backend holds an exclusive
+/// lock on its directory, so the second open fails and the server never starts.
+///
+/// # Errors
+/// See [`ServeError`].
+pub async fn spawn_serve_with_storage(
+    storage: storage::OpenedStorage,
+    config: hs_config::Config,
+    options: ServeOptions,
+) -> Result<ServeHandle, ServeError> {
     if config.listeners.listeners.is_empty() {
         return Err(ServeError::NoListeners);
     }
@@ -813,7 +831,7 @@ pub async fn spawn_serve(
     // One generic server, instantiated per backend. `spawn_serve_with_backend` is generic over
     // `B: KvBackend`, so both arms below get the same server built over a different store rather
     // than two code paths that could drift apart; the cost is that it is monomorphized twice.
-    match storage::open_storage(&config.storage)? {
+    match storage {
         storage::OpenedStorage::Embedded(backend) => {
             spawn_serve_with_backend(backend, config, options).await
         }

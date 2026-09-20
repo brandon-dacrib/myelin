@@ -1,5 +1,133 @@
 # 12. Platform and Kubernetes
 
+## First run: a config file is now optional (2026-09-20)
+
+`docs/next-steps.md` item 2, second half. The measurement it set out from: against the published
+image, `hs generate-config` wrote **158 lines of YAML**, three of which (`storage.data_dir`, the
+media `path`, `server.signing_key_path`) had to be repointed by hand before the container could
+write anything, and a fourth (`auth.enable_registration`) before anyone could sign up. Nothing was
+broken; four hand-edits simply stood between a `docker pull` and a working server.
+
+**Where it stands now: 0 lines, or 10 if you want a file.**
+
+```
+$ hs serve --data-dir ./data --server-name example.org
+```
+is a complete first run. No YAML exists anywhere. `hs generate-config` still works and now writes
+19 lines, 9 of them comments — 10 lines of settings, none of which need editing.
+
+### What changed in `crates/hs-cli`
+
+**`src/bootstrap.rs` (new).** The boot path `hs serve` and `hs config` share. It resolves the
+three layers RFC 0016 defines (file < database < environment) in the only order the circularity
+allows: read file + `HS__` environment, deserialize *only* `storage` out of that to find the
+database, open it, seed it from the file if nothing has ever been written, then resolve for real
+with the database as the middle layer. `Booted` carries the layers, the opened storage, the
+config store and the metadata; `OpenedConfigStore` absorbs `ConfigStore`'s backend generic so the
+subcommands are written once rather than once per backend.
+
+**`--data-dir`, and the decision the assignment asked for: it is a flag with an environment twin
+(`HS_DATA_DIR`), not an `HS__` variable.** `HS__SECTION__FIELD` sets exactly one leaf of the
+schema; this sets three — `<root>/db` for the database, `<root>/keys` for signing keys,
+`<root>/media` for media. `HS__STORAGE__DATA_DIR` still exists and still means only what it says
+(the embedded database's own directory), and because it is in the environment layer it outranks
+the `<root>/db` the flag derives. The derived paths are contributed in the *file* layer and only
+for paths no other layer mentions, so a config file, an `HS__` variable or a value in the database
+all win over them — and, importantly, an operator who has already pointed media at S3 does not get
+`{backend: local, path: ...}` merged into an `s3` variant, which `deny_unknown_fields` would
+reject at startup.
+
+The database gets `<root>/db` rather than `<root>` itself because the embedded backend treats its
+directory as private; putting the operator's signing keys and media store inside it would
+interleave their files with the database's.
+
+The derived paths are deliberately **not** seeded into the database. They are recomputed from the
+flag on every boot, so moving the data directory moves the whole server instead of leaving
+machine-specific paths behind in a database that may later be restored somewhere else.
+
+**`src/config_cmd.rs` (new): `hs config`.** `show` (every effective setting with the layer that
+set it, secrets redacted, `--format table|json`), `get`, `set`, `unset`, `import`, `export`, and
+`history` (the store already records one, and an operator not in a browser should be able to read
+it). Writes validate the configuration the change would *produce* (`Layers::resolve_with_patch`),
+refuse settings an `HS__` variable pins rather than storing a value that would be ignored, and go
+through the same `ConfigStore` the admin API will, so a change made here and one made in the UI
+are the same kind of change in the same history.
+
+Secrets are found by walking the JSON Schema for `x-secret` rather than by a hardcoded list, so a
+secret added to `hs-config` later is redacted without anyone remembering to come back. `export`
+does **not** redact — a backup with `<redacted>` where the registration shared secret used to be
+restores a server that cannot register anybody.
+
+**`src/identity.rs`: a generated signing key is now written to disk.** It used to generate an
+ephemeral one and keep it in memory, logged at `warn`. That was honest but the consequence was not
+obvious from the warning: every restart signed with a different key, so events already sent stopped
+verifying against the key the server now advertised. `create_new` rather than `write`, so two
+processes starting at once cannot leave the loser signing with a key the winner's file does not
+contain; `0600` on Unix. An unwritable directory still falls back to an ephemeral key — refusing to
+start would be worse — with a warning that now says which of the two situations the operator is in.
+
+**`src/serve.rs`: `spawn_serve_with_storage`.** `hs serve` has already had to open the database by
+the time it has a configuration, because that is where the configuration lives. Opening it a second
+time is not merely wasteful: the embedded backend holds an exclusive lock on its directory, so the
+second open fails and the server never starts. `spawn_serve` is unchanged for every other caller.
+
+**`src/generate_config.rs`: rewritten.** It serialized a whole `Config`; it now writes the
+bootstrap file — server name, signing-key directory, database directory, media directory, every
+path already inside the data directory — plus a comment saying that settings here seed the database
+on the first run and are outranked by it afterwards, which RFC 0016 §4 asks for by name. A unit
+test fails if it grows back past 12 lines of settings.
+
+### What did not survive contact with the code
+
+1. **`HS__STORAGE__DATA_DIR` on its own did not parse.** `storage` is an internally tagged enum, so
+   a document that sets `data_dir` without `backend` fails with "missing field `backend`" — a
+   message pointing at something the operator never wrote. `bootstrap.rs::ensure_storage_backend`
+   names the default backend on their behalf, in the file layer, so anything that does name one
+   still wins. This had to be fixed for the whole layer stack, not just for the probe that finds
+   the database: the first attempt fixed only the probe, and the seed-time validation then failed
+   with the same message.
+
+2. **`Layers::database` is a snapshot, and a write does not update it.** `hs config set` followed
+   by `hs config show` in one process answered with the configuration from before the write, which
+   reads exactly like the write having been lost. Each CLI invocation is its own process so it
+   never bit in practice, but the in-process tests found it immediately. `Booted::refresh` reloads
+   the database layer, and every write path calls it.
+
+3. **A section-granularity seed, not a leaf-granularity one.** Seeding a translated Synapse config
+   means diffing against the schema defaults, and a leaf diff can store `path` without the
+   `backend` tag that says which enum variant it belongs to — producing a stored document that no
+   longer deserializes. Whole sections are coarser and cannot fail that way.
+
+4. **Validating before seeding is load-bearing.** A bootstrap file that does not resolve must not
+   be copied into the database, where it would outrank the corrected file on the next boot and be
+   very hard to explain. Validation is only possible when the store is empty (on later boots,
+   settings as basic as `server.server_name` live in the database), which is exactly when it
+   matters.
+
+### Left for whoever owns them (not touched, out of this assignment's paths)
+
+- **`README.md`'s quickstart is the old four-edit flow.** It can become one command with no file:
+  `docker run -d -p 8008:8008 -v "$PWD/data:/data" ghcr.io/brandon-dacrib/myelin:main serve
+  --data-dir /data --server-name localhost`. The image's `ENTRYPOINT` is already `hs`, so this
+  needs no image change.
+- **`deploy/Dockerfile`'s default `CMD` is `["serve", "-c", "/etc/hs/homeserver.yaml"]`**, which
+  still works. `["serve", "--data-dir", "/data"]` would make the image work with nothing but a
+  volume; it would change what a `docker run` with no arguments does, so it is a deliberate call
+  for whoever owns the image and the chart together.
+- **`deploy/helm/hs/templates/configmap.yaml` never sets `media.storage.path`**, so it falls back
+  to `./media-store` relative to the container's working directory — which is the same class of bug
+  this session fixed elsewhere, and means media uploads fail on a read-only root filesystem. One
+  line next to the existing `data_dir` fixes it. Not touched: my change does not break how the
+  chart passes config, and it is that track's file.
+- **`docs/compat/cli-shims.md`** documents `hs serve` and `hs generate-config` as they were; it is
+  track 13's specification document, not a status file, so it is not updated here. `hs config` is
+  new surface it does not describe at all.
+- **`docs/config.md` is generated** from the schema by `hs-config`'s `gen_config_docs` binary and
+  needs no regeneration — this change altered no schema field. Its preamble does not mention the
+  layers or that the database outranks the file; adding that is a change to the generator, which
+  belongs to track 13.
+
+
 ## From "runs on my machine" to "runs in a cluster" (2026-09-19)
 
 This session's assignment: the server had never been packaged or deployed for real — no
@@ -971,4 +1099,39 @@ kubectl delete -f deploy/crds/homeserver.yaml
 cargo fmt -p hs-operator
 cargo clippy -p hs-operator --all-targets -- -D warnings
 cargo test -p hs-operator
+```
+
+## How to verify the first-run work (2026-09-20)
+
+```sh
+cargo fmt -p hs-cli --check
+cargo clippy -p hs-cli --all-targets     # clean
+cargo test -p hs-cli                     # 140 tests: 116 lib, 9 + 7 + 8 integration
+
+# The actual first run: no YAML anywhere.
+d=$(mktemp -d)
+cargo run -p hs-cli -- serve --data-dir "$d/data" --server-name example.org &
+curl -sS http://127.0.0.1:8008/health/live                 # expect "ok"
+curl -sS http://127.0.0.1:8008/_matrix/client/versions     # expect the version list
+find "$d/data" -maxdepth 1                                  # expect db/ keys/ media/
+test -f "$d/data/keys/hs.signing.key"                       # the key it generated for itself
+
+# Administering it without a browser, with the server stopped.
+kill %1
+cargo run -p hs-cli -- config --data-dir "$d/data" show | tail -2
+cargo run -p hs-cli -- config --data-dir "$d/data" set /auth/enable_registration true
+cargo run -p hs-cli -- config --data-dir "$d/data" get /auth/enable_registration   # true
+
+# The restart needs neither the flag nor a file: the database remembers.
+cargo run -p hs-cli -- serve --data-dir "$d/data" &
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST -H 'content-type: application/json' \
+  -d '{"username":"alice","password":"correct-horse-battery","auth":{"type":"m.login.dummy"}}' \
+  http://127.0.0.1:8008/_matrix/client/v3/register          # expect 200 -- registration came
+                                                            # from `hs config set`, not a file
+kill %1; rm -rf "$d"
+
+# The file path still works, unedited.
+cargo run -p hs-cli -- generate-config --server-name example.org --data-dir ./data -o homeserver.yaml
+wc -l homeserver.yaml                                       # 19 lines, 9 of them comments
+cargo run -p hs-cli -- serve -c homeserver.yaml             # boots as written, seeds the database
 ```

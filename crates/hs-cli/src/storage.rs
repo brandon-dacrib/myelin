@@ -53,8 +53,27 @@ pub enum StorageOpenError {
          PostgreSQL, or unset this field to acknowledge a plaintext connection."
     )]
     PostgresTlsUnsupported,
+    /// The embedded Fjall database's directory could not be created.
+    #[error("failed to create the data directory {path:?}: {source}")]
+    FjallDataDir {
+        /// The directory that could not be created.
+        path: std::path::PathBuf,
+        /// The underlying `hs-kv` error.
+        #[source]
+        source: hs_kv::KvError,
+    },
     /// The embedded Fjall database could not be opened.
-    #[error("failed to open the embedded storage backend at {path:?}: {source}")]
+    ///
+    /// Overwhelmingly the reason is that something else already has it open — the embedded
+    /// backend takes an exclusive lock on its directory, and `hs config` against a running server
+    /// hits this every time. The underlying error says `Locked` and nothing else, which is true
+    /// and useless, so the message names the two ways out.
+    #[error(
+        "failed to open the embedded storage backend at {path:?}: {source}\n\
+         If this says `Locked`, another process already has this database open — most likely \
+         `hs serve`. Stop the server first, or make the change through the admin web interface, \
+         which can apply it without a restart."
+    )]
     Fjall {
         /// The data directory that failed to open.
         path: std::path::PathBuf,
@@ -86,9 +105,11 @@ impl std::fmt::Debug for OpenedStorage {
 ///
 /// # Errors
 /// Returns [`StorageOpenError::BackendNotImplemented`] for `slatedb` (no `hs-kv` backend exists
-/// for it), [`StorageOpenError::Fjall`] if the embedded backend's data directory could not be
-/// opened, or [`StorageOpenError::Postgres`]/[`StorageOpenError::PostgresTlsUnsupported`] for the
-/// PostgreSQL backend.
+/// for it), [`StorageOpenError::FjallDataDir`] if the embedded backend's data directory could not
+/// be created, [`StorageOpenError::Fjall`] if it could not be opened (usually because another
+/// process holds its lock), or
+/// [`StorageOpenError::Postgres`]/[`StorageOpenError::PostgresTlsUnsupported`] for the PostgreSQL
+/// backend.
 pub fn open_storage(config: &hs_config::StorageConfig) -> Result<OpenedStorage, StorageOpenError> {
     match config {
         hs_config::StorageConfig::Embedded(embedded) => {
@@ -131,7 +152,7 @@ fn open_postgres(
 }
 
 fn open_embedded(path: &Path) -> Result<hs_kv::fjall_backend::FjallBackend, StorageOpenError> {
-    std::fs::create_dir_all(path).map_err(|e| StorageOpenError::Fjall {
+    std::fs::create_dir_all(path).map_err(|e| StorageOpenError::FjallDataDir {
         path: path.to_owned(),
         source: hs_kv::KvError::backend(e),
     })?;

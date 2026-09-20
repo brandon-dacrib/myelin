@@ -16,13 +16,17 @@
 //!
 //! # What happens with no key on disk
 //!
-//! A fresh [`hs_model::signing::SigningKeyPair::generate`] is used instead, logged at `warn`. This
-//! is honest, not silent: the generated key is **not** persisted anywhere, so every `hs serve`
-//! restart with no signing key file signs with a *different* key, and past events' signatures
-//! stop matching the server's currently-advertised key. Run `hs generate-signing-key -o
-//! <signing_key_path>/hs.signing.key` (or point `--synapse-config` at a Synapse deployment that
-//! already has one) before relying on room state surviving a restart. Tracked as a known gap in
-//! `docs/status/12-platform-and-kubernetes.md`.
+//! One is generated and **written** to `signing_key_path`, then loaded back, so a first run is a
+//! first run rather than a broken one: an operator who has never heard of
+//! `hs generate-signing-key` gets a server whose events keep verifying across restarts.
+//!
+//! This used to generate an ephemeral key and keep it only in memory, logged at `warn`. That was
+//! honest but the consequence was not obvious from the warning: every restart signed with a
+//! *different* key, so events this server had already sent stopped verifying against the key it
+//! now advertised, and any room it shared with another server quietly broke. If the directory
+//! cannot be written — a read-only mount, a path owned by somebody else — the old behaviour is
+//! still what happens, since refusing to start would be worse than running; the warning now says
+//! which of the two situations the operator is in.
 
 use std::path::Path;
 
@@ -83,9 +87,44 @@ fn first_signing_key_in_dir(dir: &Path) -> Option<SigningKeyPair> {
     None
 }
 
+/// Writes a newly generated signing key into `dir` and returns it, or `None` if the directory
+/// could not be written.
+///
+/// `create_new` rather than `write`: two processes starting at once on the same data directory
+/// must not each write a key and leave the loser signing with one the winner's file does not
+/// contain. The loser's write fails, it re-reads the directory, and both end up on the same key.
+///
+/// The file is `0600` where the platform has permissions to set. A private signing key readable
+/// by every account on the host is the sort of thing that is discovered years later.
+fn generate_and_persist(dir: &Path) -> Option<SigningKeyPair> {
+    std::fs::create_dir_all(dir).ok()?;
+    let path = dir.join("hs.signing.key");
+    let line = crate::signing_key::generate_signing_key_line();
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    match options.open(&path) {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            file.write_all(line.as_bytes()).ok()?;
+            file.sync_all().ok()?;
+            tracing::info!(path = %path.display(), "generated this server's signing key");
+            parse_signing_key_line(line.trim_end())
+        }
+        // Somebody else won the race, or a key appeared between the scan and now: whatever is
+        // there is the key, and it is the one both processes must use.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => first_signing_key_in_dir(dir),
+        Err(_) => None,
+    }
+}
+
 /// Builds this server's [`HomeserverIdentity`]: `config.server.server_name` plus the signing key
-/// found at `config.server.signing_key_path`, or a freshly generated (unpersisted) one if none is
-/// found there. See the module doc for what "none found" means for restart durability.
+/// found at `config.server.signing_key_path`, generating and persisting one there if the
+/// directory holds none. See the module doc for what happens when it cannot be written.
 ///
 /// # Errors
 /// Returns the [`ruma::IdParseError`] from parsing `server.server_name` if it is not a valid
@@ -94,16 +133,23 @@ pub fn load_or_generate(
     config: &hs_config::Config,
 ) -> Result<HomeserverIdentity, ruma::IdParseError> {
     let server_name: ruma::OwnedServerName = ruma::ServerName::parse(&config.server.server_name)?;
-    let signing_key = match first_signing_key_in_dir(&config.server.signing_key_path) {
+    let dir = &config.server.signing_key_path;
+    let signing_key = match first_signing_key_in_dir(dir) {
         Some(pair) => pair,
-        None => {
-            tracing::warn!(
-                path = %config.server.signing_key_path.display(),
-                "no ed25519 signing key found; generating an ephemeral one for this process \
-                 only -- run `hs generate-signing-key` to persist one across restarts"
-            );
-            SigningKeyPair::generate("a_ephemeral")
-        }
+        None => match generate_and_persist(dir) {
+            Some(pair) => pair,
+            None => {
+                tracing::warn!(
+                    path = %dir.display(),
+                    "no ed25519 signing key found and none could be written there; signing with \
+                     an ephemeral key for this process only. Every restart will sign with a \
+                     different key and events this server has already sent will stop verifying \
+                     -- make that directory writable, or run `hs generate-signing-key -o \
+                     <path>/hs.signing.key` somewhere this process can read."
+                );
+                SigningKeyPair::generate("a_ephemeral")
+            }
+        },
     };
     Ok(HomeserverIdentity {
         server_name,
@@ -143,12 +189,36 @@ mod tests {
         assert_eq!(found.version(), expected.version());
     }
 
+    /// The first-run behaviour: no key, no `hs generate-signing-key`, and yet the server comes up
+    /// with a key that is still there — and still the same key — on the next boot.
     #[test]
-    fn generates_an_ephemeral_key_when_the_directory_is_empty() {
+    fn a_first_run_generates_a_key_and_keeps_it() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = hs_config::Config::default();
         config.server.server_name = "example.org".to_owned();
-        config.server.signing_key_path = dir.path().to_owned();
+        config.server.signing_key_path = dir.path().join("keys");
+
+        let first = load_or_generate(&config).unwrap();
+        assert_eq!(first.server_name.as_str(), "example.org");
+        assert!(dir.path().join("keys").join("hs.signing.key").is_file());
+
+        let second = load_or_generate(&config).unwrap();
+        assert_eq!(
+            first.signing_key.version(),
+            second.signing_key.version(),
+            "a restart must sign with the key the first run wrote, not a new one"
+        );
+    }
+
+    /// A directory that cannot be created falls back to an ephemeral key rather than refusing to
+    /// start: running with a warning beats not running at all.
+    #[test]
+    fn an_unwritable_key_directory_still_starts() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut config = hs_config::Config::default();
+        config.server.server_name = "example.org".to_owned();
+        // A path *under a regular file* can never be created as a directory.
+        config.server.signing_key_path = file.path().join("keys");
         let identity = load_or_generate(&config).unwrap();
         assert_eq!(identity.server_name.as_str(), "example.org");
     }

@@ -356,10 +356,13 @@ async fn generate_config_then_hash_password_round_trip() {
     // Exercises the other two "no network" shims that don't need a running server:
     // `hs generate-config` produces a config `hs-config` itself accepts, and
     // `hs hash-password` produces a hash `hs-auth::password::verify_password` accepts.
-    let config = hs_cli::generate_config::minimal_config("cli-test.example");
-    let yaml = hs_cli::generate_config::render_yaml(&config, "cli-test.example").unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let yaml = hs_cli::generate_config::render_yaml("cli-test.example", data_dir.path());
     let parsed = hs_config::Config::from_yaml(&yaml).unwrap();
     assert_eq!(parsed.server.server_name, "cli-test.example");
+    // The bootstrap file must work as written: no path in it may still point at the process's
+    // working directory, which in a container is neither writable nor mounted.
+    assert!(parsed.server.signing_key_path.starts_with(data_dir.path()));
 
     let hash = hs_cli::hash_password::hash_password("a-test-password").unwrap();
     assert!(hs_auth::password::verify_password("a-test-password", &hash, "").unwrap());
