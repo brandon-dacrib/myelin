@@ -6,7 +6,11 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 
 ## The state of things
 
-**A real client works.** Element Web — the actual browser client most Matrix users run — signs in against this server, shows a room list, sends and receives messages live between two independent sessions, propagates a display-name change to an already-open tab, and scrolls back through history. Screenshots in `docs/design/screenshots/`, reproduction in `web/element-testing/README.md`. That was the project's stated definition of success from day one, and it is met with one loud exception (item 1 below).
+**A real client works.** Element Web — the actual browser client most Matrix users run — signs in against this server, shows a room list, sends and receives messages live between two independent sessions, propagates a display-name change to an already-open tab, and scrolls back through history. Screenshots in `docs/design/screenshots/`, reproduction in `web/element-testing/README.md`. That was the project's stated definition of success from day one. The loud exception is closed: `/createRoom` merged its power-level override backwards, which made creating a room from the UI fail unconditionally, and it no longer does. `unsigned.prev_content` and `GET /account/3pid` went with it. **None of the three has been re-checked against a real Element session** — the unit and end-to-end tests cover them, and nobody has opened a browser since.
+
+**Configuration lives in the database** (RFC 0016). The file is a bootstrap and a seed; the database outranks it, `HS__` variables outrank the database, and the admin API refuses a write the environment would shadow rather than storing one that gets ignored. The web interface has a Configuration section that builds its forms from the server's own JSON Schema, and `hs config show|get|set|unset|import|export|history` is the same thing without a browser.
+
+**A first run is one command.** `hs serve --data-dir ./data --server-name example.org` in an empty directory produces a working server — database, signing key, media path, all underneath that directory. It was 158 lines of generated YAML with four mandatory hand-edits.
 
 **Complement, `csapi`: 191 of 296 assertions pass** (53 of 106 top-level), up from 148/293 and 125/293 on the two runs before it.
 
@@ -25,36 +29,72 @@ COMPLEMENT_BASE_IMAGE=complement-hs-reimplement:dev go test -v -timeout 30m ./te
 COMPLEMENT_BASE_IMAGE=complement-hs-reimplement:dev go test -v -timeout 30m -skip 'TestInboundCanReturnMissingEvents' ./tests
 ```
 
-A cold image build is ~4 minutes idle, up to 19 under load; each suite run is ~13-15 minutes. The `-skip` is not optional yet — see item 4.
+A cold image build is ~4 minutes idle, up to 19 under load; each suite run is ~13-15 minutes.
+
+**Those numbers are from before this session and have not been re-measured.** The `-skip` should no longer be needed — `/get_missing_events` answered newest-first, which is what dereferenced a nil state key in Complement's Go binary and killed the run 21 tests in, and it now answers oldest-first with a test pinning it. That is a local test, not a Complement run. Re-running both suites without the `-skip` is the first thing worth doing next, because it re-grades everything below it.
 
 ## What to do next, in order
 
-### 1. Element cannot create a room — one bug, one afternoon
+### 1. Re-measure, then chase what the measurement says
 
-`POST /createRoom` *replaces* the default power levels when a client sends `power_level_content_override`, instead of merging over them. The creator loses their own power-100 grant, the next bootstrap event is auth-rejected, and the request fails. Real Element sends that field on **every** room it creates, so creating a room from the UI fails unconditionally, every preset, every time.
+Nothing below this line is trustworthy until the two Complement suites run again, without the
+`-skip`, on this code. Three fixes this session were aimed squarely at conformance and none has
+been graded: the `/createRoom` power-level merge, `unsigned.prev_content` across every endpoint
+that renders an event including `/sync`, and the `/get_missing_events` ordering that was crashing
+the federation suite. Open a browser at Element too, and create a room in it — the bug that made
+that impossible is fixed and unobserved.
 
-`crates/hs-room/src/actor.rs`, `RoomActor::create_room`, at the `power_level_content_override.clone().unwrap_or_else(...)`. It is backwards from the spec's own wording for the field. Everything else in Element works; this is the one thing standing between "it works" and "it is usable", and it is small.
+Two known conformance gaps in `/get_missing_events` that the ordering fix did not touch, both
+visible in `TestInboundCanReturnMissingEvents` once it stops crashing: `min_depth` is parsed
+nowhere and ignored, and history visibility is not applied per event, so the `joined` and
+`invited` halves of that test will want redacted copies of events from before the requester
+joined and will get full ones.
 
-Two more from the same session, both cheap and both visible to a user:
+### 2. Make it fun to administer — the half that is left
 
-- **`unsigned.prev_content` is never set anywhere** (`crates/hs-room/src/routes/render.rs::client_event_json`). Element renders a display-name change as "Alice joined the room", because without the previous content it cannot tell the two apart.
-- **`GET /account/3pid` does not exist** (track 07). Element's Settings page shows a visible error.
+First run is done (see the state of things). The admin interface can now *change* the
+configuration rather than only display it, which was the stated product priority. What it still
+cannot do, in rough order of how often an operator will hit it:
 
-### 2. Make it fun to install and administer
+- **Edit an array of objects as a form.** `listeners.listeners`, `media.thumbnail_sizes` and
+  `auth.oidc_providers` fall back to a JSON textarea with live parse errors. Reachable, not
+  pleasant; the generic renderer is built to sit underneath hand-tuned editors for exactly these.
+- **Switch a tagged-enum backend** — there is no "move from embedded to postgres" flow, only a
+  view of whichever variant is live.
+- **See which *setting* changed.** `ConfigStore` records the merge patch per revision precisely so
+  the interface can show it, and no operation exposes it: `GET /config/{section}/history`
+  returning `ChangeRecord[]` would turn the section history into a per-setting one with a revert.
+- **Validate across sections.** `POST /config/validate` is sent one section at a time, so a
+  constraint spanning two only fails at save.
+- **Reload anything.** `config.reload` reports honestly that nothing was hot-applied, because
+  nothing in this server re-reads its configuration while running — the rate limiter, the
+  federation policy and the telemetry layer are built once at startup. Giving any one of them a
+  live read is what makes `reloaded_sections` non-empty.
+- **Be trusted after a blip.** Running `e2e-real` as a whole suite, two pages land on the sign-in
+  screen; the trace shows their `GET /api/v1/me` never completed (status `-1`, not `401`) and the
+  app concluded there was no session. A failed request is not a rejected token, and an operator
+  should be told the server is unreachable rather than silently signed out. Each test passes
+  alone, so this reproduces only under the full suite.
+- **Have the config pages checked by axe.** Every other e2e flow runs axe at each step; the
+  Configuration pages have never been through it.
 
-This is the product priority, and the server is now far enough along to deserve it. Two halves:
+Still on the first-run side, all left where their owners can see them: `README.md`'s quickstart is
+still the four-edit flow and could become one `docker run`; `deploy/Dockerfile`'s `CMD` still
+points at a config file; and `deploy/helm/hs/templates/configmap.yaml` never sets
+`media.storage.path`, so uploads fall back to `./media-store` relative to the working directory
+and fail on a read-only root filesystem. That last one is a real bug, found while doing this and
+not caused by it.
 
-**The admin web interface.** It reads real data and degrades honestly against the 118 operations that still answer `501`, but it is a viewer. It should become the way an operator *runs* this server: configuration through the UI rather than YAML, users and rooms managed without curl, the things an operator does weekly reachable in two clicks. Every competing homeserver is administered by hand-editing config and running Python scripts — Synapse ships no admin UI at all. This is the differentiator.
+### 3. Federation: finish the join
 
-Work backwards from an operator's day and let that drive which admin API operations to implement next, rather than working down the OpenAPI document in order.
-
-**First run.** Getting from nothing to a working server should be pleasant. Measured against the published image on 2026-09-20: `generate-config` writes **158 lines of YAML**, three of which (`data_dir`, the media `path`, `signing_key_path`) must be repointed by hand before the container can write anything, and a fourth (`auth.enable_registration`, correctly `false` by default) before anyone can sign up. After those four edits it works — health in about a second, then register, whoami and create a room all succeed. The gap is not that it is broken; it is that four hand-edits stand between a pull and a working server. A first-run flow — a single command that produces a working server and hands you a URL and an admin login — is squarely in the spirit of this priority, and the image, chart and CD pipeline that now exist are the foundation for it.
-
-### 3. Federation: stop crashing the suite, then finish the join
-
-- **`/get_missing_events` returns the wrong event first**, and it segfaults Complement's own Go binary (it dereferences a state key unconditionally where our response has an event without one). The first federation run crashed 21 tests in and silently discarded everything after, which is why the reproduction above needs `-skip`. Fixing it removes the skip and probably moves the number more than the crash suggests. Track 06's P0.
-- **Restricted and knock-restricted joins fail across the board** — ten top-level tests, all `M_FORBIDDEN: invalid join_authorised_via_users_server`. Tracks 06 and 04.
-- **Two-way federation needs a room bootstrap API.** Two instances of this server complete a real join handshake over TLS with a private CA, verified end to end — but only one way, because `hs-room` can create a new room or extend one it already has, and has no way to build a room from a join's verified state snapshot. Specified in `docs/rfcs/0015-outbound-join-needs-a-room-bootstrap-api.md`; the script that demonstrates the gap is `crates/hs-federation/scripts/two-server-federation.sh`.
+- **Restricted and knock-restricted joins fail across the board** — ten top-level tests, all
+  `M_FORBIDDEN: invalid join_authorised_via_users_server`. Tracks 06 and 04.
+- **Two-way federation needs a room bootstrap API.** Two instances of this server complete a real
+  join handshake over TLS with a private CA, verified end to end — but only one way, because
+  `hs-room` can create a new room or extend one it already has, and has no way to build a room
+  from a join's verified state snapshot. Specified in
+  `docs/rfcs/0015-outbound-join-needs-a-room-bootstrap-api.md`; the script that demonstrates the
+  gap is `crates/hs-federation/scripts/two-server-federation.sh`.
 
 ### 4. The rest of the Complement triage
 
@@ -63,33 +103,33 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 - **Track 02**: room-v12 additional-creator validation answers 403 where the spec wants 400; the create event's `room_id` is missing on `/state`, `/messages`, `/event` and `/context`.
 - **Track 09**: federation-fetched media fails outright — thumbnails, content, filenames. Implemented, but broken for remote peers.
 - **Tracks 08 and 06**: device-list and to-device delivery over federation time out at full length rather than failing fast, which reads like a delivery gap rather than a validation one.
-- **No clear owner**: some error responses are not JSON — an empty-body fallback on unknown endpoints, plain-text extractor rejections. Nothing claims the base router's fallback handling; it belongs with whoever owns the shared HTTP layer.
+- **Half-done**: error responses that are not JSON. The unknown-endpoint and wrong-method halves are fixed — `hs_http::fallback`, applied last in `hs serve`, answers `404`/`405 M_UNRECOGNIZED` in the Matrix shape and leaves the admin API's RFC 9457 alone, with an end-to-end test through the real assembled router. What is left is the extractor rejections: routes taking a bare `axum::Json` still answer a plain-text body, where the spec wants `M_NOT_JSON` (Complement's `TestRequestEncodingFails` sends invalid UTF-8 to `/register`). `hs_http::body::PermissiveJson` already does the right thing; the work is finding every bare `Json(...)` extractor on a `/_matrix` route and switching it.
 
 ### 5. Housekeeping worth doing deliberately
 
 - **Rename the crates** from `hs-` to the project's own prefix. Mechanical across twenty-six crates, and best done when nothing else is in flight.
 - **Tag `v0.0.1`** to exercise the untested half of CD: binaries for three targets, the Helm chart as an OCI artifact, and a GitHub release.
 - **`cd.yml` documents an `edge` tag it does not produce** — pushes to `main` tag the image `main`. Fix the tag or the table; they disagree.
-- **`web`'s unit tests and lint have never run on this machine.** Vitest workers time out; it has failed the same way in four separate sessions under load. The repository has since moved off iCloud, which fixed every other pathological slowdown here — try again before assuming it is unfixable.
+- ~~`web`'s unit tests and lint have never run on this machine.~~ **Done, and it was never the machine.** `vite.config.ts` excluded `e2e/**` but not `e2e-real/**`, so vitest collected a Playwright spec and died at import; and `openapi-fetch` builds a `new URL()` per request, so the app's relative `/api/v1` base threw `ERR_INVALID_URL` under jsdom and no page test could ever have passed. `npm run check` — typecheck, lint, test, build — is green, and the suite runs in about three seconds.
 - **Receipts and presence are in-memory**, so a restart forgets read state and presence. Postgres ignores `pool_size`, refuses `tls`, and hardcodes the `public` schema. `/createRoom` is not shard-gated. UIA on `/keys/device_signing/upload` needs a coordinated change with the loadgen scenario that bootstraps cross-signing without auth data.
 
 ## Known gaps, honestly held
 
 | Gap | Where | Consequence |
 |---|---|---|
-| `/createRoom` drops the creator's power level | `hs-room` | Element cannot create a room at all |
-| `unsigned.prev_content` never set | `hs-room` | clients cannot tell a rename from a join |
-| `/account/3pid` unimplemented | `hs-auth` | visible error in Element's settings |
-| `/get_missing_events` ordering crashes Complement | `hs-federation` | the federation suite cannot run unskipped |
+| `min_depth` ignored on `/get_missing_events` | `hs-cli` | a conformance gap, no longer a crash |
+| history visibility not applied per event on `/get_missing_events` | `hs-cli` | pre-join events served unredacted |
 | Restricted joins rejected | `hs-federation`, `hs-room` | ten conformance tests, a common room type |
 | No room bootstrap from a join | `hs-room` | federation completes one way only |
 | Federation media fetch broken | `hs-media` | remote avatars and attachments fail |
 | `/search` unimplemented | `hs-room` | needs a cross-room index the actor model has no place for |
-| Admin UI is read-mostly | `web` | the stated product priority is not met yet |
+| Admin UI cannot edit arrays of objects | `web` | listeners and OIDC providers are a JSON textarea |
+| Nothing hot-applies a config change | all | every change needs a restart, and says so |
+| A failed `/me` signs the operator out | `web` | a blip looks like a rejected token |
 | Receipts and presence in memory | `hs-user` | a restart forgets read state |
 | Postgres `tls`/`pool_size`/schema | `hs-kv`, `hs-cli` | encrypt in front of the database for now |
 | `/createRoom` not shard-gated | `hs-cli` | first actor may be built on a non-owner |
-| web unit tests never run here | `web` | unverified, not passing |
+| Config pages never checked by axe | `web` | the only e2e flow without an accessibility pass |
 | Sytest never run | `tests/sytest` | CPAN dependencies absent |
 | `cargo fuzz` never executed | `fuzz/` | no nightly toolchain |
 
