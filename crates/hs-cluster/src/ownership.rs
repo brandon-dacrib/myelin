@@ -692,6 +692,32 @@ mod tests {
         }
     }
 
+    /// Advances virtual time until `condition` holds, up to `max_rounds`, and reports whether it
+    /// ever did.
+    ///
+    /// Prefer this over [`settle`] before asserting on background progress. `settle` advances a
+    /// fixed number of rounds and then hopes the acquisition loop got far enough, which depends
+    /// on how the runtime happened to schedule 64 yields — fine on an idle laptop, not fine on a
+    /// contended CI runner, where exactly that assumption made
+    /// `drain_releases_every_owned_shard` fail while passing locally every time. Waiting for the
+    /// condition itself removes the guess rather than enlarging it.
+    pub(crate) async fn settle_until(
+        step: Duration,
+        max_rounds: u32,
+        mut condition: impl FnMut() -> bool,
+    ) -> bool {
+        for _ in 0..max_rounds {
+            if condition() {
+                return true;
+            }
+            advance(step).await;
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+        }
+        condition()
+    }
+
     #[tokio::test(start_paused = true)]
     async fn single_replica_acquires_every_shard() {
         let backend = MemoryBackend::new();
@@ -725,8 +751,13 @@ mod tests {
         let (mgr, _handle) = KvOwnership::start(config("hs-0"), backend.clone())
             .await
             .unwrap();
-        settle(Duration::from_millis(60), 5).await;
-        assert!(mgr.layout().all_shards().all(|s| mgr.is_mine(s)));
+        assert!(
+            settle_until(Duration::from_millis(60), 50, || {
+                mgr.layout().all_shards().all(|s| mgr.is_mine(s))
+            })
+            .await,
+            "the solo replica never acquired every shard"
+        );
         let total = mgr.layout().all_shards().count();
         let report = mgr.drain(Duration::from_secs(5)).await;
         // Solo replica: every shard is released (nothing left `owner == me`), but none is
