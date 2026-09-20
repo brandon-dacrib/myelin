@@ -422,10 +422,11 @@ async fn retried_append_is_not_duplicated() {
     let (a, _handle) = KvOwnership::start(test_config("hs-0", layout), backend.clone())
         .await
         .unwrap();
-    settle(Duration::from_millis(60), 5).await;
-
     let shard = ShardId::new(ShardKind::Room, 0);
-    assert!(a.is_mine(shard));
+    assert!(
+        settle_until(Duration::from_millis(60), 60, || a.is_mine(shard)).await,
+        "hs-0 never took ownership of {shard}"
+    );
     let fence = a.fence(shard).unwrap();
     let key = 0xDEADBEEFu128;
 
@@ -496,7 +497,13 @@ async fn drain_hands_off_to_a_live_peer_before_stopping() {
         );
     }
     // Every shard hs-0 used to own has now converged onto `b` (the only other live replica).
-    settle(Duration::from_millis(50), 20).await;
+    assert!(
+        settle_until(Duration::from_millis(50), 100, || a_owned_before
+            .iter()
+            .all(|s| b.is_mine(*s)))
+        .await,
+        "the survivor never took over every shard the drained replica held"
+    );
     for shard in &a_owned_before {
         assert!(
             b.is_mine(*shard),
