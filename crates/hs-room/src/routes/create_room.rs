@@ -136,6 +136,18 @@ pub async fn post_create_room<B: KvBackend + 'static>(
         }
     };
 
+    // The override is merged key-by-key over the generated power-levels content, so anything
+    // that is not a JSON object has no meaning at all -- reject it rather than ignore it.
+    let power_level_content_override = match body.get("power_level_content_override") {
+        None | Some(Value::Null) => None,
+        Some(v @ Value::Object(_)) => Some(v.clone()),
+        Some(_) => {
+            return Err(RoomError::BadRequest(
+                "power_level_content_override must be an object".into(),
+            ));
+        }
+    };
+
     let publish = body.get("visibility").and_then(Value::as_str) == Some("public");
 
     let request = CreateRoomRequest {
@@ -145,7 +157,7 @@ pub async fn post_create_room<B: KvBackend + 'static>(
         topic: body.get("topic").and_then(Value::as_str).map(str::to_owned),
         invite: parse_user_list(&body, "invite")?,
         initial_state: parse_initial_state(&body)?,
-        power_level_content_override: body.get("power_level_content_override").cloned(),
+        power_level_content_override,
         creation_content,
         room_alias_name: body
             .get("room_alias_name")

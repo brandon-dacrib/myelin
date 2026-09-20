@@ -52,8 +52,8 @@ pub struct CreateRoomRequest {
     pub invite: Vec<OwnedUserId>,
     /// `initial_state`: additional state events, applied after the preset's defaults.
     pub initial_state: Vec<InitialStateEvent>,
-    /// `power_level_content_override`: replaces the default `m.room.power_levels` content
-    /// entirely if present (matching the spec: this is a full override, not a merge).
+    /// `power_level_content_override`: applied on top of the default `m.room.power_levels`
+    /// content, one top-level key at a time -- a key it carries wins, a key it omits is kept.
     pub power_level_content_override: Option<serde_json::Value>,
     /// `creation_content`: merged into the `m.room.create` content (`creator`/`room_version` are
     /// still set by this crate, overriding anything the caller put there).
@@ -1317,31 +1317,46 @@ impl<B: KvBackend> RoomActor<B> {
             _ => ("invite", "shared", "can_join"),
         };
 
-        let power_levels_content =
-            request
-                .power_level_content_override
-                .clone()
-                .unwrap_or_else(|| {
-                    let mut users = serde_json::Map::new();
-                    // From room version 12 (MSC4289) the room's creators hold power implicitly and
-                    // for ever, and `m.room.power_levels` naming any of them in `users` is
-                    // rejected outright by `hs_state::auth`'s `check_room_power_levels`. Below
-                    // that version the creator's authority comes *from* this entry, so it must be
-                    // present. `explicitly_privilege_room_creators` is the room-version rule that
-                    // distinguishes the two, rather than a version comparison here.
-                    if !rules.explicitly_privilege_room_creators {
-                        users.insert(creator.to_string(), serde_json::Value::from(100));
-                    }
-                    if preset == "trusted_private_chat" {
-                        // Invitees are not creators (creators are the sender plus any
-                        // `additional_creators` on the create event), so they take an ordinary
-                        // explicit entry in every room version.
-                        for user in &request.invite {
-                            users.insert(user.to_string(), serde_json::Value::from(100));
-                        }
-                    }
-                    serde_json::json!({ "users": users })
-                });
+        let mut power_levels_content = {
+            let mut users = serde_json::Map::new();
+            // From room version 12 (MSC4289) the room's creators hold power implicitly and for
+            // ever, and `m.room.power_levels` naming any of them in `users` is rejected outright
+            // by `hs_state::auth`'s `check_room_power_levels`. Below that version the creator's
+            // authority comes *from* this entry, so it must be present.
+            // `explicitly_privilege_room_creators` is the room-version rule that distinguishes the
+            // two, rather than a version comparison here.
+            if !rules.explicitly_privilege_room_creators {
+                users.insert(creator.to_string(), serde_json::Value::from(100));
+            }
+            if preset == "trusted_private_chat" {
+                // Invitees are not creators (creators are the sender plus any
+                // `additional_creators` on the create event), so they take an ordinary explicit
+                // entry in every room version.
+                for user in &request.invite {
+                    users.insert(user.to_string(), serde_json::Value::from(100));
+                }
+            }
+            serde_json::json!({ "users": users })
+        };
+        // `power_level_content_override` is "applied on top of the generated
+        // `m.room.power_levels` event content" (client-server API, `POST /createRoom`): a
+        // top-level key the override carries wins, and every key it does not mention is kept.
+        // Replacing the whole content instead drops the `users` entry that grants the creator
+        // power 100 below room version 12, which auth-rejects the very next bootstrap event --
+        // and Element sends this field on every room it creates, so that made room creation from
+        // a real client fail unconditionally.
+        if let Some(overrides) = request
+            .power_level_content_override
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+        {
+            let base = power_levels_content
+                .as_object_mut()
+                .expect("built as an object directly above");
+            for (key, value) in overrides {
+                base.insert(key.clone(), value.clone());
+            }
+        }
         actor.send_event(
             creator.clone(),
             "m.room.power_levels".to_owned(),
@@ -3035,6 +3050,21 @@ mod tests {
         .unwrap()
     }
 
+    /// The current `m.room.power_levels` content, as plain JSON to assert against.
+    fn power_levels_of(actor: &RoomActor<MemoryBackend>) -> serde_json::Value {
+        let event = actor
+            .state_event("m.room.power_levels", "")
+            .unwrap()
+            .expect("every room this crate creates has power levels");
+        crate::routes::render::canonical_to_json(
+            event
+                .json()
+                .get("content")
+                .and_then(CanonicalJsonValue::as_object)
+                .expect("a state event always has an object for content"),
+        )
+    }
+
     #[test]
     fn create_room_bootstraps_creator_as_the_sole_joined_member() {
         let actor = room("public_chat");
@@ -3109,6 +3139,78 @@ mod tests {
             err.is_err(),
             "the full, unredacted object must NOT verify under a signature computed over the \
              redacted form -- if it does, this test is not exercising the bug"
+        );
+    }
+
+    /// `power_level_content_override` is applied *on top of* the generated power-levels content,
+    /// key by key. Element Web sends this field -- carrying `events` alone -- on every room it
+    /// creates, so when it replaced the whole content instead, the creator's `users` entry
+    /// vanished, the next bootstrap event failed auth, and creating a room from a real client
+    /// failed unconditionally, in every preset.
+    #[test]
+    fn a_power_level_override_of_one_key_keeps_the_creator_grant() {
+        let backend = MemoryBackend::new();
+        let tables = Tables::open(&backend).unwrap();
+        let actor = RoomActor::create_room(
+            backend,
+            tables,
+            HomeserverIdentity::for_tests("hs1"),
+            user_id!("@alice:hs1").to_owned(),
+            CreateRoomRequest {
+                preset: Some("private_chat".to_owned()),
+                // Room version 11: the creator's power comes from the `users` entry, not from
+                // being the creator, so losing the entry is fatal rather than cosmetic.
+                room_version: Some(RoomVersionId::try_from("11").unwrap()),
+                power_level_content_override: Some(
+                    serde_json::json!({"events": {"m.room.encryption": 100}}),
+                ),
+                ..Default::default()
+            },
+            1,
+        )
+        .expect("the bootstrap events after the power levels must still pass auth");
+
+        let content = power_levels_of(&actor);
+        assert_eq!(
+            content.pointer("/users/@alice:hs1"),
+            Some(&serde_json::Value::from(100)),
+            "the override mentioned only `events`, so the creator's grant must survive it"
+        );
+        assert_eq!(
+            content.pointer("/events/m.room.encryption"),
+            Some(&serde_json::Value::from(100)),
+            "the key the override did carry must win"
+        );
+    }
+
+    /// The other half of the same rule: a key the override *does* carry replaces the generated
+    /// one outright, rather than being merged into it. `users` is the case that matters --
+    /// Complement's v12 suite asserts the resulting `users` equals exactly what was sent.
+    #[test]
+    fn a_power_level_override_replaces_the_key_it_names() {
+        let backend = MemoryBackend::new();
+        let tables = Tables::open(&backend).unwrap();
+        let actor = RoomActor::create_room(
+            backend,
+            tables,
+            HomeserverIdentity::for_tests("hs1"),
+            user_id!("@alice:hs1").to_owned(),
+            CreateRoomRequest {
+                preset: Some("private_chat".to_owned()),
+                room_version: Some(RoomVersionId::try_from("11").unwrap()),
+                power_level_content_override: Some(serde_json::json!({
+                    "users": {"@alice:hs1": 100, "@bob:hs1": 50}
+                })),
+                ..Default::default()
+            },
+            1,
+        )
+        .unwrap();
+
+        let content = power_levels_of(&actor);
+        assert_eq!(
+            content.pointer("/users/@bob:hs1"),
+            Some(&serde_json::Value::from(50))
         );
     }
 
