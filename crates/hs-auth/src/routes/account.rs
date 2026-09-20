@@ -1,4 +1,4 @@
-//! `POST /account/password`, `POST /account/deactivate`, `GET /password_policy`.
+//! `POST /account/password`, `POST /account/deactivate`, `GET /account/3pid`, `GET /password_policy`.
 //!
 //! Both mutating endpoints re-authenticate through a single-stage UIA flow: `m.login.password`
 //! (re-enter the current password) when the account has one, or `m.login.dummy` when it does not
@@ -100,6 +100,41 @@ pub async fn post_account_deactivate(
     // We do not implement identity-server unbinding (no identity-server client in this crate
     // yet); "no-support" is the spec's documented value for "the server did not attempt it".
     Ok(Json(json!({"id_server_unbind_result": "no-support"})).into_response())
+}
+
+/// `GET /account/3pid`: the third-party identifiers (email addresses, phone numbers) this
+/// homeserver has associated with the caller's account.
+///
+/// **This server associates none, so the answer is always an empty list** — and an empty list is
+/// the spec-complete answer for an account with no third-party identifiers, not a stub. The
+/// response shape is exactly what
+/// `refs/matrix-spec/data/api/client-server/administrative_contact.yaml` defines; there is simply
+/// nothing to put in it.
+///
+/// That is a statement about this server, not a guess. Nothing here can create a 3PID
+/// association: `POST /account/3pid/add` needs a validated session from `.../requestToken`, which
+/// needs a mailer or SMS gateway and a validation-session store, and `POST /account/3pid/bind`
+/// needs an identity-server client. None of those exist, which is exactly why
+/// `GET /_matrix/client/v3/capabilities` already reports `m.3pid_changes: {"enabled": false}`
+/// (`crates/hs-cli/src/capabilities.rs`) — the spec's own way for a server to say it does not do
+/// this. `UserStore::bind_threepid` is not a counter-example: it is a login-by-email index
+/// (`crate::routes::login`'s `m.id.thirdparty` identifier), keyed `(medium, address)` with the
+/// user ID as its only value, reachable from no HTTP route, and it stores neither of the
+/// `added_at`/`validated_at` timestamps the spec makes **required** on every entry here. Making
+/// this endpoint report real rows means a by-user index over that keyspace *and* a value format
+/// that carries both timestamps — worth doing when something can actually add a 3PID, and
+/// dishonest before then, because the alternative is inventing timestamps.
+///
+/// It answers `200` rather than `501` because the question has a true answer. Element's Settings
+/// page calls this on open and shows the user a visible error when it fails; "you have no
+/// third-party identifiers" is both what a client needs to render that page and what is actually
+/// the case.
+///
+/// The [`Requester`] parameter is the point of this signature even though the body ignores it:
+/// extracting it is what enforces the endpoint's `accessTokenBearer` security requirement, so an
+/// unauthenticated caller gets `401` instead of a list.
+pub async fn get_account_3pid(_requester: Requester) -> Json<Value> {
+    Json(json!({"threepids": []}))
 }
 
 /// `GET /password_policy`: unauthenticated, so clients can show requirements before registration.
@@ -287,6 +322,22 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.errcode().as_str(), "M_USER_SUSPENDED");
+    }
+
+    /// Element's Settings page calls `GET /account/3pid` as soon as it opens and renders a
+    /// visible error if it fails, which is what a missing route gave it. The list being empty is
+    /// the whole answer this server has (see the handler's doc comment); what this pins down is
+    /// that the key is present and is an array, since a client reading `threepids.length` off a
+    /// missing key is the same broken page by a different route.
+    #[tokio::test]
+    async fn account_3pid_reports_an_empty_list_for_an_account_with_none() {
+        let (_state, requester) = state_with_user("hunter2345").await;
+        let Json(body) = get_account_3pid(requester).await;
+        assert_eq!(
+            body["threepids"],
+            json!([]),
+            "threepids must be present and an empty array, not absent: {body}"
+        );
     }
 
     #[tokio::test]

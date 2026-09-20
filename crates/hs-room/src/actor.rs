@@ -2233,6 +2233,67 @@ impl<B: KvBackend> RoomActor<B> {
         Ok(allowed)
     }
 
+    /// The state event `event` replaced: the event that held `(event.type, event.state_key)` in
+    /// this room's current state *at the point `event` was sent*, which is what the client-server
+    /// API's `unsigned.prev_content`, `unsigned.replaces_state` and `unsigned.prev_sender` are
+    /// defined against. `Ok(None)` for a message event (no `state_key`, so it replaced nothing),
+    /// for the first event of its `(type, state_key)` in the room, and for an event whose
+    /// `prev_events` this actor does not hold.
+    ///
+    /// "At the point it was sent", not "the newest one before it in the timeline", is the whole
+    /// difficulty: the room is a DAG, so the predecessor in send order is not necessarily the
+    /// state this event superseded. The answer is the resolved state at `event`'s own
+    /// `prev_events` -- the same view [`RoomActor::event_visible_to`] evaluates history
+    /// visibility "before" against, and the same one `crate::pipeline` authorized `event`
+    /// against when it was accepted. Taking it from anywhere else (the current state, or a scan
+    /// backwards through the timeline) would report the wrong content on any room that has ever
+    /// forked, and would report a *later* event's content when rendering an old page of
+    /// `/messages`.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::State`] if the state store fails.
+    pub fn replaced_state_event(&self, event: &Event) -> Result<Option<&Event>, RoomError> {
+        let Some(state_key) = event.header().state_key.as_deref() else {
+            return Ok(None);
+        };
+        let prev_sns: Vec<EventSn> = pipeline::decode_event_ids(event.json().get("prev_events"))
+            .iter()
+            .filter_map(|id| self.event_id_index.get(id).copied())
+            .collect();
+        if prev_sns.is_empty() {
+            return Ok(None);
+        }
+        self.state_view(&prev_sns)?
+            .event_for(&event.header().event_type, state_key)
+            .map_err(|e| RoomError::State(e.to_string()))
+    }
+
+    /// [`RoomActor::replaced_state_event`], resolved into the form the client-server renderer
+    /// wants: what `requester` is allowed to be told about the event `event` replaced. See
+    /// [`crate::routes::render::attach_replaced_state`], which turns this into the three
+    /// `unsigned` fields.
+    ///
+    /// The history-visibility verdict applies to the *replaced* event, not to `event`: the spec
+    /// returns `prev_content` "only ... if the client has permission to see the previous event",
+    /// so a reader who can see a join but not the membership event it superseded gets
+    /// `replaces_state` and `prev_sender` (which the spec says are returned regardless) without
+    /// `prev_content`.
+    ///
+    /// Returns `None` -- rendering nothing at all -- when there is no replaced event, and also
+    /// when the state store errors: a failed lookup must not turn an otherwise-renderable event
+    /// into a failed request, and an omitted `unsigned` field is exactly what every client
+    /// already copes with.
+    #[must_use]
+    pub fn replaced_state_for(
+        &self,
+        event: &Event,
+        requester: &UserId,
+    ) -> Option<crate::routes::render::ReplacedState> {
+        let replaced = self.replaced_state_event(event).ok().flatten()?;
+        let visible = self.event_visible_to(replaced, requester).unwrap_or(false);
+        Some(crate::routes::render::ReplacedState::new(replaced, visible))
+    }
+
     /// Pages the timeline from `from` (or the live end, if `None`) in `direction`, returning up to
     /// `limit` events and the token to continue from.
     #[must_use]

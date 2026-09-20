@@ -11,7 +11,7 @@ use serde_json::json;
 use std::collections::HashMap;
 
 use crate::error::RoomError;
-use crate::routes::render::client_event_json;
+use crate::routes::render::{attach_replaced_state, client_event_json};
 use crate::state::{RoomRequester, RoomState};
 use crate::timeline::{Direction, PaginationToken};
 
@@ -85,7 +85,12 @@ pub async fn get_state<B: KvBackend + 'static>(
                     found
                         .unwrap_or_default()
                         .into_iter()
-                        .map(client_event_json)
+                        .map(|e| {
+                            attach_replaced_state(
+                                client_event_json(e),
+                                actor.replaced_state_for(e, &requester.user_id).as_ref(),
+                            )
+                        })
                         .collect::<Vec<_>>()
                 })
         })
@@ -123,9 +128,12 @@ pub async fn get_event<B: KvBackend + 'static>(
                 &requester.user_id,
                 requester.device_id.as_deref(),
             );
-            Ok(crate::routes::render::attach_transaction_id(
-                crate::routes::render::client_event_json_bundled(event, &bundle),
-                txn_id,
+            Ok(attach_replaced_state(
+                crate::routes::render::attach_transaction_id(
+                    crate::routes::render::client_event_json_bundled(event, &bundle),
+                    txn_id,
+                ),
+                actor.replaced_state_for(event, &requester.user_id).as_ref(),
             ))
         })
         .await;
@@ -174,9 +182,12 @@ pub async fn get_context<B: KvBackend + 'static>(
                     &requester.user_id,
                     requester.device_id.as_deref(),
                 );
-                crate::routes::render::attach_transaction_id(
-                    crate::routes::render::client_event_json_bundled(e, &bundle),
-                    txn_id,
+                attach_replaced_state(
+                    crate::routes::render::attach_transaction_id(
+                        crate::routes::render::client_event_json_bundled(e, &bundle),
+                        txn_id,
+                    ),
+                    actor.replaced_state_for(e, &requester.user_id).as_ref(),
                 )
             };
             let target_json = render(target);
@@ -224,7 +235,12 @@ pub async fn get_context<B: KvBackend + 'static>(
                 .ok()??
                 .state
                 .iter()
-                .map(client_event_json)
+                .map(|e| {
+                    attach_replaced_state(
+                        client_event_json(e),
+                        actor.replaced_state_for(e, &requester.user_id).as_ref(),
+                    )
+                })
                 .collect::<Vec<_>>();
             Some(json!({
                 "event": target_json,
@@ -258,7 +274,12 @@ pub async fn get_members<B: KvBackend + 'static>(
                 found
                     .unwrap_or_default()
                     .into_iter()
-                    .map(client_event_json)
+                    .map(|e| {
+                        attach_replaced_state(
+                            client_event_json(e),
+                            actor.replaced_state_for(e, &requester.user_id).as_ref(),
+                        )
+                    })
                     .collect::<Vec<_>>()
             })
         })
@@ -392,9 +413,12 @@ pub async fn get_messages<B: KvBackend + 'static>(
                         &requester.user_id,
                         requester.device_id.as_deref(),
                     );
-                    crate::routes::render::attach_transaction_id(
-                        crate::routes::render::client_event_json_bundled(e, &bundle),
-                        txn_id,
+                    attach_replaced_state(
+                        crate::routes::render::attach_transaction_id(
+                            crate::routes::render::client_event_json_bundled(e, &bundle),
+                            txn_id,
+                        ),
+                        actor.replaced_state_for(e, &requester.user_id).as_ref(),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -538,6 +562,116 @@ mod tests {
             state_topic.as_deref(),
             Some("first"),
             "context's state must be pinned to the target event, not the room's live current state"
+        );
+    }
+
+    /// A display-name change and a join are the same event to a client that cannot see what the
+    /// previous `m.room.member` event said: both are `m.room.member` with `membership: "join"`.
+    /// Element renders the former as "Alice joined the room" when `unsigned.prev_content` is
+    /// missing, which is what this test exists to keep fixed. Reads back through `/messages` --
+    /// the endpoint a client actually pages a room's timeline with -- rather than calling the
+    /// renderer directly, so it fails if the route stops asking for the replaced state even
+    /// though the renderer still knows how to attach it.
+    ///
+    /// Also pins down the two neighbouring fields the same lookup feeds:
+    /// `unsigned.replaces_state` must name the superseded event, and `unsigned.prev_sender` its
+    /// sender (`refs/matrix-spec/data/api/client-server/definitions/client_event_without_room_id.yaml`).
+    #[tokio::test]
+    async fn a_display_name_change_carries_the_old_name_in_unsigned_prev_content() {
+        let state = app();
+        let alice = user_id!("@alice:hs1");
+        let handle = state
+            .rooms
+            .create_room(
+                alice.to_owned(),
+                crate::actor::CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .expect("create should succeed");
+        let room_id = handle.query(|actor| actor.room_id().to_owned()).await;
+
+        let named = handle
+            .refresh_own_profile(alice.to_owned(), Some("Alice".to_owned()), None, 2)
+            .await
+            .expect("setting a display name should succeed")
+            .expect("alice is joined, so this mints a membership event");
+        let renamed = handle
+            .refresh_own_profile(alice.to_owned(), Some("Alice Smith".to_owned()), None, 3)
+            .await
+            .expect("changing a display name should succeed")
+            .expect("alice is joined, so this mints a membership event");
+
+        let response = get_messages::<MemoryBackend>(
+            State(state),
+            Path(room_id.to_string()),
+            Query(MessagesQuery {
+                from: None,
+                dir: Some("b".to_owned()),
+                limit: Some(50),
+            }),
+            requester(alice),
+        )
+        .await
+        .expect("messages should succeed")
+        .into_response();
+        let body = json_body(response).await;
+        let chunk = body["chunk"].as_array().expect("chunk should be an array");
+
+        let find = |event_id: &str| {
+            chunk
+                .iter()
+                .find(|e| e["event_id"] == event_id)
+                .unwrap_or_else(|| panic!("{event_id} should be in the /messages chunk"))
+                .clone()
+        };
+
+        let rename = find(renamed.event_id().as_str());
+        assert_eq!(
+            rename["content"]["displayname"], "Alice Smith",
+            "sanity: this is the rename event"
+        );
+        assert_eq!(
+            rename["unsigned"]["prev_content"]["displayname"], "Alice",
+            "the rename must carry the old display name, or a client cannot tell it from a join"
+        );
+        assert_eq!(
+            rename["unsigned"]["replaces_state"],
+            serde_json::Value::String(named.event_id().to_string()),
+            "replaces_state must name the membership event this one superseded"
+        );
+        assert_eq!(
+            rename["unsigned"]["prev_sender"],
+            serde_json::Value::String(alice.to_string()),
+            "prev_sender must name the superseded event's sender"
+        );
+
+        // The first membership event for `(m.room.member, @alice)` replaced nothing, so all three
+        // fields must be absent rather than present-and-empty.
+        let first_join = chunk
+            .iter()
+            .filter(|e| e["type"] == "m.room.member" && e["state_key"] == alice.as_str())
+            .min_by_key(|e| e["origin_server_ts"].as_i64().unwrap_or(i64::MAX))
+            .expect("the room's bootstrap join should be in the chunk")
+            .clone();
+        assert!(
+            first_join["unsigned"].get("prev_content").is_none()
+                && first_join["unsigned"].get("replaces_state").is_none()
+                && first_join["unsigned"].get("prev_sender").is_none(),
+            "a state event that replaced nothing must omit all three fields: {first_join}"
+        );
+
+        // A message event is not a state event, so it never carries them either.
+        let create = chunk
+            .iter()
+            .find(|e| e["type"] == "m.room.create")
+            .expect("the create event should be in the chunk");
+        assert!(
+            create["unsigned"].get("prev_content").is_none(),
+            "m.room.create replaced nothing: {create}"
         );
     }
 }

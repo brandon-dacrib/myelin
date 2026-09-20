@@ -46,6 +46,11 @@ pub fn router() -> Router<AuthState> {
             "/account/deactivate",
             post(account::post_account_deactivate),
         )
+        // `GET` only: this server has no way to add, bind or delete a 3PID, and says so through
+        // `m.3pid_changes: {"enabled": false}` in `GET /capabilities`. Registering the `POST
+        // /account/3pid/*` half would claim a surface that cannot work -- see
+        // `account::get_account_3pid`'s doc comment for what each of them would need first.
+        .route("/account/3pid", get(account::get_account_3pid))
         .route("/password_policy", get(account::get_password_policy))
         .route("/devices", get(devices::get_devices))
         .route(
@@ -99,6 +104,69 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/account/whoami")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The route existing at all is the fix: Element's Settings page calls it on open and shows
+    /// the user a visible error when it 404s. Goes through the router with a real token rather
+    /// than calling the handler, because "the handler compiles" was never the missing part.
+    #[tokio::test]
+    async fn router_serves_account_3pid_to_a_registered_user() {
+        let app = router().with_state(AuthState::in_memory());
+        let body = serde_json::json!({
+            "username": "threepid",
+            "password": "hunter22",
+            "auth": {"type": "m.login.dummy"}
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let access_token = json["access_token"].as_str().unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/account/3pid")
+                    .header("Authorization", format!("Bearer {access_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["threepids"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn router_rejects_account_3pid_without_a_token() {
+        let app = router().with_state(AuthState::in_memory());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/account/3pid")
                     .body(Body::empty())
                     .unwrap(),
             )
