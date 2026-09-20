@@ -7,14 +7,20 @@ import { test, expect, type Page } from "@playwright/test";
  * does; skipped entirely (no server started, every test a no-op skip) unless
  * `HS_REAL_SERVER_URL` is set.
  *
- * As of this writing `hs serve` wires its admin surface's `TokenVerifier` to an empty
- * `StaticVerifier` (`crates/hs-cli/src/serve.rs::dummy_admin_state`) — `hs_auth::
- * admin_verifier::AdminTokenVerifier` exists and is unit-tested but not yet plugged into `hs
- * serve` itself, an `hs-cli` change this track cannot make (`hs-cli` isn't ours to edit). That
- * means *every* bearer token, including a real admin's, currently gets a `401` from `/api/v1/*`.
- * The "unrecognized token" case below needs nothing else to be true and is the one guaranteed to
- * pass today; the authenticated walkthrough is written and ready, gated behind
- * `HS_REAL_ADMIN_TOKEN`, for the day that wiring lands.
+ * That day has arrived: `hs serve` wires `hs_auth::admin_verifier::AdminTokenVerifier` to the
+ * admin surface, so an access token belonging to an account with `is_admin` set is accepted by
+ * `/api/v1/*` and the authenticated walkthrough below actually runs. Verified 2026-09-20 against
+ * a real `hs serve --data-dir`: registered an admin with `hs register --admin`, logged in over
+ * the client-server API, and `GET /api/v1/me` answered 200 with `admin:read`/`admin:write`.
+ *
+ * Known flake, deliberately not papered over: run as a whole suite, "users list is real" and
+ * "user detail" land on the sign-in page, while each passes on its own. The trace shows the only
+ * `/api/v1` call those pages made was `GET /api/v1/me`, and it never completed — Playwright
+ * records status `-1` — after which the app concluded there was no session. The same endpoint
+ * answers 200 to twelve consecutive requests by curl against the same server, so this is not the
+ * server refusing the token. Worth chasing: a request that *fails* is not a request that came
+ * back 401, and an operator whose connection blips should be told the server is unreachable, not
+ * silently signed out.
  */
 
 const hasServer = Boolean(process.env.HS_REAL_SERVER_URL);
@@ -86,13 +92,16 @@ test.describe("real server", () => {
       await page.screenshot({ path: "test-results/real-user-detail.png", fullPage: true });
     });
 
-    test("rooms list honestly reports not-implemented (GET /rooms still 501)", async ({ page }) => {
+    // `rooms.list` used to answer 501 and this test asserted the interface said so. It is a real
+    // handler now, so the honest assertion is the same one the users list gets: a table, or an
+    // empty state, or an honest 503 — never a bare error and never a stuck spinner.
+    test("rooms list is real (GET /rooms is wired)", async ({ page }) => {
       await page.goto("/admin/rooms");
-      await expect(page.getByText(/isn't implemented on this server yet/i)).toBeVisible({
+      await expect(page.getByRole("table").or(page.getByRole("status"))).toBeVisible({
         timeout: 10_000,
       });
       await page.screenshot({
-        path: "test-results/real-rooms-not-implemented.png",
+        path: "test-results/real-rooms.png",
         fullPage: true,
       });
     });
