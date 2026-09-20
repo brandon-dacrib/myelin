@@ -768,7 +768,26 @@ mod tests {
     /// deliberately not derived from any of the ~140 public roots `rustls-tls-webpki-roots`
     /// bundles. Returns `(port, cert_pem)`; the server answers exactly one plain `200 {}` per
     /// connection, then stops accepting once `stop` is dropped.
+    /// Installs `ring` as the process-wide rustls provider, once.
+    ///
+    /// Necessary because of a difference between a scoped build and a workspace build that is
+    /// easy to be caught by: `cargo test -p hs-federation` enables only the workspace's own
+    /// `ring` backend and rustls picks it automatically, while `cargo test --workspace` unifies
+    /// features across every crate — `hs-loadgen` pulls `matrix-sdk` with `rustls-aws-lc-rs` —
+    /// so two backends are enabled at once, the automatic choice becomes ambiguous, and rustls
+    /// panics. Naming the provider explicitly is what `hs_cluster::mesh::tls` already does for
+    /// the same reason.
+    fn install_ring_provider() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            // Fails only if something already installed one, which is fine for a test.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
+
     async fn spawn_self_signed_tls_peer() -> (u16, Vec<u8>, tokio::task::JoinHandle<()>) {
+        install_ring_provider();
         let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_pem = cert.pem().into_bytes();

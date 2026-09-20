@@ -171,10 +171,8 @@ mod tests {
             "as_irc",
             AppserviceRecord::new("irc", user_id!("@ircbot:example.org").to_owned(), vec![]),
         );
-        let auth_state = hs_auth::state::AuthState {
-            appservices: Arc::new(as_registry),
-            ..hs_auth::state::AuthState::in_memory()
-        };
+        let auth_state =
+            hs_auth::state::AuthState::in_memory().with_appservices(Arc::new(as_registry));
 
         let router = ping_router::<MemoryBackend>(service).with_state(auth_state.clone());
         (router, auth_state)

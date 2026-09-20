@@ -990,7 +990,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // unconditionally.
     rooms.install_fencing(Arc::new(hs_room::fencing::RoomFencing {
         ownership: cluster_handles.cluster.ownership().clone(),
-        layout: cluster_handles.layout.clone(),
+        layout: cluster_handles.layout,
         cluster_store: hs_cluster::store::ClusterStore::open(backend.clone())
             .map_err(|e| ServeError::Sessions(Box::new(e)))?,
     }));

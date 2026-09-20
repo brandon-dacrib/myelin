@@ -55,10 +55,7 @@ impl Harness {
         let query = QueryService::new(registry.clone(), Arc::new(HttpQueryTransport::new()));
 
         let adapter = Arc::new(RegistryAppserviceAdapter::new(registry.clone()));
-        let auth_state = hs_auth::state::AuthState {
-            appservices: adapter,
-            ..hs_auth::state::AuthState::in_memory()
-        };
+        let auth_state = hs_auth::state::AuthState::in_memory().with_appservices(adapter);
 
         Self {
             registry,

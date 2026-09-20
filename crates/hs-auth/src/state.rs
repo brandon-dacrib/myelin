@@ -102,6 +102,22 @@ impl AuthState {
         }
     }
 
+    /// Replaces the appservice registry, returning the state so this reads as a builder.
+    ///
+    /// This exists because [`AuthState`] has a private field (the device-list notifier hook), and
+    /// Rust forbids functional-update syntax — `AuthState { appservices, ..AuthState::in_memory() }`
+    /// — on a struct with a private field from outside the defining crate. Two crates were doing
+    /// exactly that, and adding the hook broke both of their test harnesses, which only a
+    /// workspace-wide build catches: the crates that own the field build perfectly on their own.
+    ///
+    /// Swapping the registry is the only reason anything outside this crate ever wanted to
+    /// construct an `AuthState` field by field, so this is the whole of the API that was missing.
+    #[must_use]
+    pub fn with_appservices(mut self, appservices: Arc<dyn AppserviceRegistry>) -> Self {
+        self.appservices = appservices;
+        self
+    }
+
     /// The current time, milliseconds since the Unix epoch, from this state's clock.
     #[must_use]
     pub fn now_ms(&self) -> u64 {
