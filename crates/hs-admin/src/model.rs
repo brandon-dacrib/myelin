@@ -590,6 +590,153 @@ impl Event {
     }
 }
 
+/// The OpenAPI `ConfigSection` schema: one row of `GET /config` and the body of `GET
+/// /config/{section}` and `PATCH /config/{section}`. Served by whatever implements
+/// [`crate::sources::ConfigSource`].
+///
+/// `values` is the section's *effective* configuration — what this server is actually running
+/// on, after the bootstrap file, the database and the environment have been merged — with every
+/// secret already replaced by `{"$secret": true}` (see [`crate::config_schema`]). Its keys are
+/// relative to the section, because that is the object a form edits and a merge patch is written
+/// against.
+///
+/// `origins` is keyed by *whole-configuration* JSON Pointer (`/auth/enable_registration`)
+/// instead, matching `hs_config::Resolved::origins` and the pointers `GET /config/schema`
+/// reports, so the management interface has one pointer vocabulary across both endpoints rather
+/// than two that differ by a prefix.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigSection {
+    pub name: String,
+    /// Whether this section can be swapped into a running server (`hs_config::reload`).
+    pub reloadable: bool,
+    /// Whether this section is read before the database is open and so can never be stored in
+    /// it (`storage` today). The management interface renders these read-only; `config.update`
+    /// refuses them.
+    pub bootstrap: bool,
+    /// The highest-precedence layer that sets anything in this section (`default`, `file`,
+    /// `database` or `environment`) — what an operator sees at a glance in the section list.
+    pub source: String,
+    /// RFC 3339 UTC, or `None` when this section has never been reloaded on a running server.
+    pub last_reloaded_at: Option<String>,
+    pub values: serde_json::Value,
+    pub origins: std::collections::BTreeMap<String, String>,
+    /// The configuration's revision at the time of this read, which is also this section's ETag
+    /// for `If-Match`. It counts writes to the configuration as a whole, not to this section:
+    /// any concurrent change is a reason to re-read before patching.
+    pub revision: u64,
+    /// The most recent changes to this section, newest first. Populated by `GET
+    /// /config/{section}`; left empty by the section list, which would otherwise pay for ten
+    /// histories nobody asked for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<ConfigChange>,
+}
+
+/// One recorded configuration change (`hs_config::store::ChangeRecord` on the wire). `patch` is
+/// redacted exactly as [`ConfigSection::values`] is: a secret that was set through this API must
+/// not be readable back out of its own history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigChange {
+    pub revision: u64,
+    pub section: String,
+    pub patch: serde_json::Value,
+    pub actor: Option<String>,
+    /// RFC 3339 millisecond-precision UTC (RFC 0004 D15.2).
+    pub at: String,
+}
+
+/// The OpenAPI `ConfigValidateReport` schema: the answer to "would this configuration be
+/// accepted?", asked without applying it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigValidateReport {
+    pub valid: bool,
+    #[serde(default)]
+    pub errors: Vec<hs_http::ValidationError>,
+    /// Sections whose new value could not be applied without restarting the process
+    /// (`hs_config::reload::sections_requiring_restart`). Empty does not mean "no change"; it
+    /// means every change is one a running server can take.
+    #[serde(default)]
+    pub requires_restart: Vec<String>,
+}
+
+impl ConfigValidateReport {
+    /// A report saying the candidate configuration is fine.
+    #[must_use]
+    pub fn valid(requires_restart: Vec<String>) -> Self {
+        Self {
+            valid: true,
+            errors: Vec::new(),
+            requires_restart,
+        }
+    }
+
+    /// A report carrying every problem found, rather than the first.
+    #[must_use]
+    pub fn invalid(errors: Vec<hs_http::ValidationError>) -> Self {
+        Self {
+            valid: false,
+            errors,
+            requires_restart: Vec::new(),
+        }
+    }
+}
+
+/// The OpenAPI `ConfigReloadReport` schema: what a re-read of the configuration layers actually
+/// changed on the running server.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConfigReloadReport {
+    pub reloaded_sections: Vec<String>,
+    #[serde(default)]
+    pub errors: Vec<hs_http::ValidationError>,
+    /// Sections that changed but could not be hot-applied. Reported rather than swallowed: an
+    /// operator who is told "reloaded" and then finds the old value still in force has been
+    /// lied to.
+    #[serde(default)]
+    pub requires_restart: Vec<String>,
+    pub revision: u64,
+}
+
+/// The OpenAPI `ConfigSchema` schema, served by `GET /config/schema`: everything the management
+/// interface needs to render configuration forms without knowing a single field name.
+///
+/// `schema` is the JSON Schema `schemars` derives from `hs_config::Config` — types, defaults,
+/// enums, descriptions and the shape of every nested object. `settings` is the live half: one
+/// row per setting this server actually has, saying where its value came from and whether the
+/// interface may offer to change it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigSchema {
+    pub schema: serde_json::Value,
+    pub sections: Vec<ConfigSectionInfo>,
+    pub settings: Vec<ConfigSettingInfo>,
+    pub revision: u64,
+}
+
+/// One section's metadata in [`ConfigSchema`], without its values.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigSectionInfo {
+    pub name: String,
+    pub reloadable: bool,
+    pub bootstrap: bool,
+    pub source: String,
+}
+
+/// One setting's metadata in [`ConfigSchema`], keyed by whole-configuration JSON Pointer so it
+/// lines up with both [`ConfigSection::origins`] and the `schema` member's own structure.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigSettingInfo {
+    pub pointer: String,
+    pub section: String,
+    /// `default`, `file`, `database` or `environment`.
+    pub origin: String,
+    /// Whether this setting's value is a secret and is therefore served redacted.
+    pub secret: bool,
+    /// Whether changing it takes effect without a restart.
+    pub reloadable: bool,
+    /// Whether `config.update` would accept a change to it. False for a bootstrap section and
+    /// for anything an `HS__` environment variable pins, so the interface can show the field
+    /// read-only with a reason instead of offering an edit that would be refused.
+    pub editable: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -30,13 +30,13 @@ use crate::auth::{ScopeDecision, TokenVerifier, require_scope};
 use crate::events::{EventBus, ReplayOutcome};
 use crate::idempotency::{IdempotencyStore, Replay, StoredResponse};
 use crate::model::{
-    AuditChange, AuditEntry, AuditOutcome, Event, Page, Principal, ResourceRef, Scope,
-    ServerHealth, ServerInfo,
+    AuditChange, AuditEntry, AuditOutcome, ConfigSchema, ConfigSection, ConfigSectionInfo,
+    ConfigSettingInfo, Event, Page, Principal, ResourceRef, Scope, ServerHealth, ServerInfo,
 };
 use crate::operations::{OperationDef, load as load_operations};
 use crate::sources::{
-    RoomDirectory, RoomFilter, SourceError, UserCreateRequest, UserDirectory, UserFilter,
-    UserLookupQuery,
+    ConfigPatch, ConfigSource, RoomDirectory, RoomFilter, SourceError, UserCreateRequest,
+    UserDirectory, UserFilter, UserLookupQuery,
 };
 
 /// Everything an `hs-admin` handler needs. Cloned per-request by axum (cheap: everything inside
@@ -64,6 +64,11 @@ pub struct AdminState {
     /// `crate::sources::RoomDirectory`'s doc comment for the contract track 04 should implement
     /// this against; this session did not implement one (`hs-room` is owned by another track).
     pub rooms: Option<Arc<dyn RoomDirectory>>,
+    /// The configuration every `/config*` operation reads and writes through. `None` until the
+    /// integration lead wires a real implementation with [`AdminState::with_config`]; until then
+    /// those operations answer `503 unavailable`, because a management interface that cannot
+    /// reach the configuration should say so rather than show an empty form.
+    pub config: Option<Arc<dyn ConfigSource>>,
     /// The `Idempotency-Key` cache every mutating handler that declares it consults (see
     /// [`crate::idempotency`]). Always present (never `None`): a client is never told its
     /// idempotency key was ignored.
@@ -85,6 +90,7 @@ impl AdminState {
             started_at: Instant::now(),
             users: None,
             rooms: None,
+            config: None,
             idempotency: Arc::new(IdempotencyStore::new()),
         }
     }
@@ -102,6 +108,14 @@ impl AdminState {
     #[must_use]
     pub fn with_rooms(mut self, rooms: Arc<dyn RoomDirectory>) -> Self {
         self.rooms = Some(rooms);
+        self
+    }
+
+    /// Wires a real [`ConfigSource`], making the `/config*` operations read and change this
+    /// server's actual configuration instead of answering `503 unavailable`.
+    #[must_use]
+    pub fn with_config(mut self, config: Arc<dyn ConfigSource>) -> Self {
+        self.config = Some(config);
         self
     }
 
@@ -169,6 +183,12 @@ const REAL_HANDLERS: &[&str] = &[
     "rooms.block",
     "rooms.unblock",
     "rooms.make_admin",
+    "config.list",
+    "config.schema",
+    "config.get",
+    "config.update",
+    "config.validate",
+    "config.reload",
     "audit_log.list",
     "audit_log.get",
     "audit_log.export",
@@ -1551,6 +1571,521 @@ async fn rooms_make_admin(
 }
 
 // -------------------------------------------------------------------------------------------
+// configuration (RFC 0004 section 4.12). Every one of these goes through
+// `crate::sources::ConfigSource`; none of them knows the name of a single setting. What the
+// management interface renders a form from is `GET /config/schema`, which serves the JSON Schema
+// `schemars` derives from `hs_config::Config` itself, so a setting added to that struct appears
+// in the interface without a line changing here.
+// -------------------------------------------------------------------------------------------
+
+/// A configuration section's ETag: the store's revision counter, quoted.
+///
+/// The revision counts writes to the configuration as a whole rather than to one section, which
+/// is deliberate — two operators editing different sections still need to know they are not
+/// looking at the same configuration any more, and `hs_config::ConfigStore` compares `If-Match`
+/// against exactly this number.
+fn config_etag(revision: u64) -> String {
+    format!("\"{revision}\"")
+}
+
+/// Reads `If-Match` as the revision the caller believes is current.
+///
+/// `*` is RFC 9110's "any current version", which for a configuration that always exists is no
+/// precondition at all. Anything that is not a revision cannot match one, so it fails the
+/// precondition rather than being ignored: a caller whose compare-and-set was quietly dropped
+/// would believe it had held a lock it never had.
+// See `parse_optional_json` above for why `Problem` is returned unboxed here.
+#[allow(clippy::result_large_err)]
+fn config_expected_revision(headers: &HeaderMap) -> Result<Option<u64>, Problem> {
+    let Some(raw) = headers
+        .get(axum::http::header::IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Ok(None);
+    };
+    if raw.trim() == "*" {
+        return Ok(None);
+    }
+    normalize_etag(raw).parse::<u64>().map(Some).map_err(|_| {
+        Problem::precondition_failed().with_detail(format!(
+            "If-Match {raw:?} is not a configuration ETag; re-read the section and send back the \
+             ETag it returned"
+        ))
+    })
+}
+
+/// Renders one section for the wire: every secret, in its values and in its recorded history,
+/// replaced by `{"$secret": true}`.
+///
+/// This is the only place a [`ConfigSection`] becomes a response, so a secret cannot escape
+/// through a handler that forgot to redact. Which settings are secrets comes from the derived
+/// schema (`crate::config_schema`), never from what a field is called.
+fn redacted_section(mut section: ConfigSection) -> ConfigSection {
+    let secrets = crate::config_schema::secret_paths();
+    secrets.redact(&mut section.values, &format!("/{}", section.name));
+    for change in &mut section.history {
+        secrets.redact(&mut change.patch, &format!("/{}", change.section));
+    }
+    section
+}
+
+/// `GET /api/v1/config` (`admin:read`): every section, secrets redacted.
+async fn config_list(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    let instance = "/api/v1/config";
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let Some(config) = &state.config else {
+                return source_unavailable("configuration", instance);
+            };
+            match config.list_sections().await {
+                Ok(sections) => {
+                    let body: Vec<ConfigSection> =
+                        sections.into_iter().map(redacted_section).collect();
+                    axum::Json(body).into_response()
+                }
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `GET /api/v1/config/schema` (`admin:read`): everything needed to render a configuration form
+/// without knowing what is in the configuration.
+///
+/// The static half is the JSON Schema derived from `hs_config::Config` — types, defaults, enums
+/// and the prose describing each setting. The live half says, per setting, which layer its value
+/// came from, whether it is a secret, whether changing it needs a restart, and whether this
+/// server would accept a change to it at all. That last flag is what lets the interface show a
+/// field the environment pins as read-only instead of offering an edit that `config.update`
+/// would refuse.
+async fn config_schema(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    let instance = "/api/v1/config/schema";
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let Some(config) = &state.config else {
+                return source_unavailable("configuration", instance);
+            };
+            match config.list_sections().await {
+                Ok(sections) => axum::Json(config_schema_document(&sections)).into_response(),
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// Builds `GET /config/schema`'s body from the live sections.
+fn config_schema_document(sections: &[ConfigSection]) -> ConfigSchema {
+    let secrets = crate::config_schema::secret_paths();
+    let mut section_infos = Vec::with_capacity(sections.len());
+    let mut settings = Vec::new();
+    for section in sections {
+        section_infos.push(ConfigSectionInfo {
+            name: section.name.clone(),
+            reloadable: section.reloadable,
+            bootstrap: section.bootstrap,
+            source: section.source.clone(),
+        });
+        for (pointer, origin) in &section.origins {
+            settings.push(ConfigSettingInfo {
+                pointer: pointer.clone(),
+                section: section.name.clone(),
+                origin: origin.clone(),
+                secret: secrets.is_secret(pointer),
+                reloadable: section.reloadable,
+                editable: !section.bootstrap && origin != "environment",
+            });
+        }
+    }
+    ConfigSchema {
+        schema: crate::config_schema::config_json_schema().clone(),
+        sections: section_infos,
+        settings,
+        revision: sections.first().map_or(0, |section| section.revision),
+    }
+}
+
+/// `GET /api/v1/config/{section}` (`admin:read`): one section with its recent history, secrets
+/// redacted, carrying the ETag `config.update` expects back in `If-Match`.
+async fn config_get(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(section): Path<String>,
+) -> Response {
+    let instance = format!("/api/v1/config/{section}");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let Some(config) = &state.config else {
+                return source_unavailable("configuration", &instance);
+            };
+            match config.get_section(&section).await {
+                Ok(Some(found)) => (
+                    StatusCode::OK,
+                    [(axum::http::header::ETAG, config_etag(found.revision))],
+                    axum::Json(redacted_section(found)),
+                )
+                    .into_response(),
+                Ok(None) => Problem::not_found()
+                    .with_detail(format!("no such configuration section: {section}"))
+                    .with_instance(instance)
+                    .into_response(),
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `PATCH /api/v1/config/{section}` (`admin:write`): an RFC 7396 merge patch against one
+/// section, where `null` means "reset this setting to its schema default".
+///
+/// Four things are checked before anything is written, because each of them is a way for a write
+/// to look like it worked and not have: a section the database cannot hold, a setting an `HS__`
+/// environment variable pins (the environment outranks the database, so the value would be
+/// stored faithfully and then ignored), a configuration the server would refuse to run on, and a
+/// stale `If-Match` from an operator whose view of the section has since been overwritten by
+/// somebody else's change.
+async fn config_update(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(section): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let instance = format!("/api/v1/config/{section}");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminWrite),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(principal) => {
+            let Some(config) = &state.config else {
+                return source_unavailable("configuration", &instance);
+            };
+            let mut patch: serde_json::Value = match parse_optional_json(&body) {
+                Ok(v) => v,
+                Err(p) => return p.with_instance(instance).into_response(),
+            };
+            if !patch.is_object() {
+                return Problem::validation_failed()
+                    .with_errors(vec![ValidationError::new(
+                        "",
+                        "the request body must be a JSON Merge Patch object (RFC 7396)",
+                    )])
+                    .with_instance(instance)
+                    .into_response();
+            }
+
+            let current = match config.get_section(&section).await {
+                Ok(Some(found)) => found,
+                Ok(None) => {
+                    return Problem::not_found()
+                        .with_detail(format!("no such configuration section: {section}"))
+                        .with_instance(instance)
+                        .into_response();
+                }
+                Err(e) => return e.to_problem().with_instance(instance).into_response(),
+            };
+            if current.bootstrap {
+                return Problem::conflict()
+                    .with_detail(format!(
+                        "{section:?} is read before this server's database is open, so it cannot \
+                         be stored in it — set it on the command line, in an HS__ environment \
+                         variable, or in the bootstrap file"
+                    ))
+                    .with_instance(instance)
+                    .into_response();
+            }
+
+            // A form round-trips the secrets it was shown as `{"$secret": true}`. Writing that
+            // literally would replace a real secret with a placeholder; dropping it is what
+            // "the operator left this field alone" means.
+            let untouched_secrets = crate::config_schema::secret_paths()
+                .strip_echoed_secrets(&mut patch, &format!("/{section}"));
+            if patch.as_object().is_some_and(serde_json::Map::is_empty) {
+                // Nothing to change. Bumping the revision for an empty patch would invalidate
+                // every other operator's `If-Match` and write a history entry recording that
+                // nothing happened.
+                let _ = untouched_secrets;
+                return (
+                    StatusCode::OK,
+                    [(axum::http::header::ETAG, config_etag(current.revision))],
+                    axum::Json(redacted_section(current)),
+                )
+                    .into_response();
+            }
+
+            match config.environment_pinned(&section, &patch).await {
+                Ok(pinned) if !pinned.is_empty() => {
+                    return Problem::conflict()
+                        .with_detail(
+                            "an HS__ environment variable pins these settings; this server would \
+                             store the change and then ignore it, so it is refused instead. \
+                             Change them where they are set, or unset them there first.",
+                        )
+                        .with_errors(
+                            pinned
+                                .iter()
+                                .map(|pointer| {
+                                    ValidationError::new(
+                                        pointer,
+                                        "pinned by an HS__ environment variable, which outranks \
+                                         the database",
+                                    )
+                                })
+                                .collect(),
+                        )
+                        .with_instance(instance)
+                        .into_response();
+                }
+                Ok(_) => {}
+                Err(e) => return e.to_problem().with_instance(instance).into_response(),
+            }
+
+            let candidate = serde_json::Value::Object(
+                [(section.clone(), patch.clone())]
+                    .into_iter()
+                    .collect::<serde_json::Map<String, serde_json::Value>>(),
+            );
+            match config.validate(&candidate).await {
+                Ok(report) if !report.valid => {
+                    return Problem::validation_failed()
+                        .with_detail(
+                            "the configuration this change would produce is not valid; nothing \
+                             was written",
+                        )
+                        .with_errors(report.errors)
+                        .with_instance(instance)
+                        .into_response();
+                }
+                Ok(_) => {}
+                Err(e) => return e.to_problem().with_instance(instance).into_response(),
+            }
+
+            let expected_revision = match config_expected_revision(&headers) {
+                Ok(v) => v,
+                Err(p) => return p.with_instance(instance).into_response(),
+            };
+
+            let updated = match config
+                .patch_section(ConfigPatch {
+                    section: section.clone(),
+                    patch: patch.clone(),
+                    actor: Some(principal.id.clone()),
+                    expected_revision,
+                })
+                .await
+            {
+                Ok(updated) => updated,
+                Err(e) => return e.to_problem().with_instance(instance).into_response(),
+            };
+
+            if let Err(resp) = record_mutation(
+                &state,
+                &principal,
+                "config.update",
+                "config.updated",
+                ResourceRef::new("config_section", section.clone()),
+                config_audit_changes(&current, &updated, &patch),
+                json!({ "section": section, "revision": updated.revision }),
+            )
+            .await
+            {
+                return resp;
+            }
+
+            (
+                StatusCode::OK,
+                [(axum::http::header::ETAG, config_etag(updated.revision))],
+                axum::Json(redacted_section(updated)),
+            )
+                .into_response()
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// One [`AuditChange`] per setting the patch touched, reading the before and after values out of
+/// the effective configuration rather than out of the patch — so a reset to default records the
+/// default that took effect, not the `null` that asked for it.
+///
+/// Secrets are redacted on both sides. An audit log an operator can read a password out of is
+/// the same leak as an API that returns one.
+fn config_audit_changes(
+    before: &ConfigSection,
+    after: &ConfigSection,
+    patch: &serde_json::Value,
+) -> Vec<AuditChange> {
+    let secrets = crate::config_schema::secret_paths();
+    hs_config::document::leaf_pointers(patch)
+        .into_iter()
+        .map(|leaf| {
+            let pointer = format!("/{}{leaf}", before.name);
+            let value_at = |section: &ConfigSection| {
+                section.values.pointer(&leaf).cloned().map(|mut value| {
+                    secrets.redact(&mut value, &pointer);
+                    value
+                })
+            };
+            let (from, to) = (value_at(before), value_at(after));
+            AuditChange { pointer, from, to }
+        })
+        .collect()
+}
+
+/// `POST /api/v1/config/validate` (`admin:read`): would this configuration be accepted?
+///
+/// The body is a sparse document keyed by section, applied as a merge patch over what is stored
+/// now, so the interface can ask about a whole form's worth of edits before committing to any of
+/// them. Nothing is written either way, and a configuration that would be rejected is a `200`
+/// carrying every reason — the question was answered; the answer was no.
+async fn config_validate(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let instance = "/api/v1/config/validate";
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let Some(config) = &state.config else {
+                return source_unavailable("configuration", instance);
+            };
+            let mut candidate: serde_json::Value = match parse_optional_json(&body) {
+                Ok(v) => v,
+                Err(p) => return p.with_instance(instance).into_response(),
+            };
+            if !candidate.is_object() {
+                return Problem::validation_failed()
+                    .with_errors(vec![ValidationError::new(
+                        "",
+                        "the request body must be a configuration document keyed by section",
+                    )])
+                    .with_instance(instance)
+                    .into_response();
+            }
+            crate::config_schema::secret_paths().strip_echoed_secrets(&mut candidate, "");
+            match config.validate(&candidate).await {
+                Ok(report) => axum::Json(report).into_response(),
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `POST /api/v1/config/reload` (`admin:write`, idempotent): re-read the configuration layers
+/// and swap in what can be swapped, reporting what still needs a restart rather than implying
+/// everything took effect.
+async fn config_reload(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let instance = "/api/v1/config/reload";
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminWrite),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(principal) => {
+            let Some(config) = &state.config else {
+                return source_unavailable("configuration", instance);
+            };
+            if let Some(key) = idempotency_key(&headers) {
+                match state.idempotency.check("config.reload", key, &body) {
+                    Replay::Same(stored) => return replay_response(stored),
+                    Replay::Mismatch => {
+                        return Problem::idempotency_key_payload_mismatch()
+                            .with_instance(instance)
+                            .into_response();
+                    }
+                    Replay::Fresh => {}
+                }
+            }
+
+            let report = match config.reload().await {
+                Ok(report) => report,
+                Err(e) => return e.to_problem().with_instance(instance).into_response(),
+            };
+
+            if let Err(resp) = record_mutation(
+                &state,
+                &principal,
+                "config.reload",
+                "config.reloaded",
+                // The reload is not scoped to one section, so the target names the resource kind
+                // without an id rather than picking a section arbitrarily.
+                ResourceRef::new("config_section", "*"),
+                Vec::new(),
+                json!({
+                    "reloaded_sections": report.reloaded_sections,
+                    "requires_restart": report.requires_restart,
+                }),
+            )
+            .await
+            {
+                return resp;
+            }
+
+            let response_body = serde_json::to_vec(&report).unwrap_or_default();
+            if let Some(key) = idempotency_key(&headers) {
+                state.idempotency.record(
+                    "config.reload",
+                    key,
+                    &body,
+                    StoredResponse {
+                        status: 200,
+                        content_type: "application/json".to_string(),
+                        body: response_body.clone(),
+                    },
+                );
+            }
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                response_body,
+            )
+                .into_response()
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+// -------------------------------------------------------------------------------------------
 // audit log (RFC 0004 section 9, brief deliverable 3)
 // -------------------------------------------------------------------------------------------
 
@@ -1995,6 +2530,12 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         "rooms.block" => builder.add(method, &full_path, rooms_block, meta),
         "rooms.unblock" => builder.add(method, &full_path, rooms_unblock, meta),
         "rooms.make_admin" => builder.add(method, &full_path, rooms_make_admin, meta),
+        "config.list" => builder.add(method, &full_path, config_list, meta),
+        "config.schema" => builder.add(method, &full_path, config_schema, meta),
+        "config.get" => builder.add(method, &full_path, config_get, meta),
+        "config.update" => builder.add(method, &full_path, config_update, meta),
+        "config.validate" => builder.add(method, &full_path, config_validate, meta),
+        "config.reload" => builder.add(method, &full_path, config_reload, meta),
         "audit_log.list" => builder.add(method, &full_path, audit_log_list, meta),
         "audit_log.get" => builder.add(method, &full_path, audit_log_get, meta),
         "audit_log.export" => builder.add(method, &full_path, audit_log_export, meta),
@@ -3702,5 +4243,611 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // configuration. Every one of these runs against `InMemoryConfigSource`, which resolves and
+    // validates through `hs_config` itself, so what they pin is the server's real behaviour and
+    // not a second implementation of it that happens to agree with the assertions.
+    // ---------------------------------------------------------------------------------------
+
+    /// A server whose bootstrap file says registration is off and whose database — changed
+    /// through this API at some point — says it is on, with a secret set alongside it.
+    fn config_state() -> AdminState {
+        use crate::sources::InMemoryConfigSource;
+
+        test_state().with_config(Arc::new(
+            InMemoryConfigSource::new()
+                .with_file(
+                    "/etc/myelin/homeserver.yaml",
+                    json!({
+                        "server": {"server_name": "example.org"},
+                        "auth": {"enable_registration": false},
+                    }),
+                )
+                .with_database(json!({
+                    "auth": {"enable_registration": true, "session_secret": "s3kr1t"},
+                })),
+        ))
+    }
+
+    async fn get_section(router: &axum::Router, name: &str) -> ConfigSection {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/config/{name}"))
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(&body_bytes(response).await).unwrap()
+    }
+
+    async fn patch_section(router: &axum::Router, name: &str, patch: &str) -> Response {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/v1/config/{name}"))
+                    .header("authorization", "Bearer admin-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(patch.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn config_list_is_503_when_the_source_is_not_wired() {
+        let (router, _manifest) = build_router(test_state());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/config")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The whole point of the layering: what the web interface changed is what the server runs
+    /// on, even though a file that says otherwise is still mounted, and the section says so.
+    #[tokio::test]
+    async fn config_get_reports_the_value_and_the_layer_it_came_from() {
+        let (router, _manifest) = build_router(config_state());
+        let section = get_section(&router, "auth").await;
+        assert_eq!(section.values["enable_registration"], json!(true));
+        assert_eq!(
+            section.origins["/auth/enable_registration"], "database",
+            "the database outranks the bootstrap file that says otherwise"
+        );
+        assert_eq!(
+            section.origins["/auth/enable_legacy_login"], "default",
+            "a setting nothing sets is reported, not omitted"
+        );
+        assert_eq!(section.source, "database");
+        assert!(!section.reloadable);
+        assert!(!section.bootstrap);
+    }
+
+    #[tokio::test]
+    async fn config_get_unknown_section_is_404() {
+        let (router, _manifest) = build_router(config_state());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/config/nonsense")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A secret never leaves this API in the clear — not in the section, not in the history of
+    /// the change that set it.
+    #[tokio::test]
+    async fn a_secret_is_returned_redacted_and_never_in_the_clear() {
+        let (router, _manifest) = build_router(config_state());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/config/auth")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let raw = body_bytes(response).await;
+        let section: ConfigSection = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(section.values["session_secret"], json!({"$secret": true}));
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("s3kr1t"),
+            "the secret appeared somewhere in the response body"
+        );
+
+        // And the same secret, set again through this API, is not readable back out of its own
+        // history.
+        let response = patch_section(&router, "auth", r#"{"session_secret":"a-new-one"}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/config/auth")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let raw = body_bytes(response).await;
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("a-new-one"),
+            "the secret appeared in the change history"
+        );
+    }
+
+    /// The form round-trip: a section is served with its secrets redacted, so an untouched
+    /// password field comes back as the placeholder it was shown. That means "leave it alone",
+    /// not "store this object".
+    #[tokio::test]
+    async fn an_echoed_secret_placeholder_leaves_the_stored_secret_alone() {
+        let (router, _manifest) = build_router(config_state());
+        let response = patch_section(
+            &router,
+            "auth",
+            r#"{"session_secret":{"$secret":true},"enable_registration":false}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let section = get_section(&router, "auth").await;
+        assert_eq!(section.values["enable_registration"], json!(false));
+        assert_eq!(
+            section.values["session_secret"],
+            json!({"$secret": true}),
+            "the secret is still set — it was not replaced by the placeholder"
+        );
+
+        let entries = audit_entries_for_action(&router, "config.update").await;
+        assert_eq!(entries.len(), 1);
+        let pointers: Vec<&str> = entries[0]
+            .changes
+            .iter()
+            .map(|c| c.pointer.as_str())
+            .collect();
+        assert_eq!(
+            pointers,
+            vec!["/auth/enable_registration"],
+            "the untouched secret is not recorded as a change"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_update_applies_a_patch_and_writes_audit_and_event() {
+        let state = config_state();
+        let mut rx = state.events.subscribe();
+        let (router, _manifest) = build_router(state);
+
+        let response = patch_section(&router, "auth", r#"{"enable_registration":false}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::ETAG)
+                .and_then(|v| v.to_str().ok()),
+            Some("\"2\""),
+            "the new revision is the ETag the next If-Match must carry"
+        );
+        let section: ConfigSection = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(section.values["enable_registration"], json!(false));
+
+        let event = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("an event should be published")
+            .unwrap();
+        assert_eq!(event.r#type, "config.updated");
+        assert_eq!(event.resource.unwrap().id, "auth");
+
+        let entries = audit_entries_for_action(&router, "config.update").await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].changes.len(), 1);
+        assert_eq!(entries[0].changes[0].pointer, "/auth/enable_registration");
+        assert_eq!(entries[0].changes[0].from, Some(json!(true)));
+        assert_eq!(entries[0].changes[0].to, Some(json!(false)));
+    }
+
+    /// Two operators editing at once: the second write was computed against a view that has
+    /// since moved, so it is refused rather than silently clobbering the first.
+    #[tokio::test]
+    async fn config_update_with_a_stale_if_match_is_412_and_writes_nothing() {
+        let (router, _manifest) = build_router(config_state());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/config/auth")
+                    .header("authorization", "Bearer admin-token")
+                    .header("content-type", "application/json")
+                    .header("if-match", "\"0\"")
+                    .body(Body::from(r#"{"enable_registration":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+
+        let section = get_section(&router, "auth").await;
+        assert_eq!(
+            section.values["enable_registration"],
+            json!(true),
+            "the refused patch left the other operator's value alone"
+        );
+        assert_eq!(section.revision, 1);
+    }
+
+    #[tokio::test]
+    async fn config_update_with_the_current_if_match_succeeds() {
+        let (router, _manifest) = build_router(config_state());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/config/auth")
+                    .header("authorization", "Bearer admin-token")
+                    .header("content-type", "application/json")
+                    .header("if-match", "W/\"1\"")
+                    .body(Body::from(r#"{"enable_registration":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A write the environment would override is refused and names the settings. Storing it and
+    /// reporting success would be a lie: the value would sit in the database, and the server
+    /// would go on using the environment's.
+    #[tokio::test]
+    async fn config_update_refuses_a_setting_the_environment_pins() {
+        use crate::sources::InMemoryConfigSource;
+
+        let state = test_state().with_config(Arc::new(
+            InMemoryConfigSource::new()
+                .with_file(
+                    "/etc/myelin/homeserver.yaml",
+                    json!({"server": {"server_name": "example.org"}}),
+                )
+                .with_environment(json!({"federation": {"client_timeout": "30s"}})),
+        ));
+        let (router, _manifest) = build_router(state);
+
+        let response = patch_section(&router, "federation", r#"{"client_timeout":"45s"}"#).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let problem: serde_json::Value =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(problem["type"], "urn:hs:problem:conflict");
+        assert_eq!(
+            problem["errors"][0]["pointer"], "/federation/client_timeout",
+            "the refusal names the setting the operator has to go and change elsewhere"
+        );
+
+        let section = get_section(&router, "federation").await;
+        assert_eq!(section.origins["/federation/client_timeout"], "environment");
+
+        // A sibling setting the environment says nothing about is still editable.
+        let response = patch_section(&router, "federation", r#"{"max_retry_backoff":"45s"}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A patch is legal only if the configuration it *produces* is. The rejection carries every
+    /// problem, and nothing is written.
+    #[tokio::test]
+    async fn config_update_rejecting_an_invalid_result_writes_nothing() {
+        let (router, _manifest) = build_router(config_state());
+        let response = patch_section(&router, "server", r#"{"server_name":""}"#).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let problem: serde_json::Value =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(problem["type"], "urn:hs:problem:validation-failed");
+        assert_eq!(problem["errors"][0]["pointer"], "/server/server_name");
+
+        let section = get_section(&router, "server").await;
+        assert_eq!(section.values["server_name"], json!("example.org"));
+        assert_eq!(section.revision, 1, "nothing was written");
+        assert!(
+            audit_entries_for_action(&router, "config.update")
+                .await
+                .is_empty()
+        );
+    }
+
+    /// Reset to default: `null` in a merge patch removes the setting, so it reverts to the
+    /// schema's own default and nothing owns it any more.
+    #[tokio::test]
+    async fn a_null_resets_the_setting_to_its_schema_default() {
+        let (router, _manifest) = build_router(config_state());
+        let response = patch_section(&router, "auth", r#"{"enable_legacy_login":false}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let changed = get_section(&router, "auth").await;
+        assert_eq!(changed.values["enable_legacy_login"], json!(false));
+        assert_eq!(changed.origins["/auth/enable_legacy_login"], "database");
+
+        let response = patch_section(&router, "auth", r#"{"enable_legacy_login":null}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let after = get_section(&router, "auth").await;
+        assert_eq!(
+            after.values["enable_legacy_login"],
+            json!(true),
+            "the schema's own default is back"
+        );
+        assert_eq!(after.origins["/auth/enable_legacy_login"], "default");
+    }
+
+    /// A reset of a setting the bootstrap file *also* sets falls back to the file, not to the
+    /// schema default.
+    ///
+    /// This pins what `hs_config::ConfigStore::patch_section` does today: it applies the merge
+    /// patch to the stored section, so a `null` deletes the key from the database layer and the
+    /// file underneath it wins again. `hs_config::document`'s own module documentation says the
+    /// opposite should happen — "a reset means as if nobody had ever set this, which is the only
+    /// reading that gives the same result whether or not a bootstrap file happens to be
+    /// mounted" — and `document::origins` is written for a database layer that *keeps* the null.
+    /// The two disagree, and only with a file mounted does it show. Pinned here rather than
+    /// worked around, because `hs-config` belongs to another track and the seam must describe
+    /// what the real store actually does.
+    #[tokio::test]
+    async fn a_reset_falls_back_to_the_bootstrap_file_that_still_sets_it() {
+        let (router, _manifest) = build_router(config_state());
+        let response = patch_section(&router, "auth", r#"{"enable_registration":null}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let after = get_section(&router, "auth").await;
+        assert_eq!(after.values["enable_registration"], json!(false));
+        assert_eq!(after.origins["/auth/enable_registration"], "file");
+    }
+
+    /// `storage` says where the database is, so it is read before there is a database to read it
+    /// from. Accepting a write to it would store a setting that can never be read back.
+    #[tokio::test]
+    async fn config_update_refuses_the_bootstrap_section() {
+        let (router, _manifest) = build_router(config_state());
+        let response = patch_section(&router, "storage", r#"{"data_dir":"/srv/data"}"#).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        // It is still readable, though: an operator needs to see where their data lives.
+        let section = get_section(&router, "storage").await;
+        assert!(section.bootstrap);
+    }
+
+    #[tokio::test]
+    async fn config_update_needs_admin_write() {
+        let state = config_state();
+        let state = AdminState {
+            verifier: Arc::new(StaticVerifier::new().with_token(
+                "read-only",
+                Principal {
+                    kind: PrincipalKind::User,
+                    id: "@ro:example.org".into(),
+                    display_name: None,
+                    scopes: vec![Scope::AdminRead],
+                    token_id: None,
+                    expires_at: None,
+                    issued_by: None,
+                },
+            )),
+            ..state
+        };
+        let (router, _manifest) = build_router(state);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/config/auth")
+                    .header("authorization", "Bearer read-only")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"enable_registration":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// What the management interface builds its forms from: enough to render every setting
+    /// without naming one.
+    #[tokio::test]
+    async fn config_schema_describes_every_setting_with_its_origin() {
+        use crate::sources::InMemoryConfigSource;
+
+        let state = test_state().with_config(Arc::new(
+            InMemoryConfigSource::new()
+                .with_database(json!({
+                    "server": {"server_name": "example.org"},
+                    "auth": {"session_secret": "s3kr1t"},
+                }))
+                .with_environment(json!({"federation": {"client_timeout": "30s"}})),
+        ));
+        let (router, _manifest) = build_router(state);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/config/schema")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let raw = body_bytes(response).await;
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("s3kr1t"),
+            "the schema endpoint leaked a secret's value"
+        );
+        let body: crate::model::ConfigSchema = serde_json::from_slice(&raw).unwrap();
+
+        assert_eq!(body.sections.len(), hs_config::reload::SECTION_NAMES.len());
+        assert!(
+            body.schema["properties"]["auth"].is_object(),
+            "the derived JSON Schema is what the form is rendered from"
+        );
+
+        let setting = |pointer: &str| {
+            body.settings
+                .iter()
+                .find(|s| s.pointer == pointer)
+                .unwrap_or_else(|| panic!("{pointer} is missing from the schema"))
+                .clone()
+        };
+
+        let secret = setting("/auth/session_secret");
+        assert!(secret.secret);
+        assert!(secret.editable);
+
+        let pinned = setting("/federation/client_timeout");
+        assert_eq!(pinned.origin, "environment");
+        assert!(
+            !pinned.editable,
+            "the interface must not offer an edit this server would refuse"
+        );
+        assert!(pinned.reloadable);
+
+        let bootstrap = setting("/storage/data_dir");
+        assert!(!bootstrap.editable);
+        assert_eq!(bootstrap.origin, "default");
+    }
+
+    #[tokio::test]
+    async fn config_validate_reports_the_problems_without_writing() {
+        let (router, _manifest) = build_router(config_state());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/config/validate")
+                    .header("authorization", "Bearer admin-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"server":{"server_name":""}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let report: crate::model::ConfigValidateReport =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert!(!report.valid);
+        assert_eq!(report.errors[0].pointer, "/server/server_name");
+
+        assert_eq!(get_section(&router, "server").await.revision, 1);
+    }
+
+    #[tokio::test]
+    async fn config_validate_accepts_a_good_change_and_says_what_needs_a_restart() {
+        let (router, _manifest) = build_router(config_state());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/config/validate")
+                    .header("authorization", "Bearer admin-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"server":{"server_name":"new.example"}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let report: crate::model::ConfigValidateReport =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert!(report.valid);
+        assert_eq!(
+            report.requires_restart,
+            vec!["server".to_string()],
+            "server_name is burned into every event this process has already produced"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_reload_reports_what_it_reloaded_and_writes_audit_and_event() {
+        let state = config_state();
+        let mut rx = state.events.subscribe();
+        let (router, _manifest) = build_router(state);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/config/reload")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let report: crate::model::ConfigReloadReport =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert!(report.reloaded_sections.contains(&"federation".to_string()));
+        assert!(!report.reloaded_sections.contains(&"server".to_string()));
+
+        let event = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("an event should be published")
+            .unwrap();
+        assert_eq!(event.r#type, "config.reloaded");
+        assert_eq!(
+            audit_entries_for_action(&router, "config.reload")
+                .await
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn config_update_with_a_non_object_body_is_400() {
+        let (router, _manifest) = build_router(config_state());
+        let response = patch_section(&router, "auth", "[]").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An `If-Match` that is not a revision cannot match one. Ignoring it would tell a caller its
+    /// compare-and-set held when nothing had been compared.
+    #[tokio::test]
+    async fn an_if_match_that_is_not_a_revision_fails_the_precondition() {
+        let (router, _manifest) = build_router(config_state());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/config/auth")
+                    .header("authorization", "Bearer admin-token")
+                    .header("content-type", "application/json")
+                    .header("if-match", "\"not-a-revision\"")
+                    .body(Body::from(r#"{"enable_registration":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
     }
 }

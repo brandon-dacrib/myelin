@@ -1,20 +1,27 @@
 //! Consumer-defined data-source traits, following the pattern of
 //! `crates/hs-federation/src/room_source.rs`: the trait lives here, next to the handlers that
 //! call it, and the implementation lives in whichever crate owns the real data (07's user store
-//! for [`UserDirectory`]). This crate depends on nothing beyond `async_trait`, `serde` and
-//! `thiserror` to describe the trait; the real implementation is free to depend on `hs-admin`
-//! without a cycle.
+//! for [`UserDirectory`]). Describing a trait costs this crate almost nothing — `async_trait`,
+//! `serde`, `thiserror`, and for [`ConfigSource`] the configuration schema itself, since the
+//! admin API's whole job there is to describe `hs_config::Config` to a form — and the real
+//! implementation is free to depend on `hs-admin` without a cycle.
 //!
 //! Publish this contract verbatim — do not add or remove trait methods without updating whoever
 //! is implementing them, since that happens in a separate crate track 15 does not own.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 
 use async_trait::async_trait;
+use hs_config::document::Origin;
+use hs_config::layered::{FileLayer, Layers, Resolved};
 use serde::Deserialize;
+use serde_json::{Map, Value};
 
-use crate::model::{AdminRoom, AdminUser, ExternalId, ThreePid};
+use crate::model::{
+    AdminRoom, AdminUser, ConfigChange, ConfigReloadReport, ConfigSection, ConfigValidateReport,
+    ExternalId, ThreePid,
+};
 
 /// Why a data-source call failed. Mirrors [`crate::auth::AuthError`]'s "only unavailable escapes
 /// as something other than the obvious status" shape: [`SourceError::NotFound`] maps to `404
@@ -31,6 +38,12 @@ pub enum SourceError {
     Invalid(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    /// An `If-Match` precondition named a version that is no longer current: somebody else
+    /// changed the resource in between, so the caller's change was computed against a view that
+    /// has since moved. Distinct from [`SourceError::Conflict`] because the caller's remedy is
+    /// different — re-read, re-apply, retry — and because RFC 9110 gives it its own status.
+    #[error("precondition failed: {0}")]
+    PreconditionFailed(String),
 }
 
 impl SourceError {
@@ -46,6 +59,9 @@ impl SourceError {
             }
             SourceError::Conflict(detail) => {
                 hs_http::Problem::conflict().with_detail(detail.clone())
+            }
+            SourceError::PreconditionFailed(detail) => {
+                hs_http::Problem::precondition_failed().with_detail(detail.clone())
             }
         }
     }
@@ -459,6 +475,451 @@ impl RoomDirectory for InMemoryRoomDirectory {
         } else {
             Err(SourceError::NotFound)
         }
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// configuration (RFC 0004 section 4.12, the `/config*` operations)
+// -------------------------------------------------------------------------------------------
+
+/// One `config.update` request, already parsed and authorized.
+///
+/// `patch` is an RFC 7396 JSON Merge Patch against the named section, with the admin API's own
+/// conventions already applied by the handler: a `null` member means "reset this setting to its
+/// schema default", and any secret the client echoed back as `{"$secret": true}` has been
+/// removed, because that means the operator did not touch the field.
+#[derive(Debug, Clone)]
+pub struct ConfigPatch {
+    /// The top-level `hs_config::Config` field name being changed.
+    pub section: String,
+    /// The merge patch, with keys relative to the section.
+    pub patch: Value,
+    /// The admin API principal to record against the change, for the history.
+    pub actor: Option<String>,
+    /// The revision the caller believed was current, from `If-Match`. `None` means the caller
+    /// sent no precondition and accepts whatever is there.
+    pub expected_revision: Option<u64>,
+}
+
+/// The configuration seam `hs-admin`'s `/config*` handlers call. **Not implemented against a
+/// real store by this crate** — the implementation belongs wherever `hs_config::ConfigStore` and
+/// the process's `hs_config::Layers` live, which is the binary, not here.
+/// [`InMemoryConfigSource`] is a fake for this crate's own tests only; `router::AdminState::config`
+/// defaults to `None`, so every `/config*` operation answers an honest `503 unavailable` until a
+/// real implementation is wired in with `AdminState::with_config`.
+///
+/// Contract notes for whoever implements this against `hs_config`:
+/// - [`ConfigSection::values`] is the *effective* configuration (`Layers::resolve`'s `config`,
+///   serialized), not just what the database holds, because that is what the server is running
+///   on and what an operator is looking at. Return it unredacted; the handlers redact at the
+///   boundary so that a secret cannot escape through an implementation that forgot to.
+/// - `revision` must be the store's own counter (`ConfigMeta::revision`), the same number
+///   [`ConfigPatch::expected_revision`] is compared against. It counts writes to the
+///   configuration as a whole, which is what makes it safe as an `If-Match` token.
+/// - [`ConfigSource::validate`] returns `Ok` with `valid: false` for a configuration that would
+///   be rejected: answering the question succeeded, and the answer was "no". Reserve
+///   `SourceError` for being unable to answer at all.
+/// - [`ConfigSource::patch_section`] must validate the configuration the patch would *produce*
+///   (`Layers::resolve_with_patch`) and write nothing if it is invalid, must refuse a bootstrap
+///   section (`StoreError::BootstrapSection`) and a stale `expected_revision`
+///   (`StoreError::RevisionMismatch` → [`SourceError::PreconditionFailed`]), and must refuse a
+///   patch the environment pins. The handlers check all four first, so the implementation's own
+///   checks are a backstop against a race, not the only guard — but they must be there, because
+///   a write that is stored and then ignored is a lie.
+#[async_trait]
+pub trait ConfigSource: Send + Sync + 'static {
+    /// Every section, in `hs_config::Config`'s own declaration order.
+    async fn list_sections(&self) -> Result<Vec<ConfigSection>, SourceError>;
+
+    /// One section by name, with its recent history. `Ok(None)` for a name that is not a section
+    /// — distinct from `SourceError::NotFound`, matching `get_user`'s convention.
+    async fn get_section(&self, name: &str) -> Result<Option<ConfigSection>, SourceError>;
+
+    /// The settings in `patch` that an `HS__` environment variable pins, as whole-configuration
+    /// JSON Pointers (`Layers::pinned_by_environment`). Empty means the patch is free to write.
+    async fn environment_pinned(
+        &self,
+        section: &str,
+        patch: &Value,
+    ) -> Result<Vec<String>, SourceError>;
+
+    /// Whether the configuration `candidate` would produce is one this server would accept.
+    /// `candidate` is a sparse document keyed by section, applied as a merge patch over what is
+    /// stored now — so `{"auth": {"enable_registration": true}}` asks about exactly that one
+    /// change, and nothing is written either way.
+    async fn validate(&self, candidate: &Value) -> Result<ConfigValidateReport, SourceError>;
+
+    /// Applies one section's merge patch and returns the section as it now reads.
+    async fn patch_section(&self, request: ConfigPatch) -> Result<ConfigSection, SourceError>;
+
+    /// Re-reads the configuration layers and swaps what can be swapped into the running server,
+    /// reporting what was reloaded and what still needs a restart.
+    async fn reload(&self) -> Result<ConfigReloadReport, SourceError>;
+
+    /// The most recent changes, newest first, at most `limit` of them; restricted to one section
+    /// when `section` is set. An implementation filtering by section must do so before applying
+    /// `limit`, or a busy neighbouring section will crowd this one's history out of the answer.
+    async fn history(
+        &self,
+        section: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ConfigChange>, SourceError>;
+}
+
+/// Renders `error` as the admin API's field-level validation errors, so a rejected configuration
+/// tells an operator which settings are wrong instead of just that something is.
+///
+/// `hs_config` reports dotted paths (`auth.oidc_providers[0].client_secret`); RFC 0004 reports
+/// JSON Pointers. Translating here rather than in each implementation keeps the two vocabularies
+/// from leaking into each other, and keeps the pointers the same strings the schema, the origins
+/// map and the redaction machinery all use.
+#[must_use]
+pub fn config_validation_errors(error: &hs_config::ConfigError) -> Vec<hs_http::ValidationError> {
+    match error {
+        hs_config::ConfigError::Validation(errors) => errors
+            .0
+            .iter()
+            .map(|e| hs_http::ValidationError::new(dotted_path_to_pointer(&e.path), &e.message))
+            .collect(),
+        hs_config::ConfigError::SecretFile { field, .. }
+        | hs_config::ConfigError::SecretConflict { field } => {
+            vec![hs_http::ValidationError::new(
+                dotted_path_to_pointer(field),
+                error.to_string(),
+            )]
+        }
+        // A parse failure has no field to point at: the document did not survive long enough to
+        // have one. Pointing at the root is honest; inventing a field would not be.
+        other => vec![hs_http::ValidationError::new("", other.to_string())],
+    }
+}
+
+/// `auth.oidc_providers[0].client_secret` becomes `/auth/oidc_providers/0/client_secret`.
+fn dotted_path_to_pointer(path: &str) -> String {
+    let flattened = path.replace('[', ".").replace(']', "");
+    let mut out = String::new();
+    for token in flattened.split('.').filter(|t| !t.is_empty()) {
+        out.push('/');
+        out.push_str(&token.replace('~', "~0").replace('/', "~1"));
+    }
+    out
+}
+
+/// A [`ConfigSource`] backed by `hs_config::Layers` held in memory, for this crate's own handler
+/// tests. Not a production implementation and not a shortcut to one: it has no database, so
+/// every change it accepts is forgotten when the process exits, and `reload` has no running
+/// server to swap anything into. What it *does* do for real is resolve, validate and merge
+/// through `hs_config` itself, so the behaviour the handler tests pin — the precedence order, a
+/// patch rejected for the configuration it would produce, a setting the environment pins, a
+/// `null` that resets to the schema default — is the real behaviour and not a re-implementation
+/// of it that could agree with the tests while disagreeing with the server.
+#[derive(Debug)]
+pub struct InMemoryConfigSource {
+    inner: RwLock<ConfigState>,
+}
+
+#[derive(Debug)]
+struct ConfigState {
+    layers: Layers,
+    revision: u64,
+    history: Vec<ConfigChange>,
+    reloaded_at: BTreeMap<String, String>,
+}
+
+impl Default for InMemoryConfigSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InMemoryConfigSource {
+    /// An empty configuration: no bootstrap file, nothing stored, no environment overrides, so
+    /// every setting reads at its schema default.
+    ///
+    /// The layers are empty *objects*, not `Layers::default()`, whose `database` and
+    /// `environment` are JSON `null`. A null layer is not an empty one: RFC 7396 says a non-object
+    /// patch replaces its target wholesale, so `Layers::merged` would collapse the entire
+    /// configuration to null and every section would read back at its default.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(ConfigState {
+                layers: Layers {
+                    file: None,
+                    database: Value::Object(Map::new()),
+                    environment: Value::Object(Map::new()),
+                },
+                revision: 0,
+                history: Vec::new(),
+                reloaded_at: BTreeMap::new(),
+            }),
+        }
+    }
+
+    /// Adds a bootstrap-file layer, as `-c homeserver.yaml` would.
+    #[must_use]
+    pub fn with_file(self, path: &str, document: Value) -> Self {
+        {
+            let mut state = self.state_mut();
+            state.layers.file = Some(FileLayer {
+                path: std::path::PathBuf::from(path),
+                document,
+            });
+        }
+        self
+    }
+
+    /// Seeds the database layer — what an operator has already changed through this API.
+    #[must_use]
+    pub fn with_database(self, document: Value) -> Self {
+        {
+            let mut state = self.state_mut();
+            state.layers.database = document;
+            state.revision = 1;
+        }
+        self
+    }
+
+    /// Adds `HS__` environment overrides, as a deployment's manifest would.
+    #[must_use]
+    pub fn with_environment(self, document: Value) -> Self {
+        {
+            let mut state = self.state_mut();
+            state.layers.environment = document;
+        }
+        self
+    }
+
+    fn state(&self) -> std::sync::RwLockReadGuard<'_, ConfigState> {
+        self.inner
+            .read()
+            .expect("InMemoryConfigSource lock poisoned")
+    }
+
+    fn state_mut(&self) -> std::sync::RwLockWriteGuard<'_, ConfigState> {
+        self.inner
+            .write()
+            .expect("InMemoryConfigSource lock poisoned")
+    }
+}
+
+impl ConfigState {
+    /// The resolved configuration, or the error explaining why this server would not accept what
+    /// its own layers currently say.
+    fn resolve(&self) -> Result<Resolved, SourceError> {
+        self.layers.resolve().map_err(|e| {
+            SourceError::Unavailable(format!("the current configuration does not resolve: {e}"))
+        })
+    }
+
+    fn section(&self, resolved: &Resolved, name: &str) -> ConfigSection {
+        let effective =
+            serde_json::to_value(&resolved.config).unwrap_or_else(|_| Value::Object(Map::new()));
+        let values = effective
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Map::new()));
+        ConfigSection {
+            name: name.to_owned(),
+            reloadable: hs_config::reload::is_reloadable(name),
+            bootstrap: hs_config::store::is_bootstrap_section(name),
+            source: section_source(resolved, name),
+            last_reloaded_at: self.reloaded_at.get(name).cloned(),
+            origins: section_origins(resolved, name, &values),
+            values,
+            revision: self.revision,
+            history: Vec::new(),
+        }
+    }
+}
+
+/// The highest-precedence layer that sets anything in `section`, or `default` when nothing does.
+fn section_source(resolved: &Resolved, section: &str) -> String {
+    let prefix = format!("/{section}/");
+    resolved
+        .origins
+        .iter()
+        .filter(|(pointer, _)| pointer.starts_with(&prefix))
+        .map(|(_, origin)| *origin)
+        .max()
+        .unwrap_or(Origin::Default)
+        .as_str()
+        .to_owned()
+}
+
+/// Where each of `section`'s settings got its value. Every setting is listed, including the ones
+/// nothing sets: the management interface should not have to know that an absent key means
+/// "default".
+fn section_origins(resolved: &Resolved, section: &str, values: &Value) -> BTreeMap<String, String> {
+    let prefix = format!("/{section}");
+    hs_config::document::leaf_pointers(values)
+        .into_iter()
+        .map(|leaf| {
+            let pointer = format!("{prefix}{leaf}");
+            let origin = resolved.origin(&pointer).as_str().to_owned();
+            (pointer, origin)
+        })
+        .collect()
+}
+
+#[async_trait]
+impl ConfigSource for InMemoryConfigSource {
+    async fn list_sections(&self) -> Result<Vec<ConfigSection>, SourceError> {
+        let state = self.state();
+        let resolved = state.resolve()?;
+        Ok(hs_config::reload::SECTION_NAMES
+            .iter()
+            .map(|name| state.section(&resolved, name))
+            .collect())
+    }
+
+    async fn get_section(&self, name: &str) -> Result<Option<ConfigSection>, SourceError> {
+        if !hs_config::reload::SECTION_NAMES.contains(&name) {
+            return Ok(None);
+        }
+        let state = self.state();
+        let resolved = state.resolve()?;
+        let mut section = state.section(&resolved, name);
+        section.history = state
+            .history
+            .iter()
+            .rev()
+            .filter(|change| change.section == name)
+            .take(20)
+            .cloned()
+            .collect();
+        Ok(Some(section))
+    }
+
+    async fn environment_pinned(
+        &self,
+        section: &str,
+        patch: &Value,
+    ) -> Result<Vec<String>, SourceError> {
+        Ok(self.state().layers.pinned_by_environment(section, patch))
+    }
+
+    async fn validate(&self, candidate: &Value) -> Result<ConfigValidateReport, SourceError> {
+        let state = self.state();
+        let mut proposed = state.layers.clone();
+        let mut database = proposed.database.clone();
+        hs_config::merge_patch(&mut database, candidate);
+        proposed.database = database;
+
+        match proposed.resolve() {
+            Ok(new) => {
+                let requires_restart = match state.layers.resolve() {
+                    Ok(current) => {
+                        hs_config::reload::sections_requiring_restart(&current.config, &new.config)
+                            .into_iter()
+                            .map(str::to_owned)
+                            .collect()
+                    }
+                    // Nothing to compare against: a server whose current configuration does not
+                    // resolve is being repaired, and every section is in play.
+                    Err(_) => Vec::new(),
+                };
+                Ok(ConfigValidateReport::valid(requires_restart))
+            }
+            Err(e) => Ok(ConfigValidateReport::invalid(config_validation_errors(&e))),
+        }
+    }
+
+    async fn patch_section(&self, request: ConfigPatch) -> Result<ConfigSection, SourceError> {
+        let mut state = self.state_mut();
+        if !hs_config::reload::SECTION_NAMES.contains(&request.section.as_str()) {
+            return Err(SourceError::NotFound);
+        }
+        if hs_config::store::is_bootstrap_section(&request.section) {
+            return Err(SourceError::Conflict(format!(
+                "{:?} says where this server's database is, so it cannot be stored in it",
+                request.section
+            )));
+        }
+        if let Some(expected) = request.expected_revision
+            && expected != state.revision
+        {
+            return Err(SourceError::PreconditionFailed(format!(
+                "the configuration has changed since revision {expected} (it is now at {})",
+                state.revision
+            )));
+        }
+        let pinned = state
+            .layers
+            .pinned_by_environment(&request.section, &request.patch);
+        if !pinned.is_empty() {
+            return Err(SourceError::Conflict(format!(
+                "pinned by the environment: {}",
+                pinned.join(", ")
+            )));
+        }
+        // Validate the configuration this patch would produce before writing anything: a stored
+        // setting the server then refuses to boot on is worse than a rejected request.
+        state
+            .layers
+            .resolve_with_patch(&request.section, &request.patch)
+            .map_err(|e| SourceError::Invalid(e.to_string()))?;
+
+        let mut database = state.layers.database.clone();
+        hs_config::merge_patch(
+            &mut database,
+            &Value::Object(
+                [(request.section.clone(), request.patch.clone())]
+                    .into_iter()
+                    .collect::<Map<String, Value>>(),
+            ),
+        );
+        state.layers.database = database;
+        state.revision += 1;
+        let change = ConfigChange {
+            revision: state.revision,
+            section: request.section.clone(),
+            patch: request.patch,
+            actor: request.actor,
+            at: hs_http::time::now_rfc3339(),
+        };
+        state.history.push(change);
+
+        let resolved = state.resolve()?;
+        Ok(state.section(&resolved, &request.section))
+    }
+
+    async fn reload(&self) -> Result<ConfigReloadReport, SourceError> {
+        let mut state = self.state_mut();
+        state.resolve()?;
+        let now = hs_http::time::now_rfc3339();
+        let reloaded_sections: Vec<String> = hs_config::reload::RELOADABLE_SECTIONS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        for name in &reloaded_sections {
+            state.reloaded_at.insert(name.clone(), now.clone());
+        }
+        Ok(ConfigReloadReport {
+            reloaded_sections,
+            errors: Vec::new(),
+            // This fake has no running server to have drifted from, so nothing can need a
+            // restart. A real implementation compares the configuration it booted on against
+            // the one it just read and reports the difference.
+            requires_restart: Vec::new(),
+            revision: state.revision,
+        })
+    }
+
+    async fn history(
+        &self,
+        section: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ConfigChange>, SourceError> {
+        Ok(self
+            .state()
+            .history
+            .iter()
+            .rev()
+            .filter(|change| section.is_none_or(|name| change.section == name))
+            .take(limit)
+            .cloned()
+            .collect())
     }
 }
 

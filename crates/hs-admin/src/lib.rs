@@ -12,8 +12,10 @@
 //! - [`operations`]: the operation table generated alongside `openapi/openapi.yaml`.
 //! - [`router`]: the axum router built from that table (real handlers for a first slice of
 //!   operations, `501` for the rest).
-//! - [`sources`]: consumer-defined data-source traits (`UserDirectory`, ...) the real handlers
-//!   call, implemented elsewhere and wired onto [`router::AdminState`].
+//! - [`sources`]: consumer-defined data-source traits (`UserDirectory`, `ConfigSource`, ...) the
+//!   real handlers call, implemented elsewhere and wired onto [`router::AdminState`].
+//! - [`config_schema`]: which configuration settings are secrets, derived from the configuration
+//!   type's own JSON Schema, and the redaction the `/config*` handlers apply because of it.
 //! - [`assets`]: serves the management interface's built assets at `/admin/`.
 //! - [`openapi`]: the embedded OpenAPI document.
 //!
@@ -24,6 +26,7 @@
 pub mod assets;
 pub mod audit;
 pub mod auth;
+pub mod config_schema;
 pub mod events;
 pub mod idempotency;
 pub mod model;

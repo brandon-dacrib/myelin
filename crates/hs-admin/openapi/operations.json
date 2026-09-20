@@ -244,6 +244,15 @@
       "idempotent_post": true
     },
     {
+      "method": "GET",
+      "path": "/config/schema",
+      "operation_id": "config.schema",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Config",
+      "idempotent_post": false
+    },
+    {
       "method": "POST",
       "path": "/config/validate",
       "operation_id": "config.validate",

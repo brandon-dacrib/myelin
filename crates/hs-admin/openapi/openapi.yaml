@@ -1022,6 +1022,33 @@ paths:
           $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
+  /config/schema:
+    get:
+      summary: Describe every configuration setting
+      description: 'The JSON Schema of the whole configuration (derived from the server''s own configuration type: types, defaults, enums and the prose describing each setting), plus one row per setting saying which layer its value came from, whether it is a secret, whether changing it needs a restart, and whether this server would accept a change to it. The management interface renders its configuration forms from this and hardcodes no field names.'
+      operationId: config.schema
+      tags:
+      - Config
+      security:
+      - OAuth2:
+        - admin:read
+      responses:
+        '200':
+          description: The configuration schema and the current per-setting metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfigSchema'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
   /config/validate:
     post:
       summary: Validate configuration without applying it
@@ -6844,8 +6871,13 @@ components:
           type: string
         reloadable:
           type: boolean
+          description: Whether this section can change on a running server without a restart.
+        bootstrap:
+          type: boolean
+          description: Whether this section is read before the database is open and so can never be stored in it (storage). Read-only; config.update refuses it with 409.
         source:
           type: string
+          description: 'The highest-precedence layer that sets anything in this section: default, file, database or environment.'
         last_reloaded_at:
           type:
           - string
@@ -6853,7 +6885,92 @@ components:
           format: date-time
         values:
           type: object
-          description: 'Secrets rendered as {"$secret": true}.'
+          description: 'The section''s effective values, keyed relative to the section. Secrets rendered as {"$secret": true}. A patch may set a secret; echoing the placeholder back means "leave it alone".'
+        origins:
+          type: object
+          description: 'Which layer set each setting, keyed by whole-configuration JSON Pointer (/auth/enable_registration) so it matches ConfigSchema.settings. Every setting is listed, including those at their schema default.'
+          additionalProperties:
+            type: string
+            enum:
+            - default
+            - file
+            - database
+            - environment
+        revision:
+          type: integer
+          description: The configuration's revision, which is also this section's ETag for If-Match. It counts writes to the configuration as a whole, not to this section.
+        history:
+          type: array
+          description: The most recent changes to this section, newest first. Returned by config.get; omitted by config.list.
+          items:
+            $ref: '#/components/schemas/ConfigChange'
+    ConfigChange:
+      type: object
+      properties:
+        revision:
+          type: integer
+        section:
+          type: string
+        patch:
+          type: object
+          description: 'The RFC 7396 merge patch that was applied; null members are resets to the schema default. Secrets rendered as {"$secret": true}.'
+        actor:
+          type:
+          - string
+          - 'null'
+        at:
+          type: string
+          format: date-time
+    ConfigSchema:
+      type: object
+      properties:
+        schema:
+          type: object
+          description: The JSON Schema of the whole configuration, derived from the server's own configuration type.
+        sections:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConfigSectionInfo'
+        settings:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConfigSettingInfo'
+        revision:
+          type: integer
+    ConfigSectionInfo:
+      type: object
+      properties:
+        name:
+          type: string
+        reloadable:
+          type: boolean
+        bootstrap:
+          type: boolean
+        source:
+          type: string
+    ConfigSettingInfo:
+      type: object
+      properties:
+        pointer:
+          type: string
+          description: A whole-configuration JSON Pointer (/auth/enable_registration). An array is one setting, not one per element.
+        section:
+          type: string
+        origin:
+          type: string
+          enum:
+          - default
+          - file
+          - database
+          - environment
+        secret:
+          type: boolean
+          description: Whether this setting's value is served redacted.
+        reloadable:
+          type: boolean
+        editable:
+          type: boolean
+          description: Whether config.update would accept a change to it. False for a bootstrap section and for anything an HS__ environment variable pins, so the interface can show the field read-only with a reason rather than offering an edit that would be refused.
     ConfigValidateReport:
       type: object
       properties:
@@ -6863,6 +6980,11 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ValidationError'
+        requires_restart:
+          type: array
+          description: Sections whose new value could not be applied without restarting the process.
+          items:
+            type: string
     ConfigReloadReport:
       type: object
       properties:
@@ -6874,6 +6996,13 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ValidationError'
+        requires_restart:
+          type: array
+          description: Sections that changed but could not be hot-applied. Reported rather than swallowed.
+          items:
+            type: string
+        revision:
+          type: integer
     StatisticsOverview:
       type: object
       properties:
