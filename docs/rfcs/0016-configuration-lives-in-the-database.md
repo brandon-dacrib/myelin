@@ -81,10 +81,17 @@ Writes are RFC 7396 JSON Merge Patch, per section. A `null` removes the key rath
 to null, which gives reset-to-default for free: the key leaves the merged document and the schema's
 own default stands.
 
-It reverts to the *default*, not to whatever a lower-precedence layer said. That is the only
-reading that gives an operator the same result whether or not a bootstrap file happens to be
-mounted — "reset" means "as if nobody had ever set this", and an operator should not have to know
-what is in a file they have never seen to predict what a button does.
+It reverts to whatever the layer underneath says — the bootstrap file if it sets that value, the
+schema default otherwise — because a layer is a *document*, not a patch: the store merges the null
+into the stored section rather than keeping it, so "reset" means "the database stops setting this"
+rather than "nobody may set this".
+
+The alternative was considered and rejected: a stored tombstone that shadows the file would give
+the database three states per setting instead of two, and would make a value an operator put in
+their bootstrap file permanently unreachable the moment anybody touched that key in the UI. The
+cost of the rule as built is that an operator cannot predict a reset's outcome without knowing
+what the file says — which the interface answers directly, since it reports every setting's origin
+and shows the new value and its new origin the moment the reset lands.
 
 ### 2.4 Concurrency
 

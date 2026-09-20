@@ -29,7 +29,7 @@ pub struct FileLayer {
 }
 
 /// The layers the effective configuration is built from, lowest precedence first.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Layers {
     /// The bootstrap file, if any.
     pub file: Option<FileLayer>,
@@ -64,6 +64,23 @@ impl Resolved {
     }
 }
 
+/// An empty set of layers: no file, nothing in the database, nothing in the environment -- the
+/// schema's own defaults.
+///
+/// Both documents are empty *objects*, not `Value::Null`. A derived `Default` would give null, and
+/// RFC 7396 says a non-object patch replaces its target wholesale -- so merging a null layer
+/// collapses the entire configuration to null and every setting silently reads back at its
+/// default, which looks exactly like a configuration that was never set rather than like a bug.
+impl Default for Layers {
+    fn default() -> Self {
+        Self {
+            file: None,
+            database: Value::Object(Map::new()),
+            environment: Value::Object(Map::new()),
+        }
+    }
+}
+
 impl Layers {
     /// The layers for a server booting with no database yet: file and environment only.
     #[must_use]
@@ -73,8 +90,8 @@ impl Layers {
     {
         Self {
             file,
-            database: Value::Object(Map::new()),
             environment: crate::env::override_document(env_vars),
+            ..Self::default()
         }
     }
 
@@ -255,6 +272,66 @@ mod tests {
             .resolve_with_patch("server", &json!({"server_name": "new.example"}))
             .unwrap();
         assert_eq!(resolved.config.server.server_name, "new.example");
+    }
+
+    /// The `Default` impl exists because a derived one is a trap: `Value::Null` as a layer is an
+    /// RFC 7396 whole-document replacement, so one null layer erases every other one.
+    #[test]
+    fn default_layers_resolve_to_the_schema_defaults_rather_than_erasing_everything() {
+        let layers = Layers {
+            file: Some(FileLayer {
+                path: PathBuf::from("/etc/myelin/homeserver.yaml"),
+                document: json!({"server": {"server_name": "example.org"}}),
+            }),
+            ..Layers::default()
+        };
+        assert_eq!(
+            layers.resolve().unwrap().config.server.server_name,
+            "example.org",
+            "an empty database and environment must leave the file's values alone"
+        );
+    }
+
+    /// What a reset actually means, end to end: the database stops setting the value, and
+    /// whatever layer is underneath speaks again. It does *not* leave a tombstone that suppresses
+    /// the file -- a layer is a document, not a patch, and the store merges the null away rather
+    /// than storing it (`ConfigStore::patch_section`).
+    #[test]
+    fn resetting_a_setting_hands_it_back_to_the_layer_underneath() {
+        let backend = hs_kv::memory::MemoryBackend::new();
+        let store = crate::store::ConfigStore::open(backend).unwrap();
+        let file = FileLayer {
+            path: PathBuf::from("/etc/myelin/homeserver.yaml"),
+            document: json!({
+                "server": {"server_name": "example.org"},
+                "auth": {"enable_registration": false},
+            }),
+        };
+
+        store
+            .patch_section("auth", &json!({"enable_registration": true}), None, 1, None)
+            .unwrap();
+        let layers = Layers {
+            file: Some(file.clone()),
+            ..Layers::default()
+        }
+        .with_database(store.load().unwrap().document);
+        assert!(layers.resolve().unwrap().config.auth.enable_registration);
+
+        store
+            .patch_section("auth", &json!({"enable_registration": null}), None, 2, None)
+            .unwrap();
+        let layers = Layers {
+            file: Some(file),
+            ..Layers::default()
+        }
+        .with_database(store.load().unwrap().document);
+        let resolved = layers.resolve().unwrap();
+        assert!(
+            !resolved.config.auth.enable_registration,
+            "the file sets this and the database no longer does, so the file's value stands"
+        );
+        assert_eq!(resolved.origin("/auth/enable_registration"), Origin::File);
     }
 
     #[test]

@@ -7,12 +7,18 @@
 //!
 //! The merge rule is RFC 7396 JSON Merge Patch: an object merges key by key, recursively;
 //! anything else (a scalar, an array) replaces wholesale; and an explicit `null` *removes* the
-//! key rather than setting it to null. That last case is what the admin API's reset-to-default
-//! does: storing `null` for a setting in the database drops the key out of the merged document
-//! entirely, so the value reverts to the schema's own default -- and the database never has to
-//! know what that default is. Note that it reverts to the *default*, not to whatever a
-//! lower-precedence layer said: a reset means "as if nobody had ever set this", which is the only
-//! reading that gives the same result whether or not a bootstrap file happens to be mounted.
+//! key rather than setting it to null.
+//!
+//! That last case is what the admin API's reset-to-default does, and it is worth being exact
+//! about what it resets *to*. A patch's `null` removes the key from the layer it is applied to --
+//! [`crate::store::ConfigStore::patch_section`] merges it into the stored section rather than
+//! storing the null itself -- so the database stops saying anything about that setting, and
+//! whichever layer is underneath speaks again: the bootstrap file if it sets it, the schema
+//! default otherwise. No layer can suppress a layer below it, because a layer is a document, not
+//! a patch, and "reset" means "this layer stops setting it" rather than "nobody may set it". The
+//! alternative -- storing a tombstone that shadows the file -- would make the database's
+//! contribution to a setting have three states instead of two, and the file's value permanently
+//! unreachable once anybody had touched that key.
 
 use std::collections::BTreeMap;
 
@@ -134,10 +140,11 @@ pub fn origins<'a, I: IntoIterator<Item = (Origin, &'a Value)>>(
     let mut out = BTreeMap::new();
     for (origin, document) in layers {
         for pointer in leaf_pointers(document) {
-            // A `null` leaf is a removal, not a value: `merge_patch` drops the key out of the
-            // merged document, so the effective value is the schema default and no layer owns it.
-            // Recording this layer as its source would report a setting as "set in the database"
-            // when the database's whole contribution was to stop anything setting it.
+            // A `null` leaf is a removal, not a value: `merge_patch` drops the key, so this
+            // layer does not own the setting -- whatever is underneath does. No layer this
+            // server assembles actually carries one today (the store merges patches into the
+            // stored document rather than keeping their nulls), but an `HS__FOO__BAR=null`
+            // variable produces one, so the rule is stated rather than assumed.
             if document.pointer(&pointer).is_some_and(Value::is_null) {
                 out.remove(&pointer);
                 continue;
@@ -213,12 +220,12 @@ mod tests {
         assert_eq!(origins.get("/federation/client_timeout"), None);
     }
 
-    /// A reset clears the setting for every layer at or below it -- the merged document simply
-    /// has no such key any more -- so afterwards nothing owns it and it reads as the schema
-    /// default. Reporting the file as its source would be a lie: the file's value is not what the
-    /// server is running on.
+    /// A layer that carries an explicit null does not own the setting it nulls: the key is gone
+    /// from the merged document, so reporting that layer as its source would be a lie. What the
+    /// *server* does with a reset is one level up, in `layered` -- the store never keeps the null,
+    /// so the layer below gets the setting back.
     #[test]
-    fn a_reset_leaves_the_setting_owned_by_nobody() {
+    fn a_layer_that_nulls_a_setting_does_not_own_it() {
         let file = json!({"auth": {"enable_registration": false}});
         let database = json!({"auth": {"enable_registration": null}});
         let origins = origins([(Origin::File, &file), (Origin::Database, &database)]);
