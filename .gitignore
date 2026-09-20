@@ -21,3 +21,4 @@ crates/hs-cli/data/
 # so this must never be committed, least of all to a public repository.
 web/playwright-report*/
 web/test-results/
+.playwright-mcp/

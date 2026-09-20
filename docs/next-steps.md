@@ -48,7 +48,7 @@ This is the product priority, and the server is now far enough along to deserve 
 
 Work backwards from an operator's day and let that drive which admin API operations to implement next, rather than working down the OpenAPI document in order.
 
-**First run.** Getting from nothing to a working server should be pleasant. Today it is: generate a config, edit YAML, generate a signing key, run a binary, register a user with a shared secret you had to put in the config first. A first-run flow — a single command that produces a working server and hands you a URL and an admin login — is squarely in the spirit of this priority, and the image, chart and CD pipeline that now exist are the foundation for it.
+**First run.** Getting from nothing to a working server should be pleasant. Measured against the published image on 2026-09-20: `generate-config` writes **158 lines of YAML**, three of which (`data_dir`, the media `path`, `signing_key_path`) must be repointed by hand before the container can write anything, and a fourth (`auth.enable_registration`, correctly `false` by default) before anyone can sign up. After those four edits it works — health in about a second, then register, whoami and create a room all succeed. The gap is not that it is broken; it is that four hand-edits stand between a pull and a working server. A first-run flow — a single command that produces a working server and hands you a URL and an admin login — is squarely in the spirit of this priority, and the image, chart and CD pipeline that now exist are the foundation for it.
 
 ### 3. Federation: stop crashing the suite, then finish the join
 
