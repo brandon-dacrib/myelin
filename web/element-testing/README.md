@@ -71,6 +71,7 @@ no workaround. Log in as `alice` / `alicepassword123` or `bob` / `bobpassword123
 new account — registration is enabled in this config).
 
 ### What was actually driven and verified, this session (Playwright, real Chromium, two separate
+
 origins/sessions)
 
 1. Landing page (`#/welcome`) loads correctly, no console errors, no CORS failures.
@@ -106,12 +107,13 @@ deployment to do.
 ## Bugs found this session, diagnosed to a route and an owning track
 
 **1. `POST /_matrix/client/v3/createRoom` rejects the room's own creator once a client supplies
-`power_level_content_override`, because the server *replaces* the default power-levels content
+`power_level_content_override`, because the server _replaces_ the default power-levels content
 with the override instead of merging it on top.** Real Element sends
 `power_level_content_override` on every room it creates (by default, to set a power level for
 `org.matrix.msc3401.call.member`), so **this blocks room creation from Element's UI entirely, for
 every preset, every time** — the single most severe finding of this session, and worse than any
 previous one because it isn't a missing feature, it breaks the primary flow.
+
 - Minimal reproduction:
   ```
   curl -X POST http://127.0.0.1:8098/_matrix/client/v3/createRoom \
@@ -144,11 +146,13 @@ show linked email addresses/phone numbers; it renders "Unable to load email addr
 "...phone numbers" as a visible error banner in Settings today. Confirmed no handler exists
 anywhere in the workspace (`grep -rn "account/3pid" crates/*/src` finds no route, only unrelated
 config/translation-table hits).
-  ```
-  curl -i http://127.0.0.1:8098/_matrix/client/v3/account/3pid -H "Authorization: Bearer $TOKEN"
-  # -> 404, content-length: 0
-  ```
-  Owning track: `hs-auth` (track 07) — brief explicitly lists "3PIDs, account lifecycle."
+
+```
+curl -i http://127.0.0.1:8098/_matrix/client/v3/account/3pid -H "Authorization: Bearer $TOKEN"
+# -> 404, content-length: 0
+```
+
+Owning track: `hs-auth` (track 07) — brief explicitly lists "3PIDs, account lifecycle."
 
 **3. State events never carry `unsigned.prev_content`, on `/sync` or `/messages`, anywhere.** Per
 the Matrix spec, a state event's `unsigned.prev_content` should hold the previous content for that
@@ -158,19 +162,21 @@ This server never populates it (confirmed: `grep -rln "prev_content" crates/*/sr
 nothing in the entire workspace), so Element's timeline literally renders a display-name change as
 **"Alice Wonderland joined the room"** — visibly wrong, reproduced live (see
 `element-testing`/screenshots, and the raw event below).
-  ```
-  curl ".../rooms/{roomId}/messages?dir=b&limit=10" -H "Authorization: Bearer $TOKEN"
-  # the display-name-change m.room.member event's "unsigned" is "{}" -- no prev_content at all
-  ```
-  Root cause: `crates/hs-room/src/routes/render.rs::client_event_json` — the single shared
-  function every route (`/messages`, `/sync`, `/context`, ...) uses to turn a stored `Event` into
-  client JSON — builds `unsigned` from scratch (`obj.entry("unsigned").or_insert_with(|| json!({}))`)
-  and never looks up or attaches the prior state content. This needs access to state just before
-  the event, which `render.rs`'s pure function doesn't have today — a bigger fix than 1-2 lines,
-  but well isolated.
-  Owning track: `hs-room` (track 04) — `crates/hs-room/src/routes/render.rs`, and wherever the
-  state-lookup this needs would live (`hs-state`/track 02 may also need to expose "prior content
-  for this (type, state_key) as of this event" if it doesn't already).
+
+```
+curl ".../rooms/{roomId}/messages?dir=b&limit=10" -H "Authorization: Bearer $TOKEN"
+# the display-name-change m.room.member event's "unsigned" is "{}" -- no prev_content at all
+```
+
+Root cause: `crates/hs-room/src/routes/render.rs::client_event_json` — the single shared
+function every route (`/messages`, `/sync`, `/context`, ...) uses to turn a stored `Event` into
+client JSON — builds `unsigned` from scratch (`obj.entry("unsigned").or_insert_with(|| json!({}))`)
+and never looks up or attaches the prior state content. This needs access to state just before
+the event, which `render.rs`'s pure function doesn't have today — a bigger fix than 1-2 lines,
+but well isolated.
+Owning track: `hs-room` (track 04) — `crates/hs-room/src/routes/render.rs`, and wherever the
+state-lookup this needs would live (`hs-state`/track 02 may also need to expose "prior content
+for this (type, state_key) as of this event" if it doesn't already).
 
 ### Not bugs — expected/benign 404s seen in the console
 

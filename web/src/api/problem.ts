@@ -54,12 +54,7 @@ export function unwrap<T>(result: FetchResult<T>): T {
 }
 
 export type ProblemKind =
-  | "not-implemented"
-  | "unavailable"
-  | "forbidden"
-  | "unauthorized"
-  | "not-found"
-  | "error";
+  "not-implemented" | "unavailable" | "forbidden" | "unauthorized" | "not-found" | "error";
 
 export interface ClassifiedProblem {
   kind: ProblemKind;

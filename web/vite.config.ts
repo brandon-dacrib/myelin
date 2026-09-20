@@ -41,7 +41,10 @@ export default defineConfig({
     globals: false,
     setupFiles: ["./src/test/setup.ts"],
     css: true,
-    exclude: ["node_modules/**", "e2e/**", "storybook-static/**"],
+    // `e2e/` and `e2e-real/` are Playwright suites (`npm run test:e2e`,
+    // `test:e2e:real`); Vitest collecting them fails at import, because
+    // `@playwright/test`'s `test`/`expect` are not Vitest's.
+    exclude: ["node_modules/**", "e2e/**", "e2e-real/**", "storybook-static/**"],
     coverage: {
       provider: "v8",
       reporter: ["text", "html"],

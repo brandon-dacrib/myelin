@@ -1,7 +1,14 @@
-dist
-dist-mock
-storybook-static
-playwright-report
-test-results
+# Generated output, not source: formatting it is noise, and reformatting it is
+# worse -- the next run of the tool that produced it puts everything back.
+playwright-report-real/
+playwright-report/
+test-results/
+dist/
+dist-mock/
+storybook-static/
 src/api/schema.d.ts
 node_modules
+
+# Written by `msw init`, byte for byte, into the directory package.json's
+# `msw.workerDirectory` names. Reformatting it makes the next `msw init` a diff.
+public/mockServiceWorker.js

@@ -8,6 +8,21 @@ import {
 } from "./data/appservices";
 import { bridgeTypes } from "./data/bridge-types";
 import {
+  configAuditEntries,
+  configEtag,
+  configLastReloaded,
+  configRevisions,
+  configSchemaDocument,
+  configValues,
+  environmentPinned,
+  mergePatch,
+  patchPointers,
+  recordConfigChange,
+  sectionSource,
+  validateDocument,
+  validateSection,
+} from "./data/config";
+import {
   statisticsOverview,
   serverInfo,
   clusterStatus,
@@ -18,6 +33,7 @@ import { users, userDevices, findUser } from "./data/users";
 import { rooms, roomMembers, findRoom } from "./data/rooms";
 import { ALL_SCOPES, type Scope } from "@/lib/auth";
 import type { AppService } from "@/api/bridges";
+import type { JsonValue } from "@/api/config-schema";
 
 const API = "/api/v1";
 
@@ -47,6 +63,33 @@ function paginate<T>(items: T[], url: URL) {
 
 const registeredIds = new Set(appservices.map((a) => a.id));
 
+/** An RFC 9457 body from the closed catalog in RFC 0004 section 3.5. */
+function problem(
+  status: number,
+  slug: string,
+  title: string,
+  extra?: { detail?: string; errors?: { pointer: string; detail: string }[] },
+) {
+  return HttpResponse.json({ type: `urn:hs:problem:${slug}`, title, status, ...extra }, { status });
+}
+
+function configNotFound(name: string) {
+  return problem(404, "not-found", "Configuration section not found", {
+    detail: `There is no section named "${name}".`,
+  });
+}
+
+function configSectionBody(name: string) {
+  const meta = configSchemaDocument.sections.find((s) => s.name === name);
+  return {
+    name,
+    reloadable: meta?.reloadable ?? false,
+    source: sectionSource(name),
+    last_reloaded_at: configLastReloaded[name] ?? null,
+    values: configValues[name] ?? {},
+  };
+}
+
 export const handlers = [
   // ---- Mock OAuth issuer (stands in for track 07 until it exists; not
   // part of the real admin API, which only verifies bearer tokens) ----
@@ -75,7 +118,22 @@ export const handlers = [
   }),
   http.get(`${API}/audit-log`, ({ request }) => {
     const url = new URL(request.url);
-    const { items, next_cursor, prev_cursor } = paginate(recentAuditEntries, url);
+    const targetType = url.searchParams.get("target_type");
+    const targetId = url.searchParams.get("target_id");
+    const action = url.searchParams.get("action");
+    // Configuration writes are audit entries like any other; the
+    // Configuration page reads its change history back out of here, since
+    // there is no /config/{section}/history operation on the real API.
+    const all = [...configAuditEntries, ...recentAuditEntries].sort((a, b) =>
+      b.recorded_at.localeCompare(a.recorded_at),
+    );
+    const filtered = all.filter(
+      (entry) =>
+        (!targetType || entry.target.type === targetType) &&
+        (!targetId || entry.target.id === targetId) &&
+        (!action || entry.action === action),
+    );
+    const { items, next_cursor, prev_cursor } = paginate(filtered, url);
     return HttpResponse.json({ items, next_cursor, prev_cursor });
   }),
 
@@ -471,6 +529,94 @@ export const handlers = [
         { status: 404 },
       );
     return HttpResponse.json(room);
+  }),
+
+  // ---- Configuration (crates/hs-config; docs/config.md) ----
+  //
+  // `/config/schema` is registered before `/config/:section` because MSW
+  // matches handlers in order and `:section` would otherwise swallow it.
+  http.get(`${API}/config/schema`, () => HttpResponse.json(configSchemaDocument)),
+
+  http.get(`${API}/config`, () =>
+    HttpResponse.json(configSchemaDocument.sections.map((s) => configSectionBody(s.name))),
+  ),
+
+  http.get(`${API}/config/:section`, ({ params }) => {
+    const name = String(params.section);
+    if (!(name in configValues)) return configNotFound(name);
+    return HttpResponse.json(configSectionBody(name), {
+      headers: { ETag: configEtag(name) },
+    });
+  }),
+
+  http.patch(`${API}/config/:section`, async ({ params, request }) => {
+    const name = String(params.section);
+    if (!(name in configValues)) return configNotFound(name);
+
+    const meta = configSchemaDocument.sections.find((s) => s.name === name);
+    if (meta?.bootstrap) {
+      return problem(400, "validation-failed", "Validation failed", {
+        detail: `${name} says where the database is, so it is read before there is a database to read it from. Set it on the command line, in an HS__ variable, or in the bootstrap file.`,
+      });
+    }
+
+    const ifMatch = request.headers.get("If-Match");
+    if (ifMatch && ifMatch !== configEtag(name)) {
+      return problem(412, "precondition-failed", "Someone else changed this section", {
+        detail: `Your copy was revision ${ifMatch}; the server is now at ${configEtag(name)}. Re-read the section and reapply your changes.`,
+      });
+    }
+
+    const patch = (await request.json()) as JsonValue;
+
+    const pinned = environmentPinned(name);
+    const touched = patchPointers(patch);
+    const pinnedTouched = touched.filter((pointer) => pinned.includes(pointer));
+    if (pinnedTouched.length > 0) {
+      return problem(400, "validation-failed", "Validation failed", {
+        detail: "Pinned by this deployment's environment; change it where the environment is set.",
+        errors: pinnedTouched.map((pointer) => ({
+          pointer,
+          detail: `set by an HS__ environment variable, which takes precedence over the database — change it in the deployment, not here`,
+        })),
+      });
+    }
+
+    const candidate = mergePatch(configValues[name], patch) as Record<string, JsonValue>;
+    const errors = validateSection(name, candidate);
+    if (errors.length > 0) {
+      return problem(400, "validation-failed", "Validation failed", {
+        detail: `${errors.length} setting${errors.length === 1 ? "" : "s"} could not be accepted.`,
+        errors,
+      });
+    }
+
+    configValues[name] = candidate;
+    configRevisions[name] = (configRevisions[name] ?? 0) + 1;
+    if (meta?.reloadable) configLastReloaded[name] = new Date().toISOString();
+    recordConfigChange(name, configRevisions[name]);
+
+    return HttpResponse.json(configSectionBody(name), {
+      headers: { ETag: configEtag(name) },
+    });
+  }),
+
+  http.post(`${API}/config/validate`, async ({ request }) => {
+    const document = (await request.json()) as Record<string, JsonValue>;
+    const errors = validateDocument(document);
+    // Which of the sections in the candidate document the running process
+    // could not adopt without being restarted.
+    const requires_restart = Object.keys(document).filter(
+      (name) => !configSchemaDocument.sections.find((s) => s.name === name)?.reloadable,
+    );
+    return HttpResponse.json({ valid: errors.length === 0, errors, requires_restart });
+  }),
+
+  http.post(`${API}/config/reload`, () => {
+    const reloaded = configSchemaDocument.sections.filter((s) => s.reloadable).map((s) => s.name);
+    const now = new Date().toISOString();
+    for (const name of reloaded) configLastReloaded[name] = now;
+    return HttpResponse.json({ reloaded_sections: reloaded, errors: [], requires_restart: [] });
   }),
 
   // ---- Federation destination detail (list is above, under Dashboard) ----

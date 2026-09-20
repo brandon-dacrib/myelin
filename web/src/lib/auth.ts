@@ -162,7 +162,9 @@ export async function signInWithToken(accessToken: string): Promise<Session> {
     );
   }
   if (res.status === 503) {
-    throw new AuthSignInError("The server isn't ready to verify tokens yet (503). Try again shortly.");
+    throw new AuthSignInError(
+      "The server isn't ready to verify tokens yet (503). Try again shortly.",
+    );
   }
   if (!res.ok) {
     throw new AuthSignInError(`Sign-in failed (HTTP ${res.status}).`);

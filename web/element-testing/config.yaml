@@ -11,17 +11,17 @@ server:
   report_stats: false
 listeners:
   listeners:
-  - bind_addresses:
-    - '::'
-    port: 8098
-    tls: null
-    resources:
-    - client
-    - federation
-    - media
-    - health
-    - admin
-    x_forwarded: false
+    - bind_addresses:
+        - "::"
+      port: 8098
+      tls: null
+      resources:
+        - client
+        - federation
+        - media
+        - health
+        - admin
+      x_forwarded: false
 storage:
   backend: embedded
   data_dir: ./data
@@ -31,32 +31,32 @@ media:
     path: ./media-store
   max_upload_size: 50M
   thumbnail_sizes:
-  - width: 32
-    height: 32
-    method: crop
-  - width: 96
-    height: 96
-    method: crop
-  - width: 320
-    height: 240
-    method: scale
-  - width: 640
-    height: 480
-    method: scale
-  - width: 800
-    height: 600
-    method: scale
+    - width: 32
+      height: 32
+      method: crop
+    - width: 96
+      height: 96
+      method: crop
+    - width: 320
+      height: 240
+      method: scale
+    - width: 640
+      height: 480
+      method: scale
+    - width: 800
+      height: 600
+      method: scale
   url_preview_enabled: false
   url_preview_ip_range_blocklist:
-  - 127.0.0.0/8
-  - 10.0.0.0/8
-  - 172.16.0.0/12
-  - 192.168.0.0/16
-  - 100.64.0.0/10
-  - 169.254.0.0/16
-  - ::1/128
-  - fe80::/10
-  - fc00::/7
+    - 127.0.0.0/8
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 100.64.0.0/10
+    - 169.254.0.0/16
+    - ::1/128
+    - fe80::/10
+    - fc00::/7
   remote_media_retention: null
   allow_legacy_unauthenticated_media: true
   url_preview_timeout: 30s
@@ -66,15 +66,15 @@ federation:
   enabled: true
   domain_allowlist: null
   ip_range_blocklist:
-  - 127.0.0.0/8
-  - 10.0.0.0/8
-  - 172.16.0.0/12
-  - 192.168.0.0/16
-  - 100.64.0.0/10
-  - 169.254.0.0/16
-  - ::1/128
-  - fe80::/10
-  - fc00::/7
+    - 127.0.0.0/8
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 100.64.0.0/10
+    - 169.254.0.0/16
+    - ::1/128
+    - fe80::/10
+    - fc00::/7
   ip_range_allowlist: []
   verify_certificates: true
   custom_ca_certificates: []

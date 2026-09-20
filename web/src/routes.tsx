@@ -41,6 +41,14 @@ const FederationDestinationPage = lazyRouteComponent(
   () => import("@/pages/FederationDestinationPage"),
   "FederationDestinationPage",
 );
+const ConfigurationPage = lazyRouteComponent(
+  () => import("@/pages/config/ConfigurationPage"),
+  "ConfigurationPage",
+);
+const ConfigSectionPage = lazyRouteComponent(
+  () => import("@/pages/config/ConfigSectionPage"),
+  "ConfigSectionPage",
+);
 const PlaceholderPage = lazyRouteComponent(
   () => import("@/pages/PlaceholderPage"),
   "PlaceholderPage",
@@ -162,6 +170,16 @@ const federationDestinationRoute = createRoute({
   path: "/federation/$serverName",
   component: FederationDestinationPage,
 });
+const configurationRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/configuration",
+  component: ConfigurationPage,
+});
+const configSectionRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/configuration/$section",
+  component: ConfigSectionPage,
+});
 
 // Sections on the information architecture (docs/design/information-architecture.md
 // #3) that this task did not build pages for; the route exists so navigation,
@@ -190,6 +208,8 @@ const routeTree = rootRoute.addChildren([
   reportsRoute,
   federationRoute,
   federationDestinationRoute,
+  configurationRoute,
+  configSectionRoute,
   mediaRoute,
   clusterRoute,
   migrationRoute,

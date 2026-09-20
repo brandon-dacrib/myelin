@@ -70,7 +70,10 @@ test.describe("real server", () => {
       await expect(page.getByText(/isn't implemented on this server yet/i)).toBeVisible({
         timeout: 10_000,
       });
-      await page.screenshot({ path: "test-results/real-bridges-not-implemented.png", fullPage: true });
+      await page.screenshot({
+        path: "test-results/real-bridges-not-implemented.png",
+        fullPage: true,
+      });
     });
 
     test("user detail is real, and its sub-resource gap is honest", async ({ page }) => {
@@ -88,7 +91,10 @@ test.describe("real server", () => {
       await expect(page.getByText(/isn't implemented on this server yet/i)).toBeVisible({
         timeout: 10_000,
       });
-      await page.screenshot({ path: "test-results/real-rooms-not-implemented.png", fullPage: true });
+      await page.screenshot({
+        path: "test-results/real-rooms-not-implemented.png",
+        fullPage: true,
+      });
     });
   });
 });

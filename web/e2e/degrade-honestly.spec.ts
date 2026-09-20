@@ -45,7 +45,9 @@ test.describe("degrade honestly", () => {
     );
 
     await page.goto("/admin/users/@alice:example.org");
-    await expect(page.getByText("isn't connected to a data source on this server yet")).toBeVisible();
+    await expect(
+      page.getByText("isn't connected to a data source on this server yet"),
+    ).toBeVisible();
     await expect(page.getByRole("button", { name: "Check again" })).toBeVisible();
 
     await expectNoAxeViolations(page, "user detail, 503");

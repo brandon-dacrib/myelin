@@ -201,7 +201,12 @@ export function BridgesListPage() {
 
       {isError && (
         <div className="mt-6">
-          <QueryProblemState error={error} resource="bridges" scope="bridges:read" onRetry={() => refetch()} />
+          <QueryProblemState
+            error={error}
+            resource="bridges"
+            scope="bridges:read"
+            onRetry={() => refetch()}
+          />
         </div>
       )}
 

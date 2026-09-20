@@ -140,7 +140,12 @@ export function UsersPage() {
 
       {isError && (
         <div className="mt-6">
-          <QueryProblemState error={error} resource="users" scope="admin:read" onRetry={() => refetch()} />
+          <QueryProblemState
+            error={error}
+            resource="users"
+            scope="admin:read"
+            onRetry={() => refetch()}
+          />
         </div>
       )}
 

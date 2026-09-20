@@ -60,7 +60,10 @@ describe("NotImplementedState", () => {
 
   it("shows the server's own detail message when given one", () => {
     render(
-      <NotImplementedState resource="Bridges" problem={{ detail: "Bridges are not wired up yet." }} />,
+      <NotImplementedState
+        resource="Bridges"
+        problem={{ detail: "Bridges are not wired up yet." }}
+      />,
     );
     expect(screen.getByText("Bridges are not wired up yet.")).toBeInTheDocument();
   });

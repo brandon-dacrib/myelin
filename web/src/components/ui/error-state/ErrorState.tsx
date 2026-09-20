@@ -28,7 +28,10 @@ export interface ErrorStateProps {
 export function ErrorState({ title, problem, onRetry, compact, className }: ErrorStateProps) {
   return (
     <div role="alert" className={wrapperClass(compact, className)}>
-      <AlertTriangle aria-hidden="true" className={compact ? "size-5 text-danger" : "size-8 text-danger"} />
+      <AlertTriangle
+        aria-hidden="true"
+        className={compact ? "size-5 text-danger" : "size-8 text-danger"}
+      />
       <p className="text-md font-medium text-text">
         {title ?? problem?.title ?? "Something went wrong"}
       </p>
@@ -57,11 +60,16 @@ export interface ForbiddenStateProps {
 export function ForbiddenState({ scope, compact, className }: ForbiddenStateProps) {
   return (
     <div role="alert" className={wrapperClass(compact, className)}>
-      <ShieldOff aria-hidden="true" className={compact ? "size-5 text-text-faint" : "size-8 text-text-faint"} />
+      <ShieldOff
+        aria-hidden="true"
+        className={compact ? "size-5 text-text-faint" : "size-8 text-text-faint"}
+      />
       <p className="text-md font-medium text-text">
         This needs the <code className="font-identifier">{scope}</code> scope.
       </p>
-      {!compact && <p className="max-w-sm text-sm text-text-muted">Ask an administrator to grant it.</p>}
+      {!compact && (
+        <p className="max-w-sm text-sm text-text-muted">Ask an administrator to grant it.</p>
+      )}
     </div>
   );
 }
@@ -105,7 +113,10 @@ export function NotImplementedState({
   const Icon = variant === "unavailable" ? CloudOff : Construction;
   return (
     <div role="status" className={wrapperClass(compact, className)}>
-      <Icon aria-hidden="true" className={compact ? "size-5 text-text-faint" : "size-8 text-text-faint"} />
+      <Icon
+        aria-hidden="true"
+        className={compact ? "size-5 text-text-faint" : "size-8 text-text-faint"}
+      />
       <p className={compact ? "text-sm font-medium text-text" : "text-md font-medium text-text"}>
         {heading}
       </p>

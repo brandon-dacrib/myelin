@@ -11,6 +11,7 @@ import {
   ArrowRightLeft,
   ScrollText,
   Settings,
+  SlidersHorizontal,
 } from "lucide-react";
 import type { Scope } from "@/lib/auth";
 
@@ -69,5 +70,13 @@ export const navItems: NavItem[] = [
     scope: "admin:write",
   },
   { id: "audit", label: "Audit log", href: "/audit", icon: ScrollText, scope: "admin:read" },
+  {
+    id: "configuration",
+    label: "Configuration",
+    href: "/configuration",
+    icon: SlidersHorizontal,
+    scope: "admin:read",
+    shortcut: "g c",
+  },
   { id: "settings", label: "Settings", href: "/settings", icon: Settings, scope: "admin:read" },
 ];

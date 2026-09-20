@@ -118,7 +118,12 @@ export function RoomsPage() {
 
       {isError && (
         <div className="mt-6">
-          <QueryProblemState error={error} resource="rooms" scope="admin:read" onRetry={() => refetch()} />
+          <QueryProblemState
+            error={error}
+            resource="rooms"
+            scope="admin:read"
+            onRetry={() => refetch()}
+          />
         </div>
       )}
 

@@ -92,8 +92,8 @@ function RealSignIn() {
   return (
     <SignInShell>
       <p className="mt-2 text-sm text-text-muted">
-        Sign in with a server administrator&apos;s Matrix account. There is no separate admin
-        login — any account with <code className="font-identifier">is_admin</code> set works here.
+        Sign in with a server administrator&apos;s Matrix account. There is no separate admin login
+        — any account with <code className="font-identifier">is_admin</code> set works here.
       </p>
 
       <div

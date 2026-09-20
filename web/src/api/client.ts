@@ -8,7 +8,7 @@ import { getAccessToken } from "@/lib/auth";
  * this by writing `window.__HS_ADMIN_CONFIG__` from a `config.json` fetched
  * before the app mounts (see docs/design/information-architecture.md #9.1).
  */
-function apiBaseUrl(): string {
+export function apiBaseUrl(): string {
   const injected = (window as { __HS_ADMIN_CONFIG__?: { apiBaseUrl?: string } }).__HS_ADMIN_CONFIG__
     ?.apiBaseUrl;
   return injected ?? "/api/v1";

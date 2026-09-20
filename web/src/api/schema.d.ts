@@ -433,6 +433,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/config/schema": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Describe every configuration setting
+         * @description The JSON Schema of the whole configuration (derived from the server's own configuration type: types, defaults, enums and the prose describing each setting), plus one row per setting saying which layer its value came from, whether it is a secret, whether changing it needs a restart, and whether this server would accept a change to it. The management interface renders its configuration forms from this and hardcodes no field names.
+         */
+        get: operations["config.schema"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/config/validate": {
         parameters: {
             query?: never;
@@ -2203,21 +2223,72 @@ export interface components {
             replica_count?: number;
             shard_count?: number;
         };
+        ConfigChange: {
+            actor?: string | null;
+            /** Format: date-time */
+            at?: string;
+            /** @description The RFC 7396 merge patch that was applied; null members are resets to the schema default. Secrets rendered as {"$secret": true}. */
+            patch?: Record<string, never>;
+            revision?: number;
+            section?: string;
+        };
         ConfigReloadReport: {
             errors?: components["schemas"]["ValidationError"][];
             reloaded_sections?: string[];
+            /** @description Sections that changed but could not be hot-applied. Reported rather than swallowed. */
+            requires_restart?: string[];
+            revision?: number;
+        };
+        ConfigSchema: {
+            revision?: number;
+            /** @description The JSON Schema of the whole configuration, derived from the server's own configuration type. */
+            schema?: Record<string, never>;
+            sections?: components["schemas"]["ConfigSectionInfo"][];
+            settings?: components["schemas"]["ConfigSettingInfo"][];
         };
         ConfigSection: {
+            /** @description Whether this section is read before the database is open and so can never be stored in it (storage). Read-only; config.update refuses it with 409. */
+            bootstrap?: boolean;
+            /** @description The most recent changes to this section, newest first. Returned by config.get; omitted by config.list. */
+            history?: components["schemas"]["ConfigChange"][];
             /** Format: date-time */
             last_reloaded_at?: string | null;
             name?: string;
+            /** @description Which layer set each setting, keyed by whole-configuration JSON Pointer (/auth/enable_registration) so it matches ConfigSchema.settings. Every setting is listed, including those at their schema default. */
+            origins?: {
+                [key: string]: "default" | "file" | "database" | "environment";
+            };
+            /** @description Whether this section can change on a running server without a restart. */
+            reloadable?: boolean;
+            /** @description The configuration's revision, which is also this section's ETag for If-Match. It counts writes to the configuration as a whole, not to this section. */
+            revision?: number;
+            /** @description The highest-precedence layer that sets anything in this section: default, file, database or environment. */
+            source?: string;
+            /** @description The section's effective values, keyed relative to the section. Secrets rendered as {"$secret": true}. A patch may set a secret; echoing the placeholder back means "leave it alone". */
+            values?: Record<string, never>;
+        };
+        ConfigSectionInfo: {
+            bootstrap?: boolean;
+            name?: string;
             reloadable?: boolean;
             source?: string;
-            /** @description Secrets rendered as {"$secret": true}. */
-            values?: Record<string, never>;
+        };
+        ConfigSettingInfo: {
+            /** @description Whether config.update would accept a change to it. False for a bootstrap section and for anything an HS__ environment variable pins, so the interface can show the field read-only with a reason rather than offering an edit that would be refused. */
+            editable?: boolean;
+            /** @enum {string} */
+            origin?: "default" | "file" | "database" | "environment";
+            /** @description A whole-configuration JSON Pointer (/auth/enable_registration). An array is one setting, not one per element. */
+            pointer?: string;
+            reloadable?: boolean;
+            /** @description Whether this setting's value is served redacted. */
+            secret?: boolean;
+            section?: string;
         };
         ConfigValidateReport: {
             errors?: components["schemas"]["ValidationError"][];
+            /** @description Sections whose new value could not be applied without restarting the process. */
+            requires_restart?: string[];
             valid?: boolean;
         };
         Destination: {
@@ -3861,6 +3932,31 @@ export interface operations {
             403: components["responses"]["InsufficientScope"];
             409: components["responses"]["IdempotencyInFlight"];
             422: components["responses"]["IdempotencyMismatch"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "config.schema": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The configuration schema and the current per-setting metadata. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConfigSchema"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
             429: components["responses"]["RateLimited"];
             500: components["responses"]["Internal"];
             503: components["responses"]["Unavailable"];

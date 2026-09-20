@@ -2,6 +2,7 @@ import { setupWorker } from "msw/browser";
 import { http, HttpResponse } from "msw";
 import { handlers } from "./handlers";
 import { clusterStatus } from "./data/dashboard";
+import { configRevisions } from "./data/config";
 import { queryClient } from "@/lib/query-client";
 
 /** Started from src/main.tsx when VITE_HS_MOCK=1 (npm run dev:mock / build:mock). */
@@ -27,6 +28,7 @@ declare global {
         status: 403 | 501 | 503,
         extra?: { detail?: string; required_scope?: string },
       ): Promise<void>;
+      bumpConfigRevision(section: string): Promise<void>;
     };
   }
 }
@@ -64,5 +66,18 @@ window.__hsAdminMock = {
     const problem = { type: typeByStatus[status], title: titleByStatus[status], status, ...extra };
     worker.use(http.all(path, () => HttpResponse.json(problem, { status })));
     return queryClient.invalidateQueries();
+  },
+
+  /**
+   * Advances a configuration section's revision behind the open page's back,
+   * so the next save from it fails the `If-Match` precondition exactly as it
+   * would if a second operator had saved first. This is the only way to reach
+   * the `412` branch of the Configuration page without two browsers and a
+   * stopwatch. No `worker.use()` needed: the section data is a module the
+   * handlers already read from.
+   */
+  bumpConfigRevision(section) {
+    configRevisions[section] = (configRevisions[section] ?? 0) + 1;
+    return Promise.resolve();
   },
 };

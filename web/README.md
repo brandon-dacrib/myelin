@@ -16,24 +16,24 @@ draft, is now only a fallback used if the real file is ever absent.
 
 ## Commands
 
-| Command                                    | What it does                                                                                                                                                                            |
-| ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `npm run dev`                              | Vite dev server against the real admin API at `/api/v1` (needs a running homeserver on the same origin, e.g. once embedded). Sign in with a real admin's username/password or access token — see "Real-server mode" below.                                                                                                   |
-| `npm run dev:real`                         | Same, on a fixed port (4180) so `playwright.real.config.ts` can drive it; combine with `VITE_HS_API_PROXY_TARGET` (below) to point at a real `hs serve` running elsewhere without CORS/embedding.                                       |
-| `npm run dev:mock`                         | Vite dev server with MSW mocking the admin API. Sign in with either button on the landing screen; "read-only" demonstrates the permissions model.                                       |
-| `npm run build`                            | Regenerates the typed client, typechecks, and builds the production bundle to `dist/` (served by the homeserver at `/admin/`, or standalone with a `config.json` next to `index.html`). |
-| `npm run build:mock`                       | Same, but bundles the MSW mock worker and builds to `dist-mock/` — used by `npm run preview:mock` and the Playwright suite.                                                             |
-| `npm run preview` / `npm run preview:mock` | Serves the corresponding build locally.                                                                                                                                                 |
-| `npm run generate:client`                  | Regenerates `src/api/schema.d.ts` from whichever OpenAPI document is authoritative (see `scripts/generate-client.mjs` and `docs/decisions/0003-web-stack.md`).                          |
-| `npm run mock:openapi`                     | Reports which OpenAPI document is authoritative right now and what to do about it (`scripts/check-openapi.mjs`).                                                                        |
-| `npm run lint` / `npm run lint:fix`        | ESLint (flat config, `jsx-a11y` strict) + Prettier check/fix.                                                                                                                           |
-| `npm run typecheck`                        | `tsc -b`, no emit.                                                                                                                                                                      |
-| `npm run test` / `npm run test:watch`      | Vitest unit and component tests (jsdom, Testing Library, MSW).                                                                                                                          |
-| `npm run test:e2e` / `npm run test:e2e:ui` | Playwright end-to-end tests (`e2e/`) against `npm run preview:mock`; axe (`@axe-core/playwright`) runs at every step of every flow.                                                     |
-| `npm run test:e2e:real`                    | Playwright tests (`e2e-real/`) against a **real, running `hs serve`** (`playwright.real.config.ts`). Skipped entirely unless `HS_REAL_SERVER_URL` is set; see "Real-server mode" below. |
-| `npm run storybook`                        | Storybook dev server for every primitive component (`src/components/ui/`), with the `a11y` addon running axe on each story.                                                             |
-| `npm run build:storybook`                  | Static Storybook build to `storybook-static/`.                                                                                                                                          |
-| `npm run check`                            | `lint && typecheck && test && build` — run this (or at least lint+typecheck+test) after every change; do not proceed past a failure.                                                    |
+| Command                                    | What it does                                                                                                                                                                                                               |
+| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm run dev`                              | Vite dev server against the real admin API at `/api/v1` (needs a running homeserver on the same origin, e.g. once embedded). Sign in with a real admin's username/password or access token — see "Real-server mode" below. |
+| `npm run dev:real`                         | Same, on a fixed port (4180) so `playwright.real.config.ts` can drive it; combine with `VITE_HS_API_PROXY_TARGET` (below) to point at a real `hs serve` running elsewhere without CORS/embedding.                          |
+| `npm run dev:mock`                         | Vite dev server with MSW mocking the admin API. Sign in with either button on the landing screen; "read-only" demonstrates the permissions model.                                                                          |
+| `npm run build`                            | Regenerates the typed client, typechecks, and builds the production bundle to `dist/` (served by the homeserver at `/admin/`, or standalone with a `config.json` next to `index.html`).                                    |
+| `npm run build:mock`                       | Same, but bundles the MSW mock worker and builds to `dist-mock/` — used by `npm run preview:mock` and the Playwright suite.                                                                                                |
+| `npm run preview` / `npm run preview:mock` | Serves the corresponding build locally.                                                                                                                                                                                    |
+| `npm run generate:client`                  | Regenerates `src/api/schema.d.ts` from whichever OpenAPI document is authoritative (see `scripts/generate-client.mjs` and `docs/decisions/0003-web-stack.md`).                                                             |
+| `npm run mock:openapi`                     | Reports which OpenAPI document is authoritative right now and what to do about it (`scripts/check-openapi.mjs`).                                                                                                           |
+| `npm run lint` / `npm run lint:fix`        | ESLint (flat config, `jsx-a11y` strict) + Prettier check/fix.                                                                                                                                                              |
+| `npm run typecheck`                        | `tsc -b`, no emit.                                                                                                                                                                                                         |
+| `npm run test` / `npm run test:watch`      | Vitest unit and component tests (jsdom, Testing Library, MSW).                                                                                                                                                             |
+| `npm run test:e2e` / `npm run test:e2e:ui` | Playwright end-to-end tests (`e2e/`) against `npm run preview:mock`; axe (`@axe-core/playwright`) runs at every step of every flow.                                                                                        |
+| `npm run test:e2e:real`                    | Playwright tests (`e2e-real/`) against a **real, running `hs serve`** (`playwright.real.config.ts`). Skipped entirely unless `HS_REAL_SERVER_URL` is set; see "Real-server mode" below.                                    |
+| `npm run storybook`                        | Storybook dev server for every primitive component (`src/components/ui/`), with the `a11y` addon running axe on each story.                                                                                                |
+| `npm run build:storybook`                  | Static Storybook build to `storybook-static/`.                                                                                                                                                                             |
+| `npm run check`                            | `lint && typecheck && test && build` — run this (or at least lint+typecheck+test) after every change; do not proceed past a failure.                                                                                       |
 
 `node scripts/check-contrast.mjs` independently verifies the status-colour token pairs in
 `src/styles/tokens.css` meet 4.5:1 in both themes; run it after touching any `--color-success` /
@@ -51,14 +51,17 @@ src/
   components/        shared app-level pieces (CopyableId, CopyBlock, RelativeTime, Sparkline)
   api/               generated schema (schema.d.ts), the typed fetch client, query/mutation
                      hooks per resource (dashboard.ts, bridges.ts, users.ts, rooms.ts,
-                     federation.ts — see bridges.ts's doc comment for the reconciliation
-                     against the real AppService/BridgeType model)
-  lib/               auth (mock issuer client), theme, cn(), query client, small helpers
+                     federation.ts, config.ts — see bridges.ts's doc comment for the
+                     reconciliation against the real AppService/BridgeType model, and
+                     config-schema.ts, the single adapter for GET /config/schema's wire shape)
+  lib/               auth (mock issuer client), theme, cn(), query client, config-model.ts
+                     (JSON Schema -> form model, and back to an RFC 7396 merge patch), helpers
   mocks/             MSW handlers + fixture data (browser.ts for the app, node.ts for tests)
   pages/             route components: DashboardPage, bridges/ (list, detail, add-bridge
                      wizard), UsersPage/UserDetailPage, RoomsPage/RoomDetailPage,
-                     FederationPage/FederationDestinationPage, PlaceholderPage for the
-                     remaining information-architecture sections not yet built
+                     FederationPage/FederationDestinationPage, config/ (ConfigurationPage +
+                     ConfigSectionPage: the generated configuration forms), PlaceholderPage
+                     for the remaining information-architecture sections not yet built
   routes.tsx          the route tree (TanStack Router, code-based, every page lazy-loaded
                      via lazyRouteComponent for route-level code splitting)
 e2e/                 Playwright specs against the mock (npm run test:e2e): add-bridge.spec.ts
@@ -111,11 +114,44 @@ Built: the scaffold, the design system and every Phase-0 primitive component, th
 shell (navigation, theme switching including a curated accent set, command palette, responsive
 down to tablet width, keyboard navigation), the dashboard, the bridges list/detail/add-bridge
 wizard pages (flows.md flow 1 in full, including the Kubernetes and self-managed deployment
-paths, the namespace-conflict branch, and the forbidden branch), and the Users, Rooms and
+paths, the namespace-conflict branch, and the forbidden branch), the Users, Rooms and
 Federation list/detail pages (flows.md flows 2-4: search, understand, and the primary actions
-— lock/suspend/deactivate a user, block a room, reset a federation destination's backoff).
+— lock/suspend/deactivate a user, block a room, reset a federation destination's backoff), and
+Configuration.
 
 Not built (routes exist as `PlaceholderPage` so navigation matches the full information
 architecture, but the pages themselves are Phase 1/2 per the brief): Reports, Media, Cluster,
-Migration, Audit log, Settings. See `docs/status/16-management-web-interface.md` for what is
-next, including narrower gaps on the pages that are built (e.g. no reset-password flow yet).
+Migration, Audit log, and the rest of Settings (registration tokens, server notices, scheduled
+tasks, appearance). See `docs/status/16-management-web-interface.md` for what is next, including
+narrower gaps on the pages that are built (e.g. no reset-password flow yet).
+
+## Configuration (`/configuration`)
+
+The server keeps its configuration in its own database rather than in a YAML file on a host
+(`crates/hs-config/src/store.rs`), which is what makes editing it from a browser meaningful.
+The forms are **generated from `GET /config/schema`**, not hand-written: `src/lib/config-model.ts`
+walks the JSON Schema of `hs_config::Config` into fields and groups, and `src/pages/config/`
+renders one control per kind (switches for booleans, selects for enums, text with a unit hint for
+durations and byte sizes, editable lists for scalar arrays, JSON for everything else). A field
+added to a Rust struct shows up here as soon as the server describes it; no list of settings is
+hardcoded anywhere.
+
+What the page adds on top of the generated form:
+
+- **Provenance per setting** — `default`, `file`, `database` or `environment`, from the schema
+  response's origin map. A setting an `HS__` variable pins is shown read-only with the reason,
+  because the API will refuse to change it; `storage` is read-only for the same kind of reason
+  (it says where the database is, so it cannot live in it).
+- **A diff before saving** — the sticky bar counts unsaved changes; "Review and save" shows each
+  one as `was -> becomes`, the raw merge patch, and whether it applies now or at the next restart.
+  "Check without saving" runs `POST /config/validate`.
+- **Honest failure** — a `400`'s validation errors land on the fields they name (accepting every
+  spelling of a config path the two halves of the system use, see `normalizeErrorPath`), and a
+  `412` becomes "someone else changed this section" with a re-read, not a lost update.
+- **Secrets** render as "set, hidden" with replace and clear, never a reveal.
+- **Change history** from the audit log, filtered to `config_section`.
+
+`npm run dev:mock` drives the whole page: `src/mocks/data/config.ts` carries a schema faithful to
+`docs/config.md`, and the handlers really apply merge patches, really check `If-Match`, and really
+validate. `window.__hsAdminMock.bumpConfigRevision("federation")` in the console forces the
+`412` branch.

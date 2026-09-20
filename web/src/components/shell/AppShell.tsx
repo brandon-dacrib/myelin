@@ -14,6 +14,7 @@ const GO_TARGETS: Record<string, string> = {
   u: "/users",
   r: "/rooms",
   f: "/federation",
+  c: "/configuration",
 };
 
 export function AppShell() {
