@@ -154,13 +154,18 @@ impl MatrixError {
             MatrixErrorCode::Unrecognized,
             "Unrecognized request method",
         );
-        let list = allowed
-            .iter()
-            .map(|m| m.as_str().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        e.extra
-            .insert("allow".into(), serde_json::Value::String(list));
+        // An empty set means the caller does not know which methods the path accepts (the generic
+        // router fallback is in exactly that position): say nothing rather than advertise an
+        // empty `Allow`, which a client would read as "no method works here".
+        if !allowed.is_empty() {
+            let list = allowed
+                .iter()
+                .map(|m| m.as_str().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            e.extra
+                .insert("allow".into(), serde_json::Value::String(list));
+        }
         e
     }
 

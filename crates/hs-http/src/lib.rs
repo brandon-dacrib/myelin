@@ -19,6 +19,7 @@
 pub mod body;
 pub mod cors;
 pub mod error;
+pub mod fallback;
 pub mod listener;
 pub mod problem;
 pub mod ratelimit;
@@ -26,5 +27,6 @@ pub mod router;
 pub mod time;
 
 pub use error::{MatrixError, MatrixErrorCode};
+pub use fallback::apply as apply_fallbacks;
 pub use problem::{Problem, ValidationError};
 pub use router::{AuthKind, Builder, Route, RouteManifest, RouteMeta, Surface};
