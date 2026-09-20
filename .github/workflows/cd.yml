@@ -66,14 +66,47 @@ jobs:
     name: require green ci
     runs-on: ubuntu-24.04
     steps:
+      # Deliberately a plain poll rather than a wait-for-check action. Both workflows trigger on
+      # the same push, so when this starts, CI's summary job does not exist yet — it is the last
+      # job in that workflow and depends on the rest. A check-waiting action looks for it, finds
+      # nothing, and exits immediately with "the requested check was never run against this ref",
+      # which fails the release for the one reason it must not: CI being fine but not finished.
+      #
+      # Polling the workflow run itself treats "not created yet" as "keep waiting", which is what
+      # was meant.
       - name: Wait for the ci workflow to succeed for this commit
-        uses: lewagon/wait-on-check-action@v1.3.4
-        with:
-          ref: ${{ github.sha }}
-          check-name: ci-ok
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          wait-interval: 20
-          allowed-conclusions: success
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 120); do
+            run=$(gh run list --repo "$GITHUB_REPOSITORY" --commit "$SHA" \
+                    --workflow ci --limit 1 --json status,conclusion,url)
+            status=$(jq -r '.[0].status // "absent"' <<<"$run")
+            conclusion=$(jq -r '.[0].conclusion // ""' <<<"$run")
+            case "$status" in
+              absent|queued|in_progress|waiting|requested|pending)
+                echo "ci is $status; waiting"
+                ;;
+              completed)
+                if [ "$conclusion" = "success" ]; then
+                  echo "ci succeeded: $(jq -r '.[0].url' <<<"$run")"
+                  exit 0
+                fi
+                echo "ci concluded '$conclusion'; refusing to build a release from it" >&2
+                jq -r '.[0].url' <<<"$run" >&2
+                exit 1
+                ;;
+              *)
+                echo "unexpected ci status '$status'" >&2
+                exit 1
+                ;;
+            esac
+            sleep 30
+          done
+          echo "ci did not finish within an hour; not releasing" >&2
+          exit 1
 
   # ---------------------------------------------------------------------------------------------
   # One image per architecture, built natively, pushed by digest only. The manifest list that
