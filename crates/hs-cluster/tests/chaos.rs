@@ -214,6 +214,9 @@ async fn settle_until(
         for _ in 0..64 {
             tokio::task::yield_now().await;
         }
+        // See the note in `hs_cluster::ownership`'s copy: yields under paused time run async
+        // tasks, but the acquisition path finishes on a blocking thread that needs real time.
+        let _ = tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(2))).await;
     }
     condition()
 }

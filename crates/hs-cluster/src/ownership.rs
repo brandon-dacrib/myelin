@@ -705,6 +705,14 @@ mod tests {
             for _ in 0..64 {
                 tokio::task::yield_now().await;
             }
+            // Yielding under paused virtual time lets *async* tasks run, but this crate's
+            // acquisition path parks on `spawn_blocking`, which finishes on a real OS thread and
+            // therefore needs real wall-clock time. Sleeping on the blocking pool gives it some
+            // without blocking the runtime — the difference between a test that passes on an idle
+            // machine and one that also passes on a contended CI runner, which is where this
+            // failed on arm64 even with fifty rounds of virtual time.
+            let _ =
+                tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(2))).await;
         }
         condition()
     }
