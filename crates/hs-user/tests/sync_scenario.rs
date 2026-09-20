@@ -500,3 +500,104 @@ async fn messages_accepts_a_token_minted_by_sync_in_both_directions() {
     .await
     .assert_status(StatusCode::BAD_REQUEST);
 }
+
+/// The bug Element users actually saw: without `unsigned.prev_content` a client cannot tell a
+/// display-name change from a join, and renders "Alice changed her display name to Alice Smith"
+/// as "Alice joined the room".
+///
+/// `/messages` and `/state` are covered in `hs-room`'s own tests; this one goes through `/sync`,
+/// which is where a client's live timeline actually comes from — a fix that reached only the
+/// scrollback endpoints would have looked complete and changed nothing a user sees.
+#[tokio::test]
+async fn a_display_name_change_arrives_over_sync_with_the_old_name_attached() {
+    let (mut s, rooms, hub) = setup();
+
+    s.register("alice", "alice", "hunter2-alice")
+        .await
+        .assert_ok();
+    let alice_user_id = s.session("alice").unwrap().user_id.clone().unwrap();
+
+    let create = s
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({"preset": "private_chat"})),
+        )
+        .await;
+    create.assert_ok();
+    let room_id = create.str_field("room_id").to_owned();
+
+    let handle = rooms
+        .get_or_load(&ruma::RoomId::parse(&room_id).unwrap())
+        .await
+        .unwrap();
+    hub.watch_room(handle).await;
+    settle().await;
+
+    let set_name = s
+        .send(
+            Some("alice"),
+            Method::PUT,
+            &format!("/profile/{alice_user_id}/displayname"),
+            Some(json!({"displayname": "Alice"})),
+        )
+        .await;
+    set_name.assert_ok();
+    settle().await;
+
+    // The baseline is taken *after* the first name is set, so the incremental sync below carries
+    // the rename and nothing else.
+    let baseline = s.sync("alice").await;
+    baseline.assert_ok();
+    let since = baseline.str_field("next_batch").to_owned();
+
+    let rename = s
+        .send(
+            Some("alice"),
+            Method::PUT,
+            &format!("/profile/{alice_user_id}/displayname"),
+            Some(json!({"displayname": "Alice Smith"})),
+        )
+        .await;
+    rename.assert_ok();
+    settle().await;
+
+    let after = s
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/sync?since={since}&timeout=0"),
+            None,
+        )
+        .await;
+    after.assert_ok();
+
+    let timeline = after.json["rooms"]["join"][&room_id]["timeline"]["events"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let renamed = timeline
+        .iter()
+        .find(|e| e["type"] == "m.room.member" && e["content"]["displayname"] == "Alice Smith")
+        .unwrap_or_else(|| {
+            panic!(
+                "the rename should be in alice's incremental sync: {}",
+                after.json
+            )
+        });
+
+    assert_eq!(
+        renamed["unsigned"]["prev_content"]["displayname"], "Alice",
+        "without the previous content a client renders this as a join: {renamed}"
+    );
+    assert_eq!(
+        renamed["unsigned"]["prev_sender"],
+        alice_user_id.to_string(),
+        "{renamed}"
+    );
+    assert!(
+        renamed["unsigned"]["replaces_state"].is_string(),
+        "the superseded event's id must be there too: {renamed}"
+    );
+}

@@ -94,7 +94,7 @@ use hs_e2e::store::{DeviceKeyStore, E2eStore, FallbackKeyStore, OneTimeKeyStore,
 use hs_kv::KvBackend;
 use hs_model::Event;
 use hs_push::rulesets::RulesetStore;
-use hs_room::routes::render::client_event_json;
+use hs_room::routes::render::{attach_replaced_state, client_event_json};
 use hs_room::timeline::{Direction, PaginationToken};
 use ruma::{OwnedDeviceId, OwnedRoomId, OwnedUserId, RoomId, UserId};
 use serde_json::{Value, json};
@@ -203,11 +203,31 @@ struct Timeline {
 /// crate's existing "bounded response" philosophy (`TO_DEVICE_LIMIT`).
 const FILTERED_TIMELINE_SCAN: usize = 500;
 
+/// Renders one event for a client, carrying `unsigned.prev_content`/`replaces_state`/`prev_sender`
+/// when it is a state event that replaced another one.
+///
+/// Without this a client cannot tell a display-name change from a join and renders both as "Alice
+/// joined the room" -- and `/sync` is the endpoint whose output a client's timeline is actually
+/// built from, so fixing only `/messages` and `/state` fixes only what scrollback shows.
+/// `replaced_state_for` decides the history-visibility question about the *replaced* event, which
+/// is why the requesting user has to reach this far down.
+fn rendered_with_replaced_state(
+    actor: &hs_room::actor::RoomActor<impl KvBackend>,
+    event: &Event,
+    requester: &UserId,
+) -> Value {
+    attach_replaced_state(
+        client_event_json(event),
+        actor.replaced_state_for(event, requester).as_ref(),
+    )
+}
+
 fn build_incremental_timeline(
     actor: &hs_room::actor::RoomActor<impl KvBackend>,
     resume_pos: i64,
     limit: usize,
     content_filter: Option<&crate::filter::RoomEventFilter>,
+    requester: &UserId,
 ) -> Timeline {
     let from = Some(PaginationToken::new(resume_pos, Direction::Forward));
     let request = content_filter.map_or(limit, |_| limit.max(FILTERED_TIMELINE_SCAN));
@@ -254,7 +274,10 @@ fn build_incremental_timeline(
         Some(PaginationToken::new(resume_pos, Direction::Backward).to_string())
     };
     Timeline {
-        events: events.into_iter().map(client_event_json).collect(),
+        events: events
+            .into_iter()
+            .map(|event| rendered_with_replaced_state(actor, event, requester))
+            .collect(),
         limited,
         prev_batch,
     }
@@ -264,6 +287,7 @@ fn build_fresh_timeline(
     actor: &hs_room::actor::RoomActor<impl KvBackend>,
     limit: usize,
     content_filter: Option<&crate::filter::RoomEventFilter>,
+    requester: &UserId,
 ) -> Timeline {
     let request = content_filter.map_or(limit, |_| limit.max(FILTERED_TIMELINE_SCAN));
     let (raw, next) = actor.paginate(None, Direction::Backward, request);
@@ -308,7 +332,10 @@ fn build_fresh_timeline(
     let prev_batch = next.map(|t| t.to_string());
     events.reverse(); // paginate(Backward) is newest-first; /sync wants chronological order.
     Timeline {
-        events: events.into_iter().map(client_event_json).collect(),
+        events: events
+            .into_iter()
+            .map(|event| rendered_with_replaced_state(actor, event, requester))
+            .collect(),
         limited,
         prev_batch,
     }
@@ -369,7 +396,7 @@ fn build_state_section(
             content_filter
                 .is_none_or(|f| f.matches(&e.header().event_type, e.header().sender.as_str()))
         })
-        .map(client_event_json)
+        .map(|e| rendered_with_replaced_state(actor, e, self_user))
         .collect())
 }
 
@@ -632,11 +659,13 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                         pos,
                         timeline_limit,
                         timeline_content_filter.as_ref(),
+                        &user_id_owned,
                     ),
                     ResumeMode::FreshRoom => build_fresh_timeline(
                         actor,
                         timeline_limit,
                         timeline_content_filter.as_ref(),
+                        &user_id_owned,
                     ),
                 };
                 let timeline_ids: HashSet<String> = timeline
