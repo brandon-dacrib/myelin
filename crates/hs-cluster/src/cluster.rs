@@ -98,12 +98,21 @@ mod tests {
         config.heartbeat_interval = Duration::from_millis(50);
         config.lease_ttl = Duration::from_millis(150);
         let (cluster, _mgr) = Cluster::start(config, backend).await.unwrap();
-        for _ in 0..5 {
+        // Wait for readiness rather than advancing a fixed number of rounds and hoping the
+        // heartbeat landed: how far the background loop gets per round depends on the runtime's
+        // scheduling, which is generous on an idle machine and not on a contended CI runner —
+        // where exactly this assertion failed while passing locally every time.
+        let mut ready = false;
+        for _ in 0..50 {
+            if cluster.ready() == Readiness::Ready {
+                ready = true;
+                break;
+            }
             tokio::time::advance(Duration::from_millis(60)).await;
             for _ in 0..64 {
                 tokio::task::yield_now().await;
             }
         }
-        assert_eq!(cluster.ready(), Readiness::Ready);
+        assert!(ready, "the cluster never reported ready after its heartbeat");
     }
 }

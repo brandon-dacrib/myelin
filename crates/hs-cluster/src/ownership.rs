@@ -683,24 +683,15 @@ mod tests {
     /// fixed point, then advances the paused virtual clock by `step` and repeats `rounds` times.
     /// `spawn_blocking`'s completion is a real-time event layered under tokio's virtual clock, so
     /// a single `advance()` is not enough to observe it -- both are needed together.
-    pub(crate) async fn settle(step: Duration, rounds: u32) {
-        for _ in 0..rounds {
-            advance(step).await;
-            for _ in 0..64 {
-                tokio::task::yield_now().await;
-            }
-        }
-    }
-
     /// Advances virtual time until `condition` holds, up to `max_rounds`, and reports whether it
     /// ever did.
     ///
-    /// Prefer this over [`settle`] before asserting on background progress. `settle` advances a
-    /// fixed number of rounds and then hopes the acquisition loop got far enough, which depends
-    /// on how the runtime happened to schedule 64 yields — fine on an idle laptop, not fine on a
-    /// contended CI runner, where exactly that assumption made
-    /// `drain_releases_every_owned_shard` fail while passing locally every time. Waiting for the
-    /// condition itself removes the guess rather than enlarging it.
+    /// This replaced a helper that advanced a fixed number of rounds and then hoped the
+    /// background loop had got far enough — which depends on how the runtime happened to schedule
+    /// 64 yields. That is generous on an idle laptop and not on a contended CI runner, where
+    /// three of these tests failed while passing locally every single time. Waiting for the
+    /// condition itself removes the guess rather than enlarging it, so use this before asserting
+    /// on anything a background task produces.
     pub(crate) async fn settle_until(
         step: Duration,
         max_rounds: u32,
@@ -722,7 +713,13 @@ mod tests {
     async fn single_replica_acquires_every_shard() {
         let backend = MemoryBackend::new();
         let (mgr, _handle) = KvOwnership::start(config("hs-0"), backend).await.unwrap();
-        settle(Duration::from_millis(60), 5).await;
+        assert!(
+            settle_until(Duration::from_millis(60), 50, || {
+                mgr.layout().all_shards().all(|s| mgr.is_mine(s))
+            })
+            .await,
+            "the solo replica never acquired every shard"
+        );
         for shard in mgr.layout().all_shards() {
             assert!(mgr.is_mine(shard), "{shard} not owned");
             assert!(mgr.fence(shard).is_some());
@@ -736,7 +733,15 @@ mod tests {
             .await
             .unwrap();
         let (b, _hb) = KvOwnership::start(config("hs-1"), backend).await.unwrap();
-        settle(Duration::from_millis(60), 10).await;
+        assert!(
+            settle_until(Duration::from_millis(60), 50, || {
+                a.layout()
+                    .all_shards()
+                    .all(|s| a.is_mine(s) || b.is_mine(s))
+            })
+            .await,
+            "the two replicas never partitioned the shard space"
+        );
         for shard in a.layout().all_shards() {
             let mine_a = a.is_mine(shard);
             let mine_b = b.is_mine(shard);
