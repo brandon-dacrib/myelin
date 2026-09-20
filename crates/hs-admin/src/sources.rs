@@ -713,23 +713,45 @@ impl ConfigState {
     }
 
     fn section(&self, resolved: &Resolved, name: &str) -> ConfigSection {
-        let effective =
-            serde_json::to_value(&resolved.config).unwrap_or_else(|_| Value::Object(Map::new()));
-        let values = effective
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| Value::Object(Map::new()));
-        ConfigSection {
-            name: name.to_owned(),
-            reloadable: hs_config::reload::is_reloadable(name),
-            bootstrap: hs_config::store::is_bootstrap_section(name),
-            source: section_source(resolved, name),
-            last_reloaded_at: self.reloaded_at.get(name).cloned(),
-            origins: section_origins(resolved, name, &values),
-            values,
-            revision: self.revision,
-            history: Vec::new(),
-        }
+        config_section(
+            resolved,
+            name,
+            self.revision,
+            self.reloaded_at.get(name).cloned(),
+        )
+    }
+}
+
+/// One section as the admin API reports it: effective values, per-setting origins, and the flags
+/// the management interface needs to decide whether to offer an edit at all.
+///
+/// Public because there are two [`ConfigSource`] implementations -- this crate's in-memory fake
+/// and the binary's real store-backed one -- and the wire shape must be identical between them.
+/// Two hand-written copies of this would agree on the day they were written and drift the first
+/// time a field was added to one of them.
+#[must_use]
+pub fn config_section(
+    resolved: &Resolved,
+    name: &str,
+    revision: u64,
+    last_reloaded_at: Option<String>,
+) -> ConfigSection {
+    let effective =
+        serde_json::to_value(&resolved.config).unwrap_or_else(|_| Value::Object(Map::new()));
+    let values = effective
+        .get(name)
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    ConfigSection {
+        name: name.to_owned(),
+        reloadable: hs_config::reload::is_reloadable(name),
+        bootstrap: hs_config::store::is_bootstrap_section(name),
+        source: section_source(resolved, name),
+        last_reloaded_at,
+        origins: section_origins(resolved, name, &values),
+        values,
+        revision,
+        history: Vec::new(),
     }
 }
 

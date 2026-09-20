@@ -16,6 +16,7 @@ pub mod cli;
 pub mod cluster;
 pub mod config_bridge;
 pub mod config_cmd;
+pub mod config_source;
 pub mod federation;
 pub mod generate_config;
 pub mod hash_password;

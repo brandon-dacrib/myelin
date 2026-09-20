@@ -115,7 +115,10 @@ pub enum ServeError {
 /// Options controlling `hs serve` beyond the native config file itself — kept separate from
 /// [`hs_config::Config`] because none of these belong in that crate's schema (see
 /// `crate::versions`'s module doc for why `unstable_features` in particular cannot live there).
-#[derive(Debug, Clone, Default)]
+/// `Debug` is written out rather than derived: a `ConfigSource` is a trait object and has no
+/// `Debug` bound, and requiring one on every implementation to make this one line shorter would
+/// be the tail wagging the dog.
+#[derive(Clone, Default)]
 pub struct ServeOptions {
     /// `--capabilities-config`: an optional YAML file overriding
     /// `crate::versions::default_unstable_features`.
@@ -131,6 +134,22 @@ pub struct ServeOptions {
     /// content scanning is attached (`ScanningConfig::default()`'s `mode: off`, zero behavioral
     /// change).
     pub media_scanning_config: Option<PathBuf>,
+    /// The configuration source the admin API writes through
+    /// (`crate::config_source::StoreConfigSource`). `None` leaves every `/config*` operation
+    /// answering an honest `503`, which is what a caller that has no store open -- the route
+    /// manifest, the in-process tests -- should get.
+    pub config_source: Option<Arc<dyn hs_admin::sources::ConfigSource>>,
+}
+
+impl std::fmt::Debug for ServeOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServeOptions")
+            .field("capabilities_config", &self.capabilities_config)
+            .field("routes_manifest_path", &self.routes_manifest_path)
+            .field("media_scanning_config", &self.media_scanning_config)
+            .field("config_source", &self.config_source.is_some())
+            .finish()
+    }
 }
 
 /// Builds the full application router and its `routes.json` manifest:
@@ -564,8 +583,9 @@ fn admin_state<B: KvBackend + 'static>(
     rooms: &Arc<hs_room::registry::RoomRegistry<B>>,
     server_name: &str,
     enabled_components: Vec<String>,
+    config_source: Option<Arc<dyn hs_admin::sources::ConfigSource>>,
 ) -> hs_admin::router::AdminState {
-    hs_admin::router::AdminState::new(
+    let state = hs_admin::router::AdminState::new(
         Arc::new(hs_auth::admin_verifier::AdminTokenVerifier::from_auth_state(auth)),
         audit,
         Arc::new(hs_admin::events::EventBus::new()),
@@ -590,7 +610,14 @@ fn admin_state<B: KvBackend + 'static>(
             .collect(),
         enabled_components,
         contract_version: hs_admin::model::ServerInfo::default().contract_version,
-    })
+    });
+    // Without this the whole `/config*` surface answers 503: the operations are real, but they
+    // have nothing to read or write. This is what makes the management interface able to change
+    // the server's configuration rather than only display it.
+    match config_source {
+        Some(source) => state.with_config(source),
+        None => state,
+    }
 }
 
 /// The `/api/v1` state for [`route_manifest`]'s throwaway router: routes are registered the same
@@ -998,6 +1025,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             &rooms,
             server_name.as_str(),
             enabled_components,
+            options.config_source.clone(),
         ),
     };
 
@@ -1272,6 +1300,7 @@ mod tests {
                 capabilities_config: Some(capabilities_path),
                 routes_manifest_path: None,
                 media_scanning_config: None,
+                config_source: None,
             },
         )
         .await
@@ -1318,6 +1347,7 @@ mod tests {
                 capabilities_config: None,
                 routes_manifest_path: Some(manifest_path.clone()),
                 media_scanning_config: None,
+                config_source: None,
             },
         )
         .await

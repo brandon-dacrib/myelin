@@ -24,6 +24,16 @@ pub fn format_rfc3339(dt: OffsetDateTime) -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00.000Z".to_string())
 }
 
+/// Formats milliseconds since the Unix epoch the same way. Stores that record a timestamp as an
+/// integer -- the configuration store's change history, for one -- have to reach the admin API's
+/// string form somehow, and doing it here keeps one definition of what that form is.
+pub fn rfc3339_from_millis(ms: i64) -> String {
+    let Ok(dt) = OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000) else {
+        return "1970-01-01T00:00:00.000Z".to_string();
+    };
+    format_rfc3339(dt)
+}
+
 /// Parses an RFC 3339 timestamp such as the one [`now_rfc3339`] produces.
 pub fn parse_rfc3339(s: &str) -> Result<OffsetDateTime, time::error::Parse> {
     OffsetDateTime::parse(s, &Rfc3339)
@@ -39,6 +49,19 @@ mod tests {
         assert!(s.ends_with('Z'));
         let parsed = parse_rfc3339(&s).unwrap();
         assert_eq!(format_rfc3339(parsed), s);
+    }
+
+    #[test]
+    fn epoch_millis_render_the_same_way() {
+        assert_eq!(
+            rfc3339_from_millis(1_789_000_000_123),
+            format_rfc3339(
+                OffsetDateTime::from_unix_timestamp_nanos(1_789_000_000_123_i128 * 1_000_000)
+                    .unwrap()
+            )
+        );
+        // Nonsense in, epoch out, rather than a panic in a response formatter.
+        assert!(rfc3339_from_millis(i64::MAX).ends_with('Z'));
     }
 
     #[test]

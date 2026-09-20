@@ -618,15 +618,22 @@ async fn run_serve(args: &ServeArgs) -> i32 {
         "configuration resolved from file, database and environment"
     );
 
+    // The store is a handle on the same open backend `spawn_serve_with_storage` is about to serve
+    // from, and it is what the admin API's configuration surface writes through: this is the line
+    // that turns the management interface from something that displays the configuration into
+    // something that changes it.
+    let config_source = std::sync::Arc::new(crate::config_source::StoreConfigSource::new(
+        booted.layers,
+        booted.store,
+        booted.meta,
+        config.clone(),
+    ));
     let options = crate::serve::ServeOptions {
         capabilities_config: args.capabilities_config.clone(),
         routes_manifest_path: args.routes_manifest.clone(),
         media_scanning_config: args.media_scanning_config.clone(),
+        config_source: Some(config_source),
     };
-    // The store is held for the lifetime of the process rather than dropped here: it is a handle
-    // on the same open backend `spawn_serve_with_storage` is about to serve from, and it is what
-    // the admin API's configuration surface will be wired onto.
-    let _config_store = booted.store;
     let handle = match crate::serve::spawn_serve_with_storage(booted.storage, config, options).await
     {
         Ok(h) => h,

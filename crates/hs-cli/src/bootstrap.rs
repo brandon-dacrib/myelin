@@ -277,7 +277,25 @@ impl OpenedConfigStore {
         actor: Option<&str>,
         now_ms: i64,
     ) -> Result<Stored, StoreError> {
-        on_store!(self, store => store.patch_section(section, patch, actor, now_ms, None))
+        self.patch_section_expecting(section, patch, actor, now_ms, None)
+    }
+
+    /// [`ConfigStore::patch_section`] with an `If-Match` revision: the admin API lets two
+    /// operators edit at once, so it needs the store to refuse a patch computed against a view
+    /// that is no longer current. `hs config` passes `None` -- a human at a terminal has no
+    /// stale form open.
+    ///
+    /// # Errors
+    /// As [`ConfigStore::patch_section`], including [`StoreError::RevisionMismatch`].
+    pub fn patch_section_expecting(
+        &self,
+        section: &str,
+        patch: &Value,
+        actor: Option<&str>,
+        now_ms: i64,
+        expected_revision: Option<u64>,
+    ) -> Result<Stored, StoreError> {
+        on_store!(self, store => store.patch_section(section, patch, actor, now_ms, expected_revision))
     }
 
     /// See [`ConfigStore::history`].
