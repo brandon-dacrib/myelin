@@ -8,6 +8,7 @@ publish.workspace = true
 description = "Native homeserver configuration: schema, defaults, validation, environment and file-secret overrides, reload boundary, reference docs"
 
 [dependencies]
+hs-kv = { path = "../hs-kv" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }

@@ -56,6 +56,22 @@ pub fn apply_process_env_overrides(root: &mut Value) -> usize {
     apply_env_overrides(root, std::env::vars())
 }
 
+/// The overrides in `vars`, as a sparse configuration document on their own rather than applied
+/// to something.
+///
+/// This is the environment *layer* (see [`crate::document::Origin::Environment`]): the admin API
+/// needs to know which settings the environment pins so it can report them as read-only instead
+/// of accepting an edit it knows the next restart -- or the next request -- will ignore.
+#[must_use]
+pub fn override_document<I>(vars: I) -> serde_json::Value
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut root = Value::Mapping(Default::default());
+    apply_env_overrides(&mut root, vars);
+    serde_json::to_value(&root).unwrap_or(serde_json::Value::Null)
+}
+
 fn parse_scalar(raw: &str) -> Value {
     // A bare scalar only: reject anything that parses to a mapping or
     // sequence, since `HS__` values are meant to set one leaf, not splice a
@@ -91,6 +107,22 @@ fn set_path(root: &mut Value, segments: &[String], value: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_override_document_is_just_the_overrides() {
+        let doc = override_document([
+            (
+                "HS__AUTH__ENABLE_REGISTRATION".to_string(),
+                "true".to_string(),
+            ),
+            ("PATH".to_string(), "/usr/bin".to_string()),
+        ]);
+        assert_eq!(
+            doc,
+            serde_json::json!({"auth": {"enable_registration": true}}),
+            "only HS__ variables, and nothing the config file said"
+        );
+    }
 
     #[test]
     fn sets_nested_scalar() {

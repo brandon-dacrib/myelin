@@ -72,7 +72,7 @@ pub fn sections_requiring_restart(old: &Config, new: &Config) -> Vec<&'static st
 
 /// Every top-level `Config` field name, reloadable or not. Kept in sync
 /// with the `Config` struct by the test below.
-const SECTION_NAMES: &[&str] = &[
+pub const SECTION_NAMES: &[&str] = &[
     "server",
     "listeners",
     "storage",

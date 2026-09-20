@@ -28,10 +28,12 @@
 pub mod appservice;
 pub mod auth;
 pub mod cluster;
+pub mod document;
 pub mod duration;
 pub mod env;
 pub mod error;
 pub mod federation;
+pub mod layered;
 pub mod listeners;
 pub mod media;
 pub mod ratelimit;
@@ -40,6 +42,7 @@ pub mod secret;
 pub mod server;
 pub mod size;
 pub mod storage;
+pub mod store;
 pub mod telemetry;
 
 use std::path::Path;
@@ -50,9 +53,11 @@ use serde::{Deserialize, Serialize};
 pub use appservice::AppservicesConfig;
 pub use auth::AuthConfig;
 pub use cluster::ClusterConfig;
+pub use document::{Origin, merge_patch};
 pub use duration::{Duration, DurationParseError};
 pub use error::{ConfigError, Validate, ValidationError, ValidationErrors};
 pub use federation::FederationConfig;
+pub use layered::{FileLayer, Layers, Resolved};
 pub use listeners::ListenersConfig;
 pub use media::MediaConfig;
 pub use ratelimit::RateLimitConfig;
@@ -60,6 +65,7 @@ pub use secret::SecretString;
 pub use server::ServerConfig;
 pub use size::{ByteSize, ByteSizeParseError};
 pub use storage::StorageConfig;
+pub use store::{ConfigMeta, ConfigStore, StoreError};
 pub use telemetry::TelemetryConfig;
 
 /// The complete native configuration. See each field's module for the
@@ -126,6 +132,17 @@ impl Config {
         config.resolve_secrets()?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Deserializes an already-merged JSON document (what
+    /// [`layered::Layers::merged`] produces), then resolves secrets and
+    /// validates.
+    ///
+    /// # Errors
+    /// As [`Config::from_value`].
+    pub fn from_json(document: &serde_json::Value) -> Result<Config, ConfigError> {
+        let value = serde_yaml_ng::to_value(document)?;
+        Self::from_value(value)
     }
 
     /// Reads `path`, applies every `HS__` variable in the process
