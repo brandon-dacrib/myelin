@@ -296,6 +296,25 @@ async fn keys_claim_returns_the_exact_uploaded_key_in_upload_order() {
 
 /// Not a bug, but this session's brief asked for the same "does a response drop or reshape
 /// something a client uploaded" check on the routes Complement's `csapi` suite does not reach.
+/// Who `GET /keys/changes` reports as changed since device-list stream position `from`.
+async fn changed_since(scenario: &mut Scenario, from: u64) -> Vec<String> {
+    let changes = scenario
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/keys/changes?from={from}"),
+            None,
+        )
+        .await;
+    changes.assert_ok();
+    changes.json["changed"]
+        .as_array()
+        .expect("changed is an array")
+        .iter()
+        .filter_map(|u| u.as_str().map(str::to_owned))
+        .collect()
+}
+
 /// `POST /keys/device_signing/upload` (store) followed by `POST /keys/signatures/upload` (merge a
 /// signature onto an existing device's `device_keys`) followed by `POST /keys/query` (read it
 /// back) is the one path where uploaded content flows through both cross-signing endpoints and
@@ -390,6 +409,16 @@ async fn signatures_upload_merges_without_dropping_the_device_keys_it_signs() {
             }),
         ),
     );
+    // Where the device-list stream stands before the signature: the first position from which
+    // alice no longer counts as changed.
+    let mut before_signing = 0u64;
+    while changed_since(&mut scenario, before_signing)
+        .await
+        .contains(&alice_id)
+    {
+        before_signing += 1;
+    }
+
     let signed = scenario
         .send(
             Some("alice"),
@@ -399,6 +428,14 @@ async fn signatures_upload_merges_without_dropping_the_device_keys_it_signs() {
         )
         .await;
     signed.assert_ok();
+    // A device that has been signed is a device that has changed: it is the only way anybody --
+    // alice's own client included -- finds out that it is now a verified one.
+    assert!(
+        changed_since(&mut scenario, before_signing)
+            .await
+            .contains(&alice_id),
+        "signing a device must put its owner in /keys/changes"
+    );
     assert!(
         signed.json["failures"].as_object().unwrap().is_empty(),
         "a genuinely valid signature by alice's own self-signing key must not be reported as a \

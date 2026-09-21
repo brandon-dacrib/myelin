@@ -195,12 +195,13 @@ pub async fn post_signatures_upload<B: KvBackend + 'static>(
         let Some(by_key_obj) = by_key.as_object() else {
             continue;
         };
+        let mut signed_something = false;
         for (key_id, submitted) in by_key_obj {
             let outcome =
                 apply_one_signature(&state, &requester.user_id, &target_user, key_id, submitted)
                     .await?;
             match outcome {
-                SignatureOutcome::Applied => {}
+                SignatureOutcome::Applied => signed_something = true,
                 SignatureOutcome::NotFound => {
                     failures
                         .entry(user_id_str.clone())
@@ -221,6 +222,16 @@ pub async fn post_signatures_upload<B: KvBackend + 'static>(
                         .insert(key_id.clone(), invalid_signature_failure(&msg));
                 }
             }
+        }
+        // A key that has gained a signature is a key that has changed, and a signature is the
+        // whole of what verifying a device *is*: the device's keys are the same, and what is new
+        // is that its owner vouches for them. Nothing here said so, so nobody re-fetched --
+        // other people went on seeing a verified device as unverified, and the user's own
+        // client, having just signed its own device while setting up cross-signing, never
+        // learned that the server had taken the signature: Element marked every message its
+        // own user sent "Encrypted by a device not verified by its owner".
+        if signed_something {
+            state.store.record_device_list_change(&target_user).await?;
         }
     }
 
