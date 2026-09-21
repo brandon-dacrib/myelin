@@ -166,19 +166,26 @@ async fn resume_mode<B: KvBackend + 'static, R: RoomSource<B>>(
     {
         return Ok(ResumeMode::Incremental(pos));
     }
-    // No feed history at or before the token for this room. This is expected the first time a
-    // room is ever synced (brand new to the user), and also -- persistently -- for a room that
-    // has been "hot" (`crate::hub`'s module docs) for as long as the user has been a member,
-    // since a hot room never gets feed entries at all. `membership.room_pos` (the position of
-    // this user's own last membership-changing event, set unconditionally regardless of
-    // hot/cold -- see `crate::hub::SessionHub::process_room_update`) is a safe fallback baseline
-    // in the hot case: resuming forward from it can only ever *repeat* events the client already
-    // received (never skip real ones), which is the correct direction to err in. `0` means no
-    // membership event has ever been recorded for this room by this store, which should not
-    // happen for a room that made it into the candidate set at all; fall back to the fresh-room
-    // treatment (full state plus recent history) rather than resuming from position `0`, which
-    // would try to page the room's *entire* history forward.
-    if membership.room_pos > 0 {
+    // No feed history at or before the token for this room. There are two ways to get here, and
+    // they want opposite things.
+    //
+    // A room that is *new to this client* -- created, or joined, after the token was issued. It
+    // needs the fresh-room treatment: the room's state and its recent history, as if it had
+    // turned up in an initial sync. Resuming "incrementally" from the user's own membership
+    // position instead starts at or after their own join, so the create event, the power levels
+    // and that join were in no timeline at all. That went unnoticed for as long as every
+    // incremental sync also carried the room's whole state.
+    //
+    // A room that has been "hot" (`crate::hub`'s module docs) for as long as the user has been a
+    // member. A hot room never gets feed entries, so it has no feed history *ever*, and cannot be
+    // told from a new one by looking for some. For those, `membership.room_pos` (the position of
+    // this user's own last membership-changing event, set regardless of hot/cold -- see
+    // `crate::hub::SessionHub::process_room_update`) is the baseline: resuming forward from it
+    // can only ever *repeat* events the client already received, never skip real ones. The cost
+    // is that a hot room joined after the token is resumed from that join rather than sent
+    // whole; the client recovers the rest from `/state` and `/messages`, and it is the rarer
+    // case by a wide margin.
+    if membership.hot_room && membership.room_pos > 0 {
         return Ok(ResumeMode::Incremental(membership.room_pos));
     }
     Ok(ResumeMode::FreshRoom)
@@ -555,6 +562,29 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     let store = hub.store();
     let timeline_limit = params.filter.timeline_limit(DEFAULT_TIMELINE_LIMIT);
 
+    // The positions the next token will carry are fixed *here*, before anything is read, and
+    // not afterwards. Whatever arrives while this response is being put together then has a
+    // position beyond the token and is picked up by the next sync -- possibly after also having
+    // made it into this one, which a client de-duplicates by event ID. Taken afterwards, as they
+    // were, the token covered things that arrived too late to be in the response: reported as
+    // consumed, never sent.
+    let new_feed_seq = store.latest_feed_seq(user_id).await?.max(baseline.feed_seq);
+    let new_account_data_seq = store
+        .latest_account_data_seq(user_id)
+        .await?
+        .max(baseline.account_data_seq);
+    // And this device says how far it is about to read before it reads. Feed entries are
+    // overwritten in place until a device's cursor has passed them (`append_feed_entry`), so an
+    // entry this response is going to report as consumed must be frozen first: otherwise an
+    // event landing mid-response is folded into it, its stored position moves on past that
+    // event, and the next sync resumes from *after* it. `routes::sync` records the same cursor
+    // once the response is built, which is by then a no-op.
+    if let Some(device_id) = &device_id {
+        store
+            .record_device_cursor(user_id, device_id, new_feed_seq)
+            .await?;
+    }
+
     let mut candidate_rooms: BTreeSet<OwnedRoomId> = if is_initial {
         store
             .list_memberships(user_id)
@@ -922,12 +952,6 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         }
         None => baseline.push_rules_seq,
     };
-
-    let new_feed_seq = store.latest_feed_seq(user_id).await?.max(baseline.feed_seq);
-    let new_account_data_seq = store
-        .latest_account_data_seq(user_id)
-        .await?
-        .max(baseline.account_data_seq);
 
     // `to_device`: see the module docs for why `delete_up_to(baseline.to_device_seq)` -- keyed
     // off the token *this* request presented, acknowledging the previous response -- happens
@@ -2729,6 +2753,10 @@ mod tests {
         let hub = hub();
         let e2e = e2e_store();
         let alice = user_id!("@alice:sync.test").to_owned();
+        // Followed from before the room exists, as `hs serve` follows every room: a room the hub
+        // only starts watching once it is built has no feed history from before the client's
+        // token, which is what a room *new to the client* looks like.
+        std::mem::forget(hub.watch_all(hub.rooms().subscribe_global()));
         let handle = hub
             .rooms()
             .create_room(
@@ -2741,10 +2769,17 @@ mod tests {
             )
             .await
             .unwrap();
-        hub.watch_room(handle.clone()).await;
         let room_id = handle.query(|a| a.room_id().to_owned()).await;
         tokio::time::sleep(Duration::from_millis(30)).await;
         let (_, token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+        // What `routes::sync` does after every sync, and these tests, which call `build`
+        // directly, otherwise never do: say how far this device has read. Until some device
+        // has, new activity is coalesced into the feed entry it has "not consumed yet" rather
+        // than given a new one, and an incremental sync sees no change at all.
+        hub.store()
+            .record_device_cursor(&alice, ruma::device_id!("GAPTEST"), token.feed_seq)
+            .await
+            .unwrap();
 
         for n in 1..=25 {
             // Every third event is a reaction, so that a filter for messages has something to
@@ -2958,5 +2993,177 @@ mod tests {
             .find(|e| e["type"] == "m.room.name")
             .expect("the rename arrives in `state`");
         assert_eq!(name["content"]["name"], "After");
+    }
+
+    /// A room that came into being after the client's token is *new to the client*: it needs the
+    /// room's state and recent history, exactly as if it had turned up in an initial sync.
+    ///
+    /// It was instead resumed "incrementally" from the user's own membership position -- a
+    /// fallback meant for very large rooms -- which is at or after their own join, so the create
+    /// event, the power levels and the user's own join were in no timeline at all. Nobody
+    /// noticed, because every incremental sync also carried the room's entire state; when that
+    /// stopped, Complement's `TestRoomSummary` could no longer find alice joined to the room she
+    /// had just created.
+    #[tokio::test]
+    async fn a_room_created_after_the_token_arrives_whole() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        // As `hs serve` does it: following every room from before any exists, so that the whole
+        // creation burst is seen, rather than `watch_room` on a room that is already built.
+        let _following = hub.watch_all(hub.rooms().subscribe_global());
+        let (_, token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    name: Some("New".to_owned()),
+                    invite: vec![bob.clone()],
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (response, next) = build(&hub, &e2e, &alice, params(Some(token)))
+            .await
+            .unwrap();
+        let room = &response["rooms"]["join"][room_id.as_str()];
+        let everything: Vec<&Value> = room["state"]["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .chain(room["timeline"]["events"].as_array().into_iter().flatten())
+            .collect();
+        let has = |event_type: &str, state_key: &str| {
+            everything
+                .iter()
+                .any(|e| e["type"] == event_type && e["state_key"] == state_key)
+        };
+        assert!(has("m.room.create", ""), "{room}");
+        assert!(has("m.room.power_levels", ""), "{room}");
+        assert!(has("m.room.name", ""), "{room}");
+        assert!(
+            has("m.room.member", alice.as_str()),
+            "alice's own join: {room}"
+        );
+        assert!(has("m.room.member", bob.as_str()), "bob's invite: {room}");
+        assert_eq!(room["summary"]["m.joined_member_count"], 1);
+        assert_eq!(room["summary"]["m.invited_member_count"], 1);
+
+        // Once it has arrived it is an ordinary room: nothing more to say about it.
+        let (response, _) = build(&hub, &e2e, &alice, params(Some(next))).await.unwrap();
+        assert!(
+            response["rooms"]["join"].get(room_id.as_str()).is_none(),
+            "{response}"
+        );
+    }
+
+    /// An event that lands while a sync response is on its way out must reach that client on
+    /// its next sync.
+    ///
+    /// Feed entries are coalesced in place until some device's cursor has passed them, and the
+    /// cursor used to be recorded by the route *after* the response was built. An event arriving
+    /// in that window was folded into the entry the response had already reported as consumed:
+    /// the token pointed past it, the entry's stored position moved on to cover it, and the
+    /// resume point for the following sync was therefore *after* it. It was in no timeline, ever.
+    /// `build` now claims the feed position it is about to report before it reads anything.
+    #[tokio::test]
+    async fn an_event_that_arrives_while_a_sync_is_in_flight_is_not_lost() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let device = ruma::device_id!("PHONE");
+        std::mem::forget(hub.watch_all(hub.rooms().subscribe_global()));
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let as_device = |since: Option<SyncToken>| {
+            let mut p = params(since);
+            p.device_id = Some(device.to_owned());
+            p
+        };
+        let say = |body: &'static str, ts: i64| {
+            let (handle, alice) = (handle.clone(), alice.clone());
+            async move {
+                handle
+                    .send_event(
+                        alice,
+                        "m.room.message".to_owned(),
+                        None,
+                        serde_json::json!({"body": body}),
+                        None,
+                        ts,
+                    )
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        };
+
+        // `routes::sync`, step for step: build the response, and only then record how far this
+        // device has read. The gap between the two is the window.
+        let (_, token) = build(&hub, &e2e, &alice, as_device(None)).await.unwrap();
+        hub.store()
+            .record_device_cursor(&alice, device, token.feed_seq)
+            .await
+            .unwrap();
+
+        say("first", 10).await;
+        let (response, token) = build(&hub, &e2e, &alice, as_device(Some(token)))
+            .await
+            .unwrap();
+        assert_eq!(
+            bodies(&response["rooms"]["join"][room_id.as_str()]["timeline"]),
+            vec!["first"]
+        );
+        // The response is built and the cursor is not recorded yet. An event lands.
+        say("second", 11).await;
+        hub.store()
+            .record_device_cursor(&alice, device, token.feed_seq)
+            .await
+            .unwrap();
+
+        let (response, token) = build(&hub, &e2e, &alice, as_device(Some(token)))
+            .await
+            .unwrap();
+        assert_eq!(
+            bodies(&response["rooms"]["join"][room_id.as_str()]["timeline"]),
+            vec!["second"],
+            "{response}"
+        );
+        hub.store()
+            .record_device_cursor(&alice, device, token.feed_seq)
+            .await
+            .unwrap();
+
+        // And it stays delivered exactly once as the room carries on.
+        say("third", 12).await;
+        let (response, _) = build(&hub, &e2e, &alice, as_device(Some(token)))
+            .await
+            .unwrap();
+        assert_eq!(
+            bodies(&response["rooms"]["join"][room_id.as_str()]["timeline"]),
+            vec!["third"]
+        );
     }
 }
