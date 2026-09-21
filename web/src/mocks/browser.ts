@@ -33,6 +33,51 @@ declare global {
   }
 }
 
+interface ForcedProblem {
+  path: string;
+  status: 403 | 501 | 503;
+  extra?: { detail?: string; required_scope?: string };
+}
+
+const FORCED_PROBLEMS_KEY = "hs-mock:forced-problems";
+
+function applyForcedProblem({ path, status, extra }: ForcedProblem) {
+  const titleByStatus = { 403: "Forbidden", 501: "Not implemented", 503: "Unavailable" } as const;
+  const typeByStatus = {
+    403: "urn:hs:problem:forbidden",
+    501: "urn:hs:problem:not-implemented",
+    503: "urn:hs:problem:unavailable",
+  } as const;
+  const problem = { type: typeByStatus[status], title: titleByStatus[status], status, ...extra };
+  worker.use(http.all(path, () => HttpResponse.json(problem, { status })));
+}
+
+/**
+ * `worker.use()` overrides live in this page's memory, so a full page load -- `page.goto()` in
+ * a test, which is how you reach a detail page by its address -- silently drops them and the
+ * page under test loads normally. Two of `degrade-honestly.spec.ts`'s three tests did exactly
+ * that and had been failing for as long as they had used `goto`. Forced problems are therefore
+ * kept in `sessionStorage` (per tab, so tests cannot leak into each other) and re-applied when
+ * the mock starts.
+ */
+function rememberForcedProblem(forced: ForcedProblem) {
+  try {
+    const all = JSON.parse(sessionStorage.getItem(FORCED_PROBLEMS_KEY) ?? "[]") as ForcedProblem[];
+    sessionStorage.setItem(FORCED_PROBLEMS_KEY, JSON.stringify([...all, forced]));
+  } catch {
+    /* storage unavailable: the override still holds until the next full load */
+  }
+}
+
+try {
+  const remembered = JSON.parse(
+    sessionStorage.getItem(FORCED_PROBLEMS_KEY) ?? "[]",
+  ) as ForcedProblem[];
+  remembered.forEach(applyForcedProblem);
+} catch {
+  /* nothing remembered */
+}
+
 window.__hsAdminMock = {
   setClusterMode(mode, replicaCount = mode === "cluster" ? 3 : 1) {
     worker.use(
@@ -57,14 +102,9 @@ window.__hsAdminMock = {
    * for Playwright's CDP-level routing to intercept.
    */
   setForceProblem(path, status, extra) {
-    const titleByStatus = { 403: "Forbidden", 501: "Not implemented", 503: "Unavailable" } as const;
-    const typeByStatus = {
-      403: "urn:hs:problem:forbidden",
-      501: "urn:hs:problem:not-implemented",
-      503: "urn:hs:problem:unavailable",
-    } as const;
-    const problem = { type: typeByStatus[status], title: titleByStatus[status], status, ...extra };
-    worker.use(http.all(path, () => HttpResponse.json(problem, { status })));
+    const forced: ForcedProblem = { path, status, extra };
+    applyForcedProblem(forced);
+    rememberForcedProblem(forced);
     return queryClient.invalidateQueries();
   },
 

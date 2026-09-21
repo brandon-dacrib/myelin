@@ -36,7 +36,7 @@ use crate::model::{
 };
 use crate::operations::{OperationDef, load as load_operations};
 use crate::sources::{
-    ConfigPatch, ConfigSource, RoomDirectory, RoomFilter, SetupSource, SourceError,
+    ConfigPatch, ConfigSource, OverviewSource, RoomDirectory, RoomFilter, SetupSource, SourceError,
     UserCreateRequest, UserDirectory, UserFilter, UserLookupQuery,
 };
 
@@ -74,6 +74,9 @@ pub struct AdminState {
     /// wired with [`AdminState::with_setup`]; until then `GET /setup` says no setup is on offer
     /// (which is true: nothing here could perform one) and `POST /setup` answers `503`.
     pub setup: Option<Arc<dyn SetupSource>>,
+    /// What `GET /statistics/overview` and `GET /cluster` read. `None` until wired with
+    /// [`AdminState::with_overview`]; until then both answer `503 unavailable`.
+    pub overview: Option<Arc<dyn OverviewSource>>,
     /// The `Idempotency-Key` cache every mutating handler that declares it consults (see
     /// [`crate::idempotency`]). Always present (never `None`): a client is never told its
     /// idempotency key was ignored.
@@ -97,6 +100,7 @@ impl AdminState {
             rooms: None,
             config: None,
             setup: None,
+            overview: None,
             idempotency: Arc::new(IdempotencyStore::new()),
         }
     }
@@ -122,6 +126,14 @@ impl AdminState {
     #[must_use]
     pub fn with_config(mut self, config: Arc<dyn ConfigSource>) -> Self {
         self.config = Some(config);
+        self
+    }
+
+    /// Wires a real [`OverviewSource`], which is what gives the management interface's first
+    /// page numbers to show instead of "Not implemented".
+    #[must_use]
+    pub fn with_overview(mut self, overview: Arc<dyn OverviewSource>) -> Self {
+        self.overview = Some(overview);
         self
     }
 
@@ -182,6 +194,8 @@ const REAL_HANDLERS: &[&str] = &[
     "me.get",
     "server.get",
     "server.health",
+    "statistics.overview",
+    "cluster.get",
     "users.list",
     "users.get",
     "users.update",
@@ -2450,6 +2464,54 @@ async fn serve_openapi_json(State(state): State<AdminState>) -> Response {
     }
 }
 
+/// `GET /api/v1/statistics/overview`: the counts on the Overview page.
+async fn statistics_overview(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    let instance = "/api/v1/statistics/overview";
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let Some(overview) = &state.overview else {
+                return source_unavailable("statistics", instance);
+            };
+            match overview.statistics().await {
+                Ok(statistics) => axum::Json(statistics).into_response(),
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `GET /api/v1/cluster`: whether this is one server or several, and how many.
+async fn cluster_get(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    let instance = "/api/v1/cluster";
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let Some(overview) = &state.overview else {
+                return source_unavailable("cluster", instance);
+            };
+            match overview.cluster().await {
+                Ok(cluster) => axum::Json(cluster).into_response(),
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
 // -------------------------------------------------------------------------------------------
 // First-run setup. The only two operations besides the OpenAPI document that take no bearer
 // token: `GET /setup` because the interface asks it before anybody can sign in, and
@@ -2633,6 +2695,8 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         "me.get" => builder.add(method, &full_path, me_get, meta),
         "server.get" => builder.add(method, &full_path, server_get, meta),
         "server.health" => builder.add(method, &full_path, server_health, meta),
+        "statistics.overview" => builder.add(method, &full_path, statistics_overview, meta),
+        "cluster.get" => builder.add(method, &full_path, cluster_get, meta),
         "users.list" => builder.add(method, &full_path, users_list, meta),
         "users.get" => builder.add(method, &full_path, users_get, meta),
         "users.update" => builder.add(method, &full_path, users_update, meta),
@@ -5156,5 +5220,73 @@ mod tests {
             device_id: "SETUP".into(),
         };
         assert!(!format!("{session:?}").contains("syt_secret"));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The Overview page's numbers.
+    // ---------------------------------------------------------------------------------------
+
+    async fn get_json(
+        router: &axum::Router,
+        uri: &str,
+        token: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = Request::builder().uri(uri);
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let response = router
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn overview_numbers_nobody_has_are_left_out_rather_than_reported_as_zero() {
+        use crate::model::{ClusterStatus, StatisticsOverview};
+        use crate::sources::StaticOverviewSource;
+
+        let state = test_state().with_overview(Arc::new(StaticOverviewSource {
+            statistics: StatisticsOverview {
+                users_count: Some(3),
+                rooms_count: Some(0),
+                ..StatisticsOverview::default()
+            },
+            cluster: ClusterStatus {
+                mode: "single-node".into(),
+                epoch: None,
+                replica_count: Some(1),
+                shard_count: None,
+            },
+        }));
+        let (router, _manifest) = build_router(state);
+
+        let (status, body) =
+            get_json(&router, "/api/v1/statistics/overview", Some("admin-token")).await;
+        assert_eq!(status, StatusCode::OK);
+        // A real zero is a number; a number nobody counted is not there at all.
+        assert_eq!(body, json!({"users_count": 3, "rooms_count": 0}));
+
+        let (status, body) = get_json(&router, "/api/v1/cluster", Some("admin-token")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"mode": "single-node", "replica_count": 1}));
+    }
+
+    #[tokio::test]
+    async fn overview_operations_need_a_token_and_a_source() {
+        let (router, _manifest) = build_router(test_state());
+        for uri in ["/api/v1/statistics/overview", "/api/v1/cluster"] {
+            let (status, _) = get_json(&router, uri, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+            // Wired to nothing, it says so: not a 501 (the handler exists) and not invented data.
+            let (status, _) = get_json(&router, uri, Some("admin-token")).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        }
     }
 }

@@ -23,6 +23,7 @@ pub mod hash_password;
 pub mod identity;
 pub mod media;
 pub mod metrics_layer;
+pub mod overview;
 pub mod register;
 pub mod serve;
 pub mod signing_key;

@@ -19,8 +19,8 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::model::{
-    AdminRoom, AdminUser, ConfigChange, ConfigReloadReport, ConfigSection, ConfigValidateReport,
-    ExternalId, SetupRequest, SetupSession, ThreePid,
+    AdminRoom, AdminUser, ClusterStatus, ConfigChange, ConfigReloadReport, ConfigSection,
+    ConfigValidateReport, ExternalId, SetupRequest, SetupSession, StatisticsOverview, ThreePid,
 };
 
 /// Why a data-source call failed. Mirrors [`crate::auth::AuthError`]'s "only unavailable escapes
@@ -942,6 +942,43 @@ impl ConfigSource for InMemoryConfigSource {
             .take(limit)
             .cloned()
             .collect())
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// The Overview page's numbers.
+// -------------------------------------------------------------------------------------------
+
+/// What `GET /statistics/overview` and `GET /cluster` read: the handful of numbers the
+/// management interface's first page is made of. One trait rather than two because the only
+/// implementation that can exist is the process that owns the stores and the cluster handle,
+/// and it has all of it to hand.
+///
+/// # Contract for implementors
+///
+/// The dashboard polls these, by default every thirty seconds from every open tab, so an
+/// implementation must not do work proportional to the size of the server on each call. Count
+/// once and remember the answer for a while; a user count that is a minute old is fine.
+#[async_trait]
+pub trait OverviewSource: Send + Sync + 'static {
+    async fn statistics(&self) -> Result<StatisticsOverview, SourceError>;
+    async fn cluster(&self) -> Result<ClusterStatus, SourceError>;
+}
+
+/// A fixed [`OverviewSource`], for this crate's tests.
+pub struct StaticOverviewSource {
+    pub statistics: StatisticsOverview,
+    pub cluster: ClusterStatus,
+}
+
+#[async_trait]
+impl OverviewSource for StaticOverviewSource {
+    async fn statistics(&self) -> Result<StatisticsOverview, SourceError> {
+        Ok(self.statistics.clone())
+    }
+
+    async fn cluster(&self) -> Result<ClusterStatus, SourceError> {
+        Ok(self.cluster.clone())
     }
 }
 

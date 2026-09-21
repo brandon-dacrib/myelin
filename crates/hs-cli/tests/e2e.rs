@@ -1382,3 +1382,117 @@ async fn the_setup_link_is_rooted_at_the_public_base_url_when_there_is_one() {
     );
     handle.shutdown().await;
 }
+
+/// The Overview page's numbers, through the real server: what a new administrator sees in the
+/// first minute. Before this the two operations answered `501` and the page said "Not
+/// implemented" where these go.
+#[tokio::test]
+async fn the_overview_counts_real_accounts_and_rooms_and_omits_what_nobody_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = hs_cli::serve::spawn_serve(
+        test_config(reserve_ephemeral_port(), dir.path()),
+        hs_cli::serve::ServeOptions::default(),
+    )
+    .await
+    .expect("server should boot");
+    let base = handle.base_url();
+    let client = reqwest::Client::new();
+
+    // The administrator, by the front door.
+    let token = setup_token_of(handle.setup_link.as_deref().unwrap()).to_owned();
+    let admin: serde_json::Value = client
+        .post(format!("{base}/api/v1/setup"))
+        .json(&json!({"setup_token": token, "username": "ops", "password": "hunter2-first-admin"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let admin_token = admin["access_token"].as_str().unwrap().to_owned();
+
+    // An ordinary user, who makes a room.
+    let alice: serde_json::Value = client
+        .post(format!("{base}/_matrix/client/v3/register"))
+        .json(&json!({"username": "alice", "password": "hunter2-alice", "auth": {"type": "m.login.dummy"}}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let created = client
+        .post(format!("{base}/_matrix/client/v3/createRoom"))
+        .bearer_auth(alice["access_token"].as_str().unwrap())
+        .json(&json!({"preset": "private_chat"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), reqwest::StatusCode::OK);
+
+    let overview = |client: reqwest::Client, base: String, token: String| async move {
+        let response = client
+            .get(format!("{base}/api/v1/statistics/overview"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        response.json::<serde_json::Value>().await.unwrap()
+    };
+    let first = overview(client.clone(), base.clone(), admin_token.clone()).await;
+    assert_eq!(first["users_count"], 2, "{first}");
+    assert_eq!(first["rooms_count"], 1, "{first}");
+    // Alice has just made authenticated requests, so she at least is active today.
+    assert!(
+        first["daily_active_users"].as_u64().unwrap() >= 1,
+        "{first}"
+    );
+    assert!(
+        first["monthly_active_users"].as_u64().unwrap()
+            >= first["daily_active_users"].as_u64().unwrap(),
+        "{first}"
+    );
+    // Nothing here can count these yet, so they are absent -- not 0, not null.
+    for unknown in [
+        "media_count",
+        "media_bytes",
+        "federation_destinations_failing_count",
+        "pending_reports_count",
+    ] {
+        assert!(first.get(unknown).is_none(), "{unknown} in {first}");
+    }
+
+    // The dashboard polls. A count is shared for a minute rather than redone on every poll, so
+    // an account made a moment later is not in the next answer yet.
+    let _bob = client
+        .post(format!("{base}/_matrix/client/v3/register"))
+        .json(&json!({"username": "bob", "password": "hunter2-bob", "auth": {"type": "m.login.dummy"}}))
+        .send()
+        .await
+        .unwrap();
+    let second = overview(client.clone(), base.clone(), admin_token.clone()).await;
+    assert_eq!(second, first);
+
+    let cluster: serde_json::Value = client
+        .get(format!("{base}/api/v1/cluster"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cluster, json!({"mode": "single-node", "replica_count": 1}));
+
+    // Not for just anybody: an ordinary account's token is not an administrator's.
+    let response = client
+        .get(format!("{base}/api/v1/statistics/overview"))
+        .bearer_auth(alice["access_token"].as_str().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    handle.shutdown().await;
+}

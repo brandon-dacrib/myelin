@@ -41,6 +41,23 @@ impl ShardMap {
     pub fn owner_of(&self, shard: ShardId) -> Option<&ReplicaId> {
         self.owners.get(&shard)
     }
+
+    /// How many shards this map believes are owned by somebody.
+    #[must_use]
+    pub fn owned_shard_count(&self) -> usize {
+        self.owners.len()
+    }
+
+    /// How many distinct replicas own at least one shard: the nearest thing this map has to
+    /// "how many replicas are serving", and what an operator's overview shows. A replica that
+    /// is up but owns nothing yet is not counted.
+    #[must_use]
+    pub fn owning_replica_count(&self) -> usize {
+        self.owners
+            .values()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
 }
 
 /// Ownership convergence events, emitted on [`Ownership::subscribe`].

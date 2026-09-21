@@ -583,8 +583,7 @@ fn admin_state<B: KvBackend + 'static>(
     rooms: &Arc<hs_room::registry::RoomRegistry<B>>,
     server_name: &str,
     enabled_components: Vec<String>,
-    config_source: Option<Arc<dyn hs_admin::sources::ConfigSource>>,
-    setup: Arc<hs_auth::setup::FirstRunSetup>,
+    sources: AdminSources,
 ) -> hs_admin::router::AdminState {
     let state = hs_admin::router::AdminState::new(
         Arc::new(hs_auth::admin_verifier::AdminTokenVerifier::from_auth_state(auth)),
@@ -602,7 +601,9 @@ fn admin_state<B: KvBackend + 'static>(
     )))
     // What lets the management interface create this server's first administrator, instead of
     // that taking a shared secret, `hs register --admin`, a `curl` and a pasted token.
-    .with_setup(setup)
+    .with_setup(sources.setup)
+    // The Overview page's numbers: until this, its tiles read "Not implemented".
+    .with_overview(sources.overview)
     .with_server_info(hs_admin::model::ServerInfo {
         name: server_name.to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -618,10 +619,20 @@ fn admin_state<B: KvBackend + 'static>(
     // Without this the whole `/config*` surface answers 503: the operations are real, but they
     // have nothing to read or write. This is what makes the management interface able to change
     // the server's configuration rather than only display it.
-    match config_source {
+    match sources.config {
         Some(source) => state.with_config(source),
         None => state,
     }
+}
+
+/// The admin API sources that [`admin_state`] is handed rather than building itself, because
+/// something else in `spawn_serve` needs them too: the setup source is asked for the link once
+/// the listeners are bound, and the overview is given the cluster's ownership view once the
+/// cluster has started.
+struct AdminSources {
+    config: Option<Arc<dyn hs_admin::sources::ConfigSource>>,
+    setup: Arc<hs_auth::setup::FirstRunSetup>,
+    overview: Arc<dyn hs_admin::sources::OverviewSource>,
 }
 
 /// The `/api/v1` state for [`route_manifest`]'s throwaway router: routes are registered the same
@@ -1018,6 +1029,11 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     enabled_components.sort();
 
     let setup = Arc::new(hs_auth::setup::FirstRunSetup::from_auth_state(&auth_state));
+    let overview = Arc::new(crate::overview::ServerOverview::new(
+        &auth_state,
+        rooms.clone(),
+        config.cluster.single_node,
+    ));
 
     let mounts = Mounts {
         room: room_state,
@@ -1036,8 +1052,11 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             &rooms,
             server_name.as_str(),
             enabled_components,
-            options.config_source.clone(),
-            setup.clone(),
+            AdminSources {
+                config: options.config_source.clone(),
+                setup: setup.clone(),
+                overview: overview.clone(),
+            },
         ),
     };
 
@@ -1047,6 +1066,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // DAG (`docs/status/03-cluster.md`'s two-replica experiment). Inert in single-node mode
     // (`config.cluster.single_node`, the default) — this matches today's behavior exactly.
     let cluster_handles = crate::cluster::start(&config, backend.clone()).await?;
+    overview.set_ownership(cluster_handles.cluster.ownership().clone());
 
     // The routing gate above stops two replicas both building a room actor, which is what closed
     // the silent split-brain. This is the belt-and-braces underneath it: the fence is read inside

@@ -30,6 +30,11 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
   been built into this binary yet": the interface existed in `web/` and nothing embedded it. The
   image now builds it, release builds fail rather than embed the placeholder, and CD refuses to
   publish an image whose `/admin/` is not the interface. It adds 0.9 MB.
+- **The Overview page has numbers on it.** Users, rooms, daily and monthly active users, and
+  whether this is one server or a cluster, counted from the real stores. A number nothing can
+  count yet is left out of the response and shown as a dash, never as zero, and the page's
+  "nothing needs your attention" names what it was unable to check. Seen in a real browser
+  against the real binary.
 - **Logs are readable where logs end up.** A first boot logged 72 lines, 67 of them the storage
   engine reporting flushes; it logs five. The text format wrote ANSI colour codes into pipes and
   files, so `docker logs` and `kubectl logs` were full of escape sequences; colour is now for

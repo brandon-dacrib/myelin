@@ -1,6 +1,7 @@
 import { useMemo, type ReactNode } from "react";
+import { formatCount, formatUptime, joinWithOr } from "@/lib/format";
 import { useNavigate } from "@tanstack/react-router";
-import { CheckCircle2, TriangleAlert, CircleX } from "lucide-react";
+import { CheckCircle2, TriangleAlert, CircleX, Info } from "lucide-react";
 import {
   useStatisticsOverview,
   useServerInfo,
@@ -55,6 +56,14 @@ export function DashboardPage() {
   // because one of six independent queries failed (docs/status/16-management-web-interface.md,
   // "Degrade honestly").
   const attentionSourcesFailed = stats.isError && appservices.isError && federation.isError;
+
+  // What an all-clear below cannot vouch for, because the source that would have said so could
+  // not be asked. Without this, "Nothing needs your attention" is shown over a server whose
+  // bridges and federation answered 501 -- an all-clear about things nobody looked at.
+  const unchecked: string[] = [];
+  if (appservices.isError) unchecked.push("bridges");
+  if (federation.isError) unchecked.push("federation");
+  if (stats.isError || stats.data?.pending_reports_count == null) unchecked.push("reports");
 
   const unhealthyBridges = useMemo(
     () => (appservices.data?.items ?? []).filter((b) => b.health !== "healthy" && !b.paused),
@@ -135,12 +144,21 @@ export function DashboardPage() {
                 }}
               />
             )}
-            {!isLoading && !attentionSourcesFailed && attention.length === 0 && (
-              <p className="flex items-center gap-2 p-4 text-sm text-text-muted">
-                <CheckCircle2 size={16} aria-hidden="true" className="text-success" />
-                Nothing needs your attention.
-              </p>
-            )}
+            {!isLoading &&
+              !attentionSourcesFailed &&
+              attention.length === 0 &&
+              (unchecked.length === 0 ? (
+                <p className="flex items-center gap-2 p-4 text-sm text-text-muted">
+                  <CheckCircle2 size={16} aria-hidden="true" className="text-success" />
+                  Nothing needs your attention.
+                </p>
+              ) : (
+                <p className="flex items-center gap-2 p-4 text-sm text-text-muted">
+                  <Info size={16} aria-hidden="true" className="shrink-0 text-text-faint" />
+                  Nothing needs your attention, as far as this server can tell. It can&apos;t check{" "}
+                  {joinWithOr(unchecked)} yet.
+                </p>
+              ))}
             {!isLoading &&
               !attentionSourcesFailed &&
               attention.map((item, i) => {
@@ -224,7 +242,7 @@ export function DashboardPage() {
                     stats.isError ? (
                       <TileProblem error={stats.error} />
                     ) : (
-                      (stats.data?.users_count ?? 0).toLocaleString()
+                      formatCount(stats.data?.users_count)
                     )
                   }
                 />
@@ -234,7 +252,7 @@ export function DashboardPage() {
                     stats.isError ? (
                       <TileProblem error={stats.error} />
                     ) : (
-                      (stats.data?.rooms_count ?? 0).toLocaleString()
+                      formatCount(stats.data?.rooms_count)
                     )
                   }
                 />
@@ -244,7 +262,7 @@ export function DashboardPage() {
                     stats.isError ? (
                       <TileProblem error={stats.error} />
                     ) : (
-                      (stats.data?.daily_active_users ?? 0).toLocaleString()
+                      formatCount(stats.data?.daily_active_users)
                     )
                   }
                 />
@@ -422,11 +440,4 @@ function TileProblem({ error }: { error: unknown }) {
         ? "Unavailable"
         : "Unknown";
   return <span className="text-sm font-normal text-text-faint">{label}</span>;
-}
-
-function formatUptime(ms: number): string {
-  const hours = Math.floor(ms / 3_600_000);
-  const days = Math.floor(hours / 24);
-  const remHours = hours % 24;
-  return days > 0 ? `${days}d ${remHours}h` : `${hours}h`;
 }

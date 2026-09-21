@@ -123,12 +123,15 @@ First run is done (see the state of things). The admin interface can now *change
 configuration rather than only display it, which was the stated product priority. What it still
 cannot do, in rough order of how often an operator will hit it:
 
-- **Give the Overview something to say.** The first page a new administrator sees, seconds after
-  setup, is a wall of "Not implemented": Users, Rooms, Daily active users, Mode, Attention,
-  Bridges, Federation. `statistics.overview`, `cluster.get`, `appservices.list` and
-  `federation.destinations.list` all answer an honest 501. The first of those is a count of
-  accounts and rooms this server already has to hand, and is the cheapest large improvement to a
-  first impression available.
+- **Finish giving the Overview something to say.** Half done 2026-09-21: `statistics.overview`
+  and `cluster.get` are real (`crates/hs-cli/src/overview.rs`), so a new administrator sees
+  Users, Rooms, Daily active users, Mode and an uptime in words instead of "Not implemented"
+  five times. Counts are shared for a minute rather than redone per poll, and what nothing can
+  count yet (media, failing destinations, pending reports) is *absent* from the response rather
+  than zero — the page shows a dash, and its all-clear now says what it could not check instead
+  of putting a green tick over bridges and federation nobody asked about. What is left on that
+  page is the two panels still answering 501: `appservices.list` and
+  `federation.destinations.list`.
 - **The interface still calls itself "hs admin".** The project has been Myelin for a while; the
   sign-in card, the top bar and the page title have not heard.
 - **Edit an array of objects as a form.** `listeners.listeners`, `media.thumbnail_sizes` and
@@ -212,11 +215,13 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | Admin UI cannot edit arrays of objects | `web` | listeners and OIDC providers are a JSON textarea |
 | Nothing hot-applies a config change | all | every change needs a restart, and says so |
 | One `/api/v1` fetch fails under the full `e2e-real` suite | `web` (dev proxy) | two tests fail together, pass alone |
+| CI does not run the Playwright suite | `.github` | two of its tests failed for an unknown length of time before anybody noticed (fixed 2026-09-21) |
 | Receipts and presence in memory | `hs-user` | a restart forgets read state |
 | Postgres `tls`/`pool_size`/schema | `hs-kv`, `hs-cli` | encrypt in front of the database for now |
 | `/createRoom` not shard-gated | `hs-cli` | first actor may be built on a non-owner |
 | Config pages never checked by axe | `web` | the only e2e flow without an accessibility pass |
-| Overview is mostly 501s | `hs-admin`, `hs-cli` | a new administrator's first page says "Not implemented" seven times |
+| Overview's Bridges and Federation panels are 501s | `hs-admin`, `hs-cli` | the first page still says "isn't implemented" twice, and its all-clear is qualified accordingly |
+| Overview counts media, failing destinations and reports as unknown | `hs-cli` | three dashes where numbers should be; the sources exist in `hs-media`, `hs-federation` and nowhere respectively |
 | Setup link assumes `localhost:<bound port>` without `public_baseurl` | `hs-cli` | wrong behind a remapped port or an undescribed proxy |
 | In-process server cannot be restarted over its data directory | `hs-cli` | background tasks hold the store's lock after `shutdown()`; restart tests need the real binary |
 | Embedded UI never verified from a CD-built image | `deploy`, `.github` | verified on a local build only until the next CD run |

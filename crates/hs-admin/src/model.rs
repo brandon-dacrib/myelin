@@ -239,6 +239,45 @@ pub enum PrincipalKind {
     Legacy,
 }
 
+/// The OpenAPI `StatisticsOverview` schema: the body of `GET /statistics/overview`.
+///
+/// Every field is optional, in the contract and here, and an absent one means "this server does
+/// not know", not zero. A source fills in what it can count honestly and leaves the rest out, so
+/// that the dashboard can show a dash for a number nobody has rather than a confident `0`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatisticsOverview {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub users_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rooms_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daily_active_users: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monthly_active_users: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub federation_destinations_failing_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_reports_count: Option<u64>,
+}
+
+/// The OpenAPI `ClusterStatus` schema: the body of `GET /cluster`. As with
+/// [`StatisticsOverview`], only `mode` is always known.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterStatus {
+    /// `single-node` or `cluster`.
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replica_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shard_count: Option<u64>,
+}
+
 /// The OpenAPI `SetupStatus` schema: the body of `GET /setup`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetupStatus {
