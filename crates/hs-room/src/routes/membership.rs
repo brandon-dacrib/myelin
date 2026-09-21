@@ -76,6 +76,22 @@ async fn extra<B: hs_kv::KvBackend + 'static>(
     body: &Value,
 ) -> Value {
     let mut out = json!({});
+    // A join's body *is* the content the client wants on its member event -- the spec's join
+    // endpoints take no parameters of their own beyond `reason` and `third_party_signed` -- so
+    // whatever else it carries is kept (Complement's "can join a room with custom content", and
+    // how a client attaches its own keys to a membership). `third_party_signed` is the one key
+    // that is an instruction to the server rather than content, and `membership` is decided by
+    // the action, never by the body. Every other action's body is parameters (`user_id`), from
+    // which only `reason` belongs on the event.
+    if action == Action::Join
+        && let Some(object) = body.as_object()
+    {
+        for (key, value) in object {
+            if key != "third_party_signed" && key != "membership" {
+                out[key] = value.clone();
+            }
+        }
+    }
     if let Some(reason) = body.get("reason") {
         out["reason"] = reason.clone();
     }
@@ -85,10 +101,16 @@ async fn extra<B: hs_kv::KvBackend + 'static>(
     if matches!(action, Action::Join | Action::Invite | Action::Knock)
         && let Ok(Some(profile)) = state.auth.store.get_user(target).await
     {
-        if let Some(name) = profile.display_name {
+        // The profile fills in what the body left out; it does not overrule a join that named
+        // its own display name for this room.
+        if let Some(name) = profile.display_name
+            && out.get("displayname").is_none()
+        {
             out["displayname"] = Value::String(name);
         }
-        if let Some(avatar) = profile.avatar_url {
+        if let Some(avatar) = profile.avatar_url
+            && out.get("avatar_url").is_none()
+        {
             out["avatar_url"] = Value::String(avatar);
         }
     }

@@ -258,10 +258,24 @@ pub async fn get_context<B: KvBackend + 'static>(
         .ok_or_else(|| RoomError::EventNotFound("event not found".into()))
 }
 
+/// Query parameters for `GET /rooms/{roomId}/members`. `at` is accepted and not honoured: the
+/// member list is always the current one (or, for a departed member, the one as of their
+/// leaving -- see [`get_members`]).
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct MembersQuery {
+    /// Only members whose `membership` is this.
+    #[serde(default)]
+    pub membership: Option<String>,
+    /// Leave out members whose `membership` is this.
+    #[serde(default)]
+    pub not_membership: Option<String>,
+}
+
 /// `GET /rooms/{roomId}/members`.
 pub async fn get_members<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_id): Path<String>,
+    Query(filter): Query<MembersQuery>,
     RoomRequester(requester): RoomRequester,
 ) -> Result<Response, RoomError> {
     let room_id = parse_room_id(&room_id)?;
@@ -274,6 +288,25 @@ pub async fn get_members<B: KvBackend + 'static>(
                 found
                     .unwrap_or_default()
                     .into_iter()
+                    // `membership` and `not_membership`: how a client asks for "everyone who is
+                    // here" without paging through everyone who ever was. Both were ignored, so
+                    // `?not_membership=leave` came back with the people who had left.
+                    .filter(|e| {
+                        let membership = e
+                            .json()
+                            .get("content")
+                            .and_then(hs_model::canonical::CanonicalJsonValue::as_object)
+                            .and_then(|c| c.get("membership"))
+                            .and_then(hs_model::canonical::CanonicalJsonValue::as_str);
+                        filter
+                            .membership
+                            .as_deref()
+                            .is_none_or(|want| membership == Some(want))
+                            && filter
+                                .not_membership
+                                .as_deref()
+                                .is_none_or(|unwanted| membership != Some(unwanted))
+                    })
                     .map(|e| {
                         attach_replaced_state(
                             client_event_json(e),

@@ -339,7 +339,10 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     /// should not happen for anything this server itself wrote -- is skipped rather than failing
     /// the whole call). Shared by [`SessionHub::set_typing`] and [`SessionHub::set_presence`]: both
     /// need "who should be woken by this change", and both mean exactly this.
-    async fn joined_member_ids(&self, room_id: &RoomId) -> Result<Vec<OwnedUserId>, UserError> {
+    pub(crate) async fn joined_member_ids(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<OwnedUserId>, UserError> {
         let handle = self.rooms.get_or_load(room_id).await?;
         Ok(handle
             .query(|actor| {

@@ -1988,6 +1988,102 @@ async fn rooms_refuse_what_the_spec_says_they_must_and_spell_out_their_defaults(
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["errcode"], "M_TOO_LARGE");
 
+    // ---- 4b. A join carries its body onto the member event, and /members can be filtered. ----
+    let created: serde_json::Value = client
+        .post(format!("{base}/_matrix/client/v3/createRoom"))
+        .bearer_auth(&alice)
+        .json(&json!({"preset": "public_chat"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let public_room = created["room_id"].as_str().unwrap().to_owned();
+    let joined = client
+        .post(format!(
+            "{base}/_matrix/client/v3/join/{}",
+            enc(&public_room)
+        ))
+        .bearer_auth(&bob)
+        .json(&json!({"foo": "bar", "membership": "ban", "third_party_signed": {"x": 1}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(joined.status(), reqwest::StatusCode::OK);
+    let member: serde_json::Value = client
+        .get(format!(
+            "{base}/_matrix/client/v3/rooms/{}/state/m.room.member/%40policy-bob%3Aexample.org",
+            enc(&public_room)
+        ))
+        .bearer_auth(&alice)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        member["foo"], "bar",
+        "the client's own key survives: {member}"
+    );
+    assert_eq!(
+        member["membership"], "join",
+        "and the body does not get to choose the membership"
+    );
+    assert!(member.get("third_party_signed").is_none(), "{member}");
+
+    let left = client
+        .post(format!(
+            "{base}/_matrix/client/v3/rooms/{}/leave",
+            enc(&public_room)
+        ))
+        .bearer_auth(&bob)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(left.status(), reqwest::StatusCode::OK);
+    let members_with = |query: &'static str| {
+        let (client, base, alice, room) = (
+            client.clone(),
+            base.clone(),
+            alice.clone(),
+            public_room.clone(),
+        );
+        async move {
+            let body: serde_json::Value = client
+                .get(format!(
+                    "{base}/_matrix/client/v3/rooms/{}/members{query}",
+                    room.replace('!', "%21").replace(':', "%3A")
+                ))
+                .bearer_auth(alice)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let mut who: Vec<String> = body["chunk"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["state_key"].as_str().unwrap().to_owned())
+                .collect();
+            who.sort();
+            who
+        }
+    };
+    assert_eq!(members_with("").await.len(), 2, "everyone who ever was");
+    assert_eq!(
+        members_with("?not_membership=leave").await,
+        vec!["@policy-alice:example.org"]
+    );
+    assert_eq!(
+        members_with("?membership=leave").await,
+        vec!["@policy-bob:example.org"]
+    );
+
     // ---- 5. A wrong password mid-way through interactive auth is a 401 that can be retried. ----
     let response = client
         .post(format!("{base}/_matrix/client/v3/account/deactivate"))

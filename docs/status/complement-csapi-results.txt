@@ -1,26 +1,26 @@
-# Complement tests/csapi, top-level results. One line per test so that two runs can be diffed:
-#   a change is worth something when it moves a *named* test and that survives a re-run.
-# Regenerate: grep -E '^--- (PASS|FAIL|SKIP)' <log> | awk '{print $2, $3}' | sed 's/://' | sort -k2
-# Run of 2026-09-21 at commit 070e9ab: 248 of 370 assertions, 61 of 104 top-level (2 skipped).
+# Complement tests/csapi, top-level results. One line per test so that two runs can be compared
+# by name: a change is worth something when it moves a *named* test and that survives a re-run.
+# Written and read by tools/complement_triage.py (--write-baseline, --diff).
+# Run of 2026-09-21 at commit 213bc77: 289 of 384 assertions, 72 of 106 top-level (0 skipped).
 PASS TestAddAccountData
 FAIL TestArchivedRoomsHistory
 FAIL TestAsyncUpload
 PASS TestAvatarUrlUpdate
+PASS TestCanRegisterAdmin
 PASS TestCannotKickLeftUser
 PASS TestCannotKickNonPresentUser
-SKIP TestCanRegisterAdmin
 PASS TestChangePassword
 FAIL TestChangePasswordPushers
 PASS TestContent
 PASS TestContentCSAPIMediaV1
 PASS TestCumulativeJoinLeaveJoinSync
-FAIL TestDeactivateAccount
+PASS TestDeactivateAccount
 PASS TestDemotingUsersViaUsersDefault
 FAIL TestDeviceListUpdates
 FAIL TestDeviceManagement
 PASS TestDisplayNameUpdate
 PASS TestE2EKeyBackupReplaceRoomKeyRules
-FAIL TestEvent
+PASS TestEvent
 PASS TestFetchEvent
 PASS TestFetchEventNonWorldReadable
 PASS TestFetchEventWorldReadable
@@ -41,17 +41,17 @@ PASS TestKeyClaimOrdering
 PASS TestKeysQueryWithDeviceIDAsObjectFails
 PASS TestLeakyTyping
 PASS TestLeaveEventInviteRejection
-FAIL TestLeaveEventVisibility
+PASS TestLeaveEventVisibility
 FAIL TestLeftRoomFixture
 PASS TestLogin
 PASS TestLogout
 PASS TestMediaConfig
-FAIL TestMembershipOnEvents
 PASS TestMembersLocal
+FAIL TestMembershipOnEvents
 FAIL TestMessagesOverFederation
 PASS TestNotPresentUserCannotBanOthers
 PASS TestOlderLeftRoomsNotInLeaveSection
-FAIL TestPowerLevels
+PASS TestPowerLevels
 PASS TestPresence
 PASS TestPresenceSyncDifferentRooms
 PASS TestProfileAvatarURL
@@ -59,15 +59,15 @@ PASS TestProfileDisplayName
 PASS TestPublicRooms
 PASS TestPushRuleCacheHealth
 FAIL TestPushRuleRoomUpgrade
-FAIL TestPushSync
+PASS TestPushSync
 PASS TestRedact
 FAIL TestRegistration
 PASS TestRelations
 FAIL TestRelationsPagination
 FAIL TestRelationsPaginationSync
 PASS TestRequestEncodingFails
-FAIL TestRoomAlias
-FAIL TestRoomCanonicalAlias
+PASS TestRoomAlias
+PASS TestRoomCanonicalAlias
 PASS TestRoomCreate
 PASS TestRoomCreationReportsEventsToMyself
 FAIL TestRoomDeleteAlias
@@ -78,28 +78,28 @@ FAIL TestRoomMessagesLazyLoading
 FAIL TestRoomMessagesLazyLoadingLocalUser
 PASS TestRoomReadMarkers
 PASS TestRoomReceipts
-FAIL TestRoomsInvite
-FAIL TestRoomSpecificUsernameAtJoin
-FAIL TestRoomSpecificUsernameChange
+PASS TestRoomSpecificUsernameAtJoin
+PASS TestRoomSpecificUsernameChange
 FAIL TestRoomState
 PASS TestRoomSummary
+PASS TestRoomsInvite
 FAIL TestSearch
 PASS TestSendAndFetchMessage
 PASS TestSendMessageWithTxn
 FAIL TestServerCapabilities
-SKIP TestServerNotices
+FAIL TestServerNotices
 FAIL TestSync
 PASS TestSyncFilter
 PASS TestSyncLeaveSection
 FAIL TestSyncTimelineGap
 PASS TestTentativeEventualJoiningAfterRejecting
-FAIL TestThreadedReceipts
 FAIL TestThreadReceiptsInSyncMSC4102
+FAIL TestThreadedReceipts
 FAIL TestThreadsEndpoint
 PASS TestToDeviceMessages
+FAIL TestTxnIdWithRefreshToken
 PASS TestTxnIdempotency
 PASS TestTxnIdempotencyScopedToDevice
-FAIL TestTxnIdWithRefreshToken
 PASS TestTxnInEvent
 FAIL TestTxnScopeOnLocalEcho
 PASS TestTyping

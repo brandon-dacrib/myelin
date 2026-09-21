@@ -278,9 +278,9 @@ impl<B: KvBackend> MediaRepository<B> {
     /// # Errors
     /// [`MediaError::NotFound`] if no such reservation exists; [`MediaError::UploadExpired`] if it
     /// expired; [`MediaError::TooLarge`]/[`MediaError::QuotaExceeded`] as for
-    /// [`MediaRepository::upload`]; a plain `Err` with `completed: true` semantics is represented
-    /// as [`MediaError::InvalidInput`] ("already uploaded") since re-`PUT`ing is a caller bug, not
-    /// a missing/expired reservation.
+    /// [`MediaRepository::upload`]; [`MediaError::AlreadyUploaded`] (`409
+    /// M_CANNOT_OVERWRITE_MEDIA`) if the reservation already has content, since media is
+    /// immutable once uploaded.
     pub async fn complete_reservation(
         &self,
         ctx: &UploadContext,
@@ -293,9 +293,7 @@ impl<B: KvBackend> MediaRepository<B> {
             .get_media(&self.server_name, media_id.as_str())?
             .ok_or(MediaError::NotFound)?;
         if record.completed {
-            return Err(MediaError::InvalidInput(
-                "this media ID has already been uploaded".into(),
-            ));
+            return Err(MediaError::AlreadyUploaded);
         }
         if let Some(expires_at) = record.expires_at_ms
             && expires_at < self.now_ms()
@@ -1032,7 +1030,11 @@ mod tests {
             .complete_reservation(&ctx(), &id, "image/png", Bytes::from_static(b"y"))
             .await
             .unwrap_err();
-        assert!(matches!(err, MediaError::InvalidInput(_)));
+        assert!(matches!(err, MediaError::AlreadyUploaded));
+        // The spec's own status and code for it, which is what a retrying client keys on.
+        let matrix = err.to_matrix_error();
+        assert_eq!(matrix.status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(matrix.errcode.as_str(), "M_CANNOT_OVERWRITE_MEDIA");
     }
 
     #[tokio::test]

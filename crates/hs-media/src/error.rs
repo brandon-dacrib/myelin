@@ -75,6 +75,13 @@ pub enum MediaError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
 
+    /// An upload to a media ID that already has content. `409 M_CANNOT_OVERWRITE_MEDIA`: media
+    /// is immutable once uploaded, and the spec gives the attempt its own status and code so
+    /// that a client retrying an upload it believes failed can tell "it had already worked"
+    /// from "your request was malformed".
+    #[error("this media ID has already been uploaded")]
+    AlreadyUploaded,
+
     /// Authentication failed. Carries the original `hs_auth::error::MatrixError` (`hs-auth`
     /// predates `hs-http` and has its own, differently-shaped error type — see
     /// `crate::state::MediaRequester`'s doc) so the real status and errcode reach the client
@@ -180,6 +187,11 @@ impl MediaError {
                 axum::http::StatusCode::BAD_REQUEST,
                 MatrixErrorCode::InvalidParam,
                 msg.clone(),
+            ),
+            MediaError::AlreadyUploaded => MatrixError::custom(
+                axum::http::StatusCode::CONFLICT,
+                MatrixErrorCode::Other("M_CANNOT_OVERWRITE_MEDIA".to_owned()),
+                self.to_string(),
             ),
             MediaError::Auth(e) => MatrixError::custom(
                 e.status(),

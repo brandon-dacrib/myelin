@@ -26,7 +26,7 @@ Megolm establishes, the recipient decrypts. `cargo test -p hs-loadgen --test rea
 
 | | |
 |---|---|
-| Complement `csapi` | 248 / 370 assertions (61 / 104 tests) |
+| Complement `csapi` | 289 / 384 assertions (72 / 106 tests) |
 | Complement federation | 59 / 246 assertions (6 / 88 tests), the whole package for the first time |
 | Spec routes served | 138 / 235 (58.7%) — client-server 108/166, server-server 30/36 |
 | Rust | 26 crates, ~126k lines, 1,686 tests |

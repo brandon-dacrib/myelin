@@ -2562,7 +2562,7 @@ impl<B: KvBackend> RoomActor<B> {
 
     /// `GET /rooms/{roomId}/threads`: every event in this room that is the target of at least one
     /// `m.thread`-`rel_type` relation (a thread root), newest-active-thread first -- ordered by
-    /// the latest `m.thread` child's `origin_server_ts`, descending. `room_threads_test.go`'s
+    /// the latest `m.thread` child's position on this room's timeline, descending. `room_threads_test.go`'s
     /// `TestThreadsEndpoint` checks this ordering directly, including that a new reply to an
     /// older thread moves it back to the front.
     ///
@@ -2577,6 +2577,13 @@ impl<B: KvBackend> RoomActor<B> {
     /// itself) rather than duplicating it into every enumeration method.
     #[must_use]
     pub fn thread_roots(&self, requester: &UserId, participated_only: bool) -> Vec<&Event> {
+        // Timeline position, not `origin_server_ts`. The timestamp has millisecond resolution and
+        // is whatever the sender's clock said, so two replies sent back to back tie -- and the
+        // tie-break is then an event ID, which is a hash. Complement's `TestThreadsEndpoint`
+        // passed in two runs out of four on exactly that coin. Position is a total order, is this
+        // server's own, and is what "most recently active" means.
+        let position_of: HashMap<EventSn, i64> =
+            self.timeline.iter().map(|(pos, sn)| (*sn, *pos)).collect();
         let mut roots: Vec<(&Event, i64)> = self
             .relations_by_target
             .keys()
@@ -2595,15 +2602,20 @@ impl<B: KvBackend> RoomActor<B> {
                         return None;
                     }
                 }
-                let latest_ts = thread_children
+                // A reply this room holds but has not placed on its timeline (an outlier) says
+                // nothing about recency; a thread with only those sorts last.
+                let latest = thread_children
                     .iter()
-                    .map(|c| c.header().origin_server_ts)
-                    .max()?;
-                Some((root, latest_ts))
+                    .filter_map(|c| self.event_id_index.get(c.event_id()))
+                    .filter_map(|sn| position_of.get(sn))
+                    .max()
+                    .copied()
+                    .unwrap_or(i64::MIN);
+                Some((root, latest))
             })
             .collect();
-        // Descending by latest activity, with event ID as a deterministic tie-break (two threads
-        // updated in the same millisecond must still sort consistently across calls).
+        // Descending by latest activity. Positions are unique, so the event ID only ever breaks
+        // a tie between threads whose replies are all outliers.
         roots.sort_by(|a, b| {
             b.1.cmp(&a.1)
                 .then_with(|| a.0.event_id().cmp(b.0.event_id()))
@@ -4463,6 +4475,41 @@ mod tests {
             vec![root1.event_id(), root2.event_id()],
             "a new reply to root1's thread must move it back to the front"
         );
+    }
+
+    /// Two replies in the same millisecond -- which is what a script, a bridge, or a test sends
+    /// -- must still come back in the order they happened. Ordered by timestamp they tied, and
+    /// the winner was decided by comparing event IDs, which are hashes.
+    #[test]
+    fn thread_roots_in_the_same_millisecond_are_ordered_by_what_happened_last() {
+        for _ in 0..8 {
+            let mut actor = room("public_chat");
+            let alice = user_id!("@alice:hs1").to_owned();
+            let mut roots = Vec::new();
+            for body in ["one", "two", "three"] {
+                roots.push(
+                    actor
+                        .send_event(
+                            alice.clone(),
+                            "m.room.message".to_owned(),
+                            None,
+                            serde_json::json!({"msgtype": "m.text", "body": body}),
+                            None,
+                            7,
+                        )
+                        .unwrap(),
+                );
+            }
+            for root in &roots {
+                thread_reply(&mut actor, &alice, root.event_id(), 7);
+            }
+            let listed = actor.thread_roots(&alice, false);
+            assert_eq!(
+                listed.iter().map(|e| e.event_id()).collect::<Vec<_>>(),
+                roots.iter().rev().map(|e| e.event_id()).collect::<Vec<_>>(),
+                "replied to last, listed first"
+            );
+        }
     }
 
     /// `?include=participated`: only threads the requester started or replied to come back.

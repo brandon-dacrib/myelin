@@ -200,6 +200,10 @@ struct Timeline {
     prev_batch: Option<String>,
 }
 
+/// How many of a newly joined room's members have their presence sent to the joiner along with
+/// the room. See `build`'s `newly_visible`.
+const NEWLY_JOINED_PRESENCE_LIMIT: usize = 500;
+
 /// How many raw timeline events a single `/sync` response will fetch in one `paginate` call once
 /// `room.timeline` carries a content filter (`types`/`not_types`/`senders`/`not_senders`), rather
 /// than the plain `limit` an unfiltered request uses. A filter that excludes nearly everything
@@ -656,6 +660,9 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     // See the module docs; deliberately built from data this loop already computes, not a second
     // pass over history.
     let mut left_candidates: BTreeSet<OwnedUserId> = BTreeSet::new();
+    // Everyone in a room this user joined since their token. Their presence is sent whatever its
+    // stamp says: see where it is read, below.
+    let mut newly_visible: BTreeSet<OwnedUserId> = BTreeSet::new();
 
     for room_id in &candidate_rooms {
         if !params.filter.room_allowed(room_id.as_str()) {
@@ -716,6 +723,17 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
 
         let resume = resume_mode(hub, user_id, room_id, &baseline, is_initial, &membership).await?;
         let force_full_state = full_state_requested || matches!(resume, ResumeMode::FreshRoom);
+        if !is_initial && matches!(resume, ResumeMode::FreshRoom) && membership.membership == "join"
+        {
+            // Bounded, because a room can have tens of thousands of members and this is one
+            // response. Past the bound the client still learns about people as they do things.
+            newly_visible.extend(
+                hub.joined_member_ids(room_id)
+                    .await?
+                    .into_iter()
+                    .take(NEWLY_JOINED_PRESENCE_LIMIT),
+            );
+        }
 
         let account_data = if force_full_state {
             store.list_room_account_data(user_id, room_id).await?
@@ -1024,7 +1042,13 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             continue;
         };
         new_presence_seq = new_presence_seq.max(record.seq);
-        if is_initial || record.seq > baseline.presence_seq {
+        // Newer than the token -- or belonging to somebody in a room this user has only just
+        // joined. Presence has one sequence for the whole server, so the people already in that
+        // room may well have last changed state long before this user's token; by stamp alone
+        // the newcomer would see an empty room until each of them happened to do something.
+        // (The other direction, the room learning about the newcomer, is
+        // `PresenceRegistry::restamp`.)
+        if is_initial || record.seq > baseline.presence_seq || newly_visible.contains(other) {
             let mut content = json!({
                 "presence": record.presence,
                 "last_active_ago": record.last_active_ago_ms(),
@@ -3164,6 +3188,68 @@ mod tests {
         assert_eq!(
             bodies(&response["rooms"]["join"][room_id.as_str()]["timeline"]),
             vec!["third"]
+        );
+    }
+
+    /// The other half of presence on join, Complement's "Newly joined room includes presence in
+    /// incremental sync": the joiner is told about the people already there, once.
+    #[tokio::test]
+    async fn joining_a_room_brings_the_presence_of_the_people_already_in_it() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        std::mem::forget(hub.watch_all(hub.rooms().subscribe_global()));
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        // Alice was last seen changing state well before bob's token exists.
+        hub.set_presence(&alice, "online".to_owned(), None)
+            .await
+            .unwrap();
+        hub.touch_presence(&bob, "online").await.unwrap();
+        let (_, before_joining) = build(&hub, &e2e, &bob, params(None)).await.unwrap();
+
+        handle
+            .membership(
+                bob.clone(),
+                Action::Join,
+                bob.clone(),
+                serde_json::json!({}),
+                2,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (response, token) = build(&hub, &e2e, &bob, params(Some(before_joining)))
+            .await
+            .unwrap();
+        let senders: Vec<&str> = response["presence"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["sender"].as_str().unwrap())
+            .collect();
+        assert!(senders.contains(&"@alice:sync.test"), "{response}");
+
+        // "There should be no new presence events": it is news once.
+        let (response, _) = build(&hub, &e2e, &bob, params(Some(token))).await.unwrap();
+        assert!(
+            response["presence"]["events"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{response}"
         );
     }
 }

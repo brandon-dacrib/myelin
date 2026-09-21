@@ -16,23 +16,45 @@ While the server has no administrator it logs a one-time setup link at every sta
 
 **The admin interface ships.** Until 2026-09-21 it did not: every binary and every published image served a placeholder at `/admin/` saying the interface had not been built in, because nothing embedded `web/dist`. `crates/hs-admin/build.rs` now stages the built interface (or the placeholder, for a Rust-only checkout, and says so at startup); release builds set `HS_ADMIN_WEB_DIST` and *fail* without a built interface; CD refuses to publish an image whose `/admin/` is not the interface. Verified on the published artifact: `ghcr.io/brandon-dacrib/myelin:main`, pulled from the registry on 2026-09-21 and run with the README's exact command, serves the interface at `/admin/`, answers `needs_setup: true`, and logs the setup link. What has still never run is the `v*` binaries job's new Node step, which only a tag exercises.
 
-**Complement, `csapi`: 248 of 370 assertions pass** (61 of 104 top-level), measured 2026-09-21, up from 241/370 earlier the same day and 191/296, 148/293 and 125/293 before that. `docs/status/complement-csapi-results.txt` has the result of every top-level test, so the next run can be `diff`ed against this one instead of compared by total.
+**Complement, `csapi`: 289 of 384 assertions pass** (72 of 106 top-level), measured 2026-09-21 at
+`213bc77`. The same morning it was 241 of 370 (61 of 104); before that 191/296, 148/293 and
+125/293. The denominator grew because the harness image now configures Complement's shared
+secret, which un-skipped two tests: `TestCanRegisterAdmin` passes, and `TestServerNotices` runs
+for the first time and fails, since server notices do not exist here.
 
-**That run was graded with a `/sync` that did not wait, and the next one is the one to read.**
-Two consecutive runs of the same commit used to differ by a top-level test in each direction --
-`TestRoomsInvite` and `TestPushSync` failed in one and passed in the other -- and this file called
-that noise: subtests run in parallel and lose races under load. They did lose races, but the load
-was ours. The 2026-09-21 log has waits that saw **4,381 and 12,040 `/sync` responses** inside five
-seconds: for any user whose own presence record was the newest they could see, `/sync` returned
-at once, empty, with an unmoved token, forever (`has_new_data` watched the user's own presence;
-`build` never emitted it or advanced past it). Which user that was depended on who synced last,
-which is exactly what made it look random. Fixed in `hs-user`, with the invariant as the test:
-*the token a sync hands back must not itself count as news*. The 248 above was measured *before*
-that fix.
+Read a run by name, not by total: `python3 tools/complement_triage.py <log>` prints each failing
+test with its first reason, `--diff` lists what moved against
+`docs/status/complement-csapi-results.txt`, and `--write-baseline` makes a run the new baseline.
+The total hides things. One of the day's runs went *up* by three while a test went from PASS to
+FAIL, and that was a real regression.
 
-The general lesson is older than this instance and keeps being true: when a number wobbles, look
-for the mechanism before filing it under noise. "Seen 4381 /sync responses" had been in every
-log.
+**What the wobble was.** Two consecutive runs of the same commit used to differ by a top-level
+test in each direction -- `TestRoomsInvite` and `TestPushSync` -- and this file called that
+noise: subtests run in parallel and lose races under load. They did lose races, but the load was
+ours. The log had waits that saw **4,381 and 12,040 `/sync` responses** in five seconds: for any
+user whose own presence record was the newest they could see, `/sync` returned at once, empty,
+with an unmoved token, forever. Which user that was depended on who synced last, which is
+exactly what made it look random. When a number wobbles, look for the mechanism before filing it
+under noise; "Seen 4381 /sync responses" had been in every log.
+
+**What fixing it uncovered.** `/sync` had been resending every room's entire state on every
+incremental sync, and that was quietly papering over four other defects, each of which surfaced
+as a named Complement regression the moment the one before it was fixed:
+
+- A client that missed more than one page of a room was sent the *oldest* page and a token
+  positioned at the end. The rest was never delivered, and `prev_batch` pointed the wrong way.
+- A room created or joined after the client's token was resumed from the user's own join, so the
+  create event, the power levels and that join were in no timeline at all.
+- An event landing while a sync response was being built was folded into a feed entry the
+  response had already reported as consumed. It was in no timeline, ever.
+- Presence has one sequence for the whole server while a record's audience grows as people join
+  rooms, so neither the joiner nor the people already there were told about each other.
+
+All four are fixed, each with a test that states the invariant rather than the instance (*the
+token a sync hands back must not itself count as news*; *say how far you have read before you
+read*). What is left of the same family, known and not yet done: a very large ("hot") room
+joined after the token is still resumed from the join rather than sent whole, and a requester
+with no device -- some appservice callers -- never records a feed cursor at all.
 
 **Complement, federation package: 59 of 246 assertions** (6 of 88 top-level), measured 2026-09-21 — and for the first time that is the *whole* package. The suite used to segfault Complement's own Go binary 21 tests in and silently discard everything after, so every federation number before this one was "however far it got before dying". There are no panics in the log now and `-skip` is retired.
 
@@ -76,7 +98,7 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 
 | Area | Where it is | Basis |
 |---|---|---|
-| Client-server API | ~65% | 241/370 csapi assertions, 61/104 top-level; a real Element session signs in, creates rooms, sends, invites, scrolls back |
+| Client-server API | ~70% | 289/384 csapi assertions, 72/106 top-level; a real Element session signs in, creates rooms, sends, invites, scrolls back. The number understates the day: four of the fixes behind it were `/sync` silently losing events, which no percentage shows |
 | Storage, rooms, state resolution | ~85% | the engine underneath; 1600+ tests, two backends through one conformance suite, state bake-off done |
 | Configuration and first run | ~90% | database-backed, editable in the UI, one command from nothing to a working server |
 | Admin API | ~23% | 34 of 145 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Config 6/6, Server 5/5, AuditLog 3/3, Setup 2/2, Users 10/41, Rooms 5/23, Statistics 1/4, Cluster 1/6, and **Bridges 0/16**, Federation 0/7, Media 0/9, RegistrationTokens 0/5 |
@@ -96,38 +118,33 @@ beyond a loadgen harness, `cargo fuzz` never run, Sytest never run, and no real 
 
 ## What to do next, in order
 
-### 1. Keep pulling on the measurement, and open a browser
+### 1. Keep pulling on the measurement
 
-The suites are current as of 2026-09-21 (above). What the latest csapi log says to do next, in
-rough order of how many assertions sit behind it:
+`python3 tools/complement_triage.py <log>` against run 4 (2026-09-21), largest first. Count by
+test, not by log line: one polling test can print the same line twenty times.
 
-- **`MustSyncUntil` timeouts.** Count them by *test*, not by line: 28 log lines were 8 distinct
-  tests, and after the presence fix below they are fewer still. What is left is push rules
-  surviving a room upgrade (2), device-list tracking when a user leaves (1), and the alias tests
-  (now fixed). The lesson from the invite cluster holds -- one sync-shaped defect can be worth
-  seven top-level tests -- but check how many tests a cluster really is before sizing the work.
-- **`rooms.join.<room>.timeline.events` missing, 21 times, was one test polling** -- all of
-  `TestRoomDeleteAlias`, now fixed. Counting log lines overstates a cluster badly.
-- ~~`TestRequestEncodingFails`~~ **Done 2026-09-21, not yet re-measured.** All 57 client-server
-  routes that took a bare `axum::Json` take `hs_http::body::PermissiveJson`, which now honours
-  the body limit, tells `M_NOT_JSON` from `M_BAD_JSON`, and checks UTF-8 over the whole body
-  (`serde_json` skips the strings it ignores, so a typed route accepted Complement's payload).
-  An end-to-end test walks the route manifest, so a new route is covered without anybody
-  remembering to. The admin API's ten bare extractors are untouched: that surface wants
-  `StrictJson` and RFC 9457, and is its own change.
-- ~~`/user_directory/search` searches every local account.~~ **Scoped 2026-09-21.** By default
-  a search finds the people the searcher shares a room with and the members of public rooms --
-  the spec's floor, Synapse's default, and what `TestRoomSpecificUsernameChange` and
-  `TestRoomSpecificUsernameAtJoin` were failing for. Searching everyone is
-  `auth.user_directory_search_all_users`, off by default because a bridge makes a local account
-  for every contact of every user, so "everyone" includes other people's address books. The
-  scope is computed per search by walking rooms; a public room with tens of thousands of
-  members is when that wants a table. Not yet re-measured under Complement.
+- **`TestServerNotices` (9)**: newly running, not newly broken. Server notices are unimplemented
+  (`ServerNotices` is 0 of 2 in the admin API too).
+- **`TestSearch` (8)**: `/search` needs a cross-room index the room-actor model has no place for.
+- **`TestDeviceListUpdates` (8)**: device-list tracking when users join and leave rooms.
+- **`TestMessagesOverFederation` (6), `TestPushRuleRoomUpgrade` (6)**: both die joining a room
+  over federation with `404 room not found` -- item 3, the room bootstrap API.
+- **`TestArchivedRoomsHistory` (6)**: `rooms.leave` in `/sync` carries state it should not, and
+  the wrong timeline.
+- **`TestRoomState` (5)**, **`TestSync` (4)**: mixed; read the reasons.
+- **Fixed after run 4 and not yet graded**: `TestThreadsEndpoint` (threads were ordered by
+  millisecond timestamp with an event-ID tie-break, so two back-to-back replies were a coin flip
+  -- it passed in two runs of four), `TestRoomMembers` (a join's custom content was dropped),
+  `TestGetFilteredRoomMembers` (`membership`/`not_membership` were ignored), `TestAsyncUpload`
+  (`409 M_CANNOT_OVERWRITE_MEDIA`), and the joiner's half of presence in `TestSync`.
+- **`TestChangePasswordPushers` (2)**: a password change should delete pushers made by other
+  sessions. Needs pushers to remember which device made them, and a revocation hook from
+  `hs-auth` into `hs-push`.
 - **`min_depth` on `/get_missing_events`**, still parsed nowhere, and history visibility still not
   applied per event there.
 
-**Open Element and create a room in it.** The bug that made that impossible is fixed and nobody
-has watched it work.
+Element has not been opened since the `/sync` changes above. The `matrix-rust-sdk` scenarios pass
+against them, which is a real client and a good sign; it is not a browser.
 
 ### 2. Make it fun to administer — the half that is left
 
@@ -246,7 +263,9 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | In-process server cannot be restarted over its data directory | `hs-cli` | background tasks hold the store's lock after `shutdown()`; restart tests need the real binary |
 | The release binaries job's web build has never run | `.github` | it only runs on a `v*` tag; the image path is verified, this one is not |
 | User-directory scope is computed by walking rooms on every search | `hs-user` | fine today; the first thing to index if a public room gets very large |
-| csapi run-to-run wobble, cause found, effect not yet re-measured | `tests`, `hs-user` | was ±2 top-level tests; `/sync` was spinning (fixed 2026-09-21), so the next run says how much of it that was |
+| `TestThreadsEndpoint` flapped between runs | `hs-room` | ordering tie on a millisecond timestamp; fixed 2026-09-21, not yet graded -- if any test still moves between identical runs, that is a bug to find, not noise |
+| A hot room joined after the token is resumed from the join, not sent whole | `hs-user` | the client recovers from `/state` and `/messages`; rare, and written down in `resume_mode` |
+| A requester with no device never records a feed cursor | `hs-user` | its feed entries coalesce forever and an incremental sync sees no change; some appservice callers |
 | `heartbeat_seq` is derived from wall-clock milliseconds | `hs-cluster` | two ticks in one millisecond read as "no progress", i.e. death; harmless at the production 1s interval, surfaces only in tests |
 | Sytest never run | `tests/sytest` | CPAN dependencies absent |
 | `cargo fuzz` never executed | `fuzz/` | no nightly toolchain |
