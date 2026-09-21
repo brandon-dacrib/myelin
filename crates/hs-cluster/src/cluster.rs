@@ -77,6 +77,7 @@ mod tests {
     use hs_kv::memory::MemoryBackend;
 
     use super::*;
+    use crate::test_clock::settle_until;
     use crate::types::{ShardId, ShardKind, ShardLayout};
 
     #[tokio::test]
@@ -99,22 +100,14 @@ mod tests {
         config.lease_ttl = Duration::from_millis(150);
         let (cluster, _mgr) = Cluster::start(config, backend).await.unwrap();
         // Wait for readiness rather than advancing a fixed number of rounds and hoping the
-        // heartbeat landed: how far the background loop gets per round depends on the runtime's
-        // scheduling, which is generous on an idle machine and not on a contended CI runner —
-        // where exactly this assertion failed while passing locally every time.
-        let mut ready = false;
-        for _ in 0..50 {
-            if cluster.ready() == Readiness::Ready {
-                ready = true;
-                break;
-            }
-            tokio::time::advance(Duration::from_millis(60)).await;
-            for _ in 0..64 {
-                tokio::task::yield_now().await;
-            }
-        }
+        // heartbeat landed. This loop already asked the right question and still used the wrong
+        // clock: the heartbeat it is waiting for lands on a `spawn_blocking` thread, so a round
+        // that only advances virtual time and yields grants it no time to happen in. See
+        // `crate::test_clock::settle`.
         assert!(
-            ready,
+            settle_until(Duration::from_millis(60), 200, || cluster.ready()
+                == Readiness::Ready)
+            .await,
             "the cluster never reported ready after its heartbeat"
         );
     }

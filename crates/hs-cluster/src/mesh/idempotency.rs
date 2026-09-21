@@ -109,6 +109,12 @@ mod tests {
         assert_eq!(got.payload, Bytes::from_static(b"hi"));
     }
 
+    /// The one fixed sleep in this crate that is allowed to stay one. Elsewhere a duration
+    /// standing in for "wait until X" is a bet on how fast the host is, because X is background
+    /// work that a slow machine does more slowly. Here there is no background work at all: the
+    /// cache expires entries on the wall clock, in `get`, on the calling thread. The only thing
+    /// being waited for is the clock itself, and a sleep can overshoot but never undershoot -- a
+    /// slower host makes this test more certain to pass, not less.
     #[test]
     fn entries_expire() {
         let cache = IdempotencyCache::new(Duration::from_millis(1), 100);

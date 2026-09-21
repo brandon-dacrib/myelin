@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use hs_cluster::ownership::{Drainable, KvOwnership, Ownership};
 use hs_cluster::store::ClusterStore;
-use hs_cluster::{ClusterConfig, Fence, ReplicaId, ShardId, ShardKind, ShardLayout};
+use hs_cluster::{ClusterConfig, Epoch, Fence, ReplicaId, ShardId, ShardKind, ShardLayout};
 use hs_kv::memory::MemoryBackend;
 use hs_kv::{Conflict, KvBackend, KvError, KvRead, KvWrite, TransactConfig, transact};
 use serde::{Deserialize, Serialize};
@@ -183,24 +183,61 @@ fn test_config(me: &str, layout: ShardLayout) -> ClusterConfig {
     c
 }
 
-/// Lets background tasks (including ones parked behind a `spawn_blocking` join, which resolves
-/// on a real OS thread) make progress, then advances the paused virtual clock and repeats.
+/// The most real time one [`settle`] round will spend waiting for the blocking pool. See
+/// [`settle`] for why there is a ratio at all and why it is capped.
+const MAX_REAL_TIME_PER_ROUND: Duration = Duration::from_millis(5);
+
+/// Advances the paused virtual clock by `step`, `rounds` times, letting every background task --
+/// the async ones and the ones parked on a `spawn_blocking` join -- make progress in between.
+///
+/// That second group is the part that is easy to leave out, and expensive to leave out. Yielding
+/// under a paused clock runs *async* tasks, but `hs-cluster`'s heartbeat, failure detection and
+/// shard acquisition all finish on `spawn_blocking` threads, which need real wall-clock time that
+/// `yield_now` does not cost. A round that advances virtual time while granting no real time lets
+/// the clock outrun the work it is supposed to be pacing: the background loop falls a little
+/// further behind every round, and how far it gets stops being a property of the code and becomes
+/// a property of how fast the machine is.
+///
+/// That is exactly how `a_partitioned_replica_cannot_write_after_being_fenced` came to pass on
+/// every developer laptop and every amd64 run and fail on the slower arm64 runner. Nothing was
+/// racing: hs-1 takes the shard over reliably once its loop is allowed to run. The test had simply
+/// travelled 600ms of virtual time -- four times the lease TTL, so apparently generous -- while
+/// handing the blocking pool around 30ms of real time in which to do the work that virtual time
+/// was pretending had already happened.
+///
+/// So every round hands the blocking pool `step / 4` of real time, capped at
+/// [`MAX_REAL_TIME_PER_ROUND`] so the fixed-round driver loops stay cheap. The ratio is the point,
+/// not the absolute figure: virtual time never runs more than about four times ahead of the wall
+/// clock, which is what makes the round counts in this file a property of the code rather than of
+/// the host. Measured against a deliberately slowed store, the failover these loops pace needs
+/// 10-17 rounds here and still lands in 53 on a host slow enough to spend 20ms inside every store
+/// call -- where the same loop without the real-time grant never gets there at all.
+///
+/// This duplicates `hs_cluster::test_clock`, which the crate's own unit tests use. An integration
+/// test compiles against the crate from the outside and cannot see anything behind `#[cfg(test)]`,
+/// so the two copies have to be kept in agreement by hand.
 async fn settle(step: Duration, rounds: u32) {
+    let real_time = (step / 4).min(MAX_REAL_TIME_PER_ROUND);
     for _ in 0..rounds {
         tokio::time::advance(step).await;
         for _ in 0..64 {
             tokio::task::yield_now().await;
         }
+        let _ = tokio::task::spawn_blocking(move || std::thread::sleep(real_time)).await;
     }
 }
 
-/// Like [`settle`], but stops as soon as `condition` holds and reports whether it ever did.
+/// Drives the clock like [`settle`], but stops as soon as `condition` holds, and reports whether
+/// it ever did.
 ///
-/// Use this before asserting on anything a background task produces. A fixed round count assumes
-/// the acquisition loop gets far enough within however many times the runtime chooses to poll it,
-/// which holds on an idle machine and does not on a contended CI runner — three of the tests in
-/// this file failed there while passing locally every time, all of them waiting for the same
-/// thing: the initial claim of a share of the shards.
+/// Use this before asserting on anything a background task produces. A fixed round count is a
+/// guess about how far that task gets per round; the guess holds on an idle laptop and does not on
+/// a contended runner, which is what put five of this crate's tests -- and then a sixth -- on the
+/// CI flake list while they passed locally every single time. Waiting for the condition itself
+/// removes the guess rather than enlarging it.
+///
+/// Be generous with `max_rounds`. It bounds how long a genuine failure takes to report, and
+/// nothing else: a passing run stops at the condition and never spends it.
 async fn settle_until(
     step: Duration,
     max_rounds: u32,
@@ -210,13 +247,7 @@ async fn settle_until(
         if condition() {
             return true;
         }
-        tokio::time::advance(step).await;
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-        }
-        // See the note in `hs_cluster::ownership`'s copy: yields under paused time run async
-        // tasks, but the acquisition path finishes on a blocking thread that needs real time.
-        let _ = tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(2))).await;
+        settle(step, 1).await;
     }
     condition()
 }
@@ -259,7 +290,16 @@ async fn no_two_replicas_ever_commit_the_same_shard_epoch() {
         replicas.push(mgr);
         handles.push(handle);
     }
-    settle(Duration::from_millis(60), 6).await;
+    // The kill at round 15 is only meaningful if the doomed replica actually owns something by
+    // then, and the assertion that it does is two hundred lines below the six rounds that were
+    // supposed to arrange it. Wait for the shard space to be claimed instead.
+    assert!(
+        settle_until(Duration::from_millis(60), 200, || layout
+            .all_shards()
+            .all(|s| replicas.iter().any(|r| r.is_mine(s))))
+        .await,
+        "the four replicas never claimed the shard space between them"
+    );
 
     // Chaos: repeatedly append to random shards, occasionally killing a replica (simulating a
     // crash) and letting the survivors converge, across many rounds.
@@ -331,12 +371,57 @@ async fn no_two_replicas_ever_commit_the_same_shard_epoch() {
 
         settle(Duration::from_millis(40), 1).await;
     }
-    settle(Duration::from_millis(200), 6).await;
+
+    // The forty rounds above are a driver -- applying load for a while is the point of them, not
+    // waiting for anything -- but `adversarial_checks` is not something a driver can be trusted to
+    // produce. It only counts up once a survivor has actually re-acquired a shard the doomed
+    // replica held, which is background work on someone else's schedule; on a host slow enough
+    // that no takeover landed inside those rounds, the count comes out zero and the guarantee this
+    // test is named for goes unchecked. So wait for the re-acquisition, then check it deliberately
+    // rather than hoping the chaos rounds happened to cover it.
+    let doomed = stale_writer
+        .clone()
+        .expect("the doomed replica was taken out at round 15");
+    let re_acquired = |shard: ShardId, held: Epoch| {
+        observer_store
+            .get_shard(shard)
+            .map(|current| current.epoch > held)
+            .unwrap_or(false)
+    };
+    assert!(
+        settle_until(Duration::from_millis(40), 200, || stale_fences
+            .iter()
+            .all(|(s, f)| f.epoch.is_none_or(|held| re_acquired(*s, held))))
+        .await,
+        "the survivors never re-acquired every shard the doomed replica held"
+    );
+
+    // Every shard it held has demonstrably moved past the epoch it captured, so every one of these
+    // is a genuinely stale write and every one of them must be rejected.
+    for (shard, fence) in &stale_fences {
+        let Some(held) = fence.epoch else { continue };
+        idem += 1;
+        let result = log.append(
+            fence,
+            observer_store.shard_keyspace(),
+            *shard,
+            &doomed,
+            idem,
+        );
+        assert!(
+            result.is_err(),
+            "shard {shard}: a write using the stale, pre-failover fence must be rejected once a \
+             new owner has taken over, got {result:?} (held epoch {held:?})"
+        );
+        adversarial_checks += 1;
+    }
 
     assert!(
-        adversarial_checks > 0,
-        "the stale-fence check never actually fired (no shard the doomed replica owned was ever \
-         re-acquired by a survivor) -- this test would pass vacuously without checking anything"
+        adversarial_checks >= stale_fences.len() as u32,
+        "the stale-fence check fired {adversarial_checks} times for {} shards the doomed replica \
+         held -- it must reject a stale write for every one of them, or the guarantee this test \
+         is named for is only partly checked",
+        stale_fences.len()
     );
 
     // Safety invariant: for every shard, every committed epoch has exactly one writer, and
@@ -382,7 +467,7 @@ async fn failover_completes_within_configured_ttl() {
         .await
         .unwrap();
     assert!(
-        settle_until(Duration::from_millis(60), 60, || layout
+        settle_until(Duration::from_millis(60), 200, || layout
             .all_shards()
             .any(|s| a.is_mine(s)))
         .await,
@@ -396,6 +481,11 @@ async fn failover_completes_within_configured_ttl() {
     assert!(!b.is_mine(shard));
 
     // Kill the owner and measure how long the survivor takes to notice and take over.
+    //
+    // Unlike the loops elsewhere in this file, the round count here is *not* a stand-in for a
+    // condition -- the bound on the virtual clock is the thing being asserted, and loosening it
+    // would delete the test. What makes it sound is that `settle` now paces virtual time against
+    // real time, so the clock this measures against cannot run away from the work it is timing.
     handle_a.abort();
     let start = tokio::time::Instant::now();
     let deadline = lease_ttl + heartbeat_interval * 3; // detection window plus one tick's slack
@@ -427,7 +517,7 @@ async fn retried_append_is_not_duplicated() {
         .unwrap();
     let shard = ShardId::new(ShardKind::Room, 0);
     assert!(
-        settle_until(Duration::from_millis(60), 60, || a.is_mine(shard)).await,
+        settle_until(Duration::from_millis(60), 200, || a.is_mine(shard)).await,
         "hs-0 never took ownership of {shard}"
     );
     let fence = a.fence(shard).unwrap();
@@ -466,7 +556,7 @@ async fn drain_hands_off_to_a_live_peer_before_stopping() {
         .await
         .unwrap();
     assert!(
-        settle_until(Duration::from_millis(60), 60, || layout
+        settle_until(Duration::from_millis(60), 200, || layout
             .all_shards()
             .any(|s| a.is_mine(s)))
         .await,
@@ -483,10 +573,22 @@ async fn drain_hands_off_to_a_live_peer_before_stopping() {
     // `a` releases -- this is what "handoff completes before a replica stops" means with a live
     // peer, as opposed to the single-replica case (covered in `ownership.rs`'s unit tests) where
     // there is nobody to hand off to.
-    let settler = tokio::spawn(async move {
-        settle(Duration::from_millis(50), 200).await;
-    });
+    //
+    // Driving for a fixed number of rounds is a bet that the drain finishes inside them; two
+    // hundred rounds of 50ms came to exactly the drain's own ten-second deadline, so a slow host
+    // could run the clock out from under the very thing it was driving. Driving until the drain
+    // returns is not a bet.
+    let driving = Arc::new(AtomicBool::new(true));
+    let settler = {
+        let driving = driving.clone();
+        tokio::spawn(async move {
+            while driving.load(Ordering::SeqCst) {
+                settle(Duration::from_millis(50), 1).await;
+            }
+        })
+    };
     let report = a.drain(Duration::from_secs(10)).await;
+    driving.store(false, Ordering::SeqCst);
     settler.await.unwrap();
 
     assert!(
@@ -501,7 +603,7 @@ async fn drain_hands_off_to_a_live_peer_before_stopping() {
     }
     // Every shard hs-0 used to own has now converged onto `b` (the only other live replica).
     assert!(
-        settle_until(Duration::from_millis(50), 100, || a_owned_before
+        settle_until(Duration::from_millis(50), 200, || a_owned_before
             .iter()
             .all(|s| b.is_mine(*s)))
         .await,
@@ -529,7 +631,7 @@ async fn a_partitioned_replica_cannot_write_after_being_fenced() {
         .await
         .unwrap();
     assert!(
-        settle_until(Duration::from_millis(60), 60, || layout
+        settle_until(Duration::from_millis(60), 200, || layout
             .all_shards()
             .any(|s| a.is_mine(s)))
         .await,
@@ -548,16 +650,16 @@ async fn a_partitioned_replica_cannot_write_after_being_fenced() {
     faulty.set_cut(true);
 
     // hs-1 eventually judges hs-0 dead (its heartbeat_seq stops advancing) and takes the shard.
-    let mut took_over = false;
-    for _ in 0..30 {
-        settle(Duration::from_millis(20), 1).await;
-        if b.is_mine(shard) {
-            took_over = true;
-            break;
-        }
-    }
+    // How many rounds that takes is not something this test should be predicting: detection costs
+    // a lease TTL of virtual time, but noticing it and acquiring the shard costs several trips
+    // through the blocking pool, which is real time. This loop used to stop after thirty rounds
+    // and assert the takeover had happened, which is a bet on the host being fast; it paid out on
+    // every laptop and every amd64 run and not on the arm64 runner. Four seconds of virtual time
+    // is twenty-six lease TTLs -- long enough that reaching the end means the takeover is not
+    // coming -- and about a second of wall clock to establish that, so a genuine regression still
+    // reports promptly.
     assert!(
-        took_over,
+        settle_until(Duration::from_millis(20), 200, || b.is_mine(shard)).await,
         "hs-1 should have taken over the partitioned replica's shard"
     );
 

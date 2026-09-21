@@ -18,6 +18,8 @@ pub mod mesh;
 pub mod metrics;
 pub mod ownership;
 pub mod store;
+#[cfg(test)]
+mod test_clock;
 pub mod types;
 
 pub use cluster::Cluster;

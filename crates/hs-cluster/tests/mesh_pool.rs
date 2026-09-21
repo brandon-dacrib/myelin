@@ -21,6 +21,7 @@ use hs_cluster::{Generation, ReplicaId, ShardId, ShardKind, metrics::ClusterMetr
 use http_body_util::Full;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 
 async fn spawn_counting_peer() -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -57,11 +58,16 @@ async fn spawn_counting_peer() -> (String, Arc<AtomicUsize>) {
 /// idle connection that timed out from the server's side. Every later connection is served
 /// normally and indefinitely. Used to test that [`hs_cluster::mesh::Forwarder`] notices a dead
 /// pooled connection and redials rather than failing outright.
-async fn spawn_peer_whose_first_connection_dies() -> (String, Arc<AtomicUsize>) {
+///
+/// The returned [`Notify`] fires once that first connection has actually been dropped, so the test
+/// can wait for the event rather than for a duration it hopes is longer than the event takes.
+async fn spawn_peer_whose_first_connection_dies() -> (String, Arc<AtomicUsize>, Arc<Notify>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr").to_string();
     let accepted = Arc::new(AtomicUsize::new(0));
     let counter = accepted.clone();
+    let first_closed = Arc::new(Notify::new());
+    let closed_tx = first_closed.clone();
 
     tokio::spawn(async move {
         loop {
@@ -69,6 +75,7 @@ async fn spawn_peer_whose_first_connection_dies() -> (String, Arc<AtomicUsize>) 
                 break;
             };
             let index = counter.fetch_add(1, Ordering::SeqCst);
+            let closed_tx = closed_tx.clone();
             tokio::spawn(async move {
                 let service = hyper::service::service_fn(
                     |_req: hyper::Request<hyper::body::Incoming>| async move {
@@ -84,6 +91,10 @@ async fn spawn_peer_whose_first_connection_dies() -> (String, Arc<AtomicUsize>) 
                     // is, so the client-side pooled handle becomes unusable without either side
                     // ever seeing a clean HTTP-level close.
                     let _ = tokio::time::timeout(Duration::from_millis(30), conn).await;
+                    // Dropping `conn` closed the socket. Announce it with `notify_one`, which
+                    // leaves a permit behind, so the test gets the signal whether or not it is
+                    // already waiting when this fires.
+                    closed_tx.notify_one();
                 } else {
                     let _ = conn.await;
                 }
@@ -91,7 +102,7 @@ async fn spawn_peer_whose_first_connection_dies() -> (String, Arc<AtomicUsize>) 
         }
     });
 
-    (addr, accepted)
+    (addr, accepted, first_closed)
 }
 
 fn envelope(seq: u128) -> Envelope {
@@ -154,7 +165,7 @@ async fn forwarder_reuses_one_connection_across_many_forwards() {
 
 #[tokio::test]
 async fn forwarder_redials_after_the_pooled_connection_is_gone() {
-    let (addr, accepted) = spawn_peer_whose_first_connection_dies().await;
+    let (addr, accepted, first_closed) = spawn_peer_whose_first_connection_dies().await;
     let ownership = SingleNode::new(ReplicaId::new(addr));
     let forwarder = hs_cluster::mesh::Forwarder::new(
         AuthMode::SharedSecret {
@@ -180,9 +191,15 @@ async fn forwarder_redials_after_the_pooled_connection_is_gone() {
         "first forward should have dialed exactly one connection"
     );
 
-    // Give the peer's 30ms self-close timer time to fire, so the pooled connection is now dead
-    // on the server side without either end having done a clean HTTP-level close.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Wait for the peer to actually drop that connection, rather than sleeping for a duration
+    // picked to be comfortably longer than its 30ms self-close timer. A duration is a guess about
+    // how fast the host is -- the same guess that had five of this crate's paused-clock tests
+    // passing locally and failing on CI -- and this one is knowable: the peer says when it has
+    // closed. The pooled connection is now dead on the server side without either end having done
+    // a clean HTTP-level close.
+    tokio::time::timeout(Duration::from_secs(10), first_closed.notified())
+        .await
+        .expect("the peer never dropped its first connection");
 
     let reply2 = forwarder
         .forward(envelope(2))

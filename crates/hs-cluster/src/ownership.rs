@@ -666,9 +666,9 @@ impl<B: KvBackend> Drainable for KvOwnership<B> {
 #[cfg(test)]
 mod tests {
     use hs_kv::memory::MemoryBackend;
-    use tokio::time::advance;
 
     use super::*;
+    use crate::test_clock::settle_until;
     use crate::types::ShardLayout;
 
     fn config(me: &str) -> ClusterConfig {
@@ -678,51 +678,12 @@ mod tests {
         c
     }
 
-    /// Lets every background task (including ones parked behind a `spawn_blocking` join, which
-    /// resolves on a real OS thread and needs a few real executor polls to be noticed) run to a
-    /// fixed point, then advances the paused virtual clock by `step` and repeats `rounds` times.
-    /// `spawn_blocking`'s completion is a real-time event layered under tokio's virtual clock, so
-    /// a single `advance()` is not enough to observe it -- both are needed together.
-    /// Advances virtual time until `condition` holds, up to `max_rounds`, and reports whether it
-    /// ever did.
-    ///
-    /// This replaced a helper that advanced a fixed number of rounds and then hoped the
-    /// background loop had got far enough — which depends on how the runtime happened to schedule
-    /// 64 yields. That is generous on an idle laptop and not on a contended CI runner, where
-    /// three of these tests failed while passing locally every single time. Waiting for the
-    /// condition itself removes the guess rather than enlarging it, so use this before asserting
-    /// on anything a background task produces.
-    pub(crate) async fn settle_until(
-        step: Duration,
-        max_rounds: u32,
-        mut condition: impl FnMut() -> bool,
-    ) -> bool {
-        for _ in 0..max_rounds {
-            if condition() {
-                return true;
-            }
-            advance(step).await;
-            for _ in 0..64 {
-                tokio::task::yield_now().await;
-            }
-            // Yielding under paused virtual time lets *async* tasks run, but this crate's
-            // acquisition path parks on `spawn_blocking`, which finishes on a real OS thread and
-            // therefore needs real wall-clock time. Sleeping on the blocking pool gives it some
-            // without blocking the runtime — the difference between a test that passes on an idle
-            // machine and one that also passes on a contended CI runner, which is where this
-            // failed on arm64 even with fifty rounds of virtual time.
-            let _ =
-                tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(2))).await;
-        }
-        condition()
-    }
-
     #[tokio::test(start_paused = true)]
     async fn single_replica_acquires_every_shard() {
         let backend = MemoryBackend::new();
         let (mgr, _handle) = KvOwnership::start(config("hs-0"), backend).await.unwrap();
         assert!(
-            settle_until(Duration::from_millis(60), 50, || {
+            settle_until(Duration::from_millis(60), 200, || {
                 mgr.layout().all_shards().all(|s| mgr.is_mine(s))
             })
             .await,
@@ -742,7 +703,7 @@ mod tests {
             .unwrap();
         let (b, _hb) = KvOwnership::start(config("hs-1"), backend).await.unwrap();
         assert!(
-            settle_until(Duration::from_millis(60), 50, || {
+            settle_until(Duration::from_millis(60), 200, || {
                 a.layout()
                     .all_shards()
                     .all(|s| a.is_mine(s) || b.is_mine(s))
@@ -765,7 +726,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            settle_until(Duration::from_millis(60), 50, || {
+            settle_until(Duration::from_millis(60), 200, || {
                 mgr.layout().all_shards().all(|s| mgr.is_mine(s))
             })
             .await,
