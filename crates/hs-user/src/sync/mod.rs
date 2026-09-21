@@ -341,8 +341,9 @@ fn build_fresh_timeline(
     }
 }
 
-/// `m.room.*` types Synapse's default `invite_room_state`/`knock_room_state` sends: enough for a
-/// client to render an invite/knock preview without joining.
+/// The state event types stripped state carries, from the client-server API's own list
+/// ("Stripped state should contain some or all of the following"). `m.room.create` is
+/// **required** there as of Matrix v1.16.
 const STRIPPED_STATE_TYPES: &[&str] = &[
     "m.room.create",
     "m.room.join_rules",
@@ -353,15 +354,60 @@ const STRIPPED_STATE_TYPES: &[&str] = &[
     "m.room.encryption",
 ];
 
+/// The state of a room as offered to somebody who is not in it: enough to render an invite or a
+/// knock without being able to read the room.
+///
+/// Two things here are easy to get wrong and were both wrong:
+///
+/// **The recipient's own `m.room.member` event has to be in it.** It is not in the type list
+/// above -- that list is about describing the *room* -- but the spec's own `invite_state` example
+/// carries it, and it is the only thing in the response that says who was invited and by whom. A
+/// client that reads membership out of `invite_state` (Complement's `syncMembershipIn` checker
+/// does, and so every invite test in `csapi` did) sees an invite with no invitee at all without
+/// it. The inviter's member event goes in too, because "Alice invited you" needs Alice's display
+/// name and avatar, and the recipient cannot fetch them from a room they have not joined.
+///
+/// **A stripped state event may carry only four properties**: `sender`, `type`, `state_key` and
+/// `content`. Not `event_id`, not `origin_server_ts`, not `room_id`, not `unsigned` -- which is
+/// what [`client_event_json`] produces, and what this used to send.
 fn stripped_state(
     actor: &hs_room::actor::RoomActor<impl KvBackend>,
+    recipient: &UserId,
 ) -> Result<Vec<Value>, hs_room::RoomError> {
-    Ok(actor
-        .full_state()?
-        .into_iter()
-        .filter(|e| STRIPPED_STATE_TYPES.contains(&e.header().event_type.as_str()))
-        .map(client_event_json)
-        .collect())
+    let mut out = Vec::new();
+    let mut inviter: Option<String> = None;
+    for event in actor.full_state()? {
+        let header = event.header();
+        if STRIPPED_STATE_TYPES.contains(&header.event_type.as_str()) {
+            out.push(strip(event));
+        } else if header.event_type == "m.room.member"
+            && header.state_key.as_deref() == Some(recipient.as_str())
+        {
+            inviter = Some(header.sender.to_string());
+            out.push(strip(event));
+        }
+    }
+    // Second pass rather than a lookup inside the first: whose event to add is only known once
+    // the recipient's own membership has been seen, and `full_state` has no ordering guarantee
+    // that would put it first.
+    if let Some(inviter) = inviter
+        && inviter != recipient.as_str()
+        && let Some(event) = actor.state_event("m.room.member", &inviter)?
+    {
+        out.push(strip(event));
+    }
+    Ok(out)
+}
+
+/// One event as a stripped state event: the four properties the spec allows, and nothing else.
+fn strip(event: &Event) -> Value {
+    let full = client_event_json(event);
+    json!({
+        "type": full.get("type").cloned().unwrap_or(Value::Null),
+        "state_key": full.get("state_key").cloned().unwrap_or(Value::Null),
+        "sender": full.get("sender").cloned().unwrap_or(Value::Null),
+        "content": full.get("content").cloned().unwrap_or_else(|| json!({})),
+    })
 }
 
 /// Full current state, minus whatever event ids are already present in `timeline_events` (avoids
@@ -615,7 +661,10 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
 
         match membership_value.as_str() {
             "invite" => {
-                let events = handle.query(move |actor| stripped_state(actor)).await?;
+                let user_for_invite = user_id_owned.clone();
+                let events = handle
+                    .query(move |actor| stripped_state(actor, &user_for_invite))
+                    .await?;
                 invite.insert(
                     room_id_owned.to_string(),
                     json!({"invite_state": {"events": events}}),
@@ -623,7 +672,10 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                 continue;
             }
             "knock" => {
-                let events = handle.query(move |actor| stripped_state(actor)).await?;
+                let user_for_knock = user_id_owned.clone();
+                let events = handle
+                    .query(move |actor| stripped_state(actor, &user_for_knock))
+                    .await?;
                 knock.insert(
                     room_id_owned.to_string(),
                     json!({"knock_state": {"events": events}}),

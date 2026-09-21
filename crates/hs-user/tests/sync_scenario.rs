@@ -601,3 +601,96 @@ async fn a_display_name_change_arrives_over_sync_with_the_old_name_attached() {
         "the superseded event's id must be there too: {renamed}"
     );
 }
+
+/// An invite that does not say who was invited is not an invite a client can render. The spec's
+/// own `invite_state` example carries the recipient's `m.room.member` event, and every checker
+/// that reads membership out of `invite_state` — Complement's `syncMembershipIn`, and so every
+/// invite test in its `csapi` suite — needs it. It was missing: `invite_state` carried
+/// `m.room.create` and `m.room.join_rules` and nothing about the invitee at all.
+///
+/// The second half of the same rule: a stripped state event may carry only `sender`, `type`,
+/// `state_key` and `content`. These were full client events, with `event_id`, `origin_server_ts`,
+/// `room_id` and `unsigned` on them.
+#[tokio::test]
+async fn an_invite_carries_the_invitees_own_membership_and_nothing_it_should_not() {
+    let (mut s, rooms, hub) = setup();
+
+    s.register("alice", "alice", "hunter2-alice")
+        .await
+        .assert_ok();
+    s.register("bob", "bob", "hunter2-bob").await.assert_ok();
+    let bob_user_id = s.session("bob").unwrap().user_id.clone().unwrap();
+    let alice_user_id = s.session("alice").unwrap().user_id.clone().unwrap();
+
+    let create = s
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({"preset": "private_chat", "name": "Invite Me"})),
+        )
+        .await;
+    create.assert_ok();
+    let room_id = create.str_field("room_id").to_owned();
+
+    let handle = rooms
+        .get_or_load(&ruma::RoomId::parse(&room_id).unwrap())
+        .await
+        .unwrap();
+    hub.watch_room(handle).await;
+    settle().await;
+
+    s.send(
+        Some("alice"),
+        Method::POST,
+        &format!("/rooms/{room_id}/invite"),
+        Some(json!({"user_id": bob_user_id})),
+    )
+    .await
+    .assert_ok();
+    settle().await;
+
+    let sync = s.sync("bob").await;
+    sync.assert_ok();
+    let events = sync.json["rooms"]["invite"][&room_id]["invite_state"]["events"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("bob should see the invite: {}", sync.json));
+
+    let own_membership = events
+        .iter()
+        .find(|e| {
+            e["type"] == "m.room.member" && e["state_key"] == bob_user_id.to_string().as_str()
+        })
+        .unwrap_or_else(|| panic!("invite_state must say who was invited: {events:#?}"));
+    assert_eq!(own_membership["content"]["membership"], "invite");
+    assert_eq!(own_membership["sender"], alice_user_id.to_string());
+
+    assert!(
+        events.iter().any(|e| {
+            e["type"] == "m.room.member" && e["state_key"] == alice_user_id.to_string().as_str()
+        }),
+        "the inviter's own membership belongs there too, or a client cannot render \
+         \"Alice invited you\" without joining: {events:#?}"
+    );
+    assert!(
+        events.iter().any(|e| e["type"] == "m.room.create"),
+        "m.room.create is required in invite_state as of Matrix v1.16: {events:#?}"
+    );
+
+    for event in &events {
+        let keys: Vec<&str> = event
+            .as_object()
+            .expect("each stripped event is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for key in &keys {
+            assert!(
+                matches!(*key, "sender" | "type" | "state_key" | "content"),
+                "a stripped state event may carry only sender/type/state_key/content, \
+                 found {key:?} in {event:#?}"
+            );
+        }
+    }
+}
