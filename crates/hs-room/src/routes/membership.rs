@@ -98,23 +98,39 @@ async fn extra<B: hs_kv::KvBackend + 'static>(
     if let Some(via) = body.get("join_authorised_via_users_server") {
         out["join_authorised_via_users_server"] = via.clone();
     }
-    if matches!(action, Action::Join | Action::Invite | Action::Knock)
-        && let Ok(Some(profile)) = state.auth.store.get_user(target).await
-    {
-        // The profile fills in what the body left out; it does not overrule a join that named
-        // its own display name for this room.
-        if let Some(name) = profile.display_name
-            && out.get("displayname").is_none()
-        {
-            out["displayname"] = Value::String(name);
-        }
-        if let Some(avatar) = profile.avatar_url
-            && out.get("avatar_url").is_none()
-        {
-            out["avatar_url"] = Value::String(avatar);
-        }
+    if matches!(action, Action::Join | Action::Invite | Action::Knock) {
+        fill_in_profile(state, target, &mut out).await;
     }
     out
+}
+
+/// Adds `target`'s current `displayname`/`avatar_url` to `content`, an `m.room.member` event's
+/// content in the making. The profile fills in what is not already there; it does not overrule
+/// a join that named its own display name for this room. A user this server holds no profile
+/// for (a remote one -- see the module docs) is left as they are.
+///
+/// Also how `crate::routes::create_room` fills in the creator's join and the invitations it
+/// sends, which are membership events like any other and used to go out bare: whoever made a
+/// room was `@alice:example.org` to everyone in it, in every client, until they next changed
+/// their name.
+pub(crate) async fn fill_in_profile<B: hs_kv::KvBackend + 'static>(
+    state: &RoomState<B>,
+    target: &ruma::UserId,
+    content: &mut Value,
+) {
+    let Ok(Some(profile)) = state.auth.store.get_user(target).await else {
+        return;
+    };
+    if let Some(name) = profile.display_name
+        && content.get("displayname").is_none()
+    {
+        content["displayname"] = Value::String(name);
+    }
+    if let Some(avatar) = profile.avatar_url
+        && content.get("avatar_url").is_none()
+    {
+        content["avatar_url"] = Value::String(avatar);
+    }
 }
 
 async fn act<B: KvBackend + 'static>(

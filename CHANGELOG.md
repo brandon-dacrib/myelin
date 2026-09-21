@@ -45,6 +45,23 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
   a gap answered with the oldest page instead of the newest, a new room resumed from the wrong
   place, an event landing mid-response, presence not crossing a join -- plus one way it never
   waited at all. All found by reading a Complement log for mechanisms rather than totals.
+- **Accepting an invitation brings you the room.** It used to bring your own join event and
+  nothing else -- no state, so no `m.room.encryption`, and Element offered to send plain text
+  into an encrypted room. The same went for coming back to a room you had left. Found by
+  accepting an invitation in Element; a regression of the day's own `/sync` work, which no test
+  here or in Complement had covered. Declining an invitation works again too (it had stopped
+  moving the room to `leave`, which Complement did catch), and a room sent whole no longer says
+  everything twice.
+- **Devices find out that they are verified, and about each other.** Signing a device recorded
+  no device-list change, so nobody re-fetched it: Element never learned the server had its own
+  device's signature, flagged every message its own user sent as "not verified by its owner",
+  and never offered key backup. `device_lists.changed` also never named the people you had just
+  come to share a room with, or you -- which is how one of your devices hears of another. With
+  these a new Element account gets a green shield and the backup prompt.
+- **People have names in the rooms they make, and a direct chat is one.** Room creation wrote
+  the creator's membership, and its invitations, without their profile -- the creator was a raw
+  user ID to everyone in the room -- and dropped `is_direct`, so the invitee's client filed a
+  direct chat as a room.
 - **The user directory no longer lets anyone list everyone.** A search finds people you share a
   room with and members of public rooms, as the specification requires; finding everybody is an
   explicit setting (`auth.user_directory_search_all_users`), off by default because bridged
@@ -68,9 +85,12 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
   receives messages live between two independent sessions, propagates a display-name change to an
   already-open tab, and pages back through history. Screenshots in
   `docs/design/screenshots/`, reproduction in `web/element-testing/README.md`.
-  - Known exception: creating a room from Element's UI fails, because `POST /createRoom` replaces
-    the default power levels when a client sends `power_level_content_override` instead of merging
-    over them. See `docs/next-steps.md` item 1.
+  - Re-verified 2026-09-21 with two Element sessions against the real binary, after the day's
+    `/sync` changes: creating an encrypted room from Element's own dialog (which used to fail, and
+    no longer does), inviting by user ID, accepting, and an encrypted reply read on the other
+    side. That session found four bugs the test suites had not; see `docs/next-steps.md`,
+    "Run 6, and what opening Element found". Not yet tried in Element: verifying one session from
+    another, key backup restore, rooms of more than two.
 - **End-to-end encryption works.** Two `matrix-rust-sdk` clients with encryption enabled exchange a
   message this server can never read: device and one-time keys upload, cross-signing bootstraps,
   keys are claimed atomically, the Megolm session establishes, and the recipient decrypts.

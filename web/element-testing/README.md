@@ -24,6 +24,61 @@ of `element-config.json` (the old proxy-origin config, kept for reference).
 Also fixed since the previous session: `GET /capabilities` no longer lies about
 `m.set_displayname`/`m.set_avatar_url`.
 
+### The short way (2026-09-21): no configuration file
+
+The server no longer needs one, and accounts no longer need a shared secret. From the repo root:
+
+```sh
+cargo build -p hs-cli --bin hs
+D=$(mktemp -d)
+HS_DATA_DIR=$D/data HS__SERVER__SERVER_NAME=test.local \
+  HS__SERVER__PUBLIC_BASEURL=http://127.0.0.1:8008 HS__RATE_LIMITS__ENABLED=false \
+  target/debug/hs serve > $D/hs.log 2>&1 &
+
+# The first administrator, from the one-time setup link the server logs (or open the link).
+TOKEN=$(grep -o 'setup_link=[^ ]*' $D/hs.log | tail -1 | sed 's/.*#token=//')
+ADMIN=$(curl -s -X POST http://127.0.0.1:8008/api/v1/setup -H 'content-type: application/json' \
+  -d "{\"setup_token\":\"$TOKEN\",\"username\":\"ops\",\"password\":\"opspassword123\"}" \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
+for u in alice bob; do
+  curl -s -X POST http://127.0.0.1:8008/api/v1/users -H "authorization: Bearer $ADMIN" \
+    -H 'content-type: application/json' \
+    -d "{\"localpart\":\"$u\",\"password\":\"${u}password123\",\"display_name\":\"$u\"}"
+done
+
+# One Element per person, each its own origin, so their sessions cannot collide. Use ports a
+# browser profile has never seen: a stale Element session on a reused origin fails confusingly.
+for who in alice:8190 bob:8191; do
+  docker run -d --name element-web-${who%%:*} -p ${who##*:}:80 \
+    -v "$PWD/web/element-testing/element-config-direct.json:/app/config.json:ro" \
+    vectorim/element-web:latest
+done
+```
+
+(`element-config-direct.json` points at `127.0.0.1:8098`; change its `base_url` to `:8008`, or
+run the server on 8098.) Afterwards: `docker rm -f element-web-alice element-web-bob`, stop the
+server, and wait for it to exit before starting another on the same data directory.
+
+#### What to do in it, because each of these has been broken once
+
+The 2026-09-21 session found four bugs that Complement, the `matrix-rust-sdk` scenarios and
+every test in the repository had passed over. They are fixed and tested now; this is the list
+that found them, and it takes ten minutes.
+
+1. Alice creates a room from Element's own **New room** dialog, encryption left on. *The room
+   opens; "Encryption enabled" and "You created this room" are in the timeline; the creator is
+   shown by display name, not by user ID.*
+2. Alice sends a message. *No red shield on it. A red shield on your own message, reading
+   "Encrypted by a device not verified by its owner", means the client never heard that its own
+   device was signed: `device_lists.changed` must name the user themself after
+   `/keys/signatures/upload`.* A new account should also be offered **Back up your chats**.
+3. Alice invites Bob by full user ID (searching "bob" finds nobody, by design: they share no
+   room yet). *Bob's tab title gains a "[1]" without a reload.*
+4. Bob accepts. *His composer reads "Send a message…", not "Send an unencrypted message…", and
+   the timeline shows "Encryption enabled". The second means his join arrived without the room's
+   state.*
+5. Bob replies. *Alice reads it, decrypted, without a reload.*
+
 ### One-time setup
 
 ```sh

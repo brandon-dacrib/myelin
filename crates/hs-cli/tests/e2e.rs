@@ -652,8 +652,12 @@ async fn a_room_created_over_http_reaches_its_creators_sync() {
     let room = sync["rooms"]["join"]
         .get(&room_id)
         .unwrap_or_else(|| panic!("the created room should reach /sync: {sync}"));
+    // In `state` or in `timeline`, never both: a room this new fits in its timeline whole.
     assert!(
-        !room["state"]["events"].as_array().unwrap().is_empty(),
+        ["state", "timeline"]
+            .iter()
+            .flat_map(|section| room[section]["events"].as_array().into_iter().flatten())
+            .any(|e| e["type"] == "m.room.create"),
         "the room's current state should come with it: {room}"
     );
     let since = sync["next_batch"]
@@ -1769,6 +1773,253 @@ async fn the_user_directory_shows_a_searcher_only_who_they_could_already_see() {
         search(alice.clone(), "dir-").await,
         vec!["@dir-bob:example.org"],
         "alice sees bob (their private room) and not eve, who is in no room with her"
+    );
+
+    handle.shutdown().await;
+}
+/// What opening Element on this server found, the day `/sync` stopped resending every room's
+/// whole state with every message. Two people, a direct and encrypted chat, an invitation
+/// accepted: the most ordinary thing the server will ever be asked to do, and it went wrong four
+/// ways that no conformance test had noticed.
+///
+/// - The room's creator was `@story-alice:example.org` to everybody: room creation wrote her
+///   join, and the invitation, with no profile on them.
+/// - The invitation did not say the chat was a direct one, so it was filed as a room.
+/// - Accepting it brought Bob his own join event and nothing else -- no state, so no
+///   `m.room.encryption`, and his client offered to send plain text into an encrypted room. The
+///   invitation had left history in his feed, and the join was resumed from it as though he had
+///   been in the room all along.
+/// - Nobody new to him was in `device_lists.changed`, and nor was a user's own id ever, which is
+///   how one device hears that its owner has signed in on another.
+#[tokio::test]
+async fn accepting_an_invitation_to_an_encrypted_direct_chat_tells_the_client_everything() {
+    use serde_json::Value;
+
+    let dir = tempfile::tempdir().unwrap();
+    let handle = hs_cli::serve::spawn_serve(
+        test_config(reserve_ephemeral_port(), dir.path()),
+        hs_cli::serve::ServeOptions::default(),
+    )
+    .await
+    .expect("server should boot");
+    let base = handle.base_url();
+    let client = reqwest::Client::new();
+
+    let call = |method: reqwest::Method, path: String, token: String, body: Option<Value>| {
+        let (client, base) = (client.clone(), base.clone());
+        async move {
+            let mut request = client
+                .request(method, format!("{base}/_matrix/client/v3{path}"))
+                .bearer_auth(token);
+            if let Some(body) = body {
+                request = request.json(&body);
+            }
+            let response = request.send().await.unwrap();
+            let status = response.status();
+            let body: Value = response.json().await.unwrap();
+            assert!(status.is_success(), "{status}: {body}");
+            body
+        }
+    };
+    let (get, post, put) = (
+        reqwest::Method::GET,
+        reqwest::Method::POST,
+        reqwest::Method::PUT,
+    );
+
+    let mut tokens = Vec::new();
+    for (name, shown_as) in [("story-alice", "Alice"), ("story-bob", "Bob")] {
+        let registered: Value = client
+            .post(format!("{base}/_matrix/client/v3/register"))
+            .json(&json!({"username": name, "password": format!("hunter2-{name}"), "auth": {"type": "m.login.dummy"}}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let token = registered["access_token"].as_str().unwrap().to_owned();
+        call(
+            put.clone(),
+            format!("/profile/@{name}:example.org/displayname"),
+            token.clone(),
+            Some(json!({"displayname": shown_as})),
+        )
+        .await;
+        tokens.push(token);
+    }
+    let (alice, bob) = (tokens[0].clone(), tokens[1].clone());
+    let (alice_id, bob_id) = ("@story-alice:example.org", "@story-bob:example.org");
+
+    // Bob's client is already running, as it would be.
+    let synced = call(get.clone(), "/sync?timeout=0".into(), bob.clone(), None).await;
+    let since = synced["next_batch"].as_str().unwrap().to_owned();
+
+    let created = call(
+        post.clone(),
+        "/createRoom".into(),
+        alice.clone(),
+        Some(json!({
+            "preset": "trusted_private_chat",
+            "is_direct": true,
+            "invite": [bob_id],
+            "initial_state": [
+                {"type": "m.room.encryption", "state_key": "", "content": {"algorithm": "m.megolm.v1.aes-sha2"}},
+                {"type": "m.room.history_visibility", "state_key": "", "content": {"history_visibility": "invited"}},
+            ],
+        })),
+    )
+    .await;
+    let room_id = created["room_id"].as_str().unwrap().to_owned();
+    let room_path = room_id.replace('!', "%21").replace(':', "%3A");
+
+    let creator = call(
+        get.clone(),
+        format!("/rooms/{room_path}/state/m.room.member/{alice_id}"),
+        alice.clone(),
+        None,
+    )
+    .await;
+    assert_eq!(creator["displayname"], "Alice", "{creator}");
+
+    let synced = call(
+        get.clone(),
+        format!("/sync?timeout=0&since={since}"),
+        bob.clone(),
+        None,
+    )
+    .await;
+    let since = synced["next_batch"].as_str().unwrap().to_owned();
+    let invitation = synced["rooms"]["invite"][&room_id]["invite_state"]["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no invitation: {synced}"))
+        .iter()
+        .find(|e| e["type"] == "m.room.member" && e["state_key"] == bob_id)
+        .unwrap_or_else(|| panic!("the invitation is not among its own state: {synced}"))
+        .clone();
+    assert_eq!(invitation["content"]["is_direct"], true, "{invitation}");
+    assert_eq!(invitation["content"]["displayname"], "Bob", "{invitation}");
+
+    call(
+        post.clone(),
+        format!("/rooms/{room_path}/join"),
+        bob.clone(),
+        Some(json!({})),
+    )
+    .await;
+    // Lazy-loading members, the way every real client asks.
+    let filter = "%7B%22room%22%3A%7B%22state%22%3A%7B%22lazy_load_members%22%3Atrue%7D%7D%7D";
+    let synced = call(
+        get.clone(),
+        format!("/sync?timeout=0&since={since}&filter={filter}"),
+        bob.clone(),
+        None,
+    )
+    .await;
+    let since = synced["next_batch"].as_str().unwrap().to_owned();
+    let room = &synced["rooms"]["join"][&room_id];
+    let known: Vec<(&str, &str)> = ["state", "timeline"]
+        .iter()
+        .flat_map(|section| room[section]["events"].as_array().into_iter().flatten())
+        .filter_map(|e| Some((e["type"].as_str()?, e["state_key"].as_str()?)))
+        .collect();
+    for needed in [
+        ("m.room.create", ""),
+        ("m.room.encryption", ""),
+        ("m.room.power_levels", ""),
+        ("m.room.join_rules", ""),
+        ("m.room.history_visibility", ""),
+        ("m.room.member", alice_id),
+        ("m.room.member", bob_id),
+    ] {
+        assert!(
+            known.contains(&needed),
+            "{needed:?} never reached bob: {synced}"
+        );
+    }
+    assert_eq!(
+        synced["device_lists"]["changed"],
+        json!([alice_id]),
+        "{synced}"
+    );
+
+    // And then it is an ordinary room: the next thing said in it arrives on its own.
+    call(
+        put.clone(),
+        format!("/rooms/{room_path}/send/m.room.message/hello"),
+        alice.clone(),
+        Some(json!({"msgtype": "m.text", "body": "hello bob"})),
+    )
+    .await;
+    let synced = call(
+        get.clone(),
+        format!("/sync?timeout=0&since={since}&filter={filter}"),
+        bob.clone(),
+        None,
+    )
+    .await;
+    let since = synced["next_batch"].as_str().unwrap().to_owned();
+    let room = &synced["rooms"]["join"][&room_id];
+    let timeline = room["timeline"]["events"].as_array().unwrap();
+    assert_eq!(timeline.len(), 1, "{synced}");
+    assert_eq!(timeline[0]["content"]["body"], "hello bob", "{synced}");
+    assert_eq!(room["timeline"]["limited"], false, "{synced}");
+    assert_eq!(synced["device_lists"]["changed"], json!([]), "{synced}");
+
+    // Bob signs in somewhere else. The device he is already on has to hear of it, and so does
+    // Alice, who shares a room with him.
+    let alice_synced = call(get.clone(), "/sync?timeout=0".into(), alice.clone(), None).await;
+    let alice_since = alice_synced["next_batch"].as_str().unwrap().to_owned();
+    let second: Value = client
+        .post(format!("{base}/_matrix/client/v3/login"))
+        .json(&json!({
+            "type": "m.login.password",
+            "identifier": {"type": "m.id.user", "user": "story-bob"},
+            "password": "hunter2-story-bob",
+            "device_id": "SECOND",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    call(
+        post.clone(),
+        "/keys/upload".into(),
+        second["access_token"].as_str().unwrap().to_owned(),
+        Some(json!({"device_keys": {
+            "user_id": bob_id,
+            "device_id": "SECOND",
+            "algorithms": ["m.olm.v1.curve25519-aes-sha2", "m.megolm.v1.aes-sha2"],
+            "keys": {"curve25519:SECOND": "c2Vjb25kIGN1cnZl", "ed25519:SECOND": "c2Vjb25kIGVk"},
+            "signatures": {},
+        }})),
+    )
+    .await;
+    let synced = call(
+        get.clone(),
+        format!("/sync?timeout=0&since={since}"),
+        bob.clone(),
+        None,
+    )
+    .await;
+    assert_eq!(
+        synced["device_lists"]["changed"],
+        json!([bob_id]),
+        "{synced}"
+    );
+    let synced = call(
+        get.clone(),
+        format!("/sync?timeout=0&since={alice_since}"),
+        alice.clone(),
+        None,
+    )
+    .await;
+    assert_eq!(
+        synced["device_lists"]["changed"],
+        json!([bob_id]),
+        "{synced}"
     );
 
     handle.shutdown().await;

@@ -6,7 +6,9 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 
 ## The state of things
 
-**A real client works.** Element Web — the actual browser client most Matrix users run — signs in against this server, shows a room list, sends and receives messages live between two independent sessions, propagates a display-name change to an already-open tab, and scrolls back through history. Screenshots in `docs/design/screenshots/`, reproduction in `web/element-testing/README.md`. That was the project's stated definition of success from day one. The loud exception is closed: `/createRoom` merged its power-level override backwards, which made creating a room from the UI fail unconditionally, and it no longer does. `unsigned.prev_content` and `GET /account/3pid` went with it. **None of the three has been re-checked against a real Element session** — the unit and end-to-end tests cover them, and nobody has opened a browser since.
+**A real client works.** Element Web — the actual browser client most Matrix users run — signs in against this server, shows a room list, sends and receives messages live between two independent sessions, propagates a display-name change to an already-open tab, and scrolls back through history. Screenshots in `docs/design/screenshots/`, reproduction in `web/element-testing/README.md`. That was the project's stated definition of success from day one. The loud exception is closed: `/createRoom` merged its power-level override backwards, which made creating a room from the UI fail unconditionally, and it no longer does. `unsigned.prev_content` and `GET /account/3pid` went with it. Creating a room from Element's own dialog was re-checked in a real browser on 2026-09-21 (several times, encrypted rooms included); `prev_content` and `GET /account/3pid` have still only been checked by tests.
+
+**Opening Element is worth more than another Complement run, and the evidence is one evening.** On 2026-09-21, after a day of `/sync` fixes that moved csapi from 241 to 305 of 384 with every test in the repository green, two Element sessions and one invitation found four bugs none of it had seen: accepting an invitation brought the invitee their own join and no room state (so Element offered to send plain text into an encrypted room); a client never learned that the server had taken the signature on its own device (so Element marked every message its own user sent "not verified by its owner", and never offered key backup); whoever created a room had no name in it; and a direct chat's invitation did not say it was one. All four are fixed, each with a test that fails without the fix, and the first is this project's own regression from that same day -- see "What opening Element found" below.
 
 **Configuration lives in the database** (RFC 0016). The file is a bootstrap and a seed; the database outranks it, `HS__` variables outrank the database, and the admin API refuses a write the environment would shadow rather than storing one that gets ignored. The web interface has a Configuration section that builds its forms from the server's own JSON Schema, and `hs config show|get|set|unset|import|export|history` is the same thing without a browser.
 
@@ -108,7 +110,7 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 
 | Area | Where it is | Basis |
 |---|---|---|
-| Client-server API | ~72% | 301/384 csapi assertions, 76/106 top-level; a real Element session signs in, creates rooms, sends, invites, scrolls back. The number understates the day: four of the fixes behind it were `/sync` silently losing events, which no percentage shows |
+| Client-server API | ~73% | 305/384 csapi assertions at run 6 (75/106 top-level, with two regressions since fixed and not yet re-graded); two real Element sessions sign in, create an encrypted room, invite, accept, and read each other's encrypted messages. The number understates the day: four of the fixes behind it were `/sync` silently losing events, which no percentage shows |
 | Storage, rooms, state resolution | ~85% | the engine underneath; 1600+ tests, two backends through one conformance suite, state bake-off done |
 | Configuration and first run | ~90% | database-backed, editable in the UI, one command from nothing to a working server |
 | Admin API | ~23% | 34 of 145 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Config 6/6, Server 5/5, AuditLog 3/3, Setup 2/2, Users 10/41, Rooms 5/23, Statistics 1/4, Cluster 1/6, and **Bridges 0/16**, Federation 0/7, Media 0/9, RegistrationTokens 0/5 |
@@ -154,8 +156,67 @@ test, not by log line: one polling test can print the same line twenty times.
 - **`min_depth` on `/get_missing_events`**, still parsed nowhere, and history visibility still not
   applied per event there.
 
-Element has not been opened since the `/sync` changes above. The `matrix-rust-sdk` scenarios pass
-against them, which is a real client and a good sign; it is not a browser.
+#### Run 6, and what opening Element found
+
+Run 6 (2026-09-21, commit `1f84eda`): **305 of 384**, 75 of 106 top-level. `TestRoomState` moved
+to passing as predicted, `TestDeviceListUpdates` gained its leaving-a-room case -- and two tests
+*regressed*, both the same mistake: `TestLeaveEventInviteRejection` and `TestRoomsInvite`'s
+"Invited user can reject invite for empty room". `1f84eda` made `/sync` apply history visibility,
+and by the letter of those rules somebody who declines an invitation was never joined and may not
+see their own leave, so the room never moved to `leave`. A user may now always see an event about
+their own membership (`RoomActor::event_visible_to`). `TestArchivedRoomsHistory` did not move
+because its remaining complaint was a different one: a room sent whole repeated in `state` every
+state event its `timeline` already carried. It no longer does.
+
+The baseline file is still run 5's. **Run 7 has to grade everything below before it is
+rewritten**, and what it should show, by name: the two regressions back to passing,
+`TestArchivedRoomsHistory` passing, nothing else moving. The local half of
+`TestDeviceListUpdates` was passing *by accident* and should now pass on purpose: a token from an
+initial sync carried a device-list position of zero, so the first incremental sync after it
+re-reported everybody who had ever uploaded a key, which is the only reason "somebody joined your
+room" appeared to reach `device_lists.changed`. Nothing put them there. Now something does, and
+an initial sync's token starts at the present.
+
+Then Element was opened, against the real binary, two sessions and a third later
+(`web/element-testing/README.md`; a fresh server, accounts made through the admin API, one
+Element container per user so their sessions cannot collide). Found, in the order they appeared:
+
+1. **Accepting an invitation brought the invitee nothing but their own join.** No state, so no
+   `m.room.encryption`: Bob's composer read "Send an unencrypted message" in a room Alice had
+   created encrypted. The invitation leaves history in the invitee's feed, so `resume_mode` found
+   a position to resume from and treated the join as an ordinary increment. Before that morning
+   every incremental sync resent the room's whole state, which had hidden it; removing that was
+   right and this is what it uncovered. The same mistake covered coming *back* to a room after
+   leaving. `resume_mode` now asks the room whether the user was joined at the position their
+   token points to (`RoomActor::was_joined_at`), and only when their membership has changed
+   since. **Still open, same family:** a *hot* room (over 500 members) joined after the token is
+   resumed from the join, because hot rooms have no feed entries to date the join against.
+2. **`device_lists.changed` never named anybody you had just come to share a room with, and
+   never named you.** The first is the spec's "or who now share an encrypted room with the
+   client"; the second is how the device you are signed in on hears about the one you have just
+   signed in on. Both are in now, from both sides of a join, and a display-name change (also a
+   `join` event) does not count as arriving.
+3. **`POST /keys/signatures/upload` recorded no device-list change**, so nobody re-fetched a
+   device that had just been signed -- which is all that verifying a device *is*. Element's own
+   symptom: having signed its own device while setting up cross-signing, it never learned the
+   server had the signature, showed a red shield ("Encrypted by a device not verified by its
+   owner") on every message its own user sent, and never offered key backup. With the fix a new
+   account gets a green shield and the backup prompt.
+4. **Whoever created a room had no name in it.** `createRoom` wrote the creator's join, and the
+   invitations it sends, with bare content -- Alice was `@alice:test.local` to everyone in every
+   room she made -- and ignored `is_direct`, so a direct chat's invitation was filed by the
+   invitee's client as a room.
+
+All four are verified fixed in the same Element sessions: Bob accepts, sees "Encryption enabled"
+and an encrypted composer, replies, and Alice reads it decrypted. What Element has *not* been
+asked to do since: verify one session from another (the interactive emoji flow), restore from key
+backup, leave and rejoin, or anything with more than two people.
+
+**Something else it showed, not fixed:** stopping the server while clients are long-polling took
+between ten and forty seconds -- graceful shutdown waits for every open `/sync` to time out on
+its own rather than waking it. A restart that raced it found the database still locked.
+Kubernetes' default grace period is thirty seconds, so a rolling update can end in `SIGKILL`.
+Shutdown should wake the long-polls (the hub already has a waker per user).
 
 ### 2. Make it fun to administer — the half that is left
 

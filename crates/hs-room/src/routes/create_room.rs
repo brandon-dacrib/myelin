@@ -157,12 +157,29 @@ pub async fn post_create_room<B: KvBackend + 'static>(
     // published, and invite-only.
     let preset = preset.or_else(|| publish.then(|| "public_chat".to_owned()));
 
+    let invite = parse_user_list(&body, "invite")?;
+    // The membership events creating the room sends -- the creator's join, the invitations --
+    // say who these people are, like any other membership event. And the invitations of a
+    // direct chat say that it is one: `is_direct` on the invitation is the only way the invitee's
+    // client can know to file the room under people rather than rooms.
+    let is_direct = body.get("is_direct").and_then(Value::as_bool) == Some(true);
+    let mut member_content = std::collections::HashMap::new();
+    for user in std::iter::once(&requester.user_id).chain(&invite) {
+        let mut content = json!({});
+        if is_direct && user != &requester.user_id {
+            content["is_direct"] = Value::Bool(true);
+        }
+        crate::routes::membership::fill_in_profile(&state, user, &mut content).await;
+        member_content.insert(user.clone(), content);
+    }
+
     let request = CreateRoomRequest {
         room_version,
         preset,
         name: body.get("name").and_then(Value::as_str).map(str::to_owned),
         topic: body.get("topic").and_then(Value::as_str).map(str::to_owned),
-        invite: parse_user_list(&body, "invite")?,
+        invite,
+        member_content,
         initial_state: parse_initial_state(&body)?,
         power_level_content_override,
         creation_content,

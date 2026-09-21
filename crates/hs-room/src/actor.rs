@@ -60,6 +60,13 @@ pub struct CreateRoomRequest {
     pub creation_content: serde_json::Value,
     /// `room_alias_name`: the localpart of a local alias to create for this room.
     pub room_alias_name: Option<String>,
+    /// What the `m.room.member` events that creating this room sends carry besides `membership`,
+    /// by the user each is about: the creator's join, and each invitee's invitation. That is
+    /// their profile as it stands (a membership event is where a room's members learn each
+    /// other's names), and `is_direct` on the invitations of a direct chat. Filled in by
+    /// `crate::routes::create_room`, because profiles are not something a room knows; a user
+    /// with no entry gets a bare event.
+    pub member_content: HashMap<OwnedUserId, serde_json::Value>,
     /// An explicit room ID to use instead of generating a fresh random one. `None` (the ordinary
     /// `POST /createRoom` case) means "generate one" ([`RoomId::new_v1`]). `Some` exists for
     /// `POST /rooms/{roomId}/upgrade` (`crate::routes::upgrade`), which must know the replacement
@@ -1302,11 +1309,18 @@ impl<B: KvBackend> RoomActor<B> {
             now_ms,
         )?;
 
+        let member_content = |user: &UserId| {
+            request
+                .member_content
+                .get(user)
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}))
+        };
         actor.membership_action(
             creator.clone(),
             Action::Join,
             creator.clone(),
-            serde_json::json!({}),
+            member_content(&creator),
             now_ms,
         )?;
 
@@ -1495,7 +1509,7 @@ impl<B: KvBackend> RoomActor<B> {
                 creator.clone(),
                 Action::Invite,
                 user.clone(),
-                serde_json::json!({}),
+                member_content(user),
                 now_ms,
             )?;
         }
@@ -2297,6 +2311,30 @@ impl<B: KvBackend> RoomActor<B> {
             == Some("join"))
     }
 
+    /// Whether `user` was joined to this room as of timeline position `room_pos`: the state
+    /// immediately after the last event at or before that position. `false` when the position
+    /// is before the room's first event.
+    ///
+    /// `/sync` asks this about the position a client's token points to, to tell a room the
+    /// client has been following from one it has only just come into -- by accepting an
+    /// invitation, or by coming back after leaving. Both leave history in the user's feed from
+    /// before they were joined, so "is there a position to resume from" cannot tell them apart,
+    /// and the second kind needs the room sent whole.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::State`] if the state store fails.
+    pub fn was_joined_at(&self, user: &UserId, room_pos: i64) -> Result<bool, RoomError> {
+        let Some((_, sn)) = self.timeline.range(..=room_pos).next_back() else {
+            return Ok(false);
+        };
+        Ok(self
+            .state_view_at_sn(*sn)?
+            .event_for("m.room.member", user.as_str())
+            .map_err(|e| RoomError::State(e.to_string()))?
+            .and_then(|e| content_str(e, "membership"))
+            == Some("join"))
+    }
+
     /// The room-local send position (`room_pos`) of a known [`EventSn`], by linear scan of
     /// `self.timeline`. Phase 0 scope, same tradeoff as `RoomActor::get_context`'s full scan for
     /// an event's position: this crate holds a room's whole timeline resident in memory already
@@ -2313,9 +2351,10 @@ impl<B: KvBackend> RoomActor<B> {
     /// algorithm (`crate::history_visibility`; ported from
     /// `refs/matrix-spec/content/client-server-api/modules/history_visibility.md`'s "Server
     /// behaviour" section, CC-BY-4.0). Evaluated against the room's state **as of `event`**, with
-    /// the two "before or after" special cases that section documents for
-    /// `m.room.history_visibility` events and for the requester's own `m.room.member` events --
-    /// not just the room's *current* setting, which is what let a user who had left a
+    /// the "before or after" special case that section documents for
+    /// `m.room.history_visibility` events, and with the requester's own `m.room.member` events
+    /// always visible to them (wider than that section's own "before or after" rule for them;
+    /// the body says why) -- not just the room's *current* setting, which is what let a user who had left a
     /// non-world-readable room read full event content before this method existed (this crate's
     /// security-fix session; see `docs/status/04-room-and-events.md`).
     ///
@@ -2324,6 +2363,18 @@ impl<B: KvBackend> RoomActor<B> {
     /// this actor does not hold `event` (should not happen for an event this same actor just
     /// handed back from its own cache).
     pub fn event_visible_to(&self, event: &Event, requester: &UserId) -> Result<bool, RoomError> {
+        // The spec's rule for a user's own membership events is "allowed under their membership
+        // before it, or after it" -- and then there is the case that rule leaves out. Somebody
+        // who declines an invitation (or has it withdrawn, or is banned while still only
+        // invited) was never joined, so under anything but `invited` visibility neither side of
+        // their own leave lets them see it: `/sync` never moved the room to `leave`, and the
+        // invitation sat in their client for good. An event about a user's own membership tells
+        // them nothing they are not entitled to know, so they may always see it.
+        if event.header().event_type == "m.room.member"
+            && event.header().state_key.as_deref() == Some(requester.as_str())
+        {
+            return Ok(true);
+        }
         let sn = *self
             .event_id_index
             .get(event.event_id())
@@ -2364,12 +2415,6 @@ impl<B: KvBackend> RoomActor<B> {
                 .map_err(|e| RoomError::State(e.to_string()))?
                 .and_then(|e| content_str(e, "history_visibility")),
         );
-        let membership_before = parse_membership(
-            before
-                .event_for("m.room.member", requester.as_str())
-                .map_err(|e| RoomError::State(e.to_string()))?
-                .and_then(|e| content_str(e, "membership")),
-        );
         let membership_after = parse_membership(
             after
                 .event_for("m.room.member", requester.as_str())
@@ -2377,16 +2422,10 @@ impl<B: KvBackend> RoomActor<B> {
                 .and_then(|e| content_str(e, "membership")),
         );
 
-        let event_type = event.header().event_type.as_str();
-        let is_own_member_event = event_type == "m.room.member"
-            && event.header().state_key.as_deref() == Some(requester.as_str());
-        let is_hv_event = event_type == "m.room.history_visibility";
+        let is_hv_event = event.header().event_type == "m.room.history_visibility";
 
         let allowed = if is_hv_event {
             history_visibility::base_rule_allows(hv_before, membership_after, joined_later)
-                || history_visibility::base_rule_allows(hv_after, membership_after, joined_later)
-        } else if is_own_member_event {
-            history_visibility::base_rule_allows(hv_after, membership_before, joined_later)
                 || history_visibility::base_rule_allows(hv_after, membership_after, joined_later)
         } else {
             history_visibility::base_rule_allows(hv_after, membership_after, joined_later)

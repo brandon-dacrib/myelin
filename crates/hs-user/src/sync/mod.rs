@@ -164,6 +164,22 @@ async fn resume_mode<B: KvBackend + 'static, R: RoomSource<B>>(
         .room_pos_as_of(user_id, room_id, baseline.feed_seq)
         .await?
     {
+        // A position to resume from is not the same as having been *in* the room at it. Somebody
+        // who was invited and has now accepted, or who left and has come back, has feed history
+        // from before they were joined; resumed from there, all they are sent is their own join,
+        // with no state -- so no `m.room.encryption`, and Element offered to send plain text
+        // into an encrypted room. They are new to the room and get it whole. Only worth asking
+        // the room when their membership has changed since that position at all.
+        if membership.membership == "join" && membership.room_pos > pos {
+            let handle = hub.rooms().get_or_load(room_id).await?;
+            let user = user_id.to_owned();
+            let was_joined = handle
+                .query(move |actor| actor.was_joined_at(&user, pos))
+                .await?;
+            if !was_joined {
+                return Ok(ResumeMode::FreshRoom);
+            }
+        }
         return Ok(ResumeMode::Incremental(pos));
     }
     // No feed history at or before the token for this room. There are two ways to get here, and
@@ -699,6 +715,13 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     // Everyone in a room this user joined since their token. Their presence is sent whatever its
     // stamp says: see where it is read, below.
     let mut newly_visible: BTreeSet<OwnedUserId> = BTreeSet::new();
+    // Everyone this user has come to share a room with since their token, from either side: the
+    // members of a room they have just joined, and whoever has just joined a room they were
+    // already in. The spec puts both in `device_lists.changed` ("or who now share an encrypted
+    // room with the client"), and nothing did: the only thing that ever reached `changed` was a
+    // key upload. Not restricted to encrypted rooms, because a room can become one later and
+    // nothing would announce its members then.
+    let mut newly_shared: BTreeSet<OwnedUserId> = BTreeSet::new();
 
     for room_id in &candidate_rooms {
         if !params.filter.room_allowed(room_id.as_str()) {
@@ -759,16 +782,15 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
 
         let resume = resume_mode(hub, user_id, room_id, &baseline, is_initial, &membership).await?;
         let force_full_state = full_state_requested || matches!(resume, ResumeMode::FreshRoom);
-        if !is_initial && matches!(resume, ResumeMode::FreshRoom) && membership.membership == "join"
-        {
+        let fresh_room = matches!(resume, ResumeMode::FreshRoom);
+        if !is_initial && fresh_room && membership.membership == "join" {
+            let members = hub.joined_member_ids(room_id).await?;
             // Bounded, because a room can have tens of thousands of members and this is one
             // response. Past the bound the client still learns about people as they do things.
-            newly_visible.extend(
-                hub.joined_member_ids(room_id)
-                    .await?
-                    .into_iter()
-                    .take(NEWLY_JOINED_PRESENCE_LIMIT),
-            );
+            newly_visible.extend(members.iter().take(NEWLY_JOINED_PRESENCE_LIMIT).cloned());
+            // Not bounded: somebody left out of this is somebody whose devices never get the
+            // keys to what this user says.
+            newly_shared.extend(members);
         }
 
         let account_data = if force_full_state {
@@ -794,7 +816,6 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
 
         let (timeline, state_events, summary) = handle
             .query(move |actor| {
-                let fresh_room = matches!(resume, ResumeMode::FreshRoom);
                 let timeline = match resume {
                     ResumeMode::Incremental(pos) => build_incremental_timeline(
                         actor,
@@ -822,22 +843,16 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                     .iter()
                     .filter_map(|e| e.get("sender").and_then(Value::as_str).map(str::to_owned))
                     .collect();
-                let state = if force_full_state {
-                    build_state_section(
-                        actor,
-                        &HashSet::new(),
-                        lazy,
-                        &timeline_senders,
-                        &user_id_owned,
-                        state_content_filter.as_ref(),
-                    )?
-                } else if fresh_room || timeline.limited {
-                    // A room the client has no baseline for, or a gap: the client's idea of the
-                    // room's state cannot be brought up to date by the timeline alone, so it gets
-                    // the current state (less whatever the timeline already carries). For a gap
-                    // that is more than the strict minimum -- the spec asks for the state changes
-                    // *between* `since` and the start of the timeline -- and it errs in the safe
-                    // direction: a repeated state event is harmless, a missed one is a stale room.
+                let state = if force_full_state || timeline.limited {
+                    // A room the client has no baseline for (an initial sync, `full_state`, a
+                    // room new to it) or a gap: the client's idea of the room's state cannot be
+                    // brought up to date by the timeline alone, so it gets the current state --
+                    // less whatever the timeline already carries, which would otherwise reach it
+                    // twice. A room sent whole used to skip that subtraction, and Complement's
+                    // `TestArchivedRoomsHistory` is a client that counts. For a gap this is more
+                    // than the strict minimum -- the spec asks for the state changes *between*
+                    // `since` and the start of the timeline -- and it errs in the safe direction:
+                    // a repeated state event is harmless, a missed one is a stale room.
                     build_state_section(
                         actor,
                         &timeline_ids,
@@ -899,6 +914,25 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             {
                 left_candidates.insert(other);
             }
+            // Somebody else arriving -- and not merely changing their display name, which is
+            // also a `join` event, and in a big room would have every member re-fetching the
+            // keys of anyone who so much as changed their avatar.
+            let was_joined = event
+                .pointer("/unsigned/prev_content/membership")
+                .and_then(Value::as_str)
+                == Some("join");
+            if membership == Some("join")
+                && !was_joined
+                && let Ok(other) = ruma::UserId::parse(state_key)
+            {
+                newly_shared.insert(other);
+            }
+        }
+        // A gap: whoever joined inside it is in no timeline this client will be sent. Everyone
+        // in the room is named instead -- more than the minimum, and the direction that costs a
+        // key query rather than a message nobody can read.
+        if !is_initial && !fresh_room && timeline.limited && membership.membership == "join" {
+            newly_shared.extend(hub.joined_member_ids(room_id).await?);
         }
 
         // Only a joined room can have typing or receipt activity (both maps above are only ever
@@ -1066,15 +1100,26 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     // `device_lists.changed`/`left`: per spec, only meaningful (and only sent) on an incremental
     // sync. Scoped to `shared` -- see the module docs.
     let (device_lists_json, new_device_list_seq) = if is_initial {
-        (None, baseline.device_list_seq)
+        // A client starting from nothing holds no device lists to be told are stale, so its
+        // token starts at the present. It used to start at zero, and the first incremental sync
+        // after every initial one reported everybody who had ever uploaded a key -- which is
+        // also what hid, from every test that began with an initial sync, that joining a room
+        // put nobody in `changed`.
+        (None, DeviceKeyStore::current_stream_pos(&**e2e).await?)
     } else {
         let upto = DeviceKeyStore::current_stream_pos(&**e2e).await?;
         let changed_all =
             DeviceKeyStore::changed_users_since(&**e2e, baseline.device_list_seq, Some(upto))
                 .await?;
-        let changed: Vec<Value> = changed_all
+        // The user's own id belongs here too: it is how the device they are already signed in
+        // on hears about the one they have just signed in on.
+        let changed: BTreeSet<&OwnedUserId> = changed_all
             .iter()
-            .filter(|u| shared.contains(*u))
+            .filter(|u| shared.contains(*u) || u.as_str() == user_id.as_str())
+            .chain(newly_shared.iter().filter(|u| shared.contains(*u)))
+            .collect();
+        let changed: Vec<Value> = changed
+            .into_iter()
             .map(|u| Value::String(u.to_string()))
             .collect();
         let left: Vec<Value> = left_candidates
@@ -1801,6 +1846,11 @@ mod tests {
             )
             .await
             .unwrap();
+        // Enough said since that the room's state is no longer in its timeline: `state` leaves
+        // out what the timeline already carries, and it is `state` this filter is about.
+        for n in 0..DEFAULT_TIMELINE_LIMIT as i64 {
+            say(&handle, &alice, "filler", 3 + n).await;
+        }
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         let mut p = params(None);
@@ -3582,5 +3632,468 @@ mod tests {
         let (response, _) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
         let said = all_bodies(&response["rooms"]["join"][room_id.as_str()]);
         assert!(said.contains(&"before bob".to_owned()) && said.contains(&"after bob".to_owned()));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Coming into a room you already had history with: an invitation accepted, a return.
+    // ---------------------------------------------------------------------------------------
+
+    /// Every `(type, state_key)` a joined room's entry gives the client, from either section.
+    fn state_known_to_client(room: &Value) -> BTreeSet<(String, String)> {
+        ["state", "timeline"]
+            .iter()
+            .flat_map(|section| {
+                room[section]["events"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter_map(|e| {
+                Some((
+                    e.get("type")?.as_str()?.to_owned(),
+                    e.get("state_key")?.as_str()?.to_owned(),
+                ))
+            })
+            .collect()
+    }
+
+    /// An encrypted private room, the way Element makes one.
+    async fn encrypted_private_room(
+        hub: &TestHub,
+        creator: &UserId,
+    ) -> hs_room::actor::RoomActorHandle<MemoryBackend> {
+        hub.rooms()
+            .create_room(
+                creator.to_owned(),
+                CreateRoomRequest {
+                    preset: Some("private_chat".to_owned()),
+                    name: Some("Plans".to_owned()),
+                    initial_state: vec![
+                        hs_room::actor::InitialStateEvent {
+                            event_type: "m.room.encryption".to_owned(),
+                            state_key: String::new(),
+                            content: serde_json::json!({"algorithm": "m.megolm.v1.aes-sha2"}),
+                        },
+                        hs_room::actor::InitialStateEvent {
+                            event_type: "m.room.history_visibility".to_owned(),
+                            state_key: String::new(),
+                            content: serde_json::json!({"history_visibility": "invited"}),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Found with Element, not with a test: Bob accepted an invitation to an encrypted room and
+    /// his composer offered to "Send an unencrypted message". The invitation had left history
+    /// in his feed, so his join was resumed from it as if he had been following the room all
+    /// along, and all he was sent was his own join event: no state, so no `m.room.encryption`.
+    #[tokio::test]
+    async fn accepting_an_invitation_brings_the_whole_room_not_just_your_own_join() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let device = ruma::device_id!("BOB");
+        std::mem::forget(hub.watch_all(hub.rooms().subscribe_global()));
+        let (_, token) = build(&hub, &e2e, &bob, params(None)).await.unwrap();
+
+        let handle = encrypted_private_room(&hub, &alice).await;
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        say(&handle, &alice, "before bob was asked", 2).await;
+        handle
+            .membership(
+                alice.clone(),
+                Action::Invite,
+                bob.clone(),
+                serde_json::json!({}),
+                3,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Bob's client sees the invitation, and says so by syncing again from the new token.
+        let (response, token) = build(&hub, &e2e, &bob, params(Some(token))).await.unwrap();
+        assert!(
+            response["rooms"]["invite"].get(room_id.as_str()).is_some(),
+            "{response}"
+        );
+        hub.store()
+            .record_device_cursor(&bob, device, token.feed_seq)
+            .await
+            .unwrap();
+
+        handle
+            .membership(
+                bob.clone(),
+                Action::Join,
+                bob.clone(),
+                serde_json::json!({}),
+                4,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (response, token) = build(&hub, &e2e, &bob, params(Some(token))).await.unwrap();
+        let room = &response["rooms"]["join"][room_id.as_str()];
+        let known = state_known_to_client(room);
+        for event_type in [
+            "m.room.create",
+            "m.room.encryption",
+            "m.room.power_levels",
+            "m.room.join_rules",
+            "m.room.history_visibility",
+            "m.room.name",
+        ] {
+            assert!(
+                known.contains(&(event_type.to_owned(), String::new())),
+                "{event_type} never reached bob: {response}"
+            );
+        }
+        assert!(
+            known.contains(&("m.room.member".to_owned(), alice.to_string())),
+            "{response}"
+        );
+        // History visibility is `invited`, and this was said before he was.
+        assert!(
+            !all_bodies(room).contains(&"before bob was asked".to_owned()),
+            "{response}"
+        );
+        // The people he now shares a room with are people whose keys he needs.
+        let changed = response["device_lists"]["changed"].as_array().unwrap();
+        assert!(
+            changed.contains(&Value::String(alice.to_string())),
+            "{response}"
+        );
+
+        // And it is news once: the room is one he is following now.
+        hub.store()
+            .record_device_cursor(&bob, device, token.feed_seq)
+            .await
+            .unwrap();
+        say(&handle, &alice, "welcome", 5).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (response, _) = build(&hub, &e2e, &bob, params(Some(token))).await.unwrap();
+        let room = &response["rooms"]["join"][room_id.as_str()];
+        assert_eq!(
+            bodies(&room["timeline"]),
+            vec!["welcome".to_owned()],
+            "{response}"
+        );
+        assert_eq!(room["timeline"]["limited"], false, "{response}");
+        assert!(
+            room["state"]["events"].as_array().unwrap().is_empty(),
+            "{response}"
+        );
+    }
+
+    /// The same mistake from the other direction: somebody who left and has come back has feed
+    /// history from before they went. What changed while they were away was never sent to them
+    /// (rightly), so resuming from there tells them nothing about the room they have rejoined.
+    #[tokio::test]
+    async fn coming_back_to_a_room_brings_what_changed_while_you_were_away() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let device = ruma::device_id!("BOB");
+        std::mem::forget(hub.watch_all(hub.rooms().subscribe_global()));
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        let join = |ts| {
+            handle.membership(
+                bob.clone(),
+                Action::Join,
+                bob.clone(),
+                serde_json::json!({}),
+                ts,
+            )
+        };
+        join(2).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (_, token) = build(&hub, &e2e, &bob, params(None)).await.unwrap();
+        hub.store()
+            .record_device_cursor(&bob, device, token.feed_seq)
+            .await
+            .unwrap();
+
+        handle
+            .membership(
+                bob.clone(),
+                Action::Leave,
+                bob.clone(),
+                serde_json::json!({}),
+                3,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (response, token) = build(&hub, &e2e, &bob, params(Some(token))).await.unwrap();
+        assert!(
+            response["rooms"]["leave"].get(room_id.as_str()).is_some(),
+            "{response}"
+        );
+        hub.store()
+            .record_device_cursor(&bob, device, token.feed_seq)
+            .await
+            .unwrap();
+
+        handle
+            .send_event(
+                alice.clone(),
+                "m.room.name".to_owned(),
+                Some(String::new()),
+                serde_json::json!({"name": "Renamed while bob was out"}),
+                None,
+                4,
+            )
+            .await
+            .unwrap();
+        join(5).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (response, _) = build(&hub, &e2e, &bob, params(Some(token))).await.unwrap();
+        let room = &response["rooms"]["join"][room_id.as_str()];
+        // Wherever it arrives -- a room sent whole carries its state in both sections.
+        let names: BTreeSet<&str> = ["state", "timeline"]
+            .iter()
+            .flat_map(|section| room[section]["events"].as_array().unwrap())
+            .filter(|e| e["type"] == "m.room.name")
+            .filter_map(|e| e["content"]["name"].as_str())
+            .collect();
+        assert_eq!(
+            names,
+            BTreeSet::from(["Renamed while bob was out"]),
+            "{response}"
+        );
+    }
+
+    /// The other side of a join: the people already in the room now share it with the newcomer,
+    /// and have to be told so or they never fetch the newcomer's keys. Complement's version of
+    /// this passed only because its client had just done an initial sync, whose token used to
+    /// carry a device-list position of zero and so re-reported everybody.
+    #[tokio::test]
+    async fn somebody_joining_your_room_is_somebody_whose_keys_you_now_need() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let device = ruma::device_id!("ALICE");
+        std::mem::forget(hub.watch_all(hub.rooms().subscribe_global()));
+        // Bob's keys were uploaded long ago, as far as alice's token will be concerned.
+        DeviceKeyStore::record_device_list_change(&*e2e, &bob)
+            .await
+            .unwrap();
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (_, token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+        // Settled: nothing about bob is pending before he arrives.
+        let (response, token) = build(&hub, &e2e, &alice, params(Some(token)))
+            .await
+            .unwrap();
+        assert_eq!(
+            response["device_lists"]["changed"],
+            serde_json::json!([]),
+            "{response}"
+        );
+        hub.store()
+            .record_device_cursor(&alice, device, token.feed_seq)
+            .await
+            .unwrap();
+
+        let join = |content: Value, ts| {
+            handle.membership(bob.clone(), Action::Join, bob.clone(), content, ts)
+        };
+        join(serde_json::json!({}), 2).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (response, token) = build(&hub, &e2e, &alice, params(Some(token)))
+            .await
+            .unwrap();
+        assert_eq!(
+            response["device_lists"]["changed"],
+            serde_json::json!([bob.as_str()]),
+            "{response}"
+        );
+
+        // A new display name is a `join` event too, and is not an arrival.
+        hub.store()
+            .record_device_cursor(&alice, device, token.feed_seq)
+            .await
+            .unwrap();
+        join(serde_json::json!({"displayname": "Robert"}), 3)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (response, _) = build(&hub, &e2e, &alice, params(Some(token)))
+            .await
+            .unwrap();
+        assert_eq!(
+            response["device_lists"]["changed"],
+            serde_json::json!([]),
+            "{response}"
+        );
+    }
+
+    /// A user's own id in `device_lists.changed` is how the device they are signed in on hears
+    /// about the one they have just signed in on. It was filtered out with everybody else who
+    /// "does not share a room" with them.
+    #[tokio::test]
+    async fn your_own_new_device_is_news_to_your_other_devices() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let (_, token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+        DeviceKeyStore::record_device_list_change(&*e2e, &alice)
+            .await
+            .unwrap();
+        let (response, _) = build(&hub, &e2e, &alice, params(Some(token)))
+            .await
+            .unwrap();
+        assert_eq!(
+            response["device_lists"]["changed"],
+            serde_json::json!([alice.as_str()]),
+            "{response}"
+        );
+    }
+
+    /// Complement caught this one (`TestLeaveEventInviteRejection`, and "Invited user can reject
+    /// invite for empty room") the run after `/sync` began applying history visibility: somebody
+    /// who declines an invitation was never joined, so by the letter of the visibility rules
+    /// they may not see their own leave -- and the invitation never left their client.
+    #[tokio::test]
+    async fn declining_an_invitation_moves_the_room_to_leave() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        std::mem::forget(hub.watch_all(hub.rooms().subscribe_global()));
+        let handle = hub
+            .rooms()
+            .create_room(alice.clone(), CreateRoomRequest::default(), 1)
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        handle
+            .membership(
+                alice.clone(),
+                Action::Invite,
+                bob.clone(),
+                serde_json::json!({}),
+                2,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (response, token) = build(&hub, &e2e, &bob, params(None)).await.unwrap();
+        assert!(
+            response["rooms"]["invite"].get(room_id.as_str()).is_some(),
+            "{response}"
+        );
+        hub.store()
+            .record_device_cursor(&bob, ruma::device_id!("BOB"), token.feed_seq)
+            .await
+            .unwrap();
+
+        handle
+            .membership(
+                bob.clone(),
+                Action::Leave,
+                bob.clone(),
+                serde_json::json!({}),
+                3,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (response, _) = build(&hub, &e2e, &bob, params(Some(token))).await.unwrap();
+        let events = response["rooms"]["leave"][room_id.as_str()]["timeline"]["events"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the room never moved to leave: {response}"));
+        assert!(
+            events.iter().any(|e| e["type"] == "m.room.member"
+                && e["state_key"] == bob.as_str()
+                && e["content"]["membership"] == "leave"),
+            "{response}"
+        );
+        // And nothing else of a room he was never in.
+        assert!(
+            events.iter().all(|e| e["state_key"] == bob.as_str()),
+            "{response}"
+        );
+    }
+
+    /// A room sent whole -- an initial sync, a room the client has just come into -- carries its
+    /// state in `state` *or* in `timeline`, never the same event in both. It used to send every
+    /// state event the timeline held a second time, which Complement's
+    /// `TestArchivedRoomsHistory` counts, and which is most of a small room sent twice.
+    #[tokio::test]
+    async fn a_room_sent_whole_says_each_thing_once() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        std::mem::forget(hub.watch_all(hub.rooms().subscribe_global()));
+        let handle = hub
+            .rooms()
+            .create_room(alice.clone(), CreateRoomRequest::default(), 1)
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let mut full_state = params(None);
+        full_state.full_state = true;
+        for p in [params(None), full_state] {
+            let (response, _) = build(&hub, &e2e, &alice, p).await.unwrap();
+            let room = &response["rooms"]["join"][room_id.as_str()];
+            let ids = |section: &str| -> Vec<String> {
+                room[section]["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|e| e["event_id"].as_str().unwrap().to_owned())
+                    .collect()
+            };
+            let (state, timeline) = (ids("state"), ids("timeline"));
+            assert!(!timeline.is_empty(), "{response}");
+            assert!(
+                state.iter().all(|id| !timeline.contains(id)),
+                "said twice: {response}"
+            );
+            // Nothing went missing in the subtraction.
+            let known = state_known_to_client(room);
+            assert!(
+                known.contains(&("m.room.create".to_owned(), String::new())),
+                "{response}"
+            );
+        }
     }
 }
