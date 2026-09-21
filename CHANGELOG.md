@@ -37,6 +37,14 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
   generate, and an administrator switch that says what it means. It ends on a hand-over view
   with the user ID and password to copy, because the password is about to be unrecoverable and
   still has to reach a person. Refusals land beside the field they are about.
+- **`/sync` shows a user what they are allowed to see.** It applied no history-visibility check
+  at all, so somebody who had left a room (or been removed from it) could be sent what was said
+  after they went, and somebody joining a members-only-history room what was said before they
+  arrived. It now applies the same per-event rule `/messages` always has.
+- **`/sync` stopped losing things.** Four separate ways a client could silently miss events --
+  a gap answered with the oldest page instead of the newest, a new room resumed from the wrong
+  place, an event landing mid-response, presence not crossing a join -- plus one way it never
+  waited at all. All found by reading a Complement log for mechanisms rather than totals.
 - **The user directory no longer lets anyone list everyone.** A search finds people you share a
   room with and members of public rooms, as the specification requires; finding everybody is an
   explicit setting (`auth.user_directory_search_all_users`), off by default because bridged
@@ -75,7 +83,7 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
 
 ### Conformance
 
-- **Complement `csapi`: 289 of 384 assertions**, 72 of 106 top-level tests, measured 2026-09-21;
+- **Complement `csapi`: 301 of 384 assertions**, 76 of 106 top-level tests, measured 2026-09-21;
   241 of 370 that morning, 191 of 296 the run before that. The first run this project ever took was 125; the suite had never
   been run before that.
 - **Complement federation package: 59 of 246 assertions**, 6 of 88 top-level, and for the first

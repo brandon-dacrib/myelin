@@ -1894,6 +1894,58 @@ async fn rooms_refuse_what_the_spec_says_they_must_and_spell_out_their_defaults(
         );
     }
 
+    // ---- 2b. `joined_members` names both profile keys; `format=event` is the whole event. ----
+    let joined: serde_json::Value = client
+        .get(format!(
+            "{base}/_matrix/client/v3/rooms/{}/joined_members",
+            enc(&room)
+        ))
+        .bearer_auth(&alice)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let me = joined["joined"]["@policy-alice:example.org"]
+        .as_object()
+        .expect("alice is listed");
+    assert!(
+        me.contains_key("display_name") && me.contains_key("avatar_url"),
+        "{joined}"
+    );
+
+    let member_url = format!(
+        "{base}/_matrix/client/v3/rooms/{}/state/m.room.member/%40policy-alice%3Aexample.org",
+        enc(&room)
+    );
+    let content: serde_json::Value = client
+        .get(&member_url)
+        .bearer_auth(&alice)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(content["membership"], "join");
+    assert!(
+        content.get("sender").is_none(),
+        "the default is the content alone: {content}"
+    );
+    let event: serde_json::Value = client
+        .get(format!("{member_url}?format=event"))
+        .bearer_auth(&alice)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(event["sender"], "@policy-alice:example.org", "{event}");
+    assert_eq!(event["room_id"], room.as_str());
+    assert_eq!(event["content"]["membership"], "join");
+
     // ---- 3. A canonical alias has to be this room's alias. ----
     let set_canonical = |room: String, content: serde_json::Value| {
         let (client, base, alice) = (client.clone(), base.clone(), alice.clone());

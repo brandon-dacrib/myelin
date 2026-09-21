@@ -16,8 +16,8 @@ While the server has no administrator it logs a one-time setup link at every sta
 
 **The admin interface ships.** Until 2026-09-21 it did not: every binary and every published image served a placeholder at `/admin/` saying the interface had not been built in, because nothing embedded `web/dist`. `crates/hs-admin/build.rs` now stages the built interface (or the placeholder, for a Rust-only checkout, and says so at startup); release builds set `HS_ADMIN_WEB_DIST` and *fail* without a built interface; CD refuses to publish an image whose `/admin/` is not the interface. Verified on the published artifact: `ghcr.io/brandon-dacrib/myelin:main`, pulled from the registry on 2026-09-21 and run with the README's exact command, serves the interface at `/admin/`, answers `needs_setup: true`, and logs the setup link. What has still never run is the `v*` binaries job's new Node step, which only a tag exercises.
 
-**Complement, `csapi`: 289 of 384 assertions pass** (72 of 106 top-level), measured 2026-09-21 at
-`213bc77`. The same morning it was 241 of 370 (61 of 104); before that 191/296, 148/293 and
+**Complement, `csapi`: 301 of 384 assertions pass** (76 of 106 top-level), measured 2026-09-21 at
+`b4fa13e`. The same morning it was 241 of 370 (61 of 104); before that 191/296, 148/293 and
 125/293. The denominator grew because the harness image now configures Complement's shared
 secret, which un-skipped two tests: `TestCanRegisterAdmin` passes, and `TestServerNotices` runs
 for the first time and fails, since server notices do not exist here.
@@ -50,7 +50,17 @@ as a named Complement regression the moment the one before it was fixed:
 - Presence has one sequence for the whole server while a record's audience grows as people join
   rooms, so neither the joiner nor the people already there were told about each other.
 
-All four are fixed, each with a test that states the invariant rather than the instance (*the
+And one that was not a delivery bug but a disclosure. `/sync` built a room's timeline and state
+the same way whatever the requester's relation to it: the latest events, the live state, no
+history-visibility check. So a user who had left, or been kicked or banned, and then did an
+initial sync with `include_leave` was sent the room's *latest* messages and its current state --
+everything since they were gone -- and a user joining a room whose history is for members from
+the point they joined was sent what came before. `/messages`, `/event`, `/context` and `/threads`
+had applied the per-event rule all along; `/sync`, which is where a client's timeline actually
+comes from, had not. It does now, reads state through the reader's view, and ends a departed
+user's page at their departure. Found by reading for `TestArchivedRoomsHistory`.
+
+All of these are fixed, each with a test that states the invariant rather than the instance (*the
 token a sync hands back must not itself count as news*; *say how far you have read before you
 read*). What is left of the same family, known and not yet done: a very large ("hot") room
 joined after the token is still resumed from the join rather than sent whole, and a requester
@@ -98,7 +108,7 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 
 | Area | Where it is | Basis |
 |---|---|---|
-| Client-server API | ~70% | 289/384 csapi assertions, 72/106 top-level; a real Element session signs in, creates rooms, sends, invites, scrolls back. The number understates the day: four of the fixes behind it were `/sync` silently losing events, which no percentage shows |
+| Client-server API | ~72% | 301/384 csapi assertions, 76/106 top-level; a real Element session signs in, creates rooms, sends, invites, scrolls back. The number understates the day: four of the fixes behind it were `/sync` silently losing events, which no percentage shows |
 | Storage, rooms, state resolution | ~85% | the engine underneath; 1600+ tests, two backends through one conformance suite, state bake-off done |
 | Configuration and first run | ~90% | database-backed, editable in the UI, one command from nothing to a working server |
 | Admin API | ~23% | 34 of 145 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Config 6/6, Server 5/5, AuditLog 3/3, Setup 2/2, Users 10/41, Rooms 5/23, Statistics 1/4, Cluster 1/6, and **Bridges 0/16**, Federation 0/7, Media 0/9, RegistrationTokens 0/5 |
@@ -120,7 +130,7 @@ beyond a loadgen harness, `cargo fuzz` never run, Sytest never run, and no real 
 
 ### 1. Keep pulling on the measurement
 
-`python3 tools/complement_triage.py <log>` against run 4 (2026-09-21), largest first. Count by
+`python3 tools/complement_triage.py <log>` against run 5 (2026-09-21), largest first. Count by
 test, not by log line: one polling test can print the same line twenty times.
 
 - **`TestServerNotices` (9)**: newly running, not newly broken. Server notices are unimplemented
@@ -129,14 +139,15 @@ test, not by log line: one polling test can print the same line twenty times.
 - **`TestDeviceListUpdates` (8)**: device-list tracking when users join and leave rooms.
 - **`TestMessagesOverFederation` (6), `TestPushRuleRoomUpgrade` (6)**: both die joining a room
   over federation with `404 room not found` -- item 3, the room bootstrap API.
-- **`TestArchivedRoomsHistory` (6)**: `rooms.leave` in `/sync` carries state it should not, and
-  the wrong timeline.
+- **`TestArchivedRoomsHistory` (6)**: fixed after run 4, not yet graded -- and it was a disclosure,
+  not a formatting problem; see "What fixing it uncovered" above.
 - **`TestRoomState` (5)**, **`TestSync` (4)**: mixed; read the reasons.
-- **Fixed after run 4 and not yet graded**: `TestThreadsEndpoint` (threads were ordered by
-  millisecond timestamp with an event-ID tie-break, so two back-to-back replies were a coin flip
-  -- it passed in two runs of four), `TestRoomMembers` (a join's custom content was dropped),
-  `TestGetFilteredRoomMembers` (`membership`/`not_membership` were ignored), `TestAsyncUpload`
-  (`409 M_CANNOT_OVERWRITE_MEDIA`), and the joiner's half of presence in `TestSync`.
+- **Fixed after run 5 and not yet graded**: `TestArchivedRoomsHistory` (the disclosure above),
+  the local half of `TestDeviceListUpdates` (leaving a room never produced a
+  `device_lists.left`, because only *other* people's departures were considered), and two of
+  `TestRoomState` (`joined_members` omitted `avatar_url`; `?format=event` on a single state
+  event was ignored). Run 5 was the first of the day in which exactly the predicted tests moved
+  and nothing else did.
 - **`TestChangePasswordPushers` (2)**: a password change should delete pushers made by other
   sessions. Needs pushers to remember which device made them, and a revocation hook from
   `hs-auth` into `hs-push`.

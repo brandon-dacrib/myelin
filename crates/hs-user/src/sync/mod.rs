@@ -256,6 +256,7 @@ fn build_incremental_timeline(
     limit: usize,
     content_filter: Option<&crate::filter::RoomEventFilter>,
     requester: &UserId,
+    upto: Option<i64>,
 ) -> Timeline {
     let from = Some(PaginationToken::new(resume_pos, Direction::Forward));
     // One more than could be returned, so that "exactly `limit` new events" (no gap) can be told
@@ -264,16 +265,17 @@ fn build_incremental_timeline(
     let (raw, _) = actor.paginate(from, Direction::Forward, request);
     let scan_cut_short = raw.len() == request;
 
-    let events: Vec<&Event> = match content_filter {
-        None => raw,
-        Some(f) => raw
-            .into_iter()
-            .filter(|e| f.matches(&e.header().event_type, e.header().sender.as_str()))
-            .collect(),
-    };
+    let events: Vec<&Event> = raw
+        .into_iter()
+        .filter(|e| visible_in_sync(actor, e, requester))
+        .filter(|e| {
+            content_filter
+                .is_none_or(|f| f.matches(&e.header().event_type, e.header().sender.as_str()))
+        })
+        .collect();
 
     if events.len() > limit || scan_cut_short {
-        let mut newest = build_fresh_timeline(actor, limit, content_filter, requester);
+        let mut newest = build_fresh_timeline(actor, limit, content_filter, requester, upto);
         newest.limited = true;
         return newest;
     }
@@ -293,23 +295,53 @@ fn build_incremental_timeline(
     }
 }
 
+/// Whether `event` belongs in `requester`'s sync timeline: the history-visibility module's
+/// per-event rule, which `/messages` and `/event` already applied and `/sync` did not.
+///
+/// Without it a timeline was whatever the room held. Somebody who had left, or been kicked or
+/// banned, and then did an initial sync with `include_leave` was sent the room's *latest*
+/// messages -- everything said since they were gone -- and somebody who joined a room whose
+/// history is visible only to members from the point they joined was sent what came before. An
+/// event whose visibility cannot be worked out is left out.
+fn visible_in_sync(
+    actor: &hs_room::actor::RoomActor<impl KvBackend>,
+    event: &Event,
+    requester: &UserId,
+) -> bool {
+    actor.event_visible_to(event, requester).unwrap_or(false)
+}
+
+/// The most recent `limit` events `requester` may see, oldest first.
+///
+/// `upto` is the room position of the requester's own departure, for a room they have left or
+/// been removed from: the page then ends there rather than at the room's live end, which for
+/// them is a stretch of events they may not read and so would come back empty however much
+/// they are entitled to from before.
 fn build_fresh_timeline(
     actor: &hs_room::actor::RoomActor<impl KvBackend>,
     limit: usize,
     content_filter: Option<&crate::filter::RoomEventFilter>,
     requester: &UserId,
+    upto: Option<i64>,
 ) -> Timeline {
     let request = content_filter.map_or(limit, |_| limit.max(FILTERED_TIMELINE_SCAN));
-    let (raw, next) = actor.paginate(None, Direction::Backward, request);
+    let from = upto.map(|pos| PaginationToken::new(pos.saturating_add(1), Direction::Backward));
+    let (raw, next) = actor.paginate(from, Direction::Backward, request);
     let raw_exhausted = raw.len() < request;
+    let raw: Vec<&Event> = raw
+        .into_iter()
+        .filter(|e| visible_in_sync(actor, e, requester))
+        .collect();
 
     let (mut events, limited): (Vec<&Event>, bool) = match content_filter {
         None => {
-            let limited = if raw.len() == limit {
+            // `raw_exhausted` is about the page as fetched, before visibility was applied: a
+            // full page means there may be more behind it, whatever survived the filter.
+            let limited = if raw_exhausted {
+                false
+            } else {
                 let (more, _) = actor.paginate(next, Direction::Backward, 1);
                 !more.is_empty()
-            } else {
-                false
             };
             (raw, limited)
         }
@@ -437,8 +469,12 @@ fn build_state_section(
     self_user: &UserId,
     content_filter: Option<&crate::filter::RoomEventFilter>,
 ) -> Result<Vec<Value>, hs_room::RoomError> {
+    // Through the reader's view, not the room's live state: for somebody who has left, that is
+    // the state as of their leaving. The live state told them who had joined since, what the
+    // room had been renamed to, and anything else that changed after they were gone.
     Ok(actor
-        .full_state()?
+        .full_state_for_reader(self_user)?
+        .unwrap_or_default()
         .into_iter()
         .filter(|e| !timeline_event_ids.contains(e.event_id().as_str()))
         .filter(|e| {
@@ -750,6 +786,12 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             .map(|a| json!({"type": a.event_type, "content": a.content}))
             .collect();
 
+        // Where this user's view of the room ends, if it has: the position of their own leave,
+        // kick or ban (`MembershipRecord::room_pos` is that of their latest membership event).
+        let departed_at = matches!(membership.membership.as_str(), "leave" | "ban")
+            .then_some(membership.room_pos)
+            .filter(|pos| *pos > 0);
+
         let (timeline, state_events, summary) = handle
             .query(move |actor| {
                 let fresh_room = matches!(resume, ResumeMode::FreshRoom);
@@ -760,12 +802,14 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                         timeline_limit,
                         timeline_content_filter.as_ref(),
                         &user_id_owned,
+                        departed_at,
                     ),
                     ResumeMode::FreshRoom => build_fresh_timeline(
                         actor,
                         timeline_limit,
                         timeline_content_filter.as_ref(),
                         &user_id_owned,
+                        departed_at,
                     ),
                 };
                 let timeline_ids: HashSet<String> = timeline
@@ -834,13 +878,22 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             let Some(state_key) = event.get("state_key").and_then(Value::as_str) else {
                 continue;
             };
-            if state_key == user_id.as_str() {
-                continue;
-            }
             let membership = event
                 .get("content")
                 .and_then(|c| c.get("membership"))
                 .and_then(Value::as_str);
+            if state_key == user_id.as_str() {
+                // The user's *own* departure: everybody in the room they have just left is
+                // somebody they may no longer share a room with, and so whose device list they
+                // will stop hearing about. Whether that is true of each is decided below, against
+                // the rooms they are still in. This used to `continue`, so leaving a room never
+                // produced a `device_lists.left` at all, and a client went on trusting a device
+                // list it was no longer being kept up to date on.
+                if matches!(membership, Some("leave") | Some("ban")) {
+                    left_candidates.extend(hub.joined_member_ids(room_id).await?);
+                }
+                continue;
+            }
             if matches!(membership, Some("leave") | Some("ban"))
                 && let Ok(other) = ruma::UserId::parse(state_key)
             {
@@ -2456,6 +2509,91 @@ mod tests {
         assert_eq!(summary["m.joined_member_count"], 1);
     }
 
+    /// The mirror image of the test above: it is the *syncing* user who leaves. Everybody in the
+    /// room they walked out of, and share nothing else with, is somebody whose device list they
+    /// will no longer hear about -- Complement's "when leaving a room with a local user". Only
+    /// other people's departures were considered, so leaving a room never produced a
+    /// `device_lists.left` and a client kept trusting a list nobody was updating for it.
+    #[tokio::test]
+    async fn leaving_a_room_reports_the_people_left_behind_in_it() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let carol = user_id!("@carol:sync.test").to_owned();
+        std::mem::forget(hub.watch_all(hub.rooms().subscribe_global()));
+
+        // Two rooms of bob's. Alice is in both; carol is only in the one alice will leave.
+        let mut rooms = Vec::new();
+        for ts in [1, 10] {
+            let handle = hub
+                .rooms()
+                .create_room(
+                    bob.clone(),
+                    CreateRoomRequest {
+                        preset: Some("public_chat".to_owned()),
+                        ..Default::default()
+                    },
+                    ts,
+                )
+                .await
+                .unwrap();
+            handle
+                .membership(
+                    alice.clone(),
+                    Action::Join,
+                    alice.clone(),
+                    serde_json::json!({}),
+                    ts + 1,
+                )
+                .await
+                .unwrap();
+            rooms.push(handle);
+        }
+        rooms[0]
+            .membership(
+                carol.clone(),
+                Action::Join,
+                carol.clone(),
+                serde_json::json!({}),
+                3,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (_, token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+        hub.store()
+            .record_device_cursor(&alice, ruma::device_id!("DEV1"), token.feed_seq)
+            .await
+            .unwrap();
+
+        rooms[0]
+            .membership(
+                alice.clone(),
+                Action::Leave,
+                alice.clone(),
+                serde_json::json!({}),
+                20,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (response, _) = build(&hub, &e2e, &alice, params(Some(token)))
+            .await
+            .unwrap();
+        let left: Vec<&str> = response["device_lists"]["left"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(left, vec!["@carol:sync.test"], "{response}");
+        // Bob is still in a room with alice, so she still hears about his devices.
+        assert!(!left.contains(&"@bob:sync.test"));
+    }
+
     // ---------------------------------------------------------------------------------------
     // The long-poll actually waits.
     // ---------------------------------------------------------------------------------------
@@ -3251,5 +3389,198 @@ mod tests {
                 .is_empty(),
             "{response}"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // /sync shows a user what they may see, and nothing else.
+    // ---------------------------------------------------------------------------------------
+
+    async fn say(
+        handle: &hs_room::actor::RoomActorHandle<MemoryBackend>,
+        who: &UserId,
+        body: &str,
+        ts: i64,
+    ) {
+        handle
+            .send_event(
+                who.to_owned(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"body": body}),
+                None,
+                ts,
+            )
+            .await
+            .unwrap();
+    }
+
+    fn all_bodies(room: &Value) -> Vec<String> {
+        room["timeline"]["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e["content"]["body"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// Somebody who has left a room is sent what they could see before they went, and nothing
+    /// from after: not the messages, and not the state. `/sync` used to build a left room's
+    /// timeline and state exactly as it builds a joined one's -- the latest events, the current
+    /// state -- so an initial sync with `include_leave` handed a departed (or kicked, or banned)
+    /// user everything said since. Complement's `TestArchivedRoomsHistory` is this.
+    #[tokio::test]
+    async fn a_user_who_left_is_not_sent_what_happened_after_they_went() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        std::mem::forget(hub.watch_all(hub.rooms().subscribe_global()));
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    name: Some("Before".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        handle
+            .membership(
+                bob.clone(),
+                Action::Join,
+                bob.clone(),
+                serde_json::json!({}),
+                2,
+            )
+            .await
+            .unwrap();
+        say(&handle, &alice, "before", 3).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (_, while_joined) = build(&hub, &e2e, &bob, params(None)).await.unwrap();
+        hub.store()
+            .record_device_cursor(&bob, ruma::device_id!("BOB"), while_joined.feed_seq)
+            .await
+            .unwrap();
+
+        handle
+            .membership(
+                bob.clone(),
+                Action::Leave,
+                bob.clone(),
+                serde_json::json!({}),
+                4,
+            )
+            .await
+            .unwrap();
+        say(&handle, &alice, "after", 5).await;
+        handle
+            .send_event(
+                alice.clone(),
+                "m.room.name".to_owned(),
+                Some(String::new()),
+                serde_json::json!({"name": "After"}),
+                None,
+                6,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let include_leave: SyncFilter =
+            serde_json::from_value(serde_json::json!({"room": {"include_leave": true}})).unwrap();
+
+        // An initial sync that asks for left rooms.
+        let mut p = params(None);
+        p.filter = include_leave.clone();
+        let (response, _) = build(&hub, &e2e, &bob, p).await.unwrap();
+        let room = &response["rooms"]["leave"][room_id.as_str()];
+        assert!(room.is_object(), "the left room is listed: {response}");
+        let said = all_bodies(room);
+        assert!(said.contains(&"before".to_owned()), "{room}");
+        assert!(
+            !said.contains(&"after".to_owned()),
+            "a message from after bob left: {room}"
+        );
+        let everything = room.to_string();
+        assert!(
+            !everything.contains("\"After\""),
+            "the room's later name: {room}"
+        );
+        assert!(
+            everything.contains("\"Before\""),
+            "the name as bob knew it: {room}"
+        );
+
+        // And the incremental sync that tells bob he has left.
+        let mut p = params(Some(while_joined));
+        p.filter = include_leave;
+        let (response, _) = build(&hub, &e2e, &bob, p).await.unwrap();
+        let room = &response["rooms"]["leave"][room_id.as_str()];
+        assert!(room.is_object(), "{response}");
+        assert!(!all_bodies(room).contains(&"after".to_owned()), "{room}");
+        assert!(!room.to_string().contains("\"After\""), "{room}");
+        let leave_is_there = room["timeline"]["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|e| e["type"] == "m.room.member" && e["content"]["membership"] == "leave");
+        assert!(leave_is_there, "bob is told that he left: {room}");
+    }
+
+    /// The same rule from the other end: a room whose history is for members, from when they
+    /// joined. Somebody joining it is not sent what was said before they arrived.
+    #[tokio::test]
+    async fn a_new_member_is_not_sent_history_the_room_keeps_for_those_who_were_there() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        std::mem::forget(hub.watch_all(hub.rooms().subscribe_global()));
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    initial_state: vec![hs_room::actor::InitialStateEvent {
+                        event_type: "m.room.history_visibility".to_owned(),
+                        state_key: String::new(),
+                        content: serde_json::json!({"history_visibility": "joined"}),
+                    }],
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        say(&handle, &alice, "before bob", 2).await;
+        handle
+            .membership(
+                bob.clone(),
+                Action::Join,
+                bob.clone(),
+                serde_json::json!({}),
+                3,
+            )
+            .await
+            .unwrap();
+        say(&handle, &alice, "after bob", 4).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (response, _) = build(&hub, &e2e, &bob, params(None)).await.unwrap();
+        let said = all_bodies(&response["rooms"]["join"][room_id.as_str()]);
+        assert!(said.contains(&"after bob".to_owned()), "{response}");
+        assert!(!said.contains(&"before bob".to_owned()), "{response}");
+
+        // Alice was there for all of it.
+        let (response, _) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+        let said = all_bodies(&response["rooms"]["join"][room_id.as_str()]);
+        assert!(said.contains(&"before bob".to_owned()) && said.contains(&"after bob".to_owned()));
     }
 }

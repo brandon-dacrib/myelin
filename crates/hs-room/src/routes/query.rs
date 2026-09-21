@@ -38,33 +38,67 @@ fn parse_event_id(raw: &str) -> Result<ruma::OwnedEventId, RoomError> {
 pub async fn get_state_with_key<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path((room_id, event_type, state_key)): Path<(String, String, String)>,
+    Query(query): Query<StateEventQuery>,
     RoomRequester(requester): RoomRequester,
 ) -> Result<Response, RoomError> {
     let room_id = parse_room_id(&room_id)?;
     let handle = state.rooms.get_or_load(&room_id).await?;
-    let content = handle
+    // `format=event` asks for the whole event -- sender, timestamps, `unsigned` -- where the
+    // default, `content`, is only its content. A client uses it to find out *who* set a piece
+    // of state and when, which the content alone cannot say.
+    let whole_event = query.format.as_deref() == Some("event");
+    let found = handle
         .query(move |actor| {
             actor
                 .state_event_for_reader(&requester.user_id, &event_type, &state_key)
-                .map(|found| found.and_then(|e| e.json().get("content").cloned()))
+                .map(|found| {
+                    found.map(|e| {
+                        if whole_event {
+                            attach_replaced_state(
+                                client_event_json(e),
+                                actor.replaced_state_for(e, &requester.user_id).as_ref(),
+                            )
+                        } else {
+                            crate::routes::render::canonical_to_json(
+                                &e.json()
+                                    .get("content")
+                                    .and_then(hs_model::canonical::CanonicalJsonValue::as_object)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            )
+                        }
+                    })
+                })
         })
         .await?;
-    match content {
-        Some(content) => Ok(Json(crate::routes::render::canonical_to_json(
-            &content.as_object().cloned().unwrap_or_default(),
-        ))
-        .into_response()),
+    match found {
+        Some(body) => Ok(Json(body).into_response()),
         None => Err(RoomError::EventNotFound("state event not found".into())),
     }
+}
+
+/// Query parameters for `GET /rooms/{roomId}/state/{eventType}(/{stateKey})`.
+#[derive(Debug, Default, Deserialize)]
+pub struct StateEventQuery {
+    /// `content` (the default) or `event`.
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 /// `GET /rooms/{roomId}/state/{eventType}` (empty state key).
 pub async fn get_state_no_key<B: KvBackend + 'static>(
     state: State<RoomState<B>>,
     Path((room_id, event_type)): Path<(String, String)>,
+    query: Query<StateEventQuery>,
     requester: RoomRequester,
 ) -> Result<Response, RoomError> {
-    get_state_with_key(state, Path((room_id, event_type, String::new())), requester).await
+    get_state_with_key(
+        state,
+        Path((room_id, event_type, String::new())),
+        query,
+        requester,
+    )
+    .await
 }
 
 /// `GET /rooms/{roomId}/state`. See [`get_state_with_key`]'s doc comment: reads through
@@ -340,14 +374,25 @@ pub async fn get_joined_members<B: KvBackend + 'static>(
                     .into_iter()
                     .filter_map(|e| {
                         let user_id = e.header().state_key.clone()?;
-                        let display_name = e
+                        let content = e
                             .json()
                             .get("content")
-                            .and_then(hs_model::canonical::CanonicalJsonValue::as_object)
-                            .and_then(|c| c.get("displayname"))
-                            .and_then(hs_model::canonical::CanonicalJsonValue::as_str)
-                            .map(str::to_owned);
-                        Some((user_id, json!({"display_name": display_name})))
+                            .and_then(hs_model::canonical::CanonicalJsonValue::as_object);
+                        let field = |key: &str| {
+                            content
+                                .and_then(|c| c.get(key))
+                                .and_then(hs_model::canonical::CanonicalJsonValue::as_str)
+                                .map(str::to_owned)
+                        };
+                        // Both keys, always: the spec's `RoomMember` has the two, and a client
+                        // that reads `avatar_url` should find `null`, not nothing.
+                        Some((
+                            user_id,
+                            json!({
+                                "display_name": field("displayname"),
+                                "avatar_url": field("avatar_url"),
+                            }),
+                        ))
                     })
                     .collect::<HashMap<_, _>>()
             })
