@@ -71,8 +71,8 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
 
 ### Conformance
 
-- **Complement `csapi`: 241 of 370 assertions**, 61 of 104 top-level tests, measured 2026-09-21;
-  191 of 296 the run before. The first run this project ever took was 125; the suite had never
+- **Complement `csapi`: 248 of 370 assertions**, 61 of 104 top-level tests, measured 2026-09-21;
+  241 earlier that day, 191 of 296 the run before that. The first run this project ever took was 125; the suite had never
   been run before that.
 - **Complement federation package: 59 of 246 assertions**, 6 of 88 top-level, and for the first
   time the whole package rather than however far it got before crashing. Measured with

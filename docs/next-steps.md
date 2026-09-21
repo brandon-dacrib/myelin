@@ -16,14 +16,23 @@ While the server has no administrator it logs a one-time setup link at every sta
 
 **The admin interface ships.** Until 2026-09-21 it did not: every binary and every published image served a placeholder at `/admin/` saying the interface had not been built in, because nothing embedded `web/dist`. `crates/hs-admin/build.rs` now stages the built interface (or the placeholder, for a Rust-only checkout, and says so at startup); release builds set `HS_ADMIN_WEB_DIST` and *fail* without a built interface; CD refuses to publish an image whose `/admin/` is not the interface. Verified on the published artifact: `ghcr.io/brandon-dacrib/myelin:main`, pulled from the registry on 2026-09-21 and run with the README's exact command, serves the interface at `/admin/`, answers `needs_setup: true`, and logs the setup link. What has still never run is the `v*` binaries job's new Node step, which only a tag exercises.
 
-**Complement, `csapi`: 241 of 370 assertions pass** (61 of 104 top-level), measured 2026-09-21, up from 191/296, 148/293 and 125/293 on the runs before it.
+**Complement, `csapi`: 248 of 370 assertions pass** (61 of 104 top-level), measured 2026-09-21, up from 241/370 earlier the same day and 191/296, 148/293 and 125/293 before that. `docs/status/complement-csapi-results.txt` has the result of every top-level test, so the next run can be `diff`ed against this one instead of compared by total.
 
-**Read small deltas in that number with suspicion.** Two consecutive runs of the same commit
-differed by a top-level test in each direction: `TestRoomsInvite` and `TestPushSync` failed in one
-and passed in the other, and `TestRoomsInvite` passes on its own every time. The suite runs its
-subtests in parallel and some of them lose races under load on this machine. A change is worth
-something when it moves a *named* test from fail to pass and that survives a re-run; a ±2
-assertion wobble is noise.
+**That run was graded with a `/sync` that did not wait, and the next one is the one to read.**
+Two consecutive runs of the same commit used to differ by a top-level test in each direction --
+`TestRoomsInvite` and `TestPushSync` failed in one and passed in the other -- and this file called
+that noise: subtests run in parallel and lose races under load. They did lose races, but the load
+was ours. The 2026-09-21 log has waits that saw **4,381 and 12,040 `/sync` responses** inside five
+seconds: for any user whose own presence record was the newest they could see, `/sync` returned
+at once, empty, with an unmoved token, forever (`has_new_data` watched the user's own presence;
+`build` never emitted it or advanced past it). Which user that was depended on who synced last,
+which is exactly what made it look random. Fixed in `hs-user`, with the invariant as the test:
+*the token a sync hands back must not itself count as news*. The 248 above was measured *before*
+that fix.
+
+The general lesson is older than this instance and keeps being true: when a number wobbles, look
+for the mechanism before filing it under noise. "Seen 4381 /sync responses" had been in every
+log.
 
 **Complement, federation package: 59 of 246 assertions** (6 of 88 top-level), measured 2026-09-21 — and for the first time that is the *whole* package. The suite used to segfault Complement's own Go binary 21 tests in and silently discard everything after, so every federation number before this one was "however far it got before dying". There are no panics in the log now and `-skip` is retired.
 
@@ -234,7 +243,7 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | In-process server cannot be restarted over its data directory | `hs-cli` | background tasks hold the store's lock after `shutdown()`; restart tests need the real binary |
 | The release binaries job's web build has never run | `.github` | it only runs on a `v*` tag; the image path is verified, this one is not |
 | `/user_directory/search` returns every local user | `hs-auth` | display names are enumerable by any account |
-| csapi subtests lose races under parallel load | `tests` | ±2 top-level tests of run-to-run noise |
+| csapi run-to-run wobble, cause found, effect not yet re-measured | `tests`, `hs-user` | was ±2 top-level tests; `/sync` was spinning (fixed 2026-09-21), so the next run says how much of it that was |
 | `heartbeat_seq` is derived from wall-clock milliseconds | `hs-cluster` | two ticks in one millisecond read as "no progress", i.e. death; harmless at the production 1s interval, surfaces only in tests |
 | Sytest never run | `tests/sytest` | CPAN dependencies absent |
 | `cargo fuzz` never executed | `fuzz/` | no nightly toolchain |
