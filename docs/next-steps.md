@@ -12,7 +12,14 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 
 **A first run is one command.** `hs serve --data-dir ./data --server-name example.org` in an empty directory produces a working server — database, signing key, media path, all underneath that directory. It was 158 lines of generated YAML with four mandatory hand-edits.
 
-**Complement, `csapi`: 239 of 370 assertions pass** (62 of 104 top-level), measured 2026-09-21, up from 191/296, 148/293 and 125/293 on the three runs before it.
+**Complement, `csapi`: 241 of 370 assertions pass** (61 of 104 top-level), measured 2026-09-21, up from 191/296, 148/293 and 125/293 on the runs before it.
+
+**Read small deltas in that number with suspicion.** Two consecutive runs of the same commit
+differed by a top-level test in each direction: `TestRoomsInvite` and `TestPushSync` failed in one
+and passed in the other, and `TestRoomsInvite` passes on its own every time. The suite runs its
+subtests in parallel and some of them lose races under load on this machine. A change is worth
+something when it moves a *named* test from fail to pass and that survives a re-run; a ±2
+assertion wobble is noise.
 
 **Complement, federation package: 59 of 246 assertions** (6 of 88 top-level), measured 2026-09-21 — and for the first time that is the *whole* package. The suite used to segfault Complement's own Go binary 21 tests in and silently discard everything after, so every federation number before this one was "however far it got before dying". There are no panics in the log now and `-skip` is retired.
 
@@ -49,6 +56,31 @@ skip the event when it would set the default, and Complement is written to Synap
 spec-mandated event to win four subtests is bending the server to the test, so it stands. It is a
 two-line change if the conformance points are wanted instead.
 
+## How far along is this?
+
+A number, because it gets asked. **Roughly 55-60% of a homeserver somebody else could run** --
+but the number is only meaningful broken up, because the parts are nowhere near each other:
+
+| Area | Where it is | Basis |
+|---|---|---|
+| Client-server API | ~65% | 241/370 csapi assertions, 61/104 top-level; a real Element session signs in, creates rooms, sends, invites, scrolls back |
+| Storage, rooms, state resolution | ~85% | the engine underneath; 1600+ tests, two backends through one conformance suite, state bake-off done |
+| Configuration and first run | ~90% | database-backed, editable in the UI, one command from nothing to a working server |
+| Admin API | ~22% | 31 of 143 operations genuinely served; the rest answer an honest 501 |
+| Management web interface | ~60% | users, rooms, federation, bridges, and configuration are real; arrays-of-objects and several resources are not |
+| **Federation** | **~15%** | 59/246 assertions, 6/88 top-level; a two-server join works one way only |
+| Bridges | ~20% | the appservice surface exists; no real bridge has ever been pointed at it |
+| Operations (HA, scale-out) | ~40% | it runs on Kubernetes with a chart and a tested image; the cluster path has never carried real traffic |
+
+Federation is the honest answer to "when could I use this". Everything else is far enough along
+that the gaps are specific and listed; federation is the one where "6 of 88" means a user on this
+server cannot really talk to the rest of Matrix yet. That, not the client-server percentage, is
+what stands between this and a server somebody else would run.
+
+What is *not* in those percentages, and should temper them: no security review, no load testing
+beyond a loadgen harness, `cargo fuzz` never run, Sytest never run, and no real bridge
+(mautrix-*) has ever connected. Each of those has historically found things.
+
 ## What to do next, in order
 
 ### 1. Keep pulling on the measurement, and open a browser
@@ -56,13 +88,21 @@ two-line change if the conformance points are wanted instead.
 The suites are current as of 2026-09-21 (above). What the latest csapi log says to do next, in
 rough order of how many assertions sit behind it:
 
-- **`MustSyncUntil` timeouts, 28 of them.** The biggest remaining shape. These are tests waiting
-  for something to turn up in `/sync` that never does; they are not one bug, but they are one
-  place to look, and the invite cluster proves how much sits behind a single sync-shaped defect.
-- **`rooms.join.<room>.timeline.events` missing, 21 times**, and `state.events` 6 times.
+- **`MustSyncUntil` timeouts.** Count them by *test*, not by line: 28 log lines were 8 distinct
+  tests, and after the presence fix below they are fewer still. What is left is push rules
+  surviving a room upgrade (2), device-list tracking when a user leaves (1), and the alias tests
+  (now fixed). The lesson from the invite cluster holds -- one sync-shaped defect can be worth
+  seven top-level tests -- but check how many tests a cluster really is before sizing the work.
+- **`rooms.join.<room>.timeline.events` missing, 21 times, was one test polling** -- all of
+  `TestRoomDeleteAlias`, now fixed. Counting log lines overstates a cluster badly.
 - **`TestRequestEncodingFails`**: invalid UTF-8 in a JSON body must be `400 M_NOT_JSON`. Routes
   taking a bare `axum::Json` still answer a plain-text rejection; `hs_http::body::PermissiveJson`
   already does the right thing and the work is switching every `/_matrix` route to it.
+- **`/user_directory/search` searches every local account.** Implemented 2026-09-21 because
+  Element's invite dialog 404s without it. The spec allows it and it is what makes the endpoint
+  useful, but it means any logged-in user can enumerate every other user's display name. If this
+  server ever hosts people who should not see each other, put it behind a setting -- the module
+  doc in `crates/hs-auth/src/routes/user_directory.rs` says the same.
 - **`min_depth` on `/get_missing_events`**, still parsed nowhere, and history visibility still not
   applied per event there.
 
@@ -154,6 +194,9 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | Postgres `tls`/`pool_size`/schema | `hs-kv`, `hs-cli` | encrypt in front of the database for now |
 | `/createRoom` not shard-gated | `hs-cli` | first actor may be built on a non-owner |
 | Config pages never checked by axe | `web` | the only e2e flow without an accessibility pass |
+| `/user_directory/search` returns every local user | `hs-auth` | display names are enumerable by any account |
+| csapi subtests lose races under parallel load | `tests` | ±2 top-level tests of run-to-run noise |
+| `a_partitioned_replica_cannot_write_after_being_fenced` is flaky on arm64 | `hs-cluster` | CI goes red about one run in three |
 | Sytest never run | `tests/sytest` | CPAN dependencies absent |
 | `cargo fuzz` never executed | `fuzz/` | no nightly toolchain |
 
