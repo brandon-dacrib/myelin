@@ -175,13 +175,18 @@ pub async fn post_upgrade<B: KvBackend + 'static>(
     // others.
     for alias in &old_aliases {
         if let Ok(alias_id) = <&ruma::RoomAliasId>::try_from(alias.as_str()) {
+            // The upgrade moves the alias; whoever asked for the upgrade becomes its creator on
+            // the new room. The original creator is not carried across because the alias on the
+            // new room is a new grant -- and the person doing the upgrade necessarily had the
+            // power to make it.
+            let alias_creator = sender.clone();
             let owned = alias_id.to_owned();
             let _ = old_handle
                 .query(move |actor| actor.remove_alias(&owned))
                 .await;
             let owned = alias_id.to_owned();
             let _ = new_handle
-                .query(move |actor| actor.create_alias(&owned))
+                .query(move |actor| actor.create_alias(&owned, &alias_creator))
                 .await;
         }
     }

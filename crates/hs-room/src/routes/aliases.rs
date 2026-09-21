@@ -38,7 +38,7 @@ pub async fn get_room_aliases<B: KvBackend + 'static>(
 pub async fn put_alias<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_alias): Path<String>,
-    RoomRequester(_requester): RoomRequester,
+    RoomRequester(requester): RoomRequester,
     Json(body): Json<Value>,
 ) -> Result<Response, RoomError> {
     let alias = parse_alias(&room_alias)?;
@@ -48,8 +48,9 @@ pub async fn put_alias<B: KvBackend + 'static>(
         .ok_or_else(|| RoomError::BadRequest("missing room_id".into()))?;
     let room_id = parse_room_id(room_id_str)?;
     let handle = state.rooms.get_or_load(&room_id).await?;
+    let creator = requester.user_id.clone();
     handle
-        .query(move |actor| actor.create_alias(&alias))
+        .query(move |actor| actor.create_alias(&alias, &creator))
         .await?;
     Ok(Json(json!({})).into_response())
 }
@@ -68,10 +69,15 @@ pub async fn get_alias<B: KvBackend + 'static>(
 }
 
 /// `DELETE /directory/room/{roomAlias}`.
+///
+/// Anyone could delete anyone's alias before this: the requester was extracted and dropped. The
+/// rule the spec allows and every other server implements is that you may remove an alias you
+/// created, or one in a room where you have the power to set `m.room.canonical_alias` -- a
+/// moderator tidying up after somebody, not a passer-by unpicking a room's address.
 pub async fn delete_alias<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_alias): Path<String>,
-    RoomRequester(_requester): RoomRequester,
+    RoomRequester(requester): RoomRequester,
 ) -> Result<Response, RoomError> {
     let alias = parse_alias(&room_alias)?;
     let room_id = state
@@ -79,6 +85,25 @@ pub async fn delete_alias<B: KvBackend + 'static>(
         .resolve_alias(&alias)?
         .ok_or_else(|| RoomError::RoomNotFound(room_alias.clone()))?;
     let handle = state.rooms.get_or_load(&room_id).await?;
+    let user_id = requester.user_id.clone();
+    let check_alias = alias.clone();
+    let allowed = handle
+        .query(move |actor| {
+            let created_it = actor
+                .alias_creator(&check_alias)?
+                .is_some_and(|creator| creator == user_id);
+            if created_it {
+                return Ok::<bool, RoomError>(true);
+            }
+            actor.can_send_state(&user_id, "m.room.canonical_alias")
+        })
+        .await?;
+    if !allowed {
+        return Err(RoomError::Forbidden(format!(
+            "{} was not created by you, and you do not have permission to remove it",
+            alias.as_str()
+        )));
+    }
     handle
         .query(move |actor| actor.remove_alias(&alias))
         .await?;

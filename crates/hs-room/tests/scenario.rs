@@ -1321,3 +1321,94 @@ async fn transaction_id_is_echoed_back_to_the_sender_only() {
         seen_by_bob.json["unsigned"]
     );
 }
+
+/// Anyone could delete anyone else's room alias: `delete_alias` extracted the requester and
+/// dropped it on the floor, so a passer-by could unpick a room's published address.
+///
+/// The rule is the one the spec permits and other servers implement: you may remove an alias you
+/// created, or one in a room where you have the power to set `m.room.canonical_alias`.
+#[tokio::test]
+async fn an_alias_can_only_be_deleted_by_its_creator_or_someone_with_the_power() {
+    let mut scenario = Scenario::new(app());
+    scenario
+        .register("alice", "alice", "correct horse battery staple")
+        .await
+        .assert_ok();
+    scenario
+        .register("bob", "bob", "hunter2official")
+        .await
+        .assert_ok();
+
+    let created = scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    created.assert_ok();
+    let room_id = created.str_field("room_id").to_string();
+
+    scenario
+        .send(
+            Some("bob"),
+            Method::POST,
+            &format!("/rooms/{room_id}/join"),
+            Some(json!({})),
+        )
+        .await
+        .assert_ok();
+
+    // `#` and `:` both have to survive the path, so the alias is percent-encoded the way a real
+    // client sends it.
+    let alias_path = "%23alias-permission-test%3Aexample.org";
+    scenario
+        .send(
+            Some("alice"),
+            Method::PUT,
+            &format!("/directory/room/{alias_path}"),
+            Some(json!({"room_id": room_id})),
+        )
+        .await
+        .assert_ok();
+
+    // Bob is an ordinary member: not the alias's creator, and without power over canonical
+    // aliases in a room he merely joined.
+    let refused = scenario
+        .send(
+            Some("bob"),
+            Method::DELETE,
+            &format!("/directory/room/{alias_path}"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "an ordinary member must not delete somebody else's alias: {}",
+        refused.json
+    );
+
+    // The part that actually matters: it is still there.
+    scenario
+        .send(
+            Some("bob"),
+            Method::GET,
+            &format!("/directory/room/{alias_path}"),
+            None,
+        )
+        .await
+        .assert_ok();
+
+    // Alice created it, so she may remove it.
+    scenario
+        .send(
+            Some("alice"),
+            Method::DELETE,
+            &format!("/directory/room/{alias_path}"),
+            None,
+        )
+        .await
+        .assert_ok();
+}

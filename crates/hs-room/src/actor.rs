@@ -1440,7 +1440,7 @@ impl<B: KvBackend> RoomActor<B> {
             let alias_str = format!("#{localpart}:{}", actor.identity.server_name);
             let alias = RoomAliasId::parse(&alias_str)
                 .map_err(|e| RoomError::BadRequest(format!("invalid room_alias_name: {e}")))?;
-            actor.create_alias(&alias)?;
+            actor.create_alias(&alias, &creator)?;
             actor.send_event(
                 creator.clone(),
                 "m.room.canonical_alias".to_owned(),
@@ -1469,9 +1469,14 @@ impl<B: KvBackend> RoomActor<B> {
     /// # Errors
     /// Returns [`RoomError::RoomAlreadyExists`] (reused: "this alias is already in use") if the
     /// alias is already mapped, or [`RoomError::Store`] on a storage failure.
-    pub fn create_alias(&self, alias: &RoomAliasId) -> Result<(), RoomError> {
+    pub fn create_alias(&self, alias: &RoomAliasId, creator: &UserId) -> Result<(), RoomError> {
         let room_sn = self.room_sn;
         let alias_key = (alias.to_string(),);
+        // The stored value is the room's short id followed by the creator's user ID. Rows written
+        // before the creator was recorded are just the four short-id bytes, and still read: see
+        // `alias_creator`, which reports `None` for them rather than guessing.
+        let mut value = room_sn.to_be_bytes().to_vec();
+        value.extend_from_slice(creator.as_str().as_bytes());
         transact(&self.backend, TransactConfig::default(), |txn| {
             if self
                 .tables
@@ -1484,7 +1489,7 @@ impl<B: KvBackend> RoomActor<B> {
             }
             self.tables
                 .aliases
-                .put(txn, &alias_key, &room_sn.to_be_bytes())
+                .put(txn, &alias_key, &value)
                 .map_err(to_kv)?;
             self.tables
                 .room_aliases
@@ -1517,6 +1522,95 @@ impl<B: KvBackend> RoomActor<B> {
                 .map_err(to_kv)
         })
         .map_err(RoomError::from)
+    }
+
+    /// Who created `alias`, if this server recorded it. `None` for an alias created before the
+    /// creator was stored, which is not the same as "nobody" -- a caller deciding whether to
+    /// allow something must fall back to another rule rather than treat it as a match.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::Store`] on a storage failure.
+    pub fn alias_creator(&self, alias: &RoomAliasId) -> Result<Option<OwnedUserId>, RoomError> {
+        let snapshot = self.backend.snapshot();
+        let Some(value) = self.tables.aliases.get(&snapshot, &(alias.to_string(),))? else {
+            return Ok(None);
+        };
+        let tail = &value.as_ref()[4.min(value.as_ref().len())..];
+        if tail.is_empty() {
+            return Ok(None);
+        }
+        let raw = std::str::from_utf8(tail).map_err(|e| RoomError::Internal(e.to_string()))?;
+        Ok(UserId::parse(raw).ok().map(|u| u.to_owned()))
+    }
+
+    /// Whether `user` currently has enough power to send `event_type` as a state event in this
+    /// room.
+    ///
+    /// This answers the question the auth rules would answer, without building and rejecting an
+    /// event to find out: the room's `m.room.power_levels`, read through
+    /// [`EffectivePowerLevels`](hs_model::power_levels::EffectivePowerLevels) so that a room
+    /// creator's implicit, un-demotable power in room version 12 and later counts.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::State`] if the room's state could not be read.
+    pub fn can_send_state(&self, user: &UserId, event_type: &str) -> Result<bool, RoomError> {
+        let rules = room_version::rules_for(self.room_version())
+            .ok_or_else(|| RoomError::Internal("unknown room version".into()))?;
+        let creators = self.room_creators(&rules)?;
+
+        let Some(event) = self.state_event("m.room.power_levels", "")? else {
+            // A room with no power-levels event yet: the spec's pre-first-event default is 100
+            // for a creator and 0 for everybody else, against a state_default of 50.
+            return Ok(creators.iter().any(|c| c == user));
+        };
+        let content = event
+            .json()
+            .get("content")
+            .and_then(CanonicalJsonValue::as_object)
+            .ok_or_else(|| RoomError::Internal("power levels have no content".into()))?;
+        let levels = hs_model::power_levels::PowerLevels::parse(content, &rules)
+            .map_err(|e| RoomError::Internal(e.to_string()))?;
+        let effective =
+            hs_model::power_levels::EffectivePowerLevels::new(&levels, &rules, creators);
+        Ok(effective.user_power(user) >= levels.required_power(event_type, true))
+    }
+
+    /// This room's creators: the `m.room.create` sender (or its `creator` field, below room
+    /// version 11) plus any `additional_creators`.
+    fn room_creators(
+        &self,
+        rules: &hs_model::room_version::RoomVersionRules,
+    ) -> Result<Vec<OwnedUserId>, RoomError> {
+        let create = self
+            .state_event("m.room.create", "")?
+            .ok_or_else(|| RoomError::Internal("room has no m.room.create".into()))?;
+        let mut out = Vec::new();
+        if rules.use_room_create_sender {
+            out.push(create.header().sender.clone());
+        } else if let Some(creator) = create
+            .json()
+            .get("content")
+            .and_then(CanonicalJsonValue::as_object)
+            .and_then(|c| c.get("creator"))
+            .and_then(CanonicalJsonValue::as_str)
+            .and_then(|c| UserId::parse(c).ok())
+        {
+            out.push(creator.to_owned());
+        }
+        if rules.additional_room_creators
+            && let Some(CanonicalJsonValue::Array(items)) = create
+                .json()
+                .get("content")
+                .and_then(CanonicalJsonValue::as_object)
+                .and_then(|c| c.get("additional_creators"))
+        {
+            for item in items {
+                if let Some(id) = item.as_str().and_then(|s| UserId::parse(s).ok()) {
+                    out.push(id.to_owned());
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Every local alias pointing at this room.
@@ -2648,6 +2742,16 @@ pub fn find_event_globally<B: KvBackend>(
     Ok(Some(row))
 }
 
+/// The room short id at the front of a stored alias value. The rest, when there is any, is the
+/// user ID of whoever created the alias (see [`RoomActor::create_alias`]).
+fn room_sn_from_alias_value(value: &[u8]) -> Result<RoomSn, RoomError> {
+    let arr: [u8; 4] = value
+        .get(..4)
+        .and_then(|head| head.try_into().ok())
+        .ok_or_else(|| RoomError::Internal("corrupt alias entry".into()))?;
+    Ok(RoomSn::from_be_bytes(arr))
+}
+
 /// Resolves a local alias to its room ID, without needing that room's actor loaded.
 ///
 /// # Errors
@@ -2661,11 +2765,7 @@ pub fn resolve_alias<B: KvBackend>(
     let Some(sn_bytes) = tables.aliases.get(&snapshot, &(alias.to_string(),))? else {
         return Ok(None);
     };
-    let arr: [u8; 4] = sn_bytes
-        .as_ref()
-        .try_into()
-        .map_err(|_| RoomError::Internal("corrupt alias entry".into()))?;
-    let room_sn = RoomSn::from_be_bytes(arr);
+    let room_sn = room_sn_from_alias_value(sn_bytes.as_ref())?;
     let Some(room_id_bytes) = tables.room_sn.resolve(&snapshot, room_sn)? else {
         return Ok(None);
     };
