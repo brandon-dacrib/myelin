@@ -70,11 +70,16 @@ cannot do, in rough order of how often an operator will hit it:
   nothing in this server re-reads its configuration while running — the rate limiter, the
   federation policy and the telemetry layer are built once at startup. Giving any one of them a
   live read is what makes `reloaded_sections` non-empty.
-- **Be trusted after a blip.** Running `e2e-real` as a whole suite, two pages land on the sign-in
-  screen; the trace shows their `GET /api/v1/me` never completed (status `-1`, not `401`) and the
-  app concluded there was no session. A failed request is not a rejected token, and an operator
-  should be told the server is unreachable rather than silently signed out. Each test passes
-  alone, so this reproduces only under the full suite.
+- **Nothing here, as it turns out** — this bullet used to claim the interface signs an operator out
+  when a request merely fails. It does not: `signInWithToken` already distinguishes a failed fetch
+  ("Couldn't reach the server") from a 401 ("That token wasn't recognized"). What actually
+  happened is that `e2e-real`'s `beforeEach` asserted `toHaveURL(/\/admin\/?$/)` after signing in,
+  and `AppShell` renders the sign-in form *at whatever URL you are on* when there is no session —
+  so that assertion passed identically whether sign-in worked or not, and a failed sign-in
+  surfaced two tests later as a page mysteriously showing sign-in. The assertion now checks that
+  the sign-in form is gone. The real open question is narrower and is not in the app: one `fetch`
+  through the Vite dev server's `/api/v1` proxy fails, only under the full suite, against a server
+  answering 200 to twelve consecutive curls.
 - **Have the config pages checked by axe.** Every other e2e flow runs axe at each step; the
   Configuration pages have never been through it.
 
@@ -125,7 +130,7 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | `/search` unimplemented | `hs-room` | needs a cross-room index the actor model has no place for |
 | Admin UI cannot edit arrays of objects | `web` | listeners and OIDC providers are a JSON textarea |
 | Nothing hot-applies a config change | all | every change needs a restart, and says so |
-| A failed `/me` signs the operator out | `web` | a blip looks like a rejected token |
+| One `/api/v1` fetch fails under the full `e2e-real` suite | `web` (dev proxy) | two tests fail together, pass alone |
 | Receipts and presence in memory | `hs-user` | a restart forgets read state |
 | Postgres `tls`/`pool_size`/schema | `hs-kv`, `hs-cli` | encrypt in front of the database for now |
 | `/createRoom` not shard-gated | `hs-cli` | first actor may be built on a non-owner |

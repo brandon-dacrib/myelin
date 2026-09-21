@@ -15,12 +15,14 @@ import { test, expect, type Page } from "@playwright/test";
  *
  * Known flake, deliberately not papered over: run as a whole suite, "users list is real" and
  * "user detail" land on the sign-in page, while each passes on its own. The trace shows the only
- * `/api/v1` call those pages made was `GET /api/v1/me`, and it never completed — Playwright
- * records status `-1` — after which the app concluded there was no session. The same endpoint
- * answers 200 to twelve consecutive requests by curl against the same server, so this is not the
- * server refusing the token. Worth chasing: a request that *fails* is not a request that came
- * back 401, and an operator whose connection blips should be told the server is unreachable, not
- * silently signed out.
+ * `/api/v1` call in the failing test was `GET /api/v1/me` and it never completed — Playwright
+ * records status `-1`. That call is the *sign-in* in `beforeEach`, not a call from the page under
+ * test: `signInWithToken` turns a failed fetch into "Couldn't reach the server", leaves you on
+ * the sign-in form, and the old `toHaveURL` assertion could not see it (see the comment there).
+ * So the app is not signing anybody out on a blip — it says the server is unreachable, which is
+ * correct. What is still unexplained is why that one `fetch` to the Vite dev server's `/api/v1`
+ * proxy fails only when the suite runs as a whole, against a server answering 200 to twelve
+ * consecutive curls. Chase it in the proxy, not in the app.
  */
 
 const hasServer = Boolean(process.env.HS_REAL_SERVER_URL);
@@ -51,7 +53,13 @@ test.describe("real server", () => {
       await page.getByRole("tab", { name: "Access token" }).click();
       await page.getByLabel("Access token").fill(adminToken!);
       await page.getByRole("button", { name: "Sign in" }).click();
-      await expect(page).toHaveURL(/\/admin\/?$/);
+      // NOT a URL assertion. `AppShell` renders `<SignIn />` in place of the app whenever there
+      // is no session, at whatever URL you are on -- so `toHaveURL(/\/admin\/?$/)`, which this
+      // used to assert, passes identically whether sign-in succeeded or failed, and a failed
+      // sign-in then surfaced as a mystifying failure in the *next* test's body. Assert the thing
+      // that is only true once there is a session.
+      await expect(page.getByRole("tab", { name: "Access token" })).toBeHidden();
+      await expect(page.getByRole("banner")).toBeVisible();
     });
 
     test("dashboard renders what's real and reports what isn't", async ({ page }) => {
