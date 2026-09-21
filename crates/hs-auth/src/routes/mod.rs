@@ -20,6 +20,7 @@ pub mod profile;
 pub mod refresh;
 pub mod register;
 pub mod synapse_admin;
+pub mod user_directory;
 pub mod whoami;
 
 use axum::Router;
@@ -60,6 +61,10 @@ pub fn router() -> Router<AuthState> {
                 .delete(devices::delete_device),
         )
         .route("/delete_devices", post(devices::post_delete_devices))
+        .route(
+            "/user_directory/search",
+            post(user_directory::post_user_directory_search),
+        )
         .route("/profile/{userId}", get(profile::get_profile))
         // `PUT` for both of these lives in `hs-room`'s router instead
         // (`crates/hs-room/src/routes/profile.rs`), merged at the same prefix in `hs-cli`'s
