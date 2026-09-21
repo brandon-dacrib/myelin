@@ -29,6 +29,28 @@ pub trait DeviceListChangeNotifier: Send + Sync {
     async fn notify_device_list_changed(&self, user_id: &UserId);
 }
 
+/// Who `POST /user_directory/search` may show to whom.
+///
+/// The spec's floor for that endpoint is "the users the requesting user shares a room with and
+/// those who reside in public rooms", and that floor is also the ceiling a server should want by
+/// default: a directory that searches every account lets any account enumerate every other
+/// user's name. But "shares a room" and "public room" are facts about rooms, and this crate
+/// cannot see rooms (`hs-user` depends on it, not the other way round) -- so, like
+/// [`DeviceListChangeNotifier`], the question is a trait defined here and answered from outside
+/// (`hs_user::hub::SessionHub`, installed by `hs serve`).
+#[async_trait::async_trait]
+pub trait UserDirectoryVisibility: Send + Sync {
+    /// Every user `requester` may find, not counting themself.
+    ///
+    /// # Errors
+    /// A description of why the room layer could not answer. The search then fails rather than
+    /// falling back to showing everybody.
+    async fn visible_to(
+        &self,
+        requester: &UserId,
+    ) -> Result<std::collections::BTreeSet<ruma::OwnedUserId>, String>;
+}
+
 /// Everything a handler needs: storage, the appservice registry, rate limiting, config and a
 /// clock, all behind `Arc` so `AuthState` itself is cheap to clone (axum requires `State<S>: Clone`).
 #[derive(Clone)]
@@ -56,6 +78,8 @@ pub struct AuthState {
     // `pub` fields can be set from outside `hs-auth`); they go through
     // [`AuthState::install_device_list_notifier`] regardless.
     pub(crate) device_list_notifier: Arc<OnceLock<Arc<dyn DeviceListChangeNotifier>>>,
+    /// See [`UserDirectoryVisibility`] and [`AuthState::install_user_directory_visibility`].
+    pub(crate) user_directory_visibility: Arc<OnceLock<Arc<dyn UserDirectoryVisibility>>>,
 }
 
 impl AuthState {
@@ -72,6 +96,7 @@ impl AuthState {
             config: Arc::new(AuthConfig::default()),
             clock: Arc::new(SystemClock),
             device_list_notifier: Arc::new(OnceLock::new()),
+            user_directory_visibility: Arc::new(OnceLock::new()),
         }
     }
 
@@ -142,6 +167,24 @@ impl AuthState {
                  ignoring the second install"
             );
         }
+    }
+
+    /// Installs what scopes `POST /user_directory/search` to the users its caller may see.
+    /// Same one-installer convention as [`AuthState::install_device_list_notifier`].
+    pub fn install_user_directory_visibility(&self, visibility: Arc<dyn UserDirectoryVisibility>) {
+        if self.user_directory_visibility.set(visibility).is_err() {
+            tracing::warn!(
+                "a user-directory visibility source was already installed on this auth state; \
+                 ignoring the second install"
+            );
+        }
+    }
+
+    /// The installed [`UserDirectoryVisibility`], if any. `None` means this process has no room
+    /// layer at all (a test of this crate alone), and so no rooms for anybody to be private in.
+    #[must_use]
+    pub fn user_directory_visibility(&self) -> Option<&Arc<dyn UserDirectoryVisibility>> {
+        self.user_directory_visibility.get()
     }
 
     /// The installed [`DeviceListChangeNotifier`], if any.

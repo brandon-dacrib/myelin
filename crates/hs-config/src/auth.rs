@@ -159,6 +159,16 @@ pub struct AuthConfig {
     /// Path to a file containing the shared-secret-registration secret.
     #[serde(default)]
     pub registration_shared_secret_file: Option<PathBuf>,
+    /// Let the user directory (`POST /user_directory/search`, the box a client's invite dialog
+    /// searches) find every account on this server. Off by default: a search then finds only
+    /// the people the searcher shares a room with and the members of public rooms, which is
+    /// what the Matrix specification requires and no more. Turning it on lets people find
+    /// somebody they have not met yet -- convenient on a small server where everyone knows
+    /// everyone -- at the cost that any account can list every other account's name,
+    /// including the accounts a bridge creates for other people's contacts. Corresponds to
+    /// Synapse's `user_directory.search_all_users`.
+    #[serde(default)]
+    pub user_directory_search_all_users: bool,
     /// Serve the legacy `/login` and user-interactive-auth flows in
     /// addition to the native OAuth 2.0 issuer. Needed for older clients,
     /// bridges and `m.login.application_service`.
@@ -198,6 +208,7 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             enable_registration: false,
+            user_directory_search_all_users: false,
             registration_shared_secret: SecretString::default(),
             registration_shared_secret_file: None,
             enable_legacy_login: true,

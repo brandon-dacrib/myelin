@@ -1620,3 +1620,134 @@ async fn an_administrator_can_add_a_user_who_can_then_sign_in() {
 
     handle.shutdown().await;
 }
+
+/// Who the user directory shows to whom, through the real server: Complement's
+/// `TestRoomSpecificUsername*` scenario, which this server failed by showing a searcher somebody
+/// they share nothing with. Alice is in a public room, so everybody can find her; Bob shares a
+/// private room with Alice and nothing with Eve.
+#[tokio::test]
+async fn the_user_directory_shows_a_searcher_only_who_they_could_already_see() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = hs_cli::serve::spawn_serve(
+        test_config(reserve_ephemeral_port(), dir.path()),
+        hs_cli::serve::ServeOptions::default(),
+    )
+    .await
+    .expect("server should boot");
+    let base = handle.base_url();
+    let client = reqwest::Client::new();
+
+    let register = |name: &'static str| {
+        let (client, base) = (client.clone(), base.clone());
+        async move {
+            let body: serde_json::Value = client
+                .post(format!("{base}/_matrix/client/v3/register"))
+                .json(&json!({"username": name, "password": format!("hunter2-{name}"), "auth": {"type": "m.login.dummy"}}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            body["access_token"].as_str().unwrap().to_owned()
+        }
+    };
+    let alice = register("dir-alice").await;
+    let bob = register("dir-bob").await;
+    let eve = register("dir-eve").await;
+
+    let create_room = |token: String, body: serde_json::Value| {
+        let (client, base) = (client.clone(), base.clone());
+        async move {
+            let created: serde_json::Value = client
+                .post(format!("{base}/_matrix/client/v3/createRoom"))
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            created["room_id"].as_str().expect("a room id").to_owned()
+        }
+    };
+    create_room(
+        alice.clone(),
+        json!({"visibility": "public", "preset": "public_chat"}),
+    )
+    .await;
+    create_room(
+        alice.clone(),
+        json!({"preset": "private_chat", "invite": ["@dir-bob:example.org"]}),
+    )
+    .await;
+    // Bob accepts, so that he and Alice share a private room.
+    let bob_sync: serde_json::Value = client
+        .get(format!("{base}/_matrix/client/v3/sync?timeout=0"))
+        .bearer_auth(&bob)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let invited_to = bob_sync["rooms"]["invite"]
+        .as_object()
+        .and_then(|rooms| rooms.keys().next().cloned())
+        .expect("bob has an invite");
+    let joined = client
+        .post(format!(
+            "{base}/_matrix/client/v3/join/{}",
+            invited_to.replace('!', "%21").replace(':', "%3A")
+        ))
+        .bearer_auth(&bob)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(joined.status(), reqwest::StatusCode::OK);
+
+    let search = |token: String, term: &'static str| {
+        let (client, base) = (client.clone(), base.clone());
+        async move {
+            let found: serde_json::Value = client
+                .post(format!("{base}/_matrix/client/v3/user_directory/search"))
+                .bearer_auth(token)
+                .json(&json!({"search_term": term}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let mut ids: Vec<String> = found["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["user_id"].as_str().unwrap().to_owned())
+                .collect();
+            ids.sort();
+            ids
+        }
+    };
+
+    // "dir-" matches all three accounts. Each searcher gets the ones they could already see.
+    assert_eq!(
+        search(eve.clone(), "dir-").await,
+        vec!["@dir-alice:example.org"],
+        "eve sees alice (public room) and not bob (shares nothing with her)"
+    );
+    assert_eq!(
+        search(bob.clone(), "dir-").await,
+        vec!["@dir-alice:example.org"],
+        "bob sees alice and not eve"
+    );
+    assert_eq!(
+        search(alice.clone(), "dir-").await,
+        vec!["@dir-bob:example.org"],
+        "alice sees bob (their private room) and not eve, who is in no room with her"
+    );
+
+    handle.shutdown().await;
+}

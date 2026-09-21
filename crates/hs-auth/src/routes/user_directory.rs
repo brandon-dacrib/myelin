@@ -7,17 +7,17 @@
 //! publicly joinable rooms, users in world-readable rooms -- while "the homeserver may determine
 //! which subset of users are searched".
 //!
-//! This implementation searches every account on this server. That is a superset of the floor, so
-//! it satisfies the requirement, and it is the behaviour that makes the endpoint useful for what
-//! clients actually call it for: finding somebody you have *not* met yet in order to invite them.
-//! A shared-rooms filter is also not something this crate could apply -- room membership lives in
-//! `hs-room`, which depends on this crate and not the other way round.
+//! By default this implementation searches exactly that floor: the people the requester shares a
+//! room with, and the members of public rooms. It used to search every account, on the reasoning
+//! that the endpoint exists to find somebody you have *not* met yet -- which is true, and is why
+//! the wider search is still available as `auth.user_directory_search_all_users`. But it is off
+//! by default, as Synapse's `user_directory.search_all_users` is, because the cost is not
+//! confined to open servers: a bridge makes a local account for every contact of every user it
+//! serves, so searching everyone lets any user read other people's address books.
 //!
-//! It is worth being explicit that this is a policy choice with a privacy cost: on this server,
-//! any logged-in user can enumerate the display names of all the others by searching. Synapse
-//! makes the opposite choice by default (`user_directory.search_all_users: false`) and is
-//! correspondingly unable to find a stranger to invite. If this server ever hosts users who
-//! should not be able to see each other, this is the first thing to put behind a setting.
+//! Who shares a room with whom is a fact about rooms, and this crate cannot see rooms (`hs-user`
+//! depends on it, not the other way round), so the scope arrives through
+//! [`crate::state::UserDirectoryVisibility`], installed by `hs serve`.
 //!
 //! Remote users are not searched. The spec says a server "SHOULD query remote users as part of
 //! the search"; doing so means federated user-directory queries, which this server does not make.
@@ -69,6 +69,22 @@ pub async fn post_user_directory_search(
         return Ok(Json(json!({"results": [], "limited": false})).into_response());
     }
 
+    // Who the requester may find at all: people they share a room with, and people in public
+    // rooms. Without this a search covered every account, so any account could enumerate every
+    // other user's name -- and Complement's `TestRoomSpecificUsername*` noticed, by finding
+    // somebody it should not have. `None` only when no room layer is installed (this crate's own
+    // tests), where there are no rooms for anybody to be private in. A room layer that *fails* is
+    // an error, never a reason to show everybody.
+    let visible = match state.user_directory_visibility() {
+        // An operator's explicit choice to let everybody find everybody.
+        Some(_) if state.config.user_directory_search_all_users => None,
+        Some(visibility) => Some(visibility.visible_to(&requester.user_id).await.map_err(|e| {
+            tracing::error!(error = %e, "could not work out who the user directory may show");
+            MatrixError::internal()
+        })?),
+        None => None,
+    };
+
     let needle = search_term.to_lowercase();
     let mut matches: Vec<(Rank, UserRecord)> = state
         .store
@@ -81,6 +97,7 @@ pub async fn post_user_directory_search(
             // too: every client filters it back out, and nobody searches for themselves.
             !user.deactivated && user.user_id != requester.user_id
         })
+        .filter(|user| visible.as_ref().is_none_or(|v| v.contains(&user.user_id)))
         .filter_map(|user| rank(&user, &needle).map(|rank| (rank, user)))
         .collect();
 
@@ -278,5 +295,105 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.errcode().as_str(), "M_MISSING_PARAM");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Who may find whom.
+    // ---------------------------------------------------------------------------------------
+
+    /// Stands in for the room layer: a fixed answer per requester, or a failure.
+    struct FixedVisibility(Result<Vec<&'static str>, &'static str>);
+
+    #[async_trait::async_trait]
+    impl crate::state::UserDirectoryVisibility for FixedVisibility {
+        async fn visible_to(
+            &self,
+            _requester: &ruma::UserId,
+        ) -> Result<std::collections::BTreeSet<ruma::OwnedUserId>, String> {
+            match &self.0 {
+                Ok(ids) => Ok(ids
+                    .iter()
+                    .map(|id| ruma::UserId::parse(*id).unwrap())
+                    .collect()),
+                Err(e) => Err((*e).to_owned()),
+            }
+        }
+    }
+
+    /// With a room layer installed, a match the requester is not allowed to see is not a match.
+    /// "alice" matches Alice and Dave ("Alice Impostor"); bob may only see Alice.
+    #[tokio::test]
+    async fn a_search_finds_only_the_people_its_caller_may_see() {
+        let state = state_with_users().await;
+        assert_eq!(
+            ids(&search(&state, "@bob:example.org", "alice").await).len(),
+            2,
+            "without a room layer there are no rooms to be private in"
+        );
+
+        state.install_user_directory_visibility(std::sync::Arc::new(FixedVisibility(Ok(vec![
+            "@alice:example.org",
+            "@carol:example.org",
+        ]))));
+        let results = search(&state, "@bob:example.org", "alice").await;
+        assert_eq!(ids(&results), vec!["@alice:example.org"]);
+        assert_eq!(results["limited"], false);
+
+        // Nobody visible means nobody found, however good the match.
+        let nobody = AuthState::in_memory();
+        for id in ["@alice:example.org", "@bob:example.org"] {
+            nobody
+                .store
+                .create_user(UserRecord::new(ruma::UserId::parse(id).unwrap(), 0))
+                .await
+                .unwrap();
+        }
+        nobody.install_user_directory_visibility(std::sync::Arc::new(FixedVisibility(Ok(vec![]))));
+        assert!(ids(&search(&nobody, "@bob:example.org", "alice").await).is_empty());
+    }
+
+    /// The operator's opt-in: everybody finds everybody, whatever the room layer would say.
+    #[tokio::test]
+    async fn search_all_users_is_an_explicit_setting_that_overrides_the_scope() {
+        let state = AuthState::in_memory_with_config(crate::config::AuthConfig {
+            user_directory_search_all_users: true,
+            ..crate::config::AuthConfig::default()
+        });
+        for id in [
+            "@alice:example.org",
+            "@bob:example.org",
+            "@alicia:example.org",
+        ] {
+            state
+                .store
+                .create_user(UserRecord::new(ruma::UserId::parse(id).unwrap(), 0))
+                .await
+                .unwrap();
+        }
+        state.install_user_directory_visibility(std::sync::Arc::new(FixedVisibility(Ok(vec![]))));
+        assert_eq!(
+            ids(&search(&state, "@bob:example.org", "ali").await),
+            vec!["@alice:example.org", "@alicia:example.org"]
+        );
+    }
+
+    /// A room layer that cannot answer is an error. The tempting fallback -- search everybody --
+    /// is exactly the disclosure the scoping exists to prevent.
+    #[tokio::test]
+    async fn a_room_layer_that_fails_does_not_fall_back_to_showing_everybody() {
+        let state = state_with_users().await;
+        state.install_user_directory_visibility(std::sync::Arc::new(FixedVisibility(Err(
+            "room store unreachable",
+        ))));
+        let requester =
+            Requester::for_user(ruma::UserId::parse("@bob:example.org").unwrap().to_owned());
+        let err = post_user_directory_search(
+            State(state.clone()),
+            requester,
+            PermissiveJson(json!({"search_term": "alice"})),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

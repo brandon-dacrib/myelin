@@ -496,6 +496,31 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         Ok(shared)
     }
 
+    /// Everyone `user_id` may find in the user directory: the people they share a joined room
+    /// with, and everyone joined to a public room (one whose join rule is `public`) -- the spec's
+    /// floor for `POST /user_directory/search`, and this server's ceiling.
+    ///
+    /// Computed per search by walking rooms, which is the honest cost of having no directory
+    /// table: fine at the size this server runs at today, and the first thing to replace with
+    /// one if a public room ever has tens of thousands of members.
+    ///
+    /// # Errors
+    /// Returns [`UserError`] if a membership list or a room could not be read.
+    pub async fn users_visible_in_directory_to(
+        &self,
+        user_id: &UserId,
+    ) -> Result<std::collections::BTreeSet<OwnedUserId>, UserError> {
+        let mut visible = self.users_sharing_room_with(user_id).await?;
+        for room in self.store.list_public_rooms().await? {
+            for member in self.joined_member_ids(&room.room_id).await? {
+                if member.as_str() != user_id.as_str() {
+                    visible.insert(member);
+                }
+            }
+        }
+        Ok(visible)
+    }
+
     /// Spawns a background task forwarding `handle`'s publish stream
     /// ([`hs_room::actor::RoomActorHandle::subscribe`]) into [`SessionHub::process_room_update`]
     /// for as long as the room stays resident. See the module docs, "The discovery gap", for why
@@ -667,6 +692,20 @@ pub async fn wait_or_timeout(notify: &Notify, timeout: Duration) {
     let notified = notify.notified();
     tokio::pin!(notified);
     let _ = tokio::time::timeout(timeout, notified).await;
+}
+
+#[async_trait::async_trait]
+impl<B: KvBackend + 'static, R: RoomSource<B> + 'static> hs_auth::state::UserDirectoryVisibility
+    for SessionHub<B, R>
+{
+    async fn visible_to(
+        &self,
+        requester: &UserId,
+    ) -> Result<std::collections::BTreeSet<OwnedUserId>, String> {
+        self.users_visible_in_directory_to(requester)
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(test)]

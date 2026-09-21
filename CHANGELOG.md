@@ -37,6 +37,10 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
   generate, and an administrator switch that says what it means. It ends on a hand-over view
   with the user ID and password to copy, because the password is about to be unrecoverable and
   still has to reach a person. Refusals land beside the field they are about.
+- **The user directory no longer lets anyone list everyone.** A search finds people you share a
+  room with and members of public rooms, as the specification requires; finding everybody is an
+  explicit setting (`auth.user_directory_search_all_users`), off by default because bridged
+  contacts are local accounts too.
 - **The Overview page has numbers on it.** Users, rooms, daily and monthly active users, and
   whether this is one server or a cluster, counted from the real stores. A number nothing can
   count yet is left out of the response and shown as a dash, never as zero, and the page's

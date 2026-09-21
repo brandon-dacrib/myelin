@@ -62,6 +62,10 @@ pub struct AuthConfig {
     /// Whether `POST /register` accepts new accounts at all. Synapse's `enable_registration`.
     pub registration_enabled: bool,
 
+    /// Whether the user directory searches every account rather than only the ones its caller
+    /// may see. See `hs_config::auth::AuthConfig::user_directory_search_all_users`.
+    pub user_directory_search_all_users: bool,
+
     /// Whether registration requires a valid `m.login.registration_token` stage. Synapse's
     /// `registration_requires_token`.
     pub registration_requires_token: bool,
@@ -133,6 +137,7 @@ impl Default for AuthConfig {
             login_token_ttl_ms: 2 * 60 * 1000,
             uia_session_timeout_ms: 15 * 60 * 1000,
             registration_enabled: true,
+            user_directory_search_all_users: false,
             registration_requires_token: false,
             valid_registration_tokens: HashSet::new(),
             guest_registration_enabled: false,
@@ -201,6 +206,7 @@ impl TryFrom<&hs_config::Config> for AuthConfig {
             refreshable_access_token_ttl_ms: config.auth.access_token_lifetime.as_millis(),
             refresh_token_ttl_ms: config.auth.refresh_token_lifetime.map(|d| d.as_millis()),
             registration_enabled: config.auth.enable_registration,
+            user_directory_search_all_users: config.auth.user_directory_search_all_users,
             // See this method's doc comment: deliberately reused, not left at the default.
             shared_secret_auth_secret: config
                 .auth

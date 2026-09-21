@@ -941,6 +941,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     };
 
     let (user_state, e2e_state, push_state) = build_session_mounts(&backend, &auth_state, &rooms)?;
+    // The user directory is searched in `hs-auth`, which cannot see rooms; the hub can, and says
+    // who each searcher is allowed to find.
+    auth_state.install_user_directory_visibility(user_state.hub.clone());
 
     // Closes the discovery gap (`docs/rfcs/0012-room-registry-global-updates.md`): every room the
     // registry creates or loads is followed into users' durable feeds, so a room created through

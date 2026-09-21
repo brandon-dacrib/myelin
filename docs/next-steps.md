@@ -115,11 +115,14 @@ rough order of how many assertions sit behind it:
   An end-to-end test walks the route manifest, so a new route is covered without anybody
   remembering to. The admin API's ten bare extractors are untouched: that surface wants
   `StrictJson` and RFC 9457, and is its own change.
-- **`/user_directory/search` searches every local account.** Implemented 2026-09-21 because
-  Element's invite dialog 404s without it. The spec allows it and it is what makes the endpoint
-  useful, but it means any logged-in user can enumerate every other user's display name. If this
-  server ever hosts people who should not see each other, put it behind a setting -- the module
-  doc in `crates/hs-auth/src/routes/user_directory.rs` says the same.
+- ~~`/user_directory/search` searches every local account.~~ **Scoped 2026-09-21.** By default
+  a search finds the people the searcher shares a room with and the members of public rooms --
+  the spec's floor, Synapse's default, and what `TestRoomSpecificUsernameChange` and
+  `TestRoomSpecificUsernameAtJoin` were failing for. Searching everyone is
+  `auth.user_directory_search_all_users`, off by default because a bridge makes a local account
+  for every contact of every user, so "everyone" includes other people's address books. The
+  scope is computed per search by walking rooms; a public room with tens of thousands of
+  members is when that wants a table. Not yet re-measured under Complement.
 - **`min_depth` on `/get_missing_events`**, still parsed nowhere, and history visibility still not
   applied per event there.
 
@@ -242,7 +245,7 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | Setup link assumes `localhost:<bound port>` without `public_baseurl` | `hs-cli` | wrong behind a remapped port or an undescribed proxy |
 | In-process server cannot be restarted over its data directory | `hs-cli` | background tasks hold the store's lock after `shutdown()`; restart tests need the real binary |
 | The release binaries job's web build has never run | `.github` | it only runs on a `v*` tag; the image path is verified, this one is not |
-| `/user_directory/search` returns every local user | `hs-auth` | display names are enumerable by any account |
+| User-directory scope is computed by walking rooms on every search | `hs-user` | fine today; the first thing to index if a public room gets very large |
 | csapi run-to-run wobble, cause found, effect not yet re-measured | `tests`, `hs-user` | was ±2 top-level tests; `/sync` was spinning (fixed 2026-09-21), so the next run says how much of it that was |
 | `heartbeat_seq` is derived from wall-clock milliseconds | `hs-cluster` | two ticks in one millisecond read as "no progress", i.e. death; harmless at the production 1s interval, surfaces only in tests |
 | Sytest never run | `tests/sytest` | CPAN dependencies absent |
