@@ -62,6 +62,11 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
   the creator's membership, and its invitations, without their profile -- the creator was a raw
   user ID to everyone in the room -- and dropped `is_direct`, so the invitee's client filed a
   direct chat as a room.
+- **The server stops when it is told to.** With anybody signed in it took up to thirty seconds,
+  because graceful shutdown waited for every open `/sync` long-poll to run out its client's
+  timeout: 29.3 seconds measured for a single idle client, which is Kubernetes' whole default
+  grace period, and long enough that a quick restart found the database still locked. Waiting
+  clients are now answered first, and ask again of whatever replaces this server.
 - **The user directory no longer lets anyone list everyone.** A search finds people you share a
   room with and members of public rooms, as the specification requires; finding everybody is an
   explicit setting (`auth.user_directory_search_all_users`), off by default because bridged

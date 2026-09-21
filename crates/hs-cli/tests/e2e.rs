@@ -1777,6 +1777,96 @@ async fn the_user_directory_shows_a_searcher_only_who_they_could_already_see() {
 
     handle.shutdown().await;
 }
+/// Stopping the server while anybody is signed in. A `/sync` long-poll is a request that is meant
+/// to stay open -- thirty seconds, from every real client -- and graceful shutdown waits for
+/// requests in flight, so the server took as long to stop as its most patient client was prepared
+/// to wait. Seen with two Element tabs open: more than ten seconds, a restart that found the
+/// database still locked, and a margin over Kubernetes' thirty-second grace period of nothing.
+#[tokio::test]
+async fn stopping_the_server_does_not_wait_for_clients_to_finish_waiting() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = hs_cli::serve::spawn_serve(
+        test_config(reserve_ephemeral_port(), dir.path()),
+        hs_cli::serve::ServeOptions::default(),
+    )
+    .await
+    .expect("server should boot");
+    let base = handle.base_url();
+    let client = reqwest::Client::new();
+
+    let registered: serde_json::Value = client
+        .post(format!("{base}/_matrix/client/v3/register"))
+        .json(&json!({"username": "patient", "password": "hunter2-patient", "auth": {"type": "m.login.dummy"}}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = registered["access_token"].as_str().unwrap().to_owned();
+    let first: serde_json::Value = client
+        .get(format!("{base}/_matrix/client/v3/sync?timeout=0"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let since = first["next_batch"].as_str().unwrap().to_owned();
+    // Twice, so that the second has nothing to report and really does wait.
+    let settled: serde_json::Value = client
+        .get(format!(
+            "{base}/_matrix/client/v3/sync?timeout=0&since={since}"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let since = settled["next_batch"].as_str().unwrap().to_owned();
+
+    let waiting = tokio::spawn({
+        let (client, base, token, since) = (client.clone(), base.clone(), token, since.clone());
+        async move {
+            let started = std::time::Instant::now();
+            let response = client
+                .get(format!(
+                    "{base}/_matrix/client/v3/sync?timeout=30000&since={since}"
+                ))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap();
+            (started.elapsed(), status, body)
+        }
+    });
+    // Long enough for the request to be inside its long-poll when the server is told to stop.
+    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    assert!(!waiting.is_finished(), "the sync was meant to be waiting");
+
+    let stopping = std::time::Instant::now();
+    handle.shutdown().await;
+    let took = stopping.elapsed();
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "shutdown waited {took:?} for a client that was only waiting for news"
+    );
+
+    // And the client was answered, not cut off: an ordinary empty sync it can ask again from.
+    let (waited, status, body) = waiting.await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    assert!(body["next_batch"].is_string(), "{body}");
+    assert!(
+        waited < std::time::Duration::from_secs(10),
+        "the long-poll ran {waited:?}"
+    );
+}
+
 /// What opening Element on this server found, the day `/sync` stopped resending every room's
 /// whole state with every message. Two people, a direct and encrypted chat, an invitation
 /// accepted: the most ordinary thing the server will ever be asked to do, and it went wrong four

@@ -1362,6 +1362,11 @@ async fn long_poll<B: KvBackend + 'static, R: RoomSource<B>>(
         tokio::pin!(notified);
         notified.as_mut().enable();
 
+        // Checked after registering with the waker, like the condition below and for the same
+        // reason: `begin_shutdown` sets the flag and then wakes, so one or the other is seen.
+        if hub.is_shutting_down() {
+            return Ok(());
+        }
         if has_new_data(hub, e2e, user_id, device_id, baseline).await? {
             return Ok(());
         }

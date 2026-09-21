@@ -197,6 +197,9 @@ pub struct SessionHub<B: KvBackend, R: RoomSource<B>> {
     /// feed alone.
     fan_out_threshold: usize,
     wakers: Mutex<HashMap<OwnedUserId, Arc<Notify>>>,
+    /// Set once, by [`SessionHub::begin_shutdown`]: the server is stopping, and a `/sync` that is
+    /// waiting for news should stop waiting.
+    shutting_down: std::sync::atomic::AtomicBool,
     /// In-memory `m.typing` state. See [`crate::typing`]'s module docs for why this lives here
     /// rather than in `store`: ephemeral, never persisted, and this hub is already the one place
     /// that both knows how to reach a room's member list and owns the wakers a change needs to
@@ -238,6 +241,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             rooms,
             fan_out_threshold,
             wakers: Mutex::new(HashMap::new()),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
             typing: TypingRegistry::new(),
             presence: PresenceRegistry::new(),
             receipts: ReceiptRegistry::new(),
@@ -311,6 +315,29 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     /// `docs/status/05-sync.md` for the exact call site and line this needs added.
     pub fn install_device_list_token_resolver(&self, e2e: &hs_e2e::state::E2eState<B>) {
         e2e.install_sync_token_resolver(Arc::new(DeviceListTokenResolver));
+    }
+
+    /// Tells every `/sync` that is waiting for news to answer now, with whatever it has, and
+    /// every later one not to wait at all.
+    ///
+    /// A long-poll is a request that is *supposed* to stay open, for as long as its client asked
+    /// (thirty seconds, from every real client). Graceful shutdown waits for in-flight requests
+    /// to finish, so a server with anybody signed in took up to that long to stop -- longer than
+    /// Kubernetes' default grace period, which ends in `SIGKILL`, and long enough that a
+    /// restart which did not wait found the database still locked. A client handed an early,
+    /// empty answer simply asks again, and meets the server that replaces this one.
+    pub async fn begin_shutdown(&self) {
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        for waker in self.wakers.lock().await.values() {
+            waker.notify_waiters();
+        }
+    }
+
+    /// Whether [`SessionHub::begin_shutdown`] has been called.
+    #[must_use]
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The waker a long-polling `/sync` call should register interest on *before* checking

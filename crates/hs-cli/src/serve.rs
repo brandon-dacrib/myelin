@@ -794,6 +794,9 @@ pub struct ServeHandle {
     pub setup_link: Option<String>,
     shutdown_tx: watch::Sender<bool>,
     join: tokio::task::JoinHandle<()>,
+    /// Ends every `/sync` long-poll in flight (`hs_user::hub::SessionHub::begin_shutdown`), so
+    /// that draining the listeners does not mean waiting out each client's thirty-second timeout.
+    release_long_polls: ReleaseLongPolls,
     /// Keeps the opened storage backend alive for as long as the server is: Fjall holds an
     /// exclusive lock on its data directory and the Postgres backend owns a connection pool, and
     /// dropping either while listeners are still serving would take the store out from under
@@ -806,6 +809,10 @@ pub struct ServeHandle {
     mesh: Option<crate::cluster::MeshRuntime>,
 }
 
+/// [`ServeHandle`]'s type-erased call into the session hub. See its `release_long_polls` field.
+type ReleaseLongPolls =
+    Box<dyn Fn() -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 /// How long [`ServeHandle::shutdown`] gives `Cluster::drain` to release this replica's shards and
 /// see them claimed by a peer before giving up and shutting down anyway (RFC 0001 section 10). No
 /// `hs-config` field exists for this yet (see `docs/status/03-cluster.md`); chosen to comfortably
@@ -817,8 +824,9 @@ const CLUSTER_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_se
 impl ServeHandle {
     /// Runs the cluster's graceful handoff (releasing every shard this replica owns and waiting,
     /// up to [`CLUSTER_DRAIN_DEADLINE`], for a peer to claim it), stops the mesh listener, then
-    /// signals every HTTP listener to begin graceful shutdown and waits for them to finish
-    /// draining in-flight requests. `hs serve`'s `SIGTERM` handler calls this.
+    /// answers every `/sync` that is waiting for news, signals every HTTP listener to begin
+    /// graceful shutdown and waits for them to finish draining in-flight requests. `hs serve`'s
+    /// `SIGTERM` handler calls this.
     pub async fn shutdown(self) {
         let report = self.cluster.drain(CLUSTER_DRAIN_DEADLINE).await;
         if report.handed_off > 0 || report.released_unclaimed > 0 {
@@ -832,6 +840,9 @@ impl ServeHandle {
         if let Some(mesh) = self.mesh {
             mesh.shutdown().await;
         }
+        // Before the listeners are told to drain, not after: a long-poll is an in-flight request
+        // that would otherwise hold its listener open until the client's own timeout ran out.
+        (self.release_long_polls)().await;
         let _ = self.shutdown_tx.send(true);
         let _ = self.join.await;
     }
@@ -951,6 +962,14 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // Subscribed here, before any listener is bound below, because the stream does not replay: an
     // update published before this subscription exists would be missed.
     user_state.hub.watch_all(rooms.subscribe_global());
+    // Shutdown's way to the hub, which is generic over the backend where `ServeHandle` is not.
+    let release_long_polls: ReleaseLongPolls = {
+        let hub = user_state.hub.clone();
+        Box::new(move || {
+            let hub = hub.clone();
+            Box::pin(async move { hub.begin_shutdown().await })
+        })
+    };
 
     let media_state = crate::media::build_media_state(
         &config,
@@ -1201,6 +1220,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         setup_link,
         shutdown_tx,
         join,
+        release_long_polls,
         _storage: Box::new(backend.clone()),
         cluster,
         mesh,

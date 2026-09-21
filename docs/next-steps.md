@@ -212,11 +212,15 @@ and an encrypted composer, replies, and Alice reads it decrypted. What Element h
 asked to do since: verify one session from another (the interactive emoji flow), restore from key
 backup, leave and rejoin, or anything with more than two people.
 
-**Something else it showed, not fixed:** stopping the server while clients are long-polling took
-between ten and forty seconds -- graceful shutdown waits for every open `/sync` to time out on
-its own rather than waking it. A restart that raced it found the database still locked.
-Kubernetes' default grace period is thirty seconds, so a rolling update can end in `SIGKILL`.
-Shutdown should wake the long-polls (the hub already has a waker per user).
+**Something else it showed, fixed the same evening:** stopping the server while clients were
+long-polling took as long as the most patient client was prepared to wait -- 29.3 seconds for
+one idle `/sync`, measured -- because graceful shutdown waits for requests in flight and a
+long-poll is one. A restart that raced it found the database still locked, and Kubernetes'
+default grace period is thirty seconds, so a rolling update was a coin toss with `SIGKILL`.
+Shutdown now answers every waiting `/sync` first (`SessionHub::begin_shutdown`); the client gets
+an ordinary empty response and asks again. Not looked at: the other requests that wait on
+purpose, of which `GET /media/.../download?timeout_ms=` for a not-yet-uploaded file is the one
+that comes to mind.
 
 ### 2. Make it fun to administer — the half that is left
 
