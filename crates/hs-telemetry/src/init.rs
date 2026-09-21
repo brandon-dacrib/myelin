@@ -37,6 +37,20 @@ impl Level {
             Level::Error => "error",
         }
     }
+
+    /// The filter directives this level means when `RUST_LOG` is not set.
+    ///
+    /// At `info` the embedded storage engine is held to `warn`. `lsm_tree` logs every flush and
+    /// ingestion at `info`, which on a first boot was 67 of the 72 lines an operator saw -- the
+    /// other five being the ones that mattered: where the signing key went and what address is
+    /// listening. Asking for `debug` or `trace` is asking for everything, so those are left
+    /// alone, and `RUST_LOG` overrides all of it.
+    fn default_directives(self) -> String {
+        match self {
+            Level::Info => "info,lsm_tree=warn,fjall=warn".to_owned(),
+            other => other.as_str().to_owned(),
+        }
+    }
 }
 
 /// The log line format.
@@ -142,7 +156,7 @@ impl Drop for Guard {
 /// tracing is enabled).
 pub fn init(options: &Options) -> Result<Guard, TelemetryError> {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(options.level.as_str()));
+        .unwrap_or_else(|_| EnvFilter::new(options.level.default_directives()));
 
     let fmt_layer_json = matches!(options.format, LogFormat::Json).then(|| {
         tracing_subscriber::fmt::layer()
@@ -228,6 +242,53 @@ mod tests {
         let opts = Options::default();
         assert_eq!(opts.level, Level::Info);
         assert_eq!(opts.format, LogFormat::Json);
+    }
+
+    /// Through a real subscriber scoped to this test, not by comparing directive strings: what
+    /// matters is which lines come out.
+    #[test]
+    fn at_info_the_storage_engine_is_quiet_and_the_server_is_not() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let lines_at = |level: Level| {
+            let capture = Capture::default();
+            let writer = capture.clone();
+            let subscriber = tracing_subscriber::registry()
+                .with(EnvFilter::new(level.default_directives()))
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(move || writer.clone()),
+                );
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(target: "lsm_tree::tree::ingest", "Finished ingestion writer");
+                tracing::warn!(target: "lsm_tree::tree", "a storage warning");
+                tracing::info!(target: "hs_cli::cli", "listening");
+            });
+            String::from_utf8(capture.0.lock().unwrap().clone()).unwrap()
+        };
+
+        let info = lines_at(Level::Info);
+        assert!(!info.contains("Finished ingestion writer"), "{info}");
+        assert!(info.contains("a storage warning"), "{info}");
+        assert!(info.contains("listening"), "{info}");
+
+        // Asking for more is asking for everything.
+        let debug = lines_at(Level::Debug);
+        assert!(debug.contains("Finished ingestion writer"), "{debug}");
     }
 
     // `init` itself installs a *global* subscriber, so it is exercised by the `hs-cli`

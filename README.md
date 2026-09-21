@@ -26,10 +26,10 @@ Megolm establishes, the recipient decrypts. `cargo test -p hs-loadgen --test rea
 
 | | |
 |---|---|
-| Complement `csapi` | 191 / 296 assertions (53 / 106 tests) |
-| Complement federation | 52 / 212 assertions (6 / 88 tests) |
+| Complement `csapi` | 241 / 370 assertions (61 / 104 tests) |
+| Complement federation | 59 / 246 assertions (6 / 88 tests), the whole package for the first time |
 | Spec routes served | 138 / 235 (58.7%) — client-server 108/166, server-server 30/36 |
-| Rust | 26 crates, ~126k lines, 1,562 tests |
+| Rust | 26 crates, ~126k lines, 1,686 tests |
 
 **It runs for real.** PostgreSQL or an embedded store, a distroless non-root image on amd64 and
 arm64, a Helm chart, and a Kubernetes operator. Two replicas share a room without forking its
@@ -37,18 +37,17 @@ history. CD refuses to publish an image that has not booted and answered `/healt
 architectures.
 
 ```sh
-docker run --rm ghcr.io/brandon-dacrib/myelin:main \
-  generate-config --server-name localhost > homeserver.yaml
-# edit homeserver.yaml: point data_dir, media path and signing_key_path at /data,
-# and set auth.enable_registration to true if you want to register a user
-mkdir data && docker run -d --name myelin -p 8008:8008 \
-  -v "$PWD/homeserver.yaml:/etc/hs/homeserver.yaml:ro" -v "$PWD/data:/data" \
-  ghcr.io/brandon-dacrib/myelin:main
+docker run -d --name myelin -p 8008:8008 -v myelin:/data \
+  -e HS__SERVER__SERVER_NAME=example.org ghcr.io/brandon-dacrib/myelin:main
 ```
 
-It answers `/health/live` about a second later, and `POST /_matrix/client/v3/register` then gets
-you a user, a token and a room. Those four steps and a 158-line YAML file are also the honest
-reason item 2 of `docs/next-steps.md` exists: this should be one command.
+That is the whole installation. There is no configuration file: the database, the signing key
+and uploaded media all live in the `myelin` volume, and every other setting is a default until
+you change it in the admin interface at <http://localhost:8008/admin/>, which keeps it in the
+database. It answers `/health/live` about three seconds later. CD boots the image with exactly
+this command before it will publish it, so if this stops working the release stops too.
+
+Without Docker, `hs serve --data-dir ./data --server-name example.org` is the same thing.
 
 `CHANGELOG.md` is the full record of what has been built, and is honest about the difference
 between a route that is registered and a route that works. `docs/next-steps.md` is what comes next

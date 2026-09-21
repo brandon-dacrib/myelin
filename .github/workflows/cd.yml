@@ -177,16 +177,11 @@ jobs:
           docker buildx build --load --platform ${{ matrix.platform }} \
             -f deploy/Dockerfile -t myelin:smoke .
 
-          mkdir -p smoke && chmod 777 smoke
-          docker run --rm myelin:smoke generate-config --server-name smoke.invalid \
-            | sed -e 's|data_dir: .*|data_dir: /data|' \
-                  -e 's|path: ./media-store|path: /data/media|' \
-                  -e 's|signing_key_path: .*|signing_key_path: /data/keys|' \
-            > smoke/homeserver.yaml
-
+          # Exactly the command the README gives: no config file, a named volume, one variable.
+          # If this stops working, the quickstart has stopped working.
           docker run -d --name myelin-smoke -p 8008:8008 \
-            -v "$PWD/smoke/homeserver.yaml:/etc/hs/homeserver.yaml:ro" \
-            -v "$PWD/smoke:/data" \
+            -v myelin-smoke:/data \
+            -e HS__SERVER__SERVER_NAME=smoke.invalid \
             myelin:smoke
 
           ok=0

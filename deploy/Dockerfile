@@ -65,7 +65,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     RUST_TARGET="$(cat /rust_target.txt)" && \
     cargo build --release --locked -p hs-cli --target "${RUST_TARGET}" && \
-    mkdir -p /out && \
+    mkdir -p /out /out/data && \
     cp "target/${RUST_TARGET}/release/hs" /out/hs
 
 # ---------------------------------------------------------------------------
@@ -76,6 +76,12 @@ FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 # distroless/static-debian12:nonroot already runs as uid/gid 65532 ("nonroot") and ships CA
 # certificates (needed for outbound federation TLS and OTLP/Sentry export over HTTPS).
 COPY --from=builder /out/hs /usr/local/bin/hs
+
+# An empty /data that the non-root user owns. The runtime image has no shell to `mkdir` or `chown`
+# with, so the directory is made in the builder and copied across. It has to exist in the image:
+# a named volume mounted over a directory inherits that directory's ownership the first time it
+# is used, and one mounted over nothing is root's, which uid 65532 cannot write to.
+COPY --from=builder --chown=65532:65532 /out/data /data
 
 # Metadata only; the chart/orchestrator is expected to enforce `readOnlyRootFilesystem: true`,
 # `runAsNonRoot: true` and drop all capabilities (deploy/helm's securityContext defaults do this —
@@ -89,5 +95,18 @@ WORKDIR /
 # the actual bound ports come from the mounted config.
 EXPOSE 8008 8448
 
+# With no arguments this image is a first run: `hs serve` with `HS_DATA_DIR` set puts the
+# database, the signing key and the media store under /data (crates/hs-cli/src/bootstrap.rs), and
+# everything else is a default, a `HS__` variable, or a setting changed later in the admin
+# interface and kept in the database. So
+#
+#   docker run -p 8008:8008 -v myelin:/data -e HS__SERVER__SERVER_NAME=example.org <image>
+#
+# is a working server. The derived paths are only defaults: a deployment that mounts a config
+# file and passes `serve -c <file>` (the Helm chart does) sets all three itself and never touches
+# /data.
+ENV HS_DATA_DIR=/data
+VOLUME /data
+
 ENTRYPOINT ["/usr/local/bin/hs"]
-CMD ["serve", "-c", "/etc/hs/homeserver.yaml"]
+CMD ["serve"]
