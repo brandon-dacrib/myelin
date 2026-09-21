@@ -405,6 +405,25 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         Ok(())
     }
 
+    /// Marks `user_id` as being in `presence` as a side effect of them polling `/sync`, waking
+    /// everyone who shares a room with them **only if** that actually changed their state.
+    ///
+    /// Unlike [`SessionHub::set_presence`] this does not wake the user themselves: the only
+    /// caller is their own in-flight `/sync`, which is about to answer anyway, and waking it
+    /// would just make it go round again.
+    ///
+    /// # Errors
+    /// Returns [`UserError`] if a shared room could not be loaded.
+    pub async fn touch_presence(&self, user_id: &UserId, presence: &str) -> Result<(), UserError> {
+        if !self.presence.touch(user_id, presence).await {
+            return Ok(());
+        }
+        for other in self.users_sharing_room_with(user_id).await? {
+            self.wake(&other).await;
+        }
+        Ok(())
+    }
+
     /// `user_id`'s current presence record, if this process has ever recorded one.
     pub async fn presence_of(&self, user_id: &UserId) -> Option<crate::presence::PresenceRecord> {
         self.presence.get(user_id).await

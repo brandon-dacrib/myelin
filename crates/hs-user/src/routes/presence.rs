@@ -12,8 +12,9 @@ use crate::error::UserError;
 use crate::room_source::RoomSource;
 use crate::state::{UserRequester, UserState};
 
-/// The presence values the spec defines. Anything else in a `PUT` body is `400 M_INVALID_PARAM`.
-const VALID_PRESENCE: &[&str] = &["online", "offline", "unavailable"];
+/// The presence values the spec defines. Anything else in a `PUT` body -- or in `/sync`'s
+/// `set_presence` query parameter, which shares this list -- is `400 M_INVALID_PARAM`.
+pub(crate) const VALID_PRESENCE: &[&str] = &["online", "offline", "unavailable"];
 
 fn parse_user_id(raw: &str) -> Result<ruma::OwnedUserId, UserError> {
     UserId::parse(raw)

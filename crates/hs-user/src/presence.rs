@@ -88,6 +88,48 @@ impl PresenceRegistry {
         seq
     }
 
+    /// Records `presence` for `user_id` without touching their status message, and counts as a
+    /// change -- a new stamp, and so a presence event other people's syncs will carry -- only when
+    /// the state actually differs from what is stored. Returns whether it was a change.
+    ///
+    /// This exists because `GET /sync` marks its caller online on *every* poll: that is the
+    /// spec's default when `set_presence` is omitted. Bumping the stamp each time would wake
+    /// everyone sharing a room with them, whose own `/sync` would return, mark *them* online, and
+    /// wake everyone again -- a feedback loop with nothing to damp it. Refreshing `last_active`
+    /// without a new stamp keeps `last_active_ago` honest and leaves the loop unstarted.
+    ///
+    /// The status message is deliberately preserved: `set_presence` on `/sync` says what state
+    /// the client is in, not what the user wants to tell people, and clearing somebody's "On
+    /// holiday until Monday" because their client polled would be wrong.
+    pub async fn touch(&self, user_id: &UserId, presence: &str) -> bool {
+        let mut users = self.users.lock().await;
+        match users.get_mut(user_id) {
+            Some(existing) if existing.presence == presence => {
+                existing.last_active = Instant::now();
+                false
+            }
+            Some(existing) => {
+                existing.presence = presence.to_owned();
+                existing.last_active = Instant::now();
+                existing.seq = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+                true
+            }
+            None => {
+                let seq = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+                users.insert(
+                    user_id.to_owned(),
+                    PresenceRecord {
+                        presence: presence.to_owned(),
+                        status_msg: None,
+                        last_active: Instant::now(),
+                        seq,
+                    },
+                );
+                true
+            }
+        }
+    }
+
     /// This user's current record, if this process has ever recorded one.
     pub async fn get(&self, user_id: &UserId) -> Option<PresenceRecord> {
         self.users.lock().await.get(user_id).cloned()
@@ -104,6 +146,58 @@ impl Default for PresenceRegistry {
 mod tests {
     use super::*;
     use ruma::user_id;
+
+    /// The property the whole `set_presence`-on-`/sync` design rests on. Every poll marks the
+    /// caller online; if each one produced a new stamp, it would wake everyone sharing a room with
+    /// them, whose syncs would return and mark *them* online, and so on without end.
+    #[tokio::test]
+    async fn repeatedly_touching_the_same_state_is_not_a_change() {
+        let reg = PresenceRegistry::new();
+        let uid = user_id!("@alice:example.org");
+
+        assert!(reg.touch(uid, "online").await, "the first one is a change");
+        let first = reg.get(uid).await.unwrap().seq;
+        for _ in 0..10 {
+            assert!(
+                !reg.touch(uid, "online").await,
+                "polling again is not a presence change"
+            );
+        }
+        assert_eq!(
+            reg.get(uid).await.unwrap().seq,
+            first,
+            "the stamp must not move, or every sync wakes every room-mate"
+        );
+    }
+
+    #[tokio::test]
+    async fn touching_a_different_state_is_a_change() {
+        let reg = PresenceRegistry::new();
+        let uid = user_id!("@alice:example.org");
+        reg.touch(uid, "online").await;
+        let first = reg.get(uid).await.unwrap().seq;
+
+        assert!(reg.touch(uid, "unavailable").await);
+        let record = reg.get(uid).await.unwrap();
+        assert_eq!(record.presence, "unavailable");
+        assert!(record.seq > first);
+    }
+
+    /// A client polling `/sync` says where it is, not what the user wants people to read. Clearing
+    /// somebody's "On holiday until Monday" because their phone polled would be wrong.
+    #[tokio::test]
+    async fn touching_presence_leaves_the_status_message_alone() {
+        let reg = PresenceRegistry::new();
+        let uid = user_id!("@alice:example.org");
+        reg.set(uid, "online".to_owned(), Some("On holiday".to_owned()))
+            .await;
+
+        reg.touch(uid, "unavailable").await;
+
+        let record = reg.get(uid).await.unwrap();
+        assert_eq!(record.presence, "unavailable");
+        assert_eq!(record.status_msg.as_deref(), Some("On holiday"));
+    }
 
     #[tokio::test]
     async fn unknown_user_has_no_record() {

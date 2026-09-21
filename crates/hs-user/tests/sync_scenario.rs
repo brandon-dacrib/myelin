@@ -694,3 +694,96 @@ async fn an_invite_carries_the_invitees_own_membership_and_nothing_it_should_not
         }
     }
 }
+
+/// Complement's "Presence can be set from sync": polling `/sync` is itself a presence signal, and
+/// `?set_presence=` is how a client says which one. This was parsed and thrown away, so a user's
+/// presence only ever changed through an explicit `PUT`, and a client that never calls that --
+/// which is most of them -- looked permanently offline to everybody they shared a room with.
+#[tokio::test]
+async fn a_sync_poll_sets_the_callers_presence_and_the_other_member_sees_it() {
+    let (mut s, rooms, hub) = setup();
+
+    s.register("alice", "alice", "hunter2-alice")
+        .await
+        .assert_ok();
+    s.register("bob", "bob", "hunter2-bob").await.assert_ok();
+    let alice_user_id = s.session("alice").unwrap().user_id.clone().unwrap();
+    let bob_user_id = s.session("bob").unwrap().user_id.clone().unwrap();
+
+    let create = s
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    create.assert_ok();
+    let room_id = create.str_field("room_id").to_owned();
+    let handle = rooms
+        .get_or_load(&ruma::RoomId::parse(&room_id).unwrap())
+        .await
+        .unwrap();
+    hub.watch_room(handle).await;
+    settle().await;
+
+    s.send(
+        Some("alice"),
+        Method::POST,
+        &format!("/rooms/{room_id}/invite"),
+        Some(json!({"user_id": bob_user_id})),
+    )
+    .await
+    .assert_ok();
+    s.send(
+        Some("bob"),
+        Method::POST,
+        &format!("/rooms/{room_id}/join"),
+        Some(json!({})),
+    )
+    .await
+    .assert_ok();
+    settle().await;
+
+    // Bob's baseline, taken before alice says anything about her presence.
+    let baseline = s.sync("bob").await;
+    baseline.assert_ok();
+    let since = baseline.str_field("next_batch").to_owned();
+
+    // Alice polls with `set_presence=unavailable` -- no PUT anywhere in this test.
+    s.send(
+        Some("alice"),
+        Method::GET,
+        "/sync?timeout=0&set_presence=unavailable",
+        None,
+    )
+    .await
+    .assert_ok();
+    settle().await;
+
+    let after = s
+        .send(
+            Some("bob"),
+            Method::GET,
+            &format!("/sync?since={since}&timeout=0"),
+            None,
+        )
+        .await;
+    after.assert_ok();
+
+    let events = after.json["presence"]["events"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let alice_presence = events
+        .iter()
+        .find(|e| e["sender"] == alice_user_id.to_string().as_str())
+        .unwrap_or_else(|| {
+            panic!(
+                "bob shares a room with alice and must see her presence: {}",
+                after.json
+            )
+        });
+    assert_eq!(alice_presence["type"], "m.presence");
+    assert_eq!(alice_presence["content"]["presence"], "unavailable");
+}

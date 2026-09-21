@@ -10,6 +10,7 @@ use serde::Deserialize;
 
 use crate::error::UserError;
 use crate::room_source::RoomSource;
+use crate::routes::presence::VALID_PRESENCE;
 use crate::state::{UserRequester, UserState};
 use crate::sync::{self, SyncParams};
 use crate::token::SyncToken;
@@ -30,9 +31,8 @@ pub struct SyncQuery {
     /// Whether to send full state for every room regardless of what changed.
     #[serde(default)]
     pub full_state: bool,
-    /// Presence-setting side effect. Parsed, not applied: this crate does not implement presence
-    /// yet (`crate::sync`'s module docs).
-    #[allow(dead_code)]
+    /// The presence state this poll puts the caller in. Omitted means `online` -- polling
+    /// `/sync` is itself the signal that a client is there, which is the spec's own default.
     pub set_presence: Option<String>,
     /// Milliseconds to long-poll for.
     pub timeout: Option<u64>,
@@ -59,6 +59,31 @@ pub async fn get_sync<B: KvBackend + 'static, R: RoomSource<B> + 'static>(
         .map(Duration::from_millis)
         .unwrap_or_default()
         .min(MAX_TIMEOUT);
+
+    // The presence side effect, before the long poll rather than after it: a client that polls
+    // with a 30-second timeout is present *now*, and everyone who shares a room with them should
+    // learn it now rather than half a minute later.
+    //
+    // The spec: omitting `set_presence` marks the client online, `offline` means "do not mark me
+    // online" (leave whatever is stored alone -- it does not say to mark them offline), and
+    // `unavailable` marks them idle.
+    match query.set_presence.as_deref() {
+        Some("offline") => {}
+        Some(other) => {
+            if !VALID_PRESENCE.contains(&other) {
+                return Err(UserError::InvalidId(format!(
+                    "set_presence must be one of {VALID_PRESENCE:?}, got {other:?}"
+                )));
+            }
+            state.hub.touch_presence(&requester.user_id, other).await?;
+        }
+        None => {
+            state
+                .hub
+                .touch_presence(&requester.user_id, "online")
+                .await?;
+        }
+    }
 
     let (response, token) = sync::build(
         &state.hub,
