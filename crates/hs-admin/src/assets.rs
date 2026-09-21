@@ -2,10 +2,10 @@
 //! `index.html` fallback for client-side routes, `Cache-Control: immutable` for hashed assets,
 //! `no-store` for `index.html` itself.
 //!
-//! Embeds `crates/hs-admin/web-dist-placeholder/` today, not `web/dist` directly: `web/dist` is a
-//! build artifact (`cd web && npm run build`) and is gitignored, so embedding it directly would
-//! break a clean checkout that has not run that build. See the comment in
-//! `web-dist-placeholder/index.html` for how to switch this to the real build output.
+//! What is embedded is whatever `build.rs` staged in `$OUT_DIR/web-dist`: the built interface
+//! when there is one, a placeholder page when there is not. See `build.rs` for how that is
+//! chosen and why a release build cannot end up with the placeholder by accident;
+//! [`EMBEDDED_UI`] says which one this binary got.
 
 use axum::extract::Path;
 use axum::http::{HeaderValue, StatusCode, header};
@@ -16,8 +16,24 @@ use rust_embed::RustEmbed;
 use crate::router::AdminState;
 
 #[derive(RustEmbed)]
-#[folder = "web-dist-placeholder"]
+#[folder = "$OUT_DIR/web-dist"]
 struct Assets;
+
+/// Which management interface this binary carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddedUi {
+    /// The real interface, from a `web/` build.
+    Built,
+    /// A page saying the interface was not built in. `/api/v1` works all the same; there is just
+    /// nothing at `/admin/` to drive it with.
+    Placeholder,
+}
+
+/// Which management interface this binary carries, decided by `build.rs` at compile time.
+pub const EMBEDDED_UI: EmbeddedUi = match env!("HS_ADMIN_WEB_UI").as_bytes() {
+    b"built" => EmbeddedUi::Built,
+    _ => EmbeddedUi::Placeholder,
+};
 
 /// A small, deliberately incomplete extension-to-MIME map covering what a Vite build emits
 /// (`.html`, `.js`, `.css`, `.json`, `.svg`, `.png`, `.woff2`, source maps); anything else falls
@@ -59,6 +75,13 @@ fn serve_embedded(path: &str) -> Response {
                 file.data.into_owned(),
             )
                 .into_response()
+        }
+        // A missing file under `assets/` is a missing file. Those names are content-hashed, so
+        // the usual way to ask for one that is not here is a tab left open across an upgrade;
+        // answering it with `index.html` and a `200` turns that into "Unexpected token '<'" in
+        // the console instead of a failed load the app can notice.
+        None if path.starts_with("assets/") => {
+            (StatusCode::NOT_FOUND, "no such asset").into_response()
         }
         None => serve_index_fallback(),
     }
@@ -115,7 +138,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_root_serves_placeholder_index() {
+    async fn a_missing_hashed_asset_is_404_not_the_app_shell() {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/assets/index-0ldHash.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Nothing that is only useful to a developer is staged into the binary, whichever
+    /// interface it carries.
+    #[test]
+    fn no_source_maps_or_mock_worker_are_embedded() {
+        for file in Assets::iter() {
+            assert!(!file.ends_with(".map"), "{file}");
+            assert_ne!(file, "mockServiceWorker.js");
+        }
+        assert!(Assets::get("index.html").is_some());
+    }
+
+    #[tokio::test]
+    async fn admin_root_serves_the_embedded_index() {
         let response = app()
             .oneshot(
                 Request::builder()
@@ -130,10 +178,12 @@ mod tests {
             .await
             .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(
-            text.contains("hs-admin"),
-            "placeholder index.html should be served, got: {text}"
-        );
+        // True of the built interface and of the placeholder alike; which one this is depends
+        // on whether `web/dist` existed when the crate was compiled.
+        match EMBEDDED_UI {
+            EmbeddedUi::Built => assert!(text.contains(r#"<div id="root">"#), "{text}"),
+            EmbeddedUi::Placeholder => assert!(text.contains("has not been built"), "{text}"),
+        }
     }
 
     #[tokio::test]

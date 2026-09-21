@@ -645,6 +645,14 @@ async fn run_serve(args: &ServeArgs) -> i32 {
     for addr in &handle.addrs {
         tracing::info!(%addr, "listening");
     }
+    if hs_admin::assets::EMBEDDED_UI == hs_admin::assets::EmbeddedUi::Placeholder {
+        // Said once, here, rather than left for an operator to discover by opening /admin/ and
+        // finding a page about build steps. Release builds cannot reach this: they set
+        // HS_ADMIN_WEB_DIST, and `hs-admin`'s build script fails without a built interface.
+        tracing::warn!(
+            "this binary was built without the management interface: /admin/ serves a placeholder. The admin API at /api/v1 is unaffected. Build `web/` and rebuild to include it"
+        );
+    }
     if let Some(link) = &handle.setup_link {
         // `warn`, not `info`: it is the one line of a first boot the operator must act on, and
         // it should survive a deployment that has turned the log level down. It stops appearing

@@ -25,7 +25,8 @@ tracing-subscriber = { workspace = true }
 time = { workspace = true }
 ulid = { workspace = true }
 rand = { workspace = true }
-rust-embed = { workspace = true }
+# `interpolate-folder-path` so `src/assets.rs` can embed `$OUT_DIR/web-dist`, which `build.rs` stages.
+rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 futures = { workspace = true }
 bytes = { workspace = true }
 async-stream = { workspace = true }

@@ -21,6 +21,26 @@
 #
 ARG RUST_VERSION=1.98
 #
+# ---------------------------------------------------------------------------------------------
+# The management interface. Its output is JavaScript, the same for every architecture, so unlike
+# the Rust stage below this one *is* pinned to the build host's platform: there is no reason to
+# run `npm ci` and a TypeScript build under QEMU once per target.
+#
+# `npm run build` regenerates the typed API client from the admin API's OpenAPI document before
+# it compiles, which is why that one directory of `crates/` is copied in beside `web/`, at the
+# relative path the script expects.
+# ---------------------------------------------------------------------------------------------
+ARG NODE_VERSION=22
+FROM --platform=$BUILDPLATFORM node:${NODE_VERSION}-bookworm-slim AS web
+
+WORKDIR /src/web
+COPY web/package.json web/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+COPY web ./
+COPY crates/hs-admin/openapi /src/crates/hs-admin/openapi
+RUN npm run build
+
+#
 # Deliberately *not* pinned to `--platform=$BUILDPLATFORM`: when built with
 # `docker buildx build --platform linux/amd64,linux/arm64`, buildx runs the entire build once per
 # requested platform (each under QEMU emulation if the host cannot run it natively), so every
@@ -58,6 +78,13 @@ WORKDIR /src
 # without BuildKit cache-mount support.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+
+# The interface built above, and an instruction to `crates/hs-admin/build.rs` to embed *that* and
+# to fail the build if it is not there. Without the variable the build script falls back to a
+# placeholder page so that a Rust-only checkout still compiles -- which is how every image before
+# this one came to serve "the management interface has not been built into this binary yet".
+COPY --from=web /src/web/dist /src/web-dist
+ENV HS_ADMIN_WEB_DIST=/src/web-dist
 
 ENV CARGO_TERM_COLOR=never
 

@@ -1,0 +1,15 @@
+# Read by BuildKit for deploy/Dockerfile only (a `<Dockerfile>.dockerignore` beside the
+# Dockerfile wins over a root `.dockerignore`), so it cannot disturb any other image build.
+#
+# `COPY web ./` would otherwise drag in a few hundred MB of node_modules and whatever build
+# output is lying around; the image builds its own of both.
+target
+refs
+.git
+**/node_modules
+web/dist
+web/dist-mock
+web/storybook-static
+web/playwright-report
+web/playwright-report-real
+web/test-results

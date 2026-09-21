@@ -14,6 +14,30 @@ Versions follow [semantic versioning](https://semver.org). Nothing is released y
 Everything below exists on `main` and has never been tagged. The container image is published
 continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
 
+### Installing and administering it
+
+- **Installation is one command, and the first administrator is one link.**
+  `docker run -p 8008:8008 -v myelin:/data -e HS__SERVER__SERVER_NAME=example.org <image>` is a
+  working server with no configuration file. While it has no administrator it logs a one-time
+  setup link at every start; opening it asks for a username and a password and signs you in to
+  the admin interface as the server's first administrator. Verified in a real browser against
+  the real binary, from an empty data directory to the Users page showing the new account, and
+  by a test that drives the real binary across restarts: same link until used, never offered
+  after. Before this the route to an administrator was a shared secret, `hs register --admin`, a
+  `curl` to `/login`, and a pasted token.
+- **The admin interface is actually in the binary.** Every binary and every published image
+  before 2026-09-21 served a placeholder at `/admin/` reading "the management interface has not
+  been built into this binary yet": the interface existed in `web/` and nothing embedded it. The
+  image now builds it, release builds fail rather than embed the placeholder, and CD refuses to
+  publish an image whose `/admin/` is not the interface. It adds 0.9 MB.
+- **Logs are readable where logs end up.** A first boot logged 72 lines, 67 of them the storage
+  engine reporting flushes; it logs five. The text format wrote ANSI colour codes into pipes and
+  files, so `docker logs` and `kubectl logs` were full of escape sequences; colour is now for
+  terminals, and `NO_COLOR` is honoured.
+- **The Helm chart's defaults could never have worked, and now do.** It pulled an image from a
+  repository that is not ours, and rendered no media path, so every upload failed under its own
+  `readOnlyRootFilesystem: true`.
+
 ### Verified against a real client
 
 - **Element Web works.** The browser client most Matrix users run signs in, lists rooms, sends and
@@ -35,9 +59,11 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
 
 ### Conformance
 
-- **Complement `csapi`: 191 of 296 assertions**, 53 of 106 top-level tests. The first run this
-  project ever took was 125; the suite had never been run before that.
-- **Complement federation package: 52 of 212 assertions**, 6 of 88 top-level. Measured with
+- **Complement `csapi`: 241 of 370 assertions**, 61 of 104 top-level tests, measured 2026-09-21;
+  191 of 296 the run before. The first run this project ever took was 125; the suite had never
+  been run before that.
+- **Complement federation package: 59 of 246 assertions**, 6 of 88 top-level, and for the first
+  time the whole package rather than however far it got before crashing. Measured with
   certificate verification *on*, trusting Complement's CA the way a deployment trusts a private
   one, after the harness stopped disabling verification.
 - **Spec coverage: 138 of 235 routes (58.7%)** — client-server 108/166, server-server 30/36.

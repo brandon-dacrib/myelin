@@ -43,9 +43,23 @@ docker run -d --name myelin -p 8008:8008 -v myelin:/data \
 
 That is the whole installation. There is no configuration file: the database, the signing key
 and uploaded media all live in the `myelin` volume, and every other setting is a default until
-you change it in the admin interface at <http://localhost:8008/admin/>, which keeps it in the
-database. It answers `/health/live` about three seconds later. CD boots the image with exactly
-this command before it will publish it, so if this stops working the release stops too.
+you change it in the admin interface, which keeps it in the database.
+
+A new server has no accounts, so it tells you how to make the first one. `docker logs myelin`
+ends with a line like
+
+```
+WARN this server has no administrator yet: open the setup link to create one. It works once,
+     for whoever opens it first setup_link=http://localhost:8008/admin/setup#token=...
+```
+
+Open it, choose a username and a password, and you are signed in to the admin interface as the
+server's administrator. The link is offered at every start until somebody uses it and never
+again after; only someone who can read the server's log can use it. Behind a reverse proxy, set
+`HS__SERVER__PUBLIC_BASEURL` and the link is rooted there instead of at `localhost`.
+
+CD boots the image with exactly this command before it will publish it, and refuses to publish
+one that does not answer `/health/live`, serve the admin interface and log a setup link.
 
 Without Docker, `hs serve --data-dir ./data --server-name example.org` is the same thing.
 

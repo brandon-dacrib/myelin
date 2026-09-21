@@ -1,6 +1,6 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead. `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`.
+Written 2026-09-20 by the integration lead, last revised 2026-09-21. `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
@@ -10,7 +10,11 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 
 **Configuration lives in the database** (RFC 0016). The file is a bootstrap and a seed; the database outranks it, `HS__` variables outrank the database, and the admin API refuses a write the environment would shadow rather than storing one that gets ignored. The web interface has a Configuration section that builds its forms from the server's own JSON Schema, and `hs config show|get|set|unset|import|export|history` is the same thing without a browser.
 
-**A first run is one command.** `hs serve --data-dir ./data --server-name example.org` in an empty directory produces a working server — database, signing key, media path, all underneath that directory. It was 158 lines of generated YAML with four mandatory hand-edits.
+**A first run is one command, and the first administrator is one link.** `hs serve --data-dir ./data --server-name example.org` in an empty directory produces a working server — database, signing key, media path, all underneath that directory — and so does `docker run -p 8008:8008 -v myelin:/data -e HS__SERVER__SERVER_NAME=example.org <image>`, which CD now boots verbatim before it will publish. It was 158 lines of generated YAML with four mandatory hand-edits.
+
+While the server has no administrator it logs a one-time setup link at every start (`/admin/setup#token=...`, `hs_auth::setup`). Opening it asks for a username and a password and signs you in as the first administrator. Watched working in a real browser against the real binary on 2026-09-21, from an empty directory to the Users page showing the new account. It was: configure a shared secret, `hs register --admin`, `curl /login`, paste a token.
+
+**The admin interface ships.** Until 2026-09-21 it did not: every binary and every published image served a placeholder at `/admin/` saying the interface had not been built in, because nothing embedded `web/dist`. `crates/hs-admin/build.rs` now stages the built interface (or the placeholder, for a Rust-only checkout, and says so at startup); release builds set `HS_ADMIN_WEB_DIST` and *fail* without a built interface; CD refuses to publish an image whose `/admin/` is not the interface. **This has only been verified on a locally built image** — the first CD run after this lands is the real test, and the `v*` binaries job gained a Node step that has never run.
 
 **Complement, `csapi`: 241 of 370 assertions pass** (61 of 104 top-level), measured 2026-09-21, up from 191/296, 148/293 and 125/293 on the runs before it.
 
@@ -95,9 +99,13 @@ rough order of how many assertions sit behind it:
   seven top-level tests -- but check how many tests a cluster really is before sizing the work.
 - **`rooms.join.<room>.timeline.events` missing, 21 times, was one test polling** -- all of
   `TestRoomDeleteAlias`, now fixed. Counting log lines overstates a cluster badly.
-- **`TestRequestEncodingFails`**: invalid UTF-8 in a JSON body must be `400 M_NOT_JSON`. Routes
-  taking a bare `axum::Json` still answer a plain-text rejection; `hs_http::body::PermissiveJson`
-  already does the right thing and the work is switching every `/_matrix` route to it.
+- ~~`TestRequestEncodingFails`~~ **Done 2026-09-21, not yet re-measured.** All 57 client-server
+  routes that took a bare `axum::Json` take `hs_http::body::PermissiveJson`, which now honours
+  the body limit, tells `M_NOT_JSON` from `M_BAD_JSON`, and checks UTF-8 over the whole body
+  (`serde_json` skips the strings it ignores, so a typed route accepted Complement's payload).
+  An end-to-end test walks the route manifest, so a new route is covered without anybody
+  remembering to. The admin API's ten bare extractors are untouched: that surface wants
+  `StrictJson` and RFC 9457, and is its own change.
 - **`/user_directory/search` searches every local account.** Implemented 2026-09-21 because
   Element's invite dialog 404s without it. The spec allows it and it is what makes the endpoint
   useful, but it means any logged-in user can enumerate every other user's display name. If this
@@ -115,6 +123,14 @@ First run is done (see the state of things). The admin interface can now *change
 configuration rather than only display it, which was the stated product priority. What it still
 cannot do, in rough order of how often an operator will hit it:
 
+- **Give the Overview something to say.** The first page a new administrator sees, seconds after
+  setup, is a wall of "Not implemented": Users, Rooms, Daily active users, Mode, Attention,
+  Bridges, Federation. `statistics.overview`, `cluster.get`, `appservices.list` and
+  `federation.destinations.list` all answer an honest 501. The first of those is a count of
+  accounts and rooms this server already has to hand, and is the cheapest large improvement to a
+  first impression available.
+- **The interface still calls itself "hs admin".** The project has been Myelin for a while; the
+  sign-in card, the top bar and the page title have not heard.
 - **Edit an array of objects as a form.** `listeners.listeners`, `media.thumbnail_sizes` and
   `auth.oidc_providers` fall back to a JSON textarea with live parse errors. Reachable, not
   pleasant; the generic renderer is built to sit underneath hand-tuned editors for exactly these.
@@ -142,12 +158,18 @@ cannot do, in rough order of how often an operator will hit it:
 - **Have the config pages checked by axe.** Every other e2e flow runs axe at each step; the
   Configuration pages have never been through it.
 
-Still on the first-run side, all left where their owners can see them: `README.md`'s quickstart is
-still the four-edit flow and could become one `docker run`; `deploy/Dockerfile`'s `CMD` still
-points at a config file; and `deploy/helm/hs/templates/configmap.yaml` never sets
-`media.storage.path`, so uploads fall back to `./media-store` relative to the working directory
-and fail on a read-only root filesystem. That last one is a real bug, found while doing this and
-not caused by it.
+The three first-run leftovers this section used to end with are done: the README quickstart is
+one `docker run`, the image's `CMD` is `serve` with `HS_DATA_DIR=/data`, and the Helm chart
+renders a media path (and no longer pulls its image from a repository that is not ours — a second
+defect found while fixing the first; see the chart's commit). What is left there:
+
+- **The setup link guesses its own address.** It is rooted at `server.public_baseurl` when set
+  and at `http://localhost:<first bound port>` otherwise, which is wrong behind `-p 9000:8008`
+  or any proxy that has not been described to the server. Correct for the quickstart; the
+  operator has to edit the port otherwise.
+- **A first boot takes about five seconds in the container**, nearly all of it between generating
+  the signing key and binding the listener. Unmeasured; opening ~60 keyspaces with a synchronous
+  flush each is the suspect.
 
 ### 3. Federation: finish the join
 
@@ -194,6 +216,10 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | Postgres `tls`/`pool_size`/schema | `hs-kv`, `hs-cli` | encrypt in front of the database for now |
 | `/createRoom` not shard-gated | `hs-cli` | first actor may be built on a non-owner |
 | Config pages never checked by axe | `web` | the only e2e flow without an accessibility pass |
+| Overview is mostly 501s | `hs-admin`, `hs-cli` | a new administrator's first page says "Not implemented" seven times |
+| Setup link assumes `localhost:<bound port>` without `public_baseurl` | `hs-cli` | wrong behind a remapped port or an undescribed proxy |
+| In-process server cannot be restarted over its data directory | `hs-cli` | background tasks hold the store's lock after `shutdown()`; restart tests need the real binary |
+| Embedded UI never verified from a CD-built image | `deploy`, `.github` | verified on a local build only until the next CD run |
 | `/user_directory/search` returns every local user | `hs-auth` | display names are enumerable by any account |
 | csapi subtests lose races under parallel load | `tests` | ±2 top-level tests of run-to-run noise |
 | `heartbeat_seq` is derived from wall-clock milliseconds | `hs-cluster` | two ticks in one millisecond read as "no progress", i.e. death; harmless at the production 1s interval, surfaces only in tests |
@@ -207,4 +233,9 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 - **Run the gates CI runs.** `cargo test -p <crate>` cannot see what `--workspace --all-targets` sees: feature unification, cross-crate visibility, dead code. Seven consecutive red CI runs came from exactly that gap.
 - **Wait for conditions, not durations — and grant real time, not just virtual time.** This has now bitten seven times. The 2026-09-21 round found the mechanism: `settle` advanced a virtual clock and called `yield_now()`, which runs async tasks at no wall-clock cost, while the work it was waiting for finishes on `spawn_blocking` threads. Thirty rounds bought 600ms of virtual time and about 30ms of real time. What matters is the *ratio* of real time granted to virtual time advanced, not the number of rounds. One test in that batch could also pass vacuously — it asserted `count > 0` on a count that is zero exactly when the thing under test never happened.
 - **Keep the repository off iCloud.** `git status` took 600 seconds there and takes 0.24 here.
+- **A check that passes on both branches proves neither.** On 2026-09-21 a test asserting "the
+  embedded interface matches what the build script chose" passed, and was read as proof the real
+  interface was embedded; it would have passed for the placeholder too, and the binary had the
+  placeholder. Look at the decision itself (the build script's output, the log line, the byte on
+  the wire), not at a test that is satisfied either way.
 - **Registered is not working.** 24 of 142 admin operations are genuinely served; the rest answer 501, or 503 when a seam exists but nothing implements it.

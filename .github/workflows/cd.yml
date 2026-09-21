@@ -198,6 +198,24 @@ jobs:
           echo "health/live answered; asking what it supports:"
           curl -sf http://127.0.0.1:8008/_matrix/client/versions | head -c 200
           echo
+
+          # The image has to carry the management interface, not the page that says it was left
+          # out. Both answer 200, so look at what came back.
+          admin="$(curl -sf http://127.0.0.1:8008/admin/)"
+          if ! printf '%s' "$admin" | grep -q '<div id="root">'; then
+            echo "/admin/ is not the management interface; it served:" >&2
+            printf '%s\n' "$admin" | head -20 >&2
+            docker rm -f myelin-smoke >/dev/null 2>&1 || true
+            exit 1
+          fi
+          # And a new server has to say how to get into it.
+          if ! docker logs myelin-smoke 2>&1 | grep -q 'setup_link=http://localhost:8008/admin/setup#token='; then
+            echo "the first boot did not log a setup link; logs follow" >&2
+            docker logs myelin-smoke >&2 || true
+            docker rm -f myelin-smoke >/dev/null 2>&1 || true
+            exit 1
+          fi
+          echo "/admin/ serves the interface, and the log offers a setup link"
           docker rm -f myelin-smoke >/dev/null
 
       - name: Export the digest
@@ -286,7 +304,21 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # The management interface is embedded in the binary, so it is built first.
+      # HS_ADMIN_WEB_DIST makes `crates/hs-admin/build.rs` fail the build rather than quietly
+      # embed its placeholder page if that step ever goes missing.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build the management interface
+        working-directory: web
+        run: npm ci && npm run build
+
       - run: cargo build --release --locked -p hs-cli --bin hs --target ${{ matrix.target }}
+        env:
+          HS_ADMIN_WEB_DIST: ${{ github.workspace }}/web/dist
 
       - name: Check the binary runs and reports its version
         run: ./target/${{ matrix.target }}/release/hs --version || true

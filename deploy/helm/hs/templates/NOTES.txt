@@ -12,6 +12,18 @@ Port-forward the client API for a local check:
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "hs.fullname" . }} {{ .Values.service.clientPort }}:{{ .Values.service.clientPort }}
   curl http://127.0.0.1:{{ .Values.service.clientPort }}/health/ready
 
+Create the first administrator. A new server has no accounts, and says how to make the first one
+in its log, at every start until somebody does:
+  kubectl -n {{ .Release.Namespace }} logs statefulset/{{ include "hs.fullname" . }} | grep setup_link
+{{- if .Values.publicBaseUrl }}
+Open the link it prints (rooted at {{ .Values.publicBaseUrl }}), choose a username and a password,
+and you are signed in to the admin interface. The link works once.
+{{- else }}
+Open the link it prints, choose a username and a password, and you are signed in to the admin
+interface. The link works once. It is rooted at http://localhost:{{ .Values.service.clientPort }}, which the
+port-forward above makes true; set publicBaseUrl to have it rooted at your real address instead.
+{{- end }}
+
 {{- if not .Values.secrets.signingKey.existingSecret }}
 
 WARNING: secrets.signingKey.existingSecret is not set. The workload will fail to start (see
