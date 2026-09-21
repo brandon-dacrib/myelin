@@ -12,9 +12,9 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 
 **A first run is one command.** `hs serve --data-dir ./data --server-name example.org` in an empty directory produces a working server — database, signing key, media path, all underneath that directory. It was 158 lines of generated YAML with four mandatory hand-edits.
 
-**Complement, `csapi`: 191 of 296 assertions pass** (53 of 106 top-level), up from 148/293 and 125/293 on the two runs before it.
+**Complement, `csapi`: 239 of 370 assertions pass** (62 of 104 top-level), measured 2026-09-21, up from 191/296, 148/293 and 125/293 on the three runs before it.
 
-**Complement, federation package: 52 of 212 assertions** (6 of 88 top-level). That is now a real measurement rather than a TLS wall: `federation.custom_ca_certificates` works, and the harness no longer disables certificate verification — it trusts Complement's CA the way a deployment would trust a private one.
+**Complement, federation package: 59 of 246 assertions** (6 of 88 top-level), measured 2026-09-21 — and for the first time that is the *whole* package. The suite used to segfault Complement's own Go binary 21 tests in and silently discard everything after, so every federation number before this one was "however far it got before dying". There are no panics in the log now and `-skip` is retired.
 
 **Spec coverage: 138 of 235 routes (58.7%)** — client-server 108/166, server-server 30/36. Generated from the manifest the binary emits, so it cannot overclaim. Registered still is not the same as working.
 
@@ -31,24 +31,43 @@ COMPLEMENT_BASE_IMAGE=complement-hs-reimplement:dev go test -v -timeout 30m -ski
 
 A cold image build is ~4 minutes idle, up to 19 under load; each suite run is ~13-15 minutes.
 
-**Those numbers are from before this session and have not been re-measured.** The `-skip` should no longer be needed — `/get_missing_events` answered newest-first, which is what dereferenced a nil state key in Complement's Go binary and killed the run 21 tests in, and it now answers oldest-first with a test pinning it. That is a local test, not a Complement run. Re-running both suites without the `-skip` is the first thing worth doing next, because it re-grades everything below it.
+Both numbers above are from these commands, run on 2026-09-21 against this code.
+
+The re-measurement paid for itself immediately: `TestRoomCreate` still failed after `/createRoom`
+was fixed, and chasing why found that `invite_state` omitted the invitee's own `m.room.member`
+event — 100 of the 127 missing-key failures in the whole suite, and the largest single cluster in
+it. Fixing that turned seven top-level tests green in one commit (`TestRoomsInvite`,
+`TestRoomCreate`, `TestRoomSummary`, `TestLeaveEventInviteRejection`,
+`TestTentativeEventualJoiningAfterRejecting` and both `TestFetchHistoricalInvited*`) and moved
+csapi from 221 to 239 assertions. Nothing regressed.
+
+**One conformance failure is a deliberate refusal.** `TestInboundCanReturnMissingEvents` now runs
+to completion and fails on content: its first four events are exactly right, and everything after
+is shifted by one because we also send `m.room.guest_access` for a `public_chat` room. The spec's
+`createRoom` preset table says `public_chat` sets `guest_access: forbidden`; Synapse appears to
+skip the event when it would set the default, and Complement is written to Synapse. Dropping a
+spec-mandated event to win four subtests is bending the server to the test, so it stands. It is a
+two-line change if the conformance points are wanted instead.
 
 ## What to do next, in order
 
-### 1. Re-measure, then chase what the measurement says
+### 1. Keep pulling on the measurement, and open a browser
 
-Nothing below this line is trustworthy until the two Complement suites run again, without the
-`-skip`, on this code. Three fixes this session were aimed squarely at conformance and none has
-been graded: the `/createRoom` power-level merge, `unsigned.prev_content` across every endpoint
-that renders an event including `/sync`, and the `/get_missing_events` ordering that was crashing
-the federation suite. Open a browser at Element too, and create a room in it — the bug that made
-that impossible is fixed and unobserved.
+The suites are current as of 2026-09-21 (above). What the latest csapi log says to do next, in
+rough order of how many assertions sit behind it:
 
-Two known conformance gaps in `/get_missing_events` that the ordering fix did not touch, both
-visible in `TestInboundCanReturnMissingEvents` once it stops crashing: `min_depth` is parsed
-nowhere and ignored, and history visibility is not applied per event, so the `joined` and
-`invited` halves of that test will want redacted copies of events from before the requester
-joined and will get full ones.
+- **`MustSyncUntil` timeouts, 28 of them.** The biggest remaining shape. These are tests waiting
+  for something to turn up in `/sync` that never does; they are not one bug, but they are one
+  place to look, and the invite cluster proves how much sits behind a single sync-shaped defect.
+- **`rooms.join.<room>.timeline.events` missing, 21 times**, and `state.events` 6 times.
+- **`TestRequestEncodingFails`**: invalid UTF-8 in a JSON body must be `400 M_NOT_JSON`. Routes
+  taking a bare `axum::Json` still answer a plain-text rejection; `hs_http::body::PermissiveJson`
+  already does the right thing and the work is switching every `/_matrix` route to it.
+- **`min_depth` on `/get_missing_events`**, still parsed nowhere, and history visibility still not
+  applied per event there.
+
+**Open Element and create a room in it.** The bug that made that impossible is fixed and nobody
+has watched it work.
 
 ### 2. Make it fun to administer — the half that is left
 
