@@ -54,10 +54,32 @@ export async function signInReadOnly(page: Page): Promise<void> {
 }
 
 /**
+ * Waits for every finite animation and transition on the page to finish.
+ *
+ * axe computes colour contrast from what is painted *now*. A dialog that has just opened is
+ * part-way through fading in, so its text is blended with what is behind it and axe reports
+ * contrast failures that do not exist a moment later: the configuration review dialog showed
+ * four at the instant it opened and none 600ms on. Waiting a fixed time would be a guess about
+ * the animation's length; this waits for the animations themselves. Ones that never end
+ * (a spinner) are left alone, or this would never return.
+ */
+async function animationsToFinish(page: Page): Promise<void> {
+  await page.evaluate(() =>
+    Promise.all(
+      document
+        .getAnimations()
+        .filter((a) => Number.isFinite(a.effect?.getComputedTiming().endTime ?? Infinity))
+        .map((a) => a.finished.catch(() => undefined)),
+    ),
+  );
+}
+
+/**
  * Runs axe against the current page at the WCAG levels accessibility.md
  * commits to, and fails the test on any violation.
  */
 export async function expectNoAxeViolations(page: Page, label: string): Promise<void> {
+  await animationsToFinish(page);
   const results = await new AxeBuilder({ page })
     .withTags(["wcag2a", "wcag2aa", "wcag21aa", "wcag22aa"])
     .analyze();

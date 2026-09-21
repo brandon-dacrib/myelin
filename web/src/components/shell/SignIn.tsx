@@ -12,6 +12,7 @@ import {
 import { Button } from "../ui/button/Button";
 import { Input, Field } from "../ui/input/Input";
 import { fetchNeedsSetup } from "@/lib/setup";
+import { PRODUCT_NAME } from "@/lib/brand";
 
 /**
  * In mock mode (`VITE_HS_MOCK=1`) this stands in for track 07's OAuth issuer redirect
@@ -218,7 +219,7 @@ export function SignInShell({ children }: { children: ReactNode }) {
   return (
     <div className="flex min-h-screen items-center justify-center bg-canvas px-4">
       <div className="w-full max-w-sm rounded-lg border border-border bg-surface p-8 shadow-2">
-        <h1 className="text-xl text-text">hs admin</h1>
+        <h1 className="text-xl text-text">{PRODUCT_NAME}</h1>
         {children}
       </div>
     </div>

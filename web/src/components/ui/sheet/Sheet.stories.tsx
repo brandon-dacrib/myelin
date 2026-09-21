@@ -38,7 +38,7 @@ export const Left: StoryObj = {
       <SheetTrigger asChild>
         <Button variant="secondary">Open navigation</Button>
       </SheetTrigger>
-      <SheetContent side="left" title="hs admin">
+      <SheetContent side="left" title="Myelin">
         <p className="text-sm text-text-muted">Navigation goes here.</p>
       </SheetContent>
     </Sheet>

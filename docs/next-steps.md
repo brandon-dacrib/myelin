@@ -132,8 +132,6 @@ cannot do, in rough order of how often an operator will hit it:
   of putting a green tick over bridges and federation nobody asked about. What is left on that
   page is the two panels still answering 501: `appservices.list` and
   `federation.destinations.list`.
-- **The interface still calls itself "hs admin".** The project has been Myelin for a while; the
-  sign-in card, the top bar and the page title have not heard.
 - **Edit an array of objects as a form.** `listeners.listeners`, `media.thumbnail_sizes` and
   `auth.oidc_providers` fall back to a JSON textarea with live parse errors. Reachable, not
   pleasant; the generic renderer is built to sit underneath hand-tuned editors for exactly these.
@@ -158,8 +156,12 @@ cannot do, in rough order of how often an operator will hit it:
   the sign-in form is gone. The real open question is narrower and is not in the app: one `fetch`
   through the Vite dev server's `/api/v1` proxy fails, only under the full suite, against a server
   answering 200 to twelve consecutive curls.
-- **Have the config pages checked by axe.** Every other e2e flow runs axe at each step; the
-  Configuration pages have never been through it.
+- ~~Have the config pages checked by axe.~~ **Done 2026-09-21**: `e2e/configuration.spec.ts` walks
+  index, search, a section's form, an edit, the review dialog, a rejected check and a save, with
+  axe at each, and the two densest states again at phone width. All clean. The one thing it
+  turned up was in the *check*: axe reads contrast from what is painted, so a dialog sampled
+  mid-fade reports failures that are gone 600ms later. `expectNoAxeViolations` now waits for the
+  page's finite animations to finish, which protects every spec that opens a dialog.
 
 The three first-run leftovers this section used to end with are done: the README quickstart is
 one `docker run`, the image's `CMD` is `serve` with `HS_DATA_DIR=/data`, and the Helm chart
@@ -219,7 +221,7 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | Receipts and presence in memory | `hs-user` | a restart forgets read state |
 | Postgres `tls`/`pool_size`/schema | `hs-kv`, `hs-cli` | encrypt in front of the database for now |
 | `/createRoom` not shard-gated | `hs-cli` | first actor may be built on a non-owner |
-| Config pages never checked by axe | `web` | the only e2e flow without an accessibility pass |
+| `e2e/configuration.spec.ts` failed once in 112 runs | `web` | unreproduced, and the machine was running Complement at the time; if it recurs, the error is the first thing to capture |
 | Overview's Bridges and Federation panels are 501s | `hs-admin`, `hs-cli` | the first page still says "isn't implemented" twice, and its all-clear is qualified accordingly |
 | Overview counts media, failing destinations and reports as unknown | `hs-cli` | three dashes where numbers should be; the sources exist in `hs-media`, `hs-federation` and nowhere respectively |
 | Setup link assumes `localhost:<bound port>` without `public_baseurl` | `hs-cli` | wrong behind a remapped port or an undescribed proxy |

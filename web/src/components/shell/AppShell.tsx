@@ -8,6 +8,7 @@ import { Setup } from "./Setup";
 import { Sheet, SheetContent } from "../ui/sheet/Sheet";
 import { Toaster } from "../ui/toast/Toaster";
 import { getSession, subscribeSession } from "@/lib/auth";
+import { PRODUCT_NAME } from "@/lib/brand";
 
 const GO_TARGETS: Record<string, string> = {
   o: "/",
@@ -91,7 +92,7 @@ export function AppShell() {
       </div>
 
       <Sheet open={drawerOpen} onOpenChange={setDrawerOpen}>
-        <SheetContent side="left" title="hs admin">
+        <SheetContent side="left" title={PRODUCT_NAME}>
           <Sidebar variant="full" onNavigate={() => setDrawerOpen(false)} />
         </SheetContent>
       </Sheet>

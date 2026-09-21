@@ -5,6 +5,7 @@ import { cn } from "@/lib/cn";
 import { applyTheme, readTheme, type Theme } from "@/lib/theme";
 import { getSession, signOut, subscribeSession } from "@/lib/auth";
 import { useClusterStatus } from "@/api/dashboard";
+import { PRODUCT_NAME } from "@/lib/brand";
 
 export interface TopBarProps {
   onOpenPalette: () => void;
@@ -38,7 +39,7 @@ export function TopBar({ onOpenPalette, onOpenNavDrawer }: TopBarProps) {
       </button>
 
       <div className="flex items-center gap-2 text-sm font-medium text-text">
-        <span>hs admin</span>
+        <span>{PRODUCT_NAME}</span>
         <span className="text-text-faint" aria-hidden="true">
           &middot;
         </span>
