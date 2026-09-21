@@ -14,7 +14,7 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 
 While the server has no administrator it logs a one-time setup link at every start (`/admin/setup#token=...`, `hs_auth::setup`). Opening it asks for a username and a password and signs you in as the first administrator. Watched working in a real browser against the real binary on 2026-09-21, from an empty directory to the Users page showing the new account. It was: configure a shared secret, `hs register --admin`, `curl /login`, paste a token.
 
-**The admin interface ships.** Until 2026-09-21 it did not: every binary and every published image served a placeholder at `/admin/` saying the interface had not been built in, because nothing embedded `web/dist`. `crates/hs-admin/build.rs` now stages the built interface (or the placeholder, for a Rust-only checkout, and says so at startup); release builds set `HS_ADMIN_WEB_DIST` and *fail* without a built interface; CD refuses to publish an image whose `/admin/` is not the interface. **This has only been verified on a locally built image** — the first CD run after this lands is the real test, and the `v*` binaries job gained a Node step that has never run.
+**The admin interface ships.** Until 2026-09-21 it did not: every binary and every published image served a placeholder at `/admin/` saying the interface had not been built in, because nothing embedded `web/dist`. `crates/hs-admin/build.rs` now stages the built interface (or the placeholder, for a Rust-only checkout, and says so at startup); release builds set `HS_ADMIN_WEB_DIST` and *fail* without a built interface; CD refuses to publish an image whose `/admin/` is not the interface. Verified on the published artifact: `ghcr.io/brandon-dacrib/myelin:main`, pulled from the registry on 2026-09-21 and run with the README's exact command, serves the interface at `/admin/`, answers `needs_setup: true`, and logs the setup link. What has still never run is the `v*` binaries job's new Node step, which only a tag exercises.
 
 **Complement, `csapi`: 241 of 370 assertions pass** (61 of 104 top-level), measured 2026-09-21, up from 191/296, 148/293 and 125/293 on the runs before it.
 
@@ -224,7 +224,7 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | Overview counts media, failing destinations and reports as unknown | `hs-cli` | three dashes where numbers should be; the sources exist in `hs-media`, `hs-federation` and nowhere respectively |
 | Setup link assumes `localhost:<bound port>` without `public_baseurl` | `hs-cli` | wrong behind a remapped port or an undescribed proxy |
 | In-process server cannot be restarted over its data directory | `hs-cli` | background tasks hold the store's lock after `shutdown()`; restart tests need the real binary |
-| Embedded UI never verified from a CD-built image | `deploy`, `.github` | verified on a local build only until the next CD run |
+| The release binaries job's web build has never run | `.github` | it only runs on a `v*` tag; the image path is verified, this one is not |
 | `/user_directory/search` returns every local user | `hs-auth` | display names are enumerable by any account |
 | csapi subtests lose races under parallel load | `tests` | ±2 top-level tests of run-to-run noise |
 | `heartbeat_seq` is derived from wall-clock milliseconds | `hs-cluster` | two ticks in one millisecond read as "no progress", i.e. death; harmless at the production 1s interval, surfaces only in tests |
