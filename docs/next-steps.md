@@ -18,9 +18,9 @@ While the server has no administrator it logs a one-time setup link at every sta
 
 **The admin interface ships.** Until 2026-09-21 it did not: every binary and every published image served a placeholder at `/admin/` saying the interface had not been built in, because nothing embedded `web/dist`. `crates/hs-admin/build.rs` now stages the built interface (or the placeholder, for a Rust-only checkout, and says so at startup); release builds set `HS_ADMIN_WEB_DIST` and *fail* without a built interface; CD refuses to publish an image whose `/admin/` is not the interface. Verified on the published artifact: `ghcr.io/brandon-dacrib/myelin:main`, pulled from the registry on 2026-09-21 and run with the README's exact command, serves the interface at `/admin/`, answers `needs_setup: true`, and logs the setup link. What has still never run is the `v*` binaries job's new Node step, which only a tag exercises.
 
-**Complement, `csapi`: 301 of 384 assertions pass** (76 of 106 top-level), measured 2026-09-21 at
-`b4fa13e`. The same morning it was 241 of 370 (61 of 104); before that 191/296, 148/293 and
-125/293. The denominator grew because the harness image now configures Complement's shared
+**Complement, `csapi`: 314 of 384 assertions pass** (78 of 106 top-level), measured 2026-09-21 at
+`318f8f4` (run 7). The same morning it was 241 of 370 (61 of 104); before that 191/296, 148/293
+and 125/293. The denominator grew because the harness image now configures Complement's shared
 secret, which un-skipped two tests: `TestCanRegisterAdmin` passes, and `TestServerNotices` runs
 for the first time and fails, since server notices do not exist here.
 
@@ -110,7 +110,7 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 
 | Area | Where it is | Basis |
 |---|---|---|
-| Client-server API | ~73% | 305/384 csapi assertions at run 6 (75/106 top-level, with two regressions since fixed and not yet re-graded); two real Element sessions sign in, create an encrypted room, invite, accept, and read each other's encrypted messages. The number understates the day: four of the fixes behind it were `/sync` silently losing events, which no percentage shows |
+| Client-server API | ~75% | 314/384 csapi assertions, 78/106 top-level (run 7); two real Element sessions sign in, create an encrypted room, invite, accept, and read each other's encrypted messages. The number understates the day: four of the fixes behind it were `/sync` silently losing events, which no percentage shows |
 | Storage, rooms, state resolution | ~85% | the engine underneath; 1600+ tests, two backends through one conformance suite, state bake-off done |
 | Configuration and first run | ~90% | database-backed, editable in the UI, one command from nothing to a working server |
 | Admin API | ~23% | 34 of 145 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Config 6/6, Server 5/5, AuditLog 3/3, Setup 2/2, Users 10/41, Rooms 5/23, Statistics 1/4, Cluster 1/6, and **Bridges 0/16**, Federation 0/7, Media 0/9, RegistrationTokens 0/5 |
@@ -132,24 +132,19 @@ beyond a loadgen harness, `cargo fuzz` never run, Sytest never run, and no real 
 
 ### 1. Keep pulling on the measurement
 
-`python3 tools/complement_triage.py <log>` against run 5 (2026-09-21), largest first. Count by
-test, not by log line: one polling test can print the same line twenty times.
+`python3 tools/complement_triage.py <log>` against run 7 (2026-09-21, `318f8f4`, the baseline
+in `docs/status/complement-csapi-results.txt`), largest first. Count by test, not by log line:
+one polling test can print the same line twenty times.
 
 - **`TestServerNotices` (9)**: newly running, not newly broken. Server notices are unimplemented
   (`ServerNotices` is 0 of 2 in the admin API too).
 - **`TestSearch` (8)**: `/search` needs a cross-room index the room-actor model has no place for.
-- **`TestDeviceListUpdates` (8)**: device-list tracking when users join and leave rooms.
+- **`TestDeviceListUpdates` (5)**: every local case passes; the five that remain are the
+  remote-user halves, which need federation (item 3).
 - **`TestMessagesOverFederation` (6), `TestPushRuleRoomUpgrade` (6)**: both die joining a room
   over federation with `404 room not found` -- item 3, the room bootstrap API.
-- **`TestArchivedRoomsHistory` (6)**: fixed after run 4, not yet graded -- and it was a disclosure,
-  not a formatting problem; see "What fixing it uncovered" above.
-- **`TestRoomState` (5)**, **`TestSync` (4)**: mixed; read the reasons.
-- **Fixed after run 5 and not yet graded**: `TestArchivedRoomsHistory` (the disclosure above),
-  the local half of `TestDeviceListUpdates` (leaving a room never produced a
-  `device_lists.left`, because only *other* people's departures were considered), and two of
-  `TestRoomState` (`joined_members` omitted `avatar_url`; `?format=event` on a single state
-  event was ignored). Run 5 was the first of the day in which exactly the predicted tests moved
-  and nothing else did.
+- **`TestSync` (4)**: "Newly joined room has correct timeline in incremental sync" and the
+  lazy-loading `device_lists.left` case; read the reasons.
 - **`TestChangePasswordPushers` (2)**: a password change should delete pushers made by other
   sessions. Needs pushers to remember which device made them, and a revocation hook from
   `hs-auth` into `hs-push`.
@@ -168,14 +163,14 @@ their own membership (`RoomActor::event_visible_to`). `TestArchivedRoomsHistory`
 because its remaining complaint was a different one: a room sent whole repeated in `state` every
 state event its `timeline` already carried. It no longer does.
 
-The baseline file is still run 5's. **Run 7 has to grade everything below before it is
-rewritten**, and what it should show, by name: the two regressions back to passing,
-`TestArchivedRoomsHistory` passing, nothing else moving. The local half of
-`TestDeviceListUpdates` was passing *by accident* and should now pass on purpose: a token from an
-initial sync carried a device-list position of zero, so the first incremental sync after it
-re-reported everybody who had ever uploaded a key, which is the only reason "somebody joined your
-room" appeared to reach `device_lists.changed`. Nothing put them there. Now something does, and
-an initial sync's token starts at the present.
+Run 7 (2026-09-21, commit `318f8f4`, everything below included): **314 of 384**, 78 of 106
+top-level, and by name exactly what was predicted -- the two regressions back to passing,
+`TestArchivedRoomsHistory` passing, every local `TestDeviceListUpdates` case passing, nothing
+else moved. It is the baseline now. The local device-list cases had been passing *by accident*:
+a token from an initial sync carried a device-list position of zero, so the first incremental
+sync after it re-reported everybody who had ever uploaded a key, which is the only reason
+"somebody joined your room" appeared to reach `device_lists.changed`. Nothing put them there.
+Now something does, an initial sync's token starts at the present, and they pass on purpose.
 
 Then Element was opened, against the real binary, two sessions and a third later
 (`web/element-testing/README.md`; a fresh server, accounts made through the admin API, one
