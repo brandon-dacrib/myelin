@@ -11,6 +11,7 @@ description = "Requester middleware, legacy login/UIA/registration, tokens, devi
 hs-admin = { path = "../hs-admin" }
 hs-compat = { path = "../hs-compat" }
 hs-config = { path = "../hs-config" }
+hs-http = { path = "../hs-http" }
 hs-kv = { path = "../hs-kv" }
 hs-tables = { path = "../hs-tables" }
 bytes = { workspace = true }

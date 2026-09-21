@@ -28,6 +28,7 @@ use axum::routing::get;
 use hs_compat::shared_secret::{
     NonceError, NonceRegistry, RegistrationError, RegistrationRequest, verify_registration_request,
 };
+use hs_http::body::PermissiveJson;
 use ruma::UserId;
 use serde_json::{Map, Value, json};
 
@@ -79,7 +80,7 @@ async fn get_register_nonce(
 async fn post_register(
     State(state): State<AuthState>,
     Extension(registry): Extension<SharedNonceRegistry>,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, MatrixError> {
     let Some(secret) = state.config.registration_shared_secret.clone() else {
         return Err(MatrixError::feature_not_configured());

@@ -3,6 +3,7 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
+use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 use ruma::{RoomAliasId, RoomId};
 use serde_json::{Value, json};
@@ -39,7 +40,7 @@ pub async fn put_alias<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_alias): Path<String>,
     RoomRequester(requester): RoomRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
     let alias = parse_alias(&room_alias)?;
     let room_id_str = body

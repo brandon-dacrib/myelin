@@ -22,6 +22,7 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
+use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 use ruma::RoomId;
 use serde::Deserialize;
@@ -124,7 +125,7 @@ pub async fn put_directory_visibility<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_id): Path<String>,
     RoomRequester(_requester): RoomRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
     let room_id = parse_room_id(&room_id)?;
     let published = match body.get("visibility").and_then(Value::as_str) {
@@ -240,7 +241,7 @@ pub async fn get_public_rooms<B: KvBackend + 'static>(
 /// `POST /publicRooms`.
 pub async fn post_public_rooms<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
-    Json(body): Json<PublicRoomsBody>,
+    PermissiveJson(body): PermissiveJson<PublicRoomsBody>,
 ) -> Result<Response, RoomError> {
     let term = body.filter.and_then(|f| f.generic_search_term);
     render_public_rooms(&state, body.limit, term).await

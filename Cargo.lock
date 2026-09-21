@@ -2191,6 +2191,7 @@ dependencies = [
  "hs-admin",
  "hs-compat",
  "hs-config",
+ "hs-http",
  "hs-kv",
  "hs-tables",
  "http",

@@ -3,6 +3,7 @@
 use axum::Json;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
+use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 use ruma::{OwnedUserId, RoomVersionId, UserId};
 use serde_json::{Value, json};
@@ -81,7 +82,7 @@ const PRESETS: &[&str] = &["private_chat", "public_chat", "trusted_private_chat"
 pub async fn post_create_room<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     RoomRequester(requester): RoomRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
     // `room_version` must be a JSON string if present at all -- a well-formed-but-wrong-typed
     // value (a number, an object, ...) is `M_BAD_JSON` (sytest/Complement: "rejects attempts to

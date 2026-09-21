@@ -9,6 +9,7 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
+use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -166,7 +167,7 @@ pub struct CreateVersionBody {
 pub async fn post_version<B: KvBackend + 'static>(
     State(state): State<E2eState<B>>,
     E2eRequester(requester): E2eRequester,
-    Json(body): Json<CreateVersionBody>,
+    PermissiveJson(body): PermissiveJson<CreateVersionBody>,
 ) -> Result<Json<Value>, E2eError> {
     let version = state
         .store
@@ -191,7 +192,7 @@ pub async fn put_version<B: KvBackend + 'static>(
     State(state): State<E2eState<B>>,
     E2eRequester(requester): E2eRequester,
     Path(version): Path<String>,
-    Json(body): Json<UpdateVersionBody>,
+    PermissiveJson(body): PermissiveJson<UpdateVersionBody>,
 ) -> Result<Json<Value>, E2eError> {
     if let Some(body_version) = &body.version
         && body_version != &version
@@ -305,7 +306,7 @@ pub async fn put_keys_all<B: KvBackend + 'static>(
     State(state): State<E2eState<B>>,
     E2eRequester(requester): E2eRequester,
     Query(q): Query<VersionQuery>,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Json<Value>, E2eError> {
     let version = resolve_write_version(&state, &requester.user_id, q.version.as_deref()).await?;
     let rooms = body
@@ -336,7 +337,7 @@ pub async fn put_keys_room<B: KvBackend + 'static>(
     E2eRequester(requester): E2eRequester,
     Path(room_id): Path<String>,
     Query(q): Query<VersionQuery>,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Json<Value>, E2eError> {
     let version = resolve_write_version(&state, &requester.user_id, q.version.as_deref()).await?;
     let sessions = body
@@ -361,7 +362,7 @@ pub async fn put_keys_session<B: KvBackend + 'static>(
     E2eRequester(requester): E2eRequester,
     Path((room_id, session_id)): Path<(String, String)>,
     Query(q): Query<VersionQuery>,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Json<Value>, E2eError> {
     let version = resolve_write_version(&state, &requester.user_id, q.version.as_deref()).await?;
     let row = session_from_json(&body)?;

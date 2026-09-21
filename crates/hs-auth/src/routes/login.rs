@@ -25,6 +25,7 @@ use crate::session::{self, NewSession};
 use crate::shared_secret_auth;
 use crate::state::AuthState;
 use crate::token::TokenHash;
+use hs_http::body::PermissiveJson;
 
 /// Synapse's exact wording for "no such user" and "wrong password" alike, deliberately identical
 /// so a failed login never tells an attacker which half was wrong.
@@ -58,7 +59,7 @@ pub async fn post_login(
     State(state): State<AuthState>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, MatrixError> {
     let device_id: Option<OwnedDeviceId> = body
         .get("device_id")
@@ -378,7 +379,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
-            Json(body),
+            PermissiveJson(body),
         )
         .await
         .unwrap();
@@ -393,7 +394,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
-            Json(body),
+            PermissiveJson(body),
         )
         .await
         .unwrap();
@@ -411,7 +412,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
-            Json(body),
+            PermissiveJson(body),
         )
         .await
         .unwrap();
@@ -426,7 +427,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
-            Json(body),
+            PermissiveJson(body),
         )
         .await
         .unwrap();
@@ -441,7 +442,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
-            Json(body),
+            PermissiveJson(body),
         )
         .await
         .unwrap();
@@ -456,7 +457,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
-            Json(body),
+            PermissiveJson(body),
         )
         .await
         .unwrap_err();
@@ -472,7 +473,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
-            Json(body),
+            PermissiveJson(body),
         )
         .await
         .unwrap_err();
@@ -496,7 +497,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
-            Json(body),
+            PermissiveJson(body),
         )
         .await
         .unwrap();
@@ -529,7 +530,7 @@ mod tests {
             State(state.clone()),
             HeaderMap::new(),
             Query(HashMap::new()),
-            Json(body.clone()),
+            PermissiveJson(body.clone()),
         )
         .await
         .unwrap();
@@ -539,7 +540,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
-            Json(body),
+            PermissiveJson(body),
         )
         .await
         .unwrap_err();
@@ -610,7 +611,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
-            Json(body),
+            PermissiveJson(body),
         )
         .await
         .unwrap();
@@ -639,7 +640,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
-            Json(body),
+            PermissiveJson(body),
         )
         .await
         .unwrap_err();
@@ -664,7 +665,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
-            Json(body),
+            PermissiveJson(body),
         )
         .await
         .unwrap_err();

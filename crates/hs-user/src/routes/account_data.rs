@@ -4,6 +4,7 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
+use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 
 use crate::error::UserError;
@@ -56,7 +57,7 @@ pub async fn put_global<B: KvBackend + 'static, R: RoomSource<B> + 'static>(
     State(state): State<UserState<B, R>>,
     Path((user_id, event_type)): Path<(String, String)>,
     UserRequester(requester): UserRequester,
-    Json(content): Json<serde_json::Value>,
+    PermissiveJson(content): PermissiveJson<serde_json::Value>,
 ) -> Result<Response, UserError> {
     require_self(&requester, &user_id)?;
     state
@@ -99,7 +100,7 @@ pub async fn put_room<B: KvBackend + 'static, R: RoomSource<B> + 'static>(
     State(state): State<UserState<B, R>>,
     Path((user_id, room_id, event_type)): Path<(String, String, String)>,
     UserRequester(requester): UserRequester,
-    Json(content): Json<serde_json::Value>,
+    PermissiveJson(content): PermissiveJson<serde_json::Value>,
 ) -> Result<Response, UserError> {
     require_self(&requester, &user_id)?;
     let room_id = parse_room_id(&room_id)?;

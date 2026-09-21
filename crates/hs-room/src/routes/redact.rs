@@ -3,6 +3,7 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
+use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 use ruma::{EventId, RoomId};
 use serde_json::{Value, json};
@@ -28,7 +29,7 @@ pub async fn put_redact<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path((room_id, event_id, txn_id)): Path<(String, String, String)>,
     RoomRequester(requester): RoomRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
     let room_id = RoomId::parse(&room_id)
         .map(|r| r.to_owned())

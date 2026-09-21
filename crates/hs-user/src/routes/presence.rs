@@ -3,6 +3,7 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
+use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 use ruma::UserId;
 use serde::Deserialize;
@@ -74,7 +75,7 @@ pub async fn put_status<B: KvBackend + 'static, R: RoomSource<B> + 'static>(
     State(state): State<UserState<B, R>>,
     Path(user_id): Path<String>,
     UserRequester(requester): UserRequester,
-    Json(body): Json<PresenceBody>,
+    PermissiveJson(body): PermissiveJson<PresenceBody>,
 ) -> Result<Response, UserError> {
     let uid = parse_user_id(&user_id)?;
     if uid != requester.user_id {
@@ -152,7 +153,7 @@ mod tests {
             State(state.clone()),
             Path(alice.to_string()),
             UserRequester(Requester::for_user(alice.to_owned())),
-            Json(PresenceBody {
+            PermissiveJson(PresenceBody {
                 presence: "unavailable".to_owned(),
                 status_msg: Some("brb".to_owned()),
             }),
@@ -185,7 +186,7 @@ mod tests {
             State(state),
             Path(bob.to_string()),
             UserRequester(Requester::for_user(alice.to_owned())),
-            Json(PresenceBody {
+            PermissiveJson(PresenceBody {
                 presence: "online".to_owned(),
                 status_msg: None,
             }),
@@ -206,7 +207,7 @@ mod tests {
             State(state),
             Path(alice.to_string()),
             UserRequester(Requester::for_user(alice.to_owned())),
-            Json(PresenceBody {
+            PermissiveJson(PresenceBody {
                 presence: "extremely-online".to_owned(),
                 status_msg: None,
             }),

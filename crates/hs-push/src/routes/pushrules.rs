@@ -3,6 +3,7 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
+use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 use ruma::UserId;
 use ruma::push::{
@@ -113,7 +114,7 @@ pub async fn put_pushrule<B: KvBackend + 'static>(
     State(state): State<PushState<B>>,
     Path((kind, rule_id)): Path<(String, String)>,
     Query(ba): Query<BeforeAfter>,
-    Json(body): Json<SetRuleBody>,
+    PermissiveJson(body): PermissiveJson<SetRuleBody>,
 ) -> Result<Json<Value>, hs_http::error::MatrixError> {
     let kind = rule_kind(&kind)?;
     let new_rule = match kind {
@@ -193,7 +194,7 @@ pub async fn put_pushrule_actions<B: KvBackend + 'static>(
     PushRequester(requester): PushRequester,
     State(state): State<PushState<B>>,
     Path((kind, rule_id)): Path<(String, String)>,
-    Json(body): Json<SetActionsBody>,
+    PermissiveJson(body): PermissiveJson<SetActionsBody>,
 ) -> Result<Json<Value>, hs_http::error::MatrixError> {
     let kind = rule_kind(&kind)?;
     let mut ruleset = (*effective(&state, &requester.user_id).await?).clone();
@@ -219,7 +220,7 @@ pub async fn put_pushrule_enabled<B: KvBackend + 'static>(
     PushRequester(requester): PushRequester,
     State(state): State<PushState<B>>,
     Path((kind, rule_id)): Path<(String, String)>,
-    Json(body): Json<SetEnabledBody>,
+    PermissiveJson(body): PermissiveJson<SetEnabledBody>,
 ) -> Result<Json<Value>, hs_http::error::MatrixError> {
     let kind = rule_kind(&kind)?;
     let mut ruleset = (*effective(&state, &requester.user_id).await?).clone();

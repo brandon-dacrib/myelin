@@ -8,6 +8,7 @@
 
 use axum::Json;
 use axum::extract::State;
+use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 use ruma::UserId;
 use serde_json::{Map, Value, json};
@@ -134,7 +135,7 @@ pub(crate) async fn build_keys_query_response<B: KvBackend + 'static>(
 pub async fn post_keys_query<B: KvBackend + 'static>(
     State(state): State<E2eState<B>>,
     E2eRequester(requester): E2eRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Json<Value>, E2eError> {
     let device_keys_req = body.get("device_keys").cloned().unwrap_or(json!({}));
     let response = build_keys_query_response(&state, &requester.user_id, &device_keys_req).await?;

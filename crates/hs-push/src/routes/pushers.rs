@@ -2,6 +2,7 @@
 
 use axum::Json;
 use axum::extract::State;
+use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 use ruma::api::client::push::{EmailPusherData, Pusher, PusherIds, PusherInit, PusherKind};
 use ruma::push::{HttpPusherData, PushFormat};
@@ -55,7 +56,7 @@ fn default_lang() -> String {
 pub async fn post_pushers_set<B: KvBackend + 'static>(
     PushRequester(requester): PushRequester,
     State(state): State<PushState<B>>,
-    Json(body): Json<SetPusherBody>,
+    PermissiveJson(body): PermissiveJson<SetPusherBody>,
 ) -> Result<Json<Value>, hs_http::error::MatrixError> {
     let Some(kind) = body.kind else {
         let ids = PusherIds::new(body.pushkey, body.app_id);

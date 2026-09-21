@@ -31,6 +31,7 @@ use crate::error::MatrixError;
 use crate::requester::Requester;
 use crate::state::AuthState;
 use crate::store::UserRecord;
+use hs_http::body::PermissiveJson;
 
 /// The spec's documented default when the request omits `limit`.
 const DEFAULT_LIMIT: usize = 10;
@@ -44,7 +45,7 @@ const MAX_LIMIT: usize = 100;
 pub async fn post_user_directory_search(
     State(state): State<AuthState>,
     requester: Requester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, MatrixError> {
     let search_term = body
         .get("search_term")
@@ -175,9 +176,10 @@ mod tests {
     async fn search(state: &AuthState, requester: &str, term: &str) -> Value {
         let body = json!({"search_term": term});
         let requester = Requester::for_user(ruma::UserId::parse(requester).unwrap().to_owned());
-        let response = post_user_directory_search(State(state.clone()), requester, Json(body))
-            .await
-            .unwrap();
+        let response =
+            post_user_directory_search(State(state.clone()), requester, PermissiveJson(body))
+                .await
+                .unwrap();
         let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
             .await
             .unwrap();
@@ -248,9 +250,10 @@ mod tests {
         let state = state_with_users().await;
         let body = json!({"search_term": "example.org", "limit": 2});
         let requester = Requester::for_user(user_id!("@bob:example.org").to_owned());
-        let response = post_user_directory_search(State(state.clone()), requester, Json(body))
-            .await
-            .unwrap();
+        let response =
+            post_user_directory_search(State(state.clone()), requester, PermissiveJson(body))
+                .await
+                .unwrap();
         let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
             .await
             .unwrap();
@@ -271,7 +274,7 @@ mod tests {
     async fn a_missing_search_term_is_a_missing_param() {
         let state = state_with_users().await;
         let requester = Requester::for_user(user_id!("@bob:example.org").to_owned());
-        let err = post_user_directory_search(State(state), requester, Json(json!({})))
+        let err = post_user_directory_search(State(state), requester, PermissiveJson(json!({})))
             .await
             .unwrap_err();
         assert_eq!(err.errcode().as_str(), "M_MISSING_PARAM");

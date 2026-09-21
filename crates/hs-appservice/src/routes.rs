@@ -25,6 +25,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use hs_auth::requester::Requester;
 use hs_auth::state::AuthState;
+use hs_http::body::PermissiveJson;
 use hs_http::error::{MatrixError, MatrixErrorCode};
 use hs_kv::KvBackend;
 use serde::Deserialize;
@@ -63,7 +64,7 @@ async fn ping_handler<B: KvBackend>(
     Extension(service): Extension<Arc<PingService<B>>>,
     requester: Requester,
     Path(appservice_id): Path<String>,
-    body: Option<Json<PingRequestBody>>,
+    body: Option<PermissiveJson<PingRequestBody>>,
 ) -> Result<Json<Value>, MatrixError> {
     // Spec: "This API cannot be invoked by users who are not identified as application
     // services. Additionally, the appservice ID in the path must be the same as the appservice
@@ -79,7 +80,7 @@ async fn ping_handler<B: KvBackend>(
         ));
     }
 
-    let transaction_id = body.and_then(|Json(b)| b.transaction_id);
+    let transaction_id = body.and_then(|PermissiveJson(b)| b.transaction_id);
     let outcome = service
         .ping(&appservice_id, transaction_id.as_deref())
         .await

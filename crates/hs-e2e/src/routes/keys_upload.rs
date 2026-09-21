@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use axum::Json;
 use axum::extract::State;
+use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 use serde_json::{Value, json};
 
@@ -26,7 +27,7 @@ fn as_object_map(value: Option<&Value>) -> Result<BTreeMap<String, Value>, E2eEr
 pub async fn post_keys_upload<B: KvBackend + 'static>(
     State(state): State<E2eState<B>>,
     E2eRequester(requester): E2eRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Json<Value>, E2eError> {
     let Some(device_id) = requester.device_id.clone() else {
         return Err(E2eError::BadRequest(
@@ -180,7 +181,7 @@ mod tests {
         let Json(_) = post_keys_upload::<MemoryBackend>(
             State(state),
             E2eRequester(device_bound_requester()),
-            Json(json!({
+            PermissiveJson(json!({
                 "device_keys": {
                     "algorithms": ["m.olm.v1.curve25519-aes-sha2"],
                     "device_id": "DEV1",
@@ -209,7 +210,7 @@ mod tests {
         let Json(_) = post_keys_upload::<MemoryBackend>(
             State(state),
             E2eRequester(device_bound_requester()),
-            Json(json!({
+            PermissiveJson(json!({
                 "one_time_keys": {"curve25519:AAAA": "base64key"},
             })),
         )

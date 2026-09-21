@@ -12,6 +12,7 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
+use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 use ruma::{RoomId, RoomVersionId};
 use serde_json::{Value, json};
@@ -57,7 +58,7 @@ pub async fn post_upgrade<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_id): Path<String>,
     RoomRequester(requester): RoomRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
     let old_room_id = parse_room_id(&room_id)?;
     let new_version_str = body
@@ -307,7 +308,7 @@ mod tests {
         let created = post_create_room::<MemoryBackend>(
             State(state.clone()),
             requester(alice),
-            Json(json!({"preset": "public_chat", "topic": "before the upgrade"})),
+            PermissiveJson(json!({"preset": "public_chat", "topic": "before the upgrade"})),
         )
         .await
         .unwrap();
@@ -321,7 +322,7 @@ mod tests {
             State(state.clone()),
             Path(old_room_id.clone()),
             requester(alice),
-            Json(json!({"new_version": "10"})),
+            PermissiveJson(json!({"new_version": "10"})),
         )
         .await
         .unwrap();
@@ -392,7 +393,7 @@ mod tests {
         let created = post_create_room::<MemoryBackend>(
             State(state.clone()),
             requester(alice),
-            Json(json!({"preset": "public_chat"})),
+            PermissiveJson(json!({"preset": "public_chat"})),
         )
         .await
         .unwrap();
@@ -405,7 +406,7 @@ mod tests {
             State(state.clone()),
             Path(old_room_id.clone()),
             requester(alice),
-            Json(json!({"new_version": "not-a-real-version"})),
+            PermissiveJson(json!({"new_version": "not-a-real-version"})),
         )
         .await
         .unwrap_err();

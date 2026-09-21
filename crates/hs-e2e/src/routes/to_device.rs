@@ -10,6 +10,7 @@
 
 use axum::Json;
 use axum::extract::{Path, State};
+use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 use serde_json::{Value, json};
 
@@ -21,7 +22,7 @@ pub async fn put_send_to_device<B: KvBackend + 'static>(
     State(state): State<E2eState<B>>,
     E2eRequester(requester): E2eRequester,
     Path((event_type, txn_id)): Path<(String, String)>,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Json<Value>, E2eError> {
     let Some(sender_device) = requester.device_id.clone() else {
         return Err(E2eError::BadRequest(

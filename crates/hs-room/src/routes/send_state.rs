@@ -3,6 +3,7 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
+use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 use ruma::RoomId;
 use serde_json::{Value, json};
@@ -34,7 +35,7 @@ pub async fn put_send<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path((room_id, event_type, txn_id)): Path<(String, String, String)>,
     RoomRequester(requester): RoomRequester,
-    Json(content): Json<Value>,
+    PermissiveJson(content): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
     let room_id = parse_room_id(&room_id)?;
     let handle = state.rooms.get_or_load(&room_id).await?;
@@ -56,7 +57,7 @@ pub async fn put_state<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path((room_id, event_type, state_key)): Path<(String, String, String)>,
     RoomRequester(requester): RoomRequester,
-    Json(content): Json<Value>,
+    PermissiveJson(content): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
     let room_id = parse_room_id(&room_id)?;
     let handle = state.rooms.get_or_load(&room_id).await?;
@@ -78,7 +79,7 @@ pub async fn put_state_no_key<B: KvBackend + 'static>(
     state: State<RoomState<B>>,
     Path((room_id, event_type)): Path<(String, String)>,
     requester: RoomRequester,
-    body: Json<Value>,
+    body: PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
     put_state(
         state,

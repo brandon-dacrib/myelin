@@ -31,6 +31,7 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
+use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 use ruma::{RoomId, UserId};
 use serde_json::{Value, json};
@@ -137,7 +138,7 @@ pub async fn post_join<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_id): Path<String>,
     RoomRequester(requester): RoomRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
     act_join(&state, &room_id, requester.user_id, &body).await
 }
@@ -147,7 +148,7 @@ pub async fn post_join_by_id_or_alias<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_id_or_alias): Path<String>,
     RoomRequester(requester): RoomRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
     let room_id = if room_id_or_alias.starts_with('!') {
         parse_room_id(&room_id_or_alias)?
@@ -167,7 +168,7 @@ pub async fn post_leave<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_id): Path<String>,
     RoomRequester(requester): RoomRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
     let user = requester.user_id.clone();
     act(&state, &room_id, user.clone(), Action::Leave, user, &body).await
@@ -204,7 +205,7 @@ pub async fn post_invite<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_id): Path<String>,
     RoomRequester(requester): RoomRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
     let target = target_user(&body, &requester.user_id)?;
     act(
@@ -223,7 +224,7 @@ pub async fn post_kick<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_id): Path<String>,
     RoomRequester(requester): RoomRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
     let target = target_user(&body, &requester.user_id)?;
     act(
@@ -242,7 +243,7 @@ pub async fn post_ban<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_id): Path<String>,
     RoomRequester(requester): RoomRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
     let target = target_user(&body, &requester.user_id)?;
     act(
@@ -261,7 +262,7 @@ pub async fn post_unban<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_id): Path<String>,
     RoomRequester(requester): RoomRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
     let target = target_user(&body, &requester.user_id)?;
     act(
@@ -280,7 +281,7 @@ pub async fn post_knock<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_id): Path<String>,
     RoomRequester(requester): RoomRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
     let user = requester.user_id.clone();
     act(&state, &room_id, user.clone(), Action::Knock, user, &body).await
@@ -291,7 +292,7 @@ pub async fn post_knock_by_id_or_alias<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_id_or_alias): Path<String>,
     RoomRequester(requester): RoomRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
     let room_id = if room_id_or_alias.starts_with('!') {
         parse_room_id(&room_id_or_alias)?

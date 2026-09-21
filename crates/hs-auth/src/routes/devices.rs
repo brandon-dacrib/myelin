@@ -16,6 +16,7 @@ use crate::reauth;
 use crate::requester::Requester;
 use crate::state::AuthState;
 use crate::store::DeviceRecord;
+use hs_http::body::PermissiveJson;
 
 /// Parses a request body that may legitimately be empty into a JSON [`Value`], treating "no body
 /// at all" as `{}` rather than a parse failure.
@@ -88,7 +89,7 @@ pub async fn put_device(
     State(state): State<AuthState>,
     requester: Requester,
     Path(device_id): Path<String>,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Json<Value>, MatrixError> {
     let device_id: ruma::OwnedDeviceId = device_id.into();
     let display_name = body
@@ -303,7 +304,7 @@ mod tests {
             State(state.clone()),
             requester.clone(),
             Path(did.to_string()),
-            Json(body),
+            PermissiveJson(body),
         )
         .await
         .unwrap();
@@ -399,7 +400,7 @@ mod tests {
             State(state),
             requester,
             Path("NOPE".to_string()),
-            Json(json!({})),
+            PermissiveJson(json!({})),
         )
         .await
         .unwrap_err();
@@ -421,7 +422,7 @@ mod tests {
             State(state.clone()),
             requester,
             Path("NEWDEV".to_string()),
-            Json(body),
+            PermissiveJson(body),
         )
         .await
         .unwrap();
@@ -485,7 +486,7 @@ mod tests {
             State(state),
             requester.clone(),
             Path(did.to_string()),
-            Json(json!({"display_name": "renamed"})),
+            PermissiveJson(json!({"display_name": "renamed"})),
         )
         .await
         .unwrap();
@@ -506,7 +507,7 @@ mod tests {
             State(state),
             requester,
             Path("NEWDEV".to_string()),
-            Json(json!({"display_name": "puppeted device"})),
+            PermissiveJson(json!({"display_name": "puppeted device"})),
         )
         .await
         .unwrap();

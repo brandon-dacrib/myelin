@@ -926,3 +926,130 @@ async fn an_endpoint_this_server_does_not_have_answers_a_json_matrix_error() {
 
     handle.shutdown().await;
 }
+
+/// Every client-server route that reads a body, sent a body that is not JSON, through the real
+/// assembled router with a real access token -- so the request gets past authentication and
+/// reaches whatever parses the body.
+///
+/// The client-server spec's "Standard error response" section wants a JSON object with an
+/// `errcode` for every error, and `M_NOT_JSON` for this one. `axum::Json`'s own rejection is a
+/// plain-text `400`/`415`/`422`, which is what a route gets by taking a bare `Json<T>` instead of
+/// `hs_http::body::PermissiveJson<T>`. The walk is over the route manifest rather than a list, so
+/// a route added tomorrow is covered without anybody remembering this test exists.
+///
+/// The body is the one Complement's `TestRequestEncodingFails` sends: a JSON string holding a
+/// lone `0x81`.
+#[tokio::test]
+async fn a_body_that_is_not_json_is_m_not_json_on_every_route_never_plain_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(reserve_ephemeral_port(), dir.path());
+    let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
+        .await
+        .expect("server should boot");
+    let base = handle.base_url();
+    let client = reqwest::Client::new();
+
+    let register: serde_json::Value = client
+        .post(format!("{base}/_matrix/client/v3/register"))
+        .json(&json!({
+            "username": "encoding",
+            "password": "hunter2-encoding",
+            "auth": {"type": "m.login.dummy"},
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = register["access_token"].as_str().unwrap().to_owned();
+    let user_id = register["user_id"].as_str().unwrap().to_owned();
+    let created: serde_json::Value = client
+        .post(format!("{base}/_matrix/client/v3/createRoom"))
+        .bearer_auth(&token)
+        .json(&json!({"preset": "private_chat"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let room_id = created["room_id"].as_str().unwrap().to_owned();
+
+    let not_json: &[u8] = b"{ \"test\":\"a\x81\" }";
+    let mut not_json_answers = 0usize;
+    let mut report = Vec::new();
+    let mut failures = Vec::new();
+
+    let mut routes = hs_cli::serve::route_manifest().routes;
+    routes.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.method.cmp(&b.method)));
+    for route in routes {
+        if route.surface != hs_http::Surface::MatrixClient
+            || !matches!(route.method.as_str(), "POST" | "PUT" | "DELETE" | "PATCH")
+        {
+            continue;
+        }
+        // These take no body and end the session every later request depends on.
+        if route.path.contains("/logout") {
+            continue;
+        }
+        let path = route
+            .path
+            .split('/')
+            .map(|segment| match segment {
+                "{roomId}" | "{room_id}" => room_id.replace('!', "%21").replace(':', "%3A"),
+                "{userId}" | "{user_id}" => user_id.replace('@', "%40").replace(':', "%3A"),
+                s if s.starts_with('{') => "placeholder".to_owned(),
+                s => s.to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        let response = client
+            .request(route.method.parse().unwrap(), format!("{base}{path}"))
+            .bearer_auth(&token)
+            .header("content-type", "application/json")
+            .body(not_json)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        let text = response.text().await.unwrap();
+        let errcode = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v["errcode"].as_str().map(str::to_owned));
+        let label = format!("{} {}", route.method, route.path);
+        report.push(format!("{status} {errcode:?} {label}"));
+
+        if errcode.as_deref() == Some("M_NOT_JSON") {
+            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{label}");
+            not_json_answers += 1;
+        }
+        if (status.is_client_error() || status.is_server_error()) && errcode.is_none() {
+            failures.push(format!(
+                "{label}: {status} with no errcode ({content_type}): {text:.120}"
+            ));
+        }
+        if matches!(status.as_u16(), 415 | 422) {
+            failures.push(format!("{label}: {status} is an axum::Json rejection"));
+        }
+    }
+
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    // Without a floor this passes when nothing was tested: a token that stopped working would
+    // turn every answer into a well-formed `401 M_UNKNOWN_TOKEN`. 130 of 153 routes answered
+    // `M_NOT_JSON` when this was written; the other 23 take no JSON body (media upload,
+    // `forget`, the `DELETE`s).
+    assert!(
+        not_json_answers >= 100,
+        "only {not_json_answers} routes answered M_NOT_JSON:\n{}",
+        report.join("\n")
+    );
+
+    handle.shutdown().await;
+}

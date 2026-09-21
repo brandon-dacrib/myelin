@@ -43,6 +43,7 @@ use crate::error::MatrixError;
 use crate::requester::Requester;
 use crate::state::AuthState;
 use crate::store::UserRecord;
+use hs_http::body::PermissiveJson;
 
 fn parse_user_id(raw: &str) -> Result<ruma::OwnedUserId, MatrixError> {
     UserId::parse(raw).map_err(|e| MatrixError::invalid_param(format!("invalid user_id: {e}")))
@@ -100,7 +101,7 @@ pub async fn put_displayname(
     State(state): State<AuthState>,
     Path(user_id): Path<String>,
     requester: Requester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, MatrixError> {
     let uid = parse_user_id(&user_id)?;
     require_self(&requester, &uid)?;
@@ -142,7 +143,7 @@ pub async fn put_avatar_url(
     State(state): State<AuthState>,
     Path(user_id): Path<String>,
     requester: Requester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, MatrixError> {
     let uid = parse_user_id(&user_id)?;
     require_self(&requester, &uid)?;
@@ -214,7 +215,7 @@ mod tests {
             State(state.clone()),
             Path("@alice:example.org".to_string()),
             requester,
-            Json(json!({"displayname": "Alice"})),
+            PermissiveJson(json!({"displayname": "Alice"})),
         )
         .await
         .unwrap();
@@ -242,7 +243,7 @@ mod tests {
             State(state),
             Path("@alice:example.org".to_string()),
             requester,
-            Json(json!({"displayname": "Not Alice"})),
+            PermissiveJson(json!({"displayname": "Not Alice"})),
         )
         .await
         .unwrap_err();
@@ -258,7 +259,7 @@ mod tests {
             State(state.clone()),
             Path("@alice:example.org".to_string()),
             requester,
-            Json(json!({"avatar_url": "mxc://example.org/abc"})),
+            PermissiveJson(json!({"avatar_url": "mxc://example.org/abc"})),
         )
         .await
         .unwrap();
@@ -286,7 +287,7 @@ mod tests {
             State(state),
             Path("@alice:example.org".to_string()),
             requester,
-            Json(json!({"avatar_url": "mxc://evil/x"})),
+            PermissiveJson(json!({"avatar_url": "mxc://evil/x"})),
         )
         .await
         .unwrap_err();

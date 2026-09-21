@@ -33,6 +33,7 @@ use crate::session;
 use crate::state::AuthState;
 use crate::store::UserRecord;
 use crate::uia;
+use hs_http::body::PermissiveJson;
 
 fn registration_flows(state: &AuthState) -> Vec<AuthFlow> {
     let mut required = Vec::new();
@@ -140,7 +141,7 @@ fn random_localpart() -> String {
 pub async fn post_register(
     State(state): State<AuthState>,
     Query(query): Query<HashMap<String, String>>,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, MatrixError> {
     let kind = query.get("kind").map(String::as_str).unwrap_or("user");
     if kind == "guest" {
@@ -355,7 +356,7 @@ mod tests {
     async fn registration_completes_with_dummy_stage_by_default() {
         let state = AuthState::in_memory();
         let body = json!({"username": "newuser", "password": "hunter22", "auth": {"type": "m.login.dummy"}});
-        let response = post_register(State(state), Query(HashMap::new()), Json(body))
+        let response = post_register(State(state), Query(HashMap::new()), PermissiveJson(body))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -365,7 +366,7 @@ mod tests {
     async fn first_call_without_auth_returns_401_with_flows() {
         let state = AuthState::in_memory();
         let body = json!({"username": "newuser2", "password": "hunter22"});
-        let response = post_register(State(state), Query(HashMap::new()), Json(body))
+        let response = post_register(State(state), Query(HashMap::new()), PermissiveJson(body))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -384,7 +385,7 @@ mod tests {
         let state = AuthState::in_memory_with_config(config);
         let body =
             json!({"username": "shortpw", "password": "short", "auth": {"type": "m.login.dummy"}});
-        let err = post_register(State(state), Query(HashMap::new()), Json(body))
+        let err = post_register(State(state), Query(HashMap::new()), PermissiveJson(body))
             .await
             .unwrap_err();
         assert_eq!(err.errcode().as_str(), "M_WEAK_PASSWORD");
@@ -398,12 +399,12 @@ mod tests {
         let response = post_register(
             State(state.clone()),
             Query(HashMap::new()),
-            Json(body.clone()),
+            PermissiveJson(body.clone()),
         )
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let err = post_register(State(state), Query(HashMap::new()), Json(body))
+        let err = post_register(State(state), Query(HashMap::new()), PermissiveJson(body))
             .await
             .unwrap_err();
         assert_eq!(err.errcode().as_str(), "M_USER_IN_USE");
@@ -421,13 +422,17 @@ mod tests {
         let state = AuthState::in_memory_with_config(config);
 
         let body = json!({"username": "tokenuser", "auth": {"type": "m.login.registration_token", "token": "bad-token"}});
-        let err = post_register(State(state.clone()), Query(HashMap::new()), Json(body))
-            .await
-            .unwrap_err();
+        let err = post_register(
+            State(state.clone()),
+            Query(HashMap::new()),
+            PermissiveJson(body),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.status(), StatusCode::FORBIDDEN);
 
         let body = json!({"username": "tokenuser", "auth": {"type": "m.login.registration_token", "token": "good-token"}});
-        let response = post_register(State(state), Query(HashMap::new()), Json(body))
+        let response = post_register(State(state), Query(HashMap::new()), PermissiveJson(body))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -437,7 +442,7 @@ mod tests {
     async fn recaptcha_stage_fails_cleanly_when_submitted() {
         let state = AuthState::in_memory();
         let body = json!({"username": "recaptchauser", "auth": {"type": "m.login.recaptcha", "response": "x"}});
-        let err = post_register(State(state), Query(HashMap::new()), Json(body))
+        let err = post_register(State(state), Query(HashMap::new()), PermissiveJson(body))
             .await
             .unwrap_err();
         assert_eq!(err.errcode().as_str(), "M_UNRECOGNIZED");
@@ -452,7 +457,7 @@ mod tests {
             "inhibit_login": true,
             "auth": {"type": "m.login.dummy"}
         });
-        let response = post_register(State(state), Query(HashMap::new()), Json(body))
+        let response = post_register(State(state), Query(HashMap::new()), PermissiveJson(body))
             .await
             .unwrap();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -468,7 +473,7 @@ mod tests {
         let state = AuthState::in_memory(); // guest_registration_enabled: false by default
         let mut query = HashMap::new();
         query.insert("kind".to_string(), "guest".to_string());
-        let err = post_register(State(state), Query(query), Json(json!({})))
+        let err = post_register(State(state), Query(query), PermissiveJson(json!({})))
             .await
             .unwrap_err();
         assert_eq!(err.status(), StatusCode::FORBIDDEN);
@@ -483,7 +488,7 @@ mod tests {
         let state = AuthState::in_memory_with_config(config);
         let mut query = HashMap::new();
         query.insert("kind".to_string(), "guest".to_string());
-        let response = post_register(State(state), Query(query), Json(json!({})))
+        let response = post_register(State(state), Query(query), PermissiveJson(json!({})))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -494,9 +499,13 @@ mod tests {
         let state = AuthState::in_memory();
         let body =
             json!({"username": "taken", "password": "hunter22", "auth": {"type": "m.login.dummy"}});
-        post_register(State(state.clone()), Query(HashMap::new()), Json(body))
-            .await
-            .unwrap();
+        post_register(
+            State(state.clone()),
+            Query(HashMap::new()),
+            PermissiveJson(body),
+        )
+        .await
+        .unwrap();
 
         let mut query = HashMap::new();
         query.insert("username".to_string(), "taken".to_string());
@@ -547,9 +556,13 @@ mod tests {
                 "username": format!("user-{ch}-reject-please"),
                 "password": "sUp3rs3kr1t",
             });
-            let err = post_register(State(state.clone()), Query(HashMap::new()), Json(body))
-                .await
-                .unwrap_err();
+            let err = post_register(
+                State(state.clone()),
+                Query(HashMap::new()),
+                PermissiveJson(body),
+            )
+            .await
+            .unwrap_err();
             assert_eq!(err.status(), StatusCode::BAD_REQUEST, "char {ch:?}");
             assert_eq!(err.errcode().as_str(), "M_INVALID_USERNAME", "char {ch:?}");
         }
@@ -568,7 +581,7 @@ mod tests {
             "password": "sUp3rs3kr1t",
             "auth": {"type": "m.login.dummy"}
         });
-        let response = post_register(State(state), Query(HashMap::new()), Json(body))
+        let response = post_register(State(state), Query(HashMap::new()), PermissiveJson(body))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -591,9 +604,13 @@ mod tests {
             "password": "sUp3rs3kr1t",
             "auth": {"type": "m.login.dummy"}
         });
-        let response = post_register(State(state.clone()), Query(HashMap::new()), Json(first))
-            .await
-            .unwrap();
+        let response = post_register(
+            State(state.clone()),
+            Query(HashMap::new()),
+            PermissiveJson(first),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
         let second = json!({
@@ -601,7 +618,7 @@ mod tests {
             "password": "sUp3rs3kr1t",
             "auth": {"type": "m.login.dummy"}
         });
-        let err = post_register(State(state), Query(HashMap::new()), Json(second))
+        let err = post_register(State(state), Query(HashMap::new()), PermissiveJson(second))
             .await
             .unwrap_err();
         assert_eq!(err.errcode().as_str(), "M_USER_IN_USE");
@@ -624,7 +641,7 @@ mod tests {
             "password": "sUp3rs3kr1t",
             "auth": {"type": "m.login.dummy"}
         });
-        let response = post_register(State(state), Query(HashMap::new()), Json(body))
+        let response = post_register(State(state), Query(HashMap::new()), PermissiveJson(body))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);

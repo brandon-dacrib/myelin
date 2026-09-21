@@ -3,6 +3,7 @@
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
+use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 use serde::Deserialize;
 use serde_json::json;
@@ -155,7 +156,7 @@ pub async fn get_public_rooms<B: KvBackend + 'static, R: RoomSource<B> + 'static
 pub async fn post_public_rooms<B: KvBackend + 'static, R: RoomSource<B> + 'static>(
     State(state): State<UserState<B, R>>,
     UserRequester(_requester): UserRequester,
-    body: axum::Json<PublicRoomsBody>,
+    body: PermissiveJson<PublicRoomsBody>,
 ) -> Result<Response, UserError> {
     let body = body.0;
     let search = body

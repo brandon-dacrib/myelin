@@ -20,11 +20,12 @@ use crate::error::MatrixError;
 use crate::session;
 use crate::state::AuthState;
 use crate::token::TokenHash;
+use hs_http::body::PermissiveJson;
 
 /// `POST /refresh`.
 pub async fn post_refresh(
     State(state): State<AuthState>,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Json<Value>, MatrixError> {
     let raw = body
         .get("refresh_token")
@@ -127,7 +128,7 @@ mod tests {
             .unwrap();
 
         let body = json!({"refresh_token": refresh_token});
-        let Json(response) = post_refresh(State(state.clone()), Json(body))
+        let Json(response) = post_refresh(State(state.clone()), PermissiveJson(body))
             .await
             .unwrap();
         assert!(response["access_token"].is_string());
@@ -147,12 +148,12 @@ mod tests {
     async fn reusing_a_consumed_refresh_token_revokes_the_session() {
         let (state, refresh_token) = logged_in_state().await;
         let body = json!({"refresh_token": refresh_token});
-        let _ = post_refresh(State(state.clone()), Json(body.clone()))
+        let _ = post_refresh(State(state.clone()), PermissiveJson(body.clone()))
             .await
             .unwrap();
 
         // Second use of the same (now-consumed) refresh token: must fail...
-        let err = post_refresh(State(state.clone()), Json(body))
+        let err = post_refresh(State(state.clone()), PermissiveJson(body))
             .await
             .unwrap_err();
         assert_eq!(err.errcode().as_str(), "M_UNKNOWN_TOKEN");
@@ -162,14 +163,16 @@ mod tests {
     async fn unknown_refresh_token_is_rejected() {
         let state = AuthState::in_memory();
         let body = json!({"refresh_token": "syr_nope"});
-        let err = post_refresh(State(state), Json(body)).await.unwrap_err();
+        let err = post_refresh(State(state), PermissiveJson(body))
+            .await
+            .unwrap_err();
         assert_eq!(err.errcode().as_str(), "M_UNKNOWN_TOKEN");
     }
 
     #[tokio::test]
     async fn missing_refresh_token_field_is_rejected() {
         let state = AuthState::in_memory();
-        let err = post_refresh(State(state), Json(json!({})))
+        let err = post_refresh(State(state), PermissiveJson(json!({})))
             .await
             .unwrap_err();
         assert_eq!(err.errcode().as_str(), "M_MISSING_PARAM");

@@ -21,6 +21,7 @@
 
 use axum::Json;
 use axum::extract::State;
+use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 use serde_json::{Value, json};
 
@@ -42,7 +43,7 @@ fn require_appservice(requester: &hs_auth::requester::Requester) -> Result<(), E
 pub async fn post_msc3983_claim<B: KvBackend + 'static>(
     State(state): State<E2eState<B>>,
     E2eRequester(requester): E2eRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Json<Value>, E2eError> {
     require_appservice(&requester)?;
     // MSC3983's request body is the map of `{"<user_id>": {"<device_id>": "<algorithm>"}}`
@@ -55,7 +56,7 @@ pub async fn post_msc3983_claim<B: KvBackend + 'static>(
 pub async fn post_msc3984_keys_query<B: KvBackend + 'static>(
     State(state): State<E2eState<B>>,
     E2eRequester(requester): E2eRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Json<Value>, E2eError> {
     require_appservice(&requester)?;
     // MSC3984's request body is `{"<user_id>": ["<device_id>", ...]}` directly (unlike

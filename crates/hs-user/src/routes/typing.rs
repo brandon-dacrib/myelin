@@ -5,6 +5,7 @@ use std::time::Duration;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
+use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 use ruma::{RoomId, UserId};
 use serde::Deserialize;
@@ -52,7 +53,7 @@ pub async fn put_typing<B: KvBackend + 'static, R: RoomSource<B> + 'static>(
     State(state): State<UserState<B, R>>,
     Path((room_id, user_id)): Path<(String, String)>,
     UserRequester(requester): UserRequester,
-    Json(body): Json<TypingBody>,
+    PermissiveJson(body): PermissiveJson<TypingBody>,
 ) -> Result<Response, UserError> {
     let room_id = parse_room_id(&room_id)?;
     let target = parse_user_id(&user_id)?;
@@ -149,7 +150,7 @@ mod tests {
             State(state.clone()),
             Path((room_id.to_string(), alice.to_string())),
             UserRequester(Requester::for_user(alice.to_owned())),
-            Json(TypingBody {
+            PermissiveJson(TypingBody {
                 typing: true,
                 timeout: Some(30_000),
             }),
@@ -170,7 +171,7 @@ mod tests {
             State(state),
             Path((room_id.to_string(), bob.to_string())),
             UserRequester(Requester::for_user(alice.to_owned())),
-            Json(TypingBody {
+            PermissiveJson(TypingBody {
                 typing: true,
                 timeout: None,
             }),
@@ -191,7 +192,7 @@ mod tests {
             State(state),
             Path((room_id.to_string(), carol.to_string())),
             UserRequester(Requester::for_user(carol.to_owned())),
-            Json(TypingBody {
+            PermissiveJson(TypingBody {
                 typing: true,
                 timeout: None,
             }),
@@ -212,7 +213,7 @@ mod tests {
             State(state),
             Path(("not-a-room-id".to_string(), alice.to_string())),
             UserRequester(Requester::for_user(alice.to_owned())),
-            Json(TypingBody {
+            PermissiveJson(TypingBody {
                 typing: true,
                 timeout: None,
             }),

@@ -3,6 +3,7 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
+use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 use serde_json::json;
 
@@ -33,7 +34,7 @@ pub async fn post_filter<B: KvBackend + 'static, R: RoomSource<B> + 'static>(
     State(state): State<UserState<B, R>>,
     Path(user_id): Path<String>,
     UserRequester(requester): UserRequester,
-    Json(body): Json<serde_json::Value>,
+    PermissiveJson(body): PermissiveJson<serde_json::Value>,
 ) -> Result<Response, UserError> {
     require_self(&requester, &user_id)?;
     let _validated: crate::filter::SyncFilter = serde_json::from_value(body.clone())

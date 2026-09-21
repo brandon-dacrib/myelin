@@ -18,12 +18,13 @@ use crate::password;
 use crate::reauth;
 use crate::requester::Requester;
 use crate::state::AuthState;
+use hs_http::body::PermissiveJson;
 
 /// `POST /account/password`.
 pub async fn post_account_password(
     State(state): State<AuthState>,
     requester: Requester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, MatrixError> {
     requester.require_not_suspended()?;
 
@@ -72,7 +73,7 @@ pub async fn post_account_password(
 pub async fn post_account_deactivate(
     State(state): State<AuthState>,
     requester: Requester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, MatrixError> {
     requester.require_not_suspended()?;
 
@@ -181,7 +182,7 @@ mod tests {
     async fn password_change_requires_reauth_first() {
         let (state, requester) = state_with_user("oldpassword1").await;
         let body = json!({"new_password": "newpassword1"});
-        let response = post_account_password(State(state), requester, Json(body))
+        let response = post_account_password(State(state), requester, PermissiveJson(body))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -194,9 +195,13 @@ mod tests {
             "new_password": "newpassword1",
             "auth": {"type": "m.login.password", "identifier": {"type": "m.id.user", "user": "alice"}, "password": "oldpassword1"}
         });
-        let response = post_account_password(State(state.clone()), requester.clone(), Json(body))
-            .await
-            .unwrap();
+        let response = post_account_password(
+            State(state.clone()),
+            requester.clone(),
+            PermissiveJson(body),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
         let user = state
@@ -218,7 +223,7 @@ mod tests {
             "new_password": "newpassword1",
             "auth": {"type": "m.login.password", "identifier": {"type": "m.id.user", "user": "alice"}, "password": "wrongpassword"}
         });
-        let err = post_account_password(State(state), requester, Json(body))
+        let err = post_account_password(State(state), requester, PermissiveJson(body))
             .await
             .unwrap_err();
         assert_eq!(err.status(), StatusCode::FORBIDDEN);
@@ -245,9 +250,13 @@ mod tests {
             "new_password": "newpassword1",
             "auth": {"type": "m.login.password", "identifier": {"type": "m.id.user", "user": "alice"}, "password": "oldpassword1"}
         });
-        post_account_password(State(state.clone()), requester.clone(), Json(body))
-            .await
-            .unwrap();
+        post_account_password(
+            State(state.clone()),
+            requester.clone(),
+            PermissiveJson(body),
+        )
+        .await
+        .unwrap();
 
         assert!(
             state
@@ -280,7 +289,7 @@ mod tests {
             .unwrap();
         let requester = Requester::for_user(uid);
         let body = json!({"new_password": "short"});
-        let err = post_account_password(State(state), requester, Json(body))
+        let err = post_account_password(State(state), requester, PermissiveJson(body))
             .await
             .unwrap_err();
         assert_eq!(err.errcode().as_str(), "M_WEAK_PASSWORD");
@@ -290,9 +299,13 @@ mod tests {
     async fn deactivate_clears_password_and_revokes_tokens() {
         let (state, requester) = state_with_user("oldpassword1").await;
         let body = json!({"auth": {"type": "m.login.password", "identifier": {"type": "m.id.user", "user": "alice"}, "password": "oldpassword1"}});
-        let response = post_account_deactivate(State(state.clone()), requester.clone(), Json(body))
-            .await
-            .unwrap();
+        let response = post_account_deactivate(
+            State(state.clone()),
+            requester.clone(),
+            PermissiveJson(body),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
         let user = state
@@ -318,7 +331,7 @@ mod tests {
         let (state, mut requester) = state_with_user("oldpassword1").await;
         requester.suspended = true;
         let body = json!({"new_password": "newpassword1"});
-        let err = post_account_password(State(state), requester, Json(body))
+        let err = post_account_password(State(state), requester, PermissiveJson(body))
             .await
             .unwrap_err();
         assert_eq!(err.errcode().as_str(), "M_USER_SUSPENDED");

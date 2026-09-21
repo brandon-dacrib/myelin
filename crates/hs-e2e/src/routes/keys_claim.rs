@@ -2,6 +2,7 @@
 
 use axum::Json;
 use axum::extract::State;
+use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 use ruma::{OwnedDeviceId, UserId};
 use serde_json::{Map, Value, json};
@@ -86,7 +87,7 @@ async fn claim_one<B: KvBackend + 'static>(
 pub async fn post_keys_claim<B: KvBackend + 'static>(
     State(state): State<E2eState<B>>,
     E2eRequester(_requester): E2eRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Json<Value>, E2eError> {
     let one_time_keys_req = body.get("one_time_keys").cloned().unwrap_or(json!({}));
     let response = build_keys_claim_response(&state, &one_time_keys_req).await?;

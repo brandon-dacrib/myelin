@@ -57,6 +57,7 @@
 use axum::Json;
 use axum::extract::State;
 use ed25519_dalek::VerifyingKey;
+use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 use hs_model::signing::{to_signable_object, verify_object, verifying_key_from_base64};
 use ruma::{OwnedDeviceId, UserId};
@@ -70,7 +71,7 @@ use crate::store::CrossSigningKeyType;
 pub async fn post_device_signing_upload<B: KvBackend + 'static>(
     State(state): State<E2eState<B>>,
     E2eRequester(requester): E2eRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Json<Value>, E2eError> {
     // Resolve the master key to verify `self_signing_key`/`user_signing_key` against *before*
     // writing anything: the one in this request if given, else the user's most recently stored
@@ -180,7 +181,7 @@ fn invalid_signature_failure(message: &str) -> Value {
 pub async fn post_signatures_upload<B: KvBackend + 'static>(
     State(state): State<E2eState<B>>,
     E2eRequester(requester): E2eRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Json<Value>, E2eError> {
     let Some(by_user) = body.as_object() else {
         return Err(E2eError::BadRequest("body must be an object".to_string()));

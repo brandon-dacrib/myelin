@@ -53,9 +53,9 @@
 
 use std::sync::Arc;
 
-use axum::Json;
 use axum::extract::{Path, State};
 use axum::response::Response;
+use hs_http::body::PermissiveJson;
 use hs_http::error::MatrixError;
 use hs_kv::KvBackend;
 use ruma::UserId;
@@ -154,13 +154,13 @@ pub async fn put_displayname<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(user_id): Path<String>,
     RoomRequester(requester): RoomRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, MatrixError> {
     let response = hs_auth::routes::profile::put_displayname(
         State(state.auth.clone()),
         Path(user_id.clone()),
         requester,
-        Json(body),
+        PermissiveJson(body),
     )
     .await
     .map_err(auth_error_to_matrix_error)?;
@@ -174,13 +174,13 @@ pub async fn put_avatar_url<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(user_id): Path<String>,
     RoomRequester(requester): RoomRequester,
-    Json(body): Json<Value>,
+    PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, MatrixError> {
     let response = hs_auth::routes::profile::put_avatar_url(
         State(state.auth.clone()),
         Path(user_id.clone()),
         requester,
-        Json(body),
+        PermissiveJson(body),
     )
     .await
     .map_err(auth_error_to_matrix_error)?;
@@ -268,7 +268,7 @@ mod tests {
             State(state.clone()),
             Path(alice.to_string()),
             RoomRequester(hs_auth::requester::Requester::for_user(alice.clone())),
-            Json(serde_json::json!({"displayname": "Alice In Wonderland"})),
+            PermissiveJson(serde_json::json!({"displayname": "Alice In Wonderland"})),
         )
         .await
         .unwrap();
@@ -335,7 +335,7 @@ mod tests {
             State(state),
             Path(carol.to_string()),
             RoomRequester(hs_auth::requester::Requester::for_user(carol.clone())),
-            Json(serde_json::json!({"displayname": "Carol"})),
+            PermissiveJson(serde_json::json!({"displayname": "Carol"})),
         )
         .await
         .unwrap();
@@ -353,7 +353,7 @@ mod tests {
             State(state),
             Path(alice.to_string()),
             RoomRequester(hs_auth::requester::Requester::for_user(bob)),
-            Json(serde_json::json!({"displayname": "Not Alice"})),
+            PermissiveJson(serde_json::json!({"displayname": "Not Alice"})),
         )
         .await
         .unwrap_err();

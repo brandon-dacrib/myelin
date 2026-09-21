@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
+use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 use ruma::{EventId, RoomId};
 use serde::Deserialize;
@@ -78,7 +79,7 @@ pub async fn post_receipt<B: KvBackend + 'static, R: RoomSource<B> + 'static>(
     State(state): State<UserState<B, R>>,
     Path((room_id, receipt_type, event_id)): Path<(String, String, String)>,
     UserRequester(requester): UserRequester,
-    body: Option<Json<ReceiptBody>>,
+    body: Option<PermissiveJson<ReceiptBody>>,
 ) -> Result<Response, UserError> {
     let _ = body;
     let room_id = parse_room_id(&room_id)?;
@@ -139,7 +140,7 @@ pub async fn post_read_markers<B: KvBackend + 'static, R: RoomSource<B> + 'stati
     State(state): State<UserState<B, R>>,
     Path(room_id): Path<String>,
     UserRequester(requester): UserRequester,
-    Json(body): Json<ReadMarkersBody>,
+    PermissiveJson(body): PermissiveJson<ReadMarkersBody>,
 ) -> Result<Response, UserError> {
     let room_id = parse_room_id(&room_id)?;
     require_joined(&state, &requester.user_id, &room_id).await?;
@@ -361,7 +362,7 @@ mod tests {
             State(state.clone()),
             Path(room_id.to_string()),
             UserRequester(Requester::for_user(alice.to_owned())),
-            Json(ReadMarkersBody {
+            PermissiveJson(ReadMarkersBody {
                 fully_read: Some(event_id!("$one").to_string()),
                 read: Some(event_id!("$one").to_string()),
                 read_private: None,
@@ -395,7 +396,7 @@ mod tests {
             State(state.clone()),
             Path(room_id.to_string()),
             UserRequester(Requester::for_user(alice.to_owned())),
-            Json(ReadMarkersBody {
+            PermissiveJson(ReadMarkersBody {
                 fully_read: Some(event_id!("$one").to_string()),
                 read: None,
                 read_private: None,
