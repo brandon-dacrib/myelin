@@ -970,7 +970,7 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     // who has a record at all -- the client has seen nothing yet). See the module docs.
     let mut presence_events: Vec<Value> = Vec::new();
     let mut new_presence_seq = baseline.presence_seq;
-    for other in &shared {
+    for other in &presence_audience(&shared, user_id) {
         let Some(record) = hub.presence_of(other).await else {
             continue;
         };
@@ -1048,6 +1048,21 @@ async fn shared_users<B: KvBackend + 'static, R: RoomSource<B>>(
     hub.users_sharing_room_with(user_id).await
 }
 
+/// Whose presence `user_id`'s sync carries: everyone they share a joined room with, and
+/// themself -- a user's own presence is how their second device learns what their first one set.
+///
+/// One function, used by both [`build`] and [`has_new_data`], because the two disagreeing is a
+/// busy loop. `has_new_data` used to add the user to the set and `build` did not, so a user
+/// whose own record was the newest they could see was told "there is news" by one and handed an
+/// empty response with an unmoved token by the other -- on every `/sync`, forever, as fast as
+/// the client could ask. It became every user's problem the day `GET /sync` started marking its
+/// caller online, which gives every user a record of their own.
+fn presence_audience(shared: &BTreeSet<OwnedUserId>, user_id: &UserId) -> BTreeSet<OwnedUserId> {
+    let mut audience = shared.clone();
+    audience.insert(user_id.to_owned());
+    audience
+}
+
 /// Whether anything has changed for `user_id` since `baseline` -- feed activity, the
 /// account-data counter having advanced, or (when `device_id` is known) new to-device messages
 /// or a device-list change. Used both by the long-poll loop's wake condition and (implicitly, by
@@ -1117,10 +1132,7 @@ async fn has_new_data<B: KvBackend + 'static, R: RoomSource<B>>(
     // presence update since `baseline`? Scoped the same way `device_lists` is (see the module
     // docs) -- an over-broad wake here would just cost an extra response-building pass, same
     // reasoning as the to-device peek below.
-    let mut presence_watch: Vec<OwnedUserId> =
-        shared_users(hub, user_id).await?.into_iter().collect();
-    presence_watch.push(user_id.to_owned());
-    for other in &presence_watch {
+    for other in &presence_audience(&shared_users(hub, user_id).await?, user_id) {
         if let Some(record) = hub.presence_of(other).await
             && record.seq > baseline.presence_seq
         {
@@ -2369,5 +2381,225 @@ mod tests {
             "a named room needs no heroes: {summary}"
         );
         assert_eq!(summary["m.joined_member_count"], 1);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The long-poll actually waits.
+    // ---------------------------------------------------------------------------------------
+
+    /// The invariant, stated once for every stream at the same time: the token a sync hands back
+    /// must not itself be news. If [`has_new_data`] says "yes" about the token [`build`] just
+    /// returned, the client's next `/sync` returns at once, with nothing in it and the same
+    /// token, and so does the one after -- a long-poll turned into a busy loop. That is what
+    /// Complement saw on 2026-09-21: 12,040 empty `/sync` responses inside one five-second wait.
+    ///
+    /// The cause that time was presence. `has_new_data` watches the syncing user's *own* record,
+    /// `build` only walked the users they share a room with, and since `GET /sync` started
+    /// marking its caller online every user has a record of their own. Whoever's own record was
+    /// the newest they could see never got a token that caught up with it.
+    async fn assert_settled(hub: &TestHub, e2e: &Arc<dyn E2eStore>, user: &UserId) -> SyncToken {
+        let (_, token) = build(hub, e2e, user, params(None)).await.unwrap();
+        assert!(
+            !has_new_data(hub, e2e, user, None, &token).await.unwrap(),
+            "the token an initial sync returned already counts as new data"
+        );
+        let (response, again) = build(hub, e2e, user, params(Some(token))).await.unwrap();
+        assert!(
+            !has_new_data(hub, e2e, user, None, &again).await.unwrap(),
+            "the token an incremental sync returned already counts as new data: {response}"
+        );
+        again
+    }
+
+    #[tokio::test]
+    async fn a_user_with_a_presence_record_and_nobody_to_share_it_with_is_not_news_to_themself() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        // What `GET /sync` does on every poll.
+        hub.touch_presence(&alice, "online").await.unwrap();
+        assert_settled(&hub, &e2e, &alice).await;
+    }
+
+    #[tokio::test]
+    async fn the_newest_presence_in_a_room_being_your_own_is_not_news_either() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+        handle
+            .membership(
+                bob.clone(),
+                Action::Join,
+                bob.clone(),
+                serde_json::json!({}),
+                2,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Bob polls first, then alice: hers is the newer record, which is the ordering that
+        // left *her* spinning while bob's token, carried past his own by hers, was fine.
+        hub.touch_presence(&bob, "online").await.unwrap();
+        hub.touch_presence(&alice, "online").await.unwrap();
+        assert_settled(&hub, &e2e, &alice).await;
+        assert_settled(&hub, &e2e, &bob).await;
+    }
+
+    /// The same invariant with every in-memory stream moving at once -- typing, receipts (one of
+    /// them private), account data, presence on both sides -- for the streams `build` and
+    /// `has_new_data` each keep their own idea of.
+    #[tokio::test]
+    async fn a_busy_room_settles_too() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        handle
+            .membership(
+                bob.clone(),
+                Action::Join,
+                bob.clone(),
+                serde_json::json!({}),
+                2,
+            )
+            .await
+            .unwrap();
+        let message = handle
+            .send_event(
+                bob.clone(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"body": "hello"}),
+                None,
+                3,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        hub.touch_presence(&bob, "online").await.unwrap();
+        hub.set_typing(&room_id, &bob, true, Duration::from_secs(30))
+            .await
+            .unwrap();
+        hub.set_receipt(
+            &room_id,
+            &bob,
+            crate::receipts::ReceiptKind::Read,
+            message.event_id().to_owned(),
+            4,
+        )
+        .await
+        .unwrap();
+        hub.set_receipt(
+            &room_id,
+            &alice,
+            crate::receipts::ReceiptKind::ReadPrivate,
+            message.event_id().to_owned(),
+            5,
+        )
+        .await
+        .unwrap();
+        hub.store()
+            .put_global_account_data(&alice, "m.direct", serde_json::json!({}))
+            .await
+            .unwrap();
+        hub.touch_presence(&alice, "unavailable").await.unwrap();
+
+        assert_settled(&hub, &e2e, &alice).await;
+        assert_settled(&hub, &e2e, &bob).await;
+    }
+
+    /// And the behaviour a client sees: with nothing new, a sync with a timeout takes the
+    /// timeout. Before the fix this returned in well under a millisecond.
+    #[tokio::test]
+    async fn an_incremental_sync_with_nothing_new_waits_out_its_timeout() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        hub.touch_presence(&alice, "online").await.unwrap();
+        let (_, token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+
+        let mut p = params(Some(token));
+        p.timeout = Duration::from_millis(400);
+        let started = Instant::now();
+        let (response, next) = build(&hub, &e2e, &alice, p).await.unwrap();
+        let waited = started.elapsed();
+
+        assert!(
+            waited >= Duration::from_millis(350),
+            "returned after {waited:?} with {response}"
+        );
+        assert_eq!(
+            next.encode(),
+            token.encode(),
+            "nothing happened, so nothing moved"
+        );
+    }
+
+    /// A user's own presence is theirs to see: it is how a second device learns what the first
+    /// one set. It is delivered once, not on every sync after.
+    #[tokio::test]
+    async fn your_own_presence_change_reaches_you_once() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let (_, token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+
+        hub.set_presence(
+            &alice,
+            "unavailable".to_owned(),
+            Some("back soon".to_owned()),
+        )
+        .await
+        .unwrap();
+
+        let (response, token) = build(&hub, &e2e, &alice, params(Some(token)))
+            .await
+            .unwrap();
+        let events = response["presence"]["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "{response}");
+        assert_eq!(events[0]["sender"], "@alice:sync.test");
+        assert_eq!(events[0]["content"]["presence"], "unavailable");
+        assert_eq!(events[0]["content"]["status_msg"], "back soon");
+
+        let (response, _) = build(&hub, &e2e, &alice, params(Some(token)))
+            .await
+            .unwrap();
+        assert!(
+            response["presence"]["events"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{response}"
+        );
     }
 }
