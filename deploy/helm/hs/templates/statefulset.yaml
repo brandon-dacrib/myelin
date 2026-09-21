@@ -160,6 +160,15 @@ spec:
             - name: data
               mountPath: /var/lib/hs/data
             {{- end }}
+            {{- if and (eq .Values.media.storage.backend "local") .Values.media.storage.local.existingClaim }}
+            - name: media
+              mountPath: /var/lib/hs/media
+            {{- end }}
+            {{- if and (eq .Values.media.storage.backend "s3") .Values.media.storage.s3.existingSecret }}
+            - name: secrets-media-s3
+              mountPath: /etc/hs/secrets/media-s3
+              readOnly: true
+            {{- end }}
             ## `containerSecurityContext.readOnlyRootFilesystem: true` needs a writable /tmp;
             ## nothing else on this image writes outside the mounts above.
             - name: tmp
@@ -217,6 +226,16 @@ spec:
         {{- end }}
         - name: tmp
           emptyDir: {}
+        {{- if and (eq .Values.media.storage.backend "local") .Values.media.storage.local.existingClaim }}
+        - name: media
+          persistentVolumeClaim:
+            claimName: {{ .Values.media.storage.local.existingClaim }}
+        {{- end }}
+        {{- if and (eq .Values.media.storage.backend "s3") .Values.media.storage.s3.existingSecret }}
+        - name: secrets-media-s3
+          secret:
+            secretName: {{ .Values.media.storage.s3.existingSecret }}
+        {{- end }}
         {{- if and (eq $backend "embedded") .Values.storage.embedded.existingClaim }}
         - name: data
           persistentVolumeClaim:

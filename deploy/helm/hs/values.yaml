@@ -26,7 +26,7 @@ image:
   ## The host and (optional) port of the container image registry.
   registry: ghcr.io
   ## The path in the registry where the image lives.
-  repository: matrix-org/hs
+  repository: brandon-dacrib/myelin
   ## One of `tag` or `digest` should be set; `tag` is used if both are.
   tag: ""
   # digest:
@@ -95,6 +95,30 @@ storage:
     existingSecret: ""
     accessKeyIdKey: access-key-id
     secretAccessKeyKey: secret-access-key
+
+## -- Media ------------------------------------------------------------------------------------
+## Where uploaded and cached-remote media lives (`media.storage` in the generated hs-config).
+media:
+  storage:
+    ## `local`: on a volume. In `singleNode` mode that is the embedded data volume, beside the
+    ##   database, and there is nothing to set. In `cluster` mode replicas do not share a volume,
+    ##   so `local` needs `local.existingClaim` to name a ReadWriteMany claim; without one the
+    ##   chart refuses to render, because the alternative is an upload to one replica being a 404
+    ##   on the others.
+    ## `s3`: in a bucket, on any S3-compatible service. What `cluster` mode wants.
+    backend: local
+    local:
+      existingClaim: ""
+    s3:
+      bucket: ""
+      region: ""
+      ## For S3-compatible services (MinIO, R2, Ceph RGW); leave empty for AWS.
+      endpoint: ""
+      accessKeyId: ""
+      ## Secret holding the secret access key, mounted as a file (`secret_access_key_file`) so it
+      ## is never in the ConfigMap.
+      existingSecret: ""
+      secretAccessKeyKey: secret-access-key
 
 ## CloudNativePG integration: when enabled, the chart points `storage.postgres` (and
 ## `storage.backend: postgres`, forced) at a CloudNativePG-managed `Cluster` rather than an

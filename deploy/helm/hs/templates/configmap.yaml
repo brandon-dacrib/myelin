@@ -35,7 +35,10 @@ data:
     storage:
       backend: {{ $backend }}
       {{- if eq $backend "embedded" }}
-      data_dir: /var/lib/hs/data
+      # The same layout `hs serve --data-dir` makes on a first run: `db/` and `media/` side by
+      # side under one root, here the data volume. The database does not get the volume's root
+      # to itself because media has to live on this volume too.
+      data_dir: /var/lib/hs/data/db
       {{- else if eq $backend "postgres" }}
       {{- if .Values.cloudNativePG.enabled }}
       # host/port/database/user/password are supplied via HS__STORAGE__* environment variables
@@ -54,6 +57,30 @@ data:
       bucket_url: {{ .Values.storage.objectStorage.bucketUrl | quote }}
       shard_count: {{ .Values.storage.objectStorage.shardCount }}
       {{- end }}
+    # Always set. Left out, `media.storage.path` defaults to the *relative* `./media-store`,
+    # which is the container's working directory: not on any volume, and not writable at all
+    # under `readOnlyRootFilesystem: true`, where every upload fails.
+    media:
+      storage:
+        {{- if eq .Values.media.storage.backend "s3" }}
+        backend: s3
+        bucket: {{ .Values.media.storage.s3.bucket | quote }}
+        {{- with .Values.media.storage.s3.region }}
+        region: {{ . | quote }}
+        {{- end }}
+        {{- with .Values.media.storage.s3.endpoint }}
+        endpoint: {{ . | quote }}
+        {{- end }}
+        {{- with .Values.media.storage.s3.accessKeyId }}
+        access_key_id: {{ . | quote }}
+        {{- end }}
+        {{- if .Values.media.storage.s3.existingSecret }}
+        secret_access_key_file: /etc/hs/secrets/media-s3/{{ .Values.media.storage.s3.secretAccessKeyKey }}
+        {{- end }}
+        {{- else }}
+        backend: local
+        path: {{ include "hs.mediaPath" . }}
+        {{- end }}
     telemetry:
       metrics:
         enabled: {{ .Values.telemetry.metrics.enabled }}

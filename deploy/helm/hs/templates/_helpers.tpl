@@ -97,7 +97,28 @@ Always
 Fails the render with a clear message if a required value is missing, rather than producing a
 Deployment/StatefulSet that will CrashLoopBackOff on `hs serve`'s own config validation.
 */}}
+{{/*
+Where local media lives. On the embedded data volume when there is one and no dedicated claim;
+otherwise on the dedicated claim's own mount.
+*/}}
+{{- define "hs.mediaPath" -}}
+{{- if .Values.media.storage.local.existingClaim -}}
+/var/lib/hs/media
+{{- else -}}
+/var/lib/hs/data/media
+{{- end -}}
+{{- end -}}
+
 {{- define "hs.validate" -}}
+{{- if not (has .Values.media.storage.backend (list "local" "s3")) -}}
+{{- fail (printf "media.storage.backend must be `local` or `s3`, not %q" .Values.media.storage.backend) -}}
+{{- end -}}
+{{- if and (eq .Values.media.storage.backend "s3") (not .Values.media.storage.s3.bucket) -}}
+{{- fail "media.storage.backend is s3 but media.storage.s3.bucket is not set" -}}
+{{- end -}}
+{{- if and (eq .Values.media.storage.backend "local") (ne (include "hs.storageBackend" .) "embedded") (not .Values.media.storage.local.existingClaim) -}}
+{{- fail "media.storage.backend is local, but this deployment has no data volume to keep media on (storage.backend is not embedded) and its replicas would not share one anyway: set media.storage.backend to s3, or point media.storage.local.existingClaim at a ReadWriteMany claim" -}}
+{{- end -}}
 {{- if not .Values.serverName -}}
 {{- fail "serverName is required (the hs-config server.server_name; see values.yaml)" -}}
 {{- end -}}
