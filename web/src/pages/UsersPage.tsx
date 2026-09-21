@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate, useSearch, Link } from "@tanstack/react-router";
-import { Users as UsersIcon } from "lucide-react";
+import { UserPlus, Users as UsersIcon } from "lucide-react";
 import { useUsers, type User } from "@/api/users";
 import { Button } from "@/components/ui/button/Button";
 import { Badge } from "@/components/ui/badge/Badge";
@@ -11,6 +11,7 @@ import { ForbiddenState } from "@/components/ui/error-state/ErrorState";
 import { QueryProblemState } from "@/components/QueryProblemState";
 import { RelativeTime } from "@/components/RelativeTime";
 import { hasScope } from "@/lib/auth";
+import { AddUserDialog } from "./users/AddUserDialog";
 
 /** `/users` — flows.md flow 2: find and deal with a user. */
 export function UsersPage() {
@@ -18,6 +19,8 @@ export function UsersPage() {
   const navigate = useNavigate({ from: "/users" });
   const [queryInput, setQueryInput] = useState(search.q ?? "");
   const canRead = hasScope("admin:read");
+  const canWrite = hasScope("admin:write");
+  const [addOpen, setAddOpen] = useState(false);
 
   const { data, isLoading, isError, error, refetch } = useUsers({
     q: search.q,
@@ -108,7 +111,18 @@ export function UsersPage() {
 
   return (
     <div className="mx-auto max-w-[90rem] p-6">
-      <h1 className="text-xl text-text">Users</h1>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <h1 className="text-xl text-text">Users</h1>
+        {canWrite && (
+          <Button
+            leadingIcon={<UserPlus size={16} aria-hidden="true" />}
+            onClick={() => setAddOpen(true)}
+          >
+            Add user
+          </Button>
+        )}
+      </div>
+      <AddUserDialog open={addOpen} onOpenChange={setAddOpen} />
 
       <form
         className="mt-4 flex max-w-md gap-2"

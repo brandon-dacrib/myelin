@@ -206,7 +206,7 @@ function NeedsSetupNotice() {
       <p className="text-sm font-medium text-text">This server has no administrator yet</p>
       <p className="mt-1 text-sm text-text-muted">
         Open the setup link from the server&apos;s log to create one, or{" "}
-        <Link to="/setup" className="text-accent hover:underline">
+        <Link to="/setup" className="text-accent underline underline-offset-2 hover:no-underline">
           enter the setup token here
         </Link>
         .

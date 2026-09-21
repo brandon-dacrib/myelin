@@ -30,6 +30,13 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
   been built into this binary yet": the interface existed in `web/` and nothing embedded it. The
   image now builds it, release builds fail rather than embed the placeholder, and CD refuses to
   publish an image whose `/admin/` is not the interface. It adds 0.9 MB.
+- **An administrator can add people.** Registration is closed by default, and until 2026-09-21
+  nothing in the admin API or the interface could create an account on a real server: the
+  operation existed, and the real user directory had never implemented it, so it answered 503.
+  The Users page now has "Add user": username, optional display name, a password you type or
+  generate, and an administrator switch that says what it means. It ends on a hand-over view
+  with the user ID and password to copy, because the password is about to be unrecoverable and
+  still has to reach a person. Refusals land beside the field they are about.
 - **The Overview page has numbers on it.** Users, rooms, daily and monthly active users, and
   whether this is one server or a cluster, counted from the real stores. A number nothing can
   count yet is left out of the response and shown as a dash, never as zero, and the page's

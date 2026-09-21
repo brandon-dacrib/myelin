@@ -33,7 +33,7 @@
 use std::sync::Arc;
 
 use hs_admin::model::AdminUser;
-use hs_admin::sources::{SourceError, UserDirectory, UserFilter};
+use hs_admin::sources::{SourceError, UserCreateRequest, UserDirectory, UserFilter};
 
 use crate::admin_verifier::format_rfc3339_ms;
 use crate::state::AuthState;
@@ -42,13 +42,20 @@ use crate::store::{AuthStore, StoreError, UserRecord};
 /// The user directory `hs-admin`'s `/users` handlers call, over this crate's own [`AuthStore`].
 pub struct AuthStoreUserDirectory {
     store: Arc<dyn AuthStore>,
+    /// What creating an account needs beyond the store: this server's name, its password policy
+    /// and its clock. `None` for a directory built over a bare store ([`Self::new`]), which can
+    /// read and flag accounts but answers `users.create` with `503`.
+    accounts: Option<AuthState>,
 }
 
 impl AuthStoreUserDirectory {
     /// Builds a directory over an already-open store.
     #[must_use]
     pub fn new(store: Arc<dyn AuthStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            accounts: None,
+        }
     }
 
     /// Builds a directory that shares `state`'s store, rather than opening a second handle onto
@@ -56,7 +63,10 @@ impl AuthStoreUserDirectory {
     /// [`crate::admin_verifier::AdminTokenVerifier::from_auth_state`].
     #[must_use]
     pub fn from_auth_state(state: &AuthState) -> Self {
-        Self::new(state.store.clone())
+        Self {
+            store: state.store.clone(),
+            accounts: Some(state.clone()),
+        }
     }
 
     async fn to_admin_user(&self, record: UserRecord) -> Result<AdminUser, SourceError> {
@@ -174,6 +184,103 @@ impl UserDirectory for AuthStoreUserDirectory {
             .set_deactivated(&uid, deactivated)
             .await
             .map_err(map_set_error)
+    }
+
+    /// `users.create`. With registration closed, which is the default, this is how every account
+    /// after the first administrator comes to exist -- and until it was written the trait's
+    /// default answered `503`, so on a real server nothing in the admin API or the interface
+    /// could add a user at all.
+    ///
+    /// A password is required. An account without one could only ever be signed in to through
+    /// SSO, which this server does not offer yet; creating one would be creating an account
+    /// nobody can use. `threepids`, `external_ids` and `user_type` are refused rather than
+    /// ignored, for the same reason `users.update` refuses the fields it cannot apply: a `201`
+    /// that silently dropped part of the request would be a lie about what now exists.
+    async fn create_user(&self, request: UserCreateRequest) -> Result<AdminUser, SourceError> {
+        let Some(state) = &self.accounts else {
+            return Err(SourceError::Unavailable(
+                "this user directory was built over a bare store and cannot create accounts"
+                    .to_string(),
+            ));
+        };
+        for (pointer, present) in [
+            ("/threepids", !request.threepids.is_empty()),
+            ("/external_ids", !request.external_ids.is_empty()),
+            ("/user_type", request.user_type.is_some()),
+        ] {
+            if present {
+                return Err(SourceError::InvalidField {
+                    pointer,
+                    detail: "this server cannot set this when creating an account yet".to_string(),
+                });
+            }
+        }
+
+        // `user_id` wins when both are given, and they must then agree.
+        let (pointer, named) = match (&request.user_id, &request.localpart) {
+            (Some(user_id), _) => ("/user_id", user_id.as_str()),
+            (None, Some(localpart)) => ("/localpart", localpart.as_str()),
+            (None, None) => {
+                return Err(SourceError::InvalidField {
+                    pointer: "/localpart",
+                    detail: "either localpart or user_id is required".to_string(),
+                });
+            }
+        };
+        let user_id = crate::local_user::local_user_id(state.server_name(), named)
+            .map_err(|detail| SourceError::InvalidField { pointer, detail })?;
+        if let (Some(_), Some(localpart)) = (&request.user_id, &request.localpart)
+            && !localpart.eq_ignore_ascii_case(user_id.localpart())
+        {
+            return Err(SourceError::InvalidField {
+                pointer: "/localpart",
+                detail: format!("does not match user_id {user_id}"),
+            });
+        }
+
+        let Some(password) = request.password.as_deref().filter(|p| !p.is_empty()) else {
+            return Err(SourceError::InvalidField {
+                pointer: "/password",
+                detail: "a password is required".to_string(),
+            });
+        };
+        state
+            .config
+            .password_policy
+            .validate(password)
+            .map_err(|e| SourceError::InvalidField {
+                pointer: "/password",
+                detail: e.message().to_owned(),
+            })?;
+
+        if !self
+            .store
+            .is_localpart_available(user_id.localpart())
+            .await
+            .map_err(store_unavailable)?
+        {
+            return Err(SourceError::Conflict(format!("{user_id} already exists")));
+        }
+
+        let mut record = UserRecord::new(user_id.clone(), state.now_ms());
+        record.password_hash = Some(
+            crate::password::hash_password(password)
+                .map_err(|e| SourceError::Unavailable(e.to_string()))?,
+        );
+        record.is_admin = request.admin;
+        record.display_name = request
+            .display_name
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty());
+        match self.store.create_user(record.clone()).await {
+            Ok(()) => {}
+            // Lost a race with another creation of the same name between the check and here.
+            Err(StoreError::Conflict(_)) => {
+                return Err(SourceError::Conflict(format!("{user_id} already exists")));
+            }
+            Err(e) => return Err(store_unavailable(e)),
+        }
+        self.to_admin_user(record).await
     }
 }
 
@@ -377,5 +484,144 @@ mod tests {
             .unwrap();
         assert!(user.locked);
         assert!(user.deactivated);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // users.create
+    // ---------------------------------------------------------------------------------------
+
+    fn creating_directory() -> (AuthState, AuthStoreUserDirectory) {
+        use crate::config::{AuthConfig, PasswordPolicy};
+        let state = AuthState::in_memory_with_config(AuthConfig {
+            password_policy: PasswordPolicy {
+                minimum_length: Some(8),
+                ..PasswordPolicy::default()
+            },
+            ..AuthConfig::default()
+        });
+        let directory = AuthStoreUserDirectory::from_auth_state(&state);
+        (state, directory)
+    }
+
+    fn create(localpart: &str, password: &str) -> UserCreateRequest {
+        UserCreateRequest {
+            localpart: Some(localpart.to_owned()),
+            password: Some(password.to_owned()),
+            ..UserCreateRequest::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn create_user_makes_an_account_that_can_sign_in_with_that_password() {
+        let (state, directory) = creating_directory();
+        let created = directory
+            .create_user(UserCreateRequest {
+                display_name: Some("  Carol D ".to_owned()),
+                ..create("Carol", "hunter2-carol")
+            })
+            .await
+            .unwrap();
+        assert_eq!(created.user_id, "@carol:example.org");
+        assert_eq!(created.display_name.as_deref(), Some("Carol D"));
+        assert!(!created.admin);
+
+        let uid = ruma::UserId::parse("@carol:example.org").unwrap();
+        let record = state.store.get_user(&uid).await.unwrap().unwrap();
+        let hash = record.password_hash.expect("a password hash");
+        assert!(crate::password::verify_password("hunter2-carol", &hash, "").unwrap());
+        assert!(!hash.contains("hunter2"));
+        assert!(!record.is_admin);
+    }
+
+    #[tokio::test]
+    async fn create_user_makes_an_administrator_only_when_asked() {
+        let (state, directory) = creating_directory();
+        let created = directory
+            .create_user(UserCreateRequest {
+                admin: true,
+                ..create("ops2", "hunter2-ops2")
+            })
+            .await
+            .unwrap();
+        assert!(created.admin);
+        let uid = ruma::UserId::parse("@ops2:example.org").unwrap();
+        assert!(state.store.get_user(&uid).await.unwrap().unwrap().is_admin);
+    }
+
+    #[tokio::test]
+    async fn create_user_refusals_name_the_field_and_create_nothing() {
+        let (state, directory) = creating_directory();
+        let cases: Vec<(UserCreateRequest, &str)> = vec![
+            (create("not a username", "hunter2-carol"), "/localpart"),
+            (create("carol", "short"), "/password"),
+            (create("carol", ""), "/password"),
+            (
+                UserCreateRequest {
+                    password: None,
+                    ..create("carol", "")
+                },
+                "/password",
+            ),
+            (
+                UserCreateRequest {
+                    user_id: Some("@carol:elsewhere.org".to_owned()),
+                    localpart: None,
+                    ..create("", "hunter2-carol")
+                },
+                "/user_id",
+            ),
+            (
+                UserCreateRequest {
+                    user_id: Some("@carol:example.org".to_owned()),
+                    ..create("dave", "hunter2-carol")
+                },
+                "/localpart",
+            ),
+            (
+                UserCreateRequest {
+                    user_type: Some("bot".to_owned()),
+                    ..create("carol", "hunter2-carol")
+                },
+                "/user_type",
+            ),
+        ];
+        for (request, expected) in cases {
+            match directory.create_user(request.clone()).await {
+                Err(SourceError::InvalidField { pointer, .. }) => {
+                    assert_eq!(pointer, expected, "{request:?}")
+                }
+                other => panic!("{request:?}: expected InvalidField({expected}), got {other:?}"),
+            }
+        }
+        assert!(state.store.list_users().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_user_conflicts_whatever_the_case_of_the_name() {
+        let (_state, directory) = creating_directory();
+        directory
+            .create_user(create("carol", "hunter2-carol"))
+            .await
+            .unwrap();
+        for again in ["carol", "Carol", "@CAROL:example.org"] {
+            assert!(
+                matches!(
+                    directory.create_user(create(again, "hunter2-carol")).await,
+                    Err(SourceError::Conflict(_))
+                ),
+                "{again}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_directory_over_a_bare_store_says_it_cannot_create_accounts() {
+        let directory = directory_with(InMemoryAuthStore::new());
+        assert!(matches!(
+            directory
+                .create_user(create("carol", "hunter2-carol"))
+                .await,
+            Err(SourceError::Unavailable(_))
+        ));
     }
 }

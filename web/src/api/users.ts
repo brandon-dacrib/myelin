@@ -107,3 +107,23 @@ export function useDeactivateUser() {
     onSuccess: (_data, { userId }) => invalidateUser(qc, userId),
   });
 }
+
+export type UserCreate = components["schemas"]["UserCreate"];
+
+/**
+ * Creates an account (`POST /users`). With registration closed -- the default -- this is how
+ * anybody but the first administrator comes to have one.
+ */
+export function useCreateUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (body: UserCreate) => {
+      const result = await api.POST("/users", {
+        params: { header: { "Idempotency-Key": newIdempotencyKey() } },
+        body,
+      });
+      return unwrap(result);
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["users"] }),
+  });
+}

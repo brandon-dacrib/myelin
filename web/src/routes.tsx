@@ -61,7 +61,7 @@ function NotFoundPage() {
       <h1 className="text-xl text-text">Not found</h1>
       <p className="mt-2 text-sm text-text-muted">
         Nothing lives at this address.{" "}
-        <Link to="/" className="text-accent hover:underline">
+        <Link to="/" className="text-accent underline underline-offset-2 hover:no-underline">
           Back to Overview
         </Link>
       </p>

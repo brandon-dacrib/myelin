@@ -34,6 +34,20 @@ import { server } from "@/mocks/node";
  * Setup files are evaluated before the test module graph, so starting the
  * server here is what makes `api.GET(...)` interceptable at all.
  */
+/**
+ * jsdom has no `ResizeObserver`, and Radix's Switch (through `use-size`) constructs one as soon
+ * as it is *checked* -- so a test that only renders a switch passes and one that turns it on
+ * throws. Nothing under test depends on a size ever being reported, so observing nothing is an
+ * honest stand-in.
+ */
+if (!("ResizeObserver" in globalThis)) {
+  (globalThis as { ResizeObserver?: unknown }).ResizeObserver = class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  };
+}
+
 server.listen({ onUnhandledRequest: "error" });
 
 afterEach(() => {

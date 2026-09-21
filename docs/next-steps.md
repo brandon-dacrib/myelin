@@ -132,6 +132,12 @@ cannot do, in rough order of how often an operator will hit it:
   of putting a green tick over bridges and federation nobody asked about. What is left on that
   page is the two panels still answering 501: `appservices.list` and
   `federation.destinations.list`.
+- ~~Add a user from the interface.~~ **Done 2026-09-21.** `AuthStoreUserDirectory::create_user`
+  is real (it inherited a default that answered 503), and the Users page has an "Add user"
+  dialog. What it does not do yet: set an email or an external ID at creation (refused with a
+  pointer rather than silently dropped), reset an existing user's password, or invite somebody
+  by link so that the administrator never sees the password at all — that last one is the
+  better design for anything but a household, and wants registration tokens, which are 501.
 - **Edit an array of objects as a form.** `listeners.listeners`, `media.thumbnail_sizes` and
   `auth.oidc_providers` fall back to a JSON textarea with live parse errors. Reachable, not
   pleasant; the generic renderer is built to sit underneath hand-tuned editors for exactly these.

@@ -36,6 +36,14 @@ pub enum SourceError {
     Unavailable(String),
     #[error("invalid request: {0}")]
     Invalid(String),
+    /// As [`SourceError::Invalid`], for a refusal that is about one field of the request:
+    /// `pointer` is a JSON pointer into the body (`/password`), which the problem document
+    /// carries in `errors[]` so that an interface can put the message beside the input.
+    #[error("invalid request: {detail}")]
+    InvalidField {
+        pointer: &'static str,
+        detail: String,
+    },
     #[error("conflict: {0}")]
     Conflict(String),
     /// An `If-Match` precondition named a version that is no longer current: somebody else
@@ -57,6 +65,12 @@ impl SourceError {
             SourceError::Invalid(detail) => {
                 hs_http::Problem::validation_failed().with_detail(detail.clone())
             }
+            SourceError::InvalidField { pointer, detail } => hs_http::Problem::validation_failed()
+                .with_detail(detail.clone())
+                .with_errors(vec![hs_http::ValidationError::new(
+                    *pointer,
+                    detail.clone(),
+                )]),
             SourceError::Conflict(detail) => {
                 hs_http::Problem::conflict().with_detail(detail.clone())
             }
@@ -75,7 +89,7 @@ impl SourceError {
 /// Derives [`Deserialize`] directly (field-for-field match with the OpenAPI `UserCreate` schema)
 /// so `router::users_create` can parse the request body straight into this type rather than a
 /// separate wire struct that would need to be kept in sync with it by hand.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct UserCreateRequest {
     pub localpart: Option<String>,
@@ -86,6 +100,23 @@ pub struct UserCreateRequest {
     pub user_type: Option<String>,
     pub threepids: Vec<ThreePid>,
     pub external_ids: Vec<ExternalId>,
+}
+
+/// Written by hand so that a password cannot reach a log line, a panic message or an error
+/// report through a stray `{:?}`.
+impl std::fmt::Debug for UserCreateRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserCreateRequest")
+            .field("localpart", &self.localpart)
+            .field("user_id", &self.user_id)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("display_name", &self.display_name)
+            .field("admin", &self.admin)
+            .field("user_type", &self.user_type)
+            .field("threepids", &self.threepids)
+            .field("external_ids", &self.external_ids)
+            .finish()
+    }
 }
 
 /// The match criteria `users.lookup` accepts (the OpenAPI operation's `medium`+`address` /

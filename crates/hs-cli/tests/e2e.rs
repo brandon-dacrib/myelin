@@ -1496,3 +1496,127 @@ async fn the_overview_counts_real_accounts_and_rooms_and_omits_what_nobody_count
 
     handle.shutdown().await;
 }
+
+/// With registration closed -- the default, and what this server is started with here -- the
+/// admin API is how anybody after the first administrator gets an account. Until
+/// `AuthStoreUserDirectory::create_user` existed this answered `503` on a real server.
+#[tokio::test]
+async fn an_administrator_can_add_a_user_who_can_then_sign_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(reserve_ephemeral_port(), dir.path());
+    config.auth.enable_registration = false;
+    let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
+        .await
+        .expect("server should boot");
+    let base = handle.base_url();
+    let client = reqwest::Client::new();
+
+    let token = setup_token_of(handle.setup_link.as_deref().unwrap()).to_owned();
+    let admin: serde_json::Value = client
+        .post(format!("{base}/api/v1/setup"))
+        .json(&json!({"setup_token": token, "username": "ops", "password": "hunter2-first-admin"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let admin_token = admin["access_token"].as_str().unwrap().to_owned();
+
+    // The front door really is closed.
+    let register = client
+        .post(format!("{base}/_matrix/client/v3/register"))
+        .json(&json!({"username": "carol", "password": "hunter2-carol", "auth": {"type": "m.login.dummy"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(register.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let create = |body: serde_json::Value, token: String| {
+        let (client, base) = (client.clone(), base.clone());
+        async move {
+            let response = client
+                .post(format!("{base}/api/v1/users"))
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            (status, response.json::<serde_json::Value>().await.unwrap())
+        }
+    };
+
+    // A refusal names the field, so the interface can put it beside the input.
+    let (status, problem) = create(
+        json!({"localpart": "carol", "password": "short"}),
+        admin_token.clone(),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{problem}");
+    assert_eq!(problem["errors"][0]["pointer"], "/password", "{problem}");
+
+    let (status, created) = create(
+        json!({"localpart": "Carol", "password": "hunter2-carol", "display_name": "Carol D"}),
+        admin_token.clone(),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "{created}");
+    assert_eq!(created["user_id"], "@carol:example.org");
+    assert_eq!(created["display_name"], "Carol D");
+    assert_eq!(created["admin"], false);
+    assert!(created.get("password").is_none(), "{created}");
+
+    let (status, problem) = create(
+        json!({"localpart": "carol", "password": "hunter2-carol"}),
+        admin_token.clone(),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CONFLICT, "{problem}");
+
+    // She can sign in with the password she was given, and she is not an administrator.
+    let login: serde_json::Value = client
+        .post(format!("{base}/_matrix/client/v3/login"))
+        .json(&json!({
+            "type": "m.login.password",
+            "identifier": {"type": "m.id.user", "user": "carol"},
+            "password": "hunter2-carol",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let carol_token = login["access_token"]
+        .as_str()
+        .expect("carol can sign in")
+        .to_owned();
+    let (status, _) = create(
+        json!({"localpart": "mallory", "password": "hunter2-mallory"}),
+        carol_token,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+
+    // Who made the account is on the record.
+    let audit: serde_json::Value = client
+        .get(format!("{base}/api/v1/audit-log?action=users.create"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entries = audit["items"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{audit}");
+    assert_eq!(entries[0]["actor"]["id"], "@ops:example.org");
+    assert_eq!(entries[0]["target"]["id"], "@carol:example.org");
+    assert!(
+        !audit.to_string().contains("hunter2"),
+        "a password reached the audit log"
+    );
+
+    handle.shutdown().await;
+}

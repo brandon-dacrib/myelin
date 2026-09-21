@@ -502,6 +502,44 @@ export const handlers = [
     return HttpResponse.json({ items, next_cursor, prev_cursor });
   }),
 
+  http.post(`${API}/users`, async ({ request }) => {
+    const body = (await request.json()) as {
+      localpart?: string;
+      password?: string;
+      display_name?: string;
+      admin?: boolean;
+    };
+    const localpart = (body.localpart ?? "").replace(/^@/, "").split(":")[0]!.toLowerCase();
+    if (!/^[a-z0-9._=\-/+]+$/.test(localpart)) {
+      return problem(400, "validation-failed", "Validation failed", {
+        detail: `"${localpart}" cannot be a username`,
+        errors: [{ pointer: "/localpart", detail: `"${localpart}" cannot be a username` }],
+      });
+    }
+    if ((body.password ?? "").length < 8) {
+      return problem(400, "validation-failed", "Validation failed", {
+        detail: "Password too short (minimum 8 characters)",
+        errors: [{ pointer: "/password", detail: "Password too short (minimum 8 characters)" }],
+      });
+    }
+    const user_id = `@${localpart}:example.org`;
+    if (findUser(user_id)) {
+      return problem(409, "conflict", "Conflict", { detail: `${user_id} already exists` });
+    }
+    const created = {
+      ...users[0]!,
+      user_id,
+      display_name: body.display_name ?? null,
+      admin: body.admin ?? false,
+      created_at: new Date().toISOString(),
+      last_seen_at: null,
+      device_count: 0,
+      room_count: 0,
+      media_count: 0,
+    };
+    users.push(created);
+    return HttpResponse.json(created, { status: 201 });
+  }),
   http.get(`${API}/users/:user_id`, ({ params }) => {
     const user = findUser(decodeURIComponent(String(params.user_id)));
     if (!user)

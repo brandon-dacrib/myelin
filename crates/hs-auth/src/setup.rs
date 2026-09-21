@@ -37,15 +37,13 @@
 //! An administrator created some other way closes the offer too: [`FirstRunSetup::offer`]
 //! withdraws the token at the next start, and `create_first_admin` re-checks before it acts.
 
-use hs_admin::model::{SetupRequest, SetupSession};
-use hs_admin::sources::{SetupError, SetupSource, SourceError};
-use ruma::UserId;
-
 use crate::password;
 use crate::session;
 use crate::state::AuthState;
 use crate::store::{StoreError, UserRecord, tokens_match};
 use crate::token;
+use hs_admin::model::{SetupRequest, SetupSession};
+use hs_admin::sources::{SetupError, SetupSource, SourceError};
 
 /// [`SetupSource`] over this crate's own store and session machinery.
 pub struct FirstRunSetup {
@@ -101,47 +99,13 @@ impl FirstRunSetup {
             .any(|u| u.is_admin && !u.deactivated))
     }
 
-    /// `alice`, `@alice`, and `@alice:<this server>` all mean the same account; anything naming
-    /// another server does not belong here.
     fn user_id_for(&self, username: &str) -> Result<ruma::OwnedUserId, SetupError> {
-        let invalid = |detail: String| SetupError::Invalid {
-            pointer: "/username",
-            detail,
-        };
-        let trimmed = username.trim();
-        let localpart = match trimmed.strip_prefix('@').unwrap_or(trimmed).split_once(':') {
-            None => trimmed.strip_prefix('@').unwrap_or(trimmed),
-            Some((localpart, server)) if server == self.state.server_name().as_str() => localpart,
-            Some((_, server)) => {
-                return Err(invalid(format!(
-                    "this server is {}, not {server}",
-                    self.state.server_name()
-                )));
+        crate::local_user::local_user_id(self.state.server_name(), username).map_err(|detail| {
+            SetupError::Invalid {
+                pointer: "/username",
+                detail,
             }
-        };
-        if localpart.is_empty() {
-            return Err(invalid("choose a username".to_owned()));
-        }
-        // Lower-cased for the same reason `POST /register` does it: `Ops` and `ops` must not be
-        // two accounts.
-        let localpart = localpart.to_ascii_lowercase();
-        let user_id = UserId::parse_with_server_name(localpart.as_str(), self.state.server_name())
-            .map_err(|_| {
-                invalid(format!(
-                    "\"{localpart}\" cannot be a username: use lowercase letters, digits, and any of . _ = - /"
-                ))
-            })?;
-        // `parse_with_server_name` accepts historical localparts that a new account should not
-        // be given; hold a new administrator to the strict grammar.
-        if !localpart
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._=-/+".contains(&b))
-        {
-            return Err(invalid(format!(
-                "\"{localpart}\" cannot be a username: use lowercase letters, digits, and any of . _ = - /"
-            )));
-        }
-        Ok(user_id)
+        })
     }
 }
 
@@ -246,6 +210,7 @@ mod tests {
 
     use hs_admin::auth::TokenVerifier;
     use hs_admin::model::Scope;
+    use ruma::UserId;
 
     use super::*;
     use crate::admin_verifier::AdminTokenVerifier;
