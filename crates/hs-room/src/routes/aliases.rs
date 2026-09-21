@@ -27,11 +27,20 @@ fn parse_alias(raw: &str) -> Result<ruma::OwnedRoomAliasId, RoomError> {
 pub async fn get_room_aliases<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_id): Path<String>,
-    RoomRequester(_requester): RoomRequester,
+    RoomRequester(requester): RoomRequester,
 ) -> Result<Response, RoomError> {
     let room_id = parse_room_id(&room_id)?;
     let handle = state.rooms.get_or_load(&room_id).await?;
-    let aliases = handle.query(|actor| actor.list_aliases()).await?;
+    let aliases = handle
+        .query(move |actor| {
+            if !actor.can_see_current_membership(&requester.user_id)? {
+                return Err(RoomError::Forbidden(
+                    "you aren't a member of the room".into(),
+                ));
+            }
+            actor.list_aliases()
+        })
+        .await?;
     Ok(Json(json!({"aliases": aliases})).into_response())
 }
 

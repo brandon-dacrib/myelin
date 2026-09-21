@@ -226,7 +226,10 @@ mod tests {
         let err = post_account_password(State(state), requester, PermissiveJson(body))
             .await
             .unwrap_err();
-        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        // A failed stage is the 401 challenge again with `M_FORBIDDEN` added, not a bare 403:
+        // the client keeps its session and may try the password a second time (`uia::advance`).
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(err.errcode(), crate::error::ErrCode::Forbidden);
     }
 
     #[tokio::test]

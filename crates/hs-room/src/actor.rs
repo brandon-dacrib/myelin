@@ -1336,7 +1336,46 @@ impl<B: KvBackend> RoomActor<B> {
                     users.insert(user.to_string(), serde_json::Value::from(100));
                 }
             }
-            serde_json::json!({ "users": users })
+            // Every default is written out rather than left to the auth rules' implicit ones, for
+            // two reasons. Clients read this event to decide what to offer -- Complement's
+            // `TestPowerLevels` looks for `ban`, `kick`, `redact` and the three `*_default`s, and
+            // Element greys out controls from the same keys. And the implicit defaults are
+            // *weaker* than any deployed server's: with no `events` map, changing the power levels
+            // themselves, the history visibility, the server ACL, or turning on encryption all fall
+            // under `state_default`, so a moderator at 50 could do any of them. They are reserved
+            // for 100 here, as on every Synapse-created room a user of this server will ever
+            // federate with.
+            //
+            // From room version 12 creators outrank every explicit level, and replacing the room is
+            // kept for them alone: 150 is more than anybody can be given.
+            let tombstone = if rules.explicitly_privilege_room_creators {
+                150
+            } else {
+                100
+            };
+            // Anybody may invite to a private room, where the people in it are the ones who know
+            // who else belongs; a public room leaves inviting to its moderators.
+            let invite = if preset == "public_chat" { 50 } else { 0 };
+            serde_json::json!({
+                "users": users,
+                "users_default": 0,
+                "events": {
+                    "m.room.name": 50,
+                    "m.room.avatar": 50,
+                    "m.room.canonical_alias": 50,
+                    "m.room.power_levels": 100,
+                    "m.room.history_visibility": 100,
+                    "m.room.server_acl": 100,
+                    "m.room.encryption": 100,
+                    "m.room.tombstone": tombstone,
+                },
+                "events_default": 0,
+                "state_default": 50,
+                "ban": 50,
+                "kick": 50,
+                "redact": 50,
+                "invite": invite,
+            })
         };
         // `power_level_content_override` is "applied on top of the generated
         // `m.room.power_levels` event content" (client-server API, `POST /createRoom`): a
@@ -2228,6 +2267,34 @@ impl<B: KvBackend> RoomActor<B> {
             .map_err(|e| RoomError::State(e.to_string()))?
             .is_some();
         Ok(has_membership_record)
+    }
+
+    /// Whether `requester` is joined to this room *now*, or the room is world-readable.
+    ///
+    /// Stricter than [`RoomActor::can_read_room`], which lets a departed member through so that
+    /// they can read the history they were present for. Who is in a room today, and what it is
+    /// called today, are not history: the spec gives `joined_members` to "the current user
+    /// [who] must be in the room", and `/aliases` to a member or anybody if the room is
+    /// world-readable. Both routes used to answer anyone with an access token, so any account
+    /// could list the members and aliases of any room on this server, private ones included.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::State`] if the state store fails.
+    pub fn can_see_current_membership(&self, requester: &UserId) -> Result<bool, RoomError> {
+        let view = self.current_view()?;
+        let hv = history_visibility::HistoryVisibility::parse(
+            view.event_for("m.room.history_visibility", "")
+                .map_err(|e| RoomError::State(e.to_string()))?
+                .and_then(|e| content_str(e, "history_visibility")),
+        );
+        if hv == history_visibility::HistoryVisibility::WorldReadable {
+            return Ok(true);
+        }
+        Ok(view
+            .event_for("m.room.member", requester.as_str())
+            .map_err(|e| RoomError::State(e.to_string()))?
+            .and_then(|e| content_str(e, "membership"))
+            == Some("join"))
     }
 
     /// The room-local send position (`room_pos`) of a known [`EventSn`], by linear scan of

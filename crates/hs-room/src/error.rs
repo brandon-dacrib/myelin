@@ -38,6 +38,16 @@ pub enum RoomError {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    /// A parameter is present and unusable: not the right type, or not a valid identifier.
+    /// `400 M_INVALID_PARAM`.
+    #[error("{0}")]
+    InvalidParam(String),
+
+    /// An alias being set as a room's canonical or alternative alias does not point at that
+    /// room: it does not exist, or it is another room's. `400 M_BAD_ALIAS`.
+    #[error("{0}")]
+    BadAlias(String),
+
     /// A signing or hashing operation failed.
     #[error(transparent)]
     Signing(#[from] hs_model::SigningError),
@@ -124,7 +134,25 @@ impl RoomError {
                 MatrixErrorCode::RoomInUse,
                 self.to_string(),
             ),
+            // The spec gives an event over the 65,535-byte limit its own status and code: `413
+            // M_TOO_LARGE`. It was answered as `400 M_BAD_JSON`, which tells a client its JSON is
+            // malformed when the problem is that there is too much of it.
+            Self::InvalidEvent(hs_model::EventError::TooLarge { .. }) => MatrixError::custom(
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                MatrixErrorCode::TooLarge,
+                self.to_string(),
+            ),
             Self::InvalidEvent(_) | Self::BadRequest(_) => MatrixError::bad_json(self.to_string()),
+            Self::InvalidParam(msg) => MatrixError::custom(
+                axum::http::StatusCode::BAD_REQUEST,
+                MatrixErrorCode::InvalidParam,
+                msg.clone(),
+            ),
+            Self::BadAlias(msg) => MatrixError::custom(
+                axum::http::StatusCode::BAD_REQUEST,
+                MatrixErrorCode::BadAlias,
+                msg.clone(),
+            ),
             Self::Forbidden(msg) => MatrixError::forbidden(msg.clone()),
             Self::RoomBlocked(_) => MatrixError::forbidden(self.to_string()),
             Self::Fenced(_) => MatrixError::custom(

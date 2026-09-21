@@ -291,12 +291,17 @@ pub async fn get_members<B: KvBackend + 'static>(
 pub async fn get_joined_members<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_id): Path<String>,
-    RoomRequester(_requester): RoomRequester,
+    RoomRequester(requester): RoomRequester,
 ) -> Result<Response, RoomError> {
     let room_id = parse_room_id(&room_id)?;
     let handle = state.rooms.get_or_load(&room_id).await?;
     let joined = handle
-        .query(|actor| {
+        .query(move |actor| {
+            if !actor.can_see_current_membership(&requester.user_id)? {
+                return Err(RoomError::Forbidden(
+                    "you aren't a member of the room".into(),
+                ));
+            }
             actor.joined_members().map(|members| {
                 members
                     .into_iter()

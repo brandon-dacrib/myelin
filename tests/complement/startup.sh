@@ -94,6 +94,11 @@ listeners:
 auth:
   enable_registration: true
   enable_legacy_login: true
+  # Complement registers its admin accounts through Synapse's shared-secret protocol, with this
+  # fixed secret (refs/complement/client/auth.go: `SharedSecret = "complement"`). Without it
+  # /_synapse/admin/v1/register answers 404 and Complement reports that the image "does not
+  # support shared secret registration" -- three assertions this server could pass all along.
+  registration_shared_secret: complement
 federation:
 $FEDERATION_CA_CONFIG
   ip_range_blocklist: []

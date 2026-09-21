@@ -1773,3 +1773,248 @@ async fn the_user_directory_shows_a_searcher_only_who_they_could_already_see() {
 
     handle.shutdown().await;
 }
+
+/// Five things the client-server spec says a server must refuse or spell out, all found by
+/// reading a Complement log and all answered wrongly until 2026-09-21. One server boot, because
+/// each is a request or two.
+#[tokio::test]
+async fn rooms_refuse_what_the_spec_says_they_must_and_spell_out_their_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = hs_cli::serve::spawn_serve(
+        test_config(reserve_ephemeral_port(), dir.path()),
+        hs_cli::serve::ServeOptions::default(),
+    )
+    .await
+    .expect("server should boot");
+    let base = handle.base_url();
+    let client = reqwest::Client::new();
+    let enc = |id: &str| {
+        id.replace('!', "%21")
+            .replace(':', "%3A")
+            .replace('#', "%23")
+    };
+
+    let mut tokens = Vec::new();
+    for name in ["policy-alice", "policy-bob"] {
+        let body: serde_json::Value = client
+            .post(format!("{base}/_matrix/client/v3/register"))
+            .json(&json!({"username": name, "password": format!("hunter2-{name}"), "auth": {"type": "m.login.dummy"}}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        tokens.push(body["access_token"].as_str().unwrap().to_owned());
+    }
+    let (alice, bob) = (tokens[0].clone(), tokens[1].clone());
+
+    let mut rooms = Vec::new();
+    for _ in 0..2 {
+        let created: serde_json::Value = client
+            .post(format!("{base}/_matrix/client/v3/createRoom"))
+            .bearer_auth(&alice)
+            .json(&json!({"preset": "private_chat"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        rooms.push(created["room_id"].as_str().unwrap().to_owned());
+    }
+    let (room, other_room) = (rooms[0].clone(), rooms[1].clone());
+
+    // ---- 1. Default power levels are written out, and the dangerous events are reserved. ----
+    let levels: serde_json::Value = client
+        .get(format!(
+            "{base}/_matrix/client/v3/rooms/{}/state/m.room.power_levels",
+            enc(&room)
+        ))
+        .bearer_auth(&alice)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for key in [
+        "ban",
+        "kick",
+        "redact",
+        "invite",
+        "state_default",
+        "events_default",
+        "users_default",
+    ] {
+        assert!(
+            levels[key].is_number(),
+            "{key} is not spelled out: {levels}"
+        );
+    }
+    assert_eq!(levels["invite"], 0, "anybody in a private room may invite");
+    for reserved in [
+        "m.room.power_levels",
+        "m.room.history_visibility",
+        "m.room.server_acl",
+        "m.room.encryption",
+    ] {
+        assert_eq!(levels["events"][reserved], 100, "{reserved}: {levels}");
+    }
+
+    // ---- 2. Who is in a room, and what it is called, are for the people in it. ----
+    for path in ["joined_members", "aliases"] {
+        let response = client
+            .get(format!(
+                "{base}/_matrix/client/v3/rooms/{}/{path}",
+                enc(&room)
+            ))
+            .bearer_auth(&bob)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::FORBIDDEN,
+            "{path} for a stranger"
+        );
+        let response = client
+            .get(format!(
+                "{base}/_matrix/client/v3/rooms/{}/{path}",
+                enc(&room)
+            ))
+            .bearer_auth(&alice)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "{path} for a member"
+        );
+    }
+
+    // ---- 3. A canonical alias has to be this room's alias. ----
+    let set_canonical = |room: String, content: serde_json::Value| {
+        let (client, base, alice) = (client.clone(), base.clone(), alice.clone());
+        async move {
+            let response = client
+                .put(format!(
+                    "{base}/_matrix/client/v3/rooms/{}/state/m.room.canonical_alias",
+                    room.replace('!', "%21").replace(':', "%3A")
+                ))
+                .bearer_auth(alice)
+                .json(&content)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap();
+            (
+                status,
+                body["errcode"].as_str().unwrap_or_default().to_owned(),
+            )
+        }
+    };
+    let put_alias = |alias: &'static str, room: String| {
+        let (client, base, alice) = (client.clone(), base.clone(), alice.clone());
+        async move {
+            let response = client
+                .put(format!(
+                    "{base}/_matrix/client/v3/directory/room/{}",
+                    alias.replace('#', "%23").replace(':', "%3A")
+                ))
+                .bearer_auth(alice)
+                .json(&json!({"room_id": room}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK, "{alias}");
+        }
+    };
+    put_alias("#mine:example.org", room.clone()).await;
+    put_alias("#theirs:example.org", other_room.clone()).await;
+
+    assert_eq!(
+        set_canonical(room.clone(), json!({"alias": "#nowhere:example.org"})).await,
+        (reqwest::StatusCode::BAD_REQUEST, "M_BAD_ALIAS".to_owned()),
+        "an alias that does not exist"
+    );
+    assert_eq!(
+        set_canonical(room.clone(), json!({"alias": "#theirs:example.org"})).await,
+        (reqwest::StatusCode::BAD_REQUEST, "M_BAD_ALIAS".to_owned()),
+        "another room's alias"
+    );
+    assert_eq!(
+        set_canonical(room.clone(), json!({"alias": "%not-an-alias:example.org"})).await,
+        (
+            reqwest::StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM".to_owned()
+        ),
+    );
+    assert_eq!(
+        set_canonical(
+            room.clone(),
+            json!({"alias": "#mine:example.org", "alt_aliases": ["#theirs:example.org"]})
+        )
+        .await,
+        (reqwest::StatusCode::BAD_REQUEST, "M_BAD_ALIAS".to_owned()),
+        "an alt_alias is held to the same rule"
+    );
+    assert_eq!(
+        set_canonical(room.clone(), json!({"alias": "#mine:example.org"}))
+            .await
+            .0,
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        set_canonical(room.clone(), json!({})).await.0,
+        reqwest::StatusCode::OK,
+        "and it can be removed again"
+    );
+
+    // ---- 4. An event over the size limit is 413 M_TOO_LARGE, not "your JSON is bad". ----
+    let response = client
+        .put(format!(
+            "{base}/_matrix/client/v3/rooms/{}/send/m.room.message/too-large",
+            enc(&room)
+        ))
+        .bearer_auth(&alice)
+        .json(&json!({"msgtype": "m.text", "body": "and they don't stop coming ".repeat(2700)}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["errcode"], "M_TOO_LARGE");
+
+    // ---- 5. A wrong password mid-way through interactive auth is a 401 that can be retried. ----
+    let response = client
+        .post(format!("{base}/_matrix/client/v3/account/deactivate"))
+        .bearer_auth(&bob)
+        .json(&json!({"auth": {
+            "type": "m.login.password",
+            "identifier": {"type": "m.id.user", "user": "policy-bob"},
+            "password": "not-bobs-password",
+        }}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["errcode"], "M_FORBIDDEN", "{body}");
+    assert!(
+        body["session"].is_string() && body["flows"].is_array(),
+        "{body}"
+    );
+    // And bob is still there: a failed attempt deactivated nothing.
+    let whoami = client
+        .get(format!("{base}/_matrix/client/v3/account/whoami"))
+        .bearer_auth(&bob)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(whoami.status(), reqwest::StatusCode::OK);
+
+    handle.shutdown().await;
+}

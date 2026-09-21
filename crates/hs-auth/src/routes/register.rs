@@ -429,7 +429,9 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        // Refused, and free to try again with a token that works: see `uia::advance`.
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(err.errcode(), crate::error::ErrCode::Forbidden);
 
         let body = json!({"username": "tokenuser", "auth": {"type": "m.login.registration_token", "token": "good-token"}});
         let response = post_register(State(state), Query(HashMap::new()), PermissiveJson(body))

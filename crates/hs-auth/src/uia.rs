@@ -126,9 +126,30 @@ pub async fn advance(
 
     if let Some(auth_type) = submitted {
         if !stage_ok {
-            return Err(MatrixError::forbidden(
+            // The spec, on user-interactive authentication: "If the homeserver decides that an
+            // attempt on a stage was unsuccessful, but the client may make a second attempt, it
+            // returns the same HTTP status 401 response as above, with the addition of the
+            // standard `errcode` and `error` fields describing the error." This was a bare
+            // `403`, which tells a client the dance is over and takes away the `session` it
+            // would need to try the password again.
+            let completed = store
+                .completed_stages(&session_id)
+                .await?
+                .into_iter()
+                .map(AuthType::from)
+                .collect();
+            let challenge =
+                serde_json::to_value(incomplete_body(flows.to_vec(), completed, session_id))
+                    .unwrap_or_default();
+            let mut error = MatrixError::new(
+                axum::http::StatusCode::UNAUTHORIZED,
+                crate::error::ErrCode::Forbidden,
                 "Invalid authentication data for this stage",
-            ));
+            );
+            for (key, value) in challenge.as_object().into_iter().flatten() {
+                error = error.with_extra(key, value.clone());
+            }
+            return Err(error);
         }
         complete_stage(store, &session_id, auth_type).await?;
     }
@@ -293,8 +314,11 @@ mod tests {
         assert_eq!(round3.completed.len(), 2);
     }
 
+    /// A failed attempt is not the end of the dance: the spec wants the same `401` challenge
+    /// again, with `errcode` and `error` added, so that the client still holds the `session` it
+    /// needs to try a second time.
     #[tokio::test]
-    async fn failed_stage_verification_is_forbidden_and_does_not_complete_it() {
+    async fn a_failed_stage_is_a_401_that_still_carries_the_challenge() {
         let store = InMemoryAuthStore::new();
         let flows = dummy_flow();
         let round1 = advance(&store, &flows, None, None, true, 0, 10_000)
@@ -311,10 +335,29 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(err.status(), axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(err.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(err.errcode(), crate::error::ErrCode::Forbidden);
+
+        use axum::response::IntoResponse;
+        let bytes = axum::body::to_bytes(err.into_response().into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["errcode"], "M_FORBIDDEN");
+        assert!(body["error"].is_string(), "{body}");
+        assert_eq!(
+            body["session"],
+            round1.session_id.as_str(),
+            "the same session, to retry with"
+        );
+        assert!(body["flows"].is_array(), "{body}");
+        assert!(body["params"].is_object(), "{body}");
 
         let completed = store.completed_stages(&round1.session_id).await.unwrap();
-        assert!(completed.is_empty());
+        assert!(
+            completed.is_empty(),
+            "and the failed stage was not completed"
+        );
     }
 
     #[tokio::test]

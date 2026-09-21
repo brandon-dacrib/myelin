@@ -30,6 +30,8 @@ pub enum MatrixErrorCode {
     InvalidUsername,
     RoomInUse,
     InvalidParam,
+    /// `M_BAD_ALIAS`: an alias in the request does not point at the room it is being set on.
+    BadAlias,
     MissingParam,
     TooLarge,
     Exclusive,
@@ -70,6 +72,7 @@ impl MatrixErrorCode {
             Self::InvalidUsername => "M_INVALID_USERNAME",
             Self::RoomInUse => "M_ROOM_IN_USE",
             Self::InvalidParam => "M_INVALID_PARAM",
+            Self::BadAlias => "M_BAD_ALIAS",
             Self::MissingParam => "M_MISSING_PARAM",
             Self::TooLarge => "M_TOO_LARGE",
             Self::Exclusive => "M_EXCLUSIVE",
