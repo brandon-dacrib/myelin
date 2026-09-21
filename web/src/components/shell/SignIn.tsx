@@ -1,4 +1,5 @@
-import { useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { Link } from "@tanstack/react-router";
 import {
   ALL_SCOPES,
   AuthSignInError,
@@ -10,6 +11,7 @@ import {
 } from "@/lib/auth";
 import { Button } from "../ui/button/Button";
 import { Input, Field } from "../ui/input/Input";
+import { fetchNeedsSetup } from "@/lib/setup";
 
 /**
  * In mock mode (`VITE_HS_MOCK=1`) this stands in for track 07's OAuth issuer redirect
@@ -91,6 +93,7 @@ function RealSignIn() {
 
   return (
     <SignInShell>
+      <NeedsSetupNotice />
       <p className="mt-2 text-sm text-text-muted">
         Sign in with a server administrator&apos;s Matrix account. There is no separate admin login
         — any account with <code className="font-identifier">is_admin</code> set works here.
@@ -181,7 +184,37 @@ function RealSignIn() {
   );
 }
 
-function SignInShell({ children }: { children: ReactNode }) {
+/**
+ * Shown above the sign-in form while the server has no administrator: nobody can sign in to such
+ * a server, and without this the form would simply refuse every attempt without saying why.
+ */
+function NeedsSetupNotice() {
+  const [needsSetup, setNeedsSetup] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    void fetchNeedsSetup().then((value) => {
+      if (!cancelled) setNeedsSetup(value === true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  if (!needsSetup) return null;
+  return (
+    <div role="status" className="mt-4 rounded-md border border-border bg-surface-sunken p-3">
+      <p className="text-sm font-medium text-text">This server has no administrator yet</p>
+      <p className="mt-1 text-sm text-text-muted">
+        Open the setup link from the server&apos;s log to create one, or{" "}
+        <Link to="/setup" className="text-accent hover:underline">
+          enter the setup token here
+        </Link>
+        .
+      </p>
+    </div>
+  );
+}
+
+export function SignInShell({ children }: { children: ReactNode }) {
   return (
     <div className="flex min-h-screen items-center justify-center bg-canvas px-4">
       <div className="w-full max-w-sm rounded-lg border border-border bg-surface p-8 shadow-2">

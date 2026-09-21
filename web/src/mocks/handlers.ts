@@ -37,6 +37,27 @@ import type { JsonValue } from "@/api/config-schema";
 
 const API = "/api/v1";
 
+const NO_STORE = { "Cache-Control": "no-store" };
+
+/** Where a test puts the token that opens the mock's first-run setup. */
+export const MOCK_SETUP_TOKEN_KEY = "hs-mock:setup-token";
+
+function mockSetupToken(): string | null {
+  try {
+    return globalThis.sessionStorage?.getItem(MOCK_SETUP_TOKEN_KEY) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function closeMockSetup(): void {
+  try {
+    globalThis.sessionStorage?.removeItem(MOCK_SETUP_TOKEN_KEY);
+  } catch {
+    /* nothing to close */
+  }
+}
+
 function encodeCursor(index: number): string {
   return btoa(`offset:${index}`);
 }
@@ -101,6 +122,70 @@ export const handlers = [
       token_type: "Bearer",
       scopes,
       operator: { name: "Operator", subject: "mock-operator" },
+    });
+  }),
+
+  // ---- First-run setup ----
+  // Closed by default, like a server that already has its administrator, so every other flow is
+  // unaffected. A test opens it by putting a token in `sessionStorage` before the app loads
+  // (`MOCK_SETUP_TOKEN_KEY`); using the token closes it again, as on the real server.
+  http.get(`${API}/setup`, () =>
+    HttpResponse.json({ needs_setup: mockSetupToken() !== null }, { headers: NO_STORE }),
+  ),
+  http.post(`${API}/setup`, async ({ request }) => {
+    const body = (await request.json()) as {
+      setup_token?: string;
+      username?: string;
+      password?: string;
+    };
+    const offered = mockSetupToken();
+    if (offered === null) {
+      return problem(409, "conflict", "Conflict", {
+        detail: "this server already has an administrator",
+      });
+    }
+    if (body.setup_token !== offered) {
+      return problem(401, "unauthenticated", "Unauthenticated", {
+        detail: "that is not this server's setup token",
+      });
+    }
+    const localpart = (body.username ?? "").replace(/^@/, "").split(":")[0]!.toLowerCase();
+    if (!/^[a-z0-9._=\-/+]+$/.test(localpart)) {
+      return problem(400, "validation-failed", "Validation failed", {
+        detail: `"${localpart}" cannot be a username`,
+        errors: [{ pointer: "/username", detail: `"${localpart}" cannot be a username` }],
+      });
+    }
+    if ((body.password ?? "").length < 8) {
+      return problem(400, "validation-failed", "Validation failed", {
+        detail: "Password too short (minimum 8 characters)",
+        errors: [{ pointer: "/password", detail: "Password too short (minimum 8 characters)" }],
+      });
+    }
+    closeMockSetup();
+    return HttpResponse.json(
+      {
+        user_id: `@${localpart}:example.org`,
+        access_token: `mock-admin-token.${crypto.randomUUID()}`,
+        device_id: "SETUP",
+      },
+      { status: 201, headers: NO_STORE },
+    );
+  }),
+  // What `signInWithToken` verifies a token against. Any mock-issued token is a full
+  // administrator's, which is also what the real `AdminTokenVerifier` grants.
+  http.get(`${API}/me`, ({ request }) => {
+    const auth = request.headers.get("authorization") ?? "";
+    if (!auth.startsWith("Bearer mock-admin-token.")) {
+      return problem(401, "unauthenticated", "Unauthenticated", {
+        detail: "missing or unrecognized token",
+      });
+    }
+    return HttpResponse.json({
+      kind: "user",
+      id: "@ops:example.org",
+      display_name: "Operator",
+      scopes: ["admin:read", "admin:write"],
     });
   }),
 

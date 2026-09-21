@@ -4,6 +4,7 @@ import {
   createRouter,
   lazyRouteComponent,
   Link,
+  Navigate,
 } from "@tanstack/react-router";
 import { AppShell } from "@/components/shell/AppShell";
 import { WIZARD_STEPS, type WizardStep } from "@/pages/bridges/wizard/wizard-state";
@@ -74,6 +75,14 @@ const indexRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/",
   component: DashboardPage,
+});
+
+// `/setup` is rendered by `AppShell` itself while there is no session (see `Setup.tsx`). With a
+// session there is nothing to set up, so the address just goes home.
+const setupRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/setup",
+  component: () => <Navigate to="/" replace />,
 });
 
 interface BridgesListSearch {
@@ -197,6 +206,7 @@ const settingsRoute = placeholderRoute("/settings");
 
 const routeTree = rootRoute.addChildren([
   indexRoute,
+  setupRoute,
   bridgesListRoute,
   bridgesNewRoute,
   bridgeCreatedRoute,

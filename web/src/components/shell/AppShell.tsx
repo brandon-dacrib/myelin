@@ -4,6 +4,7 @@ import { Sidebar } from "./Sidebar";
 import { TopBar } from "./TopBar";
 import { CommandPalette } from "./CommandPalette";
 import { SignIn } from "./SignIn";
+import { Setup } from "./Setup";
 import { Sheet, SheetContent } from "../ui/sheet/Sheet";
 import { Toaster } from "../ui/toast/Toaster";
 import { getSession, subscribeSession } from "@/lib/auth";
@@ -67,7 +68,9 @@ export function AppShell() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [navigate]);
 
-  if (!session) return <SignIn />;
+  // A server with no administrator cannot be signed in to, so its setup page is served here, in
+  // place of the sign-in form, rather than as a route behind it.
+  if (!session) return pathname.replace(/^\/admin/, "") === "/setup" ? <Setup /> : <SignIn />;
 
   return (
     <div className="flex h-screen flex-col bg-canvas">
