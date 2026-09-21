@@ -140,7 +140,7 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
   rooms this replica does not own, with a fencing check inside the transaction that commits a
   write. Before this, concurrent sends through two replicas silently produced two divergent
   histories with no error to any client.
-- Admin API: 24 of 142 operations genuinely served — users, rooms, moderation actions, a durable
+- Admin API: 34 of 145 operations genuinely served (`tools/admin_api_coverage.py`) — users, rooms, moderation actions, a durable
   audit log, and an SSE event stream. Every mutation writes exactly one audit entry and publishes
   exactly one event. The rest answer `501`, or `503` naming the capability when a seam exists but
   nothing implements it.

@@ -79,10 +79,10 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 | Client-server API | ~65% | 241/370 csapi assertions, 61/104 top-level; a real Element session signs in, creates rooms, sends, invites, scrolls back |
 | Storage, rooms, state resolution | ~85% | the engine underneath; 1600+ tests, two backends through one conformance suite, state bake-off done |
 | Configuration and first run | ~90% | database-backed, editable in the UI, one command from nothing to a working server |
-| Admin API | ~22% | 31 of 143 operations genuinely served; the rest answer an honest 501 |
+| Admin API | ~23% | 34 of 145 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Config 6/6, Server 5/5, AuditLog 3/3, Setup 2/2, Users 10/41, Rooms 5/23, Statistics 1/4, Cluster 1/6, and **Bridges 0/16**, Federation 0/7, Media 0/9, RegistrationTokens 0/5 |
 | Management web interface | ~60% | users, rooms, federation, bridges, and configuration are real; arrays-of-objects and several resources are not |
 | **Federation** | **~15%** | 59/246 assertions, 6/88 top-level; a two-server join works one way only |
-| Bridges | ~20% | the appservice surface exists; no real bridge has ever been pointed at it |
+| Bridges | ~20% | the appservice surface exists; no real bridge has ever been pointed at it, and **none of the 16 bridge operations the interface's Bridges section calls is served** — that section works against the mock only |
 | Operations (HA, scale-out) | ~40% | it runs on Kubernetes with a chart and a tested image; the cluster path has never carried real traffic |
 
 Federation is the honest answer to "when could I use this". Everything else is far enough along
@@ -263,4 +263,4 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
   interface was embedded; it would have passed for the placeholder too, and the binary had the
   placeholder. Look at the decision itself (the build script's output, the log line, the byte on
   the wire), not at a test that is satisfied either way.
-- **Registered is not working.** 24 of 142 admin operations are genuinely served; the rest answer 501, or 503 when a seam exists but nothing implements it.
+- **Registered is not working, and a real handler is not working either.** 34 of 145 admin operations have a real handler (`tools/admin_api_coverage.py` counts them; the figure used to be quoted by hand and was different in every document). The rest answer 501. But `users.create` had a real handler for days while the only real user directory answered it 503 — so "has a handler" is a ceiling, and the floor is an end-to-end test through `hs serve`.
