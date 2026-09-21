@@ -150,6 +150,12 @@ pub async fn post_create_room<B: KvBackend + 'static>(
     };
 
     let publish = body.get("visibility").and_then(Value::as_str) == Some("public");
+    // The spec, on `preset`: "If unspecified, the server should use the `visibility` to determine
+    // which preset to use. A visibility of `public` equates to a preset of `public_chat` and
+    // `private` visibility equates to a preset of `private_chat`." Without this a room created
+    // with only `visibility: public` was listed in the directory and impossible to join from it:
+    // published, and invite-only.
+    let preset = preset.or_else(|| publish.then(|| "public_chat".to_owned()));
 
     let request = CreateRoomRequest {
         room_version,

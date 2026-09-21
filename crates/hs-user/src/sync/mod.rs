@@ -222,6 +222,23 @@ fn rendered_with_replaced_state(
     )
 }
 
+/// A room's timeline for an incremental sync: what happened after `resume_pos`.
+///
+/// Usually that is a handful of events and they are all returned, oldest first. When it is more
+/// than `limit` there is a *gap*, and the spec is specific about which side of it the client
+/// gets: the most recent `limit` events, with `limited: true` and a `prev_batch` from which
+/// paginating backwards recovers the rest. So a gap is answered by [`build_fresh_timeline`], the
+/// same newest-first page an initial sync uses.
+///
+/// It used to be answered with the *oldest* `limit` events. The token handed back alongside them
+/// is positioned at the end of the room, so everything after that first page was never delivered
+/// by any later sync either, and `prev_batch` pointed back past `resume_pos` into history the
+/// client already had. Whatever did not fit in one page was simply lost to that client -- which
+/// is what happens to a phone that has been offline for an hour in a busy room.
+///
+/// With a content filter the forward scan is bounded by [`FILTERED_TIMELINE_SCAN`], and running
+/// into that bound is treated as a gap as well: there may be matching events beyond it, the token
+/// is going to skip past them regardless, and the newest matching events are the ones to send.
 fn build_incremental_timeline(
     actor: &hs_room::actor::RoomActor<impl KvBackend>,
     resume_pos: i64,
@@ -230,43 +247,25 @@ fn build_incremental_timeline(
     requester: &UserId,
 ) -> Timeline {
     let from = Some(PaginationToken::new(resume_pos, Direction::Forward));
-    let request = content_filter.map_or(limit, |_| limit.max(FILTERED_TIMELINE_SCAN));
-    let (raw, next) = actor.paginate(from, Direction::Forward, request);
-    let raw_exhausted = raw.len() < request;
+    // One more than could be returned, so that "exactly `limit` new events" (no gap) can be told
+    // from "more than `limit`" (a gap) without a second query.
+    let request = content_filter.map_or(limit, |_| limit.max(FILTERED_TIMELINE_SCAN)) + 1;
+    let (raw, _) = actor.paginate(from, Direction::Forward, request);
+    let scan_cut_short = raw.len() == request;
 
-    let (events, limited): (Vec<&Event>, bool) = match content_filter {
-        None => {
-            let limited = if raw.len() == limit {
-                let (more, _) = actor.paginate(next, Direction::Forward, 1);
-                !more.is_empty()
-            } else {
-                false
-            };
-            (raw, limited)
-        }
-        Some(f) => {
-            let filtered: Vec<&Event> = raw
-                .into_iter()
-                .filter(|e| f.matches(&e.header().event_type, e.header().sender.as_str()))
-                .collect();
-            let truncated = filtered.len() > limit;
-            let events = if truncated {
-                filtered.into_iter().take(limit).collect()
-            } else {
-                filtered
-            };
-            // Conservative: `limited` is true whenever this response did not prove the room has
-            // nothing more for this window -- either the filtered set alone already filled
-            // `limit` (there may well be more beyond it), or the raw scan itself was cut off by
-            // `FILTERED_TIMELINE_SCAN` before reaching the true end of the room's forward
-            // history. Worst case a client pages once more than strictly necessary and gets a
-            // smaller-than-expected (possibly empty) page; this never *skips* real events, which
-            // is the direction this crate's other resume-mode fallbacks already choose to err in
-            // (see `resume_mode`'s own doc comment).
-            let limited = truncated || !raw_exhausted;
-            (events, limited)
-        }
+    let events: Vec<&Event> = match content_filter {
+        None => raw,
+        Some(f) => raw
+            .into_iter()
+            .filter(|e| f.matches(&e.header().event_type, e.header().sender.as_str()))
+            .collect(),
     };
+
+    if events.len() > limit || scan_cut_short {
+        let mut newest = build_fresh_timeline(actor, limit, content_filter, requester);
+        newest.limited = true;
+        return newest;
+    }
 
     let prev_batch = if events.is_empty() {
         None
@@ -278,7 +277,7 @@ fn build_incremental_timeline(
             .into_iter()
             .map(|event| rendered_with_replaced_state(actor, event, requester))
             .collect(),
-        limited,
+        limited: false,
         prev_batch,
     }
 }
@@ -705,6 +704,7 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
 
         let (timeline, state_events, summary) = handle
             .query(move |actor| {
+                let fresh_room = matches!(resume, ResumeMode::FreshRoom);
                 let timeline = match resume {
                     ResumeMode::Incremental(pos) => build_incremental_timeline(
                         actor,
@@ -739,7 +739,13 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                         &user_id_owned,
                         state_content_filter.as_ref(),
                     )?
-                } else {
+                } else if fresh_room || timeline.limited {
+                    // A room the client has no baseline for, or a gap: the client's idea of the
+                    // room's state cannot be brought up to date by the timeline alone, so it gets
+                    // the current state (less whatever the timeline already carries). For a gap
+                    // that is more than the strict minimum -- the spec asks for the state changes
+                    // *between* `since` and the start of the timeline -- and it errs in the safe
+                    // direction: a repeated state event is harmless, a missed one is a stale room.
                     build_state_section(
                         actor,
                         &timeline_ids,
@@ -748,6 +754,25 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                         &user_id_owned,
                         state_content_filter.as_ref(),
                     )?
+                } else {
+                    // An ordinary incremental sync: every state change since `since` is *in* the
+                    // timeline, so there is nothing for `state` to add -- except, under lazy
+                    // loading, the membership of whoever sent those events, which the client may
+                    // never have been given. This used to send the room's entire state on every
+                    // sync that had so much as one new message in it.
+                    build_state_section(
+                        actor,
+                        &timeline_ids,
+                        lazy,
+                        &timeline_senders,
+                        &user_id_owned,
+                        state_content_filter.as_ref(),
+                    )?
+                    .into_iter()
+                    .filter(|e| {
+                        lazy && e.get("type").and_then(Value::as_str) == Some("m.room.member")
+                    })
+                    .collect()
                 };
                 let summary = build_room_summary(actor, &user_id_owned)?;
                 Ok::<_, hs_room::RoomError>((timeline, state, summary))
@@ -2460,6 +2485,80 @@ mod tests {
         assert_settled(&hub, &e2e, &bob).await;
     }
 
+    /// Complement's "Existing members see new members' presence (in incremental sync)", which
+    /// fixing the busy loop broke. Bob's presence is stamped *before* alice's token; then he joins
+    /// her room. By stamp alone he is older than anything she has yet to see, and she would
+    /// never be sent him. It used to work only because alice's token never caught up with
+    /// anything at all.
+    #[tokio::test]
+    async fn somebody_joining_your_room_brings_their_presence_with_them() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+
+        hub.set_presence(&bob, "online".to_owned(), None)
+            .await
+            .unwrap();
+        // Alice polls after that, as `GET /sync` does, so her own record and her token are both
+        // newer than bob's.
+        hub.touch_presence(&alice, "online").await.unwrap();
+        let (_, before_bob_joins) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+
+        handle
+            .membership(
+                bob.clone(),
+                Action::Join,
+                bob.clone(),
+                serde_json::json!({}),
+                2,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (response, token) = build(&hub, &e2e, &alice, params(Some(before_bob_joins)))
+            .await
+            .unwrap();
+        let senders: Vec<&str> = response["presence"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["sender"].as_str().unwrap())
+            .collect();
+        assert!(senders.contains(&"@bob:sync.test"), "{response}");
+
+        // Once. A join is news one time, not on every sync after it.
+        let (response, token) = build(&hub, &e2e, &alice, params(Some(token)))
+            .await
+            .unwrap();
+        assert!(
+            response["presence"]["events"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{response}"
+        );
+        assert!(
+            !has_new_data(&hub, &e2e, &alice, None, &token)
+                .await
+                .unwrap()
+        );
+    }
+
     /// The same invariant with every in-memory stream moving at once -- typing, receipts (one of
     /// them private), account data, presence on both sides -- for the streams `build` and
     /// `has_new_data` each keep their own idea of.
@@ -2601,5 +2700,263 @@ mod tests {
                 .is_empty(),
             "{response}"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // A gap is filled from the new end, not the old one.
+    // ---------------------------------------------------------------------------------------
+
+    /// Twenty-five messages arrive between two syncs and the timeline limit is ten. The client
+    /// must get the *newest* ten, be told the timeline is `limited`, and be given a `prev_batch`
+    /// that pages back into the fifteen it was not sent.
+    ///
+    /// This server returned the *oldest* ten -- while handing back a token positioned at the end
+    /// of the room. The other fifteen were never delivered by any later sync, and `prev_batch`
+    /// pointed at history the client already had. Anybody whose phone had been offline for an
+    /// hour lost whatever did not fit in the first page. Complement's "sync token points to a
+    /// redaction of an unknown event" had been failing on exactly this, under a name that
+    /// suggests something else.
+    async fn room_with_a_gap(
+        filter: serde_json::Value,
+    ) -> (
+        Arc<TestHub>,
+        Arc<dyn E2eStore>,
+        OwnedUserId,
+        OwnedRoomId,
+        SyncToken,
+        SyncFilter,
+    ) {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (_, token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+
+        for n in 1..=25 {
+            // Every third event is a reaction, so that a filter for messages has something to
+            // leave out.
+            let event_type = if n % 3 == 0 {
+                "m.reaction"
+            } else {
+                "m.room.message"
+            };
+            handle
+                .send_event(
+                    alice.clone(),
+                    event_type.to_owned(),
+                    None,
+                    serde_json::json!({"body": format!("message {n}")}),
+                    None,
+                    10 + n,
+                )
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let filter: SyncFilter = serde_json::from_value(filter).unwrap();
+        (hub, e2e, alice, room_id, token, filter)
+    }
+
+    fn bodies(timeline: &Value) -> Vec<String> {
+        timeline["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["content"]["body"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn after_a_gap_an_incremental_sync_returns_the_newest_events_and_a_way_back() {
+        let (hub, e2e, alice, room_id, token, filter) =
+            room_with_a_gap(serde_json::json!({"room": {"timeline": {"limit": 10}}})).await;
+        let mut p = params(Some(token));
+        p.filter = filter;
+        let (response, next) = build(&hub, &e2e, &alice, p).await.unwrap();
+
+        let timeline = &response["rooms"]["join"][room_id.as_str()]["timeline"];
+        let expected: Vec<String> = (16..=25).map(|n| format!("message {n}")).collect();
+        assert_eq!(bodies(timeline), expected, "the newest ten, oldest first");
+        assert_eq!(timeline["limited"], true);
+
+        // `prev_batch` leads back into the gap: the page before it ends with message 15.
+        let prev_batch: PaginationToken = timeline["prev_batch"].as_str().unwrap().parse().unwrap();
+        let handle = hub.rooms().get_or_load(&room_id).await.unwrap();
+        let before: Vec<String> = handle
+            .query(move |actor| {
+                let (page, _) = actor.paginate(Some(prev_batch), Direction::Backward, 3);
+                page.iter()
+                    .map(|e| {
+                        client_event_json(e)["content"]["body"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned()
+                    })
+                    .collect()
+            })
+            .await;
+        assert_eq!(before, vec!["message 15", "message 14", "message 13"]);
+
+        // And nothing is left over: the next sync has no more of this room to give.
+        let mut p = params(Some(next));
+        p.filter = serde_json::from_value(serde_json::json!({"room": {"timeline": {"limit": 10}}}))
+            .unwrap();
+        let (response, _) = build(&hub, &e2e, &alice, p).await.unwrap();
+        assert!(
+            response["rooms"]["join"].get(room_id.as_str()).is_none(),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_gap_an_incremental_sync_is_everything_in_order_and_not_limited() {
+        let (hub, e2e, alice, room_id, token, filter) =
+            room_with_a_gap(serde_json::json!({"room": {"timeline": {"limit": 25}}})).await;
+        let mut p = params(Some(token));
+        p.filter = filter;
+        let (response, _) = build(&hub, &e2e, &alice, p).await.unwrap();
+
+        let timeline = &response["rooms"]["join"][room_id.as_str()]["timeline"];
+        let expected: Vec<String> = (1..=25).map(|n| format!("message {n}")).collect();
+        assert_eq!(bodies(timeline), expected);
+        assert_eq!(
+            timeline["limited"], false,
+            "exactly `limit` events is not a gap"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gap_is_filled_from_the_new_end_under_a_content_filter_too() {
+        let (hub, e2e, alice, room_id, token, filter) = room_with_a_gap(serde_json::json!({
+            "room": {"timeline": {"limit": 5, "types": ["m.room.message"]}}
+        }))
+        .await;
+        let mut p = params(Some(token));
+        p.filter = filter;
+        let (response, _) = build(&hub, &e2e, &alice, p).await.unwrap();
+
+        let timeline = &response["rooms"]["join"][room_id.as_str()]["timeline"];
+        // Multiples of three are reactions; the newest five *messages* are these.
+        let expected: Vec<String> = [19, 20, 22, 23, 25]
+            .iter()
+            .map(|n| format!("message {n}"))
+            .collect();
+        assert_eq!(bodies(timeline), expected);
+        assert_eq!(timeline["limited"], true);
+    }
+
+    /// What `state` is for. On an ordinary incremental sync the timeline *is* the delta, so
+    /// `state` has nothing to add; it used to carry the room's entire current state on every
+    /// sync with so much as one new message, which in a large room is most of the response.
+    #[tokio::test]
+    async fn an_ordinary_incremental_sync_does_not_resend_the_rooms_state() {
+        let (hub, e2e, alice, room_id, token, _) =
+            room_with_a_gap(serde_json::json!({"room": {"timeline": {"limit": 50}}})).await;
+        let mut p = params(Some(token));
+        p.filter = serde_json::from_value(serde_json::json!({"room": {"timeline": {"limit": 50}}}))
+            .unwrap();
+        let (response, _) = build(&hub, &e2e, &alice, p).await.unwrap();
+        let room = &response["rooms"]["join"][room_id.as_str()];
+        assert_eq!(room["timeline"]["events"].as_array().unwrap().len(), 25);
+        assert_eq!(room["timeline"]["limited"], false);
+        assert_eq!(
+            room["state"]["events"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or(0),
+            0,
+            "{}",
+            room["state"]
+        );
+    }
+
+    /// Across a gap it is the opposite: a state change that fell inside the gap is in no
+    /// timeline the client will be sent, so `state` is the only way it arrives.
+    #[tokio::test]
+    async fn a_state_change_inside_a_gap_still_reaches_the_client() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    name: Some("Before".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (_, token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+
+        // Renamed, and then enough chatter to push the rename out of the newest page.
+        handle
+            .send_event(
+                alice.clone(),
+                "m.room.name".to_owned(),
+                Some(String::new()),
+                serde_json::json!({"name": "After"}),
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        for n in 1..=12 {
+            handle
+                .send_event(
+                    alice.clone(),
+                    "m.room.message".to_owned(),
+                    None,
+                    serde_json::json!({"body": format!("message {n}")}),
+                    None,
+                    10 + n,
+                )
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut p = params(Some(token));
+        p.filter = serde_json::from_value(serde_json::json!({"room": {"timeline": {"limit": 5}}}))
+            .unwrap();
+        let (response, _) = build(&hub, &e2e, &alice, p).await.unwrap();
+        let room = &response["rooms"]["join"][room_id.as_str()];
+        assert_eq!(room["timeline"]["limited"], true);
+        assert!(
+            !bodies(&room["timeline"]).is_empty()
+                && room["timeline"]["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|e| e["type"] == "m.room.message"),
+            "the rename is not in the newest page"
+        );
+        let name = room["state"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["type"] == "m.room.name")
+            .expect("the rename arrives in `state`");
+        assert_eq!(name["content"]["name"], "After");
     }
 }

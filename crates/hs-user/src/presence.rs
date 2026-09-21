@@ -130,6 +130,26 @@ impl PresenceRegistry {
         }
     }
 
+    /// Gives `user_id`'s record a new stamp without changing what it says, so that it counts as
+    /// news to everyone whose sync token predates this moment. Returns whether there was a record
+    /// to restamp.
+    ///
+    /// Presence has one sequence for the whole server, but the *audience* of a record is
+    /// everyone who shares a room with its owner, and that set grows. When somebody joins a
+    /// room, the people already in it have tokens newer than the joiner's last presence change
+    /// -- they were syncing while the joiner was elsewhere -- so by stamp alone they would never
+    /// be sent it. A join is news about who you can see; this makes it news in the stream too.
+    pub async fn restamp(&self, user_id: &UserId) -> bool {
+        let mut users = self.users.lock().await;
+        match users.get_mut(user_id) {
+            Some(existing) => {
+                existing.seq = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// This user's current record, if this process has ever recorded one.
     pub async fn get(&self, user_id: &UserId) -> Option<PresenceRecord> {
         self.users.lock().await.get(user_id).cloned()

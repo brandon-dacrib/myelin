@@ -1672,11 +1672,33 @@ async fn the_user_directory_shows_a_searcher_only_who_they_could_already_see() {
             created["room_id"].as_str().expect("a room id").to_owned()
         }
     };
-    create_room(
+    // Only `visibility`, exactly as Complement sends it: the spec makes that imply the
+    // `public_chat` preset, and a room that is published but invite-only would not make Alice
+    // findable by anybody.
+    let public_room = create_room(alice.clone(), json!({"visibility": "public"})).await;
+    let explicit = create_room(
         alice.clone(),
-        json!({"visibility": "public", "preset": "public_chat"}),
+        json!({"visibility": "public", "preset": "private_chat"}),
     )
     .await;
+    for (room, expected) in [(&public_room, "public"), (&explicit, "invite")] {
+        let rules: serde_json::Value = client
+            .get(format!(
+                "{base}/_matrix/client/v3/rooms/{}/state/m.room.join_rules",
+                room.replace('!', "%21").replace(':', "%3A")
+            ))
+            .bearer_auth(&alice)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            rules["join_rule"], expected,
+            "{room}: an explicit preset still wins"
+        );
+    }
     create_room(
         alice.clone(),
         json!({"preset": "private_chat", "invite": ["@dir-bob:example.org"]}),

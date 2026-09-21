@@ -634,6 +634,16 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             targets.insert(delta.user_id.clone(), delta.membership.clone());
         }
 
+        // Somebody joining enters the presence audience of everyone already here, whose tokens
+        // may well be newer than the joiner's last presence change. Restamp it so that it
+        // reaches them (`PresenceRegistry::restamp`); the wake below is the same one the join
+        // itself causes. Complement's "Existing members see new members' presence" is this.
+        for delta in &update.membership_deltas {
+            if delta.membership == "join" {
+                self.presence.restamp(&delta.user_id).await;
+            }
+        }
+
         for (user_id, membership) in &targets {
             let changed_now = update
                 .membership_deltas
