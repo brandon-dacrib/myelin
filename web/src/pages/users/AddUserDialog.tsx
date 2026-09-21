@@ -122,7 +122,7 @@ export function AddUserDialog({
             </dd>
             <dt className="text-text-muted">Password</dt>
             <dd>
-              <CopyableId value={created.password} />
+              <CopyableId value={created.password} label="password" />
             </dd>
           </dl>
           <p className="mt-4 text-sm text-text-muted">

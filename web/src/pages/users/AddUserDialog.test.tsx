@@ -73,6 +73,9 @@ describe("AddUserDialog", () => {
     const done = within(await screen.findByRole("dialog", { name: "Account created" }));
     expect(done.getByText("@carol:example.org")).toBeInTheDocument();
     expect(done.getByText(generated)).toBeInTheDocument();
+    // Copyable, by a button that says what it copies without saying the password itself.
+    expect(done.getByRole("button", { name: "Copy password" })).toBeInTheDocument();
+    expect(done.queryByRole("button", { name: new RegExp(generated) })).not.toBeInTheDocument();
     expect(done.getByText(/They can sign in from any Matrix client/)).toBeInTheDocument();
 
     const created = users.find((u) => u.user_id === "@carol:example.org");
