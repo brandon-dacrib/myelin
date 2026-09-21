@@ -29,6 +29,8 @@ servers:
 tags:
 - name: Server
   description: Server identity, health and the caller's own principal.
+- name: Setup
+  description: Creating the first administrator on a server that has none.
 - name: Users
   description: Users, devices, sessions and their moderation actions.
 - name: Rooms
@@ -3581,6 +3583,59 @@ paths:
           $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
+  /setup:
+    get:
+      summary: Whether this server still needs its first administrator
+      operationId: setup.get
+      tags:
+      - Setup
+      security: []
+      description: Unauthenticated, because it is what the management interface asks before anybody can sign in, to decide between showing a sign-in form and pointing at the setup link. It says only whether the offer is open, never the token.
+      responses:
+        '200':
+          description: Whether setup is open.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SetupStatus'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+    post:
+      summary: Create the first administrator
+      operationId: setup.create
+      tags:
+      - Setup
+      security: []
+      description: Unauthenticated by bearer token, because there is nobody to have one yet. The credential is the setup token in the body, which the server writes to its log at every start for as long as it has no administrator; whoever can read the log can claim the server. It works once. The response is a signed-in session for the new account, so the interface does not have to ask for the password a second time.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetupRequest'
+      responses:
+        '201':
+          description: The administrator was created, and this is a session for them.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SetupSession'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
   /statistics/overview:
     get:
       summary: Dashboard overview numbers
@@ -7116,6 +7171,44 @@ components:
         uptime_ms:
           type: integer
         contract_version:
+          type: string
+    SetupStatus:
+      type: object
+      required:
+      - needs_setup
+      properties:
+        needs_setup:
+          type: boolean
+          description: True while this server has no administrator and is offering to create one. False from the moment one exists, however it came to.
+    SetupRequest:
+      type: object
+      required:
+      - setup_token
+      - username
+      - password
+      properties:
+        setup_token:
+          type: string
+          description: The token from the setup link in the server's log.
+        username:
+          type: string
+          description: The localpart of the account to create, `alice` for `@alice:example.org`. A full user ID on this server is accepted too.
+        password:
+          type: string
+          description: Checked against the server's password policy.
+    SetupSession:
+      type: object
+      required:
+      - user_id
+      - access_token
+      - device_id
+      properties:
+        user_id:
+          type: string
+        access_token:
+          type: string
+          description: An ordinary access token for the new account, which, being an administrator's, this API accepts.
+        device_id:
           type: string
     ServerHealth:
       type: object

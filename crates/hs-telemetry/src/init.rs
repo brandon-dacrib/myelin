@@ -138,6 +138,18 @@ impl Drop for Guard {
     }
 }
 
+/// Whether the text log format should colour its output.
+///
+/// `tracing-subscriber` colours by default whatever it is writing to, which is right for a
+/// terminal and wrong everywhere a server's log actually ends up: `docker logs`, `kubectl logs`,
+/// journald and a redirected file all got `\x1b[2m` sequences through every line -- including
+/// between a field's name and its value, so `grep setup_link=` found nothing in a log that
+/// plainly contained it. Colour is for a terminal, and not even there if `NO_COLOR` is set to
+/// anything non-empty (<https://no-color.org>).
+fn use_color(stdout_is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
+    stdout_is_terminal && no_color.is_none_or(std::ffi::OsStr::is_empty)
+}
+
 /// Installs the global [`tracing`] subscriber: an env-filter built from [`Options::level`]
 /// (overridable by `RUST_LOG`), a JSON or Synapse-like text formatting layer, and — when this
 /// crate is compiled with the matching feature and the option is set — an OpenTelemetry OTLP
@@ -178,6 +190,10 @@ pub fn init(options: &Options) -> Result<Guard, TelemetryError> {
                 ),
             ))
             .with_target(true)
+            .with_ansi(use_color(
+                std::io::IsTerminal::is_terminal(&std::io::stdout()),
+                std::env::var_os("NO_COLOR").as_deref(),
+            ))
     });
 
     let registry = tracing_subscriber::registry()
@@ -289,6 +305,22 @@ mod tests {
         // Asking for more is asking for everything.
         let debug = lines_at(Level::Debug);
         assert!(debug.contains("Finished ingestion writer"), "{debug}");
+    }
+
+    #[test]
+    fn colour_is_for_terminals_that_have_not_asked_otherwise() {
+        use std::ffi::OsStr;
+        assert!(use_color(true, None));
+        assert!(
+            use_color(true, Some(OsStr::new(""))),
+            "an empty NO_COLOR is not set"
+        );
+        assert!(!use_color(true, Some(OsStr::new("1"))));
+        assert!(
+            !use_color(false, None),
+            "a pipe or a file is not a terminal"
+        );
+        assert!(!use_color(false, Some(OsStr::new(""))));
     }
 
     // `init` itself installs a *global* subscriber, so it is exercised by the `hs-cli`

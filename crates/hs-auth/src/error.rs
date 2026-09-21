@@ -292,6 +292,12 @@ impl MatrixError {
     pub fn status(&self) -> StatusCode {
         self.status
     }
+
+    /// The human-readable `error` text this error carries.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.error
+    }
 }
 
 impl std::fmt::Display for MatrixError {

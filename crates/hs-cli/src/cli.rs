@@ -645,6 +645,15 @@ async fn run_serve(args: &ServeArgs) -> i32 {
     for addr in &handle.addrs {
         tracing::info!(%addr, "listening");
     }
+    if let Some(link) = &handle.setup_link {
+        // `warn`, not `info`: it is the one line of a first boot the operator must act on, and
+        // it should survive a deployment that has turned the log level down. It stops appearing
+        // the moment an administrator exists.
+        tracing::warn!(
+            setup_link = %link,
+            "this server has no administrator yet: open the setup link to create one. It works once, for whoever opens it first"
+        );
+    }
 
     wait_for_shutdown_signal().await;
     tracing::info!("shutdown signal received, draining connections");

@@ -857,6 +857,24 @@
     },
     {
       "method": "GET",
+      "path": "/setup",
+      "operation_id": "setup.get",
+      "scope": null,
+      "public": true,
+      "tag": "Setup",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/setup",
+      "operation_id": "setup.create",
+      "scope": null,
+      "public": true,
+      "tag": "Setup",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
       "path": "/statistics/overview",
       "operation_id": "statistics.overview",
       "scope": "admin:read",

@@ -498,6 +498,43 @@ pub(crate) async fn uia_operations_on_missing_session_are_not_found<S: AuthStore
 /// Runs every shared test body against `make_store`, a factory so each test gets a fresh, empty
 /// store (some backends, like `TablesAuthStore` over a real `hs-kv` backend, are not cheap to
 /// reset in place). Call this once per store implementation from a single `#[tokio::test]`.
+pub(crate) async fn setup_token_is_absent_until_inserted_and_the_first_insert_wins<S: AuthStore>(
+    s: &S,
+) {
+    assert_eq!(s.setup_token().await.unwrap(), None);
+    assert_eq!(s.setup_token_or_insert("first").await.unwrap(), "first");
+    // A second replica booting with its own candidate is told the first one's.
+    assert_eq!(s.setup_token_or_insert("second").await.unwrap(), "first");
+    assert_eq!(s.setup_token().await.unwrap().as_deref(), Some("first"));
+}
+
+pub(crate) async fn setup_token_is_consumed_once_and_only_by_the_right_token<S: AuthStore>(s: &S) {
+    // Nothing stored: nothing to consume, and in particular the empty string does not match
+    // "no token".
+    assert!(!s.consume_setup_token("").await.unwrap());
+    assert!(!s.consume_setup_token("anything").await.unwrap());
+
+    s.setup_token_or_insert("right").await.unwrap();
+    assert!(!s.consume_setup_token("wrong").await.unwrap());
+    assert!(!s.consume_setup_token("righ").await.unwrap());
+    assert!(!s.consume_setup_token("right ").await.unwrap());
+    // A wrong guess does not burn the token.
+    assert_eq!(s.setup_token().await.unwrap().as_deref(), Some("right"));
+
+    assert!(s.consume_setup_token("right").await.unwrap());
+    assert!(!s.consume_setup_token("right").await.unwrap());
+    assert_eq!(s.setup_token().await.unwrap(), None);
+}
+
+pub(crate) async fn clear_setup_token_withdraws_it_and_is_idempotent<S: AuthStore>(s: &S) {
+    s.clear_setup_token().await.unwrap();
+    s.setup_token_or_insert("token").await.unwrap();
+    s.clear_setup_token().await.unwrap();
+    assert_eq!(s.setup_token().await.unwrap(), None);
+    assert!(!s.consume_setup_token("token").await.unwrap());
+    s.clear_setup_token().await.unwrap();
+}
+
 pub(crate) async fn run_all<S: AuthStore>(make_store: impl Fn() -> S) {
     create_user_then_get_round_trips(&make_store()).await;
     create_user_conflict_is_case_insensitive(&make_store()).await;
@@ -527,4 +564,7 @@ pub(crate) async fn run_all<S: AuthStore>(make_store: impl Fn() -> S) {
     uia_session_tracks_completed_stages_and_data(&make_store()).await;
     uia_session_exists_is_false_for_unknown_id(&make_store()).await;
     uia_operations_on_missing_session_are_not_found(&make_store()).await;
+    setup_token_is_absent_until_inserted_and_the_first_insert_wins(&make_store()).await;
+    setup_token_is_consumed_once_and_only_by_the_right_token(&make_store()).await;
+    clear_setup_token_withdraws_it_and_is_idempotent(&make_store()).await;
 }

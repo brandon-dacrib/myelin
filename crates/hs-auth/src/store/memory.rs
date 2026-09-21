@@ -10,8 +10,8 @@ use rand::distr::Alphanumeric;
 use ruma::{DeviceId, OwnedDeviceId, OwnedUserId, UserId};
 
 use super::{
-    AccessTokenRecord, DeviceRecord, DeviceStore, LoginTokenRecord, RefreshTokenRecord, StoreError,
-    TokenStore, UiaStore, UserRecord, UserStore,
+    AccessTokenRecord, DeviceRecord, DeviceStore, LoginTokenRecord, RefreshTokenRecord, SetupStore,
+    StoreError, TokenStore, UiaStore, UserRecord, UserStore, tokens_match,
 };
 use crate::token::TokenHash;
 
@@ -31,6 +31,7 @@ struct Inner {
     login_tokens: HashMap<TokenHash, LoginTokenRecord>,
     uia_sessions: HashMap<String, UiaSession>,
     threepids: HashMap<(String, String), OwnedUserId>,
+    setup_token: Option<String>,
 }
 
 /// The in-memory `AuthStore`. Cheap to construct; clone the `Arc` you wrap it in, not this type.
@@ -404,6 +405,38 @@ impl TokenStore for InMemoryAuthStore {
         }
         rec.used = true;
         Ok(Some(rec.clone()))
+    }
+}
+
+#[async_trait]
+impl SetupStore for InMemoryAuthStore {
+    async fn setup_token_or_insert(&self, candidate: &str) -> Result<String, StoreError> {
+        let mut inner = self.lock();
+        Ok(inner
+            .setup_token
+            .get_or_insert_with(|| candidate.to_owned())
+            .clone())
+    }
+
+    async fn setup_token(&self) -> Result<Option<String>, StoreError> {
+        Ok(self.lock().setup_token.clone())
+    }
+
+    async fn consume_setup_token(&self, presented: &str) -> Result<bool, StoreError> {
+        let mut inner = self.lock();
+        let matches = inner
+            .setup_token
+            .as_deref()
+            .is_some_and(|stored| tokens_match(stored, presented));
+        if matches {
+            inner.setup_token = None;
+        }
+        Ok(matches)
+    }
+
+    async fn clear_setup_token(&self) -> Result<(), StoreError> {
+        self.lock().setup_token = None;
+        Ok(())
     }
 }
 

@@ -448,7 +448,42 @@ pub trait UiaStore: Send + Sync {
     ) -> Result<bool, StoreError>;
 }
 
+/// Storage for the first-run setup token: the one-time credential that lets whoever can read
+/// this server's log create its first administrator (see [`crate::setup`]).
+///
+/// The token is kept as it was minted, not hashed. It has to be printed again on every boot
+/// until somebody uses it, by every replica of a cluster, and they all have to print the same
+/// one -- and a server that still has a setup token has, by definition, no administrator and
+/// nothing behind it worth stealing. It stops existing the moment it is used.
+#[async_trait]
+pub trait SetupStore: Send + Sync {
+    /// The stored setup token, storing `candidate` first if there is none. Atomic: of any number
+    /// of replicas booting at once, each with its own candidate, all get the same answer.
+    async fn setup_token_or_insert(&self, candidate: &str) -> Result<String, StoreError>;
+
+    /// The stored setup token, if there is one. Its presence is what "this server has not been
+    /// set up" means to an unauthenticated caller, because it is one key to read -- where "no
+    /// user is an administrator" is a scan of every account, which is not something to hand
+    /// anybody who can reach the port.
+    async fn setup_token(&self) -> Result<Option<String>, StoreError>;
+
+    /// Removes the stored token if, and only if, it equals `presented`, and says whether it did.
+    /// Atomic: of any number of concurrent callers presenting the right token, exactly one gets
+    /// `true`. The comparison does not leak how much of the token matched.
+    async fn consume_setup_token(&self, presented: &str) -> Result<bool, StoreError>;
+
+    /// Removes the stored token, whatever it is. For when an administrator came to exist some
+    /// other way and the offer should be withdrawn.
+    async fn clear_setup_token(&self) -> Result<(), StoreError>;
+}
+
+/// Whether two tokens are equal, in time that depends on their lengths and nothing else.
+pub(crate) fn tokens_match(stored: &str, presented: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    stored.as_bytes().ct_eq(presented.as_bytes()).into()
+}
+
 /// The union of every storage trait this crate needs, for callers that just want "the auth
-/// store" without naming each capability. [`memory::InMemoryAuthStore`] implements all four.
-pub trait AuthStore: UserStore + DeviceStore + TokenStore + UiaStore {}
-impl<T: UserStore + DeviceStore + TokenStore + UiaStore> AuthStore for T {}
+/// store" without naming each capability. [`memory::InMemoryAuthStore`] implements all five.
+pub trait AuthStore: UserStore + DeviceStore + TokenStore + UiaStore + SetupStore {}
+impl<T: UserStore + DeviceStore + TokenStore + UiaStore + SetupStore> AuthStore for T {}

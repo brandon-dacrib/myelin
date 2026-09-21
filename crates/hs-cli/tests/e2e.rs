@@ -18,7 +18,7 @@
 
 use serde_json::json;
 
-fn test_config(port: u16, data_dir: &std::path::Path) -> hs_config::Config {
+fn test_config_yaml(port: u16, data_dir: &std::path::Path) -> String {
     // `media.storage.path` is set explicitly, not left at its default. That default is the
     // *relative* `./media-store` (`hs_config::MediaStorageBackend::Default`), which for a test is
     // the crate's working directory — so every media upload in this file used to write real bytes
@@ -26,15 +26,18 @@ fn test_config(port: u16, data_dir: &std::path::Path) -> hs_config::Config {
     // `docs/next-steps.md`'s known-gaps table). Pointing it inside the same tempdir as the
     // storage backend means the files go away with the test.
     let media_dir = data_dir.join("media");
-    let yaml = format!(
+    format!(
         "server:\n  server_name: example.org\n\
          listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health, metrics]\n\
          storage:\n  backend: embedded\n  data_dir: {:?}\n\
          media:\n  storage:\n    backend: local\n    path: {:?}\n\
          auth:\n  enable_registration: true\n",
         data_dir, media_dir
-    );
-    hs_config::Config::from_yaml(&yaml).unwrap()
+    )
+}
+
+fn test_config(port: u16, data_dir: &std::path::Path) -> hs_config::Config {
+    hs_config::Config::from_yaml(&test_config_yaml(port, data_dir)).unwrap()
 }
 
 fn reserve_ephemeral_port() -> u16 {
@@ -1051,5 +1054,331 @@ async fn a_body_that_is_not_json_is_m_not_json_on_every_route_never_plain_text()
         report.join("\n")
     );
 
+    handle.shutdown().await;
+}
+
+fn setup_token_of(link: &str) -> &str {
+    link.split_once("/admin/setup#token=")
+        .unwrap_or_else(|| panic!("not a setup link: {link}"))
+        .1
+}
+
+/// A server with no administrator says so in one place -- the link `hs serve` logs -- and that
+/// link is all it takes to get from an empty data directory to a signed-in administrator. Runs
+/// against the real on-disk store, because "exactly one of several simultaneous claims wins" is
+/// a property of its transactions, not of the in-memory fake the unit tests use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_setup_link_creates_exactly_one_administrator_however_many_ask_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let handle = hs_cli::serve::spawn_serve(
+        test_config(reserve_ephemeral_port(), dir.path()),
+        hs_cli::serve::ServeOptions::default(),
+    )
+    .await
+    .expect("server should boot");
+    let base = handle.base_url();
+    let link = handle
+        .setup_link
+        .clone()
+        .expect("a fresh server offers setup");
+    let token = setup_token_of(&link).to_owned();
+    assert_eq!(token.len(), 40);
+    assert!(token.bytes().all(|b| b.is_ascii_alphabetic()), "{token}");
+    assert!(
+        link.starts_with(&format!("http://localhost:{}/", handle.addrs[0].port())),
+        "{link}"
+    );
+    assert!(needs_setup(&client, &base).await);
+
+    // A guess is refused as a bad credential, and costs the real token nothing.
+    let response = client
+        .post(format!("{base}/api/v1/setup"))
+        .json(&json!({"setup_token": "a".repeat(40), "username": "mallory", "password": "hunter2-mallory"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/problem+json"
+    );
+
+    // Six claims at once, all carrying the right token.
+    let mut claims = Vec::new();
+    for i in 0..6 {
+        let (client, base, token) = (client.clone(), base.clone(), token.clone());
+        claims.push(tokio::spawn(async move {
+            let response = client
+                .post(format!("{base}/api/v1/setup"))
+                .json(&json!({
+                    "setup_token": token,
+                    "username": format!("admin{i}"),
+                    "password": "hunter2-first-admin",
+                }))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap();
+            (status, body)
+        }));
+    }
+    let mut sessions = Vec::new();
+    for claim in claims {
+        let (status, body) = claim.await.unwrap();
+        match status {
+            reqwest::StatusCode::CREATED => sessions.push(body),
+            reqwest::StatusCode::CONFLICT => {}
+            other => panic!("a claim answered {other}: {body}"),
+        }
+    }
+    assert_eq!(sessions.len(), 1, "exactly one claim wins: {sessions:?}");
+    let session = &sessions[0];
+    let user_id = session["user_id"].as_str().unwrap();
+    let access_token = session["access_token"].as_str().unwrap();
+
+    // The session it handed back is an administrator's, as far as the admin API is concerned...
+    let me: serde_json::Value = client
+        .get(format!("{base}/api/v1/me"))
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(me["id"], user_id, "{me}");
+    assert!(
+        me["scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s == "admin:write"),
+        "{me}"
+    );
+    let users: serde_json::Value = client
+        .get(format!("{base}/api/v1/users"))
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let admins = users["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|u| u["admin"] == true)
+        .count();
+    assert_eq!(admins, 1, "one administrator exists, not six: {users}");
+
+    // ...and the password typed into the form is the one the account signs in with afterwards.
+    let login = client
+        .post(format!("{base}/_matrix/client/v3/login"))
+        .json(&json!({
+            "type": "m.login.password",
+            "identifier": {"type": "m.id.user", "user": user_id},
+            "password": "hunter2-first-admin",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+
+    // The offer is over, including to the token that just worked.
+    assert!(!needs_setup(&client, &base).await);
+    let response = client
+        .post(format!("{base}/api/v1/setup"))
+        .json(&json!({"setup_token": token, "username": "late", "password": "hunter2-too-late"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+
+    handle.shutdown().await;
+}
+
+async fn needs_setup(client: &reqwest::Client, base: &str) -> bool {
+    let body: serde_json::Value = client
+        .get(format!("{base}/api/v1/setup"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    body["needs_setup"].as_bool().unwrap()
+}
+
+/// One run of the real `hs` binary, for what only a real process can show: what an operator
+/// reads in the log, and what survives the process ending. (An in-process server cannot be
+/// restarted over the same data directory -- its background tasks keep the store's lock until
+/// the process exits.)
+struct HsProcess {
+    child: std::process::Child,
+    lines: std::sync::mpsc::Receiver<String>,
+    seen: Vec<String>,
+}
+
+impl HsProcess {
+    fn serve(config_path: &std::path::Path) -> Self {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+            .args(["serve", "-c"])
+            .arg(config_path)
+            .env_remove("RUST_LOG")
+            .env_remove("HS_DATA_DIR")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("the hs binary should start");
+        let stdout = child.stdout.take().unwrap();
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            child,
+            lines,
+            seen: Vec::new(),
+        }
+    }
+
+    /// Reads the log until a line contains `needle`. A condition, not a duration: the timeout
+    /// only bounds how long a broken server can hang the suite.
+    fn wait_for(&mut self, needle: &str) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok(line) => {
+                    self.seen.push(line.clone());
+                    if line.contains(needle) {
+                        return line;
+                    }
+                }
+                Err(_) => panic!(
+                    "the log never said {needle:?}; it said:\n{}",
+                    self.seen.join("\n")
+                ),
+            }
+        }
+    }
+
+    /// Asks the server to stop the way `docker stop` or Kubernetes would, waits for it to, and
+    /// returns everything it logged.
+    fn stop(mut self) -> String {
+        let pid = self.child.id().to_string();
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid])
+            .status();
+        let _ = self.child.wait();
+        while let Ok(line) = self.lines.recv() {
+            self.seen.push(line);
+        }
+        self.seen.join("\n")
+    }
+}
+
+impl Drop for HsProcess {
+    fn drop(&mut self) {
+        // Only reached with the child still running when a test panicked; `stop` has already
+        // waited otherwise, and killing an exited child is a harmless error.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// What the operator actually sees and does, with the real binary: the link is in the log, the
+/// same link is in the log after a restart, using it works, and then it is never logged again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_real_binary_logs_the_same_setup_link_until_it_is_used_and_never_after() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = reserve_ephemeral_port();
+    let config_path = dir.path().join("homeserver.yaml");
+    std::fs::write(
+        &config_path,
+        test_config_yaml(port, &dir.path().join("data")),
+    )
+    .unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+
+    let mut first = HsProcess::serve(&config_path);
+    let line = first.wait_for("setup_link=");
+    assert!(
+        line.contains("WARN"),
+        "the one line to act on should stand out: {line}"
+    );
+    let link = line.split_once("setup_link=").unwrap().1;
+    let token: String = setup_token_of(link)
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect();
+    assert_eq!(token.len(), 40, "{line}");
+    assert!(
+        link.starts_with(&format!("http://localhost:{port}/admin/setup#token=")),
+        "{line}"
+    );
+    first.stop();
+
+    // A restart before anybody has used it: yesterday's link still works, because it is the
+    // same link.
+    let mut second = HsProcess::serve(&config_path);
+    let line = second.wait_for("setup_link=");
+    assert!(
+        line.contains(&token),
+        "the token changed across a restart: {line}"
+    );
+
+    let response = client
+        .post(format!("{base}/api/v1/setup"))
+        .json(&json!({"setup_token": token, "username": "ops", "password": "hunter2-first-admin"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let log = second.stop();
+    assert!(
+        !log.contains("hunter2-first-admin"),
+        "the password reached the log"
+    );
+
+    // And now there is an administrator, so there is no offer and nothing to log.
+    let mut third = HsProcess::serve(&config_path);
+    third.wait_for("listening");
+    assert!(!needs_setup(&client, &base).await);
+    let log = third.stop();
+    assert!(
+        !log.contains("setup_link"),
+        "setup was offered again:\n{log}"
+    );
+    assert!(log.contains("listening"));
+}
+
+/// With `server.public_baseurl` set, the link is one the operator's browser can actually open:
+/// the address the server is reached at, not the one it happens to be bound to.
+#[tokio::test]
+async fn the_setup_link_is_rooted_at_the_public_base_url_when_there_is_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(reserve_ephemeral_port(), dir.path());
+    config.server.public_baseurl = Some("https://matrix.example.org/".to_owned());
+    let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
+        .await
+        .expect("server should boot");
+    let link = handle.setup_link.clone().unwrap();
+    assert!(
+        link.starts_with("https://matrix.example.org/admin/setup#token="),
+        "{link}"
+    );
     handle.shutdown().await;
 }

@@ -36,8 +36,8 @@ use ruma::{DeviceId, OwnedUserId, UserId};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AccessTokenRecord, DeviceRecord, DeviceStore, LoginTokenRecord, RefreshTokenRecord, StoreError,
-    TokenStore, UiaStore, UserRecord, UserStore,
+    AccessTokenRecord, DeviceRecord, DeviceStore, LoginTokenRecord, RefreshTokenRecord, SetupStore,
+    StoreError, TokenStore, UiaStore, UserRecord, UserStore, tokens_match,
 };
 use crate::token::TokenHash;
 
@@ -126,6 +126,8 @@ pub struct TablesAuthStore<B: KvBackend> {
     login_tokens: TypedKeyspace<B::Keyspace, (String,)>,
     uia_sessions: TypedKeyspace<B::Keyspace, (String,)>,
     threepids: TypedKeyspace<B::Keyspace, (String, String)>,
+    /// One row at most, under [`SETUP_TOKEN_KEY`].
+    setup: TypedKeyspace<B::Keyspace, (String,)>,
 }
 
 impl<B: KvBackend> TablesAuthStore<B> {
@@ -161,6 +163,7 @@ impl<B: KvBackend> TablesAuthStore<B> {
         let login_tokens = TypedKeyspace::new(open("hs_auth.login_tokens")?);
         let uia_sessions = TypedKeyspace::new(open("hs_auth.uia_sessions")?);
         let threepids = TypedKeyspace::new(open("hs_auth.threepids")?);
+        let setup = TypedKeyspace::new(open("hs_auth.setup")?);
         Ok(Self {
             backend,
             users,
@@ -173,6 +176,7 @@ impl<B: KvBackend> TablesAuthStore<B> {
             login_tokens,
             uia_sessions,
             threepids,
+            setup,
         })
     }
 
@@ -740,6 +744,66 @@ impl<B: KvBackend> TokenStore for TablesAuthStore<B> {
                 .map_err(|e| KvError::backend(DecodeFail(e.to_string())))?;
             self.login_tokens.put(txn, &key, &value).map_err(to_kv)?;
             Ok(Some(record))
+        })
+        .map_err(store_err)
+    }
+}
+
+/// The only key in the `hs_auth.setup` keyspace.
+const SETUP_TOKEN_KEY: &str = "token";
+
+fn decode_setup_token(bytes: &[u8]) -> Result<String, KvError> {
+    String::from_utf8(bytes.to_vec()).map_err(|e| KvError::backend(DecodeFail(e.to_string())))
+}
+
+#[async_trait::async_trait]
+impl<B: KvBackend> SetupStore for TablesAuthStore<B> {
+    async fn setup_token_or_insert(&self, candidate: &str) -> Result<String, StoreError> {
+        let key = (SETUP_TOKEN_KEY.to_owned(),);
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            if let Some(bytes) = self.setup.get(txn, &key).map_err(to_kv)? {
+                return decode_setup_token(&bytes);
+            }
+            self.setup
+                .put(txn, &key, candidate.as_bytes())
+                .map_err(to_kv)?;
+            Ok(candidate.to_owned())
+        })
+        .map_err(store_err)
+    }
+
+    async fn setup_token(&self) -> Result<Option<String>, StoreError> {
+        let snap = self.backend.snapshot();
+        let key = (SETUP_TOKEN_KEY.to_owned(),);
+        match self
+            .setup
+            .get(&snap, &key)
+            .map_err(|e| StoreError::Backend(e.to_string()))?
+        {
+            Some(bytes) => Ok(Some(decode_setup_token(&bytes).map_err(store_err)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn consume_setup_token(&self, presented: &str) -> Result<bool, StoreError> {
+        let key = (SETUP_TOKEN_KEY.to_owned(),);
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let Some(bytes) = self.setup.get(txn, &key).map_err(to_kv)? else {
+                return Ok(false);
+            };
+            if !tokens_match(&decode_setup_token(&bytes)?, presented) {
+                return Ok(false);
+            }
+            self.setup.delete(txn, &key).map_err(to_kv)?;
+            Ok(true)
+        })
+        .map_err(store_err)
+    }
+
+    async fn clear_setup_token(&self) -> Result<(), StoreError> {
+        let key = (SETUP_TOKEN_KEY.to_owned(),);
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            self.setup.delete(txn, &key).map_err(to_kv)
         })
         .map_err(store_err)
     }

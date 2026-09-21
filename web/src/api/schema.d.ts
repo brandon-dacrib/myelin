@@ -1439,6 +1439,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/setup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Whether this server still needs its first administrator
+         * @description Unauthenticated, because it is what the management interface asks before anybody can sign in, to decide between showing a sign-in form and pointing at the setup link. It says only whether the offer is open, never the token.
+         */
+        get: operations["setup.get"];
+        put?: never;
+        /**
+         * Create the first administrator
+         * @description Unauthenticated by bearer token, because there is nobody to have one yet. The credential is the setup token in the body, which the server writes to its log at every start for as long as it has no administrator; whoever can read the log can claim the server. It works once. The response is a signed-in session for the new account, so the interface does not have to ask for the password a second time.
+         */
+        post: operations["setup.create"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/statistics/overview": {
         parameters: {
             query?: never;
@@ -2632,6 +2656,24 @@ export interface components {
         };
         SessionPage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["Session"][];
+        };
+        SetupRequest: {
+            /** @description Checked against the server's password policy. */
+            password: string;
+            /** @description The token from the setup link in the server's log. */
+            setup_token: string;
+            /** @description The localpart of the account to create, `alice` for `@alice:example.org`. A full user ID on this server is accepted too. */
+            username: string;
+        };
+        SetupSession: {
+            /** @description An ordinary access token for the new account, which, being an administrator's, this API accepts. */
+            access_token: string;
+            device_id: string;
+            user_id: string;
+        };
+        SetupStatus: {
+            /** @description True while this server has no administrator and is offering to create one. False from the moment one exists, however it came to. */
+            needs_setup: boolean;
         };
         Shard: {
             id?: string;
@@ -6224,6 +6266,59 @@ export interface operations {
             };
             401: components["responses"]["Unauthenticated"];
             403: components["responses"]["InsufficientScope"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "setup.get": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Whether setup is open. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SetupStatus"];
+                };
+            };
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "setup.create": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetupRequest"];
+            };
+        };
+        responses: {
+            /** @description The administrator was created, and this is a session for them. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SetupSession"];
+                };
+            };
+            400: components["responses"]["ValidationFailed"];
+            401: components["responses"]["Unauthenticated"];
+            409: components["responses"]["Conflict"];
             429: components["responses"]["RateLimited"];
             500: components["responses"]["Internal"];
             503: components["responses"]["Unavailable"];

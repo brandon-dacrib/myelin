@@ -20,7 +20,7 @@ use serde_json::{Map, Value};
 
 use crate::model::{
     AdminRoom, AdminUser, ConfigChange, ConfigReloadReport, ConfigSection, ConfigValidateReport,
-    ExternalId, ThreePid,
+    ExternalId, SetupRequest, SetupSession, ThreePid,
 };
 
 /// Why a data-source call failed. Mirrors [`crate::auth::AuthError`]'s "only unavailable escapes
@@ -942,6 +942,142 @@ impl ConfigSource for InMemoryConfigSource {
             .take(limit)
             .cloned()
             .collect())
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// First-run setup: creating the first administrator on a server that has none.
+// -------------------------------------------------------------------------------------------
+
+/// Why `POST /setup` did not create an administrator.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SetupError {
+    /// An administrator already exists, so there is nothing to set up. `409 conflict`.
+    #[error("this server already has an administrator")]
+    Closed,
+    /// The setup token is not the one this server is offering. `401 unauthenticated`: the token
+    /// is this operation's credential.
+    #[error("that is not this server's setup token")]
+    BadToken,
+    /// A field of the request cannot be used. `400 validation-failed`, with `pointer` naming the
+    /// field so the interface can put the message beside it.
+    #[error("{detail}")]
+    Invalid {
+        /// A JSON pointer into the request body, `/username` or `/password`.
+        pointer: &'static str,
+        detail: String,
+    },
+    /// The store could not be reached. `503 unavailable`.
+    #[error("setup is temporarily unavailable: {0}")]
+    Unavailable(String),
+}
+
+impl SetupError {
+    /// Maps this error onto the RFC 9457 problem catalog.
+    pub fn to_problem(&self) -> hs_http::Problem {
+        match self {
+            SetupError::Closed => hs_http::Problem::conflict().with_detail(self.to_string()),
+            SetupError::BadToken => {
+                hs_http::Problem::unauthenticated().with_detail(self.to_string())
+            }
+            SetupError::Invalid { pointer, detail } => hs_http::Problem::validation_failed()
+                .with_detail(detail.clone())
+                .with_errors(vec![hs_http::ValidationError::new(
+                    *pointer,
+                    detail.clone(),
+                )]),
+            SetupError::Unavailable(detail) => {
+                hs_http::Problem::unavailable().with_detail(detail.clone())
+            }
+        }
+    }
+}
+
+/// What `GET /setup` and `POST /setup` call. The real implementation is track 07's
+/// (`hs_auth::setup`), because creating an account and signing it in are that crate's business;
+/// this crate only owns the HTTP shape.
+///
+/// # Contract for implementors
+///
+/// - `needs_setup` must be cheap. It is answered to anybody who can reach the port, so it must
+///   not be a scan of every account.
+/// - `create_first_admin` must check the token before it reveals anything else: a caller without
+///   it must not be able to learn whether a username is taken or what the password policy is.
+/// - It must succeed at most once, however many callers present the right token at once.
+/// - It must refuse with [`SetupError::Closed`] when an administrator exists, even if a token is
+///   somehow still outstanding, and withdraw the token when it does.
+#[async_trait]
+pub trait SetupSource: Send + Sync + 'static {
+    async fn needs_setup(&self) -> Result<bool, SourceError>;
+    async fn create_first_admin(&self, request: SetupRequest) -> Result<SetupSession, SetupError>;
+}
+
+/// A [`SetupSource`] over one token held in memory, for this crate's tests and `hs-admin-mock`.
+/// It honours the contract above, but its "account" is only the session it hands back.
+pub struct InMemorySetupSource {
+    token: RwLock<Option<String>>,
+    server_name: String,
+}
+
+impl InMemorySetupSource {
+    /// A server named `server_name` that needs setting up and is offering `token`.
+    pub fn open(server_name: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            token: RwLock::new(Some(token.into())),
+            server_name: server_name.into(),
+        }
+    }
+
+    /// A server that already has an administrator.
+    pub fn closed(server_name: impl Into<String>) -> Self {
+        Self {
+            token: RwLock::new(None),
+            server_name: server_name.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl SetupSource for InMemorySetupSource {
+    async fn needs_setup(&self) -> Result<bool, SourceError> {
+        Ok(self
+            .token
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some())
+    }
+
+    async fn create_first_admin(&self, request: SetupRequest) -> Result<SetupSession, SetupError> {
+        let mut token = self
+            .token
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(current) = token.as_deref() else {
+            return Err(SetupError::Closed);
+        };
+        if current != request.setup_token {
+            return Err(SetupError::BadToken);
+        }
+        let localpart = request.username.trim().trim_start_matches('@');
+        let localpart = localpart.split(':').next().unwrap_or_default();
+        if localpart.is_empty() {
+            return Err(SetupError::Invalid {
+                pointer: "/username",
+                detail: "a username is required".to_owned(),
+            });
+        }
+        if request.password.len() < 8 {
+            return Err(SetupError::Invalid {
+                pointer: "/password",
+                detail: "the password must be at least 8 characters".to_owned(),
+            });
+        }
+        *token = None;
+        Ok(SetupSession {
+            user_id: format!("@{}:{}", localpart.to_ascii_lowercase(), self.server_name),
+            access_token: format!("syt_mock_{}", crate::model::new_id()),
+            device_id: "SETUP".to_owned(),
+        })
     }
 }
 

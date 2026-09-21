@@ -239,6 +239,53 @@ pub enum PrincipalKind {
     Legacy,
 }
 
+/// The OpenAPI `SetupStatus` schema: the body of `GET /setup`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupStatus {
+    /// True while this server has no administrator and is offering to create one.
+    pub needs_setup: bool,
+}
+
+/// The OpenAPI `SetupRequest` schema: the body of `POST /setup`.
+///
+/// `Debug` is written by hand so that neither the setup token nor the password can reach a log
+/// line through a stray `{:?}`.
+#[derive(Clone, Deserialize)]
+pub struct SetupRequest {
+    pub setup_token: String,
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for SetupRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetupRequest")
+            .field("setup_token", &"<redacted>")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The OpenAPI `SetupSession` schema: the body of a successful `POST /setup`, a signed-in
+/// session for the administrator it just created.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SetupSession {
+    pub user_id: String,
+    pub access_token: String,
+    pub device_id: String,
+}
+
+impl std::fmt::Debug for SetupSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetupSession")
+            .field("user_id", &self.user_id)
+            .field("access_token", &"<redacted>")
+            .field("device_id", &self.device_id)
+            .finish()
+    }
+}
+
 /// The OpenAPI `User` schema (`crates/hs-admin/openapi/openapi.yaml`): one row of `GET /users`
 /// and the body of `GET /users/{user_id}`. Field-for-field match with that schema. Served by
 /// whatever implements [`crate::sources::UserDirectory`] (track 07's real implementation, or

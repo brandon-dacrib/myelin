@@ -43,6 +43,7 @@ pub mod reauth;
 pub mod requester;
 pub mod routes;
 pub mod session;
+pub mod setup;
 pub mod shared_secret_auth;
 pub mod state;
 pub mod store;

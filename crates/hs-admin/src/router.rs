@@ -30,13 +30,14 @@ use crate::auth::{ScopeDecision, TokenVerifier, require_scope};
 use crate::events::{EventBus, ReplayOutcome};
 use crate::idempotency::{IdempotencyStore, Replay, StoredResponse};
 use crate::model::{
-    AuditChange, AuditEntry, AuditOutcome, ConfigSchema, ConfigSection, ConfigSectionInfo,
-    ConfigSettingInfo, Event, Page, Principal, ResourceRef, Scope, ServerHealth, ServerInfo,
+    Actor, ActorKind, AuditChange, AuditEntry, AuditOutcome, ConfigSchema, ConfigSection,
+    ConfigSectionInfo, ConfigSettingInfo, Event, Page, Principal, ResourceRef, Scope, ServerHealth,
+    ServerInfo, SetupRequest, SetupStatus,
 };
 use crate::operations::{OperationDef, load as load_operations};
 use crate::sources::{
-    ConfigPatch, ConfigSource, RoomDirectory, RoomFilter, SourceError, UserCreateRequest,
-    UserDirectory, UserFilter, UserLookupQuery,
+    ConfigPatch, ConfigSource, RoomDirectory, RoomFilter, SetupSource, SourceError,
+    UserCreateRequest, UserDirectory, UserFilter, UserLookupQuery,
 };
 
 /// Everything an `hs-admin` handler needs. Cloned per-request by axum (cheap: everything inside
@@ -69,6 +70,10 @@ pub struct AdminState {
     /// those operations answer `503 unavailable`, because a management interface that cannot
     /// reach the configuration should say so rather than show an empty form.
     pub config: Option<Arc<dyn ConfigSource>>,
+    /// What `GET /setup` and `POST /setup` call to create the first administrator. `None` until
+    /// wired with [`AdminState::with_setup`]; until then `GET /setup` says no setup is on offer
+    /// (which is true: nothing here could perform one) and `POST /setup` answers `503`.
+    pub setup: Option<Arc<dyn SetupSource>>,
     /// The `Idempotency-Key` cache every mutating handler that declares it consults (see
     /// [`crate::idempotency`]). Always present (never `None`): a client is never told its
     /// idempotency key was ignored.
@@ -91,6 +96,7 @@ impl AdminState {
             users: None,
             rooms: None,
             config: None,
+            setup: None,
             idempotency: Arc::new(IdempotencyStore::new()),
         }
     }
@@ -116,6 +122,14 @@ impl AdminState {
     #[must_use]
     pub fn with_config(mut self, config: Arc<dyn ConfigSource>) -> Self {
         self.config = Some(config);
+        self
+    }
+
+    /// Wires a real [`SetupSource`], which is what lets a server with no administrator be given
+    /// one from the management interface.
+    #[must_use]
+    pub fn with_setup(mut self, setup: Arc<dyn SetupSource>) -> Self {
+        self.setup = Some(setup);
         self
     }
 
@@ -2436,6 +2450,96 @@ async fn serve_openapi_json(State(state): State<AdminState>) -> Response {
     }
 }
 
+// -------------------------------------------------------------------------------------------
+// First-run setup. The only two operations besides the OpenAPI document that take no bearer
+// token: `GET /setup` because the interface asks it before anybody can sign in, and
+// `POST /setup` because its credential is the setup token in the body.
+// -------------------------------------------------------------------------------------------
+
+async fn setup_get(State(state): State<AdminState>) -> Response {
+    let instance = "/api/v1/setup";
+    let needs_setup = match &state.setup {
+        // Nothing wired means nothing here can perform a setup, so none is on offer. Saying
+        // `true` would send an operator looking for a link this server never printed.
+        None => false,
+        Some(setup) => match setup.needs_setup().await {
+            Ok(v) => v,
+            Err(e) => return e.to_problem().with_instance(instance).into_response(),
+        },
+    };
+    (
+        StatusCode::OK,
+        // The answer changes exactly once, and the interface must not keep showing a setup page
+        // for a server somebody has just claimed.
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        axum::Json(SetupStatus { needs_setup }),
+    )
+        .into_response()
+}
+
+async fn setup_create(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
+    let instance = "/api/v1/setup";
+    let Some(setup) = &state.setup else {
+        return source_unavailable("first-run setup", instance);
+    };
+    let request: SetupRequest = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            // `e` names a position and a field, never a value, so it cannot echo the token or
+            // the password back.
+            return Problem::validation_failed()
+                .with_detail(format!("invalid JSON body: {e}"))
+                .with_instance(instance)
+                .into_response();
+        }
+    };
+
+    let session = match setup.create_first_admin(request).await {
+        Ok(session) => session,
+        Err(e) => return e.to_problem().with_instance(instance).into_response(),
+    };
+
+    // The actor is the account that now exists: there was nobody before it to have done this.
+    let actor = Actor {
+        kind: ActorKind::User,
+        id: session.user_id.clone(),
+        display_name: None,
+        token_id: None,
+        ip: None,
+        user_agent: None,
+    };
+    let target = ResourceRef::new("user", session.user_id.clone());
+    let mut entry = AuditEntry::new(
+        "setup.create",
+        actor.clone(),
+        target.clone(),
+        AuditOutcome::success(201),
+    );
+    entry.changes = vec![AuditChange {
+        pointer: "/admin".to_string(),
+        from: None,
+        to: Some(json!(true)),
+    }];
+    // The account exists whether or not this write lands, and refusing to hand over its session
+    // would lock the operator out of the server they just claimed. So unlike every other
+    // mutation, a failed audit write here is logged rather than turned into a `503`.
+    if let Err(e) = state.audit.append(entry).await {
+        tracing::error!(error = %e, user_id = %session.user_id, "the first administrator was created but the audit entry for it could not be written");
+    }
+    state.events.publish(
+        Event::new("setup.completed", json!({ "user_id": session.user_id }))
+            .with_resource(target)
+            .with_actor(actor),
+    );
+
+    (
+        StatusCode::CREATED,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        axum::Json(session),
+    )
+        .into_response()
+}
+
 /// Builds the full router: every declared `/api/v1` operation (enforced but not implemented),
 /// the OpenAPI document endpoints, and `/admin/` static assets (`crate::assets`). Returns the
 /// manifest alongside so callers can write `routes.json` (RFC 0005) or run the contract check.
@@ -2443,8 +2547,8 @@ pub fn build_router(state: AdminState) -> (axum::Router, RouteManifest) {
     let mut builder: Builder<AdminState> = Builder::new();
 
     for op in load_operations() {
-        // The two `public` operations (the OpenAPI document itself) are registered below with
-        // their real handlers; every other operation gets either a real handler (`REAL_HANDLERS`)
+        // The `public` operations (the OpenAPI document itself, and first-run setup) are
+        // registered below with their real handlers; every other operation gets either a real handler (`REAL_HANDLERS`)
         // or the generic 501 handler.
         if op.public {
             continue;
@@ -2467,6 +2571,20 @@ pub fn build_router(state: AdminState) -> (axum::Router, RouteManifest) {
         "/api/v1/openapi.json",
         serve_openapi_json,
         RouteMeta::new(Surface::Admin, AuthKind::None),
+    );
+    builder = builder.add(
+        axum::http::Method::GET,
+        "/api/v1/setup",
+        setup_get,
+        RouteMeta::new(Surface::Admin, AuthKind::None).with_operation_id("setup.get"),
+    );
+    builder = builder.add(
+        axum::http::Method::POST,
+        "/api/v1/setup",
+        setup_create,
+        RouteMeta::new(Surface::Admin, AuthKind::None)
+            .with_operation_id("setup.create")
+            .rate_limited(),
     );
 
     let (router, manifest) = builder.build();
@@ -4849,5 +4967,194 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // First-run setup.
+    // ---------------------------------------------------------------------------------------
+
+    fn state_needing_setup(audit: Arc<InMemoryAuditSink>) -> AdminState {
+        use crate::sources::InMemorySetupSource;
+        AdminState::new(
+            Arc::new(StaticVerifier::new()),
+            audit,
+            Arc::new(EventBus::new()),
+        )
+        .with_setup(Arc::new(InMemorySetupSource::open(
+            "example.org",
+            "the-setup-token",
+        )))
+    }
+
+    async fn setup_status(router: &axum::Router) -> serde_json::Value {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/setup")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn post_setup(
+        router: &axum::Router,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/setup")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn setup_status_needs_no_token_and_is_false_when_nothing_can_perform_one() {
+        // `test_state` wires no setup source at all.
+        let (router, _manifest) = build_router(test_state());
+        assert_eq!(setup_status(&router).await, json!({"needs_setup": false}));
+
+        let (router, _manifest) =
+            build_router(state_needing_setup(Arc::new(InMemoryAuditSink::new())));
+        assert_eq!(setup_status(&router).await, json!({"needs_setup": true}));
+    }
+
+    #[tokio::test]
+    async fn setup_creates_the_first_administrator_once_and_records_who() {
+        let audit = Arc::new(InMemoryAuditSink::new());
+        let (router, _manifest) = build_router(state_needing_setup(audit.clone()));
+
+        let (status, session) = post_setup(
+            &router,
+            json!({"setup_token": "the-setup-token", "username": "Ops", "password": "correct horse"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{session}");
+        assert_eq!(session["user_id"], "@ops:example.org");
+        assert!(
+            session["access_token"]
+                .as_str()
+                .is_some_and(|t| !t.is_empty())
+        );
+
+        // The offer is closed from that moment, to the status check and to a second attempt
+        // with the very same token.
+        assert_eq!(setup_status(&router).await, json!({"needs_setup": false}));
+        let (status, problem) = post_setup(
+            &router,
+            json!({"setup_token": "the-setup-token", "username": "mallory", "password": "correct horse"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{problem}");
+
+        let entries = audit
+            .query(&AuditFilter {
+                action: Some("setup.create".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1, "exactly one setup is ever recorded");
+        assert_eq!(entries[0].actor.id, "@ops:example.org");
+        assert_eq!(entries[0].target.id, "@ops:example.org");
+    }
+
+    #[tokio::test]
+    async fn setup_with_the_wrong_token_is_401_and_does_not_close_the_offer() {
+        let (router, _manifest) =
+            build_router(state_needing_setup(Arc::new(InMemoryAuditSink::new())));
+        let (status, problem) = post_setup(
+            &router,
+            json!({"setup_token": "a-guess", "username": "mallory", "password": "correct horse"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{problem}");
+        assert!(
+            problem["type"]
+                .as_str()
+                .unwrap()
+                .ends_with("unauthenticated")
+        );
+        assert_eq!(setup_status(&router).await, json!({"needs_setup": true}));
+    }
+
+    #[tokio::test]
+    async fn setup_names_the_field_it_could_not_use_and_never_echoes_a_secret() {
+        let (router, _manifest) =
+            build_router(state_needing_setup(Arc::new(InMemoryAuditSink::new())));
+        let (status, problem) = post_setup(
+            &router,
+            json!({"setup_token": "the-setup-token", "username": "ops", "password": "short"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+        assert_eq!(problem["errors"][0]["pointer"], "/password");
+        // A refused request leaves the offer open for the corrected one.
+        assert_eq!(setup_status(&router).await, json!({"needs_setup": true}));
+
+        // A body of the wrong shape is refused without quoting any of it back.
+        let (status, problem) = post_setup(
+            &router,
+            json!({"setup_token": "the-setup-token", "username": 7, "password": "hunter2-secret"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let text = problem.to_string();
+        assert!(!text.contains("the-setup-token"), "{text}");
+        assert!(!text.contains("hunter2-secret"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn setup_create_without_a_source_is_503_not_a_silent_success() {
+        let (router, _manifest) = build_router(test_state());
+        let (status, _problem) = post_setup(
+            &router,
+            json!({"setup_token": "x", "username": "ops", "password": "correct horse"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn setup_secrets_do_not_survive_debug_formatting() {
+        let request = SetupRequest {
+            setup_token: "the-setup-token".into(),
+            username: "ops".into(),
+            password: "hunter2-secret".into(),
+        };
+        let text = format!("{request:?}");
+        assert!(text.contains("ops"));
+        assert!(
+            !text.contains("the-setup-token") && !text.contains("hunter2-secret"),
+            "{text}"
+        );
+
+        let session = crate::model::SetupSession {
+            user_id: "@ops:example.org".into(),
+            access_token: "syt_secret".into(),
+            device_id: "SETUP".into(),
+        };
+        assert!(!format!("{session:?}").contains("syt_secret"));
     }
 }

@@ -584,6 +584,7 @@ fn admin_state<B: KvBackend + 'static>(
     server_name: &str,
     enabled_components: Vec<String>,
     config_source: Option<Arc<dyn hs_admin::sources::ConfigSource>>,
+    setup: Arc<hs_auth::setup::FirstRunSetup>,
 ) -> hs_admin::router::AdminState {
     let state = hs_admin::router::AdminState::new(
         Arc::new(hs_auth::admin_verifier::AdminTokenVerifier::from_auth_state(auth)),
@@ -599,6 +600,9 @@ fn admin_state<B: KvBackend + 'static>(
     .with_rooms(Arc::new(hs_room::admin::RoomRegistryDirectory::new(
         rooms.clone(),
     )))
+    // What lets the management interface create this server's first administrator, instead of
+    // that taking a shared secret, `hs register --admin`, a `curl` and a pasted token.
+    .with_setup(setup)
     .with_server_info(hs_admin::model::ServerInfo {
         name: server_name.to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -772,6 +776,11 @@ pub struct ServeHandle {
     /// Every address the server ended up bound to, one per `(bind_address, port)` pair across
     /// every configured listener.
     pub addrs: Vec<SocketAddr>,
+    /// The link that creates this server's first administrator, while it has none (see
+    /// [`hs_auth::setup`]). `None` once an administrator exists. `hs serve` writes it to the log;
+    /// it is on the handle so that is one decision made in one place, and so a test can follow
+    /// the same link an operator would.
+    pub setup_link: Option<String>,
     shutdown_tx: watch::Sender<bool>,
     join: tokio::task::JoinHandle<()>,
     /// Keeps the opened storage backend alive for as long as the server is: Fjall holds an
@@ -1008,6 +1017,8 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     }
     enabled_components.sort();
 
+    let setup = Arc::new(hs_auth::setup::FirstRunSetup::from_auth_state(&auth_state));
+
     let mounts = Mounts {
         room: room_state,
         federation,
@@ -1026,6 +1037,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             server_name.as_str(),
             enabled_components,
             options.config_source.clone(),
+            setup.clone(),
         ),
     };
 
@@ -1148,14 +1160,48 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
 
     let join = tokio::spawn(async move { while tasks.join_next().await.is_some() {} });
 
+    // Asked last, once the listeners are bound, because the link needs a port that is real. A
+    // server that cannot work out whether to offer setup still serves: everything else about it
+    // is fine, and `hs register --admin` remains a way in.
+    let setup_link = match setup.offer().await {
+        Ok(token) => {
+            token.map(|token| setup_link(config.server.public_baseurl.as_deref(), &addrs, &token))
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "could not determine whether this server needs its first administrator; no setup link will be offered");
+            None
+        }
+    };
+
     Ok(ServeHandle {
         addrs,
+        setup_link,
         shutdown_tx,
         join,
         _storage: Box::new(backend.clone()),
         cluster,
         mesh,
     })
+}
+
+/// The first-run setup link for `token`.
+///
+/// Rooted at `server.public_baseurl` when the operator has said what this server is called from
+/// outside, and otherwise at `localhost` on the first bound port -- which is right for a first
+/// run on a laptop or behind `docker run -p`, the cases where nothing has been configured yet.
+///
+/// The token is in the *fragment*. Browsers do not send a fragment to the server, so the token
+/// cannot land in an access log, a reverse proxy's log or a `Referer` header on its way to the
+/// page that reads it.
+fn setup_link(public_baseurl: Option<&str>, addrs: &[SocketAddr], token: &str) -> String {
+    let base = match public_baseurl.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(url) => url.trim_end_matches('/').to_owned(),
+        None => format!(
+            "http://localhost:{}",
+            addrs.first().map_or(8008, SocketAddr::port)
+        ),
+    };
+    format!("{base}/admin/setup#token={token}")
 }
 
 /// `hs-config`'s `bind_addresses` defaults to `"::"` (all interfaces, IPv6-mapped), matching

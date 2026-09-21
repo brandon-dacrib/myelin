@@ -107,6 +107,18 @@ pub fn generate_login_token() -> String {
     format!("{base}_{crc}")
 }
 
+/// How many letters a setup token has. Each is one of 52, so 40 of them is about 228 bits:
+/// guessing it is not a way in.
+const SETUP_TOKEN_LEN: usize = 40;
+
+/// Generates a first-run setup token (see [`crate::setup`]). Letters only, so it survives being
+/// put in a URL fragment, pasted from a terminal, or read out of a JSON log line without any
+/// escaping to get wrong.
+#[must_use]
+pub fn generate_setup_token() -> String {
+    random_ascii_letters(SETUP_TOKEN_LEN)
+}
+
 fn generate_user_scoped(kind: TokenKind, localpart: &str) -> String {
     let b64local = STANDARD_NO_PAD.encode(localpart.as_bytes());
     let random = random_ascii_letters(RANDOM_LEN);
