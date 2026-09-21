@@ -196,7 +196,7 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | Config pages never checked by axe | `web` | the only e2e flow without an accessibility pass |
 | `/user_directory/search` returns every local user | `hs-auth` | display names are enumerable by any account |
 | csapi subtests lose races under parallel load | `tests` | ±2 top-level tests of run-to-run noise |
-| `a_partitioned_replica_cannot_write_after_being_fenced` is flaky on arm64 | `hs-cluster` | CI goes red about one run in three |
+| `heartbeat_seq` is derived from wall-clock milliseconds | `hs-cluster` | two ticks in one millisecond read as "no progress", i.e. death; harmless at the production 1s interval, surfaces only in tests |
 | Sytest never run | `tests/sytest` | CPAN dependencies absent |
 | `cargo fuzz` never executed | `fuzz/` | no nightly toolchain |
 
@@ -205,6 +205,6 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 - **Verify by running.** Every claim above was checked against the binary, a real client, or a conformance suite. Reports that were taken on trust have been wrong repeatedly — a "clean typecheck" with two errors, a gap reported open that had been closed hours earlier, a receipts bug that was a stale binary.
 - **Point real things at it.** Every serious bug this project has found came from Complement, a real SDK, or a real browser — never from its own tests. The signing bug had passed every test for weeks because the signer and the verifier shared the same wrong assumption.
 - **Run the gates CI runs.** `cargo test -p <crate>` cannot see what `--workspace --all-targets` sees: feature unification, cross-crate visibility, dead code. Seven consecutive red CI runs came from exactly that gap.
-- **Wait for conditions, not durations.** Five cluster tests advanced a virtual clock a fixed number of rounds and asserted a background task had kept up. They passed locally every time and failed on CI, including one that needed *real* time because the work finishes on a blocking thread.
+- **Wait for conditions, not durations — and grant real time, not just virtual time.** This has now bitten seven times. The 2026-09-21 round found the mechanism: `settle` advanced a virtual clock and called `yield_now()`, which runs async tasks at no wall-clock cost, while the work it was waiting for finishes on `spawn_blocking` threads. Thirty rounds bought 600ms of virtual time and about 30ms of real time. What matters is the *ratio* of real time granted to virtual time advanced, not the number of rounds. One test in that batch could also pass vacuously — it asserted `count > 0` on a count that is zero exactly when the thing under test never happened.
 - **Keep the repository off iCloud.** `git status` took 600 seconds there and takes 0.24 here.
 - **Registered is not working.** 24 of 142 admin operations are genuinely served; the rest answer 501, or 503 when a seam exists but nothing implements it.
