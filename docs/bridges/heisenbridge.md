@@ -23,14 +23,17 @@ container:
    the bot invites it, it joins -- the bridge's ordinary flow). A message in Matrix arrives on IRC
    as the owner's nick.
 5. The admin API's user list attributes the bot and the ghost to the bridge (`appservice_id`).
+6. The *server* restarted underneath the running bridge: a new IRC user then arrived in Matrix as
+   a new ghost, and a Matrix message reached IRC. (This is what found the two restart bugs
+   described in `docs/next-steps.md`; it now works.)
 
 Nothing else in the bridge's log was a server problem: a repeated bot registration is answered
 `M_USER_IN_USE`, which every mautrix bridge expects; a probe for Synapse's own admin endpoint
 is a 404; the first read of not-yet-written account data is a 404.
 
 Not verified: the bridge's media path (`--media-proxy`), identd, a second Matrix user in a
-bridged channel, and a restart of the *bridge* (its state lives in the bot's account data, which
-the server keeps, so it should come back; it has not been watched doing so).
+bridged channel, and a restart of the *bridge itself* (its state lives in the bot's account
+data, which the server keeps, so it should come back; it has not been watched doing so).
 
 ## Reproducing it
 
