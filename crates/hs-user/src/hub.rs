@@ -197,6 +197,9 @@ pub struct SessionHub<B: KvBackend, R: RoomSource<B>> {
     /// feed alone.
     fan_out_threshold: usize,
     wakers: Mutex<HashMap<OwnedUserId, Arc<Notify>>>,
+    /// The `global_seq` of the last update [`SessionHub::consume_updates`] finished processing
+    /// from the registry's global stream. See [`SessionHub::wait_for_consumed`].
+    consumed: tokio::sync::watch::Sender<u64>,
     /// Set once, by [`SessionHub::begin_shutdown`]: the server is stopping, and a `/sync` that is
     /// waiting for news should stop waiting.
     shutting_down: std::sync::atomic::AtomicBool,
@@ -241,6 +244,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             rooms,
             fan_out_threshold,
             wakers: Mutex::new(HashMap::new()),
+            consumed: tokio::sync::watch::channel(0).0,
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             typing: TypingRegistry::new(),
             presence: PresenceRegistry::new(),
@@ -315,6 +319,23 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     /// `docs/status/05-sync.md` for the exact call site and line this needs added.
     pub fn install_device_list_token_resolver(&self, e2e: &hs_e2e::state::E2eState<B>) {
         e2e.install_sync_token_resolver(Arc::new(DeviceListTokenResolver));
+    }
+
+    /// Waits until this hub has processed every global-stream update numbered up to `seq`
+    /// (`hs_room::protocol::RoomUpdate::global_seq`), or `at_most` has passed.
+    ///
+    /// The feeds `/sync` reads are written here, off the registry's stream, a moment after the
+    /// event that caused them was accepted. A client that joins a room and asks `/sync` in the
+    /// same breath -- a bot, a test, a person on a fast link -- could be answered from before its
+    /// own join had been written, and told nothing. Waiting here, for what was published before
+    /// the request arrived, is what makes a client's own writes visible to its next read. The
+    /// wait is bounded: a hub that has fallen seconds behind should not hold every sync with it.
+    pub async fn wait_for_consumed(&self, seq: u64, at_most: Duration) {
+        if seq == 0 || *self.consumed.borrow() >= seq {
+            return;
+        }
+        let mut rx = self.consumed.subscribe();
+        let _ = tokio::time::timeout(at_most, rx.wait_for(|consumed| *consumed >= seq)).await;
     }
 
     /// Tells every `/sync` that is waiting for news to answer now, with whatever it has, and
@@ -602,18 +623,42 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         loop {
             match updates.recv().await {
                 Ok(update) => {
+                    let seq = update.global_seq;
                     if let Err(e) = self.process_room_update(update).await {
                         tracing::warn!(error = %e, "failed to process a room update into user feeds");
                     }
+                    // Processed or failed, it has been dealt with: nobody should wait for it.
+                    if seq > 0 {
+                        self.consumed.send_if_modified(|current| {
+                            if seq > *current {
+                                *current = seq;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    // A slow consumer missed `skipped` publishes. There is no way to recover the
-                    // exact events from the channel, but nothing is actually lost: the room
-                    // actor's own store still has every position, so the next update this hub
-                    // *does* see will append (or coalesce into) a feed entry carrying the room's
-                    // then-current `room_pos`, and any user who syncs in between reads the room's
-                    // live state directly. Logged, not silently dropped.
-                    tracing::warn!(skipped, "session hub lagged behind a room's publish stream");
+                    // This hub missed `skipped` publishes, and cannot get them back from the
+                    // channel. Which rooms they were about is unknowable, so every resident room
+                    // is re-read from where it is now: `process_room_update` on a room's head
+                    // writes any membership row that is missing and gives every active member a
+                    // feed entry at the head. At worst that repeats something a client has
+                    // already seen; what it prevents is an invitation whose only update was
+                    // among the skipped ones never reaching its target, which is what this arm
+                    // used to do while saying nothing was lost.
+                    tracing::warn!(
+                        skipped,
+                        "session hub fell behind the room stream; re-reading every resident room"
+                    );
+                    for handle in self.rooms.resident_handles().await {
+                        if let Some(head) = handle.query(|actor| actor.head_update()).await
+                            && let Err(e) = self.process_room_update(head).await
+                        {
+                            tracing::warn!(error = %e, "failed to re-read a room after falling behind");
+                        }
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }

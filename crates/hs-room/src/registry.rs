@@ -66,6 +66,33 @@ pub trait GlobalTokenResolver: Send + Sync {
     ) -> Result<Option<Option<i64>>, RoomError>;
 }
 
+/// The registry's one stream of every resident room's updates, numbered. Numbering and sending
+/// happen under one lock so that the numbers come out in the order the stream delivers them --
+/// every resident room publishes here, from inside its own actor, and two of them racing
+/// between "take a number" and "send" would otherwise deliver 6 before 5, and a consumer that
+/// had seen 6 would be wrong to say it had seen everything up to it. The lock is held for a
+/// `broadcast::send`, which does not block.
+pub(crate) struct GlobalStream {
+    sender: tokio::sync::broadcast::Sender<RoomUpdate>,
+    next_seq: std::sync::Mutex<u64>,
+    /// Mirrors `next_seq` for lock-free reads.
+    published: std::sync::atomic::AtomicU64,
+}
+
+impl GlobalStream {
+    pub(crate) fn publish(&self, mut update: RoomUpdate) {
+        let mut next = self
+            .next_seq
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *next += 1;
+        update.global_seq = *next;
+        self.published
+            .store(*next, std::sync::atomic::Ordering::Release);
+        let _ = self.sender.send(update);
+    }
+}
+
 /// The registry: `room_id -> RoomActorHandle`, loaded on first access and dropped after
 /// [`RoomRegistry::evict_idle`] finds it idle longer than the configured threshold.
 ///
@@ -81,7 +108,7 @@ pub struct RoomRegistry<B: KvBackend> {
     rooms: Mutex<HashMap<OwnedRoomId, Entry<B>>>,
     /// Every resident room's updates, fanned into one stream. See
     /// [`RoomRegistry::subscribe_global`] and `docs/rfcs/0012-room-registry-global-updates.md`.
-    global: tokio::sync::broadcast::Sender<RoomUpdate>,
+    global: Arc<GlobalStream>,
     /// See [`GlobalTokenResolver`] and [`RoomRegistry::install_global_token_resolver`]. Unset
     /// (`None`) means no other crate has installed one -- `crate::routes::query::get_messages`
     /// then treats a `from` token that isn't this crate's own format as a hard error, same as
@@ -104,7 +131,15 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
         // Sized to absorb a burst from many rooms at once without stalling any room actor: a
         // `broadcast` send never blocks, it drops the oldest item and reports `Lagged` to the
         // slow receiver, which the consumer must handle (`hs_user::hub`'s watcher does).
-        let (global, _rx) = tokio::sync::broadcast::channel(1024);
+        // Room for a burst. An update is a few hundred bytes; a consumer that falls more than
+        // this far behind is told so (`Lagged`), and what it does about it is its business --
+        // `hs-user`'s session hub re-reads every resident room.
+        let (sender, _rx) = tokio::sync::broadcast::channel(16 * 1024);
+        let global = Arc::new(GlobalStream {
+            sender,
+            next_seq: std::sync::Mutex::new(0),
+            published: std::sync::atomic::AtomicU64::new(0),
+        });
         Ok(Self {
             backend,
             tables,
@@ -186,7 +221,6 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             return Err(RoomError::RoomNotFound(room_id.to_string()));
         };
         actor.set_fencing(self.fencing.get().cloned());
-        let handle = RoomActorHandle::new(actor);
 
         let mut rooms = self.rooms.lock().await;
         let entry = match rooms.entry(room_id.to_owned()) {
@@ -195,14 +229,15 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
                 entry.into_mut()
             }
             std::collections::hash_map::Entry::Vacant(slot) => {
-                // The same forwarder a created room gets. It was missing here, so a room loaded
-                // from disk -- every room, after a restart -- published to nobody: nothing that
-                // happened in it reached `/sync`, push, or a bridge until the server was restarted
-                // again and the room created... never. Every test created its rooms in the
-                // process that read them, and this was the first one that did not.
-                self.spawn_global_forwarder(&handle);
+                // Joined to the global stream like a created room is. It was not, once, so a
+                // room loaded from disk -- every room, after a restart -- published to nobody:
+                // nothing that happened in it reached `/sync`, push, or a bridge. Every test
+                // created its rooms in the process that read them, and the first one that did
+                // not found it. Under the lock, so that the head announcement and the entry are
+                // one step for anybody racing to load the same room.
+                actor.join_global_stream(self.global.clone());
                 slot.insert(Entry {
-                    handle: handle.clone(),
+                    handle: RoomActorHandle::new(actor),
                     last_used: Instant::now(),
                 })
             }
@@ -238,6 +273,7 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     /// into this registry's map goes through here or through `get_or_load` directly.
     pub async fn insert(&self, mut actor: RoomActor<B>) -> RoomActorHandle<B> {
         actor.set_fencing(self.fencing.get().cloned());
+        actor.join_global_stream(self.global.clone());
         let room_id = actor.room_id().to_owned();
         let handle = RoomActorHandle::new(actor);
         let mut rooms = self.rooms.lock().await;
@@ -248,44 +284,7 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
                 last_used: Instant::now(),
             },
         );
-        self.spawn_global_forwarder(&handle);
         handle
-    }
-
-    /// Forwards one newly-resident room's publish stream into this registry's global stream. One
-    /// task per inserted handle, which is also one per *residency*: a room evicted and later
-    /// reloaded is a new actor with a new publish channel and gets a new forwarder, while the old
-    /// task ends on its own when the old actor is dropped and its channel closes.
-    fn spawn_global_forwarder(&self, handle: &RoomActorHandle<B>) {
-        let handle = handle.clone();
-        let global = self.global.clone();
-        tokio::spawn(async move {
-            let mut rx = handle.subscribe().await;
-            // Subscribe first, then announce: a room built by `RoomActor::create_room` published
-            // its whole create burst before any handle existed to subscribe with, so without this
-            // a freshly created room would never appear on the global stream at all until someone
-            // wrote to it. Taking the subscription before reading the head means an event landing
-            // in between is seen twice at worst, never missed.
-            if let Some(head) = handle.query(|actor| actor.head_update()).await {
-                let _ = global.send(head);
-            }
-            loop {
-                match rx.recv().await {
-                    // A send failing means nobody is subscribed globally, which is normal (a
-                    // server with no `hs-user` wired in, or before the watcher starts).
-                    Ok(update) => {
-                        let _ = global.send(update);
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(
-                            skipped,
-                            "the global room-update forwarder fell behind a room's publish stream"
-                        );
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
     }
 
     /// A stream of every [`RoomUpdate`] published by any room this registry loads or creates, from
@@ -298,7 +297,17 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     /// serving any request.
     #[must_use]
     pub fn subscribe_global(&self) -> tokio::sync::broadcast::Receiver<RoomUpdate> {
-        self.global.subscribe()
+        self.global.sender.subscribe()
+    }
+
+    /// The `global_seq` of the newest update published on the global stream, or `0` if none has
+    /// been. A consumer that has processed an update with this number has processed everything
+    /// published so far; see `RoomUpdate::global_seq`.
+    #[must_use]
+    pub fn global_published_seq(&self) -> u64 {
+        self.global
+            .published
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Finds one event by ID across every room this registry's backend holds, without loading
@@ -445,6 +454,17 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     pub async fn resident_count(&self) -> usize {
         self.rooms.lock().await.len()
     }
+
+    /// A handle to every room resident right now. For a consumer of the global stream that has
+    /// fallen behind it and wants to look at every room it might have missed something in.
+    pub async fn resident_handles(&self) -> Vec<RoomActorHandle<B>> {
+        self.rooms
+            .lock()
+            .await
+            .values()
+            .map(|entry| entry.handle.clone())
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -542,7 +562,7 @@ mod tests {
     }
 
     /// Nothing requires a global subscriber: a registry nobody listens to serves rooms normally.
-    /// (`broadcast::Sender::send` returns `Err` with no receivers, which the forwarder must ignore
+    /// (`broadcast::Sender::send` returns `Err` with no receivers, which the stream must ignore
     /// rather than treat as a failure.)
     #[tokio::test]
     async fn a_room_works_with_no_global_subscriber() {
@@ -615,7 +635,7 @@ mod tests {
     }
 
     /// A room loaded from disk is a room like any other to the global stream. It was not: only
-    /// `insert` (a created room) started the forwarder, so after a restart every existing room
+    /// `insert` (a created room) joined it to the stream, so after a restart every existing room
     /// published to nobody, and nothing said in one reached `/sync`, push or a bridge. Found by
     /// the first test to send a message to a real server it had restarted.
     #[tokio::test]

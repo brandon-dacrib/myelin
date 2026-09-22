@@ -236,6 +236,13 @@ pub struct RoomActor<B: KvBackend> {
     /// "Can re-join room if re-invited" case: forgetting must not be permanent).
     forgotten: HashSet<OwnedUserId>,
     publish: tokio::sync::broadcast::Sender<RoomUpdate>,
+    /// The registry's global stream, once this actor is resident in a registry
+    /// ([`crate::registry::RoomRegistry`] installs it on insert or load). Every update this
+    /// actor publishes goes there too, in the same call that persisted the event -- so that by
+    /// the time a request that wrote an event has been answered, the update is on the stream
+    /// and numbered, which is what lets `/sync` wait for the consequences of that write. It
+    /// used to be relayed by a task per room, which is a relay that ran a moment later.
+    global: Option<Arc<crate::registry::GlobalStream>>,
     /// The cluster-fencing hook [`RoomActor::persist`] checks as the last read before committing
     /// (`docs/status/03-cluster.md` item 4). `None` (the default for every construction path
     /// today) means no fencing is installed -- single-node mode, or a server that has not wired
@@ -342,6 +349,7 @@ impl<B: KvBackend> RoomActor<B> {
             event_txn: HashMap::new(),
             forgotten: HashSet::new(),
             publish,
+            global: None,
             fencing: None,
         };
         actor.persist(create_event)?;
@@ -401,6 +409,7 @@ impl<B: KvBackend> RoomActor<B> {
             event_txn: HashMap::new(),
             forgotten: HashSet::new(),
             publish,
+            global: None,
             fencing: None,
         };
 
@@ -1243,10 +1252,14 @@ impl<B: KvBackend> RoomActor<B> {
             changed_state_keys,
             membership_deltas,
             push_evaluation_inputs: Vec::new(),
+            global_seq: 0,
         };
         self.events.insert(event_sn, event);
         // A broadcast send fails only when there are no subscribers, which is not an error: a
         // room with nobody listening yet (or right now) is normal.
+        if let Some(global) = &self.global {
+            global.publish(update.clone());
+        }
         let _ = self.publish.send(update);
 
         Ok(event_sn)
@@ -1760,6 +1773,7 @@ impl<B: KvBackend> RoomActor<B> {
             changed_state_keys: Vec::new(),
             membership_deltas: Vec::new(),
             push_evaluation_inputs: Vec::new(),
+            global_seq: 0,
         })
     }
 
@@ -2027,6 +2041,17 @@ impl<B: KvBackend> RoomActor<B> {
     /// `crate::fencing`'s module docs.
     pub(crate) fn set_fencing(&mut self, fencing: Option<Arc<crate::fencing::RoomFencing<B>>>) {
         self.fencing = fencing;
+    }
+
+    /// Installs the registry's global stream (see the field) and announces where the room is
+    /// now on it ([`RoomActor::head_update`]): for a room built by [`RoomActor::create_room`],
+    /// whose whole create burst was published before any registry held it, and for a room
+    /// loaded from disk, which a consumer of the stream may never have heard of.
+    pub(crate) fn join_global_stream(&mut self, global: Arc<crate::registry::GlobalStream>) {
+        if let Some(head) = self.head_update() {
+            global.publish(head);
+        }
+        self.global = Some(global);
     }
 
     /// Shared by [`RoomActor::full_state`] and [`RoomActor::full_state_for_reader`]: every event

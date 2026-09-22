@@ -62,6 +62,10 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
   the creator's membership, and its invitations, without their profile -- the creator was a raw
   user ID to everyone in the room -- and dropped `is_direct`, so the invitee's client filed a
   direct chat as a room.
+- **A client sees its own join in its very next `/sync`.** It could be answered from a moment
+  before -- the room had the join, the feeds `/sync` reads did not yet -- which a bot or a test
+  that asks `timeout=0` straight after joining would notice, and two tests did. A sync now waits
+  for the feeds to have caught up with everything the rooms had published when it arrived.
 - **The server stops when it is told to.** With anybody signed in it took up to thirty seconds,
   because graceful shutdown waited for every open `/sync` long-poll to run out its client's
   timeout: 29.3 seconds measured for a single idle client, which is Kubernetes' whole default

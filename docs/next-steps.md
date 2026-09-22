@@ -10,6 +10,19 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 
 **Opening Element is worth more than another Complement run, and the evidence is one evening.** On 2026-09-21, after a day of `/sync` fixes that moved csapi from 241 to 305 of 384 with every test in the repository green, two Element sessions and one invitation found four bugs none of it had seen: accepting an invitation brought the invitee their own join and no room state (so Element offered to send plain text into an encrypted room); a client never learned that the server had taken the signature on its own device (so Element marked every message its own user sent "not verified by its owner", and never offered key backup); whoever created a room had no name in it; and a direct chat's invitation did not say it was one. All four are fixed, each with a test that fails without the fix, and the first is this project's own regression from that same day -- see "What opening Element found" below.
 
+**A client's own writes are visible to its next `/sync`.** The feeds `/sync` reads are written
+by the session hub off the room registry's stream, a moment after the event; a sync sent in that
+moment -- `timeout=0` after a join, or an initial sync after an invitation -- used to be
+answered from before it. Two e2e tests raced it on CI. The registry's global stream is numbered
+now, rooms publish to it from inside the same call that persisted the event (the per-room relay
+task is gone), the hub records how far it has consumed, and `/sync` waits, up to 500 ms, for the
+hub to have consumed everything published before the request arrived
+(`SessionHub::wait_for_consumed`). Thirty joins, thirty immediate syncs, in
+`a_join_is_in_the_very_next_sync_every_time`. And a hub that falls behind that stream (it is
+told, and cannot get the missed updates back) now re-reads every resident room instead of
+claiming nothing was lost: an invitation whose only update was among the missed ones used to
+never reach its target.
+
 **Bridges are sent events, and a restart no longer silences every room.** Until 2026-09-21
 `hs serve` sent an appservice nothing, ever: `hs_appservice::scheduler` delivered a queue nothing
 filled. `hs_appservice::pump` fills it now -- a durable cursor per room, the room stream used only
@@ -382,7 +395,6 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | User-directory scope is computed by walking rooms on every search | `hs-user` | fine today; the first thing to index if a public room gets very large |
 | `TestThreadsEndpoint` flapped between runs | `hs-room` | ordering tie on a millisecond timestamp; fixed 2026-09-21, not yet graded -- if any test still moves between identical runs, that is a bug to find, not noise |
 | A hot room joined after the token is resumed from the join, not sent whole | `hs-user` | the client recovers from `/state` and `/messages`; rare, and written down in `resume_mode` |
-| A join or invitation is not always visible to the very next `/sync` | `hs-user` | membership rows and feed entries are written off the room stream by a background task; a `timeout=0` sync (or an initial one, which never waits) sent the instant after can miss it. Long-polling clients are woken when it lands. Synapse gives read-your-writes here; two e2e tests raced it on CI and now poll (`sync_until`). Writing the requester's own membership synchronously in the join and invite handlers would close it |
 | A requester with no device never records a feed cursor | `hs-user` | its feed entries coalesce forever and an incremental sync sees no change; some appservice callers |
 | `heartbeat_seq` is derived from wall-clock milliseconds | `hs-cluster` | two ticks in one millisecond read as "no progress", i.e. death; harmless at the production 1s interval, surfaces only in tests |
 | Appservice delivery carries events only | `hs-appservice` | no ephemeral (typing, receipts, presence), to-device or device-list data reaches a bridge yet; `Transaction` has the fields, the pump fills one |

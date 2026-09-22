@@ -153,4 +153,12 @@ pub struct RoomUpdate {
     pub membership_deltas: Vec<MembershipDelta>,
     /// Inputs for push rule evaluation. Not yet populated -- see the module docs.
     pub push_evaluation_inputs: Vec<()>,
+    /// This update's position on the registry's *global* stream
+    /// (`crate::registry::RoomRegistry::subscribe_global`): `1` for the first update ever
+    /// published there in this process, then one more each time, in the order the stream
+    /// delivers them. `0` on a room's own stream (`RoomActorHandle::subscribe`), which does not
+    /// number. What lets a consumer of the global stream say how far it has read, and a reader
+    /// of what that consumer writes -- `/sync` -- wait until it has read everything that was
+    /// published before the reader asked. See `RoomRegistry::global_published_seq`.
+    pub global_seq: u64,
 }

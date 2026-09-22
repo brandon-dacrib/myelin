@@ -41,6 +41,20 @@ pub trait RoomSource<B: KvBackend + 'static>: Send + Sync {
     /// production case, and the one override below) has anywhere to put this; a test double that
     /// never calls `hs-room`'s HTTP layer at all has no need for it.
     fn install_global_token_resolver(&self, _resolver: Arc<dyn GlobalTokenResolver>) {}
+
+    /// The number of the newest update published on this source's global stream
+    /// (`hs_room::registry::RoomRegistry::global_published_seq`): what `/sync` waits for the
+    /// hub to have consumed before reading feeds. `0`, the default, means "do not wait".
+    fn global_published_seq(&self) -> u64 {
+        0
+    }
+
+    /// Every room resident in this source right now. What the hub re-reads after falling
+    /// behind the global stream. Empty by default: a source with no such notion has nothing
+    /// to re-read.
+    async fn resident_handles(&self) -> Vec<RoomActorHandle<B>> {
+        Vec::new()
+    }
 }
 
 #[async_trait::async_trait]
@@ -51,6 +65,14 @@ impl<B: KvBackend + 'static> RoomSource<B> for Arc<RoomRegistry<B>> {
 
     fn install_global_token_resolver(&self, resolver: Arc<dyn GlobalTokenResolver>) {
         RoomRegistry::install_global_token_resolver(self, resolver);
+    }
+
+    fn global_published_seq(&self) -> u64 {
+        RoomRegistry::global_published_seq(self)
+    }
+
+    async fn resident_handles(&self) -> Vec<RoomActorHandle<B>> {
+        RoomRegistry::resident_handles(self).await
     }
 }
 

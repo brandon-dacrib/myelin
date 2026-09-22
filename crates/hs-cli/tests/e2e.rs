@@ -2444,6 +2444,91 @@ async fn an_administrator_can_sign_out_a_lost_phone_and_reset_a_forgotten_passwo
     handle.shutdown().await;
 }
 
+/// A client's own join is visible to its very next `/sync`, with `timeout=0`, every time. The
+/// feeds `/sync` reads are written off the room stream by the session hub; a sync used to be
+/// able to slip in between and answer from before the join. Two tests raced that on CI. Now a
+/// sync waits, briefly, for the hub to have consumed everything the rooms had published when
+/// the request arrived (`SessionHub::wait_for_consumed`), which is read-your-writes. Thirty
+/// rooms, thirty joins, thirty immediate syncs.
+#[tokio::test]
+async fn a_join_is_in_the_very_next_sync_every_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = hs_cli::serve::spawn_serve(
+        test_config(reserve_ephemeral_port(), dir.path()),
+        hs_cli::serve::ServeOptions::default(),
+    )
+    .await
+    .expect("server should boot");
+    let base = handle.base_url();
+    let client = reqwest::Client::new();
+    let mut tokens = Vec::new();
+    for name in ["ryw-alice", "ryw-bob"] {
+        let registered: serde_json::Value = client
+            .post(format!("{base}/_matrix/client/v3/register"))
+            .json(&json!({"username": name, "password": format!("hunter2-{name}"), "auth": {"type": "m.login.dummy"}}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        tokens.push(registered["access_token"].as_str().unwrap().to_owned());
+    }
+    let (alice, bob) = (tokens[0].clone(), tokens[1].clone());
+    let synced: serde_json::Value = client
+        .get(format!("{base}/_matrix/client/v3/sync?timeout=0"))
+        .bearer_auth(&bob)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut since = synced["next_batch"].as_str().unwrap().to_owned();
+
+    for n in 0..30 {
+        let created: serde_json::Value = client
+            .post(format!("{base}/_matrix/client/v3/createRoom"))
+            .bearer_auth(&alice)
+            .json(&json!({"preset": "public_chat", "name": format!("room {n}")}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let room_id = created["room_id"].as_str().unwrap().to_owned();
+        let joined = client
+            .post(format!(
+                "{base}/_matrix/client/v3/join/{}",
+                room_id.replace('!', "%21").replace(':', "%3A")
+            ))
+            .bearer_auth(&bob)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(joined.status(), reqwest::StatusCode::OK);
+        let synced: serde_json::Value = client
+            .get(format!(
+                "{base}/_matrix/client/v3/sync?timeout=0&since={since}"
+            ))
+            .bearer_auth(&bob)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            synced["rooms"]["join"].get(&room_id).is_some(),
+            "join {n} was not in the very next sync: {synced}"
+        );
+        since = synced["next_batch"].as_str().unwrap().to_owned();
+    }
+    handle.shutdown().await;
+}
+
 /// What opening Element on this server found, the day `/sync` stopped resending every room's
 /// whole state with every message. Two people, a direct and encrypted chat, an invitation
 /// accepted: the most ordinary thing the server will ever be asked to do, and it went wrong four

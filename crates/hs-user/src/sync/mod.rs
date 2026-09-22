@@ -110,6 +110,12 @@ use crate::token::SyncToken;
 /// otherwise).
 pub const DEFAULT_TIMELINE_LIMIT: usize = 10;
 
+/// The most a `/sync` waits for the session hub to catch up with what the rooms had published
+/// when the request arrived (`SessionHub::wait_for_consumed`). Normally nothing: the hub is a
+/// few microseconds behind. Long enough to cover a busy moment; short enough that a hub that
+/// has really fallen behind does not take every sync down with it.
+const READ_YOUR_WRITES_WAIT: Duration = Duration::from_millis(500);
+
 /// The most to-device messages a single `/sync` response will carry for one device. Matches this
 /// crate's `DEFAULT_TIMELINE_LIMIT`-adjacent philosophy of a bounded response; a device with more
 /// than this many queued messages simply gets the rest on its next sync (nothing is lost --
@@ -602,6 +608,13 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     let baseline = params.since.unwrap_or_else(SyncToken::initial);
     let is_initial = params.since.is_none();
     let device_id = params.device_id.clone();
+
+    // Everything published before this request arrived is in the feeds before they are read:
+    // see `SessionHub::wait_for_consumed`. Taken before the long-poll, so a request that then
+    // waits for news is not also holding a stale idea of what has already happened.
+    let published = hub.rooms().global_published_seq();
+    hub.wait_for_consumed(published, READ_YOUR_WRITES_WAIT)
+        .await;
 
     if !is_initial {
         long_poll(
@@ -4100,5 +4113,141 @@ mod tests {
                 "{response}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // A client's own writes are visible to its next read.
+    // ---------------------------------------------------------------------------------------
+
+    /// The feeds are written by the hub off the registry's stream, a moment after the event.
+    /// A sync sent in that moment used to be answered from before it. Here the moment is made
+    /// long on purpose: the hub is not consuming the stream at all when the invitation is
+    /// published and the sync begins, and starts 50 ms later. The sync waits, and answers with
+    /// the invitation.
+    #[tokio::test]
+    async fn a_sync_sent_the_instant_after_an_invitation_still_carries_it() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        // Subscribed now, so nothing is missed; consumed later, so the wait is exercised.
+        let updates = hub.rooms().subscribe_global();
+
+        let handle = hub
+            .rooms()
+            .create_room(alice.clone(), CreateRoomRequest::default(), 1)
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        handle
+            .membership(
+                alice.clone(),
+                Action::Invite,
+                bob.clone(),
+                serde_json::json!({}),
+                2,
+            )
+            .await
+            .unwrap();
+
+        let syncing = {
+            let (hub, e2e, bob) = (hub.clone(), e2e.clone(), bob.clone());
+            tokio::spawn(async move { build(&hub, &e2e, &bob, params(None)).await.unwrap() })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        std::mem::forget(hub.watch_all(updates));
+
+        let (response, _) = syncing.await.unwrap();
+        assert!(
+            response["rooms"]["invite"].get(room_id.as_str()).is_some(),
+            "{response}"
+        );
+    }
+
+    /// And a hub that has genuinely fallen behind does not hold every sync with it: the wait is
+    /// bounded, and the sync answers with what there is.
+    #[tokio::test]
+    async fn a_hub_that_never_catches_up_does_not_hold_the_sync_for_ever() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        // Nobody consumes the stream at all.
+        let _updates = hub.rooms().subscribe_global();
+        hub.rooms()
+            .create_room(alice.clone(), CreateRoomRequest::default(), 1)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let started = std::time::Instant::now();
+        let (response, _) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+        assert!(
+            started.elapsed() >= READ_YOUR_WRITES_WAIT,
+            "should have waited: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < READ_YOUR_WRITES_WAIT * 3,
+            "but not for ever: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            response["rooms"]["join"]
+                .as_object()
+                .is_none_or(serde_json::Map::is_empty),
+            "{response}"
+        );
+    }
+
+    /// A hub that falls behind the room stream is told it missed some updates and cannot get
+    /// them back. If one of them was the only update an invitation would ever produce, the
+    /// invitee's membership row was never written and the invitation never reached them; the
+    /// code said "nothing is actually lost". Now the hub re-reads every resident room. Here the
+    /// stream is a channel of one, the invitation's update is the one that is overwritten, and
+    /// the update that survives is about a different room.
+    #[tokio::test]
+    async fn an_invitation_the_hub_missed_by_falling_behind_is_recovered() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let invited = hub
+            .rooms()
+            .create_room(alice.clone(), CreateRoomRequest::default(), 1)
+            .await
+            .unwrap();
+        invited
+            .membership(
+                alice.clone(),
+                Action::Invite,
+                bob.clone(),
+                serde_json::json!({}),
+                2,
+            )
+            .await
+            .unwrap();
+        let other = hub
+            .rooms()
+            .create_room(alice.clone(), CreateRoomRequest::default(), 3)
+            .await
+            .unwrap();
+        let invited_id = invited.query(|a| a.room_id().to_owned()).await;
+
+        // The hub's stream, with the invitation's update pushed out by the other room's.
+        let (tx, rx) = tokio::sync::broadcast::channel(1);
+        tx.send(invited.query(|a| a.head_update()).await.unwrap())
+            .unwrap();
+        tx.send(other.query(|a| a.head_update()).await.unwrap())
+            .unwrap();
+        std::mem::forget(hub.watch_all(rx));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (response, _) = build(&hub, &e2e, &bob, params(None)).await.unwrap();
+        assert!(
+            response["rooms"]["invite"]
+                .get(invited_id.as_str())
+                .is_some(),
+            "{response}"
+        );
     }
 }
