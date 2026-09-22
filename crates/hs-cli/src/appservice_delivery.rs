@@ -7,6 +7,7 @@
 //! `hs_appservice::pump`'s module docs for how the stream is only a doorbell and the cursor is
 //! the truth.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -39,26 +40,50 @@ impl<B: KvBackend + 'static> RoomSource for Rooms<B> {
             .map_err(|e| e.to_string())?;
         handle
             .query(move |actor| {
-                let events = actor
-                    .events_after(after, limit)
-                    .into_iter()
-                    .map(|(pos, event)| RoomEvent {
+                let page = actor.events_after(after, limit);
+                // Who was joined as of each event: one state read, for the first event of the
+                // page, then walked forward -- membership only changes at a membership event,
+                // and the page is the room's own order. Shared between events while unchanged.
+                let mut members: Arc<BTreeSet<String>> = Arc::new(
+                    page.first()
+                        .map(|(_, first)| actor.joined_members_after(first))
+                        .transpose()
+                        .map_err(|e| e.to_string())?
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect(),
+                );
+                let mut events = Vec::with_capacity(page.len());
+                for (index, (pos, event)) in page.into_iter().enumerate() {
+                    if index > 0
+                        && event.header().event_type == "m.room.member"
+                        && let Some(user) = event.header().state_key.clone()
+                    {
+                        let json = event.json();
+                        let joined = json
+                            .get("content")
+                            .and_then(|c| c.as_object())
+                            .and_then(|c| c.get("membership"))
+                            .and_then(|m| m.as_str())
+                            == Some("join");
+                        if joined != members.contains(&user) {
+                            let mut next = (*members).clone();
+                            if joined {
+                                next.insert(user);
+                            } else {
+                                next.remove(&user);
+                            }
+                            members = Arc::new(next);
+                        }
+                    }
+                    events.push(RoomEvent {
                         pos,
                         json: client_event_json(event),
-                    })
-                    .collect();
+                        joined_members: members.clone(),
+                    });
+                }
                 let aliases = actor.list_aliases().map_err(|e| e.to_string())?;
-                let joined_members = actor
-                    .joined_members()
-                    .map_err(|e| e.to_string())?
-                    .into_iter()
-                    .filter_map(|event| event.header().state_key.clone())
-                    .collect();
-                Ok(RoomPage {
-                    events,
-                    aliases,
-                    joined_members,
-                })
+                Ok(RoomPage { events, aliases })
             })
             .await
     }
@@ -155,5 +180,103 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
     pub fn stop(&self) {
         self.pump_task.abort();
         self.delivery.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hs_kv::memory::MemoryBackend;
+    use hs_room::actor::CreateRoomRequest;
+    use hs_room::membership::Action;
+
+    /// The property the first CI run of the bridge test found missing, deterministically: read in
+    /// one page, a message from before the bot joined is still not the bot's. Each event carries
+    /// the membership as of itself, not the room's membership now.
+    #[tokio::test]
+    async fn each_event_says_who_was_in_the_room_when_it_happened() {
+        let registry = Arc::new(
+            RoomRegistry::open(
+                MemoryBackend::new(),
+                hs_room::identity::HomeserverIdentity::for_tests("example.org"),
+            )
+            .unwrap(),
+        );
+        let alice = ruma::user_id!("@alice:example.org").to_owned();
+        let bot = ruma::user_id!("@ircbot:example.org").to_owned();
+        let handle = registry
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        let say = |body: &'static str, ts: i64| {
+            let (handle, alice) = (handle.clone(), alice.clone());
+            async move {
+                handle
+                    .send_event(
+                        alice,
+                        "m.room.message".to_owned(),
+                        None,
+                        serde_json::json!({"body": body}),
+                        None,
+                        ts,
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        say("before the bot", 2).await;
+        handle
+            .membership(
+                bot.clone(),
+                Action::Join,
+                bot.clone(),
+                serde_json::json!({}),
+                3,
+            )
+            .await
+            .unwrap();
+        say("with the bot", 4).await;
+        handle
+            .membership(
+                bot.clone(),
+                Action::Leave,
+                bot.clone(),
+                serde_json::json!({}),
+                5,
+            )
+            .await
+            .unwrap();
+        say("after the bot left", 6).await;
+
+        let rooms = Rooms { registry };
+        let page = rooms.events_after(room_id.as_str(), 0, 100).await.unwrap();
+        let bot_was_there = |body: &str| -> bool {
+            page.events
+                .iter()
+                .find(|e| e.json["content"]["body"] == body)
+                .unwrap_or_else(|| panic!("{body} is not in the page"))
+                .joined_members
+                .contains(bot.as_str())
+        };
+        assert!(!bot_was_there("before the bot"));
+        assert!(bot_was_there("with the bot"));
+        assert!(!bot_was_there("after the bot left"));
+        // The bot's own join and leave count it as there and gone, respectively: the state
+        // *after* each event.
+        let membership_events: Vec<bool> = page
+            .events
+            .iter()
+            .filter(|e| e.json["type"] == "m.room.member" && e.json["state_key"] == bot.as_str())
+            .map(|e| e.joined_members.contains(bot.as_str()))
+            .collect();
+        assert_eq!(membership_events, vec![true, false]);
     }
 }

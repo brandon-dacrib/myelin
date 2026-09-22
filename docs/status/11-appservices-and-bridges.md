@@ -86,8 +86,7 @@ could not start a second time, and after any restart nothing said in a pre-exist
 
 Since 2026-09-22 the first four items below are superseded by `docs/bridges/heisenbridge.md`'s
 list: the pump delivers events only (no ephemeral, to-device or device-list data yet, though
-`Transaction` has the fields); interest is decided by a room's current members, as Synapse does;
-one process must pump (delivery is not shard-gated for a cluster); and no mautrix-* bridge with
+`Transaction` has the fields); one process must pump (delivery is not shard-gated for a cluster); and no mautrix-* bridge with
 an external service has been tried, only heisenbridge.
 
 Everything below is a real, specific gap, not a vague TODO — each is blocked on a concrete thing

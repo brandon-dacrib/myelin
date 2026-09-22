@@ -2353,6 +2353,33 @@ impl<B: KvBackend> RoomActor<B> {
             .collect()
     }
 
+    /// The user IDs joined to this room as of immediately after `event`: the room's membership
+    /// at that point in its history, not now. What appservice delivery decides interest against
+    /// -- a bridge is sent an event if one of its users was in the room *when it was sent*,
+    /// which "who is in the room now" gets wrong exactly when it matters: read together with
+    /// the bot's own join, every message from before it would go out to the bridge, and from
+    /// there to wherever it bridges to.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::EventNotFound`] if this actor does not hold `event`, or
+    /// [`RoomError::State`] if the state store fails.
+    pub fn joined_members_after(&self, event: &Event) -> Result<Vec<String>, RoomError> {
+        let sn = *self
+            .event_id_index
+            .get(event.event_id())
+            .ok_or_else(|| RoomError::EventNotFound(event.event_id().to_string()))?;
+        let view = self.state_view_at_sn(sn)?;
+        Ok(self
+            .state_at_root(view.root)?
+            .into_iter()
+            .filter(|e| {
+                e.header().event_type == "m.room.member"
+                    && content_str(e, "membership") == Some("join")
+            })
+            .filter_map(|e| e.header().state_key.clone())
+            .collect())
+    }
+
     /// The room-local send position (`room_pos`) of a known [`EventSn`], by linear scan of
     /// `self.timeline`. Phase 0 scope, same tradeoff as `RoomActor::get_context`'s full scan for
     /// an event's position: this crate holds a room's whole timeline resident in memory already

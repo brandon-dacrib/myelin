@@ -363,7 +363,6 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | A hot room joined after the token is resumed from the join, not sent whole | `hs-user` | the client recovers from `/state` and `/messages`; rare, and written down in `resume_mode` |
 | A requester with no device never records a feed cursor | `hs-user` | its feed entries coalesce forever and an incremental sync sees no change; some appservice callers |
 | `heartbeat_seq` is derived from wall-clock milliseconds | `hs-cluster` | two ticks in one millisecond read as "no progress", i.e. death; harmless at the production 1s interval, surfaces only in tests |
-| Appservice delivery reads a room's *current* members to decide interest | `hs-appservice` | Synapse's rule too; a bridge whose bot has just left still hears its own leave, and nothing after |
 | Appservice delivery carries events only | `hs-appservice` | no ephemeral (typing, receipts, presence), to-device or device-list data reaches a bridge yet; `Transaction` has the fields, the pump fills one |
 | Only one process may pump | `hs-appservice`, `hs-cluster` | two replicas would each queue every event; delivery is not shard-gated and must be before a cluster carries bridges |
 | Only heisenbridge has been run against it | `hs-appservice` | a mautrix-* bridge with an external service (and its media, double puppeting, MSC3202) is the next real-bridge check |

@@ -34,10 +34,13 @@
 //! everything said in a room its bot or one of its ghosts is in. Its bot (`sender_localpart`)
 //! counts as one of its users whether or not the `users` namespace happens to match it.
 //!
-//! Membership is the room's *current* membership, not membership as of each event, which is also
-//! what Synapse does. The cases where they differ resolve the right way: a bot that has just
-//! been invited is the target of the invitation, and a bot that has just left is the target of
-//! its own leave.
+//! Membership is membership *as of each event*, not the room's current membership. Synapse
+//! reads the current members, and gets away with it because it decides at the moment the event
+//! is sent; this pump decides later, from a cursor, and may read the bot's own join and the
+//! message before it in one page. Decided against the current members, that message would go
+//! out to the bridge, and from there to wherever it bridges to -- which is how the first CI run
+//! of the bridge test found this. A [`RoomSource`] supplies, with each event, who was joined
+//! once it had happened.
 //!
 //! # The first start
 //!
@@ -47,7 +50,7 @@
 //! ([`crate::store::AppserviceStore::start_pump_at`]). After that, a room with no cursor is a
 //! room created since -- while the server was up or while it was down -- and all of it is news.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -74,6 +77,9 @@ pub struct RoomEvent {
     /// (`room_id`, `event_id`, `sender`, `type`, `state_key`, `content`, `origin_server_ts`,
     /// `unsigned`).
     pub json: Value,
+    /// The user IDs joined to the room once this event had happened. Shared between consecutive
+    /// events when nothing changed in between, which is nearly always.
+    pub joined_members: Arc<BTreeSet<String>>,
 }
 
 /// What [`RoomSource::events_after`] returns: some of a room's events, and what the pump needs to
@@ -84,8 +90,6 @@ pub struct RoomPage {
     pub events: Vec<RoomEvent>,
     /// The room's current aliases.
     pub aliases: Vec<String>,
-    /// The user IDs currently joined to the room.
-    pub joined_members: Vec<String>,
 }
 
 /// Where the pump reads rooms from. A trait because this crate does not (and should not) depend
@@ -113,13 +117,13 @@ pub fn interested(
     namespaces: &Namespaces,
     bot_user_id: &str,
     room_id: &str,
-    event: &Value,
+    event: &RoomEvent,
     page: &RoomPage,
 ) -> bool {
     let is_theirs = |user_id: &str| {
         user_id == bot_user_id || namespaces.is_interested(NamespaceKind::Users, user_id)
     };
-    let field = |name: &str| event.get(name).and_then(Value::as_str);
+    let field = |name: &str| event.json.get(name).and_then(Value::as_str);
 
     if field("sender").is_some_and(is_theirs) {
         return true;
@@ -137,7 +141,7 @@ pub fn interested(
     {
         return true;
     }
-    page.joined_members.iter().any(|member| is_theirs(member))
+    event.joined_members.iter().any(|member| is_theirs(member))
 }
 
 /// An appservice, as the pump needs it while it reads one page: compiled once, not per event.
@@ -270,7 +274,7 @@ impl<B: KvBackend> Pump<B> {
                             &listener.namespaces,
                             &listener.bot_user_id,
                             room_id,
-                            &event.json,
+                            event,
                             &page,
                         )
                     })
@@ -310,17 +314,26 @@ mod tests {
     use serde_json::json;
     use std::sync::Mutex;
 
-    /// Rooms in memory: `room id -> (events, aliases, joined members)`.
+    /// Rooms in memory. Each event carries who was joined once it had happened, as the real
+    /// source does.
     #[derive(Default)]
     struct FakeRooms {
         rooms: Mutex<BTreeMap<String, RoomPage>>,
     }
 
     impl FakeRooms {
+        fn members_now(room: &RoomPage) -> Arc<BTreeSet<String>> {
+            room.events
+                .last()
+                .map(|e| e.joined_members.clone())
+                .unwrap_or_default()
+        }
+
         fn say(&self, room_id: &str, sender: &str, body: &str) {
             let mut rooms = self.rooms.lock().unwrap();
             let room = rooms.entry(room_id.to_owned()).or_default();
             let pos = room.events.last().map_or(1, |e| e.pos + 1);
+            let joined_members = Self::members_now(room);
             room.events.push(RoomEvent {
                 pos,
                 json: json!({
@@ -330,6 +343,7 @@ mod tests {
                     "sender": sender,
                     "content": {"msgtype": "m.text", "body": body},
                 }),
+                joined_members,
             });
         }
 
@@ -337,7 +351,8 @@ mod tests {
             let mut rooms = self.rooms.lock().unwrap();
             let room = rooms.entry(room_id.to_owned()).or_default();
             let pos = room.events.last().map_or(1, |e| e.pos + 1);
-            room.joined_members.push(user_id.to_owned());
+            let mut members = (*Self::members_now(room)).clone();
+            members.insert(user_id.to_owned());
             room.events.push(RoomEvent {
                 pos,
                 json: json!({
@@ -348,6 +363,7 @@ mod tests {
                     "state_key": user_id,
                     "content": {"membership": "join"},
                 }),
+                joined_members: Arc::new(members),
             });
         }
     }
@@ -373,7 +389,6 @@ mod tests {
                     .cloned()
                     .collect(),
                 aliases: room.aliases.clone(),
-                joined_members: room.joined_members.clone(),
             })
         }
 
@@ -455,11 +470,11 @@ mod tests {
                 .is_empty()
         );
 
-        // All of the bridged room, alice's join included: the bot is a member *now*, which is
-        // the rule (and Synapse's). None of the private one.
+        // From the bot's own join onwards: alice's join, before it, is not the bridge's to
+        // hear. None of the private room.
         assert_eq!(
             queued(&registry, "irc"),
-            vec!["@alice:example.org", "@ircbot:example.org", "hello irc"]
+            vec!["@ircbot:example.org", "hello irc"]
         );
     }
 
@@ -467,7 +482,7 @@ mod tests {
     async fn each_way_of_being_interested_is_enough_on_its_own() {
         let (_, _, pump) = setup(&[BRIDGE]);
         let listener = pump.listeners().unwrap().remove(0);
-        let ask = |event: Value, page: &RoomPage, room_id: &str| {
+        let ask = |event: RoomEvent, page: &RoomPage, room_id: &str| {
             interested(
                 &listener.namespaces,
                 &listener.bot_user_id,
@@ -477,33 +492,44 @@ mod tests {
             )
         };
         let nobody = RoomPage::default();
+        let event = |json: Value, members: &[&str]| RoomEvent {
+            pos: 1,
+            json,
+            joined_members: Arc::new(members.iter().map(|m| (*m).to_owned()).collect()),
+        };
         let message = |sender: &str| json!({"type": "m.room.message", "sender": sender});
 
         assert!(!ask(
-            message("@alice:example.org"),
+            event(message("@alice:example.org"), &[]),
             &nobody,
             "!r:example.org"
         ));
         // Sent by one of its ghosts, or by its bot, which its namespace does not mention.
         assert!(ask(
-            message("@irc_bob:example.org"),
+            event(message("@irc_bob:example.org"), &[]),
             &nobody,
             "!r:example.org"
         ));
         assert!(ask(
-            message("@ircbot:example.org"),
+            event(message("@ircbot:example.org"), &[]),
             &nobody,
             "!r:example.org"
         ));
         // An invitation to one of its ghosts, who is not in the room yet.
         assert!(ask(
-            json!({"type": "m.room.member", "sender": "@alice:example.org", "state_key": "@irc_bob:example.org"}),
+            event(
+                json!({"type": "m.room.member", "sender": "@alice:example.org", "state_key": "@irc_bob:example.org"}),
+                &[]
+            ),
             &nobody,
             "!r:example.org"
         ));
         // ...but a state key is only a user for a membership event.
         assert!(!ask(
-            json!({"type": "org.example.thing", "sender": "@alice:example.org", "state_key": "@irc_bob:example.org"}),
+            event(
+                json!({"type": "org.example.thing", "sender": "@alice:example.org", "state_key": "@irc_bob:example.org"}),
+                &[]
+            ),
             &nobody,
             "!r:example.org"
         ));
@@ -513,21 +539,17 @@ mod tests {
             ..RoomPage::default()
         };
         assert!(ask(
-            message("@alice:example.org"),
+            event(message("@alice:example.org"), &[]),
             &aliased,
             "!r:example.org"
         ));
-        // One of its ghosts is in the room.
-        let with_ghost = RoomPage {
-            joined_members: vec![
-                "@alice:example.org".to_owned(),
-                "@irc_bob:example.org".to_owned(),
-            ],
-            ..RoomPage::default()
-        };
+        // One of its ghosts was in the room when this was said -- and only then.
         assert!(ask(
-            message("@alice:example.org"),
-            &with_ghost,
+            event(
+                message("@alice:example.org"),
+                &["@alice:example.org", "@irc_bob:example.org"]
+            ),
+            &nobody,
             "!r:example.org"
         ));
     }
