@@ -78,6 +78,23 @@ impl<B: KvBackend + 'static> Delivery<B> {
         workers.insert(appservice_id.to_owned(), Worker { wake, task });
     }
 
+    /// Stops the worker of every appservice `keep` says no to. For a replica that has stopped
+    /// owning some appservices' shards (see `hs-cli`'s `appservice_delivery`); what
+    /// [`Delivery::stop`] says about a delivery in flight applies.
+    pub fn retain(&self, keep: impl Fn(&str) -> bool) {
+        let mut workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        workers.retain(|id, worker| {
+            let kept = keep(id);
+            if !kept {
+                worker.task.abort();
+            }
+            kept
+        });
+    }
+
     /// Stops every worker. A delivery in flight is abandoned, which is safe: its queue entries
     /// are still pending, and are sent again, under the same transaction ID, by whatever starts
     /// next.

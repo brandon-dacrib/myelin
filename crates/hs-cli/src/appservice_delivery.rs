@@ -6,6 +6,17 @@
 //! was sent no event, ever: `Scheduler` delivered a queue nothing filled. See
 //! `hs_appservice::pump`'s module docs for how the stream is only a doorbell and the cursor is
 //! the truth.
+//!
+//! # In a cluster
+//!
+//! Every replica sees every room update, and the queue is shared storage, so two replicas each
+//! pumping would queue every event twice, and two each draining would send every transaction
+//! twice. RFC 0001's shard layout has a place for both: the pump is a singleton background job
+//! and runs on whichever replica owns [`ShardId::GLOBAL`]; the worker for an appservice runs on
+//! whichever replica owns that appservice's shard (`ShardLayout::appservice_shard`). A replica
+//! that acquires the global shard catches up on every room; one that acquires an appservice
+//! shard nudges every appservice in it; one that loses a shard stops the work it was doing for
+//! it. In single-node mode every shard is always mine and none of this is visible.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -15,6 +26,8 @@ use hs_appservice::delivery::Delivery;
 use hs_appservice::pump::{Pump, RoomEvent, RoomPage, RoomSource};
 use hs_appservice::registry::Registry;
 use hs_appservice::scheduler::{HttpTransactionSender, Scheduler};
+use hs_cluster::ownership::{Ownership, OwnershipEvent};
+use hs_cluster::{ShardId, ShardKind, ShardLayout};
 use hs_kv::KvBackend;
 use hs_room::registry::RoomRegistry;
 use hs_room::routes::render::client_event_json;
@@ -99,6 +112,56 @@ impl<B: KvBackend + 'static> RoomSource for Rooms<B> {
     }
 }
 
+/// Which of the delivery work is this replica's: the pump, if it owns the global shard; an
+/// appservice's worker, if it owns that appservice's shard. See the module docs.
+struct Gate<B: KvBackend + 'static> {
+    delivery: Arc<Delivery<B>>,
+    ownership: Arc<dyn Ownership>,
+    layout: ShardLayout,
+    registry: Arc<Registry<B>>,
+}
+
+impl<B: KvBackend + 'static> Gate<B> {
+    fn pumps_here(&self) -> bool {
+        self.ownership.is_mine(ShardId::GLOBAL)
+    }
+
+    fn delivers_here(&self, appservice_id: &str) -> bool {
+        self.ownership
+            .is_mine(self.layout.appservice_shard(appservice_id))
+    }
+
+    /// Wakes `appservice_id`'s worker, if delivering to it is this replica's job. The replica
+    /// whose job it is finds the queued work on its next timer tick at the latest.
+    fn nudge(&self, appservice_id: &str) {
+        if self.delivers_here(appservice_id) {
+            self.delivery.nudge(appservice_id);
+        }
+    }
+
+    /// Wakes the worker of every registered appservice this replica delivers to.
+    fn nudge_everything_mine(&self) {
+        match self.registry.list() {
+            Ok(rows) => {
+                for row in rows {
+                    self.nudge(&row.id);
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "could not list appservices to start their delivery workers");
+            }
+        }
+    }
+
+    /// Stops the worker of every appservice this replica no longer delivers to.
+    fn stop_workers_not_mine(&self) {
+        let ownership = self.ownership.clone();
+        let layout = self.layout;
+        self.delivery
+            .retain(move |id| ownership.is_mine(layout.appservice_shard(id)));
+    }
+}
+
 /// The running delivery machinery: stopped by [`AppserviceDelivery::stop`], which `hs serve`'s
 /// shutdown calls.
 pub struct AppserviceDelivery<B: KvBackend + 'static> {
@@ -121,6 +184,8 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
         appservices: Arc<Registry<B>>,
         ping: Arc<hs_appservice::ping::PingService<B>>,
         rooms: Arc<RoomRegistry<B>>,
+        ownership: Arc<dyn Ownership>,
+        layout: ShardLayout,
     ) -> Result<Self, hs_appservice::error::AppserviceError> {
         let clock: Arc<dyn hs_auth::clock::Clock> = Arc::new(hs_auth::clock::SystemClock);
         let scheduler = Arc::new(Scheduler::new(
@@ -128,15 +193,20 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
             clock,
             Arc::new(HttpTransactionSender::new()),
         ));
-        let delivery = Delivery::new(scheduler.clone());
+        let gate = Arc::new(Gate {
+            delivery: Delivery::new(scheduler.clone()),
+            ownership,
+            layout,
+            registry: appservices.clone(),
+        });
         let admin_directory = Arc::new(
             hs_appservice::admin_directory::RegistryAppserviceDirectory::new(
                 appservices.clone(),
                 ping,
                 scheduler,
                 {
-                    let delivery = delivery.clone();
-                    Arc::new(move |id: &str| delivery.nudge(id))
+                    let gate = gate.clone();
+                    Arc::new(move |id: &str| gate.nudge(id))
                 },
             ),
         );
@@ -150,12 +220,17 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
         // Subscribed before catching up, so that nothing published in between is missed: an
         // update the catch-up already covered is read again and found to be nothing new.
         let updates = rooms.subscribe_global();
-        for id in pump.start().await? {
-            delivery.nudge(&id);
+        let ownership_events = gate.ownership.subscribe();
+        if gate.pumps_here() {
+            for id in pump.start().await? {
+                gate.nudge(&id);
+            }
         }
-        let pump_task = tokio::spawn(Self::follow(pump, delivery.clone(), updates)).abort_handle();
+        gate.nudge_everything_mine();
+        let pump_task = tokio::spawn(Self::follow(pump, gate.clone(), updates, ownership_events))
+            .abort_handle();
         Ok(Self {
-            delivery,
+            delivery: gate.delivery.clone(),
             pump_task,
             admin_directory,
         })
@@ -169,26 +244,64 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
 
     async fn follow(
         pump: Arc<Pump<B>>,
-        delivery: Arc<Delivery<B>>,
+        gate: Arc<Gate<B>>,
         mut updates: tokio::sync::broadcast::Receiver<hs_room::protocol::RoomUpdate>,
+        mut ownership_events: tokio::sync::broadcast::Receiver<OwnershipEvent>,
     ) {
         loop {
-            let touched = match updates.recv().await {
-                Ok(update) => pump.pump_room(update.room_id.as_str()).await,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
-                    // Rings were missed; which rooms is unknowable, so every room is asked.
-                    tracing::warn!(
-                        missed,
-                        "appservice delivery fell behind the room stream; catching up on every room"
-                    );
-                    pump.catch_up().await
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            let touched = tokio::select! {
+                update = updates.recv() => match update {
+                    Ok(update) => {
+                        if !gate.pumps_here() {
+                            continue;
+                        }
+                        pump.pump_room(update.room_id.as_str()).await
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        if !gate.pumps_here() {
+                            continue;
+                        }
+                        // Rings were missed; which rooms is unknowable, so every room is asked.
+                        tracing::warn!(missed, "appservice delivery fell behind the room stream; catching up on every room");
+                        pump.catch_up().await
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                },
+                event = ownership_events.recv() => match event {
+                    // The global shard is this replica's now: whatever happened in any room
+                    // while somebody else (or nobody) was pumping is caught up on from the
+                    // cursors, which are in shared storage.
+                    Ok(OwnershipEvent::Acquired(fence)) if fence.shard == ShardId::GLOBAL => {
+                        tracing::info!("this replica now runs appservice event delivery");
+                        pump.catch_up().await
+                    }
+                    Ok(OwnershipEvent::Acquired(fence))
+                        if fence.shard.kind == ShardKind::Appservice =>
+                    {
+                        gate.nudge_everything_mine();
+                        continue;
+                    }
+                    Ok(OwnershipEvent::Released(shard) | OwnershipEvent::Lost { shard, .. })
+                        if shard.kind == ShardKind::Appservice =>
+                    {
+                        // Its new owner delivers from here; a batch in flight is abandoned and
+                        // stays pending, to be sent again under the same transaction id.
+                        gate.stop_workers_not_mine();
+                        continue;
+                    }
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        gate.nudge_everything_mine();
+                        gate.stop_workers_not_mine();
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => continue,
+                },
             };
             match touched {
                 Ok(ids) => {
                     for id in ids {
-                        delivery.nudge(&id);
+                        gate.nudge(&id);
                     }
                 }
                 Err(error) => {
@@ -212,6 +325,215 @@ mod tests {
     use hs_kv::memory::MemoryBackend;
     use hs_room::actor::CreateRoomRequest;
     use hs_room::membership::Action;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    /// An ownership whose answers a test scripts: which shards are mine, changed at will, with
+    /// the event a real acquisition or release would publish.
+    struct Scripted {
+        me: hs_cluster::types::ReplicaId,
+        mine: Mutex<HashSet<ShardId>>,
+        events: tokio::sync::broadcast::Sender<OwnershipEvent>,
+    }
+
+    impl Scripted {
+        fn owning_nothing() -> Arc<Self> {
+            Arc::new(Self {
+                me: hs_cluster::types::ReplicaId::new("replica-b"),
+                mine: Mutex::new(HashSet::new()),
+                events: tokio::sync::broadcast::channel(16).0,
+            })
+        }
+
+        fn acquire(&self, shard: ShardId) {
+            self.mine.lock().unwrap().insert(shard);
+            let _ = self
+                .events
+                .send(OwnershipEvent::Acquired(hs_cluster::fence::Fence::inert(
+                    shard,
+                )));
+        }
+
+        fn release(&self, shard: ShardId) {
+            self.mine.lock().unwrap().remove(&shard);
+            let _ = self.events.send(OwnershipEvent::Released(shard));
+        }
+    }
+
+    impl Ownership for Scripted {
+        fn me(&self) -> &hs_cluster::types::ReplicaId {
+            &self.me
+        }
+        fn owner_of(&self, shard: ShardId) -> Option<hs_cluster::types::ReplicaId> {
+            self.is_mine(shard).then(|| self.me.clone())
+        }
+        fn is_mine(&self, shard: ShardId) -> bool {
+            self.mine.lock().unwrap().contains(&shard)
+        }
+        fn fence(&self, shard: ShardId) -> Option<hs_cluster::fence::Fence> {
+            self.is_mine(shard)
+                .then(|| hs_cluster::fence::Fence::inert(shard))
+        }
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<OwnershipEvent> {
+            self.events.subscribe()
+        }
+        fn shard_map(&self) -> tokio::sync::watch::Receiver<Arc<hs_cluster::ownership::ShardMap>> {
+            tokio::sync::watch::channel(Arc::new(hs_cluster::ownership::ShardMap::default())).1
+        }
+    }
+
+    /// A bridge that records what it is sent.
+    async fn listening_bridge() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+        #[derive(Clone)]
+        struct Received(Arc<Mutex<Vec<serde_json::Value>>>);
+        async fn take(
+            axum::extract::State(received): axum::extract::State<Received>,
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> axum::Json<serde_json::Value> {
+            received.0.lock().unwrap().push(body);
+            axum::Json(serde_json::json!({}))
+        }
+        let received = Received(Arc::new(Mutex::new(Vec::new())));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                axum::routing::put(take),
+            )
+            .with_state(received.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, received.0)
+    }
+
+    async fn settle() {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
+    /// Two replicas would each queue every event and each send every transaction. So a replica
+    /// does the pump's work only while it owns the global shard, and an appservice's delivery
+    /// only while it owns that appservice's shard -- and picks each up, from shared storage,
+    /// the moment it acquires the shard.
+    #[tokio::test]
+    async fn a_replica_pumps_and_delivers_only_for_the_shards_it_owns() {
+        let backend = MemoryBackend::new();
+        let (bridge_url, received) = listening_bridge().await;
+        let registry =
+            Arc::new(Registry::open(backend.clone(), ruma::server_name!("example.org")).unwrap());
+        registry
+            .add(
+                &hs_appservice::registration::Registration::parse_yaml(&format!(
+                    "id: irc\nurl: '{bridge_url}'\nas_token: a\nhs_token: h\n\
+                     sender_localpart: ircbot\nnamespaces: {{}}\n"
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        let ping = Arc::new(hs_appservice::ping::PingService::new(
+            registry.clone(),
+            Arc::new(hs_appservice::ping::HttpPingTransport::new()),
+        ));
+        let rooms = Arc::new(
+            RoomRegistry::open(
+                backend,
+                hs_room::identity::HomeserverIdentity::for_tests("example.org"),
+            )
+            .unwrap(),
+        );
+        let ownership = Scripted::owning_nothing();
+        let layout = ShardLayout::default();
+        let delivery = AppserviceDelivery::start(
+            registry.clone(),
+            ping,
+            rooms.clone(),
+            ownership.clone(),
+            layout,
+        )
+        .await
+        .unwrap();
+
+        // A room with the bot in it, and something said: this replica owns nothing, so nothing
+        // is queued and nothing is sent.
+        let alice = ruma::user_id!("@alice:example.org").to_owned();
+        let bot = ruma::user_id!("@ircbot:example.org").to_owned();
+        let handle = rooms
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        handle
+            .membership(
+                bot.clone(),
+                Action::Join,
+                bot.clone(),
+                serde_json::json!({}),
+                2,
+            )
+            .await
+            .unwrap();
+        handle
+            .send_event(
+                alice.clone(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"body": "while nobody owned anything"}),
+                None,
+                3,
+            )
+            .await
+            .unwrap();
+        settle().await;
+        assert!(registry.backlog("irc").unwrap().is_empty());
+        assert!(received.lock().unwrap().is_empty());
+
+        // The global shard becomes this replica's: the pump catches up on the room.
+        ownership.acquire(ShardId::GLOBAL);
+        settle().await;
+        assert_eq!(registry.backlog("irc").unwrap().len(), 1);
+        // ...but the appservice's shard is still somebody else's, so nothing is sent.
+        assert!(received.lock().unwrap().is_empty());
+
+        // Now the appservice's shard too: delivery starts, from the queue.
+        ownership.acquire(layout.appservice_shard("irc"));
+        settle().await;
+        assert_eq!(
+            received.lock().unwrap().len(),
+            1,
+            "{:?}",
+            received.lock().unwrap()
+        );
+
+        // Losing the appservice shard stops its worker; a new message is queued (the pump is
+        // still ours) and not sent.
+        ownership.release(layout.appservice_shard("irc"));
+        handle
+            .send_event(
+                alice,
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"body": "after the shard moved away"}),
+                None,
+                4,
+            )
+            .await
+            .unwrap();
+        settle().await;
+        let pending = registry.backlog("irc").unwrap();
+        assert_eq!(pending.len(), 1, "queued for the new owner to send");
+        assert_eq!(
+            received.lock().unwrap().len(),
+            1,
+            "not sent by this replica"
+        );
+
+        delivery.stop();
+    }
 
     /// The property the first CI run of the bridge test found missing, deterministically: read in
     /// one page, a message from before the bot joined is still not the bot's. Each event carries

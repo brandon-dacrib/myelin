@@ -88,7 +88,7 @@ section was watched pausing and resuming that bridge.
 
 Since 2026-09-22 the first four items below are superseded by `docs/bridges/heisenbridge.md`'s
 list: the pump delivers events only (no ephemeral, to-device or device-list data yet, though
-`Transaction` has the fields); one process must pump (delivery is not shard-gated for a cluster); and no mautrix-* bridge with
+`Transaction` has the fields); the pump runs on the global shard's owner and each appservice's worker on its shard's owner, tested with a scripted ownership and not yet on a real cluster; and no mautrix-* bridge with
 an external service has been tried, only heisenbridge.
 
 Everything below is a real, specific gap, not a vague TODO — each is blocked on a concrete thing

@@ -369,6 +369,7 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | Overview's Bridges and Federation panels are 501s | `hs-admin`, `hs-cli` | the first page still says "isn't implemented" twice, and its all-clear is qualified accordingly |
 | Overview counts media, failing destinations and reports as unknown | `hs-cli` | three dashes where numbers should be; the sources exist in `hs-media`, `hs-federation` and nowhere respectively |
 | Setup link assumes `localhost:<bound port>` without `public_baseurl` | `hs-cli` | wrong behind a remapped port or an undescribed proxy |
+| The shard-gated appservice pump has only been tested with a scripted ownership | `hs-cli` | it moves with the global and appservice shards in the unit test; a real two-replica handoff of bridge delivery on the cluster has not been watched |
 | In-process server cannot be restarted over its data directory | `hs-cli` | background tasks hold the store's lock after `shutdown()`; restart tests need the real binary |
 | The release binaries job's web build has never run | `.github` | it only runs on a `v*` tag; the image path is verified, this one is not |
 | User-directory scope is computed by walking rooms on every search | `hs-user` | fine today; the first thing to index if a public room gets very large |
@@ -377,7 +378,6 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | A requester with no device never records a feed cursor | `hs-user` | its feed entries coalesce forever and an incremental sync sees no change; some appservice callers |
 | `heartbeat_seq` is derived from wall-clock milliseconds | `hs-cluster` | two ticks in one millisecond read as "no progress", i.e. death; harmless at the production 1s interval, surfaces only in tests |
 | Appservice delivery carries events only | `hs-appservice` | no ephemeral (typing, receipts, presence), to-device or device-list data reaches a bridge yet; `Transaction` has the fields, the pump fills one |
-| Only one process may pump | `hs-appservice`, `hs-cluster` | two replicas would each queue every event; delivery is not shard-gated and must be before a cluster carries bridges |
 | Only heisenbridge has been run against it | `hs-appservice` | a mautrix-* bridge with an external service (and its media, double puppeting, MSC3202) is the next real-bridge check |
 | Sytest never run | `tests/sytest` | CPAN dependencies absent |
 | `cargo fuzz` never executed | `fuzz/` | no nightly toolchain |

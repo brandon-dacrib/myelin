@@ -923,6 +923,12 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     config: hs_config::Config,
     options: ServeOptions,
 ) -> Result<ServeHandle, ServeError> {
+    // The operating system's root certificates, read once, on a blocking thread, while the
+    // stores below open: every outbound HTTP client this server builds shares them
+    // (`hs_http::client`). Read on demand instead, the first one built -- on the runtime
+    // thread, at boot -- stalled it for seconds on macOS.
+    let roots = tokio::spawn(hs_http::client::warm_native_roots());
+
     // Wired by the integration lead per docs/status/07-auth-and-identity.md "For track 12":
     // the persistent store replaces the in-memory one, so users, devices and tokens survive a
     // restart. `backend.clone()` is a cheap Arc-backed handle sharing the same open database —
@@ -939,6 +945,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
 
     let metrics = Arc::new(Metrics::new());
 
+    // The first HTTP client is built in here (the ping transport); the roots are ready by now
+    // on any machine that is not very slow, and on one that is, waiting beats blocking.
+    let _ = roots.await;
     let appservices = crate::appservices::load(&config.appservices, backend.clone(), &server_name)?;
     // Replaces `hs-auth`'s stub `InMemoryAppserviceRegistry` (empty by default) with
     // `hs-appservice`'s real, store-backed registry, so an `as_token` a loaded registration
@@ -1062,10 +1071,19 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // is started here, before any listener is bound: an event sent before the subscription
     // exists is caught up on, but only because the pump also reads cursors at start, and there
     // is no reason to lean on that for the events of the first few milliseconds.
+    // The cluster is started here, before the router that its room-shard gate wraps (see
+    // `crate::cluster`'s module docs for why every `/rooms/{roomId}/...` request is gated on
+    // shard ownership -- `docs/status/03-cluster.md`'s two-replica experiment) and before
+    // appservice delivery, which runs only on the replica that owns the shards for it
+    // (`crate::appservice_delivery`'s module docs). Inert in single-node mode
+    // (`config.cluster.single_node`, the default).
+    let cluster_handles = crate::cluster::start(&config, backend.clone()).await?;
     let appservice_delivery = crate::appservice_delivery::AppserviceDelivery::start(
         appservices.registry.clone(),
         appservices.ping_service.clone(),
         rooms.clone(),
+        cluster_handles.cluster.ownership().clone(),
+        cluster_handles.layout,
     )
     .await
     .map_err(|e| ServeError::Sessions(Box::new(e)))?;
@@ -1103,12 +1121,6 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         ),
     };
 
-    // Built before the router below so the room-shard gate layer can wrap it: see
-    // `crate::cluster`'s module docs for why gating every `/rooms/{roomId}/...` request on shard
-    // ownership (not just writes) is what actually stops two replicas from forking a room's event
-    // DAG (`docs/status/03-cluster.md`'s two-replica experiment). Inert in single-node mode
-    // (`config.cluster.single_node`, the default) — this matches today's behavior exactly.
-    let cluster_handles = crate::cluster::start(&config, backend.clone()).await?;
     overview.set_ownership(cluster_handles.cluster.ownership().clone());
 
     // The routing gate above stops two replicas both building a room actor, which is what closed
