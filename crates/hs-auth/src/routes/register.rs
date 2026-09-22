@@ -141,8 +141,19 @@ fn random_localpart() -> String {
 pub async fn post_register(
     State(state): State<AuthState>,
     Query(query): Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
     PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, MatrixError> {
+    // An appservice's own registration flow, before anything else: it has nothing in common
+    // with a person's. Per the application service API's "Registration" section it is
+    // authenticated by the `as_token`, takes no user-interactive auth, and is not subject to
+    // `enable_registration`, which is about people. The type is a *top-level* `type`, not an
+    // `auth` stage, as every bridge sends it; `/register` used to know nothing of it, so a
+    // bridge on a server with registration closed -- the default -- could not create its own
+    // bot and stopped right there. Found by starting heisenbridge.
+    if body.get("type").and_then(Value::as_str) == Some("m.login.application_service") {
+        return register_appservice_user(&state, &query, &headers, &body).await;
+    }
     let kind = query.get("kind").map(String::as_str).unwrap_or("user");
     if kind == "guest" {
         return register_guest(&state, &body).await;
@@ -153,6 +164,66 @@ pub async fn post_register(
         )));
     }
     register_user(&state, &body).await
+}
+
+/// `POST /register` with `type: m.login.application_service`: an appservice creating one of its
+/// own users -- its bot, or a ghost in its `users` namespace. See `post_register`.
+async fn register_appservice_user(
+    state: &AuthState,
+    query: &HashMap<String, String>,
+    headers: &axum::http::HeaderMap,
+    body: &Value,
+) -> Result<Response, MatrixError> {
+    let bearer = crate::middleware::bearer_token(headers)?;
+    let token = match (bearer, query.get("access_token")) {
+        (Some(token), _) => token,
+        (None, Some(token)) if state.config.accept_legacy_query_param_token => token.clone(),
+        _ => return Err(MatrixError::missing_token()),
+    };
+    let Some(appservice) = state.appservices.lookup_by_token(&token).await else {
+        return Err(MatrixError::unknown_token(false));
+    };
+
+    // The spec's field is `username`; the application service API's older text called it
+    // `user`, and Synapse still reads that first, so some bridges still send it.
+    let username = body
+        .get("username")
+        .or_else(|| body.get("user"))
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| MatrixError::invalid_param("username is required"))?;
+    validate_localpart(state, &username)?;
+    let user_id =
+        UserId::parse_with_server_name(username.as_str(), state.server_name()).map_err(|_| {
+            MatrixError::invalid_username(format!("'{username}' is not a valid user ID localpart"))
+        })?;
+    if !appservice.can_control(&user_id) {
+        return Err(MatrixError::new(
+            StatusCode::BAD_REQUEST,
+            ErrCode::Exclusive,
+            format!(
+                "{user_id} is neither appservice {}'s own user nor in its user namespace",
+                appservice.appservice_id
+            ),
+        ));
+    }
+    if !state.store.is_localpart_available(&username).await? {
+        return Err(MatrixError::user_in_use());
+    }
+    state
+        .store
+        .create_user({
+            let mut r = UserRecord::new(user_id.clone(), state.now_ms());
+            r.appservice_id = Some(appservice.appservice_id.clone());
+            r
+        })
+        .await?;
+
+    let inhibit_login = body
+        .get("inhibit_login")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    finish_registration(state, &user_id, body, inhibit_login).await
 }
 
 async fn register_guest(state: &AuthState, body: &Value) -> Result<Response, MatrixError> {
@@ -356,9 +427,14 @@ mod tests {
     async fn registration_completes_with_dummy_stage_by_default() {
         let state = AuthState::in_memory();
         let body = json!({"username": "newuser", "password": "hunter22", "auth": {"type": "m.login.dummy"}});
-        let response = post_register(State(state), Query(HashMap::new()), PermissiveJson(body))
-            .await
-            .unwrap();
+        let response = post_register(
+            State(state),
+            Query(HashMap::new()),
+            axum::http::HeaderMap::new(),
+            PermissiveJson(body),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -366,9 +442,14 @@ mod tests {
     async fn first_call_without_auth_returns_401_with_flows() {
         let state = AuthState::in_memory();
         let body = json!({"username": "newuser2", "password": "hunter22"});
-        let response = post_register(State(state), Query(HashMap::new()), PermissiveJson(body))
-            .await
-            .unwrap();
+        let response = post_register(
+            State(state),
+            Query(HashMap::new()),
+            axum::http::HeaderMap::new(),
+            PermissiveJson(body),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -385,9 +466,14 @@ mod tests {
         let state = AuthState::in_memory_with_config(config);
         let body =
             json!({"username": "shortpw", "password": "short", "auth": {"type": "m.login.dummy"}});
-        let err = post_register(State(state), Query(HashMap::new()), PermissiveJson(body))
-            .await
-            .unwrap_err();
+        let err = post_register(
+            State(state),
+            Query(HashMap::new()),
+            axum::http::HeaderMap::new(),
+            PermissiveJson(body),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.errcode().as_str(), "M_WEAK_PASSWORD");
     }
 
@@ -399,14 +485,20 @@ mod tests {
         let response = post_register(
             State(state.clone()),
             Query(HashMap::new()),
+            axum::http::HeaderMap::new(),
             PermissiveJson(body.clone()),
         )
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let err = post_register(State(state), Query(HashMap::new()), PermissiveJson(body))
-            .await
-            .unwrap_err();
+        let err = post_register(
+            State(state),
+            Query(HashMap::new()),
+            axum::http::HeaderMap::new(),
+            PermissiveJson(body),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.errcode().as_str(), "M_USER_IN_USE");
     }
 
@@ -425,6 +517,7 @@ mod tests {
         let err = post_register(
             State(state.clone()),
             Query(HashMap::new()),
+            axum::http::HeaderMap::new(),
             PermissiveJson(body),
         )
         .await
@@ -434,9 +527,14 @@ mod tests {
         assert_eq!(err.errcode(), crate::error::ErrCode::Forbidden);
 
         let body = json!({"username": "tokenuser", "auth": {"type": "m.login.registration_token", "token": "good-token"}});
-        let response = post_register(State(state), Query(HashMap::new()), PermissiveJson(body))
-            .await
-            .unwrap();
+        let response = post_register(
+            State(state),
+            Query(HashMap::new()),
+            axum::http::HeaderMap::new(),
+            PermissiveJson(body),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -444,9 +542,14 @@ mod tests {
     async fn recaptcha_stage_fails_cleanly_when_submitted() {
         let state = AuthState::in_memory();
         let body = json!({"username": "recaptchauser", "auth": {"type": "m.login.recaptcha", "response": "x"}});
-        let err = post_register(State(state), Query(HashMap::new()), PermissiveJson(body))
-            .await
-            .unwrap_err();
+        let err = post_register(
+            State(state),
+            Query(HashMap::new()),
+            axum::http::HeaderMap::new(),
+            PermissiveJson(body),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.errcode().as_str(), "M_UNRECOGNIZED");
     }
 
@@ -459,9 +562,14 @@ mod tests {
             "inhibit_login": true,
             "auth": {"type": "m.login.dummy"}
         });
-        let response = post_register(State(state), Query(HashMap::new()), PermissiveJson(body))
-            .await
-            .unwrap();
+        let response = post_register(
+            State(state),
+            Query(HashMap::new()),
+            axum::http::HeaderMap::new(),
+            PermissiveJson(body),
+        )
+        .await
+        .unwrap();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -475,9 +583,14 @@ mod tests {
         let state = AuthState::in_memory(); // guest_registration_enabled: false by default
         let mut query = HashMap::new();
         query.insert("kind".to_string(), "guest".to_string());
-        let err = post_register(State(state), Query(query), PermissiveJson(json!({})))
-            .await
-            .unwrap_err();
+        let err = post_register(
+            State(state),
+            Query(query),
+            axum::http::HeaderMap::new(),
+            PermissiveJson(json!({})),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.status(), StatusCode::FORBIDDEN);
     }
 
@@ -490,9 +603,14 @@ mod tests {
         let state = AuthState::in_memory_with_config(config);
         let mut query = HashMap::new();
         query.insert("kind".to_string(), "guest".to_string());
-        let response = post_register(State(state), Query(query), PermissiveJson(json!({})))
-            .await
-            .unwrap();
+        let response = post_register(
+            State(state),
+            Query(query),
+            axum::http::HeaderMap::new(),
+            PermissiveJson(json!({})),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -504,6 +622,7 @@ mod tests {
         post_register(
             State(state.clone()),
             Query(HashMap::new()),
+            axum::http::HeaderMap::new(),
             PermissiveJson(body),
         )
         .await
@@ -561,6 +680,7 @@ mod tests {
             let err = post_register(
                 State(state.clone()),
                 Query(HashMap::new()),
+                axum::http::HeaderMap::new(),
                 PermissiveJson(body),
             )
             .await
@@ -583,9 +703,14 @@ mod tests {
             "password": "sUp3rs3kr1t",
             "auth": {"type": "m.login.dummy"}
         });
-        let response = post_register(State(state), Query(HashMap::new()), PermissiveJson(body))
-            .await
-            .unwrap();
+        let response = post_register(
+            State(state),
+            Query(HashMap::new()),
+            axum::http::HeaderMap::new(),
+            PermissiveJson(body),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -609,6 +734,7 @@ mod tests {
         let response = post_register(
             State(state.clone()),
             Query(HashMap::new()),
+            axum::http::HeaderMap::new(),
             PermissiveJson(first),
         )
         .await
@@ -620,9 +746,14 @@ mod tests {
             "password": "sUp3rs3kr1t",
             "auth": {"type": "m.login.dummy"}
         });
-        let err = post_register(State(state), Query(HashMap::new()), PermissiveJson(second))
-            .await
-            .unwrap_err();
+        let err = post_register(
+            State(state),
+            Query(HashMap::new()),
+            axum::http::HeaderMap::new(),
+            PermissiveJson(second),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.errcode().as_str(), "M_USER_IN_USE");
     }
 
@@ -643,9 +774,146 @@ mod tests {
             "password": "sUp3rs3kr1t",
             "auth": {"type": "m.login.dummy"}
         });
-        let response = post_register(State(state), Query(HashMap::new()), PermissiveJson(body))
+        let response = post_register(
+            State(state),
+            Query(HashMap::new()),
+            axum::http::HeaderMap::new(),
+            PermissiveJson(body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // An appservice registering its own users.
+    // ---------------------------------------------------------------------------------------
+
+    /// A server with registration closed -- the default -- and one bridge registered.
+    fn closed_server_with_a_bridge() -> AuthState {
+        let state = AuthState::in_memory();
+        let registry = crate::appservice::InMemoryAppserviceRegistry::new();
+        registry.insert(
+            "as_secret",
+            crate::appservice::AppserviceRecord::new(
+                "irc",
+                ruma::user_id!("@ircbot:example.org").to_owned(),
+                vec![crate::appservice::NamespaceRule {
+                    regex: regex::Regex::new(r"^@irc_.*:example\.org$").unwrap(),
+                    exclusive: true,
+                }],
+            ),
+        );
+        AuthState {
+            appservices: std::sync::Arc::new(registry),
+            config: std::sync::Arc::new(AuthConfig {
+                registration_enabled: false,
+                ..AuthConfig::default()
+            }),
+            ..state
+        }
+    }
+
+    async fn body_json(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn bearer(token: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        headers
+    }
+
+    /// What heisenbridge sends first, byte for byte, and got "Registration is disabled" for:
+    /// the bot registering itself, with `inhibit_login`, on a server whose registration is
+    /// closed. It is the appservice's own flow, and that setting is about people.
+    #[tokio::test]
+    async fn an_appservice_registers_its_bot_with_registration_closed_and_no_uia() {
+        let state = closed_server_with_a_bridge();
+        let body = json!({"type": "m.login.application_service", "username": "heisenbridge", "inhibit_login": true});
+        // Not its bot and not in its namespace.
+        let err = post_register(
+            State(state.clone()),
+            Query(HashMap::new()),
+            bearer("as_secret"),
+            PermissiveJson(body),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.errcode(), ErrCode::Exclusive, "{err:?}");
+
+        let body = json!({"type": "m.login.application_service", "username": "ircbot", "inhibit_login": true});
+        let response = post_register(
+            State(state.clone()),
+            Query(HashMap::new()),
+            bearer("as_secret"),
+            PermissiveJson(body),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["user_id"], "@ircbot:example.org");
+        assert!(json.get("access_token").is_none(), "inhibit_login: {json}");
+        let record = state
+            .store
+            .get_user(ruma::user_id!("@ircbot:example.org"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.appservice_id.as_deref(), Some("irc"));
+
+        // A ghost, with a session this time.
+        let body = json!({"type": "m.login.application_service", "username": "irc_alice"});
+        let response = post_register(
+            State(state.clone()),
+            Query(HashMap::new()),
+            bearer("as_secret"),
+            PermissiveJson(body),
+        )
+        .await
+        .unwrap();
+        let json = body_json(response).await;
+        assert_eq!(json["user_id"], "@irc_alice:example.org");
+        assert!(json["access_token"].is_string(), "{json}");
+
+        // Twice is a conflict, which every bridge expects and treats as "already done".
+        let body = json!({"type": "m.login.application_service", "username": "ircbot"});
+        let err = post_register(
+            State(state.clone()),
+            Query(HashMap::new()),
+            bearer("as_secret"),
+            PermissiveJson(body),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.errcode(), ErrCode::UserInUse, "{err:?}");
+
+        // Without a token it is nobody's flow; with somebody else's token, no better.
+        let body = json!({"type": "m.login.application_service", "username": "irc_bob"});
+        let err = post_register(
+            State(state.clone()),
+            Query(HashMap::new()),
+            axum::http::HeaderMap::new(),
+            PermissiveJson(body.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.errcode(), ErrCode::MissingToken, "{err:?}");
+        let err = post_register(
+            State(state),
+            Query(HashMap::new()),
+            bearer("not_an_as_token"),
+            PermissiveJson(body),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.errcode(), ErrCode::UnknownToken, "{err:?}");
     }
 }

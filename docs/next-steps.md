@@ -23,9 +23,17 @@ with a registration file in its config **could not start a second time** (`add` 
 registration as a conflict with itself; `import` was there for it), and **after any restart,
 nothing said in a pre-existing room reached `/sync`, push or a bridge**, because rooms loaded
 from disk never forwarded to the registry's global stream -- only created ones did, and every
-test created its rooms in the process that read them. Both fixed. No real bridge (mautrix-*)
-has been pointed at it yet; that is the next thing to do with a bridge, and the Bridges admin
-operations (0 of 16) after it.
+test created its rooms in the process that read them. Both fixed.
+
+**And then a real bridge was pointed at it.** heisenbridge (`docs/bridges/heisenbridge.md`),
+against the real binary and a local IRC server: it could not get past its first request --
+`/register` had no `m.login.application_service` branch, so a bridge on a server with
+registration closed (the default) could not create its own bot -- and with that fixed, everything
+a bridge does on its first day worked: bot registration, masqueraded requests, account data,
+control room, commands answered through the pump, IRC relayed to Matrix through ghost users and
+Matrix to IRC. The admin API's user list now says which accounts belong to which bridge
+(`appservice_id`, which was a documented gap). Next for bridges: the Bridges admin operations
+(0 of 16), so that the interface can show what the server now knows.
 
 **Configuration lives in the database** (RFC 0016). The file is a bootstrap and a seed; the database outranks it, `HS__` variables outrank the database, and the admin API refuses a write the environment would shadow rather than storing one that gets ignored. The web interface has a Configuration section that builds its forms from the server's own JSON Schema, and `hs config show|get|set|unset|import|export|history` is the same thing without a browser.
 
@@ -133,7 +141,7 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 | Admin API | ~23% | 34 of 145 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Config 6/6, Server 5/5, AuditLog 3/3, Setup 2/2, Users 10/41, Rooms 5/23, Statistics 1/4, Cluster 1/6, and **Bridges 0/16**, Federation 0/7, Media 0/9, RegistrationTokens 0/5 |
 | Management web interface | ~60% | users, rooms, federation, bridges, and configuration are real; arrays-of-objects and several resources are not |
 | **Federation** | **~15%** | 59/246 assertions, 6/88 top-level; a two-server join works one way only |
-| Bridges | ~35% | the appservice surface exists and, since 2026-09-21, events are delivered to it (verified with a test bridge against the real binary, across a restart); no real bridge has ever been pointed at it, and **none of the 16 bridge operations the interface's Bridges section calls is served** — that section works against the mock only |
+| Bridges | ~45% | a real bridge (heisenbridge) works end to end against the real binary, both directions, `docs/bridges/heisenbridge.md`; **none of the 16 bridge operations the interface's Bridges section calls is served** — that section works against the mock only |
 | Operations (HA, scale-out) | ~40% | it runs on Kubernetes with a chart and a tested image; the cluster path has never carried real traffic |
 
 Federation is the honest answer to "when could I use this". Everything else is far enough along
@@ -358,7 +366,7 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | Appservice delivery reads a room's *current* members to decide interest | `hs-appservice` | Synapse's rule too; a bridge whose bot has just left still hears its own leave, and nothing after |
 | Appservice delivery carries events only | `hs-appservice` | no ephemeral (typing, receipts, presence), to-device or device-list data reaches a bridge yet; `Transaction` has the fields, the pump fills one |
 | Only one process may pump | `hs-appservice`, `hs-cluster` | two replicas would each queue every event; delivery is not shard-gated and must be before a cluster carries bridges |
-| No real bridge has connected | `hs-appservice` | mautrix-* against the real binary is the next verification, the way Element was for clients |
+| Only heisenbridge has been run against it | `hs-appservice` | a mautrix-* bridge with an external service (and its media, double puppeting, MSC3202) is the next real-bridge check |
 | Sytest never run | `tests/sytest` | CPAN dependencies absent |
 | `cargo fuzz` never executed | `fuzz/` | no nightly toolchain |
 

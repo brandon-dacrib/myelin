@@ -86,6 +86,16 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
 
 ### Bridges
 
+- **A real bridge works.** heisenbridge, the IRC bouncer bridge, against the real binary and a
+  local IRC server: it registers its bot, drives the server as an appservice, is sent every event
+  in its rooms, answers commands, and relays both ways -- an IRC user appears in Matrix as a ghost
+  the bridge created, and a Matrix message appears on IRC. The first thing it did failed:
+  `/register` had no `m.login.application_service` branch, so on a server with registration
+  closed (the default) a bridge could not create its own bot. It has one now, authenticated by
+  the `as_token`, with no user-interactive auth, refusing a username outside the appservice's
+  namespace with `M_EXCLUSIVE`. Reproduction in `docs/bridges/heisenbridge.md`.
+- **The admin API says which accounts belong to a bridge.** `appservice_id` on a user was a
+  documented gap; it is set on every account an appservice registers.
 - **Bridges are sent what happens in their rooms.** An appservice could register, ping and be
   masqueraded through, and was sent no event, ever: the transaction scheduler delivered a queue
   nothing filled. Now a pump reads every room from a durable cursor, decides who wants each

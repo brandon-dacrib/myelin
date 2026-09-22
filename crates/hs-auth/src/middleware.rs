@@ -46,8 +46,10 @@ pub(crate) async fn query_params(parts: &mut Parts, state: &AuthState) -> HashMa
         .unwrap_or_default()
 }
 
-fn extract_bearer(parts: &Parts) -> Result<Option<String>, MatrixError> {
-    let values: Vec<_> = parts.headers.get_all(AUTHORIZATION).iter().collect();
+/// The bearer token in `headers`, if there is one. `Ok(None)` for no `Authorization` header at
+/// all; an error for a header that is there and wrong.
+pub(crate) fn bearer_token(headers: &axum::http::HeaderMap) -> Result<Option<String>, MatrixError> {
+    let values: Vec<_> = headers.get_all(AUTHORIZATION).iter().collect();
     if values.is_empty() {
         return Ok(None);
     }
@@ -79,7 +81,7 @@ pub(crate) async fn extract_token(
     parts: &mut Parts,
     state: &AuthState,
 ) -> Result<String, MatrixError> {
-    let bearer = extract_bearer(parts)?;
+    let bearer = bearer_token(&parts.headers)?;
     let query = query_params(parts, state).await;
     let query_token = query.get("access_token").cloned();
     match (bearer, query_token) {

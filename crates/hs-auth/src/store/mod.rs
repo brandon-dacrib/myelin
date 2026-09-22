@@ -78,6 +78,11 @@ pub struct UserRecord {
     /// copied into new `m.room.member` events the same way as [`UserRecord::display_name`]. Set
     /// with [`UserStore::set_profile_avatar_url`].
     pub avatar_url: Option<String>,
+    /// The appservice that created this account through `POST /register` with
+    /// `type: m.login.application_service` -- a bridge's bot, or one of its ghosts. `None` for
+    /// a person. `default` so that rows written before the field existed still read.
+    #[serde(default)]
+    pub appservice_id: Option<String>,
 }
 
 impl UserRecord {
@@ -96,6 +101,7 @@ impl UserRecord {
             created_at_ms,
             display_name: None,
             avatar_url: None,
+            appservice_id: None,
         }
     }
 }

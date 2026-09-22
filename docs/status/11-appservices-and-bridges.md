@@ -1,6 +1,17 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-09-18 (first pass; track had not started before this session).
+Last updated: 2026-09-22.
+
+**A real bridge works.** heisenbridge, against the real binary and a local IRC server: it
+registers its bot, drives the server with masqueraded requests, receives every event in its
+rooms as transactions, relays IRC to Matrix through ghost users and Matrix to IRC. Reproduction
+and the exact list of what was and was not verified: `docs/bridges/heisenbridge.md`. Two things
+had to be fixed for it to get past its first request -- `/register` had no
+`m.login.application_service` branch, and `hs serve` delivered no events to any appservice
+(there was a scheduler and nothing that fed it; `src/pump.rs` and `src/delivery.rs` now do) --
+and two more were found on the way: a server with a registration file in its configuration
+could not start a second time, and after any restart nothing said in a pre-existing room reached
+`/sync`, push or a bridge. All four are fixed, each with a test that fails without it.
 
 ## Done
 
@@ -72,6 +83,12 @@ Last updated: 2026-09-18 (first pass; track had not started before this session)
   "Interfaces needed".
 
 ## In progress / Known gaps
+
+Since 2026-09-22 the first four items below are superseded by `docs/bridges/heisenbridge.md`'s
+list: the pump delivers events only (no ephemeral, to-device or device-list data yet, though
+`Transaction` has the fields); interest is decided by a room's current members, as Synapse does;
+one process must pump (delivery is not shard-gated for a cluster); and no mautrix-* bridge with
+an external service has been tried, only heisenbridge.
 
 Everything below is a real, specific gap, not a vague TODO — each is blocked on a concrete thing
 this track does not own, listed so the next session (or another track) can pick it up precisely:

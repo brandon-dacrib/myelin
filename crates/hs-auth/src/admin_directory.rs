@@ -21,8 +21,9 @@
 //! - `room_count`, `media_count`: this crate has no view onto rooms (track 04) or media (track
 //!   09). Wiring those in is those tracks' data-source seam to add, not this one's -- see
 //!   `docs/status/07-auth-and-identity.md`'s "Interfaces needed".
-//! - `user_type`, `consent_version`, `appservice_id`: user-type categorization and appservice
-//!   attribution are Phase 1/2 gaps noted in this crate's own status file.
+//! - `user_type`, `consent_version`: user-type categorization is a Phase 1/2 gap noted in this
+//!   crate's own status file. (`appservice_id` is real: the appservice that registered the
+//!   account, if one did.)
 //! - `erased`: account erasure is a Phase 1/2 lifecycle feature this crate has not built yet (see
 //!   this track's brief's "account lifecycle" line).
 //!
@@ -92,6 +93,7 @@ impl AuthStoreUserDirectory {
             created_at: format_rfc3339_ms(record.created_at_ms),
             last_seen_at,
             device_count: devices.len() as u64,
+            appservice_id: record.appservice_id.clone(),
             ..AdminUser::default()
         })
     }
