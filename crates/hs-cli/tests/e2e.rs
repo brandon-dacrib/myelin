@@ -48,6 +48,52 @@ fn reserve_ephemeral_port() -> u16 {
         .port()
 }
 
+/// `GET /sync` until `wanted` is true of the response, or a few seconds have passed. A room's
+/// membership rows and feed entries are written by the session hub off a background stream, so
+/// a sync sent the instant after a join or an invitation can honestly come back without it; a
+/// real client is long-polling and is woken when it lands, and this does the same, bounded, with
+/// a token carried forward -- a long-poll can also be woken by something else first (the
+/// joiner's own presence, say) and answer without the room. Returns the first response that
+/// satisfies `wanted`, or panics with the last one.
+async fn sync_until(
+    base: &str,
+    token: &str,
+    mut since: Option<String>,
+    filter: Option<&str>,
+    wanted: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let client = reqwest::Client::new();
+    let mut last = serde_json::Value::Null;
+    for _ in 0..40 {
+        let mut url = format!("{base}/_matrix/client/v3/sync?timeout=1000");
+        if let Some(since) = &since {
+            url.push_str(&format!("&since={since}"));
+        }
+        if let Some(filter) = filter {
+            url.push_str(&format!("&filter={filter}"));
+        }
+        let response: serde_json::Value = client
+            .get(url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if wanted(&response) {
+            return response;
+        }
+        // An initial sync stays initial until it has what it wants; an incremental one
+        // moves on, or it would be handed the same nothing again.
+        if since.is_some() {
+            since = response["next_batch"].as_str().map(str::to_owned);
+        }
+        last = response;
+    }
+    panic!("the sync never said what was expected; the last one said: {last}");
+}
+
 #[tokio::test]
 async fn boots_registers_logs_in_and_reports_ready() {
     let dir = tempfile::tempdir().unwrap();
@@ -1709,15 +1755,12 @@ async fn the_user_directory_shows_a_searcher_only_who_they_could_already_see() {
     )
     .await;
     // Bob accepts, so that he and Alice share a private room.
-    let bob_sync: serde_json::Value = client
-        .get(format!("{base}/_matrix/client/v3/sync?timeout=0"))
-        .bearer_auth(&bob)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let bob_sync = sync_until(&base, &bob, None, None, |s| {
+        s["rooms"]["invite"]
+            .as_object()
+            .is_some_and(|r| !r.is_empty())
+    })
+    .await;
     let invited_to = bob_sync["rooms"]["invite"]
         .as_object()
         .and_then(|rooms| rooms.keys().next().cloned())
@@ -2343,12 +2386,9 @@ async fn accepting_an_invitation_to_an_encrypted_direct_chat_tells_the_client_ev
     .await;
     assert_eq!(creator["displayname"], "Alice", "{creator}");
 
-    let synced = call(
-        get.clone(),
-        format!("/sync?timeout=0&since={since}"),
-        bob.clone(),
-        None,
-    )
+    let synced = sync_until(&base, &bob, Some(since), None, |s| {
+        s["rooms"]["invite"].get(&room_id).is_some()
+    })
     .await;
     let since = synced["next_batch"].as_str().unwrap().to_owned();
     let invitation = synced["rooms"]["invite"][&room_id]["invite_state"]["events"]
@@ -2370,12 +2410,9 @@ async fn accepting_an_invitation_to_an_encrypted_direct_chat_tells_the_client_ev
     .await;
     // Lazy-loading members, the way every real client asks.
     let filter = "%7B%22room%22%3A%7B%22state%22%3A%7B%22lazy_load_members%22%3Atrue%7D%7D%7D";
-    let synced = call(
-        get.clone(),
-        format!("/sync?timeout=0&since={since}&filter={filter}"),
-        bob.clone(),
-        None,
-    )
+    let synced = sync_until(&base, &bob, Some(since), Some(filter), |s| {
+        s["rooms"]["join"].get(&room_id).is_some()
+    })
     .await;
     let since = synced["next_batch"].as_str().unwrap().to_owned();
     let room = &synced["rooms"]["join"][&room_id];
@@ -2412,12 +2449,9 @@ async fn accepting_an_invitation_to_an_encrypted_direct_chat_tells_the_client_ev
         Some(json!({"msgtype": "m.text", "body": "hello bob"})),
     )
     .await;
-    let synced = call(
-        get.clone(),
-        format!("/sync?timeout=0&since={since}&filter={filter}"),
-        bob.clone(),
-        None,
-    )
+    let synced = sync_until(&base, &bob, Some(since), Some(filter), |s| {
+        s["rooms"]["join"].get(&room_id).is_some()
+    })
     .await;
     let since = synced["next_batch"].as_str().unwrap().to_owned();
     let room = &synced["rooms"]["join"][&room_id];
