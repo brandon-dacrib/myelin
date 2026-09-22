@@ -2062,6 +2062,123 @@ async fn a_bridge_is_sent_what_happens_in_a_room_its_bot_is_in_even_across_a_res
     server.stop();
 }
 
+/// The user-facing shape of the restart bug the bridge test found: after `hs serve` was
+/// restarted, a message in a room that already existed reached nobody's `/sync`, because a room
+/// loaded from disk never forwarded to the stream the session hub follows. Every server
+/// restarts; every room a real server has predates its last restart.
+#[tokio::test]
+async fn after_a_restart_a_message_in_an_old_room_still_reaches_the_other_person() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = reserve_ephemeral_port();
+    let config_path = dir.path().join("homeserver.yaml");
+    std::fs::write(
+        &config_path,
+        test_config_yaml(port, &dir.path().join("data")),
+    )
+    .unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    // A client per request: a pooled connection to the first process is no use against the
+    // second.
+    let call = |method: reqwest::Method,
+                path: String,
+                token: Option<String>,
+                body: Option<serde_json::Value>| {
+        let base = base.clone();
+        async move {
+            let mut request = reqwest::Client::new().request(method, format!("{base}{path}"));
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            if let Some(body) = body {
+                request = request.json(&body);
+            }
+            let response = request.send().await.unwrap();
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert!(status.is_success(), "{status}: {body}");
+            body
+        }
+    };
+
+    let mut server = HsProcess::serve(&config_path);
+    server.wait_for("listening");
+    let mut tokens = Vec::new();
+    for name in ["old-alice", "old-bob"] {
+        let registered = call(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/register".into(),
+            None,
+            Some(json!({"username": name, "password": format!("hunter2-{name}"), "auth": {"type": "m.login.dummy"}})),
+        )
+        .await;
+        tokens.push(registered["access_token"].as_str().unwrap().to_owned());
+    }
+    let (alice, bob) = (tokens[0].clone(), tokens[1].clone());
+    let created = call(
+        reqwest::Method::POST,
+        "/_matrix/client/v3/createRoom".into(),
+        Some(alice.clone()),
+        Some(json!({"preset": "public_chat", "invite": ["@old-bob:example.org"]})),
+    )
+    .await;
+    let room_id = created["room_id"].as_str().unwrap().to_owned();
+    let room_path = room_id.replace('!', "%21").replace(':', "%3A");
+    call(
+        reqwest::Method::POST,
+        format!("/_matrix/client/v3/rooms/{room_path}/join"),
+        Some(bob.clone()),
+        Some(json!({})),
+    )
+    .await;
+    // Bob's client is up to date, and keeps its token across the restart, as a real one does.
+    let synced = call(
+        reqwest::Method::GET,
+        "/_matrix/client/v3/sync?timeout=0".into(),
+        Some(bob.clone()),
+        None,
+    )
+    .await;
+    assert!(synced["rooms"]["join"].get(&room_id).is_some(), "{synced}");
+    let since = synced["next_batch"].as_str().unwrap().to_owned();
+
+    server.stop();
+    let mut server = HsProcess::serve(&config_path);
+    server.wait_for("listening");
+
+    call(
+        reqwest::Method::PUT,
+        format!("/_matrix/client/v3/rooms/{room_path}/send/m.room.message/after"),
+        Some(alice),
+        Some(json!({"msgtype": "m.text", "body": "still here after the restart"})),
+    )
+    .await;
+    // A long-poll, the way a client waits: it must be woken by the message, not time out.
+    let started = std::time::Instant::now();
+    let synced = call(
+        reqwest::Method::GET,
+        format!("/_matrix/client/v3/sync?timeout=10000&since={since}"),
+        Some(bob),
+        None,
+    )
+    .await;
+    let bodies: Vec<&str> = synced["rooms"]["join"][&room_id]["timeline"]["events"]
+        .as_array()
+        .map(|events| {
+            events
+                .iter()
+                .filter_map(|e| e["content"]["body"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(bodies, vec!["still here after the restart"], "{synced}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the sync was not woken; it waited {:?}",
+        started.elapsed()
+    );
+    server.stop();
+}
+
 /// What opening Element on this server found, the day `/sync` stopped resending every room's
 /// whole state with every message. Two people, a direct and encrypted chat, an invitation
 /// accepted: the most ordinary thing the server will ever be asked to do, and it went wrong four
