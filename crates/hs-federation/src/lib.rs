@@ -6,6 +6,7 @@
 //! what is untested.
 
 pub mod acl;
+pub mod admin_source;
 pub mod backfill;
 pub mod client;
 pub mod destination_store;

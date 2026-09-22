@@ -173,8 +173,8 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 | Client-server API | ~75% | 314/384 csapi assertions, 78/106 top-level (run 7); two real Element sessions sign in, create an encrypted room, invite, accept, and read each other's encrypted messages. The number understates the day: four of the fixes behind it were `/sync` silently losing events, which no percentage shows |
 | Storage, rooms, state resolution | ~85% | the engine underneath; 1600+ tests, two backends through one conformance suite, state bake-off done |
 | Configuration and first run | ~90% | database-backed, editable in the UI, one command from nothing to a working server |
-| Admin API | ~37% | 54 of 145 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Config 6/6, Server 5/5, AuditLog 3/3, Setup 2/2, Bridges 16/16, Users 14/41, Rooms 5/23, Statistics 1/4, Cluster 1/6, and Federation 0/7, Media 0/9, RegistrationTokens 0/5 |
-| Management web interface | ~65% | users, rooms, bridges and configuration are real against the real server; federation and media pages still read from operations that answer 501; arrays-of-objects are a JSON textarea |
+| Admin API | ~40% | 58 of 145 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Config 6/6, Server 5/5, AuditLog 3/3, Setup 2/2, Bridges 16/16, Users 14/41, Rooms 6/23, Federation 3/7, Statistics 1/4, Cluster 1/6, and Media 0/9, RegistrationTokens 0/5 |
+| Management web interface | ~70% | users (with devices, sign-out and password reset), rooms (with members), bridges (with the wizard), federation destinations and configuration are real against the real server; the media and reports pages still read from operations that answer 501; arrays-of-objects are a JSON textarea |
 | **Federation** | **~15%** | 59/246 assertions, 6/88 top-level; a two-server join works one way only |
 | Bridges | ~65% | a real bridge (heisenbridge) works end to end against the real binary, both directions, `docs/bridges/heisenbridge.md`; all 16 bridge operations are real, and the interface's Bridges section was watched adding a bridge through the wizard and pausing and resuming a live one; no mautrix-* bridge with an external service has been run |
 | Operations (HA, scale-out) | ~40% | it runs on Kubernetes with a chart and a tested image; the cluster path has never carried real traffic |
@@ -294,9 +294,14 @@ cannot do, in rough order of how often an operator will hit it:
   five times. Counts are shared for a minute rather than redone per poll, and what nothing can
   count yet (media, failing destinations, pending reports) is *absent* from the response rather
   than zero — the page shows a dash, and its all-clear now says what it could not check instead
-  of putting a green tick over bridges and federation nobody asked about. What is left on that
-  page is the two panels still answering 501: `appservices.list` and
-  `federation.destinations.list`.
+  of putting a green tick over bridges and federation nobody asked about. **Done 2026-09-22:**
+  both panels are real. `appservices.list` came with the Bridges section;
+  `federation.destinations.list/get/reset` read the outbound client's per-destination backoff
+  records (`hs_federation::admin_source`), which now carry "failing since" and the last
+  attempt, and a reset clears the backoff so the next request is tried at once. The overview
+  counts failing destinations (zero, not absent, when nothing is failing; with federation off
+  the list is honestly empty rather than a 503). Pending PDU/EDU counts are zero because there
+  is no outbound queue yet, which is true rather than a placeholder.
 - ~~Add a user from the interface.~~ **Done 2026-09-21.** `AuthStoreUserDirectory::create_user`
   is real (it inherited a default that answered 503), and the Users page has an "Add user"
   dialog. **Since 2026-09-22** the user page's devices list, "Sign out everywhere", signing out

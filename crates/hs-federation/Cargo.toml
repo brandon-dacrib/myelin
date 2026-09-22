@@ -42,6 +42,10 @@ hs-kv = { path = "../hs-kv" }
 hs-tables = { path = "../hs-tables" }
 hs-http = { path = "../hs-http" }
 hs-config = { path = "../hs-config" }
+# The admin API's federation source (`hs_admin::sources::FederationSource`) is implemented
+# here over the destination store. No cycle: `hs-admin` depends on neither this crate nor
+# anything that does.
+hs-admin = { path = "../hs-admin" }
 # Added by track 06 (fourth session): `hs_state::auth::{check_event_auth,
 # check_auth_events_selection, expected_auth_types}` is the one real room-version auth-rules
 # engine in the workspace, and `crate::join`/`crate::inbound` reuse it directly against a

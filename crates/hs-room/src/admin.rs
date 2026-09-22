@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use hs_admin::model::AdminRoom;
+use hs_admin::model::{AdminRoom, AdminRoomMember};
 use hs_admin::sources::{RoomDirectory, RoomFilter, SourceError};
 use hs_kv::KvBackend;
 use ruma::{RoomId, UserId};
@@ -187,6 +187,48 @@ impl<B: KvBackend + 'static> RoomDirectory for RoomRegistryDirectory<B> {
             .make_admin(user_id, now_ms())
             .await
             .map(|_event| ())
+            .map_err(to_source_error)
+    }
+
+    /// Every `m.room.member` event in the room's current state, as the room holds it: the
+    /// display name and avatar on each are the ones the member event carries, which is what
+    /// the room shows, not the profile the account has since changed to.
+    async fn list_members(&self, room_id: &str) -> Result<Vec<AdminRoomMember>, SourceError> {
+        let room_id = parse_room_id(room_id)?;
+        let handle = self
+            .registry
+            .get_or_load(&room_id)
+            .await
+            .map_err(to_source_error)?;
+        handle
+            .query(|actor| {
+                let members = actor.members()?;
+                Ok(members
+                    .into_iter()
+                    .filter_map(|event| {
+                        let json = crate::routes::render::client_event_json(event);
+                        let user_id = json.get("state_key")?.as_str()?.to_owned();
+                        let content = json.get("content")?;
+                        Some(AdminRoomMember {
+                            user_id,
+                            membership: content
+                                .get("membership")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("leave")
+                                .to_owned(),
+                            display_name: content
+                                .get("displayname")
+                                .and_then(|d| d.as_str())
+                                .map(str::to_owned),
+                            avatar_url: content
+                                .get("avatar_url")
+                                .and_then(|a| a.as_str())
+                                .map(str::to_owned),
+                        })
+                    })
+                    .collect())
+            })
+            .await
             .map_err(to_source_error)
     }
 }
@@ -440,5 +482,43 @@ mod tests {
             .await
             .expect_err("a non-member cannot be made admin");
         assert!(matches!(err, SourceError::Invalid(_)));
+    }
+
+    /// The member list is the room's current membership, each with what their member event
+    /// carries: a join with a display name shows it, an invitation is an invitation, and a
+    /// room that does not exist is not found.
+    #[tokio::test]
+    async fn list_members_reads_the_rooms_current_membership() {
+        let registry = registry();
+        let alice = user_id!("@alice:admin.test");
+        let bob = user_id!("@bob:admin.test");
+        let room_id = create_test_room(&registry, alice).await;
+        let handle = registry.get_or_load(&room_id).await.unwrap();
+        handle
+            .membership(
+                alice.to_owned(),
+                crate::membership::Action::Invite,
+                bob.to_owned(),
+                serde_json::json!({"displayname": "Bob"}),
+                2,
+            )
+            .await
+            .unwrap();
+
+        let directory = RoomRegistryDirectory::new(registry);
+        let mut members = directory.list_members(room_id.as_str()).await.unwrap();
+        members.sort_by(|a, b| a.user_id.cmp(&b.user_id));
+        assert_eq!(members.len(), 2, "{members:?}");
+        assert_eq!(members[0].user_id, alice.as_str());
+        assert_eq!(members[0].membership, "join");
+        assert_eq!(members[1].user_id, bob.as_str());
+        assert_eq!(members[1].membership, "invite");
+        assert_eq!(members[1].display_name.as_deref(), Some("Bob"));
+
+        let err = directory
+            .list_members("!nobody:admin.test")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SourceError::NotFound), "{err:?}");
     }
 }

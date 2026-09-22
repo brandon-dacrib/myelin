@@ -607,6 +607,8 @@ fn admin_state<B: KvBackend + 'static>(
     // The Bridges section: until this, all thirteen of its operations answered 503, and the
     // section worked against the mock server only.
     .with_appservices(sources.appservices)
+    // The Federation page and the Overview's last 501 panel.
+    .with_federation(sources.federation)
     .with_server_info(hs_admin::model::ServerInfo {
         name: server_name.to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -637,6 +639,7 @@ struct AdminSources {
     setup: Arc<hs_auth::setup::FirstRunSetup>,
     overview: Arc<dyn hs_admin::sources::OverviewSource>,
     appservices: Arc<dyn hs_admin::sources::AppserviceDirectory>,
+    federation: Arc<dyn hs_admin::sources::FederationSource>,
 }
 
 /// The `/api/v1` state for [`route_manifest`]'s throwaway router: routes are registered the same
@@ -1021,6 +1024,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
 
     // Federation is mounted over the same open backend and stores every other surface uses, so a
     // remote server reading `/state` sees exactly what a local client reading `/messages` sees.
+    // The admin API's view of federation. With federation off there are no destinations, and
+    // an empty list is the honest answer -- not a 503, which would read as "could not check".
+    let federation_source: Arc<dyn hs_admin::sources::FederationSource>;
     let federation = if config.federation.enabled {
         let mount = crate::federation::build_mount(
             &config,
@@ -1031,6 +1037,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             auth_state.store.clone(),
             e2e_state.store.clone(),
         )?;
+        federation_source = Arc::new(hs_federation::admin_source::DestinationStoreSource::new(
+            mount.destinations.clone(),
+        ));
         Some((
             mount.state,
             mount.x_matrix,
@@ -1039,6 +1048,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         ))
     } else {
         tracing::info!("federation is disabled; not mounting the federation transport server");
+        federation_source = Arc::new(hs_admin::sources::InMemoryFederationSource::new());
         None
     };
 
@@ -1094,6 +1104,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         rooms.clone(),
         config.cluster.single_node,
     ));
+    overview.set_federation(federation_source.clone());
 
     let mounts = Mounts {
         room: room_state,
@@ -1117,6 +1128,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
                 setup: setup.clone(),
                 overview: overview.clone(),
                 appservices: appservice_delivery.admin_directory(),
+                federation: federation_source.clone(),
             },
         ),
     };

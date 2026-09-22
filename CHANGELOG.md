@@ -75,6 +75,13 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
   room with and members of public rooms, as the specification requires; finding everybody is an
   explicit setting (`auth.user_directory_search_all_users`), off by default because bridged
   contacts are local accounts too.
+- **The room page lists a room's members, and the Federation page lists the servers this one
+  has tried to reach.** Members come from the room's current state with the name and avatar
+  each member event carries, joined first. Destinations come from the outbound client's own
+  backoff records -- when each last succeeded, since when it has been failing, when it was
+  last tried and how long the backoff is -- and an administrator can reset one so the next
+  request is tried at once. The Overview's last two "not implemented" panels are gone with
+  these; it counts failing destinations, and says zero when there are none.
 - **A lost phone and a forgotten password are an administrator's to fix.** A user's page lists
   their devices (it used to show an error there, against a real server), signs one out or all
   of them, and resets their password: the server's own password policy applies, everything is

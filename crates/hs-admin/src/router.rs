@@ -36,8 +36,9 @@ use crate::model::{
 };
 use crate::operations::{OperationDef, load as load_operations};
 use crate::sources::{
-    AppserviceDirectory, ConfigPatch, ConfigSource, OverviewSource, RoomDirectory, RoomFilter,
-    SetupSource, SourceError, UserCreateRequest, UserDirectory, UserFilter, UserLookupQuery,
+    AppserviceDirectory, ConfigPatch, ConfigSource, FederationSource, OverviewSource,
+    RoomDirectory, RoomFilter, SetupSource, SourceError, UserCreateRequest, UserDirectory,
+    UserFilter, UserLookupQuery,
 };
 
 /// Everything an `hs-admin` handler needs. Cloned per-request by axum (cheap: everything inside
@@ -80,6 +81,10 @@ pub struct AdminState {
     /// What every `appservices.*` operation reads and writes: the bridge registry. `None` until
     /// wired with [`AdminState::with_appservices`]; until then they answer `503 unavailable`.
     pub appservices: Option<Arc<dyn AppserviceDirectory>>,
+    /// What the `federation.destinations.*` operations read: every remote server this one has
+    /// tried to reach. `None` until wired with [`AdminState::with_federation`]; until then they
+    /// answer `503 unavailable`.
+    pub federation: Option<Arc<dyn FederationSource>>,
     /// The `Idempotency-Key` cache every mutating handler that declares it consults (see
     /// [`crate::idempotency`]). Always present (never `None`): a client is never told its
     /// idempotency key was ignored.
@@ -105,6 +110,7 @@ impl AdminState {
             setup: None,
             overview: None,
             appservices: None,
+            federation: None,
             idempotency: Arc::new(IdempotencyStore::new()),
         }
     }
@@ -138,6 +144,14 @@ impl AdminState {
     #[must_use]
     pub fn with_appservices(mut self, appservices: Arc<dyn AppserviceDirectory>) -> Self {
         self.appservices = Some(appservices);
+        self
+    }
+
+    /// Wires a real [`FederationSource`], making the `federation.destinations.*` operations
+    /// serve the outbound sender's records instead of answering `503 unavailable`.
+    #[must_use]
+    pub fn with_federation(mut self, federation: Arc<dyn FederationSource>) -> Self {
+        self.federation = Some(federation);
         self
     }
 
@@ -227,6 +241,7 @@ const REAL_HANDLERS: &[&str] = &[
     "rooms.block",
     "rooms.unblock",
     "rooms.make_admin",
+    "rooms.members.list",
     "appservices.list",
     "appservices.get",
     "appservices.create",
@@ -243,6 +258,9 @@ const REAL_HANDLERS: &[&str] = &[
     "bridge_types.list",
     "bridge_types.get",
     "bridge_types.render",
+    "federation.destinations.list",
+    "federation.destinations.get",
+    "federation.destinations.reset",
     "config.list",
     "config.schema",
     "config.get",
@@ -1689,6 +1707,82 @@ fn redacted_section(mut section: ConfigSection) -> ConfigSection {
     section
 }
 
+#[derive(Debug, Deserialize)]
+struct MembersQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+    include_total: Option<bool>,
+    membership: Option<String>,
+}
+
+/// `GET /api/v1/rooms/{room_id}/members`: everyone with a membership event in the room's
+/// current state, joined first; `?membership=` narrows to one value.
+async fn rooms_members_list(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(room_id): Path<String>,
+    Query(query): Query<MembersQuery>,
+) -> Response {
+    let instance = format!("/api/v1/rooms/{room_id}/members");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let Some(rooms) = &state.rooms else {
+                return source_unavailable("room directory", &instance);
+            };
+            if let Some(m) = query.membership.as_deref()
+                && !["join", "invite", "leave", "ban", "knock"].contains(&m)
+            {
+                return Problem::validation_failed()
+                    .with_errors(vec![ValidationError::new(
+                        "/membership",
+                        "one of join, invite, leave, ban, knock",
+                    )])
+                    .with_instance(instance)
+                    .into_response();
+            }
+            match rooms.list_members(&room_id).await {
+                Ok(mut members) => {
+                    if let Some(wanted) = query.membership.as_deref() {
+                        members.retain(|m| m.membership == wanted);
+                    }
+                    let rank = |m: &str| match m {
+                        "join" => 0,
+                        "invite" => 1,
+                        "knock" => 2,
+                        "leave" => 3,
+                        _ => 4,
+                    };
+                    members.sort_by(|a, b| {
+                        rank(&a.membership)
+                            .cmp(&rank(&b.membership))
+                            .then_with(|| a.user_id.cmp(&b.user_id))
+                    });
+                    axum::Json(Page::paginate(
+                        members,
+                        query.cursor.as_deref(),
+                        query.limit,
+                        query.include_total.unwrap_or(false),
+                    ))
+                    .into_response()
+                }
+                Err(SourceError::NotFound) => Problem::not_found()
+                    .with_detail(format!("no such room: {room_id}"))
+                    .with_instance(instance)
+                    .into_response(),
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
 // -------------------------------------------------------------------------------------------
 // users: devices, sessions and passwords. What an administrator reaches for when somebody has
 // lost a phone or a password: see their devices, sign one or all of them out, set a new
@@ -1939,6 +2033,184 @@ async fn users_reset_password(
                 return resp;
             }
             axum::Json(json!({})).into_response()
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// federation: the destinations this server has tried to reach, and how that is going.
+// -------------------------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct DestinationsQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+    include_total: Option<bool>,
+    #[allow(dead_code)]
+    sort: Option<String>,
+    failing: Option<bool>,
+}
+
+/// `GET /api/v1/federation/destinations`: failing ones first, then by name; `?failing=true`
+/// narrows to those.
+async fn federation_destinations_list(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Query(query): Query<DestinationsQuery>,
+) -> Response {
+    let instance = "/api/v1/federation/destinations";
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let Some(federation) = &state.federation else {
+                return source_unavailable("federation sender", instance);
+            };
+            match federation.list_destinations().await {
+                Ok(mut items) => {
+                    if let Some(failing) = query.failing {
+                        items.retain(|d| d.failing_since.is_some() == failing);
+                    }
+                    items.sort_by(|a, b| {
+                        b.failing_since
+                            .is_some()
+                            .cmp(&a.failing_since.is_some())
+                            .then_with(|| a.server_name.cmp(&b.server_name))
+                    });
+                    axum::Json(Page::paginate(
+                        items,
+                        query.cursor.as_deref(),
+                        query.limit,
+                        query.include_total.unwrap_or(false),
+                    ))
+                    .into_response()
+                }
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `GET /api/v1/federation/destinations/{server_name}`.
+async fn federation_destinations_get(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(server_name): Path<String>,
+) -> Response {
+    let instance = format!("/api/v1/federation/destinations/{server_name}");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let Some(federation) = &state.federation else {
+                return source_unavailable("federation sender", &instance);
+            };
+            match federation.get_destination(&server_name).await {
+                Ok(Some(d)) => axum::Json(d).into_response(),
+                Ok(None) => Problem::not_found()
+                    .with_detail(format!(
+                        "this server has never tried to reach {server_name}"
+                    ))
+                    .with_instance(instance)
+                    .into_response(),
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `POST /api/v1/federation/destinations/{server_name}/reset` (`admin:write`): forgets the
+/// backoff, so the next request to that server is attempted at once.
+async fn federation_destinations_reset(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(server_name): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let instance = format!("/api/v1/federation/destinations/{server_name}/reset");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminWrite),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(principal) => {
+            let Some(federation) = &state.federation else {
+                return source_unavailable("federation sender", &instance);
+            };
+            if let Some(key) = idempotency_key(&headers) {
+                match state
+                    .idempotency
+                    .check("federation.destinations.reset", key, &body)
+                {
+                    Replay::Same(stored) => return replay_response(stored),
+                    Replay::Mismatch => {
+                        return Problem::idempotency_key_payload_mismatch()
+                            .with_instance(instance)
+                            .into_response();
+                    }
+                    Replay::Fresh => {}
+                }
+            }
+            let destination = match federation.reset_destination(&server_name).await {
+                Ok(d) => d,
+                Err(SourceError::NotFound) => {
+                    return Problem::not_found()
+                        .with_detail(format!(
+                            "this server has never tried to reach {server_name}"
+                        ))
+                        .with_instance(instance)
+                        .into_response();
+                }
+                Err(e) => return e.to_problem().with_instance(instance).into_response(),
+            };
+            if let Err(resp) = record_mutation(
+                &state,
+                &principal,
+                "federation.destinations.reset",
+                "federation.destination_reset",
+                ResourceRef::new("destination", server_name.clone()),
+                Vec::new(),
+                json!({ "server_name": server_name }),
+            )
+            .await
+            {
+                return resp;
+            }
+            let response_body = serde_json::to_vec(&destination).unwrap_or_default();
+            if let Some(key) = idempotency_key(&headers) {
+                state.idempotency.record(
+                    "federation.destinations.reset",
+                    key,
+                    &body,
+                    StoredResponse {
+                        status: 200,
+                        content_type: "application/json".to_string(),
+                        body: response_body.clone(),
+                    },
+                );
+            }
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                response_body,
+            )
+                .into_response()
         }
         ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
         ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
@@ -3743,6 +4015,7 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         "rooms.block" => builder.add(method, &full_path, rooms_block, meta),
         "rooms.unblock" => builder.add(method, &full_path, rooms_unblock, meta),
         "rooms.make_admin" => builder.add(method, &full_path, rooms_make_admin, meta),
+        "rooms.members.list" => builder.add(method, &full_path, rooms_members_list, meta),
         "appservices.list" => builder.add(method, &full_path, appservices_list, meta),
         "appservices.get" => builder.add(method, &full_path, appservices_get, meta),
         "appservices.create" => builder.add(method, &full_path, appservices_create, meta),
@@ -3763,6 +4036,15 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         "bridge_types.list" => builder.add(method, &full_path, bridge_types_list, meta),
         "bridge_types.get" => builder.add(method, &full_path, bridge_types_get, meta),
         "bridge_types.render" => builder.add(method, &full_path, bridge_types_render, meta),
+        "federation.destinations.list" => {
+            builder.add(method, &full_path, federation_destinations_list, meta)
+        }
+        "federation.destinations.get" => {
+            builder.add(method, &full_path, federation_destinations_get, meta)
+        }
+        "federation.destinations.reset" => {
+            builder.add(method, &full_path, federation_destinations_reset, meta)
+        }
         "config.list" => builder.add(method, &full_path, config_list, meta),
         "config.schema" => builder.add(method, &full_path, config_schema, meta),
         "config.get" => builder.add(method, &full_path, config_get, meta),
@@ -7008,5 +7290,168 @@ mod tests {
         let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(created["id"], "whatsapp");
         assert_eq!(created["sender_localpart"], "whatsappbot");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // rooms: members
+    // ---------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_rooms_members_are_listed_joined_first_and_filtered_by_membership() {
+        use crate::model::{AdminRoom, AdminRoomMember};
+        let member = |user_id: &str, membership: &str| AdminRoomMember {
+            user_id: user_id.into(),
+            membership: membership.into(),
+            display_name: None,
+            avatar_url: None,
+        };
+        let directory = crate::sources::InMemoryRoomDirectory::new()
+            .with_room(AdminRoom {
+                room_id: "!lounge:example.org".into(),
+                ..Default::default()
+            })
+            .with_member("!lounge:example.org", member("@zed:example.org", "leave"))
+            .with_member("!lounge:example.org", member("@bob:example.org", "join"))
+            .with_member("!lounge:example.org", member("@alice:example.org", "join"))
+            .with_member(
+                "!lounge:example.org",
+                member("@carol:example.org", "invite"),
+            );
+        let (router, _manifest) = build_router(test_state().with_rooms(Arc::new(directory)));
+
+        let (status, body, _) = call(
+            &router,
+            "GET",
+            "/api/v1/rooms/%21lounge%3Aexample.org/members",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<&str> = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["user_id"].as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "@alice:example.org",
+                "@bob:example.org",
+                "@carol:example.org",
+                "@zed:example.org"
+            ]
+        );
+
+        let (_, body, _) = call(
+            &router,
+            "GET",
+            "/api/v1/rooms/%21lounge%3Aexample.org/members?membership=invite",
+            None,
+            None,
+        )
+        .await;
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 1, "{page}");
+        assert_eq!(page["items"][0]["user_id"], "@carol:example.org");
+
+        let (status, _, _) = call(
+            &router,
+            "GET",
+            "/api/v1/rooms/%21lounge%3Aexample.org/members?membership=lurk",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _, _) = call(
+            &router,
+            "GET",
+            "/api/v1/rooms/%21nope%3Aexample.org/members",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // federation destinations
+    // ---------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn failing_destinations_come_first_and_a_reset_clears_the_run() {
+        use crate::model::AdminDestination;
+        let source = crate::sources::InMemoryFederationSource::new()
+            .with_destination(AdminDestination {
+                server_name: "alpha.example".into(),
+                last_successful_at: Some("2026-09-22T01:00:00.000Z".into()),
+                ..Default::default()
+            })
+            .with_destination(AdminDestination {
+                server_name: "zeta.example".into(),
+                failing_since: Some("2026-09-22T02:00:00.000Z".into()),
+                retry_last_at: Some("2026-09-22T02:30:00.000Z".into()),
+                retry_interval_ms: Some(60_000),
+                ..Default::default()
+            });
+        let (router, _manifest) = build_router(test_state().with_federation(Arc::new(source)));
+
+        let (status, body, _) = call(
+            &router,
+            "GET",
+            "/api/v1/federation/destinations",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            page["items"][0]["server_name"], "zeta.example",
+            "failing first: {page}"
+        );
+        assert_eq!(page["items"][1]["server_name"], "alpha.example");
+
+        let (_, body, _) = call(
+            &router,
+            "GET",
+            "/api/v1/federation/destinations?failing=true",
+            None,
+            None,
+        )
+        .await;
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+
+        let (status, body, _) = call(
+            &router,
+            "POST",
+            "/api/v1/federation/destinations/zeta.example/reset",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let d: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(d["failing_since"], serde_json::Value::Null, "{d}");
+        assert_eq!(
+            audit_entries_for_action(&router, "federation.destinations.reset")
+                .await
+                .len(),
+            1
+        );
+
+        let (status, _, _) = call(
+            &router,
+            "GET",
+            "/api/v1/federation/destinations/never.example",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

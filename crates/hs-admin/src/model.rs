@@ -424,6 +424,30 @@ impl std::fmt::Debug for BridgeTypeRenderResult {
     }
 }
 
+/// The OpenAPI `RoomMember` schema: one row of `GET /rooms/{room_id}/members`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminRoomMember {
+    pub user_id: String,
+    /// `join`, `invite`, `leave`, `ban` or `knock`, as the member event says.
+    pub membership: String,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+}
+
+/// The OpenAPI `Destination` schema: one remote server this one has tried to reach, and how
+/// that is going. Served by whatever implements [`crate::sources::FederationSource`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminDestination {
+    pub server_name: String,
+    pub last_successful_at: Option<String>,
+    /// When the current run of failures began; `None` while it is not failing.
+    pub failing_since: Option<String>,
+    pub retry_last_at: Option<String>,
+    pub retry_interval_ms: Option<u64>,
+    pub pending_pdu_count: u64,
+    pub pending_edu_count: u64,
+}
+
 /// The OpenAPI `AppService` schema: one row of `GET /appservices` and the body of every
 /// per-appservice operation that answers with the appservice. Served by whatever implements
 /// [`crate::sources::AppserviceDirectory`] (`hs-appservice`'s real one over its registry, or

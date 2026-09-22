@@ -50,6 +50,9 @@ pub struct ServerOverview<B: KvBackend> {
     single_node: bool,
     /// Set once the cluster has started, which is after the admin router is assembled.
     ownership: OnceLock<Arc<dyn Ownership>>,
+    /// Where the count of failing federation destinations comes from. Absent until set, and
+    /// the count is then absent too rather than zero.
+    federation: OnceLock<Arc<dyn hs_admin::sources::FederationSource>>,
     cached: tokio::sync::Mutex<Option<(Instant, StatisticsOverview)>>,
     ttl: Duration,
 }
@@ -63,6 +66,7 @@ impl<B: KvBackend + 'static> ServerOverview<B> {
             rooms,
             single_node,
             ownership: OnceLock::new(),
+            federation: OnceLock::new(),
             cached: tokio::sync::Mutex::new(None),
             ttl: STATISTICS_TTL,
         }
@@ -78,6 +82,11 @@ impl<B: KvBackend + 'static> ServerOverview<B> {
     /// Hands over the cluster's ownership view once it exists. Later calls are ignored.
     pub fn set_ownership(&self, ownership: Arc<dyn Ownership>) {
         let _ = self.ownership.set(ownership);
+    }
+
+    /// Hands over the federation source, so the overview can count failing destinations.
+    pub fn set_federation(&self, federation: Arc<dyn hs_admin::sources::FederationSource>) {
+        let _ = self.federation.set(federation);
     }
 
     async fn count(&self) -> Result<StatisticsOverview, SourceError> {
@@ -113,11 +122,23 @@ impl<B: KvBackend + 'static> ServerOverview<B> {
             .list_all_room_ids()
             .map_err(|e| SourceError::Unavailable(e.to_string()))?
             .len() as u64;
+        let failing = match self.federation.get() {
+            Some(federation) => Some(
+                federation
+                    .list_destinations()
+                    .await?
+                    .iter()
+                    .filter(|d| d.failing_since.is_some())
+                    .count() as u64,
+            ),
+            None => None,
+        };
         Ok(StatisticsOverview {
             users_count: Some(users),
             rooms_count: Some(rooms),
             daily_active_users: Some(daily),
             monthly_active_users: Some(monthly),
+            federation_destinations_failing_count: failing,
             ..StatisticsOverview::default()
         })
     }

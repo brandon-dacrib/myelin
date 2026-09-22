@@ -1525,14 +1525,23 @@ async fn the_overview_counts_real_accounts_and_rooms_and_omits_what_nobody_count
         "{first}"
     );
     // Nothing here can count these yet, so they are absent -- not 0, not null.
-    for unknown in [
-        "media_count",
-        "media_bytes",
-        "federation_destinations_failing_count",
-        "pending_reports_count",
-    ] {
+    for unknown in ["media_count", "media_bytes", "pending_reports_count"] {
         assert!(first.get(unknown).is_none(), "{unknown} in {first}");
     }
+    // Failing federation destinations *are* counted now: none, because this server has tried
+    // to reach nobody. Zero, not absent: the difference between "nothing is failing" and
+    // "could not check" is the whole point of the Overview's all-clear.
+    assert_eq!(first["federation_destinations_failing_count"], 0, "{first}");
+    let destinations: serde_json::Value = client
+        .get(format!("{base}/api/v1/federation/destinations"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(destinations["items"], json!([]), "{destinations}");
 
     // The dashboard polls. A count is shared for a minute rather than redone on every poll, so
     // an account made a moment later is not in the next answer yet.

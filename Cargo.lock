@@ -2403,6 +2403,7 @@ dependencies = [
  "futures",
  "hex",
  "hickory-resolver",
+ "hs-admin",
  "hs-config",
  "hs-http",
  "hs-kv",

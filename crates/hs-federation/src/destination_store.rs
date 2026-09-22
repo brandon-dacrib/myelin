@@ -26,6 +26,13 @@ pub struct DestinationState {
     /// now" by [`DestinationState::ready_at`]).
     pub retry_at_ms: Option<u64>,
     pub last_success_ms: Option<u64>,
+    /// When the current run of failures began: the first failure after the last success. `None`
+    /// while the destination is not failing. What an administrator sees as "failing since".
+    #[serde(default)]
+    pub failing_since_ms: Option<u64>,
+    /// When this destination was last attempted, success or failure.
+    #[serde(default)]
+    pub last_attempt_ms: Option<u64>,
 }
 
 impl DestinationState {
@@ -51,6 +58,8 @@ impl DestinationState {
         let capped = base_delay_ms.min(max_backoff_ms);
         let delay = jitter(capped);
         self.retry_at_ms = Some(now.saturating_add(delay));
+        self.failing_since_ms.get_or_insert(now);
+        self.last_attempt_ms = Some(now);
         self
     }
 
@@ -61,7 +70,18 @@ impl DestinationState {
         self.failure_count = 0;
         self.retry_at_ms = None;
         self.last_success_ms = Some(now);
+        self.failing_since_ms = None;
+        self.last_attempt_ms = Some(now);
         self
+    }
+
+    /// The interval the current backoff is waiting, in milliseconds, if it is waiting.
+    #[must_use]
+    pub fn retry_interval_ms(&self) -> Option<u64> {
+        match (self.retry_at_ms, self.last_attempt_ms) {
+            (Some(retry_at), Some(attempted)) => Some(retry_at.saturating_sub(attempted)),
+            _ => None,
+        }
     }
 }
 
@@ -71,6 +91,12 @@ pub trait DestinationStore: Send + Sync {
     async fn get(&self, destination: &str) -> DestinationState;
     async fn record_failure(&self, destination: &str, max_backoff_ms: u64);
     async fn record_success(&self, destination: &str);
+    /// Every destination this store has a record of, with its state. For the admin API.
+    async fn list(&self) -> Vec<(String, DestinationState)>;
+    /// Forgets a destination's backoff, so that the next request to it is attempted at once.
+    /// What an administrator does when the other side says it is back. The record stays; only
+    /// the failure run is cleared.
+    async fn reset(&self, destination: &str);
 }
 
 /// An in-memory [`DestinationStore`], for tests and for a deployment that accepts losing backoff
@@ -114,6 +140,22 @@ impl DestinationStore for InMemoryDestinationStore {
         let mut map = self.state.lock().unwrap();
         let entry = map.entry(destination.to_string()).or_default();
         *entry = entry.on_success(now_ms());
+    }
+
+    async fn list(&self) -> Vec<(String, DestinationState)> {
+        let map = self.state.lock().unwrap();
+        let mut all: Vec<(String, DestinationState)> =
+            map.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        all
+    }
+
+    async fn reset(&self, destination: &str) {
+        if let Some(entry) = self.state.lock().unwrap().get_mut(destination) {
+            entry.failure_count = 0;
+            entry.retry_at_ms = None;
+            entry.failing_since_ms = None;
+        }
     }
 }
 
@@ -179,6 +221,43 @@ impl<B: KvBackend> DestinationStore for KvDestinationStore<B> {
                 .and_then(|b| serde_json::from_slice(&b).ok())
                 .unwrap_or_default();
             let updated = current.on_success(now_ms());
+            let bytes = serde_json::to_vec(&updated)
+                .map_err(|e| hs_kv::KvError::backend(DecodeError(e.to_string())))?;
+            self.table.put(txn, &key, &bytes).map_err(to_kv_err)
+        });
+    }
+
+    async fn list(&self) -> Vec<(String, DestinationState)> {
+        let snapshot = self.backend.snapshot();
+        let mut all = Vec::new();
+        for item in self.table.range(&snapshot, hs_kv::RangeSpec::full()) {
+            let Ok(((destination,), bytes)) = item else {
+                continue;
+            };
+            if let Ok(state) = serde_json::from_slice::<DestinationState>(&bytes) {
+                all.push((destination, state));
+            }
+        }
+        all
+    }
+
+    async fn reset(&self, destination: &str) {
+        let key = (destination.to_string(),);
+        let _ = transact(&self.backend, TransactConfig::default(), |txn| {
+            let Some(current) = self
+                .table
+                .get(txn, &key)
+                .map_err(to_kv_err)?
+                .and_then(|b| serde_json::from_slice::<DestinationState>(&b).ok())
+            else {
+                return Ok(());
+            };
+            let updated = DestinationState {
+                failure_count: 0,
+                retry_at_ms: None,
+                failing_since_ms: None,
+                ..current
+            };
             let bytes = serde_json::to_vec(&updated)
                 .map_err(|e| hs_kv::KvError::backend(DecodeError(e.to_string())))?;
             self.table.put(txn, &key, &bytes).map_err(to_kv_err)

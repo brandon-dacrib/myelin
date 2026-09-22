@@ -20,10 +20,10 @@ use serde_json::{Map, Value, json};
 
 use crate::model::{
     AdminAppservice, AdminAppserviceBacklogEntry, AdminAppserviceCreate, AdminAppserviceHealth,
-    AdminAppserviceLinks, AdminAppserviceReplay, AdminAppserviceTokens, AdminDevice,
-    AdminPasswordReset, AdminRoom, AdminUser, ClusterStatus, ConfigChange, ConfigReloadReport,
-    ConfigSection, ConfigValidateReport, ExternalId, SetupRequest, SetupSession,
-    StatisticsOverview, ThreePid,
+    AdminAppserviceLinks, AdminAppserviceReplay, AdminAppserviceTokens, AdminDestination,
+    AdminDevice, AdminPasswordReset, AdminRoom, AdminRoomMember, AdminUser, ClusterStatus,
+    ConfigChange, ConfigReloadReport, ConfigSection, ConfigValidateReport, ExternalId,
+    SetupRequest, SetupSession, StatisticsOverview, ThreePid,
 };
 
 /// Why a data-source call failed. Mirrors [`crate::auth::AuthError`]'s "only unavailable escapes
@@ -522,6 +522,16 @@ pub trait RoomDirectory: Send + Sync + 'static {
     /// `SourceError::NotFound` if the room does not exist; `SourceError::Invalid` if `user_id` is
     /// not a member of the room.
     async fn make_admin(&self, room_id: &str, user_id: &str) -> Result<(), SourceError>;
+
+    /// Everyone with a membership event in the room's current state, whatever its value
+    /// (`rooms.members.list`): joined, invited, left, banned, knocking. The handler filters by
+    /// `membership` if asked. `SourceError::NotFound` if the room does not exist.
+    async fn list_members(&self, room_id: &str) -> Result<Vec<AdminRoomMember>, SourceError> {
+        let _ = room_id;
+        Err(SourceError::Unavailable(
+            "this room directory does not list members yet".to_string(),
+        ))
+    }
 }
 
 /// An in-memory [`RoomDirectory`] for this crate's own handler tests, following
@@ -530,6 +540,7 @@ pub trait RoomDirectory: Send + Sync + 'static {
 #[derive(Debug, Default)]
 pub struct InMemoryRoomDirectory {
     rooms: RwLock<HashMap<String, AdminRoom>>,
+    members: RwLock<HashMap<String, Vec<AdminRoomMember>>>,
 }
 
 impl InMemoryRoomDirectory {
@@ -544,6 +555,17 @@ impl InMemoryRoomDirectory {
             .write()
             .expect("InMemoryRoomDirectory lock poisoned")
             .insert(room.room_id.clone(), room);
+        self
+    }
+
+    /// Gives `room_id` a member.
+    pub fn with_member(self, room_id: &str, member: AdminRoomMember) -> Self {
+        self.members
+            .write()
+            .expect("InMemoryRoomDirectory lock poisoned")
+            .entry(room_id.to_owned())
+            .or_default()
+            .push(member);
         self
     }
 }
@@ -652,6 +674,24 @@ impl RoomDirectory for InMemoryRoomDirectory {
         } else {
             Err(SourceError::NotFound)
         }
+    }
+
+    async fn list_members(&self, room_id: &str) -> Result<Vec<AdminRoomMember>, SourceError> {
+        if !self
+            .rooms
+            .read()
+            .expect("InMemoryRoomDirectory lock poisoned")
+            .contains_key(room_id)
+        {
+            return Err(SourceError::NotFound);
+        }
+        Ok(self
+            .members
+            .read()
+            .expect("InMemoryRoomDirectory lock poisoned")
+            .get(room_id)
+            .cloned()
+            .unwrap_or_default())
     }
 }
 
@@ -1520,6 +1560,85 @@ mod tests {
         dir.make_admin("!abc:example.org", "@alice:example.org")
             .await
             .unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Federation
+// ---------------------------------------------------------------------------------------------
+
+/// Where the `federation.destinations.*` operations read: every remote server this one has
+/// tried to reach, with its backoff state. Implemented for real by `hs-federation` over its
+/// destination store; by [`InMemoryFederationSource`] for tests and the mock.
+#[async_trait]
+pub trait FederationSource: Send + Sync + 'static {
+    async fn list_destinations(&self) -> Result<Vec<AdminDestination>, SourceError>;
+    /// `Ok(None)` for a server this one has never tried to reach.
+    async fn get_destination(
+        &self,
+        server_name: &str,
+    ) -> Result<Option<AdminDestination>, SourceError>;
+    /// Clears the backoff, so the next request is attempted at once. `SourceError::NotFound`
+    /// for a server there is no record of.
+    async fn reset_destination(&self, server_name: &str) -> Result<AdminDestination, SourceError>;
+}
+
+/// A [`FederationSource`] over a list held in memory.
+#[derive(Debug, Default)]
+pub struct InMemoryFederationSource {
+    destinations: RwLock<BTreeMap<String, AdminDestination>>,
+}
+
+impl InMemoryFederationSource {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_destination(self, destination: AdminDestination) -> Self {
+        self.destinations
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(destination.server_name.clone(), destination);
+        self
+    }
+}
+
+#[async_trait]
+impl FederationSource for InMemoryFederationSource {
+    async fn list_destinations(&self) -> Result<Vec<AdminDestination>, SourceError> {
+        Ok(self
+            .destinations
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    async fn get_destination(
+        &self,
+        server_name: &str,
+    ) -> Result<Option<AdminDestination>, SourceError> {
+        Ok(self
+            .destinations
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(server_name)
+            .cloned())
+    }
+
+    async fn reset_destination(&self, server_name: &str) -> Result<AdminDestination, SourceError> {
+        let mut destinations = self
+            .destinations
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let destination = destinations
+            .get_mut(server_name)
+            .ok_or(SourceError::NotFound)?;
+        destination.failing_since = None;
+        destination.retry_interval_ms = None;
+        Ok(destination.clone())
     }
 }
 

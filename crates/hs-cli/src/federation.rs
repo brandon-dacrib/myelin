@@ -847,6 +847,9 @@ pub struct FederationMount {
     /// The outbound client, kept alive because the inbound key fetcher borrows it (and because a
     /// caller that later adds a sender needs exactly this one, sharing its backoff state).
     pub client: Arc<hs_federation::client::FederationClient>,
+    /// The per-destination backoff records the client keeps, for the admin API's Federation
+    /// page (`hs_federation::admin_source`).
+    pub destinations: Arc<dyn hs_federation::destination_store::DestinationStore>,
 }
 
 /// How long a `/_matrix/key/v2/server` response this server signs stays valid. The spec caps what
@@ -878,9 +881,9 @@ pub fn build_mount<B: KvBackend + 'static>(
         (*identity.signing_key).clone(),
     ]));
 
-    let destinations = Arc::new(hs_federation::destination_store::KvDestinationStore::open(
-        backend,
-    )?);
+    let destinations: Arc<dyn hs_federation::destination_store::DestinationStore> = Arc::new(
+        hs_federation::destination_store::KvDestinationStore::open(backend)?,
+    );
     let well_known = Arc::new(hs_federation::discovery::CachingWellKnownFetcher::new(
         hs_federation::discovery::HttpWellKnownFetcher::new(),
     ));
@@ -890,7 +893,7 @@ pub fn build_mount<B: KvBackend + 'static>(
         server_name.clone(),
         (*identity.signing_key).clone(),
         client_config(&config.federation),
-        destinations,
+        destinations.clone(),
         well_known,
         srv,
         addr,
@@ -935,6 +938,7 @@ pub fn build_mount<B: KvBackend + 'static>(
         own_keys,
         server_name,
         client,
+        destinations,
     })
 }
 
