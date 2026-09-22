@@ -82,8 +82,12 @@ pub fn load<B: KvBackend>(
                 path: path.clone(),
                 source,
             })?;
+        // `import`, not `add`: the registry is durable, so on every boot after the first the
+        // registration is already there. `add` refused it as a conflict with itself, and a
+        // server with a bridge configured started exactly once. (Every test of this ran over a
+        // memory backend, where there is no second boot.)
         registry
-            .add(&registration)
+            .import(&registration)
             .map_err(|source| LoadAppservicesError::Add {
                 path: path.clone(),
                 source,
@@ -116,6 +120,40 @@ mod tests {
         )
         .unwrap();
         assert!(loaded.registry.list().unwrap().is_empty());
+    }
+
+    /// The registry persists, and the file is read at every boot: the second boot must find
+    /// the registration already there and be content, and an edit to the file must take.
+    #[test]
+    fn loads_the_same_registration_file_on_every_boot_and_follows_its_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("irc.yaml");
+        let registration = |url: &str| {
+            format!(
+                "id: irc\nurl: '{url}'\nas_token: as_secret\nhs_token: hs_secret\n\
+                 sender_localpart: ircbot\nnamespaces:\n  users:\n    - regex: '@irc_.*'\n      \
+                 exclusive: true\n"
+            )
+        };
+        std::fs::write(&path, registration("http://bridge.local:1")).unwrap();
+        let config = hs_config::AppservicesConfig {
+            registration_files: vec![path.clone()],
+            ..hs_config::AppservicesConfig::default()
+        };
+        // One backend across "boots": `MemoryBackend` clones share their store.
+        let backend = MemoryBackend::new();
+        let server_name = ruma::server_name!("example.org");
+
+        load(&config, backend.clone(), server_name).unwrap();
+        let again = load(&config, backend.clone(), server_name).expect("the second boot");
+        assert_eq!(again.registry.list().unwrap().len(), 1);
+
+        std::fs::write(&path, registration("http://bridge.local:2")).unwrap();
+        let edited = load(&config, backend, server_name).unwrap();
+        assert_eq!(
+            edited.registry.get("irc").unwrap().unwrap().url.as_deref(),
+            Some("http://bridge.local:2")
+        );
     }
 
     #[test]
