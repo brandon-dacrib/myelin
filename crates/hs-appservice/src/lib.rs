@@ -26,6 +26,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod admin_directory;
 pub mod auth_registry;
 pub mod delivery;
 pub mod error;

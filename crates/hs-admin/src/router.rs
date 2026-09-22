@@ -30,14 +30,14 @@ use crate::auth::{ScopeDecision, TokenVerifier, require_scope};
 use crate::events::{EventBus, ReplayOutcome};
 use crate::idempotency::{IdempotencyStore, Replay, StoredResponse};
 use crate::model::{
-    Actor, ActorKind, AuditChange, AuditEntry, AuditOutcome, ConfigSchema, ConfigSection,
-    ConfigSectionInfo, ConfigSettingInfo, Event, Page, Principal, ResourceRef, Scope, ServerHealth,
-    ServerInfo, SetupRequest, SetupStatus,
+    Actor, ActorKind, AdminAppserviceCreate, AdminAppserviceReplay, AuditChange, AuditEntry,
+    AuditOutcome, ConfigSchema, ConfigSection, ConfigSectionInfo, ConfigSettingInfo, Event, Page,
+    Principal, ResourceRef, Scope, ServerHealth, ServerInfo, SetupRequest, SetupStatus,
 };
 use crate::operations::{OperationDef, load as load_operations};
 use crate::sources::{
-    ConfigPatch, ConfigSource, OverviewSource, RoomDirectory, RoomFilter, SetupSource, SourceError,
-    UserCreateRequest, UserDirectory, UserFilter, UserLookupQuery,
+    AppserviceDirectory, ConfigPatch, ConfigSource, OverviewSource, RoomDirectory, RoomFilter,
+    SetupSource, SourceError, UserCreateRequest, UserDirectory, UserFilter, UserLookupQuery,
 };
 
 /// Everything an `hs-admin` handler needs. Cloned per-request by axum (cheap: everything inside
@@ -77,6 +77,9 @@ pub struct AdminState {
     /// What `GET /statistics/overview` and `GET /cluster` read. `None` until wired with
     /// [`AdminState::with_overview`]; until then both answer `503 unavailable`.
     pub overview: Option<Arc<dyn OverviewSource>>,
+    /// What every `appservices.*` operation reads and writes: the bridge registry. `None` until
+    /// wired with [`AdminState::with_appservices`]; until then they answer `503 unavailable`.
+    pub appservices: Option<Arc<dyn AppserviceDirectory>>,
     /// The `Idempotency-Key` cache every mutating handler that declares it consults (see
     /// [`crate::idempotency`]). Always present (never `None`): a client is never told its
     /// idempotency key was ignored.
@@ -101,6 +104,7 @@ impl AdminState {
             config: None,
             setup: None,
             overview: None,
+            appservices: None,
             idempotency: Arc::new(IdempotencyStore::new()),
         }
     }
@@ -126,6 +130,14 @@ impl AdminState {
     #[must_use]
     pub fn with_config(mut self, config: Arc<dyn ConfigSource>) -> Self {
         self.config = Some(config);
+        self
+    }
+
+    /// Wires a real [`AppserviceDirectory`], making every `appservices.*` operation serve the
+    /// bridge registry instead of answering `503 unavailable`.
+    #[must_use]
+    pub fn with_appservices(mut self, appservices: Arc<dyn AppserviceDirectory>) -> Self {
+        self.appservices = Some(appservices);
         self
     }
 
@@ -211,6 +223,19 @@ const REAL_HANDLERS: &[&str] = &[
     "rooms.block",
     "rooms.unblock",
     "rooms.make_admin",
+    "appservices.list",
+    "appservices.get",
+    "appservices.create",
+    "appservices.update",
+    "appservices.delete",
+    "appservices.health",
+    "appservices.backlog",
+    "appservices.registration",
+    "appservices.pause",
+    "appservices.resume",
+    "appservices.ping",
+    "appservices.rotate_tokens",
+    "appservices.replay",
     "config.list",
     "config.schema",
     "config.get",
@@ -1657,6 +1682,645 @@ fn redacted_section(mut section: ConfigSection) -> ConfigSection {
     section
 }
 
+// -------------------------------------------------------------------------------------------
+// appservices (bridges): the thirteen `appservices.*` operations, over
+// `crate::sources::AppserviceDirectory`. Reads need `admin:read`; everything that changes the
+// registry, or makes the server do something (a ping, a replay), needs `admin:write`, writes one
+// audit entry and publishes one event.
+// -------------------------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct AppservicesListQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+    include_total: Option<bool>,
+    q: Option<String>,
+}
+
+/// `GET /api/v1/appservices`.
+async fn appservices_list(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Query(query): Query<AppservicesListQuery>,
+) -> Response {
+    let instance = "/api/v1/appservices";
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let Some(appservices) = &state.appservices else {
+                return source_unavailable("appservice registry", instance);
+            };
+            match appservices.list().await {
+                Ok(mut items) => {
+                    if let Some(q) = query.q.as_deref().map(str::to_lowercase)
+                        && !q.is_empty()
+                    {
+                        items.retain(|a| {
+                            a.id.to_lowercase().contains(&q)
+                                || a.sender_localpart.to_lowercase().contains(&q)
+                                || a.protocols.iter().any(|p| p.to_lowercase().contains(&q))
+                        });
+                    }
+                    let page = Page::paginate(
+                        items,
+                        query.cursor.as_deref(),
+                        query.limit,
+                        query.include_total.unwrap_or(false),
+                    );
+                    axum::Json(page).into_response()
+                }
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `GET /api/v1/appservices/{id}`.
+async fn appservices_get(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let instance = format!("/api/v1/appservices/{id}");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let Some(appservices) = &state.appservices else {
+                return source_unavailable("appservice registry", &instance);
+            };
+            match appservices.get(&id).await {
+                Ok(Some(a)) => axum::Json(a).into_response(),
+                Ok(None) => no_such_appservice(&id, &instance),
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+fn no_such_appservice(id: &str, instance: &str) -> Response {
+    Problem::not_found()
+        .with_detail(format!("no such appservice: {id}"))
+        .with_instance(instance.to_owned())
+        .into_response()
+}
+
+/// `GET /api/v1/appservices/{id}/health`.
+async fn appservices_health(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let instance = format!("/api/v1/appservices/{id}/health");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let Some(appservices) = &state.appservices else {
+                return source_unavailable("appservice registry", &instance);
+            };
+            match appservices.health(&id).await {
+                Ok(h) => axum::Json(h).into_response(),
+                Err(SourceError::NotFound) => no_such_appservice(&id, &instance),
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BacklogQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+    include_total: Option<bool>,
+}
+
+/// `GET /api/v1/appservices/{id}/backlog`.
+async fn appservices_backlog(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<BacklogQuery>,
+) -> Response {
+    let instance = format!("/api/v1/appservices/{id}/backlog");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let Some(appservices) = &state.appservices else {
+                return source_unavailable("appservice registry", &instance);
+            };
+            match appservices.backlog(&id).await {
+                Ok(items) => axum::Json(Page::paginate(
+                    items,
+                    query.cursor.as_deref(),
+                    query.limit,
+                    query.include_total.unwrap_or(false),
+                ))
+                .into_response(),
+                Err(SourceError::NotFound) => no_such_appservice(&id, &instance),
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `GET /api/v1/appservices/{id}/registration`: the registration file, as YAML unless the
+/// caller asks for JSON. It carries both tokens; that is what a registration file is.
+async fn appservices_registration(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let instance = format!("/api/v1/appservices/{id}/registration");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let Some(appservices) = &state.appservices else {
+                return source_unavailable("appservice registry", &instance);
+            };
+            match appservices.registration(&id).await {
+                Ok(registration) => {
+                    let wants_json = headers
+                        .get(axum::http::header::ACCEPT)
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|accept| accept.contains("application/json"));
+                    if wants_json {
+                        axum::Json(registration.json).into_response()
+                    } else {
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/x-yaml")],
+                            registration.yaml,
+                        )
+                            .into_response()
+                    }
+                }
+                Err(SourceError::NotFound) => no_such_appservice(&id, &instance),
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `POST /api/v1/appservices` (`admin:write`): registers a bridge. `201` with the appservice.
+async fn appservices_create(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let instance = "/api/v1/appservices";
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminWrite),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(principal) => {
+            let Some(appservices) = &state.appservices else {
+                return source_unavailable("appservice registry", instance);
+            };
+            if let Some(key) = idempotency_key(&headers) {
+                match state.idempotency.check("appservices.create", key, &body) {
+                    Replay::Same(stored) => return replay_response(stored),
+                    Replay::Mismatch => {
+                        return Problem::idempotency_key_payload_mismatch()
+                            .with_instance(instance)
+                            .into_response();
+                    }
+                    Replay::Fresh => {}
+                }
+            }
+            let request: AdminAppserviceCreate = match parse_optional_json(&body) {
+                Ok(v) => v,
+                Err(p) => return p.with_instance(instance).into_response(),
+            };
+            let created = match appservices.create(request).await {
+                Ok(a) => a,
+                Err(e) => return e.to_problem().with_instance(instance).into_response(),
+            };
+            if let Err(resp) = record_mutation(
+                &state,
+                &principal,
+                "appservices.create",
+                "appservice.created",
+                ResourceRef::new("appservice", created.id.clone()),
+                Vec::new(),
+                json!({ "id": created.id, "sender_localpart": created.sender_localpart }),
+            )
+            .await
+            {
+                return resp;
+            }
+            let response_body = serde_json::to_vec(&created).unwrap_or_default();
+            if let Some(key) = idempotency_key(&headers) {
+                state.idempotency.record(
+                    "appservices.create",
+                    key,
+                    &body,
+                    StoredResponse {
+                        status: 201,
+                        content_type: "application/json".to_string(),
+                        body: response_body.clone(),
+                    },
+                );
+            }
+            (
+                StatusCode::CREATED,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                response_body,
+            )
+                .into_response()
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `PATCH /api/v1/appservices/{id}` (`admin:write`): an RFC 7396 merge patch to the
+/// registration.
+async fn appservices_update(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let instance = format!("/api/v1/appservices/{id}");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminWrite),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(principal) => {
+            let Some(appservices) = &state.appservices else {
+                return source_unavailable("appservice registry", &instance);
+            };
+            let patch: serde_json::Value = match parse_optional_json(&body) {
+                Ok(serde_json::Value::Null) => json!({}),
+                Ok(v) => v,
+                Err(p) => return p.with_instance(instance).into_response(),
+            };
+            if !patch.is_object() {
+                return Problem::validation_failed()
+                    .with_detail("the body must be a JSON object (RFC 7396 merge patch)")
+                    .with_instance(instance)
+                    .into_response();
+            }
+            let changes: Vec<AuditChange> = patch
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(k, v)| AuditChange {
+                    pointer: format!("/{k}"),
+                    from: None,
+                    to: Some(if k.ends_with("token") {
+                        json!("<redacted>")
+                    } else {
+                        v.clone()
+                    }),
+                })
+                .collect();
+            let updated = match appservices.update(&id, patch).await {
+                Ok(a) => a,
+                Err(SourceError::NotFound) => return no_such_appservice(&id, &instance),
+                Err(e) => return e.to_problem().with_instance(instance).into_response(),
+            };
+            if let Err(resp) = record_mutation(
+                &state,
+                &principal,
+                "appservices.update",
+                "appservice.updated",
+                ResourceRef::new("appservice", id.clone()),
+                changes,
+                json!({ "id": id }),
+            )
+            .await
+            {
+                return resp;
+            }
+            axum::Json(updated).into_response()
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `DELETE /api/v1/appservices/{id}` (`admin:write`): `204`. The bridge's tokens stop working
+/// at once; its users stay, as ordinary accounts nothing can sign in to.
+async fn appservices_delete(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let instance = format!("/api/v1/appservices/{id}");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminWrite),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(principal) => {
+            let Some(appservices) = &state.appservices else {
+                return source_unavailable("appservice registry", &instance);
+            };
+            match appservices.delete(&id).await {
+                Ok(()) => {}
+                Err(SourceError::NotFound) => return no_such_appservice(&id, &instance),
+                Err(e) => return e.to_problem().with_instance(instance).into_response(),
+            }
+            if let Err(resp) = record_mutation(
+                &state,
+                &principal,
+                "appservices.delete",
+                "appservice.deleted",
+                ResourceRef::new("appservice", id.clone()),
+                Vec::new(),
+                json!({ "id": id }),
+            )
+            .await
+            {
+                return resp;
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// What one of the simple `POST /appservices/{id}/<action>` operations does once it is allowed,
+/// found and not a replay: the call, and what to put in the audit entry and the response.
+enum AppserviceAction {
+    Pause,
+    Resume,
+    Ping,
+    RotateTokens,
+    Replay(AdminAppserviceReplay),
+}
+
+impl AppserviceAction {
+    fn operation_id(&self) -> &'static str {
+        match self {
+            Self::Pause => "appservices.pause",
+            Self::Resume => "appservices.resume",
+            Self::Ping => "appservices.ping",
+            Self::RotateTokens => "appservices.rotate_tokens",
+            Self::Replay(_) => "appservices.replay",
+        }
+    }
+
+    fn event_type(&self) -> &'static str {
+        match self {
+            Self::Pause => "appservice.paused",
+            Self::Resume => "appservice.resumed",
+            Self::Ping => "appservice.pinged",
+            Self::RotateTokens => "appservice.tokens_rotated",
+            Self::Replay(_) => "appservice.replayed",
+        }
+    }
+}
+
+/// Shared body for pause, resume, ping, rotate-tokens and replay: scope, idempotency, the
+/// action, one audit entry, one event, the response. `status` is `200` except for replay,
+/// which the contract has answer `202` with a `Task` that is already finished, since the
+/// re-queueing itself is instant and the delivery it causes is somebody else's job.
+async fn appservice_action(
+    state: &AdminState,
+    headers: &HeaderMap,
+    raw_body: &[u8],
+    id: String,
+    action: AppserviceAction,
+) -> Response {
+    let operation_id = action.operation_id();
+    let instance = format!(
+        "/api/v1/appservices/{id}/{}",
+        operation_id
+            .trim_start_matches("appservices.")
+            .replace('_', "-")
+    );
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(headers),
+        Some(Scope::AdminWrite),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(principal) => {
+            let Some(appservices) = &state.appservices else {
+                return source_unavailable("appservice registry", &instance);
+            };
+            if let Some(key) = idempotency_key(headers) {
+                match state.idempotency.check(operation_id, key, raw_body) {
+                    Replay::Same(stored) => return replay_response(stored),
+                    Replay::Mismatch => {
+                        return Problem::idempotency_key_payload_mismatch()
+                            .with_instance(instance)
+                            .into_response();
+                    }
+                    Replay::Fresh => {}
+                }
+            }
+            let event_type = action.event_type();
+            let (status, body_json, event_data) = match action {
+                AppserviceAction::Pause => match appservices.pause(&id).await {
+                    Ok(a) => (200, serde_json::to_value(a).unwrap_or_default(), json!({})),
+                    Err(SourceError::NotFound) => return no_such_appservice(&id, &instance),
+                    Err(e) => return e.to_problem().with_instance(instance).into_response(),
+                },
+                AppserviceAction::Resume => match appservices.resume(&id).await {
+                    Ok(a) => (200, serde_json::to_value(a).unwrap_or_default(), json!({})),
+                    Err(SourceError::NotFound) => return no_such_appservice(&id, &instance),
+                    Err(e) => return e.to_problem().with_instance(instance).into_response(),
+                },
+                AppserviceAction::Ping => match appservices.ping(&id).await {
+                    // The contract answers with the appservice, whose `health` now reflects the
+                    // ping; the detail is on `GET .../health`.
+                    Ok(health) => match appservices.get(&id).await {
+                        Ok(Some(a)) => (
+                            200,
+                            serde_json::to_value(a).unwrap_or_default(),
+                            json!({ "status": health.status, "last_error": health.last_error }),
+                        ),
+                        Ok(None) => return no_such_appservice(&id, &instance),
+                        Err(e) => return e.to_problem().with_instance(instance).into_response(),
+                    },
+                    Err(SourceError::NotFound) => return no_such_appservice(&id, &instance),
+                    Err(e) => return e.to_problem().with_instance(instance).into_response(),
+                },
+                AppserviceAction::RotateTokens => match appservices.rotate_tokens(&id).await {
+                    Ok(tokens) => (
+                        200,
+                        serde_json::to_value(tokens).unwrap_or_default(),
+                        json!({}),
+                    ),
+                    Err(SourceError::NotFound) => return no_such_appservice(&id, &instance),
+                    Err(e) => return e.to_problem().with_instance(instance).into_response(),
+                },
+                AppserviceAction::Replay(request) => {
+                    let asked = json!({
+                        "transaction_ids": request.transaction_ids,
+                        "since": request.since,
+                    });
+                    match appservices.replay(&id, request).await {
+                        Ok(replayed) => {
+                            let mut task = crate::model::Task::scheduled(
+                                "appservices.replay",
+                                Some(ResourceRef::new("appservice", id.clone())),
+                                principal.to_actor(),
+                            );
+                            task.status = crate::model::TaskStatus::Succeeded;
+                            task.started_at = Some(task.created_at.clone());
+                            task.finished_at = Some(task.created_at.clone());
+                            task.result = Some(json!({ "replayed": replayed }));
+                            (
+                                202,
+                                serde_json::to_value(task).unwrap_or_default(),
+                                json!({ "replayed": replayed, "requested": asked }),
+                            )
+                        }
+                        Err(SourceError::NotFound) => return no_such_appservice(&id, &instance),
+                        Err(e) => return e.to_problem().with_instance(instance).into_response(),
+                    }
+                }
+            };
+            if let Err(resp) = record_mutation(
+                state,
+                &principal,
+                operation_id,
+                event_type,
+                ResourceRef::new("appservice", id.clone()),
+                Vec::new(),
+                event_data,
+            )
+            .await
+            {
+                return resp;
+            }
+            let response_body = serde_json::to_vec(&body_json).unwrap_or_default();
+            if let Some(key) = idempotency_key(headers) {
+                state.idempotency.record(
+                    operation_id,
+                    key,
+                    raw_body,
+                    StoredResponse {
+                        status,
+                        content_type: "application/json".to_string(),
+                        body: response_body.clone(),
+                    },
+                );
+            }
+            (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                response_body,
+            )
+                .into_response()
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `POST /api/v1/appservices/{id}/pause`.
+async fn appservices_pause(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    appservice_action(&state, &headers, &body, id, AppserviceAction::Pause).await
+}
+
+/// `POST /api/v1/appservices/{id}/resume`.
+async fn appservices_resume(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    appservice_action(&state, &headers, &body, id, AppserviceAction::Resume).await
+}
+
+/// `POST /api/v1/appservices/{id}/ping`.
+async fn appservices_ping(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    appservice_action(&state, &headers, &body, id, AppserviceAction::Ping).await
+}
+
+/// `POST /api/v1/appservices/{id}/rotate-tokens`.
+async fn appservices_rotate_tokens(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    appservice_action(&state, &headers, &body, id, AppserviceAction::RotateTokens).await
+}
+
+/// `POST /api/v1/appservices/{id}/replay`.
+async fn appservices_replay(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let request: AdminAppserviceReplay = match parse_optional_json(&body) {
+        Ok(v) => v,
+        Err(p) => {
+            return p
+                .with_instance(format!("/api/v1/appservices/{id}/replay"))
+                .into_response();
+        }
+    };
+    appservice_action(
+        &state,
+        &headers,
+        &body,
+        id,
+        AppserviceAction::Replay(request),
+    )
+    .await
+}
+
 /// `GET /api/v1/config` (`admin:read`): every section, secrets redacted.
 async fn config_list(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let instance = "/api/v1/config";
@@ -2712,6 +3376,23 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         "rooms.block" => builder.add(method, &full_path, rooms_block, meta),
         "rooms.unblock" => builder.add(method, &full_path, rooms_unblock, meta),
         "rooms.make_admin" => builder.add(method, &full_path, rooms_make_admin, meta),
+        "appservices.list" => builder.add(method, &full_path, appservices_list, meta),
+        "appservices.get" => builder.add(method, &full_path, appservices_get, meta),
+        "appservices.create" => builder.add(method, &full_path, appservices_create, meta),
+        "appservices.update" => builder.add(method, &full_path, appservices_update, meta),
+        "appservices.delete" => builder.add(method, &full_path, appservices_delete, meta),
+        "appservices.health" => builder.add(method, &full_path, appservices_health, meta),
+        "appservices.backlog" => builder.add(method, &full_path, appservices_backlog, meta),
+        "appservices.registration" => {
+            builder.add(method, &full_path, appservices_registration, meta)
+        }
+        "appservices.pause" => builder.add(method, &full_path, appservices_pause, meta),
+        "appservices.resume" => builder.add(method, &full_path, appservices_resume, meta),
+        "appservices.ping" => builder.add(method, &full_path, appservices_ping, meta),
+        "appservices.rotate_tokens" => {
+            builder.add(method, &full_path, appservices_rotate_tokens, meta)
+        }
+        "appservices.replay" => builder.add(method, &full_path, appservices_replay, meta),
         "config.list" => builder.add(method, &full_path, config_list, meta),
         "config.schema" => builder.add(method, &full_path, config_schema, meta),
         "config.get" => builder.add(method, &full_path, config_get, meta),
@@ -2831,14 +3512,13 @@ mod tests {
 
     #[tokio::test]
     async fn authorized_request_to_undeclared_handler_is_501() {
-        // /api/v1/users and /api/v1/rooms are now both in REAL_HANDLERS (see below); use a
-        // still-undeclared operation (appservices, owned by another track) to exercise the
-        // generic seam.
+        // Users, rooms and appservices are all in REAL_HANDLERS now; the bridge-type catalogue
+        // is not, and exercises the generic seam.
         let (router, _manifest) = build_router(test_state());
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/appservices")
+                    .uri("/api/v1/bridge-types")
                     .header("authorization", "Bearer admin-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -5288,5 +5968,374 @@ mod tests {
             let (status, _) = get_json(&router, uri, Some("admin-token")).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}");
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // appservices
+    // ---------------------------------------------------------------------------------------
+
+    fn irc_registration() -> serde_json::Value {
+        json!({
+            "id": "irc",
+            "url": "http://irc-bridge.local:9898",
+            "as_token": "as_secret",
+            "hs_token": "hs_secret",
+            "sender_localpart": "ircbot",
+            "rate_limited": false,
+            "protocols": ["irc"],
+            "namespaces": {"users": [{"regex": "@irc_.*:example\\.org", "exclusive": true}]}
+        })
+    }
+
+    fn state_with_appservices() -> AdminState {
+        test_state().with_appservices(Arc::new(
+            crate::sources::InMemoryAppserviceDirectory::new()
+                .with_registration(irc_registration())
+                .with_backlog(
+                    "irc",
+                    vec![
+                        crate::model::AdminAppserviceBacklogEntry {
+                            transaction_id: "7".into(),
+                            age_ms: 90_000,
+                            attempts: 10,
+                            last_error: Some("connection refused".into()),
+                            dead_lettered: true,
+                        },
+                        crate::model::AdminAppserviceBacklogEntry {
+                            transaction_id: "8".into(),
+                            age_ms: 1_000,
+                            attempts: 1,
+                            last_error: None,
+                            dead_lettered: false,
+                        },
+                    ],
+                )
+                .unreachable("irc"),
+        ))
+    }
+
+    async fn call(
+        router: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+        accept: Option<&str>,
+    ) -> (StatusCode, bytes::Bytes, String) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", "Bearer admin-token");
+        if let Some(accept) = accept {
+            request = request.header("accept", accept);
+        }
+        let request = match body {
+            Some(body) => request
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+            None => request.body(Body::empty()).unwrap(),
+        };
+        let response = router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        (status, body_bytes(response).await, content_type)
+    }
+
+    #[tokio::test]
+    async fn appservices_answer_503_until_a_registry_is_wired() {
+        let (router, _manifest) = build_router(test_state());
+        for uri in [
+            "/api/v1/appservices",
+            "/api/v1/appservices/irc",
+            "/api/v1/appservices/irc/health",
+        ] {
+            let (status, _, _) = call(&router, "GET", uri, None, None).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_bridges_page_can_be_drawn_from_the_real_operations() {
+        let (router, _manifest) = build_router(state_with_appservices());
+
+        let (status, body, _) = call(&router, "GET", "/api/v1/appservices?q=IRC", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page["items"][0]["id"], "irc", "{page}");
+        assert_eq!(page["items"][0]["health"], "unknown");
+        assert_eq!(
+            page["items"][0]["links"]["login_url"],
+            serde_json::Value::Null
+        );
+        let (_, body, _) = call(&router, "GET", "/api/v1/appservices?q=telegram", None, None).await;
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(page["items"].as_array().unwrap().is_empty(), "{page}");
+
+        let (status, body, _) = call(
+            &router,
+            "GET",
+            "/api/v1/appservices/irc/backlog",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 2, "{page}");
+        assert_eq!(page["items"][0]["dead_lettered"], true);
+
+        // The registration, in whichever notation is asked for. Tokens included: it is the file.
+        let (status, body, content_type) = call(
+            &router,
+            "GET",
+            "/api/v1/appservices/irc/registration",
+            None,
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            content_type.starts_with("application/json"),
+            "{content_type}"
+        );
+        let registration: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(registration["as_token"], "as_secret", "{registration}");
+        let (_, body, content_type) = call(
+            &router,
+            "GET",
+            "/api/v1/appservices/irc/registration",
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            content_type.starts_with("application/x-yaml"),
+            "{content_type}"
+        );
+        assert!(String::from_utf8_lossy(&body).contains("hs_token: hs_secret"));
+
+        let (status, _, _) = call(&router, "GET", "/api/v1/appservices/nope", None, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, _) = call(
+            &router,
+            "GET",
+            "/api/v1/appservices/nope/health",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn every_appservice_action_is_audited_and_changes_what_the_next_read_says() {
+        let (router, _manifest) = build_router(state_with_appservices());
+
+        // Pause, and the list says so.
+        let (status, body, _) =
+            call(&router, "POST", "/api/v1/appservices/irc/pause", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let a: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(a["paused"], true);
+        assert_eq!(a["health"], "paused");
+        let (_, body, _) = call(&router, "GET", "/api/v1/appservices/irc/health", None, None).await;
+        let h: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(h["status"], "paused");
+        let (_, body, _) = call(
+            &router,
+            "POST",
+            "/api/v1/appservices/irc/resume",
+            None,
+            None,
+        )
+        .await;
+        let a: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(a["paused"], false);
+
+        // A ping that fails is a 200 that says the bridge is down, not an error.
+        let (status, body, _) =
+            call(&router, "POST", "/api/v1/appservices/irc/ping", None, None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let a: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(a["health"], "down");
+        let (_, body, _) = call(&router, "GET", "/api/v1/appservices/irc/health", None, None).await;
+        let h: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(h["status"], "down");
+        assert_eq!(h["last_error"], "connection refused");
+        assert!(h["last_ping_at"].is_string());
+
+        // New tokens are shown once, here, and the registration carries them from then on.
+        let (status, body, _) = call(
+            &router,
+            "POST",
+            "/api/v1/appservices/irc/rotate-tokens",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let tokens: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_ne!(tokens["as_token"], "as_secret");
+        let (_, body, _) = call(
+            &router,
+            "GET",
+            "/api/v1/appservices/irc/registration",
+            None,
+            Some("application/json"),
+        )
+        .await;
+        let registration: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(registration["as_token"], tokens["as_token"]);
+
+        // Replay: a finished task saying how many, and the backlog no longer dead-lettered.
+        let (status, body, _) = call(
+            &router,
+            "POST",
+            "/api/v1/appservices/irc/replay",
+            Some(json!({})),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let task: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(task["status"], "succeeded");
+        assert_eq!(task["result"]["replayed"], 1);
+        let (_, body, _) = call(
+            &router,
+            "GET",
+            "/api/v1/appservices/irc/backlog",
+            None,
+            None,
+        )
+        .await;
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["dead_lettered"] == false),
+            "{page}"
+        );
+
+        // Update, then delete, then it is gone.
+        let (status, body, _) = call(
+            &router,
+            "PATCH",
+            "/api/v1/appservices/irc",
+            Some(json!({"protocols": ["irc", "libera"]})),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let a: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(a["protocols"], json!(["irc", "libera"]));
+        let (status, _, _) = call(&router, "DELETE", "/api/v1/appservices/irc", None, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _, _) = call(&router, "GET", "/api/v1/appservices/irc", None, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, _) = call(&router, "DELETE", "/api/v1/appservices/irc", None, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        for expected in [
+            "appservices.pause",
+            "appservices.resume",
+            "appservices.ping",
+            "appservices.rotate_tokens",
+            "appservices.replay",
+            "appservices.update",
+            "appservices.delete",
+        ] {
+            assert_eq!(
+                audit_entries_for_action(&router, expected).await.len(),
+                1,
+                "{expected} should be audited exactly once"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn creating_an_appservice_takes_json_or_yaml_and_refuses_a_second_of_the_same_id() {
+        let state = test_state()
+            .with_appservices(Arc::new(crate::sources::InMemoryAppserviceDirectory::new()));
+        let (router, _manifest) = build_router(state);
+
+        let (status, body, _) = call(
+            &router,
+            "POST",
+            "/api/v1/appservices",
+            Some(json!({"registration": irc_registration()})),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let a: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(a["id"], "irc");
+        assert_eq!(a["sender_localpart"], "ircbot");
+        assert!(
+            a.get("as_token").is_none(),
+            "tokens are not on the appservice: {a}"
+        );
+
+        let (status, body, _) = call(
+            &router,
+            "POST",
+            "/api/v1/appservices",
+            Some(json!({"registration": irc_registration()})),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let yaml = "id: signal\nurl: http://signal.local:1\nas_token: a\nhs_token: h\nsender_localpart: signalbot\n";
+        let (status, body, _) = call(
+            &router,
+            "POST",
+            "/api/v1/appservices",
+            Some(json!({"registration_yaml": yaml})),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let (status, body, _) = call(
+            &router,
+            "POST",
+            "/api/v1/appservices",
+            Some(json!({})),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            problem["errors"][0]["pointer"], "/registration",
+            "{problem}"
+        );
     }
 }

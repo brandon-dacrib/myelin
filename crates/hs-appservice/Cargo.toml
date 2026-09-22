@@ -9,6 +9,7 @@ description = "The appservice registry, registration parser and transaction sche
 
 [dependencies]
 ruma = { workspace = true }
+hs-admin = { path = "../hs-admin" }
 hs-auth = { path = "../hs-auth" }
 hs-http = { path = "../hs-http" }
 hs-kv = { path = "../hs-kv" }

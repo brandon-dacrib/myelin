@@ -94,6 +94,15 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
   closed (the default) a bridge could not create its own bot. It has one now, authenticated by
   the `as_token`, with no user-interactive auth, refusing a username outside the appservice's
   namespace with `M_EXCLUSIVE`. Reproduction in `docs/bridges/heisenbridge.md`.
+- **The Bridges section of the interface is real.** All thirteen appservice operations the
+  interface calls are served from the bridge registry: the list and each bridge's health,
+  backlog and registration; registering one from a registration file in either notation;
+  pause, resume, ping, rotating its tokens, replaying dead-lettered transactions, editing and
+  removing it. Every change is audited. Watched in a browser against the real server with a
+  real bridge: pausing it held the next message, resuming delivered it and the bridge answered.
+  A failed ping now makes a bridge's health say so (it used to read "healthy" beside the
+  error), and every timestamp the admin API writes has its three millisecond digits (a whole
+  second used to lose them).
 - **The admin API says which accounts belong to a bridge.** `appservice_id` on a user was a
   documented gap; it is set on every account an appservice registers.
 - **Bridges are sent what happens in their rooms.** An appservice could register, ping and be

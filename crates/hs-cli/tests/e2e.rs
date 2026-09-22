@@ -2040,6 +2040,65 @@ async fn a_bridge_is_sent_what_happens_in_a_room_its_bot_is_in_even_across_a_res
         "{every_type:?}"
     );
 
+    // The admin API knows this bridge: what the interface's Bridges page draws. The first
+    // administrator comes from the setup link the binary logged.
+    let setup_line = server.wait_for("setup_link=");
+    let setup_token: String = setup_token_of(setup_line.split_once("setup_link=").unwrap().1)
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect();
+    let session: serde_json::Value = reqwest::Client::new()
+        .post(format!("{base}/api/v1/setup"))
+        .json(&json!({"setup_token": setup_token, "username": "ops", "password": "hunter2-ops-bridge"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let admin = session["access_token"].as_str().unwrap().to_owned();
+    let admin_get = |path: &'static str| {
+        let (base, admin) = (base.clone(), admin.clone());
+        async move {
+            let response = reqwest::Client::new()
+                .get(format!("{base}/api/v1{path}"))
+                .bearer_auth(admin)
+                .header("accept", "application/json")
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(status, reqwest::StatusCode::OK, "{path}: {body}");
+            body
+        }
+    };
+    let listed = admin_get("/appservices").await;
+    assert_eq!(listed["items"][0]["id"], "irc", "{listed}");
+    assert_eq!(listed["items"][0]["sender_localpart"], "ircbot");
+    assert_eq!(listed["items"][0]["url"], bridge_url);
+    // Delivered to, so healthy; and everything delivered, so no backlog.
+    assert_eq!(listed["items"][0]["health"], "healthy", "{listed}");
+    let backlog = admin_get("/appservices/irc/backlog").await;
+    assert_eq!(backlog["items"], json!([]), "{backlog}");
+    let registration = admin_get("/appservices/irc/registration").await;
+    assert_eq!(registration["hs_token"], "hs_secret", "{registration}");
+    // A ping reaches the bridge's own endpoint; ours does not serve one, and the admin API says
+    // so rather than failing: that is what the operation is for.
+    let pinged: serde_json::Value = reqwest::Client::new()
+        .post(format!("{base}/api/v1/appservices/irc/ping"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pinged["id"], "irc", "{pinged}");
+    let health = admin_get("/appservices/irc/health").await;
+    assert!(health["last_ping_at"].is_string(), "{health}");
+    assert!(health["last_error"].is_string(), "{health}");
+
     // The server stops and comes back. Nothing can be said while it is down, so: something
     // said the moment it is up, before anything but the pump's own catch-up has had a chance
     // to nudge the bridge's worker.

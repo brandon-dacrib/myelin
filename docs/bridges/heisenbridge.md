@@ -23,7 +23,11 @@ container:
    the bot invites it, it joins -- the bridge's ordinary flow). A message in Matrix arrives on IRC
    as the owner's nick.
 5. The admin API's user list attributes the bot and the ghost to the bridge (`appservice_id`).
-6. The *server* restarted underneath the running bridge: a new IRC user then arrived in Matrix as
+6. The management interface's Bridges page lists it, healthy; its detail page shows backlog,
+   registration and creation time; **Pause** held the next transaction and **Resume**
+   delivered it, and the bridge answered. Screenshots:
+   `docs/design/screenshots/bridge*-real-heisenbridge.png`.
+7. The *server* restarted underneath the running bridge: a new IRC user then arrived in Matrix as
    a new ghost, and a Matrix message reached IRC. (This is what found the two restart bugs
    described in `docs/next-steps.md`; it now works.)
 

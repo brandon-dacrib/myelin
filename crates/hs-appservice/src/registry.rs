@@ -79,7 +79,12 @@ fn compute_status(paused: bool, health: &HealthRow, threshold: u32) -> HealthSta
     if health.last_ping_at_ms.is_none() && health.last_success_at_ms.is_none() {
         return HealthStatus::Unknown;
     }
-    if health.consecutive_failures == 0 {
+    // A ping that failed, with nothing delivered since, is the freshest thing known about this
+    // bridge: it is not healthy, whatever the delivery counter says. Before this an operator
+    // could press "ping", watch it fail, and read "healthy" beside the error.
+    let last_ping_failed = health.last_ping_success == Some(false)
+        && health.last_ping_at_ms >= health.last_success_at_ms;
+    if health.consecutive_failures == 0 && !last_ping_failed {
         return HealthStatus::Healthy;
     }
     if health.consecutive_failures >= threshold {

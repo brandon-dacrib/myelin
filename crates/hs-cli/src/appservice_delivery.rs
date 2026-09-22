@@ -104,6 +104,10 @@ impl<B: KvBackend + 'static> RoomSource for Rooms<B> {
 pub struct AppserviceDelivery<B: KvBackend + 'static> {
     delivery: Arc<Delivery<B>>,
     pump_task: tokio::task::AbortHandle,
+    /// What the admin API's `appservices.*` operations run against: the same registry,
+    /// scheduler and workers, so a replay from the interface is delivered by the worker that
+    /// delivers everything else.
+    admin_directory: Arc<dyn hs_admin::sources::AppserviceDirectory>,
 }
 
 impl<B: KvBackend + 'static> AppserviceDelivery<B> {
@@ -115,6 +119,7 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
     /// Returns the store error if the pump cannot read its cursors or the room heads.
     pub async fn start(
         appservices: Arc<Registry<B>>,
+        ping: Arc<hs_appservice::ping::PingService<B>>,
         rooms: Arc<RoomRegistry<B>>,
     ) -> Result<Self, hs_appservice::error::AppserviceError> {
         let clock: Arc<dyn hs_auth::clock::Clock> = Arc::new(hs_auth::clock::SystemClock);
@@ -123,7 +128,18 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
             clock,
             Arc::new(HttpTransactionSender::new()),
         ));
-        let delivery = Delivery::new(scheduler);
+        let delivery = Delivery::new(scheduler.clone());
+        let admin_directory = Arc::new(
+            hs_appservice::admin_directory::RegistryAppserviceDirectory::new(
+                appservices.clone(),
+                ping,
+                scheduler,
+                {
+                    let delivery = delivery.clone();
+                    Arc::new(move |id: &str| delivery.nudge(id))
+                },
+            ),
+        );
         let pump = Arc::new(Pump::new(
             appservices,
             Arc::new(Rooms {
@@ -141,7 +157,14 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
         Ok(Self {
             delivery,
             pump_task,
+            admin_directory,
         })
+    }
+
+    /// The admin API's view onto this machinery.
+    #[must_use]
+    pub fn admin_directory(&self) -> Arc<dyn hs_admin::sources::AppserviceDirectory> {
+        self.admin_directory.clone()
     }
 
     async fn follow(

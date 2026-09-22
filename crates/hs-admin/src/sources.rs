@@ -16,11 +16,13 @@ use async_trait::async_trait;
 use hs_config::document::Origin;
 use hs_config::layered::{FileLayer, Layers, Resolved};
 use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::model::{
-    AdminRoom, AdminUser, ClusterStatus, ConfigChange, ConfigReloadReport, ConfigSection,
-    ConfigValidateReport, ExternalId, SetupRequest, SetupSession, StatisticsOverview, ThreePid,
+    AdminAppservice, AdminAppserviceBacklogEntry, AdminAppserviceCreate, AdminAppserviceHealth,
+    AdminAppserviceLinks, AdminAppserviceReplay, AdminAppserviceTokens, AdminRoom, AdminUser,
+    ClusterStatus, ConfigChange, ConfigReloadReport, ConfigSection, ConfigValidateReport,
+    ExternalId, SetupRequest, SetupSession, StatisticsOverview, ThreePid,
 };
 
 /// Why a data-source call failed. Mirrors [`crate::auth::AuthError`]'s "only unavailable escapes
@@ -1374,5 +1376,345 @@ mod tests {
         dir.make_admin("!abc:example.org", "@alice:example.org")
             .await
             .unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Appservices (bridges)
+// ---------------------------------------------------------------------------------------------
+
+/// Where the `appservices.*` operations read and write: the appservice registry, its health,
+/// its delivery queue. Implemented for real by `hs-appservice` over its `Registry`; by
+/// [`InMemoryAppserviceDirectory`] for this crate's tests and `hs-admin-mock`.
+///
+/// Every method that names an appservice answers [`SourceError::NotFound`] for one that is not
+/// registered. `create` answers [`SourceError::Conflict`] for an id, a token or an exclusive
+/// namespace already taken, and [`SourceError::Invalid`] for a registration that does not
+/// parse -- with a [`SourceError::InvalidField`] pointer when it can say which field.
+#[async_trait]
+pub trait AppserviceDirectory: Send + Sync + 'static {
+    async fn list(&self) -> Result<Vec<AdminAppservice>, SourceError>;
+    async fn get(&self, id: &str) -> Result<Option<AdminAppservice>, SourceError>;
+    /// Registers a new appservice from the JSON form of a registration file (or the file's text,
+    /// if that is what was given). Live at once: the bridge can authenticate as soon as this
+    /// returns.
+    async fn create(&self, request: AdminAppserviceCreate) -> Result<AdminAppservice, SourceError>;
+    /// Applies an RFC 7396 merge patch to the registration.
+    async fn update(&self, id: &str, patch: Value) -> Result<AdminAppservice, SourceError>;
+    async fn delete(&self, id: &str) -> Result<(), SourceError>;
+    async fn health(&self, id: &str) -> Result<AdminAppserviceHealth, SourceError>;
+    /// Pending and dead-lettered transactions, oldest first.
+    async fn backlog(&self, id: &str) -> Result<Vec<AdminAppserviceBacklogEntry>, SourceError>;
+    /// Stops delivery; the queue keeps growing and nothing is lost.
+    async fn pause(&self, id: &str) -> Result<AdminAppservice, SourceError>;
+    async fn resume(&self, id: &str) -> Result<AdminAppservice, SourceError>;
+    /// Mints a fresh `as_token` and `hs_token`. The old ones stop working at once; the bridge's
+    /// own file has to be updated by hand, which is why the new ones are returned.
+    async fn rotate_tokens(&self, id: &str) -> Result<AdminAppserviceTokens, SourceError>;
+    /// The registration as a bridge's config file would hold it -- tokens included, since that
+    /// is what the file is for.
+    async fn registration(&self, id: &str) -> Result<AdminAppserviceRegistration, SourceError>;
+    /// Sends the bridge a ping now and records the result. A bridge that does not answer is a
+    /// `Ok(health)` saying so, not an error: an unreachable bridge is the thing being reported.
+    async fn ping(&self, id: &str) -> Result<AdminAppserviceHealth, SourceError>;
+    /// Puts dead-lettered transactions back in the queue for immediate retry. Returns how many.
+    async fn replay(&self, id: &str, request: AdminAppserviceReplay) -> Result<usize, SourceError>;
+}
+
+/// A registration in both notations, for `GET /appservices/{id}/registration` to answer in
+/// whichever the caller accepts.
+#[derive(Clone)]
+pub struct AdminAppserviceRegistration {
+    pub json: Value,
+    pub yaml: String,
+}
+
+impl std::fmt::Debug for AdminAppserviceRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AdminAppserviceRegistration(<redacted>)")
+    }
+}
+
+/// An [`AppserviceDirectory`] held in memory, for this crate's handler tests and the mock server.
+/// Registrations are kept as the JSON given; health is whatever was last set; the backlog is a
+/// list the test fills. `ping` marks the appservice healthy or, if `unreachable` names it, down.
+#[derive(Debug, Default)]
+pub struct InMemoryAppserviceDirectory {
+    rows: RwLock<BTreeMap<String, InMemoryAppserviceRow>>,
+    unreachable: RwLock<Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+struct InMemoryAppserviceRow {
+    registration: Value,
+    paused: bool,
+    health: AdminAppserviceHealth,
+    backlog: Vec<AdminAppserviceBacklogEntry>,
+    created_at: String,
+}
+
+impl InMemoryAppserviceDirectory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers `registration` (a registration file as JSON) outright.
+    pub fn with_registration(self, registration: Value) -> Self {
+        let id = registration["id"].as_str().unwrap_or_default().to_owned();
+        self.rows
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                id,
+                InMemoryAppserviceRow {
+                    registration,
+                    paused: false,
+                    health: AdminAppserviceHealth {
+                        status: "unknown".to_owned(),
+                        ..AdminAppserviceHealth::default()
+                    },
+                    backlog: Vec::new(),
+                    created_at: hs_http::time::now_rfc3339(),
+                },
+            );
+        self
+    }
+
+    /// Gives `id` a backlog.
+    pub fn with_backlog(self, id: &str, entries: Vec<AdminAppserviceBacklogEntry>) -> Self {
+        if let Some(row) = self
+            .rows
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(id)
+        {
+            row.backlog = entries;
+        }
+        self
+    }
+
+    /// Makes `ping` fail for `id`.
+    pub fn unreachable(self, id: &str) -> Self {
+        self.unreachable
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(id.to_owned());
+        self
+    }
+
+    fn view(row: &InMemoryAppserviceRow) -> AdminAppservice {
+        let r = &row.registration;
+        AdminAppservice {
+            id: r["id"].as_str().unwrap_or_default().to_owned(),
+            sender_localpart: r["sender_localpart"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            url: r["url"].as_str().map(str::to_owned),
+            namespaces: r.get("namespaces").cloned().unwrap_or_else(|| json!({})),
+            rate_limited: r["rate_limited"].as_bool().unwrap_or(true),
+            protocols: r["protocols"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            paused: row.paused,
+            health: if row.paused {
+                "paused".to_owned()
+            } else {
+                row.health.status.clone()
+            },
+            created_at: row.created_at.clone(),
+            links: AdminAppserviceLinks::default(),
+        }
+    }
+
+    fn with_row<T>(
+        &self,
+        id: &str,
+        f: impl FnOnce(&mut InMemoryAppserviceRow) -> T,
+    ) -> Result<T, SourceError> {
+        let mut rows = self
+            .rows
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        rows.get_mut(id).map(f).ok_or(SourceError::NotFound)
+    }
+}
+
+#[async_trait]
+impl AppserviceDirectory for InMemoryAppserviceDirectory {
+    async fn list(&self) -> Result<Vec<AdminAppservice>, SourceError> {
+        Ok(self
+            .rows
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(Self::view)
+            .collect())
+    }
+
+    async fn get(&self, id: &str) -> Result<Option<AdminAppservice>, SourceError> {
+        Ok(self
+            .rows
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .map(Self::view))
+    }
+
+    async fn create(&self, request: AdminAppserviceCreate) -> Result<AdminAppservice, SourceError> {
+        let registration = match (request.registration, request.registration_yaml) {
+            (Some(json), _) => json,
+            (None, Some(yaml)) => {
+                serde_yaml_ng::from_str::<Value>(&yaml).map_err(|e| SourceError::InvalidField {
+                    pointer: "/registration_yaml",
+                    detail: e.to_string(),
+                })?
+            }
+            (None, None) => {
+                return Err(SourceError::InvalidField {
+                    pointer: "/registration",
+                    detail: "a registration is required, as JSON or as YAML".to_owned(),
+                });
+            }
+        };
+        let Some(id) = registration["id"].as_str().map(str::to_owned) else {
+            return Err(SourceError::InvalidField {
+                pointer: "/registration/id",
+                detail: "required".to_owned(),
+            });
+        };
+        let mut rows = self
+            .rows
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if rows.contains_key(&id) {
+            return Err(SourceError::Conflict(format!(
+                "an appservice with id {id:?} is already registered"
+            )));
+        }
+        let row = InMemoryAppserviceRow {
+            registration,
+            paused: false,
+            health: AdminAppserviceHealth {
+                status: "unknown".to_owned(),
+                ..AdminAppserviceHealth::default()
+            },
+            backlog: Vec::new(),
+            created_at: hs_http::time::now_rfc3339(),
+        };
+        let view = Self::view(&row);
+        rows.insert(id, row);
+        Ok(view)
+    }
+
+    async fn update(&self, id: &str, patch: Value) -> Result<AdminAppservice, SourceError> {
+        self.with_row(id, |row| {
+            hs_config::merge_patch(&mut row.registration, &patch);
+            Self::view(row)
+        })
+    }
+
+    async fn delete(&self, id: &str) -> Result<(), SourceError> {
+        let mut rows = self
+            .rows
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        rows.remove(id).map(|_| ()).ok_or(SourceError::NotFound)
+    }
+
+    async fn health(&self, id: &str) -> Result<AdminAppserviceHealth, SourceError> {
+        self.with_row(id, |row| {
+            let mut health = row.health.clone();
+            if row.paused {
+                health.status = "paused".to_owned();
+            }
+            health
+        })
+    }
+
+    async fn backlog(&self, id: &str) -> Result<Vec<AdminAppserviceBacklogEntry>, SourceError> {
+        self.with_row(id, |row| row.backlog.clone())
+    }
+
+    async fn pause(&self, id: &str) -> Result<AdminAppservice, SourceError> {
+        self.with_row(id, |row| {
+            row.paused = true;
+            Self::view(row)
+        })
+    }
+
+    async fn resume(&self, id: &str) -> Result<AdminAppservice, SourceError> {
+        self.with_row(id, |row| {
+            row.paused = false;
+            Self::view(row)
+        })
+    }
+
+    async fn rotate_tokens(&self, id: &str) -> Result<AdminAppserviceTokens, SourceError> {
+        self.with_row(id, |row| {
+            let tokens = AdminAppserviceTokens {
+                as_token: format!(
+                    "as_{}",
+                    hs_http::time::now_rfc3339().replace([':', '.'], "")
+                ),
+                hs_token: format!(
+                    "hs_{}",
+                    hs_http::time::now_rfc3339().replace([':', '.'], "")
+                ),
+            };
+            row.registration["as_token"] = json!(tokens.as_token);
+            row.registration["hs_token"] = json!(tokens.hs_token);
+            tokens
+        })
+    }
+
+    async fn registration(&self, id: &str) -> Result<AdminAppserviceRegistration, SourceError> {
+        self.with_row(id, |row| AdminAppserviceRegistration {
+            json: row.registration.clone(),
+            yaml: serde_yaml_ng::to_string(&row.registration).unwrap_or_default(),
+        })
+    }
+
+    async fn ping(&self, id: &str) -> Result<AdminAppserviceHealth, SourceError> {
+        let unreachable = self
+            .unreachable
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|u| u == id);
+        self.with_row(id, |row| {
+            row.health = AdminAppserviceHealth {
+                status: if unreachable { "down" } else { "healthy" }.to_owned(),
+                last_ping_at: Some(hs_http::time::now_rfc3339()),
+                last_error: unreachable.then(|| "connection refused".to_owned()),
+            };
+            let mut health = row.health.clone();
+            if row.paused {
+                health.status = "paused".to_owned();
+            }
+            health
+        })
+    }
+
+    async fn replay(&self, id: &str, request: AdminAppserviceReplay) -> Result<usize, SourceError> {
+        self.with_row(id, |row| {
+            let mut replayed = 0;
+            for entry in &mut row.backlog {
+                let wanted = request.transaction_ids.is_empty()
+                    || request.transaction_ids.contains(&entry.transaction_id);
+                if entry.dead_lettered && wanted {
+                    entry.dead_lettered = false;
+                    entry.attempts = 0;
+                    replayed += 1;
+                }
+            }
+            replayed
+        })
     }
 }

@@ -12,15 +12,15 @@ pub fn now_rfc3339() -> String {
 /// Formats an `OffsetDateTime` the way the admin API wants it: UTC, millisecond precision, `Z`
 /// suffix (never `+00:00`).
 pub fn format_rfc3339(dt: OffsetDateTime) -> String {
+    // An explicit description, not the well-known `Rfc3339`: that one writes as many fractional
+    // digits as the value has and none for a whole second, so a timestamp that happened to land
+    // on `.000` came out as `...:20Z` -- three shapes for one field, and a client parsing for
+    // `.SSS` found one of them wrong.
     let dt = dt.to_offset(time::UtcOffset::UTC);
-    // `Rfc3339` renders offset UTC as `Z` and includes as many fractional digits as the value
-    // carries; round explicitly to milliseconds first so the format is always `.SSS`.
-    let millis = dt.millisecond();
-    let truncated = dt
-        .replace_nanosecond((millis as u32) * 1_000_000)
-        .unwrap_or(dt);
-    truncated
-        .format(&Rfc3339)
+    let description = time::macros::format_description!(
+        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+    );
+    dt.format(&description)
         .unwrap_or_else(|_| "1970-01-01T00:00:00.000Z".to_string())
 }
 
@@ -68,5 +68,18 @@ mod tests {
     fn millisecond_precision() {
         let dt = time::macros::datetime!(2026-09-17 21:04:05.123456789 UTC);
         assert_eq!(format_rfc3339(dt), "2026-09-17T21:04:05.123Z");
+    }
+
+    /// A whole second is still written with its three digits: one shape, always. It was not --
+    /// the well-known format writes nothing for a zero fraction -- and a record made at exactly
+    /// the second read differently from one made a millisecond later.
+    #[test]
+    fn a_whole_second_keeps_its_three_digits() {
+        let dt = time::macros::datetime!(2023-11-14 22:13:20 UTC);
+        assert_eq!(format_rfc3339(dt), "2023-11-14T22:13:20.000Z");
+        assert_eq!(
+            rfc3339_from_millis(1_700_000_000_000),
+            "2023-11-14T22:13:20.000Z"
+        );
     }
 }

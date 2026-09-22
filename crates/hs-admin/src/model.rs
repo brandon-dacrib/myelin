@@ -351,6 +351,111 @@ pub struct AdminUser {
     pub media_count: u64,
 }
 
+/// The OpenAPI `AppService` schema: one row of `GET /appservices` and the body of every
+/// per-appservice operation that answers with the appservice. Served by whatever implements
+/// [`crate::sources::AppserviceDirectory`] (`hs-appservice`'s real one over its registry, or
+/// [`crate::sources::InMemoryAppserviceDirectory`] for tests).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminAppservice {
+    pub id: String,
+    pub sender_localpart: String,
+    /// `None` for a registration with `url: null`, which is never pushed to.
+    pub url: Option<String>,
+    /// The registration's `namespaces` as written: `users`/`aliases`/`rooms`, each a list of
+    /// `{regex, exclusive}`.
+    pub namespaces: serde_json::Value,
+    pub rate_limited: bool,
+    pub protocols: Vec<String>,
+    pub paused: bool,
+    /// `healthy`, `degraded`, `down`, `paused` or `unknown` -- the same word
+    /// [`AdminAppserviceHealth::status`] carries, so a list can be coloured without a request per
+    /// row.
+    pub health: String,
+    /// RFC 3339 millisecond-precision UTC.
+    pub created_at: String,
+    /// Where an operator can go from here. `login_url` is where a bridge with its own login
+    /// flow puts it; nothing sets it yet.
+    pub links: AdminAppserviceLinks,
+}
+
+/// `AppService.links`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminAppserviceLinks {
+    pub login_url: Option<String>,
+}
+
+/// The OpenAPI `AppServiceHealth` schema.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminAppserviceHealth {
+    pub status: String,
+    pub last_ping_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+/// The OpenAPI `AppServiceBacklogEntry` schema: one queued or dead-lettered transaction.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminAppserviceBacklogEntry {
+    pub transaction_id: String,
+    pub age_ms: u64,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+    pub dead_lettered: bool,
+}
+
+/// The OpenAPI `AppServiceTokens` schema: the body of `POST /appservices/{id}/rotate-tokens`,
+/// and the one place the tokens are ever shown. Debug shows neither.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdminAppserviceTokens {
+    pub as_token: String,
+    pub hs_token: String,
+}
+
+impl std::fmt::Debug for AdminAppserviceTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminAppserviceTokens")
+            .field("as_token", &"<redacted>")
+            .field("hs_token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The OpenAPI `AppServiceCreate` schema: a registration, as the JSON object a registration
+/// file holds or as that file's text. One of the two.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminAppserviceCreate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_yaml: Option<String>,
+}
+
+impl std::fmt::Debug for AdminAppserviceCreate {
+    // A registration carries both tokens.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminAppserviceCreate")
+            .field(
+                "registration",
+                &self.registration.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "registration_yaml",
+                &self.registration_yaml.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// The OpenAPI `AppServiceReplayRequest` schema: which dead-lettered transactions to send again.
+/// Both absent means all of them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminAppserviceReplay {
+    #[serde(default)]
+    pub transaction_ids: Vec<String>,
+    /// RFC 3339; only entries queued at or after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+}
+
 /// The OpenAPI `Room` schema: one row of `GET /rooms` and the body of `GET /rooms/{room_id}`,
 /// `.../block`, `.../unblock`, `.../make-admin`. Field-for-field match with that schema. Served by
 /// whatever implements [`crate::sources::RoomDirectory`] (track 04's real implementation, or

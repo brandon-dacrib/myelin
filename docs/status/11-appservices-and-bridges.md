@@ -11,7 +11,9 @@ had to be fixed for it to get past its first request -- `/register` had no
 (there was a scheduler and nothing that fed it; `src/pump.rs` and `src/delivery.rs` now do) --
 and two more were found on the way: a server with a registration file in its configuration
 could not start a second time, and after any restart nothing said in a pre-existing room reached
-`/sync`, push or a bridge. All four are fixed, each with a test that fails without it.
+`/sync`, push or a bridge. All four are fixed, each with a test that fails without it. The admin API's thirteen
+`appservices.*` operations are served (`src/admin_directory.rs`), and the interface's Bridges
+section was watched pausing and resuming that bridge.
 
 ## Done
 

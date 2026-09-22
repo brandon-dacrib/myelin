@@ -243,7 +243,16 @@ impl Registration {
                 field: e.to_string(),
                 expected: "representable as JSON",
             })?;
-        let Value::Object(obj) = json_value else {
+        Self::from_json(json_value)
+    }
+
+    /// Parses a registration given as JSON (the admin API's `AppServiceCreate.registration`):
+    /// the same document a registration file holds, in the other notation.
+    ///
+    /// # Errors
+    /// As [`Registration::parse_yaml`], less the YAML ones.
+    pub fn from_json(value: Value) -> Result<Self, RegistrationError> {
+        let Value::Object(obj) = value else {
             return Err(RegistrationError::NotAMapping);
         };
         Self::from_object(obj)
@@ -300,6 +309,18 @@ impl Registration {
     /// legacy key. Fields captured in [`Registration::extra`] on import are written back verbatim.
     #[must_use]
     pub fn to_yaml(&self) -> String {
+        serde_yaml_ng::to_string(&self.to_sorted_map())
+            .expect("a Registration always serializes to valid YAML")
+    }
+
+    /// This registration as a JSON object: what [`Registration::to_yaml`] writes, as JSON. The
+    /// admin API's `GET /appservices/{id}/registration` answers with it when asked for JSON.
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        Value::Object(self.to_sorted_map().into_iter().collect())
+    }
+
+    fn to_sorted_map(&self) -> BTreeMap<String, Value> {
         let mut obj = Map::new();
         obj.insert("id".to_string(), Value::String(self.id.clone()));
         obj.insert(
@@ -363,8 +384,7 @@ impl Registration {
 
         // Sort keys for a stable, diffable export (BTreeMap re-orders the JSON map before
         // handing it to the YAML serializer, which otherwise preserves insertion order).
-        let sorted: BTreeMap<String, Value> = obj.into_iter().collect();
-        serde_yaml_ng::to_string(&sorted).expect("a Registration always serializes to valid YAML")
+        obj.into_iter().collect()
     }
 }
 

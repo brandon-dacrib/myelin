@@ -2176,6 +2176,7 @@ dependencies = [
  "axum",
  "fancy-regex",
  "hex",
+ "hs-admin",
  "hs-auth",
  "hs-http",
  "hs-kv",

@@ -604,6 +604,9 @@ fn admin_state<B: KvBackend + 'static>(
     .with_setup(sources.setup)
     // The Overview page's numbers: until this, its tiles read "Not implemented".
     .with_overview(sources.overview)
+    // The Bridges section: until this, all thirteen of its operations answered 503, and the
+    // section worked against the mock server only.
+    .with_appservices(sources.appservices)
     .with_server_info(hs_admin::model::ServerInfo {
         name: server_name.to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -633,6 +636,7 @@ struct AdminSources {
     config: Option<Arc<dyn hs_admin::sources::ConfigSource>>,
     setup: Arc<hs_auth::setup::FirstRunSetup>,
     overview: Arc<dyn hs_admin::sources::OverviewSource>,
+    appservices: Arc<dyn hs_admin::sources::AppserviceDirectory>,
 }
 
 /// The `/api/v1` state for [`route_manifest`]'s throwaway router: routes are registered the same
@@ -1060,6 +1064,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // is no reason to lean on that for the events of the first few milliseconds.
     let appservice_delivery = crate::appservice_delivery::AppserviceDelivery::start(
         appservices.registry.clone(),
+        appservices.ping_service.clone(),
         rooms.clone(),
     )
     .await
@@ -1093,6 +1098,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
                 config: options.config_source.clone(),
                 setup: setup.clone(),
                 overview: overview.clone(),
+                appservices: appservice_delivery.admin_directory(),
             },
         ),
     };
