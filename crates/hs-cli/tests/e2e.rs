@@ -36,16 +36,37 @@ fn test_config_yaml(port: u16, data_dir: &std::path::Path) -> String {
     )
 }
 
+/// `port` 0 means "any free port": the configuration's own validation refuses it (an operator
+/// who writes 0 has made a mistake), so it is set after parsing, and an in-process server binds
+/// it and says what it got in `ServeHandle::addrs`. Every in-process test does this. Reserving a
+/// port first and handing the number over left a gap in which one of the other twenty-odd tests
+/// running alongside could take it, and on CI one did.
 fn test_config(port: u16, data_dir: &std::path::Path) -> hs_config::Config {
-    hs_config::Config::from_yaml(&test_config_yaml(port, data_dir)).unwrap()
+    let mut config =
+        hs_config::Config::from_yaml(&test_config_yaml(port.max(1), data_dir)).unwrap();
+    if port == 0 {
+        config.listeners.listeners[0].port = 0;
+    }
+    config
 }
 
+/// A port for a server that is started as a *subprocess* from a configuration file, which has
+/// to name one. Never the same port twice in this test process, whatever the kernel hands out;
+/// another process on the machine taking it in the gap remains possible, and rare.
 fn reserve_ephemeral_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    static HANDED_OUT: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+    loop {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut handed_out = HANDED_OUT.lock().unwrap();
+        if !handed_out.contains(&port) {
+            handed_out.push(port);
+            return port;
+        }
+    }
 }
 
 /// `GET /sync` until `wanted` is true of the response, or a few seconds have passed. A room's
@@ -97,7 +118,7 @@ async fn sync_until(
 #[tokio::test]
 async fn boots_registers_logs_in_and_reports_ready() {
     let dir = tempfile::tempdir().unwrap();
-    let config = test_config(reserve_ephemeral_port(), dir.path());
+    let config = test_config(0, dir.path());
 
     let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
         .await
@@ -365,7 +386,7 @@ async fn boots_registers_logs_in_and_reports_ready() {
 #[tokio::test]
 async fn wrong_password_login_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
-    let config = test_config(reserve_ephemeral_port(), dir.path());
+    let config = test_config(0, dir.path());
     let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
         .await
         .unwrap();
@@ -451,7 +472,7 @@ fn generate_signing_key_produces_a_synapse_shaped_line() {
 #[tokio::test]
 async fn sync_keys_and_push_surfaces_answer_through_the_real_binary() {
     let dir = tempfile::tempdir().unwrap();
-    let config = test_config(reserve_ephemeral_port(), dir.path());
+    let config = test_config(0, dir.path());
 
     let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
         .await
@@ -638,7 +659,7 @@ async fn sync_keys_and_push_surfaces_answer_through_the_real_binary() {
 #[tokio::test]
 async fn a_room_created_over_http_reaches_its_creators_sync() {
     let dir = tempfile::tempdir().unwrap();
-    let config = test_config(reserve_ephemeral_port(), dir.path());
+    let config = test_config(0, dir.path());
 
     let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
         .await
@@ -757,7 +778,7 @@ async fn a_room_created_over_http_reaches_its_creators_sync() {
 #[tokio::test]
 async fn an_invite_reaches_a_user_who_has_never_synced() {
     let dir = tempfile::tempdir().unwrap();
-    let config = test_config(reserve_ephemeral_port(), dir.path());
+    let config = test_config(0, dir.path());
 
     let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
         .await
@@ -858,7 +879,7 @@ async fn an_invite_reaches_a_user_who_has_never_synced() {
 #[tokio::test]
 async fn the_key_server_publishes_a_self_signed_key_and_federation_requires_signatures() {
     let dir = tempfile::tempdir().unwrap();
-    let config = test_config(reserve_ephemeral_port(), dir.path());
+    let config = test_config(0, dir.path());
 
     let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
         .await
@@ -930,7 +951,7 @@ async fn the_key_server_publishes_a_self_signed_key_and_federation_requires_sign
 #[tokio::test]
 async fn an_endpoint_this_server_does_not_have_answers_a_json_matrix_error() {
     let dir = tempfile::tempdir().unwrap();
-    let config = test_config(reserve_ephemeral_port(), dir.path());
+    let config = test_config(0, dir.path());
     let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
         .await
         .expect("server should boot");
@@ -995,7 +1016,7 @@ async fn an_endpoint_this_server_does_not_have_answers_a_json_matrix_error() {
 #[tokio::test]
 async fn a_body_that_is_not_json_is_m_not_json_on_every_route_never_plain_text() {
     let dir = tempfile::tempdir().unwrap();
-    let config = test_config(reserve_ephemeral_port(), dir.path());
+    let config = test_config(0, dir.path());
     let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
         .await
         .expect("server should boot");
@@ -1122,7 +1143,7 @@ async fn the_setup_link_creates_exactly_one_administrator_however_many_ask_at_on
     let dir = tempfile::tempdir().unwrap();
     let client = reqwest::Client::new();
     let handle = hs_cli::serve::spawn_serve(
-        test_config(reserve_ephemeral_port(), dir.path()),
+        test_config(0, dir.path()),
         hs_cli::serve::ServeOptions::default(),
     )
     .await
@@ -1420,7 +1441,7 @@ async fn the_real_binary_logs_the_same_setup_link_until_it_is_used_and_never_aft
 #[tokio::test]
 async fn the_setup_link_is_rooted_at_the_public_base_url_when_there_is_one() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = test_config(reserve_ephemeral_port(), dir.path());
+    let mut config = test_config(0, dir.path());
     config.server.public_baseurl = Some("https://matrix.example.org/".to_owned());
     let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
         .await
@@ -1440,7 +1461,7 @@ async fn the_setup_link_is_rooted_at_the_public_base_url_when_there_is_one() {
 async fn the_overview_counts_real_accounts_and_rooms_and_omits_what_nobody_counts() {
     let dir = tempfile::tempdir().unwrap();
     let handle = hs_cli::serve::spawn_serve(
-        test_config(reserve_ephemeral_port(), dir.path()),
+        test_config(0, dir.path()),
         hs_cli::serve::ServeOptions::default(),
     )
     .await
@@ -1553,7 +1574,7 @@ async fn the_overview_counts_real_accounts_and_rooms_and_omits_what_nobody_count
 #[tokio::test]
 async fn an_administrator_can_add_a_user_who_can_then_sign_in() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = test_config(reserve_ephemeral_port(), dir.path());
+    let mut config = test_config(0, dir.path());
     config.auth.enable_registration = false;
     let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
         .await
@@ -1679,7 +1700,7 @@ async fn an_administrator_can_add_a_user_who_can_then_sign_in() {
 async fn the_user_directory_shows_a_searcher_only_who_they_could_already_see() {
     let dir = tempfile::tempdir().unwrap();
     let handle = hs_cli::serve::spawn_serve(
-        test_config(reserve_ephemeral_port(), dir.path()),
+        test_config(0, dir.path()),
         hs_cli::serve::ServeOptions::default(),
     )
     .await
@@ -1829,7 +1850,7 @@ async fn the_user_directory_shows_a_searcher_only_who_they_could_already_see() {
 async fn stopping_the_server_does_not_wait_for_clients_to_finish_waiting() {
     let dir = tempfile::tempdir().unwrap();
     let handle = hs_cli::serve::spawn_serve(
-        test_config(reserve_ephemeral_port(), dir.path()),
+        test_config(0, dir.path()),
         hs_cli::serve::ServeOptions::default(),
     )
     .await
@@ -2288,7 +2309,7 @@ async fn after_a_restart_a_message_in_an_old_room_still_reaches_the_other_person
 async fn an_administrator_can_sign_out_a_lost_phone_and_reset_a_forgotten_password() {
     let dir = tempfile::tempdir().unwrap();
     let handle = hs_cli::serve::spawn_serve(
-        test_config(reserve_ephemeral_port(), dir.path()),
+        test_config(0, dir.path()),
         hs_cli::serve::ServeOptions::default(),
     )
     .await
@@ -2454,7 +2475,7 @@ async fn an_administrator_can_sign_out_a_lost_phone_and_reset_a_forgotten_passwo
 async fn a_join_is_in_the_very_next_sync_every_time() {
     let dir = tempfile::tempdir().unwrap();
     let handle = hs_cli::serve::spawn_serve(
-        test_config(reserve_ephemeral_port(), dir.path()),
+        test_config(0, dir.path()),
         hs_cli::serve::ServeOptions::default(),
     )
     .await
@@ -2549,7 +2570,7 @@ async fn accepting_an_invitation_to_an_encrypted_direct_chat_tells_the_client_ev
 
     let dir = tempfile::tempdir().unwrap();
     let handle = hs_cli::serve::spawn_serve(
-        test_config(reserve_ephemeral_port(), dir.path()),
+        test_config(0, dir.path()),
         hs_cli::serve::ServeOptions::default(),
     )
     .await
@@ -2775,7 +2796,7 @@ async fn accepting_an_invitation_to_an_encrypted_direct_chat_tells_the_client_ev
 async fn rooms_refuse_what_the_spec_says_they_must_and_spell_out_their_defaults() {
     let dir = tempfile::tempdir().unwrap();
     let handle = hs_cli::serve::spawn_serve(
-        test_config(reserve_ephemeral_port(), dir.path()),
+        test_config(0, dir.path()),
         hs_cli::serve::ServeOptions::default(),
     )
     .await

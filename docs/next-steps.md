@@ -214,6 +214,11 @@ their own membership (`RoomActor::event_visible_to`). `TestArchivedRoomsHistory`
 because its remaining complaint was a different one: a room sent whole repeated in `state` every
 state event its `timeline` already carried. It no longer does.
 
+Run 8 (2026-09-22, commit `4e1990f`): **314 of 384**, 78 of 106, and identical to run 7 by
+name -- a day of `/sync` internals (the numbered stream, read-your-writes, the lag re-read),
+bridge delivery and admin operations moved nothing in Complement either way, which is what
+a change to internals should look like there.
+
 Run 7 (2026-09-21, commit `318f8f4`, everything below included): **314 of 384**, 78 of 106
 top-level, and by name exactly what was predicted -- the two regressions back to passing,
 `TestArchivedRoomsHistory` passing, every local `TestDeviceListUpdates` case passing, nothing
