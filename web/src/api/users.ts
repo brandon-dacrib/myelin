@@ -86,6 +86,56 @@ export const useSuspendUser = () => useUserAction("/users/{user_id}/suspend");
 export const useUnsuspendUser = () => useUserAction("/users/{user_id}/unsuspend");
 export const useLogoutUser = () => useUserAction("/users/{user_id}/logout");
 
+/**
+ * Signs one device out (`DELETE /users/{user_id}/devices/{device_id}`): its sessions stop at
+ * once, the others stay. What an administrator does about a lost phone.
+ */
+export function useSignOutDevice() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ userId, deviceId }: { userId: string; deviceId: string }) => {
+      const result = await api.DELETE("/users/{user_id}/devices/{device_id}", {
+        params: { path: { user_id: userId, device_id: deviceId } },
+      });
+      return unwrap(result);
+    },
+    onSuccess: (_data, { userId }) => {
+      invalidateUser(qc, userId);
+      qc.invalidateQueries({ queryKey: ["user-devices", userId] });
+    },
+  });
+}
+
+/**
+ * Sets a new password (`POST /users/{user_id}/reset-password`). Signs the user out everywhere
+ * unless `logoutDevices` is false; the server applies its password policy and answers with a
+ * problem naming `/password` when it refuses.
+ */
+export function useResetPassword() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      userId,
+      password,
+      logoutDevices,
+    }: {
+      userId: string;
+      password: string;
+      logoutDevices: boolean;
+    }) => {
+      const result = await api.POST("/users/{user_id}/reset-password", {
+        params: { path: { user_id: userId } },
+        body: { password, logout_devices: logoutDevices },
+      });
+      return unwrap(result);
+    },
+    onSuccess: (_data, { userId }) => {
+      invalidateUser(qc, userId);
+      qc.invalidateQueries({ queryKey: ["user-devices", userId] });
+    },
+  });
+}
+
 export function useDeactivateUser() {
   const qc = useQueryClient();
   return useMutation({

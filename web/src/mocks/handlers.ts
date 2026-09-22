@@ -578,6 +578,41 @@ export const handlers = [
     }),
   ),
 
+  http.delete(`${API}/users/:user_id/devices/:device_id`, ({ params }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    const devices = userDevices[userId];
+    const index = devices?.findIndex((d) => d.device_id === String(params.device_id)) ?? -1;
+    if (!devices || index < 0)
+      return HttpResponse.json(
+        { type: "urn:hs:problem:not-found", title: "Not found", status: 404 },
+        { status: 404 },
+      );
+    devices.splice(index, 1);
+    return new HttpResponse(null, { status: 204 });
+  }),
+
+  http.post(`${API}/users/:user_id/reset-password`, async ({ params, request }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    if (!findUser(userId))
+      return HttpResponse.json(
+        { type: "urn:hs:problem:not-found", title: "Not found", status: 404 },
+        { status: 404 },
+      );
+    const body = (await request.json()) as { password?: string; logout_devices?: boolean };
+    if (!body.password || body.password.length < 8)
+      return HttpResponse.json(
+        {
+          type: "urn:hs:problem:validation",
+          title: "Validation failed",
+          status: 400,
+          errors: [{ pointer: "/password", detail: "the password must be at least 8 characters" }],
+        },
+        { status: 400 },
+      );
+    if (body.logout_devices ?? true) userDevices[userId] = [];
+    return HttpResponse.json({});
+  }),
+
   http.post(`${API}/users/:user_id/deactivate`, ({ params }) => {
     const user = findUser(decodeURIComponent(String(params.user_id)));
     if (!user)

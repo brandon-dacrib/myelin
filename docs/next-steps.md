@@ -276,9 +276,12 @@ cannot do, in rough order of how often an operator will hit it:
   one device and resetting a password are real too (`users.devices.list/delete`,
   `users.logout`, `users.reset_password`; the reset applies the server's password policy, signs
   the user out by default, and the password reaches neither the audit log nor the event).
-  What it does not do yet: set an email or an external ID at creation (refused with a pointer
-  rather than silently dropped), rename a device, or invite somebody by link so that the
-  administrator never sees the password at all — that last one is the better design for
+  The page has a "Sign out" on each session and a "Reset password" dialog that generates,
+  hands over once, and says whether sessions were kept; both watched working against the real
+  binary (`docs/design/screenshots/user-reset-password-real.png`). What it does not do yet:
+  set an email or an external ID at creation (refused with a pointer rather than silently
+  dropped), rename a device, or invite somebody by link so that the administrator never sees
+  the password at all — that last one is the better design for
   anything but a household, and wants registration tokens, which are 501.
 - **Edit an array of objects as a form.** `listeners.listeners`, `media.thumbnail_sizes` and
   `auth.oidc_providers` fall back to a JSON textarea with live parse errors. Reachable, not

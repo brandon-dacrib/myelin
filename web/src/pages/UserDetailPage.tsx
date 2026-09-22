@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { useParams, Link } from "@tanstack/react-router";
 import { ChevronLeft } from "lucide-react";
 import {
@@ -9,6 +9,7 @@ import {
   useSuspendUser,
   useUnsuspendUser,
   useLogoutUser,
+  useSignOutDevice,
   useDeactivateUser,
 } from "@/api/users";
 import { Button } from "@/components/ui/button/Button";
@@ -21,6 +22,7 @@ import { CopyableId } from "@/components/CopyableId";
 import { RelativeTime } from "@/components/RelativeTime";
 import { toast } from "@/components/ui/toast/toast-store";
 import { hasScope } from "@/lib/auth";
+import { ResetPasswordDialog } from "./users/ResetPasswordDialog";
 
 /** `/users/:id` — flows.md flow 2 steps 2-5: understand and act on a user. */
 export function UserDetailPage() {
@@ -40,7 +42,9 @@ export function UserDetailPage() {
   const suspend = useSuspendUser();
   const unsuspend = useUnsuspendUser();
   const logout = useLogoutUser();
+  const signOutDevice = useSignOutDevice();
   const deactivate = useDeactivateUser();
+  const [resetOpen, setResetOpen] = useState(false);
 
   if (!hasScope("admin:read")) {
     return (
@@ -203,6 +207,10 @@ export function UserDetailPage() {
               />
             </Dialog>
           )}
+          <Button variant="secondary" disabled={!canWrite} onClick={() => setResetOpen(true)}>
+            Reset password
+          </Button>
+          <ResetPasswordDialog userId={id} open={resetOpen} onOpenChange={setResetOpen} />
           <Dialog>
             <DialogTrigger asChild>
               <Button variant="secondary" disabled={!canModerate}>
@@ -269,6 +277,37 @@ export function UserDetailPage() {
                   <div className="flex items-center gap-3 text-xs text-text-muted">
                     {d.last_seen_ip && <span className="font-identifier">{d.last_seen_ip}</span>}
                     <RelativeTime at={d.last_seen_at} />
+                    <Dialog>
+                      <DialogTrigger asChild>
+                        <Button variant="ghost" size="sm" disabled={!canModerate}>
+                          Sign out
+                        </Button>
+                      </DialogTrigger>
+                      <DialogContent
+                        title={`Sign out ${d.display_name ?? d.device_id}?`}
+                        description="That device signs out immediately. The others stay signed in."
+                        footer={
+                          <>
+                            <DialogClose asChild>
+                              <Button variant="secondary">Cancel</Button>
+                            </DialogClose>
+                            <DialogClose asChild>
+                              <Button
+                                variant="danger"
+                                onClick={() =>
+                                  signOutDevice.mutate(
+                                    { userId: id, deviceId: d.device_id },
+                                    { onSuccess: () => toast({ title: "Signed out" }) },
+                                  )
+                                }
+                              >
+                                Sign out
+                              </Button>
+                            </DialogClose>
+                          </>
+                        }
+                      />
+                    </Dialog>
                   </div>
                 </li>
               ))}
