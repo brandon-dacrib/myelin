@@ -797,6 +797,9 @@ pub struct ServeHandle {
     /// Ends every `/sync` long-poll in flight (`hs_user::hub::SessionHub::begin_shutdown`), so
     /// that draining the listeners does not mean waiting out each client's thirty-second timeout.
     release_long_polls: ReleaseLongPolls,
+    /// Stops appservice delivery (`crate::appservice_delivery`). Type-erased like `_storage`,
+    /// and for the same reason.
+    stop_appservice_delivery: Box<dyn Fn() + Send + Sync>,
     /// Keeps the opened storage backend alive for as long as the server is: Fjall holds an
     /// exclusive lock on its data directory and the Postgres backend owns a connection pool, and
     /// dropping either while listeners are still serving would take the store out from under
@@ -843,6 +846,7 @@ impl ServeHandle {
         // Before the listeners are told to drain, not after: a long-poll is an in-flight request
         // that would otherwise hold its listener open until the client's own timeout ran out.
         (self.release_long_polls)().await;
+        (self.stop_appservice_delivery)();
         let _ = self.shutdown_tx.send(true);
         let _ = self.join.await;
     }
@@ -1050,6 +1054,17 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     }
     enabled_components.sort();
 
+    // Bridges hear what happens in rooms from here. Subscribes to the room stream inside, so it
+    // is started here, before any listener is bound: an event sent before the subscription
+    // exists is caught up on, but only because the pump also reads cursors at start, and there
+    // is no reason to lean on that for the events of the first few milliseconds.
+    let appservice_delivery = crate::appservice_delivery::AppserviceDelivery::start(
+        appservices.registry.clone(),
+        rooms.clone(),
+    )
+    .await
+    .map_err(|e| ServeError::Sessions(Box::new(e)))?;
+
     let setup = Arc::new(hs_auth::setup::FirstRunSetup::from_auth_state(&auth_state));
     let overview = Arc::new(crate::overview::ServerOverview::new(
         &auth_state,
@@ -1221,6 +1236,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         shutdown_tx,
         join,
         release_long_polls,
+        stop_appservice_delivery: Box::new(move || appservice_delivery.stop()),
         _storage: Box::new(backend.clone()),
         cluster,
         mesh,

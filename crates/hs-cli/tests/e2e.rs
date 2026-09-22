@@ -1867,6 +1867,201 @@ async fn stopping_the_server_does_not_wait_for_clients_to_finish_waiting() {
     );
 }
 
+/// A bridge, from its own side: it is registered with the server, its bot is in a room, and it
+/// is sent what is said there. Until 2026-09-21 nothing in `hs serve` sent an appservice
+/// anything -- the scheduler delivered a queue nothing filled -- so this is the first time a
+/// transaction has reached one from a running server. The bridge here is an axum listener that
+/// records what arrives.
+///
+/// Also: what happened while the bridge's server was down is sent when it comes back, because
+/// the pump keeps a durable cursor per room rather than trusting the live stream.
+#[tokio::test]
+async fn a_bridge_is_sent_what_happens_in_a_room_its_bot_is_in_even_across_a_restart() {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    // The bridge.
+    #[derive(Clone, Default)]
+    struct Received(Arc<Mutex<Vec<(String, String, serde_json::Value)>>>);
+    async fn take_transaction(
+        axum::extract::State(received): axum::extract::State<Received>,
+        axum::extract::Path(txn_id): axum::extract::Path<String>,
+        headers: axum::http::HeaderMap,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> axum::Json<serde_json::Value> {
+        let auth = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        received.0.lock().unwrap().push((txn_id, auth, body));
+        axum::Json(json!({}))
+    }
+    let received = Received::default();
+    let bridge = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bridge_url = format!("http://{}", bridge.local_addr().unwrap());
+    let bridge_app = axum::Router::new()
+        .route(
+            "/_matrix/app/v1/transactions/{txn_id}",
+            axum::routing::put(take_transaction),
+        )
+        .with_state(received.clone());
+    tokio::spawn(async move { axum::serve(bridge, bridge_app).await.unwrap() });
+    let heard = || -> Vec<String> {
+        received
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(_, _, body)| body["events"].as_array().cloned().unwrap_or_default())
+            .filter(|e| e["type"] == "m.room.message")
+            .filter_map(|e| e["content"]["body"].as_str().map(str::to_owned))
+            .collect()
+    };
+
+    // The real binary, with the bridge's registration file: the restart below needs the
+    // storage lock released, which an in-process `shutdown()` does not manage (background
+    // tasks hold the store), and the cursor that survives the restart is the point.
+    let dir = tempfile::tempdir().unwrap();
+    let registration = dir.path().join("irc.yaml");
+    std::fs::write(
+        &registration,
+        format!(
+            "id: irc\nurl: '{bridge_url}'\nas_token: as_secret\nhs_token: hs_secret\n\
+             sender_localpart: ircbot\nnamespaces:\n  users:\n    - regex: '@irc_.*:example\\.org'\n      exclusive: true\n"
+        ),
+    )
+    .unwrap();
+    let port = reserve_ephemeral_port();
+    let config_path = dir.path().join("homeserver.yaml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "{}appservices:\n  registration_files: [{:?}]\n",
+            test_config_yaml(port, &dir.path().join("data")),
+            registration
+        ),
+    )
+    .unwrap();
+    let mut server = HsProcess::serve(&config_path);
+    server.wait_for("listening");
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+
+    let registered: serde_json::Value = client
+        .post(format!("{base}/_matrix/client/v3/register"))
+        .json(&json!({"username": "alice", "password": "hunter2-alice", "auth": {"type": "m.login.dummy"}}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let alice = registered["access_token"].as_str().unwrap().to_owned();
+    let created: serde_json::Value = client
+        .post(format!("{base}/_matrix/client/v3/createRoom"))
+        .bearer_auth(&alice)
+        .json(&json!({"preset": "public_chat", "name": "bridged"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let room_id = created["room_id"].as_str().unwrap().to_owned();
+    let room_path = room_id.replace('!', "%21").replace(':', "%3A");
+    let say = |body: &'static str, txn: &'static str| {
+        let (base, alice, room_path) = (base.clone(), alice.clone(), room_path.clone());
+        async move {
+            // A client of its own each time: the shared one keeps a connection to a process
+            // that, below, is no longer there.
+            let sent = reqwest::Client::new()
+                .put(format!(
+                    "{base}/_matrix/client/v3/rooms/{room_path}/send/m.room.message/{txn}"
+                ))
+                .bearer_auth(&alice)
+                .json(&json!({"msgtype": "m.text", "body": body}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(sent.status(), reqwest::StatusCode::OK);
+        }
+    };
+    say("nobody from the bridge is here yet", "t1").await;
+
+    // The bridge's bot joins, as the bridge itself would do, with its own token and the
+    // appservice's right to act as its bot.
+    let joined = client
+        .post(format!("{base}/_matrix/client/v3/join/{room_path}"))
+        .bearer_auth("as_secret")
+        .query(&[("user_id", "@ircbot:example.org")])
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        joined.status(),
+        reqwest::StatusCode::OK,
+        "{}",
+        joined.text().await.unwrap()
+    );
+    say("hello irc", "t2").await;
+
+    let mut waited = 0;
+    while !heard().contains(&"hello irc".to_owned()) && waited < 200 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        waited += 1;
+    }
+    let (txn_id, auth, _) = received
+        .0
+        .lock()
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("a transaction arrived");
+    assert_eq!(
+        auth, "Bearer hs_secret",
+        "the bridge is told who is calling"
+    );
+    assert!(!txn_id.is_empty());
+    // Everything from the bot's join onwards -- and nothing from before it, which the bot had
+    // no business hearing.
+    assert_eq!(heard(), vec!["hello irc".to_owned()]);
+    let every_type: Vec<String> = received
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|(_, _, body)| body["events"].as_array().cloned().unwrap_or_default())
+        .filter_map(|e| e["type"].as_str().map(str::to_owned))
+        .collect();
+    assert!(
+        every_type.contains(&"m.room.member".to_owned()),
+        "{every_type:?}"
+    );
+
+    // The server stops and comes back. Nothing can be said while it is down, so: something
+    // said the moment it is up, before anything but the pump's own catch-up has had a chance
+    // to nudge the bridge's worker.
+    server.stop();
+    let mut server = HsProcess::serve(&config_path);
+    server.wait_for("listening");
+    say("said just after the restart", "t3").await;
+    let mut waited = 0;
+    while heard().len() < 2 && waited < 200 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        waited += 1;
+    }
+    assert_eq!(
+        heard(),
+        vec![
+            "hello irc".to_owned(),
+            "said just after the restart".to_owned()
+        ]
+    );
+    server.stop();
+}
+
 /// What opening Element on this server found, the day `/sync` stopped resending every room's
 /// whole state with every message. Two people, a direct and encrypted chat, an invitation
 /// accepted: the most ordinary thing the server will ever be asked to do, and it went wrong four

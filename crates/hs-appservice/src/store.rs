@@ -164,6 +164,9 @@ pub struct QueuedTransaction {
     pub last_error: Option<String>,
 }
 
+/// The [`AppserviceStore`] `pump_meta` row whose presence means the pump has started before.
+const PUMP_STARTED: &str = "started";
+
 /// The keyspace handles and typed accessors for one appservice registry, wired to a `B: KvBackend`.
 pub struct AppserviceStore<B: KvBackend> {
     backend: B,
@@ -173,6 +176,11 @@ pub struct AppserviceStore<B: KvBackend> {
     health: TypedKeyspace<B::Keyspace, (String,)>,
     txn_queue: TypedKeyspace<B::Keyspace, (String, u64)>,
     txn_seq: TypedKeyspace<B::Keyspace, (String,)>,
+    /// `room_id -> position`: how far into each room's timeline [`crate::pump`] has read. See
+    /// [`AppserviceStore::enqueue_for_room`].
+    room_cursor: TypedKeyspace<B::Keyspace, (String,)>,
+    /// Facts about the pump as a whole, by name. One today: [`PUMP_STARTED`].
+    pump_meta: TypedKeyspace<B::Keyspace, (String,)>,
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, AppserviceError> {
@@ -211,6 +219,8 @@ impl<B: KvBackend> AppserviceStore<B> {
         let health = TypedKeyspace::new(backend.keyspace("hs_appservice.health")?);
         let txn_queue = TypedKeyspace::new(backend.keyspace("hs_appservice.txn_queue")?);
         let txn_seq = TypedKeyspace::new(backend.keyspace("hs_appservice.txn_seq")?);
+        let room_cursor = TypedKeyspace::new(backend.keyspace("hs_appservice.room_cursor")?);
+        let pump_meta = TypedKeyspace::new(backend.keyspace("hs_appservice.pump_meta")?);
         Ok(Self {
             backend,
             registry,
@@ -219,6 +229,8 @@ impl<B: KvBackend> AppserviceStore<B> {
             health,
             txn_queue,
             txn_seq,
+            room_cursor,
+            pump_meta,
         })
     }
 
@@ -444,28 +456,122 @@ impl<B: KvBackend> AppserviceStore<B> {
     /// Returns [`AppserviceError::Store`]/[`AppserviceError::Decode`] on failure.
     pub fn enqueue(&self, id: &str, body: Value, now_ms: u64) -> Result<u64, AppserviceError> {
         transact(&self.backend, TransactConfig::default(), move |txn| {
-            let body = body.clone();
-            let seq_key = (id.to_string(),);
-            let next = txn
-                .atomic_add(self.txn_seq.raw(), &hs_tables::key::encode(&seq_key), 1)
-                .map_err(to_kv)?;
-            #[allow(clippy::cast_sign_loss, reason = "atomic_add never goes negative here")]
-            let seq = next as u64;
-            let entry = QueuedTransaction {
-                seq,
-                body,
-                enqueued_at_ms: now_ms,
-                attempts: 0,
-                next_attempt_at_ms: now_ms,
-                status: QueueStatus::Pending,
-                last_error: None,
-            };
-            let value = serde_json::to_vec(&entry)
-                .map_err(|e| hs_kv::KvError::backend(EncodeFail(e.to_string())))?;
-            self.txn_queue
-                .put(txn, &(id.to_string(), seq), &value)
-                .map_err(to_kv)?;
-            Ok(seq)
+            self.enqueue_in(txn, id, body.clone(), now_ms)
+        })
+        .map_err(|e| AppserviceError::Store(e.to_string()))
+    }
+
+    /// [`AppserviceStore::enqueue`]'s two steps, inside a transaction the caller owns.
+    fn enqueue_in<W: KvWrite<Keyspace = B::Keyspace>>(
+        &self,
+        txn: &mut W,
+        id: &str,
+        body: Value,
+        now_ms: u64,
+    ) -> Result<u64, hs_kv::KvError> {
+        let seq_key = (id.to_string(),);
+        let next = txn
+            .atomic_add(self.txn_seq.raw(), &hs_tables::key::encode(&seq_key), 1)
+            .map_err(to_kv)?;
+        #[allow(clippy::cast_sign_loss, reason = "atomic_add never goes negative here")]
+        let seq = next as u64;
+        let entry = QueuedTransaction {
+            seq,
+            body,
+            enqueued_at_ms: now_ms,
+            attempts: 0,
+            next_attempt_at_ms: now_ms,
+            status: QueueStatus::Pending,
+            last_error: None,
+        };
+        let value = serde_json::to_vec(&entry)
+            .map_err(|e| hs_kv::KvError::backend(EncodeFail(e.to_string())))?;
+        self.txn_queue
+            .put(txn, &(id.to_string(), seq), &value)
+            .map_err(to_kv)?;
+        Ok(seq)
+    }
+
+    // ---- the pump's place in each room ----
+
+    /// How far into `room_id`'s timeline the pump has read: the room-local position of the last
+    /// event it has dealt with. `None` if it has never read this room.
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`]/[`AppserviceError::Decode`] on failure.
+    pub fn room_cursor(&self, room_id: &str) -> Result<Option<i64>, AppserviceError> {
+        let snap = self.backend.snapshot();
+        match self.room_cursor.get(&snap, &(room_id.to_string(),))? {
+            Some(bytes) => decode(&bytes).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Queues one transaction body for each of `deliveries` (`(appservice id, body)`) and moves
+    /// `room_id`'s cursor to `cursor`, in one transaction.
+    ///
+    /// One transaction is the point. The cursor says "everything up to here has been queued for
+    /// whoever wanted it"; written separately, a crash between the two either queues an event
+    /// twice (a bridge relays the same message twice) or never queues it (a bridge silently
+    /// misses one), and there is no telling which from the outside.
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`]/[`AppserviceError::Decode`] on failure.
+    pub fn enqueue_for_room(
+        &self,
+        room_id: &str,
+        cursor: i64,
+        deliveries: &[(String, Value)],
+        now_ms: u64,
+    ) -> Result<(), AppserviceError> {
+        let cursor_value = encode(&cursor)?;
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            for (id, body) in deliveries {
+                self.enqueue_in(txn, id, body.clone(), now_ms)?;
+            }
+            self.room_cursor
+                .put(txn, &(room_id.to_string(),), &cursor_value)
+                .map_err(to_kv)
+        })
+        .map_err(|e| AppserviceError::Store(e.to_string()))
+    }
+
+    /// Whether the pump has ever started against this store. See
+    /// [`AppserviceStore::start_pump_at`].
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`] on failure.
+    pub fn pump_has_started(&self) -> Result<bool, AppserviceError> {
+        let snap = self.backend.snapshot();
+        Ok(self
+            .pump_meta
+            .get(&snap, &(PUMP_STARTED.to_string(),))?
+            .is_some())
+    }
+
+    /// The pump's first start against this store: records where every room that already exists
+    /// stands (`heads`, `(room id, position)`), and that this has been done.
+    ///
+    /// A server that has been running has history, and an appservice registered today did not
+    /// ask for all of it. So the first start reads nothing, and remembers the present; from then
+    /// on a room with no cursor is a room created since, whose every event is news.
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`]/[`AppserviceError::Decode`] on failure.
+    pub fn start_pump_at(&self, heads: &[(String, i64)]) -> Result<(), AppserviceError> {
+        let encoded: Vec<(String, Vec<u8>)> = heads
+            .iter()
+            .map(|(room_id, head)| Ok((room_id.clone(), encode(head)?)))
+            .collect::<Result<_, AppserviceError>>()?;
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            for (room_id, head) in &encoded {
+                self.room_cursor
+                    .put(txn, &(room_id.clone(),), head)
+                    .map_err(to_kv)?;
+            }
+            self.pump_meta
+                .put(txn, &(PUMP_STARTED.to_string(),), b"1")
+                .map_err(to_kv)
         })
         .map_err(|e| AppserviceError::Store(e.to_string()))
     }

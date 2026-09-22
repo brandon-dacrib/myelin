@@ -2335,6 +2335,24 @@ impl<B: KvBackend> RoomActor<B> {
             == Some("join"))
     }
 
+    /// Up to `limit` events after room-local position `after`, oldest first, each with its own
+    /// position. Never an event at a negative position: those are history fetched from other
+    /// servers after the fact, which is not news to anybody following the room forwards.
+    ///
+    /// What [`RoomActor::paginate`] is for a client, this is for a follower that keeps a cursor
+    /// (appservice delivery): it needs each event's position, not one continuation token.
+    #[must_use]
+    pub fn events_after(&self, after: i64, limit: usize) -> Vec<(i64, &Event)> {
+        self.timeline
+            .range((
+                std::ops::Bound::Excluded(after.max(0)),
+                std::ops::Bound::Unbounded,
+            ))
+            .take(limit)
+            .filter_map(|(pos, sn)| Some((*pos, self.events.get(sn)?)))
+            .collect()
+    }
+
     /// The room-local send position (`room_pos`) of a known [`EventSn`], by linear scan of
     /// `self.timeline`. Phase 0 scope, same tradeoff as `RoomActor::get_context`'s full scan for
     /// an event's position: this crate holds a room's whole timeline resident in memory already
@@ -3034,6 +3052,44 @@ pub fn list_all_room_ids<B: KvBackend>(
         out.push(
             OwnedRoomId::try_from(meta.room_id).map_err(|e| RoomError::Internal(e.to_string()))?,
         );
+    }
+    Ok(out)
+}
+
+/// Every room this server holds, with the room-local position of its newest event (`0` for a
+/// room with none at a positive position). Read from the stored timeline, newest key first, so
+/// that it costs one short scan per room rather than loading each room into memory: appservice
+/// delivery asks this at every start to find the rooms that moved while it was not looking.
+///
+/// # Errors
+/// Returns [`RoomError::Store`] on a storage failure, or [`RoomError::Internal`] if a stored row
+/// fails to decode.
+pub fn room_heads<B: KvBackend>(
+    backend: &B,
+    tables: &Tables<B>,
+) -> Result<Vec<(OwnedRoomId, i64)>, RoomError> {
+    let snapshot = backend.snapshot();
+    let mut out = Vec::new();
+    for item in tables.room_meta.range(&snapshot, RangeSpec::full()) {
+        let ((room_sn,), bytes) = item?;
+        let meta: RoomMeta = serde_json::from_slice(&bytes)
+            .map_err(|e| RoomError::Internal(format!("corrupt room_meta row: {e}")))?;
+        let room_id =
+            OwnedRoomId::try_from(meta.room_id).map_err(|e| RoomError::Internal(e.to_string()))?;
+        let mut newest = hs_tables::keyspace::TypedKeyspace::<
+            B::Keyspace,
+            crate::persist::TimelineKey,
+        >::prefix(&(room_sn,));
+        newest.reverse = true;
+        newest.limit = Some(1);
+        let head = match tables.timeline.range(&snapshot, newest).next() {
+            Some(entry) => {
+                let ((_, room_pos), _) = entry?;
+                room_pos.max(0)
+            }
+            None => 0,
+        };
+        out.push((room_id, head));
     }
     Ok(out)
 }

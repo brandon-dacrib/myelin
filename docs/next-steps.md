@@ -10,6 +10,23 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 
 **Opening Element is worth more than another Complement run, and the evidence is one evening.** On 2026-09-21, after a day of `/sync` fixes that moved csapi from 241 to 305 of 384 with every test in the repository green, two Element sessions and one invitation found four bugs none of it had seen: accepting an invitation brought the invitee their own join and no room state (so Element offered to send plain text into an encrypted room); a client never learned that the server had taken the signature on its own device (so Element marked every message its own user sent "not verified by its owner", and never offered key backup); whoever created a room had no name in it; and a direct chat's invitation did not say it was one. All four are fixed, each with a test that fails without the fix, and the first is this project's own regression from that same day -- see "What opening Element found" below.
 
+**Bridges are sent events, and a restart no longer silences every room.** Until 2026-09-21
+`hs serve` sent an appservice nothing, ever: `hs_appservice::scheduler` delivered a queue nothing
+filled. `hs_appservice::pump` fills it now -- a durable cursor per room, the room stream used only
+as a doorbell, Synapse's interest rule (sender, membership target, room, alias, or *any current
+member* is one of the appservice's users, its bot included), the first start recording the
+present rather than replaying history -- and `hs_appservice::delivery` runs one worker per
+appservice so a hung bridge delays only itself. The end-to-end test registers a bridge (an axum
+listener) with the real binary, has its bot join a room, and receives the transaction; then
+restarts the binary and receives the next one. That test found two things no test had: a server
+with a registration file in its config **could not start a second time** (`add` refused the
+registration as a conflict with itself; `import` was there for it), and **after any restart,
+nothing said in a pre-existing room reached `/sync`, push or a bridge**, because rooms loaded
+from disk never forwarded to the registry's global stream -- only created ones did, and every
+test created its rooms in the process that read them. Both fixed. No real bridge (mautrix-*)
+has been pointed at it yet; that is the next thing to do with a bridge, and the Bridges admin
+operations (0 of 16) after it.
+
 **Configuration lives in the database** (RFC 0016). The file is a bootstrap and a seed; the database outranks it, `HS__` variables outrank the database, and the admin API refuses a write the environment would shadow rather than storing one that gets ignored. The web interface has a Configuration section that builds its forms from the server's own JSON Schema, and `hs config show|get|set|unset|import|export|history` is the same thing without a browser.
 
 **A first run is one command, and the first administrator is one link.** `hs serve --data-dir ./data --server-name example.org` in an empty directory produces a working server — database, signing key, media path, all underneath that directory — and so does `docker run -p 8008:8008 -v myelin:/data -e HS__SERVER__SERVER_NAME=example.org <image>`, which CD now boots verbatim before it will publish. It was 158 lines of generated YAML with four mandatory hand-edits.
@@ -116,7 +133,7 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 | Admin API | ~23% | 34 of 145 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Config 6/6, Server 5/5, AuditLog 3/3, Setup 2/2, Users 10/41, Rooms 5/23, Statistics 1/4, Cluster 1/6, and **Bridges 0/16**, Federation 0/7, Media 0/9, RegistrationTokens 0/5 |
 | Management web interface | ~60% | users, rooms, federation, bridges, and configuration are real; arrays-of-objects and several resources are not |
 | **Federation** | **~15%** | 59/246 assertions, 6/88 top-level; a two-server join works one way only |
-| Bridges | ~20% | the appservice surface exists; no real bridge has ever been pointed at it, and **none of the 16 bridge operations the interface's Bridges section calls is served** — that section works against the mock only |
+| Bridges | ~35% | the appservice surface exists and, since 2026-09-21, events are delivered to it (verified with a test bridge against the real binary, across a restart); no real bridge has ever been pointed at it, and **none of the 16 bridge operations the interface's Bridges section calls is served** — that section works against the mock only |
 | Operations (HA, scale-out) | ~40% | it runs on Kubernetes with a chart and a tested image; the cluster path has never carried real traffic |
 
 Federation is the honest answer to "when could I use this". Everything else is far enough along
@@ -338,6 +355,10 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | A hot room joined after the token is resumed from the join, not sent whole | `hs-user` | the client recovers from `/state` and `/messages`; rare, and written down in `resume_mode` |
 | A requester with no device never records a feed cursor | `hs-user` | its feed entries coalesce forever and an incremental sync sees no change; some appservice callers |
 | `heartbeat_seq` is derived from wall-clock milliseconds | `hs-cluster` | two ticks in one millisecond read as "no progress", i.e. death; harmless at the production 1s interval, surfaces only in tests |
+| Appservice delivery reads a room's *current* members to decide interest | `hs-appservice` | Synapse's rule too; a bridge whose bot has just left still hears its own leave, and nothing after |
+| Appservice delivery carries events only | `hs-appservice` | no ephemeral (typing, receipts, presence), to-device or device-list data reaches a bridge yet; `Transaction` has the fields, the pump fills one |
+| Only one process may pump | `hs-appservice`, `hs-cluster` | two replicas would each queue every event; delivery is not shard-gated and must be before a cluster carries bridges |
+| No real bridge has connected | `hs-appservice` | mautrix-* against the real binary is the next verification, the way Element was for clients |
 | Sytest never run | `tests/sytest` | CPAN dependencies absent |
 | `cargo fuzz` never executed | `fuzz/` | no nightly toolchain |
 

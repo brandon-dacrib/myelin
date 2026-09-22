@@ -84,6 +84,25 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
   repository that is not ours, and rendered no media path, so every upload failed under its own
   `readOnlyRootFilesystem: true`.
 
+### Bridges
+
+- **Bridges are sent what happens in their rooms.** An appservice could register, ping and be
+  masqueraded through, and was sent no event, ever: the transaction scheduler delivered a queue
+  nothing filled. Now a pump reads every room from a durable cursor, decides who wants each
+  event by the rule bridges are written against (a bridge hears everything in a room its bot or
+  one of its ghosts is in), and one worker per appservice delivers it, in order, with retries.
+  The first start records where things stand rather than replaying a server's history into a
+  bridge registered today. Verified with a test bridge receiving transactions from the real
+  binary, including across a restart.
+- **A server with a bridge configured starts more than once.** Every boot re-added the
+  registration file to a registry that had kept it, and the second boot refused it as a conflict
+  with itself.
+- **A restart no longer silences every existing room.** Rooms loaded from disk never forwarded
+  their events to the stream `/sync`, push and bridges follow; only rooms created in the running
+  process did. After any restart, nothing said in a room that already existed reached anybody
+  until they reloaded. Every test had created its rooms in the process that read them; the
+  bridge test was the first to restart a server and then send something.
+
 ### Verified against a real client
 
 - **Element Web works.** The browser client most Matrix users run signs in, lists rooms, sends and

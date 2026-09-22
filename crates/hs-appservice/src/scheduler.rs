@@ -243,6 +243,23 @@ impl ReplayRequest {
     }
 }
 
+/// `txn` as it would be sent to `row`'s appservice -- its spelling gated on that registration's
+/// flags ([`Transaction::to_wire_json`]) -- or `None` if nothing should be queued for it at all:
+/// the transaction is empty, or the registration has `url: null` and is never pushed to. See
+/// [`Scheduler::enqueue`], which this is the deciding half of; [`crate::pump`] is the other
+/// caller, because it queues for several appservices in one transaction of its own.
+#[must_use]
+pub fn wire_body(row: &crate::store::AppserviceRow, txn: &Transaction) -> Option<Value> {
+    if row.url.is_none() || txn.is_empty() {
+        return None;
+    }
+    Some(txn.to_wire_json(
+        row.receive_ephemeral,
+        row.push_ephemeral_legacy,
+        row.msc3202,
+    ))
+}
+
 /// The per-appservice transaction scheduler.
 pub struct Scheduler<B: KvBackend> {
     registry: Arc<Registry<B>>,
@@ -300,14 +317,9 @@ impl<B: KvBackend> Scheduler<B> {
             .registry
             .get(appservice_id)?
             .ok_or_else(|| AppserviceError::NotFound(appservice_id.to_string()))?;
-        if row.url.is_none() || txn.is_empty() {
+        let Some(body) = wire_body(&row, txn) else {
             return Ok(None);
-        }
-        let body = txn.to_wire_json(
-            row.receive_ephemeral,
-            row.push_ephemeral_legacy,
-            row.msc3202,
-        );
+        };
         let seq = self
             .registry
             .store()

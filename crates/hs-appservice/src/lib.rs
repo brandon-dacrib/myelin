@@ -27,9 +27,11 @@
 #![warn(missing_docs)]
 
 pub mod auth_registry;
+pub mod delivery;
 pub mod error;
 pub mod namespace;
 pub mod ping;
+pub mod pump;
 pub mod query;
 pub mod regexp;
 pub mod registration;
