@@ -189,10 +189,24 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
         let handle = RoomActorHandle::new(actor);
 
         let mut rooms = self.rooms.lock().await;
-        let entry = rooms.entry(room_id.to_owned()).or_insert_with(|| Entry {
-            handle: handle.clone(),
-            last_used: Instant::now(),
-        });
+        let entry = match rooms.entry(room_id.to_owned()) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                // Loaded twice at once; the other load won, and this actor is dropped unused.
+                entry.into_mut()
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                // The same forwarder a created room gets. It was missing here, so a room loaded
+                // from disk -- every room, after a restart -- published to nobody: nothing that
+                // happened in it reached `/sync`, push, or a bridge until the server was restarted
+                // again and the room created... never. Every test created its rooms in the
+                // process that read them, and this was the first one that did not.
+                self.spawn_global_forwarder(&handle);
+                slot.insert(Entry {
+                    handle: handle.clone(),
+                    last_used: Instant::now(),
+                })
+            }
+        };
         entry.last_used = Instant::now();
         Ok(entry.handle.clone())
     }
@@ -359,6 +373,15 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     /// Returns [`RoomError::Store`] on a storage failure.
     pub fn list_all_room_ids(&self) -> Result<Vec<OwnedRoomId>, RoomError> {
         crate::actor::list_all_room_ids(&self.backend, &self.tables)
+    }
+
+    /// Every room this server holds, with the position of its newest event, without loading any
+    /// of them. See [`crate::actor::room_heads`].
+    ///
+    /// # Errors
+    /// Returns [`RoomError::Store`] on a storage failure.
+    pub fn room_heads(&self) -> Result<Vec<(OwnedRoomId, i64)>, RoomError> {
+        crate::actor::room_heads(&self.backend, &self.tables)
     }
 
     /// Blocks or unblocks `room_id` (`hs-admin`'s `rooms.set_blocked`). See
@@ -534,5 +557,115 @@ mod tests {
             .expect("create should succeed");
         assert_eq!(registry.resident_count().await, 1);
         assert!(handle.query(|a| a.head_update()).await.is_some());
+    }
+
+    /// What a follower with a cursor needs (appservice delivery): where every room stands,
+    /// without loading any of them, and a room's events after a position, each with its own.
+    #[tokio::test]
+    async fn room_heads_and_events_after_let_a_follower_keep_its_place() {
+        let registry = registry();
+        let alice = user_id!("@alice:registry.test").to_owned();
+        assert!(registry.room_heads().unwrap().is_empty());
+
+        let handle = registry
+            .create_room(alice.clone(), CreateRoomRequest::default(), 1)
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        let created = handle.query(|a| a.events_after(0, usize::MAX).len()).await;
+        assert!(created > 1, "a room is created with more than one event");
+        assert_eq!(
+            registry.room_heads().unwrap(),
+            vec![(room_id.clone(), i64::try_from(created).unwrap())]
+        );
+
+        handle
+            .send_event(
+                alice.clone(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"body": "one more"}),
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        let head = i64::try_from(created).unwrap() + 1;
+        assert_eq!(registry.room_heads().unwrap(), vec![(room_id, head)]);
+
+        let (positions, bodies) = handle
+            .query(move |a| {
+                let after = a.events_after(head - 1, 10);
+                (
+                    after.iter().map(|(pos, _)| *pos).collect::<Vec<_>>(),
+                    after
+                        .iter()
+                        .map(|(_, e)| {
+                            crate::routes::render::client_event_json(e)["content"]["body"].clone()
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .await;
+        assert_eq!(positions, vec![head]);
+        assert_eq!(bodies, vec![serde_json::json!("one more")]);
+        // A limit is a limit, and a negative cursor is the beginning, not before it.
+        assert_eq!(handle.query(|a| a.events_after(-5, 2).len()).await, 2);
+        assert_eq!(handle.query(|a| a.events_after(-5, 2)[0].0).await, 1);
+    }
+
+    /// A room loaded from disk is a room like any other to the global stream. It was not: only
+    /// `insert` (a created room) started the forwarder, so after a restart every existing room
+    /// published to nobody, and nothing said in one reached `/sync`, push or a bridge. Found by
+    /// the first test to send a message to a real server it had restarted.
+    #[tokio::test]
+    async fn a_room_loaded_from_disk_reports_its_events_on_the_global_stream() {
+        let backend = MemoryBackend::new();
+        let alice = user_id!("@alice:registry.test").to_owned();
+        let room_id = {
+            let registry = Arc::new(
+                RoomRegistry::open(
+                    backend.clone(),
+                    HomeserverIdentity::for_tests("registry.test"),
+                )
+                .unwrap(),
+            );
+            let handle = registry
+                .create_room(alice.clone(), CreateRoomRequest::default(), 1)
+                .await
+                .unwrap();
+            handle.query(|a| a.room_id().to_owned()).await
+        };
+
+        // "A restart": a new registry over the same storage, with a subscriber taken out before
+        // anything is loaded, as `hs serve` does.
+        let registry = Arc::new(
+            RoomRegistry::open(backend, HomeserverIdentity::for_tests("registry.test")).unwrap(),
+        );
+        let mut updates = registry.subscribe_global();
+        let handle = registry.get_or_load(&room_id).await.unwrap();
+        handle
+            .send_event(
+                alice,
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"body": "after the restart"}),
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let update = tokio::time::timeout_at(deadline, updates.recv())
+                .await
+                .expect("the message should reach the global stream")
+                .unwrap();
+            if update.event_type == "m.room.message" {
+                assert_eq!(update.room_id, room_id);
+                break;
+            }
+        }
     }
 }
