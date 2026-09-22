@@ -492,7 +492,7 @@ impl HttpWellKnownFetcher {
     /// misconfigured TLS backend, which would already be a fatal startup error elsewhere).
     #[must_use]
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
+        let client = hs_http::client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(DISCOVERY_TIMEOUT)
             .build()

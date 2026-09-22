@@ -100,7 +100,7 @@ impl HttpPusherClient {
     #[must_use]
     pub fn new(retry: RetryPolicy) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: hs_http::client::builder().build().unwrap_or_default(),
             retry,
         }
     }

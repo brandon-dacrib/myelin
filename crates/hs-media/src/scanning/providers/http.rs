@@ -142,7 +142,7 @@ impl HttpScanner {
     #[must_use]
     pub fn new(config: HttpConfig) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: hs_http::client::builder().build().unwrap_or_default(),
             config,
         }
     }

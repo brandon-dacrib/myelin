@@ -263,7 +263,9 @@ pub async fn guarded_fetch(
 
         let connect_addr = resolve_and_check(&host, port, policy).await?;
 
-        let client = reqwest::Client::builder()
+        // Built per request because the resolved address is pinned per host; the shared
+        // builder keeps that from re-reading the root store every time.
+        let client = hs_http::client::builder()
             .timeout(limits.timeout)
             .redirect(reqwest::redirect::Policy::none())
             .resolve(&host, SocketAddr::new(connect_addr, port))

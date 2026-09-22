@@ -17,6 +17,7 @@
 //! - [`time`]: RFC 3339 timestamp formatting at millisecond precision.
 
 pub mod body;
+pub mod client;
 pub mod cors;
 pub mod error;
 pub mod fallback;

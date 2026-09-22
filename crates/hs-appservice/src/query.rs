@@ -59,7 +59,7 @@ impl HttpQueryTransport {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::builder()
+            client: hs_http::client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_default(),

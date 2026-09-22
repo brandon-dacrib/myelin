@@ -24,6 +24,8 @@ tracing = { workspace = true }
 time = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
+rustls-native-certs = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
 tokio-rustls = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
