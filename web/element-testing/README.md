@@ -65,19 +65,19 @@ The 2026-09-21 session found four bugs that Complement, the `matrix-rust-sdk` sc
 every test in the repository had passed over. They are fixed and tested now; this is the list
 that found them, and it takes ten minutes.
 
-1. Alice creates a room from Element's own **New room** dialog, encryption left on. *The room
+1. Alice creates a room from Element's own **New room** dialog, encryption left on. _The room
    opens; "Encryption enabled" and "You created this room" are in the timeline; the creator is
-   shown by display name, not by user ID.*
-2. Alice sends a message. *No red shield on it. A red shield on your own message, reading
+   shown by display name, not by user ID._
+2. Alice sends a message. _No red shield on it. A red shield on your own message, reading
    "Encrypted by a device not verified by its owner", means the client never heard that its own
    device was signed: `device_lists.changed` must name the user themself after
-   `/keys/signatures/upload`.* A new account should also be offered **Back up your chats**.
+   `/keys/signatures/upload`._ A new account should also be offered **Back up your chats**.
 3. Alice invites Bob by full user ID (searching "bob" finds nobody, by design: they share no
-   room yet). *Bob's tab title gains a "[1]" without a reload.*
-4. Bob accepts. *His composer reads "Send a message…", not "Send an unencrypted message…", and
+   room yet). _Bob's tab title gains a "[1]" without a reload._
+4. Bob accepts. _His composer reads "Send a message…", not "Send an unencrypted message…", and
    the timeline shows "Encryption enabled". The second means his join arrived without the room's
-   state.*
-5. Bob replies. *Alice reads it, decrypted, without a reload.*
+   state._
+5. Bob replies. _Alice reads it, decrypted, without a reload._
 
 ### One-time setup
 
