@@ -240,6 +240,9 @@ const REAL_HANDLERS: &[&str] = &[
     "appservices.ping",
     "appservices.rotate_tokens",
     "appservices.replay",
+    "bridge_types.list",
+    "bridge_types.get",
+    "bridge_types.render",
     "config.list",
     "config.schema",
     "config.get",
@@ -1936,6 +1939,106 @@ async fn users_reset_password(
                 return resp;
             }
             axum::Json(json!({})).into_response()
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// bridge types: the catalogue the "Add bridge" wizard offers, and what it renders a choice into.
+// Read-only and server-side pure (`crate::bridge_types`); a render creates nothing.
+// -------------------------------------------------------------------------------------------
+
+/// `GET /api/v1/bridge-types`.
+async fn bridge_types_list(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Query(query): Query<BacklogQuery>,
+) -> Response {
+    let instance = "/api/v1/bridge-types";
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => axum::Json(Page::paginate(
+            crate::bridge_types::list(&state.server_info.name),
+            query.cursor.as_deref(),
+            query.limit,
+            query.include_total.unwrap_or(false),
+        ))
+        .into_response(),
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `GET /api/v1/bridge-types/{type}`.
+async fn bridge_types_get(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(type_id): Path<String>,
+) -> Response {
+    let instance = format!("/api/v1/bridge-types/{type_id}");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            match crate::bridge_types::get(&type_id, &state.server_info.name) {
+                Some(bridge_type) => axum::Json(bridge_type).into_response(),
+                None => Problem::not_found()
+                    .with_detail(format!("no such bridge type: {type_id}"))
+                    .with_instance(instance)
+                    .into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `POST /api/v1/bridge-types/{type}/render` (`admin:write`, since it mints tokens): the
+/// wizard's choices, as a registration and the files to run the bridge with.
+async fn bridge_types_render(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(type_id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let instance = format!("/api/v1/bridge-types/{type_id}/render");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminWrite),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let values: serde_json::Value = match parse_optional_json(&body) {
+                Ok(serde_json::Value::Null) => json!({}),
+                Ok(v) => v,
+                Err(p) => return p.with_instance(instance).into_response(),
+            };
+            if !values.is_object() {
+                return Problem::validation_failed()
+                    .with_detail("the body must be a JSON object of the wizard's choices")
+                    .with_instance(instance)
+                    .into_response();
+            }
+            match crate::bridge_types::render(&type_id, &state.server_info.name, &values) {
+                Some(result) => axum::Json(result).into_response(),
+                None => Problem::not_found()
+                    .with_detail(format!("no such bridge type: {type_id}"))
+                    .with_instance(instance)
+                    .into_response(),
+            }
         }
         ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
         ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
@@ -3657,6 +3760,9 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
             builder.add(method, &full_path, appservices_rotate_tokens, meta)
         }
         "appservices.replay" => builder.add(method, &full_path, appservices_replay, meta),
+        "bridge_types.list" => builder.add(method, &full_path, bridge_types_list, meta),
+        "bridge_types.get" => builder.add(method, &full_path, bridge_types_get, meta),
+        "bridge_types.render" => builder.add(method, &full_path, bridge_types_render, meta),
         "config.list" => builder.add(method, &full_path, config_list, meta),
         "config.schema" => builder.add(method, &full_path, config_schema, meta),
         "config.get" => builder.add(method, &full_path, config_get, meta),
@@ -3776,13 +3882,12 @@ mod tests {
 
     #[tokio::test]
     async fn authorized_request_to_undeclared_handler_is_501() {
-        // Users, rooms and appservices are all in REAL_HANDLERS now; the bridge-type catalogue
-        // is not, and exercises the generic seam.
+        // Registration tokens are not in REAL_HANDLERS, and exercise the generic seam.
         let (router, _manifest) = build_router(test_state());
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/bridge-types")
+                    .uri("/api/v1/registration-tokens")
                     .header("authorization", "Bearer admin-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -6808,5 +6913,100 @@ mod tests {
         assert!(!log.contains("correct horse"), "{log}");
         assert!(!log.contains("another fine"), "{log}");
         assert_eq!(entries[0].changes[0].pointer, "/password");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // bridge types
+    // ---------------------------------------------------------------------------------------
+
+    /// The whole "Add bridge" flow against the real operations: list the catalogue, render a
+    /// choice, and hand the rendered registration straight to `appservices.create`.
+    #[tokio::test]
+    async fn a_rendered_bridge_type_is_a_registration_the_server_accepts() {
+        let state = test_state()
+            .with_appservices(Arc::new(crate::sources::InMemoryAppserviceDirectory::new()));
+        let (router, _manifest) = build_router(state);
+
+        let (status, body, _) =
+            call(&router, "GET", "/api/v1/bridge-types?limit=50", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<&str> = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&"mautrix-whatsapp") && ids.contains(&"heisenbridge"),
+            "{ids:?}"
+        );
+
+        let (status, body, _) = call(
+            &router,
+            "GET",
+            "/api/v1/bridge-types/heisenbridge",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let heisenbridge: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Written for this server (the test state's is named `hs`), whatever the interface's
+        // placeholder says.
+        assert_eq!(
+            heisenbridge["default_namespaces"]["users"][0]["regex"], "@irc_.*:hs",
+            "{heisenbridge}"
+        );
+        let (status, _, _) = call(
+            &router,
+            "GET",
+            "/api/v1/bridge-types/mautrix-fax",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, body, _) = call(
+            &router,
+            "POST",
+            "/api/v1/bridge-types/mautrix-whatsapp/render",
+            Some(json!({"id": "whatsapp", "senderLocalpart": "whatsappbot", "userNamespace": "@whatsapp_.*:example.org", "deployment": "self-managed"})),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let rendered: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            rendered["registration_yaml"]
+                .as_str()
+                .unwrap()
+                .contains("as_token:")
+        );
+        assert!(
+            rendered["compose_yaml"]
+                .as_str()
+                .unwrap()
+                .contains("services:")
+        );
+
+        let (status, body, _) = call(
+            &router,
+            "POST",
+            "/api/v1/appservices",
+            Some(json!({"registration": rendered["registration"]})),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(created["id"], "whatsapp");
+        assert_eq!(created["sender_localpart"], "whatsappbot");
     }
 }

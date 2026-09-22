@@ -1,12 +1,20 @@
 import type { BridgeType } from "@/api/bridges";
 
 function type(id: string, name: string, network: string, requiredKey: string): BridgeType {
+  const short = id.replace(/^mautrix-/, "").replace(/^matrix-/, "");
   return {
     id,
     name,
     upstream_project: `mautrix-${id.replace(/^mautrix-/, "")}`,
     image: `dock.mau.dev/mautrix/${id.replace(/^mautrix-/, "")}:latest`,
-    default_namespaces: {},
+    // Written for the mock server's own name, as the real catalogue writes them for its.
+    // `default_namespaces` is an untyped OpenAPI object (`Record<string, never>` once
+    // generated); this is the one sanctioned cast for it, as the wizard's is for a render.
+    default_namespaces: {
+      users: [{ regex: `@${short}_.*:example\\.org`, exclusive: true }],
+      aliases: [{ regex: `#${short}_.*:example\\.org`, exclusive: true }],
+      rooms: [],
+    } as unknown as Record<string, never>,
     config_keys: [{ key: requiredKey, description: `${network} ${requiredKey}`, required: true }],
     supports_double_puppeting: true,
     required_features: ["de.sorunome.msc2409.push_ephemeral", "org.matrix.msc3202"],

@@ -26,6 +26,7 @@
 pub mod assets;
 pub mod audit;
 pub mod auth;
+pub mod bridge_types;
 pub mod config_schema;
 pub mod events;
 pub mod idempotency;

@@ -105,6 +105,12 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
   closed (the default) a bridge could not create its own bot. It has one now, authenticated by
   the `as_token`, with no user-interactive auth, refusing a username outside the appservice's
   namespace with `M_EXCLUSIVE`. Reproduction in `docs/bridges/heisenbridge.md`.
+- **"Add bridge" renders a real registration.** The wizard's catalogue is fourteen bridges
+  people run, with their images, ports and needs; choosing one and reviewing produces a
+  registration this server accepts as it is, with freshly minted tokens shown once, plus the
+  registration file, a Compose service and a `Bridge` resource. Namespaces are written for the
+  server's own name. Watched end to end in a browser: the bridge created from the wizard
+  authenticated as its bot a moment later.
 - **The Bridges section of the interface is real.** All thirteen appservice operations the
   interface calls are served from the bridge registry: the list and each bridge's health,
   backlog and registration; registering one from a registration file in either notation;

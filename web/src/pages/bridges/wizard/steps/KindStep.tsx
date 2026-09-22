@@ -1,4 +1,4 @@
-import { useBridgeTypes } from "@/api/bridges";
+import { useBridgeTypes, type BridgeType } from "@/api/bridges";
 import { SkeletonText } from "@/components/ui/skeleton/Skeleton";
 import { ErrorState } from "@/components/ui/error-state/ErrorState";
 import { cn } from "@/lib/cn";
@@ -8,7 +8,7 @@ export function KindStep({
   onSelect,
 }: {
   selected: string;
-  onSelect: (kindId: string) => void;
+  onSelect: (kindId: string, kind: BridgeType) => void;
 }) {
   const { data: kinds, isLoading, isError, refetch } = useBridgeTypes();
 
@@ -32,7 +32,7 @@ export function KindStep({
             type="button"
             role="radio"
             aria-checked={selected === kind.id}
-            onClick={() => onSelect(kind.id ?? "")}
+            onClick={() => onSelect(kind.id ?? "", kind)}
             className={cn(
               "flex flex-col items-start gap-1 rounded-md border p-4 text-left",
               selected === kind.id

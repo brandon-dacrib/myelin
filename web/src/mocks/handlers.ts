@@ -253,6 +253,8 @@ export const handlers = [
         ? `http://${id}.${namespace}.svc:29999`
         : "http://localhost:29999";
 
+    // The same shape the server renders: namespace *objects*, which `appservices.create`
+    // parses; a bare pattern string is not a registration.
     const registration = {
       id,
       url,
@@ -260,10 +262,17 @@ export const handlers = [
       hs_token: hsToken,
       sender_localpart: senderLocalpart,
       namespaces: {
-        users: values.userNamespace ? [String(values.userNamespace)] : [],
-        aliases: values.aliasNamespace ? [String(values.aliasNamespace)] : [],
+        users: values.userNamespace
+          ? [{ regex: String(values.userNamespace), exclusive: true }]
+          : [],
+        aliases: values.aliasNamespace
+          ? [{ regex: String(values.aliasNamespace), exclusive: true }]
+          : [],
+        rooms: [],
       },
       rate_limited: false,
+      "de.sorunome.msc2409.push_ephemeral": true,
+      ...(values.encryption ? { "org.matrix.msc3202": true, "io.element.msc4190": true } : {}),
     };
     const registration_yaml = [
       `id: ${id}`,
@@ -273,7 +282,7 @@ export const handlers = [
       `sender_localpart: ${senderLocalpart}`,
       "namespaces:",
       `  users:${values.userNamespace ? `\n    - exclusive: true\n      regex: '${values.userNamespace}'` : " []"}`,
-      `de.sorunome.msc2409.push_ephemeral: ${Boolean(values.encryption)}`,
+      "de.sorunome.msc2409.push_ephemeral: true",
       `org.matrix.msc3202: ${Boolean(values.encryption)}`,
     ].join("\n");
     const compose_yaml = [

@@ -159,7 +159,9 @@ export function AddBridgeWizardPage() {
           {step === "kind" && (
             <KindStep
               selected={state.kind}
-              onSelect={(kindId) => setState((s) => ({ ...s, ...defaultsForKind(kindId) }))}
+              onSelect={(kindId, kind) =>
+                setState((s) => ({ ...s, ...defaultsForKind(kindId, kind) }))
+              }
             />
           )}
           {step === "identity" && (

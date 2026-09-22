@@ -56,10 +56,19 @@ now". Watched in a real browser against the real binary with heisenbridge regist
 shows it healthy, the detail page reads its backlog, registration (tokens masked) and creation
 time; **Pause** from the page held the next transaction (queued, zero attempts, audited to
 `@ops`), and **Resume** delivered it at once and the bridge answered. Screenshots in
-`docs/design/screenshots/bridge*-real-heisenbridge.png`. What is left of the section: the three
-`bridge_types.*` operations (a catalogue of known bridges and their registration/compose
-templates, which the "Add bridge" flow renders through), and `links.login_url`, which nothing
-sets.
+`docs/design/screenshots/bridge*-real-heisenbridge.png`. **And the "Add bridge" wizard renders through the real catalogue** (`hs_admin::bridge_types`,
+2026-09-22): fourteen bridges people actually run -- eleven mautrix ones, heisenbridge,
+matrix-appservice-irc, hookshot -- each with the image its project publishes, the port its own
+config generator writes, its ghost prefix, what the operator has to have, and the appservice
+features it needs. A render mints two tokens and produces a registration the server accepts as
+it is (the mock's produced bare pattern strings, which it would not have), the same as YAML, a
+Compose service with the first-run notes, and a `Bridge` resource for the operator that is not
+written yet. Namespaces are written for the server's own name; the wizard takes its defaults
+from the catalogue rather than a placeholder domain. Watched in a browser against the real
+binary: Signal chosen, identity prefilled with `test\.local`, review showing the rendered
+file, create, and the bot's `as_token` answering `/whoami` a moment later
+(`docs/design/screenshots/bridge-created-real.png`). Bridges are 16 of 16. What is left:
+`links.login_url`, which nothing sets, and the operator the resource is for.
 
 **Configuration lives in the database** (RFC 0016). The file is a bootstrap and a seed; the database outranks it, `HS__` variables outrank the database, and the admin API refuses a write the environment would shadow rather than storing one that gets ignored. The web interface has a Configuration section that builds its forms from the server's own JSON Schema, and `hs config show|get|set|unset|import|export|history` is the same thing without a browser.
 
@@ -164,10 +173,10 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 | Client-server API | ~75% | 314/384 csapi assertions, 78/106 top-level (run 7); two real Element sessions sign in, create an encrypted room, invite, accept, and read each other's encrypted messages. The number understates the day: four of the fixes behind it were `/sync` silently losing events, which no percentage shows |
 | Storage, rooms, state resolution | ~85% | the engine underneath; 1600+ tests, two backends through one conformance suite, state bake-off done |
 | Configuration and first run | ~90% | database-backed, editable in the UI, one command from nothing to a working server |
-| Admin API | ~35% | 51 of 145 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Config 6/6, Server 5/5, AuditLog 3/3, Setup 2/2, Bridges 13/16, Users 14/41, Rooms 5/23, Statistics 1/4, Cluster 1/6, and Federation 0/7, Media 0/9, RegistrationTokens 0/5 |
+| Admin API | ~37% | 54 of 145 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Config 6/6, Server 5/5, AuditLog 3/3, Setup 2/2, Bridges 16/16, Users 14/41, Rooms 5/23, Statistics 1/4, Cluster 1/6, and Federation 0/7, Media 0/9, RegistrationTokens 0/5 |
 | Management web interface | ~65% | users, rooms, bridges and configuration are real against the real server; federation and media pages still read from operations that answer 501; arrays-of-objects are a JSON textarea |
 | **Federation** | **~15%** | 59/246 assertions, 6/88 top-level; a two-server join works one way only |
-| Bridges | ~60% | a real bridge (heisenbridge) works end to end against the real binary, both directions, `docs/bridges/heisenbridge.md`; 13 of the 16 bridge operations are real and the interface's Bridges section was watched pausing and resuming that bridge; the three `bridge_types.*` (catalogue and templates) are not |
+| Bridges | ~65% | a real bridge (heisenbridge) works end to end against the real binary, both directions, `docs/bridges/heisenbridge.md`; all 16 bridge operations are real, and the interface's Bridges section was watched adding a bridge through the wizard and pausing and resuming a live one; no mautrix-* bridge with an external service has been run |
 | Operations (HA, scale-out) | ~40% | it runs on Kubernetes with a chart and a tested image; the cluster path has never carried real traffic |
 
 Federation is the honest answer to "when could I use this". Everything else is far enough along

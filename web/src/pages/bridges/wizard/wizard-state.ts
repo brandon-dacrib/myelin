@@ -28,15 +28,34 @@ export interface WizardFormState {
   rateLimitExempt: boolean;
 }
 
-export function defaultsForKind(kindId: string): Partial<WizardFormState> {
+/** What the catalogue says about a kind, as far as the defaults use it. */
+export interface KindDefaults {
+  name?: string;
+  /** `users`/`aliases`, each a list of `{regex, exclusive}`, already written for this server. */
+  default_namespaces?: Record<string, unknown>;
+}
+
+function firstPattern(namespaces: Record<string, unknown> | undefined, key: string): string | null {
+  const list = namespaces?.[key];
+  if (!Array.isArray(list) || list.length === 0) return null;
+  const first = list[0] as { regex?: unknown };
+  return typeof first?.regex === "string" ? first.regex : null;
+}
+
+/**
+ * The wizard's starting values for a kind. The namespaces come from the catalogue entry, which
+ * the server writes for its own name; the fallback pattern here (`example.org`) is only for a
+ * catalogue that said nothing, and the server replaces it with its name when rendering.
+ */
+export function defaultsForKind(kindId: string, kind?: KindDefaults): Partial<WizardFormState> {
   const short = kindId.replace(/^mautrix-/, "").replace(/^matrix-/, "");
   return {
     kind: kindId,
-    name: short.charAt(0).toUpperCase() + short.slice(1),
+    name: kind?.name ?? short.charAt(0).toUpperCase() + short.slice(1),
     id: short,
     senderLocalpart: `${short}bot`,
-    userNamespace: `@${short}_.*:example.org`,
-    aliasNamespace: `#${short}_.*:example.org`,
+    userNamespace: firstPattern(kind?.default_namespaces, "users") ?? `@${short}_.*:example.org`,
+    aliasNamespace: firstPattern(kind?.default_namespaces, "aliases") ?? `#${short}_.*:example.org`,
     roomNamespace: "",
     imageTag: "latest",
   };

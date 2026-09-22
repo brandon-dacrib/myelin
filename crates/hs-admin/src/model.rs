@@ -385,6 +385,45 @@ impl std::fmt::Debug for AdminPasswordReset {
     }
 }
 
+/// The OpenAPI `BridgeType` schema: one entry of the catalogue `GET /bridge-types` offers
+/// (`crate::bridge_types`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BridgeType {
+    pub id: String,
+    pub name: String,
+    pub upstream_project: String,
+    pub image: String,
+    /// `users`/`aliases`/`rooms`, each a list of `{regex, exclusive}`, written for this server.
+    pub default_namespaces: serde_json::Value,
+    pub config_keys: Vec<BridgeTypeConfigKey>,
+    pub supports_double_puppeting: bool,
+    pub required_features: Vec<String>,
+}
+
+/// One of a [`BridgeType`]'s `config_keys`: something the operator has to have.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BridgeTypeConfigKey {
+    pub key: String,
+    pub description: String,
+    pub required: bool,
+}
+
+/// The OpenAPI `BridgeTypeRenderResult` schema: what `POST /bridge-types/{type}/render` hands
+/// back. `registration` carries freshly minted tokens; Debug shows none of it.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BridgeTypeRenderResult {
+    pub registration: serde_json::Value,
+    pub registration_yaml: String,
+    pub compose_yaml: String,
+    pub bridge_resource_yaml: String,
+}
+
+impl std::fmt::Debug for BridgeTypeRenderResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BridgeTypeRenderResult(<redacted>)")
+    }
+}
+
 /// The OpenAPI `AppService` schema: one row of `GET /appservices` and the body of every
 /// per-appservice operation that answers with the appservice. Served by whatever implements
 /// [`crate::sources::AppserviceDirectory`] (`hs-appservice`'s real one over its registry, or
