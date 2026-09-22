@@ -71,6 +71,13 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
   room with and members of public rooms, as the specification requires; finding everybody is an
   explicit setting (`auth.user_directory_search_all_users`), off by default because bridged
   contacts are local accounts too.
+- **A lost phone and a forgotten password are an administrator's to fix.** A user's page lists
+  their devices (it used to show an error there, against a real server), signs one out or all
+  of them, and resets their password: the server's own password policy applies, everything is
+  signed out unless asked otherwise, and the password reaches neither the audit log nor the
+  event stream. Verified against the real binary: the signed-out phone's token stops working,
+  the laptop's keeps working until the reset, the old password is refused and the new one
+  signs in.
 - **The Overview page has numbers on it.** Users, rooms, daily and monthly active users, and
   whether this is one server or a cluster, counted from the real stores. A number nothing can
   count yet is left out of the response and shown as a dash, never as zero, and the page's

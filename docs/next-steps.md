@@ -151,7 +151,7 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 | Client-server API | ~75% | 314/384 csapi assertions, 78/106 top-level (run 7); two real Element sessions sign in, create an encrypted room, invite, accept, and read each other's encrypted messages. The number understates the day: four of the fixes behind it were `/sync` silently losing events, which no percentage shows |
 | Storage, rooms, state resolution | ~85% | the engine underneath; 1600+ tests, two backends through one conformance suite, state bake-off done |
 | Configuration and first run | ~90% | database-backed, editable in the UI, one command from nothing to a working server |
-| Admin API | ~32% | 47 of 145 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Config 6/6, Server 5/5, AuditLog 3/3, Setup 2/2, Bridges 13/16, Users 10/41, Rooms 5/23, Statistics 1/4, Cluster 1/6, and Federation 0/7, Media 0/9, RegistrationTokens 0/5 |
+| Admin API | ~35% | 51 of 145 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Config 6/6, Server 5/5, AuditLog 3/3, Setup 2/2, Bridges 13/16, Users 14/41, Rooms 5/23, Statistics 1/4, Cluster 1/6, and Federation 0/7, Media 0/9, RegistrationTokens 0/5 |
 | Management web interface | ~65% | users, rooms, bridges and configuration are real against the real server; federation and media pages still read from operations that answer 501; arrays-of-objects are a JSON textarea |
 | **Federation** | **~15%** | 59/246 assertions, 6/88 top-level; a two-server join works one way only |
 | Bridges | ~60% | a real bridge (heisenbridge) works end to end against the real binary, both directions, `docs/bridges/heisenbridge.md`; 13 of the 16 bridge operations are real and the interface's Bridges section was watched pausing and resuming that bridge; the three `bridge_types.*` (catalogue and templates) are not |
@@ -272,10 +272,14 @@ cannot do, in rough order of how often an operator will hit it:
   `federation.destinations.list`.
 - ~~Add a user from the interface.~~ **Done 2026-09-21.** `AuthStoreUserDirectory::create_user`
   is real (it inherited a default that answered 503), and the Users page has an "Add user"
-  dialog. What it does not do yet: set an email or an external ID at creation (refused with a
-  pointer rather than silently dropped), reset an existing user's password, or invite somebody
-  by link so that the administrator never sees the password at all — that last one is the
-  better design for anything but a household, and wants registration tokens, which are 501.
+  dialog. **Since 2026-09-22** the user page's devices list, "Sign out everywhere", signing out
+  one device and resetting a password are real too (`users.devices.list/delete`,
+  `users.logout`, `users.reset_password`; the reset applies the server's password policy, signs
+  the user out by default, and the password reaches neither the audit log nor the event).
+  What it does not do yet: set an email or an external ID at creation (refused with a pointer
+  rather than silently dropped), rename a device, or invite somebody by link so that the
+  administrator never sees the password at all — that last one is the better design for
+  anything but a household, and wants registration tokens, which are 501.
 - **Edit an array of objects as a form.** `listeners.listeners`, `media.thumbnail_sizes` and
   `auth.oidc_providers` fall back to a JSON textarea with live parse errors. Reachable, not
   pleasant; the generic renderer is built to sit underneath hand-tuned editors for exactly these.

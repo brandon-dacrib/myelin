@@ -20,9 +20,10 @@ use serde_json::{Map, Value, json};
 
 use crate::model::{
     AdminAppservice, AdminAppserviceBacklogEntry, AdminAppserviceCreate, AdminAppserviceHealth,
-    AdminAppserviceLinks, AdminAppserviceReplay, AdminAppserviceTokens, AdminRoom, AdminUser,
-    ClusterStatus, ConfigChange, ConfigReloadReport, ConfigSection, ConfigValidateReport,
-    ExternalId, SetupRequest, SetupSession, StatisticsOverview, ThreePid,
+    AdminAppserviceLinks, AdminAppserviceReplay, AdminAppserviceTokens, AdminDevice,
+    AdminPasswordReset, AdminRoom, AdminUser, ClusterStatus, ConfigChange, ConfigReloadReport,
+    ConfigSection, ConfigValidateReport, ExternalId, SetupRequest, SetupSession,
+    StatisticsOverview, ThreePid,
 };
 
 /// Why a data-source call failed. Mirrors [`crate::auth::AuthError`]'s "only unavailable escapes
@@ -194,6 +195,47 @@ pub trait UserDirectory: Send + Sync + 'static {
             "this user directory does not support availability checks yet".to_string(),
         ))
     }
+
+    /// The user's devices (`users.devices.list`). `SourceError::NotFound` if there is no such
+    /// user; an empty list for a user with none.
+    async fn list_devices(&self, user_id: &str) -> Result<Vec<AdminDevice>, SourceError> {
+        let _ = user_id;
+        Err(SourceError::Unavailable(
+            "this user directory does not know about devices yet".to_string(),
+        ))
+    }
+
+    /// Signs one device out (`users.devices.delete`): its sessions stop working at once and the
+    /// device is gone from the list. `SourceError::NotFound` for a user or device that is not
+    /// there.
+    async fn delete_device(&self, user_id: &str, device_id: &str) -> Result<(), SourceError> {
+        let _ = (user_id, device_id);
+        Err(SourceError::Unavailable(
+            "this user directory does not know about devices yet".to_string(),
+        ))
+    }
+
+    /// Signs the user out everywhere (`users.logout`): every session and every device.
+    async fn logout_everywhere(&self, user_id: &str) -> Result<(), SourceError> {
+        let _ = user_id;
+        Err(SourceError::Unavailable(
+            "this user directory cannot sign users out yet".to_string(),
+        ))
+    }
+
+    /// Sets a new password (`users.reset_password`), signing the user out everywhere first if
+    /// `logout_devices`. `SourceError::InvalidField` at `/password` for one the server's policy
+    /// refuses.
+    async fn reset_password(
+        &self,
+        user_id: &str,
+        request: AdminPasswordReset,
+    ) -> Result<(), SourceError> {
+        let _ = (user_id, request);
+        Err(SourceError::Unavailable(
+            "this user directory cannot reset passwords yet".to_string(),
+        ))
+    }
 }
 
 /// An in-memory [`UserDirectory`] for this crate's own handler tests. Not a production
@@ -203,6 +245,10 @@ pub trait UserDirectory: Send + Sync + 'static {
 #[derive(Debug, Default)]
 pub struct InMemoryUserDirectory {
     users: RwLock<HashMap<String, AdminUser>>,
+    /// Devices by user id. A user with none has no entry.
+    devices: RwLock<HashMap<String, Vec<AdminDevice>>>,
+    /// Passwords by user id, as set by `reset_password` -- kept only so a test can see one land.
+    passwords: RwLock<HashMap<String, String>>,
 }
 
 impl InMemoryUserDirectory {
@@ -219,6 +265,27 @@ impl InMemoryUserDirectory {
             .expect("InMemoryUserDirectory lock poisoned")
             .insert(user.user_id.clone(), user);
         self
+    }
+
+    /// Gives `user_id` a device.
+    pub fn with_device(self, user_id: &str, device: AdminDevice) -> Self {
+        self.devices
+            .write()
+            .expect("InMemoryUserDirectory lock poisoned")
+            .entry(user_id.to_owned())
+            .or_default()
+            .push(device);
+        self
+    }
+
+    /// The password `reset_password` last set for `user_id`, if any.
+    #[must_use]
+    pub fn password_of(&self, user_id: &str) -> Option<String> {
+        self.passwords
+            .read()
+            .expect("InMemoryUserDirectory lock poisoned")
+            .get(user_id)
+            .cloned()
     }
 }
 
@@ -317,6 +384,83 @@ impl UserDirectory for InMemoryUserDirectory {
             .expect("InMemoryUserDirectory lock poisoned");
         let user = users.get_mut(user_id).ok_or(SourceError::NotFound)?;
         user.deactivated = deactivated;
+        Ok(())
+    }
+
+    async fn list_devices(&self, user_id: &str) -> Result<Vec<AdminDevice>, SourceError> {
+        if !self
+            .users
+            .read()
+            .expect("InMemoryUserDirectory lock poisoned")
+            .contains_key(user_id)
+        {
+            return Err(SourceError::NotFound);
+        }
+        Ok(self
+            .devices
+            .read()
+            .expect("InMemoryUserDirectory lock poisoned")
+            .get(user_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn delete_device(&self, user_id: &str, device_id: &str) -> Result<(), SourceError> {
+        let mut devices = self
+            .devices
+            .write()
+            .expect("InMemoryUserDirectory lock poisoned");
+        let list = devices.get_mut(user_id).ok_or(SourceError::NotFound)?;
+        let before = list.len();
+        list.retain(|d| d.device_id != device_id);
+        if list.len() == before {
+            return Err(SourceError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn logout_everywhere(&self, user_id: &str) -> Result<(), SourceError> {
+        if !self
+            .users
+            .read()
+            .expect("InMemoryUserDirectory lock poisoned")
+            .contains_key(user_id)
+        {
+            return Err(SourceError::NotFound);
+        }
+        self.devices
+            .write()
+            .expect("InMemoryUserDirectory lock poisoned")
+            .remove(user_id);
+        Ok(())
+    }
+
+    async fn reset_password(
+        &self,
+        user_id: &str,
+        request: AdminPasswordReset,
+    ) -> Result<(), SourceError> {
+        if !self
+            .users
+            .read()
+            .expect("InMemoryUserDirectory lock poisoned")
+            .contains_key(user_id)
+        {
+            return Err(SourceError::NotFound);
+        }
+        if request.password.len() < 8 {
+            return Err(SourceError::InvalidField {
+                pointer: "/password",
+                detail: "the password must be at least 8 characters".to_owned(),
+            });
+        }
+        if request.logout_devices {
+            self.logout_everywhere(user_id).await?;
+        }
+        self.passwords
+            .write()
+            .expect("InMemoryUserDirectory lock poisoned")
+            .insert(user_id.to_owned(), request.password);
         Ok(())
     }
 }

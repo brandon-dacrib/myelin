@@ -2281,6 +2281,169 @@ async fn after_a_restart_a_message_in_an_old_room_still_reaches_the_other_person
     server.stop();
 }
 
+/// Somebody has lost their phone, and then their password. The administrator signs the phone
+/// out from the Users page -- that one session dies and the laptop's lives -- and then resets
+/// the password, which refuses the old one, accepts the new one, and signs everything out.
+#[tokio::test]
+async fn an_administrator_can_sign_out_a_lost_phone_and_reset_a_forgotten_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = hs_cli::serve::spawn_serve(
+        test_config(reserve_ephemeral_port(), dir.path()),
+        hs_cli::serve::ServeOptions::default(),
+    )
+    .await
+    .expect("server should boot");
+    let base = handle.base_url();
+    let client = reqwest::Client::new();
+
+    let token = setup_token_of(handle.setup_link.as_deref().unwrap()).to_owned();
+    let admin: serde_json::Value = client
+        .post(format!("{base}/api/v1/setup"))
+        .json(&json!({"setup_token": token, "username": "ops", "password": "hunter2-first-admin"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let admin = admin["access_token"].as_str().unwrap().to_owned();
+
+    // Alice, signed in on two devices.
+    client
+        .post(format!("{base}/_matrix/client/v3/register"))
+        .json(&json!({"username": "alice", "password": "hunter2-alice", "auth": {"type": "m.login.dummy"}, "device_id": "LAPTOP", "initial_device_display_name": "Laptop"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let login = |password: &'static str, device: &'static str| {
+        let (client, base) = (client.clone(), base.clone());
+        async move {
+            let response = client
+                .post(format!("{base}/_matrix/client/v3/login"))
+                .json(&json!({
+                    "type": "m.login.password",
+                    "identifier": {"type": "m.id.user", "user": "alice"},
+                    "password": password,
+                    "device_id": device,
+                    "initial_device_display_name": device,
+                }))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap();
+            (status, body["access_token"].as_str().map(str::to_owned))
+        }
+    };
+    let (status, laptop) = login("hunter2-alice", "LAPTOP").await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let (status, phone) = login("hunter2-alice", "PHONE").await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let (laptop, phone) = (laptop.unwrap(), phone.unwrap());
+    let whoami = |token: String| {
+        let (client, base) = (client.clone(), base.clone());
+        async move {
+            client
+                .get(format!("{base}/_matrix/client/v3/account/whoami"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    assert_eq!(whoami(phone.clone()).await, reqwest::StatusCode::OK);
+
+    let devices: serde_json::Value = client
+        .get(format!("{base}/api/v1/users/@alice:example.org/devices"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = devices["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["device_id"].as_str())
+        .collect();
+    assert!(
+        ids.contains(&"PHONE") && ids.contains(&"LAPTOP"),
+        "{devices}"
+    );
+
+    // The phone is signed out. Its token is dead; the laptop's is not.
+    let response = client
+        .delete(format!(
+            "{base}/api/v1/users/@alice:example.org/devices/PHONE"
+        ))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        whoami(phone.clone()).await,
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(whoami(laptop.clone()).await, reqwest::StatusCode::OK);
+
+    // The password is reset: too weak is refused beside the field; a good one takes, signs the
+    // laptop out too, and is what signs in from now on.
+    let reset = |body: serde_json::Value| {
+        let (client, base, admin) = (client.clone(), base.clone(), admin.clone());
+        async move {
+            let response = client
+                .post(format!(
+                    "{base}/api/v1/users/@alice:example.org/reset-password"
+                ))
+                .bearer_auth(admin)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            (status, response.json::<serde_json::Value>().await.unwrap())
+        }
+    };
+    let (status, problem) = reset(json!({"password": "short"})).await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{problem}");
+    assert_eq!(problem["errors"][0]["pointer"], "/password", "{problem}");
+    let (status, body) = reset(json!({"password": "a new and better password"})).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    assert_eq!(whoami(laptop).await, reqwest::StatusCode::UNAUTHORIZED);
+    let (status, _) = login("hunter2-alice", "LAPTOP").await;
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN, "the old password");
+    let (status, _) = login("a new and better password", "LAPTOP").await;
+    assert_eq!(status, reqwest::StatusCode::OK, "the new one");
+
+    // Everything the administrator did is in the audit log, and the password is not.
+    let audit: serde_json::Value = client
+        .get(format!("{base}/api/v1/audit-log?limit=50"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let actions: Vec<&str> = audit["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["action"].as_str())
+        .collect();
+    assert!(actions.contains(&"users.devices.delete"), "{actions:?}");
+    assert!(actions.contains(&"users.reset_password"), "{actions:?}");
+    assert!(!audit.to_string().contains("a new and better password"));
+
+    handle.shutdown().await;
+}
+
 /// What opening Element on this server found, the day `/sync` stopped resending every room's
 /// whole state with every message. Two people, a direct and encrypted chat, an invitation
 /// accepted: the most ordinary thing the server will ever be asked to do, and it went wrong four

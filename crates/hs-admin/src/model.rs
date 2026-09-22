@@ -351,6 +351,40 @@ pub struct AdminUser {
     pub media_count: u64,
 }
 
+/// The OpenAPI `Device` schema: one of a user's devices, as `GET /users/{user_id}/devices`
+/// lists them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminDevice {
+    pub device_id: String,
+    pub display_name: Option<String>,
+    pub last_seen_ip: Option<String>,
+    /// RFC 3339 millisecond-precision UTC.
+    pub last_seen_at: Option<String>,
+}
+
+/// The body of `POST /users/{user_id}/reset-password`. Debug never shows the password.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminPasswordReset {
+    pub password: String,
+    /// Whether every one of the user's sessions is signed out too. The contract's default, and
+    /// the right one: a password is reset because the old one is not trusted any more.
+    #[serde(default = "default_true")]
+    pub logout_devices: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl std::fmt::Debug for AdminPasswordReset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminPasswordReset")
+            .field("password", &"<redacted>")
+            .field("logout_devices", &self.logout_devices)
+            .finish()
+    }
+}
+
 /// The OpenAPI `AppService` schema: one row of `GET /appservices` and the body of every
 /// per-appservice operation that answers with the appservice. Served by whatever implements
 /// [`crate::sources::AppserviceDirectory`] (`hs-appservice`'s real one over its registry, or

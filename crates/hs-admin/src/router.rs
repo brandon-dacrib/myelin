@@ -218,6 +218,10 @@ const REAL_HANDLERS: &[&str] = &[
     "users.create",
     "users.lookup",
     "users.availability",
+    "users.devices.list",
+    "users.devices.delete",
+    "users.logout",
+    "users.reset_password",
     "rooms.list",
     "rooms.get",
     "rooms.block",
@@ -1680,6 +1684,262 @@ fn redacted_section(mut section: ConfigSection) -> ConfigSection {
         secrets.redact(&mut change.patch, &format!("/{}", change.section));
     }
     section
+}
+
+// -------------------------------------------------------------------------------------------
+// users: devices, sessions and passwords. What an administrator reaches for when somebody has
+// lost a phone or a password: see their devices, sign one or all of them out, set a new
+// password. Each mutation is audited and published like every other.
+// -------------------------------------------------------------------------------------------
+
+/// `GET /api/v1/users/{user_id}/devices`.
+async fn users_devices_list(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    Query(query): Query<BacklogQuery>,
+) -> Response {
+    let instance = format!("/api/v1/users/{user_id}/devices");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let Some(users) = &state.users else {
+                return source_unavailable("user directory", &instance);
+            };
+            match users.list_devices(&user_id).await {
+                Ok(items) => axum::Json(Page::paginate(
+                    items,
+                    query.cursor.as_deref(),
+                    query.limit,
+                    query.include_total.unwrap_or(false),
+                ))
+                .into_response(),
+                Err(SourceError::NotFound) => Problem::not_found()
+                    .with_detail(format!("no such user: {user_id}"))
+                    .with_instance(instance)
+                    .into_response(),
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `DELETE /api/v1/users/{user_id}/devices/{device_id}` (`admin:write`): signs that device
+/// out. `204`.
+async fn users_devices_delete(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path((user_id, device_id)): Path<(String, String)>,
+) -> Response {
+    let instance = format!("/api/v1/users/{user_id}/devices/{device_id}");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminWrite),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(principal) => {
+            let Some(users) = &state.users else {
+                return source_unavailable("user directory", &instance);
+            };
+            match users.delete_device(&user_id, &device_id).await {
+                Ok(()) => {}
+                Err(SourceError::NotFound) => {
+                    return Problem::not_found()
+                        .with_detail(format!("no such device: {device_id} of {user_id}"))
+                        .with_instance(instance)
+                        .into_response();
+                }
+                Err(e) => return e.to_problem().with_instance(instance).into_response(),
+            }
+            if let Err(resp) = record_mutation(
+                &state,
+                &principal,
+                "users.devices.delete",
+                "user.device_deleted",
+                ResourceRef::new("user", user_id.clone()),
+                Vec::new(),
+                json!({ "device_id": device_id }),
+            )
+            .await
+            {
+                return resp;
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `POST /api/v1/users/{user_id}/logout` (`admin:write`): signs the user out everywhere.
+/// Answers with the user, as the contract says, so the page can redraw from it.
+async fn users_logout(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let instance = format!("/api/v1/users/{user_id}/logout");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminWrite),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(principal) => {
+            let Some(users) = &state.users else {
+                return source_unavailable("user directory", &instance);
+            };
+            if let Some(key) = idempotency_key(&headers) {
+                match state.idempotency.check("users.logout", key, &body) {
+                    Replay::Same(stored) => return replay_response(stored),
+                    Replay::Mismatch => {
+                        return Problem::idempotency_key_payload_mismatch()
+                            .with_instance(instance)
+                            .into_response();
+                    }
+                    Replay::Fresh => {}
+                }
+            }
+            let reason: ReasonRequest = match parse_optional_json(&body) {
+                Ok(v) => v,
+                Err(p) => return p.with_instance(instance).into_response(),
+            };
+            match users.logout_everywhere(&user_id).await {
+                Ok(()) => {}
+                Err(SourceError::NotFound) => {
+                    return Problem::not_found()
+                        .with_detail(format!("no such user: {user_id}"))
+                        .with_instance(instance)
+                        .into_response();
+                }
+                Err(e) => return e.to_problem().with_instance(instance).into_response(),
+            }
+            let user = match users.get_user(&user_id).await {
+                Ok(Some(u)) => u,
+                Ok(None) => {
+                    return Problem::not_found()
+                        .with_detail(format!("no such user: {user_id}"))
+                        .with_instance(instance)
+                        .into_response();
+                }
+                Err(e) => return e.to_problem().with_instance(instance).into_response(),
+            };
+            if let Err(resp) = record_mutation(
+                &state,
+                &principal,
+                "users.logout",
+                "user.logged_out",
+                ResourceRef::new("user", user_id.clone()),
+                Vec::new(),
+                match &reason.reason {
+                    Some(r) => json!({ "reason": r }),
+                    None => json!({}),
+                },
+            )
+            .await
+            {
+                return resp;
+            }
+            let response_body = serde_json::to_vec(&user).unwrap_or_default();
+            if let Some(key) = idempotency_key(&headers) {
+                state.idempotency.record(
+                    "users.logout",
+                    key,
+                    &body,
+                    StoredResponse {
+                        status: 200,
+                        content_type: "application/json".to_string(),
+                        body: response_body.clone(),
+                    },
+                );
+            }
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                response_body,
+            )
+                .into_response()
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `POST /api/v1/users/{user_id}/reset-password` (`admin:write`). The password is in the
+/// request and nowhere else: not in the audit entry, not in the event, not in the response,
+/// which is `{}`. What is recorded is that it was reset and whether the user was signed out.
+async fn users_reset_password(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let instance = format!("/api/v1/users/{user_id}/reset-password");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminWrite),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(principal) => {
+            let Some(users) = &state.users else {
+                return source_unavailable("user directory", &instance);
+            };
+            let request: crate::model::AdminPasswordReset = match parse_optional_json(&body) {
+                Ok(v) => v,
+                Err(p) => return p.with_instance(instance).into_response(),
+            };
+            if request.password.is_empty() {
+                return Problem::validation_failed()
+                    .with_errors(vec![ValidationError::new("/password", "required")])
+                    .with_instance(instance)
+                    .into_response();
+            }
+            let logout_devices = request.logout_devices;
+            match users.reset_password(&user_id, request).await {
+                Ok(()) => {}
+                Err(SourceError::NotFound) => {
+                    return Problem::not_found()
+                        .with_detail(format!("no such user: {user_id}"))
+                        .with_instance(instance)
+                        .into_response();
+                }
+                Err(e) => return e.to_problem().with_instance(instance).into_response(),
+            }
+            if let Err(resp) = record_mutation(
+                &state,
+                &principal,
+                "users.reset_password",
+                "user.password_reset",
+                ResourceRef::new("user", user_id.clone()),
+                vec![AuditChange {
+                    pointer: "/password".to_owned(),
+                    from: None,
+                    to: Some(json!("<redacted>")),
+                }],
+                json!({ "logout_devices": logout_devices }),
+            )
+            .await
+            {
+                return resp;
+            }
+            axum::Json(json!({})).into_response()
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
 }
 
 // -------------------------------------------------------------------------------------------
@@ -3371,6 +3631,10 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         "users.create" => builder.add(method, &full_path, users_create, meta),
         "users.lookup" => builder.add(method, &full_path, users_lookup, meta),
         "users.availability" => builder.add(method, &full_path, users_availability, meta),
+        "users.devices.list" => builder.add(method, &full_path, users_devices_list, meta),
+        "users.devices.delete" => builder.add(method, &full_path, users_devices_delete, meta),
+        "users.logout" => builder.add(method, &full_path, users_logout, meta),
+        "users.reset_password" => builder.add(method, &full_path, users_reset_password, meta),
         "rooms.list" => builder.add(method, &full_path, rooms_list, meta),
         "rooms.get" => builder.add(method, &full_path, rooms_get, meta),
         "rooms.block" => builder.add(method, &full_path, rooms_block, meta),
@@ -6337,5 +6601,212 @@ mod tests {
             problem["errors"][0]["pointer"], "/registration",
             "{problem}"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // users: devices, sign-out, password reset
+    // ---------------------------------------------------------------------------------------
+
+    fn state_with_a_user_and_two_devices()
+    -> (AdminState, Arc<crate::sources::InMemoryUserDirectory>) {
+        use crate::model::{AdminDevice, AdminUser};
+        let directory = Arc::new(
+            crate::sources::InMemoryUserDirectory::new()
+                .with_user(AdminUser {
+                    user_id: "@alice:example.org".to_string(),
+                    ..Default::default()
+                })
+                .with_device(
+                    "@alice:example.org",
+                    AdminDevice {
+                        device_id: "PHONE".into(),
+                        display_name: Some("Alice's phone".into()),
+                        last_seen_ip: Some("203.0.113.9".into()),
+                        last_seen_at: Some("2026-09-22T01:00:00.000Z".into()),
+                    },
+                )
+                .with_device(
+                    "@alice:example.org",
+                    AdminDevice {
+                        device_id: "LAPTOP".into(),
+                        ..Default::default()
+                    },
+                ),
+        );
+        (test_state().with_users(directory.clone()), directory)
+    }
+
+    #[tokio::test]
+    async fn a_lost_phone_can_be_signed_out_on_its_own_or_with_everything_else() {
+        let (state, _) = state_with_a_user_and_two_devices();
+        let (router, _manifest) = build_router(state);
+
+        let (status, body, _) = call(
+            &router,
+            "GET",
+            "/api/v1/users/@alice:example.org/devices",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 2, "{page}");
+        assert_eq!(page["items"][0]["device_id"], "PHONE");
+        assert_eq!(page["items"][0]["last_seen_ip"], "203.0.113.9");
+
+        let (status, _, _) = call(
+            &router,
+            "DELETE",
+            "/api/v1/users/@alice:example.org/devices/PHONE",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _, _) = call(
+            &router,
+            "DELETE",
+            "/api/v1/users/@alice:example.org/devices/PHONE",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "already gone");
+        let (_, body, _) = call(
+            &router,
+            "GET",
+            "/api/v1/users/@alice:example.org/devices",
+            None,
+            None,
+        )
+        .await;
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page["items"][0]["device_id"], "LAPTOP", "{page}");
+
+        let (status, body, _) = call(
+            &router,
+            "POST",
+            "/api/v1/users/@alice:example.org/logout",
+            Some(json!({"reason": "lost everything"})),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let user: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(user["user_id"], "@alice:example.org");
+        let (_, body, _) = call(
+            &router,
+            "GET",
+            "/api/v1/users/@alice:example.org/devices",
+            None,
+            None,
+        )
+        .await;
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(page["items"].as_array().unwrap().is_empty(), "{page}");
+
+        let (status, _, _) = call(
+            &router,
+            "GET",
+            "/api/v1/users/@nobody:example.org/devices",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            audit_entries_for_action(&router, "users.devices.delete")
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(
+            audit_entries_for_action(&router, "users.logout")
+                .await
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_password_reset_signs_the_user_out_unless_told_not_to_and_never_records_the_password()
+    {
+        let (state, directory) = state_with_a_user_and_two_devices();
+        let (router, _manifest) = build_router(state);
+
+        let (status, body, _) = call(
+            &router,
+            "POST",
+            "/api/v1/users/@alice:example.org/reset-password",
+            Some(json!({"password": "short"})),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["errors"][0]["pointer"], "/password", "{problem}");
+
+        let (status, body, _) = call(
+            &router,
+            "POST",
+            "/api/v1/users/@alice:example.org/reset-password",
+            Some(json!({"password": "correct horse battery staple", "logout_devices": false})),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            directory.password_of("@alice:example.org").as_deref(),
+            Some("correct horse battery staple")
+        );
+        let (_, body, _) = call(
+            &router,
+            "GET",
+            "/api/v1/users/@alice:example.org/devices",
+            None,
+            None,
+        )
+        .await;
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            page["items"].as_array().unwrap().len(),
+            2,
+            "kept signed in: {page}"
+        );
+
+        // The default is to sign everything out.
+        let (status, _, _) = call(
+            &router,
+            "POST",
+            "/api/v1/users/@alice:example.org/reset-password",
+            Some(json!({"password": "another fine password"})),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, body, _) = call(
+            &router,
+            "GET",
+            "/api/v1/users/@alice:example.org/devices",
+            None,
+            None,
+        )
+        .await;
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(page["items"].as_array().unwrap().is_empty(), "{page}");
+
+        // Audited twice, and neither entry nor the log as a whole carries a password.
+        let entries = audit_entries_for_action(&router, "users.reset_password").await;
+        assert_eq!(entries.len(), 2);
+        let log = serde_json::to_string(&entries).unwrap();
+        assert!(!log.contains("correct horse"), "{log}");
+        assert!(!log.contains("another fine"), "{log}");
+        assert_eq!(entries[0].changes[0].pointer, "/password");
     }
 }

@@ -33,7 +33,7 @@
 
 use std::sync::Arc;
 
-use hs_admin::model::AdminUser;
+use hs_admin::model::{AdminDevice, AdminPasswordReset, AdminUser};
 use hs_admin::sources::{SourceError, UserCreateRequest, UserDirectory, UserFilter};
 
 use crate::admin_verifier::format_rfc3339_ms;
@@ -283,6 +283,146 @@ impl UserDirectory for AuthStoreUserDirectory {
             Err(e) => return Err(store_unavailable(e)),
         }
         self.to_admin_user(record).await
+    }
+
+    async fn list_devices(&self, user_id: &str) -> Result<Vec<AdminDevice>, SourceError> {
+        let uid = parse_user_id(user_id)?;
+        if self
+            .store
+            .get_user(&uid)
+            .await
+            .map_err(store_unavailable)?
+            .is_none()
+        {
+            return Err(SourceError::NotFound);
+        }
+        let mut devices = self
+            .store
+            .list_devices(&uid)
+            .await
+            .map_err(store_unavailable)?;
+        // Most recently seen first: the one the person is holding, then the one they lost.
+        devices.sort_by_key(|d| std::cmp::Reverse(d.last_seen_ms));
+        Ok(devices
+            .into_iter()
+            .map(|d| AdminDevice {
+                device_id: d.device_id.to_string(),
+                display_name: d.display_name,
+                last_seen_ip: d.last_seen_ip,
+                last_seen_at: d.last_seen_ms.map(format_rfc3339_ms),
+            })
+            .collect())
+    }
+
+    /// The same three steps as `DELETE /devices/{deviceId}` in `crate::routes::devices`, with
+    /// the same announcement to everyone who shares a room with the user (`hs-e2e`'s
+    /// device-list stream), and without the user-interactive auth, which is the point: the
+    /// person cannot do this themself because the device is the one they lost.
+    async fn delete_device(&self, user_id: &str, device_id: &str) -> Result<(), SourceError> {
+        let uid = parse_user_id(user_id)?;
+        let device_id: ruma::OwnedDeviceId = device_id.into();
+        if self
+            .store
+            .get_device(&uid, &device_id)
+            .await
+            .map_err(store_unavailable)?
+            .is_none()
+        {
+            return Err(SourceError::NotFound);
+        }
+        self.store
+            .delete_access_tokens_for_device(&uid, &device_id)
+            .await
+            .map_err(store_unavailable)?;
+        self.store
+            .delete_device(&uid, &device_id)
+            .await
+            .map_err(store_unavailable)?;
+        if let Some(state) = &self.accounts {
+            state.notify_device_list_changed(&uid).await;
+        }
+        Ok(())
+    }
+
+    /// What `POST /logout/all` does, done to somebody else.
+    async fn logout_everywhere(&self, user_id: &str) -> Result<(), SourceError> {
+        let uid = parse_user_id(user_id)?;
+        if self
+            .store
+            .get_user(&uid)
+            .await
+            .map_err(store_unavailable)?
+            .is_none()
+        {
+            return Err(SourceError::NotFound);
+        }
+        self.store
+            .delete_all_access_tokens_for_user(&uid)
+            .await
+            .map_err(store_unavailable)?;
+        self.store
+            .delete_all_refresh_tokens_for_user(&uid)
+            .await
+            .map_err(store_unavailable)?;
+        let devices = self
+            .store
+            .list_devices(&uid)
+            .await
+            .map_err(store_unavailable)?;
+        for device in &devices {
+            self.store
+                .delete_device(&uid, &device.device_id)
+                .await
+                .map_err(store_unavailable)?;
+        }
+        if !devices.is_empty()
+            && let Some(state) = &self.accounts
+        {
+            state.notify_device_list_changed(&uid).await;
+        }
+        Ok(())
+    }
+
+    async fn reset_password(
+        &self,
+        user_id: &str,
+        request: AdminPasswordReset,
+    ) -> Result<(), SourceError> {
+        let Some(state) = &self.accounts else {
+            return Err(SourceError::Unavailable(
+                "this user directory was built over a bare store and cannot set passwords"
+                    .to_string(),
+            ));
+        };
+        let uid = parse_user_id(user_id)?;
+        if self
+            .store
+            .get_user(&uid)
+            .await
+            .map_err(store_unavailable)?
+            .is_none()
+        {
+            return Err(SourceError::NotFound);
+        }
+        // The server's own password policy, the same one `/register` and a self-service change
+        // apply; an administrator gets its reasons beside the field.
+        if let Err(e) = state.config.password_policy.validate(&request.password) {
+            return Err(SourceError::InvalidField {
+                pointer: "/password",
+                detail: e.message().to_owned(),
+            });
+        }
+        let hash = crate::password::hash_password(&request.password)
+            .map_err(|e| SourceError::Unavailable(format!("could not hash the password: {e}")))?;
+        // Sign out first, then set: a session that survived a failed sign-out would still be
+        // one the old password had opened.
+        if request.logout_devices {
+            self.logout_everywhere(user_id).await?;
+        }
+        self.store
+            .set_password_hash(&uid, Some(hash))
+            .await
+            .map_err(map_set_error)
     }
 }
 
