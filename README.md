@@ -13,10 +13,9 @@ Kubernetes-native, horizontally scalable, and equally at home as a single static
 
 **Element Web signs in and talks to it.** The browser client most Matrix users run logs in, lists
 rooms, sends and receives messages live between two independent sessions, propagates a display-name
-change to an already-open tab, and pages back through history. Screenshots are in
-`docs/design/screenshots/`; the reproduction is `web/element-testing/README.md`. Creating a room
-from Element's UI is the one thing that still fails — a single known bug, first in line in
-`docs/next-steps.md`.
+change to an already-open tab, creates rooms (encrypted ones included), invites, and pages back
+through history. Screenshots are in `docs/design/screenshots/`; the reproduction is
+`web/element-testing/README.md`.
 
 **Two encrypted clients exchange a message this server cannot read.** `matrix-rust-sdk` with
 encryption enabled: keys upload, cross-signing bootstraps, one-time keys are claimed atomically,
@@ -67,6 +66,26 @@ Without Docker, `hs serve --data-dir ./data --server-name example.org` is the sa
 between a route that is registered and a route that works. `docs/next-steps.md` is what comes next
 and the gaps as they actually stand — the largest being that administering this server should be
 pleasant, and is not yet.
+
+## How far along is it
+
+Roughly **55-60% of a homeserver somebody else could run**, but the number only means something
+broken up, because the parts are nowhere near each other. This table is kept current with
+`docs/next-steps.md`, which has the basis for each figure.
+
+| Area | Done | Basis |
+|---|---|---|
+| Client-server API | ~75% | 314/384 Complement csapi assertions; two Element sessions chat encrypted |
+| Storage, rooms, state resolution | ~85% | 1,600+ tests, two backends through one conformance suite |
+| Configuration and first run | ~90% | database-backed, edited in the UI, one command from nothing to a server |
+| Admin API | ~40% | 58 of 145 operations have a real handler; the rest answer an honest 501 |
+| Management web interface | ~70% | users, rooms, bridges, federation, configuration and the audit log are real against the real server |
+| Bridges | ~65% | heisenbridge works end to end; all 16 bridge operations are real; no mautrix bridge has connected yet |
+| Operations (HA, scale-out) | ~40% | runs on Kubernetes with a chart and a tested image; the cluster path has not carried real traffic |
+| **Federation** | **~15%** | 59/246 assertions; a two-server join works one way only |
+
+Federation is the honest answer to "when could I use this": a user here cannot really talk to
+the rest of Matrix yet.
 
 ## Where things are
 
