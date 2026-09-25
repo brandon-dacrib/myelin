@@ -66,6 +66,27 @@ test.describe("real server", () => {
       await screenshotHonestly(page, "/", "real-dashboard.png");
     });
 
+    test("audit log lists durable entries, opens one, and exports NDJSON", async ({ page }) => {
+      await page.goto("/admin/audit");
+      await expect(page.getByRole("heading", { name: "Audit log" })).toBeVisible();
+      const firstEntry = page.locator('table a[href*="/audit/"]').first();
+      const empty = page.getByText("No changes recorded yet", { exact: true });
+      await expect(firstEntry.or(empty)).toBeVisible();
+
+      if (await firstEntry.isVisible()) {
+        const action = await firstEntry.textContent();
+        await firstEntry.click();
+        await expect(page.getByRole("heading", { name: action?.trim() })).toBeVisible();
+        await expect(page.getByText("Full audit entry (JSON)")).toBeVisible();
+        await page.getByRole("link", { name: "Back to audit log" }).click();
+      }
+
+      const downloadPromise = page.waitForEvent("download");
+      await page.getByRole("button", { name: "Export NDJSON" }).click();
+      const download = await downloadPromise;
+      expect(download.suggestedFilename()).toMatch(/^audit-log-.*\.ndjson$/);
+    });
+
     test("users list is real (GET /users is wired)", async ({ page }) => {
       await page.goto("/admin/users");
       // Either real rows, a real empty state, or (if the directory source isn't attached, per

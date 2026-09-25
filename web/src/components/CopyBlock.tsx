@@ -53,7 +53,16 @@ export function CopyBlock({
           </Button>
         </div>
       </div>
-      <pre className="overflow-x-auto p-3 font-identifier text-xs text-text">{content}</pre>
+      <pre
+        // A scrollable read-only region needs keyboard focus on narrow screens.
+        // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
+        tabIndex={0}
+        role="region"
+        aria-label={label}
+        className="overflow-x-auto p-3 font-identifier text-xs text-text focus-visible:outline-2 focus-visible:outline-[var(--color-focus)]"
+      >
+        {content}
+      </pre>
     </div>
   );
 }

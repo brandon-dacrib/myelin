@@ -4,7 +4,6 @@ type StatisticsOverview = components["schemas"]["StatisticsOverview"];
 type ServerInfo = components["schemas"]["ServerInfo"];
 type ClusterStatus = components["schemas"]["ClusterStatus"];
 type Destination = components["schemas"]["Destination"];
-type AuditEntry = components["schemas"]["AuditEntry"];
 
 const now = Date.now();
 const iso = (msAgo: number) => new Date(now - msAgo).toISOString();
@@ -73,48 +72,5 @@ export const federationDestinations: Destination[] = [
     retry_interval_ms: 300_000,
     pending_pdu_count: 42,
     pending_edu_count: 3,
-  },
-];
-
-export const recentAuditEntries: AuditEntry[] = [
-  {
-    id: "audit-1",
-    recorded_at: iso(3 * 60_000),
-    action: "appservices.pause",
-    actor: { kind: "user", id: "@admin:example.org", display_name: "Operator" },
-    target: { type: "appservice", id: "discord" },
-    outcome: { status: 200, problem: null },
-  },
-  {
-    id: "audit-2",
-    recorded_at: iso(40 * 60_000),
-    action: "users.suspend",
-    actor: { kind: "user", id: "@admin:example.org", display_name: "Operator" },
-    target: { type: "user", id: "@spammer42:example.org" },
-    outcome: { status: 200, problem: null },
-  },
-  {
-    id: "audit-3",
-    recorded_at: iso(2 * 3_600_000),
-    action: "appservices.rotate_tokens",
-    actor: { kind: "user", id: "@admin:example.org", display_name: "Operator" },
-    target: { type: "appservice", id: "whatsapp" },
-    outcome: { status: 200, problem: null },
-  },
-  {
-    id: "audit-4",
-    recorded_at: iso(5 * 3_600_000),
-    action: "rooms.block",
-    actor: { kind: "user", id: "@admin:example.org", display_name: "Operator" },
-    target: { type: "room", id: "!abc:example.org" },
-    outcome: { status: 200, problem: null },
-  },
-  {
-    id: "audit-5",
-    recorded_at: iso(9 * 3_600_000),
-    action: "registration_tokens.create",
-    actor: { kind: "user", id: "@admin:example.org", display_name: "Operator" },
-    target: { type: "registration_token", id: "INVITE-2026-09" },
-    outcome: { status: 200, problem: null },
   },
 ];

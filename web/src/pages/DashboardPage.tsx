@@ -1,6 +1,6 @@
 import { useMemo, type ReactNode } from "react";
 import { formatCount, formatUptime, joinWithOr } from "@/lib/format";
-import { useNavigate } from "@tanstack/react-router";
+import { Link, useNavigate } from "@tanstack/react-router";
 import { CheckCircle2, TriangleAlert, CircleX, Info } from "lucide-react";
 import {
   useStatisticsOverview,
@@ -397,9 +397,13 @@ export function DashboardPage() {
                   key={entry.id}
                   className="flex items-center justify-between gap-3 px-4 py-2.5 text-sm"
                 >
-                  <span className="text-text">
+                  <Link
+                    to="/audit/$entryId"
+                    params={{ entryId: entry.id }}
+                    className="text-text hover:text-accent hover:underline"
+                  >
                     {entry.action} &middot; {entry.target.type} {entry.target.id}
-                  </span>
+                  </Link>
                   <span className="flex items-center gap-3 text-text-muted">
                     <span className="font-identifier">
                       {entry.actor.display_name ?? entry.actor.id}

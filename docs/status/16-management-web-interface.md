@@ -1,5 +1,17 @@
 # 16. Management web interface: status
 
+## Current update: 2026-09-23
+
+The Audit log is a working section at `/audit`, backed by the real `audit_log.list/get/export`
+operations. Filters and cursor are in the URL; the list links to entry details and resource
+pages, and the detail shows the actor, request, changes, outcome and replay link. Export is
+authenticated NDJSON and says explicitly that it uses the date range only (up to 10,000 entries).
+The mock API exercises the same filters and export shape. `npm run check` passes; all 22 mock
+Playwright tests pass, including the three Audit scenarios with axe at desktop and phone width.
+The Audit scenario also passed against a fresh `hs serve`: first administrator created, its
+durable setup entry opened, NDJSON downloaded. Reports, Media, Cluster, Migration and Settings
+remain placeholders. Older counts and open items below are retained as session history.
+
 > **Integration note, 2026-09-19 (integration lead): one of this session's three findings is a
 > false positive, and the other two are confirmed.**
 >
@@ -573,7 +585,7 @@ Design system as code, all in `web/src/components/ui/`, each with a Storybook st
 
 Application shell (`web/src/components/shell/`): `AppShell`, `Sidebar` (full/rail/drawer per breakpoint, scope-filtered, live error count on Bridges), `TopBar` (search trigger, live/polling indicator, theme cycling, operator menu), `CommandPalette` (⌘K / `/`, nav + bridge jump, arrow-key + Enter), `SignIn` (mock issuer), `g`-chord navigation (`g o/b/u/r/f`), focus-to-main on route change.
 
-Pages: `DashboardPage`, `BridgesListPage`, `BridgeDetailPage`, the add-bridge wizard (`pages/bridges/wizard/`), `UsersPage`/`UserDetailPage`, `RoomsPage`/`RoomDetailPage`, `FederationPage`/`FederationDestinationPage` (all three added in the integration-review response, see that section below), and `PlaceholderPage` for the remaining information-architecture routes (Reports, Media, Cluster, Migration, Audit, Settings) so navigation matches the full IA even though those pages are not built. Every route is lazy-loaded (`web/src/routes.tsx`, `lazyRouteComponent`). **The bridges/dashboard pages were rewritten mid-session against the real API — see "Reconciliation" below; do not assume the shapes described in `flows.md`'s example paths are current.**
+Pages: `DashboardPage`, `BridgesListPage`, `BridgeDetailPage`, the add-bridge wizard (`pages/bridges/wizard/`), `UsersPage`/`UserDetailPage`, `RoomsPage`/`RoomDetailPage`, `FederationPage`/`FederationDestinationPage` (all three added in the integration-review response, see that section below), and `PlaceholderPage` for the remaining information-architecture routes (Reports, Media, Cluster, Migration, Settings) so navigation matches the full IA even though those pages are not built. `/audit` now has real list and detail pages (2026-09-23 update above). Every route is lazy-loaded (`web/src/routes.tsx`, `lazyRouteComponent`). **The bridges/dashboard pages were rewritten mid-session against the real API — see "Reconciliation" below; do not assume the shapes described in `flows.md`'s example paths are current.**
 
 Testing:
 
@@ -615,7 +627,7 @@ New mock fixtures/handlers matching the real shapes: `web/src/mocks/data/{appser
     than anything left in this track's own backlog below.
 0. **Do this first**: re-run `npm run test` (Vitest infra failed to even start this session under host load — see "Wrap-up note" above, not a code issue) and `npm run build`, neither confirmed as of 2026-09-19. Then re-run `npm run test:e2e:real` against a fresh `hs serve` build to confirm against the now-larger real surface (15 of 142 operations per the integration lead, up from the 5 this session tested).
 0b. `GET /api/v1/events` (SSE) is real now (per the integration lead) — wire it up, replacing `TopBar`'s "Polling every 30s" and each page's `refetchInterval`. This was blocked on 15 shipping it; it no longer is.
-1. Reports page (flow not yet built; still a `PlaceholderPage`). Media, Cluster, Migration, Audit log, Settings remain placeholders too — Phase 1/2 per the brief.
+1. Reports page (flow not yet built; still a `PlaceholderPage`). Media, Cluster, Migration and Settings remain placeholders too — Phase 1/2 per the brief. Audit log was completed 2026-09-23 (update above).
 2. Reset-password for users (`POST /users/{user_id}/reset-password`) needs a password-entry/generate UI this session deliberately deferred; redact-events, media tab, pushers, external IDs, 3PIDs are also unbuilt on the User detail page.
 3. Real OAuth: swap `src/lib/auth.ts`'s mock issuer client for `oauth4webapi` against 07's issuer (check 07's status file — it was also active this session).
 4. SSE live updates (`GET /events`, referenced in 15's status file) once wired up; `TopBar`'s "Polling every 30s" indicator and each page's `refetchInterval` are the seam to replace.

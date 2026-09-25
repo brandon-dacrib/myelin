@@ -302,6 +302,14 @@ cannot do, in rough order of how often an operator will hit it:
   counts failing destinations (zero, not absent, when nothing is failing; with federation off
   the list is honestly empty rather than a 503). Pending PDU/EDU counts are zero because there
   is no outbound queue yet, which is true rather than a placeholder.
+- ~~Open and export the Audit log from the interface.~~ **Done 2026-09-23.**
+  `/audit` now lists the server's durable entries with URL-backed actor, action, resource,
+  outcome and UTC date filters, cursor pagination, and an entry detail page showing the actor,
+  request ID, changes and replay link. Resource IDs link to their pages. NDJSON export makes
+  clear that the API accepts only a date range and caps the response at 10,000 entries. The
+  mock browser suite and a fresh real `hs serve` were both exercised; the real run created its
+  first administrator, opened that audit entry and downloaded the log. The Overview's recent
+  entries now open their detail page too.
 - ~~Add a user from the interface.~~ **Done 2026-09-21.** `AuthStoreUserDirectory::create_user`
   is real (it inherited a default that answered 503), and the Users page has an "Add user"
   dialog. **Since 2026-09-22** the user page's devices list, "Sign out everywhere", signing out

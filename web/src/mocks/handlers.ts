@@ -27,8 +27,9 @@ import {
   serverInfo,
   clusterStatus,
   federationDestinations,
-  recentAuditEntries,
 } from "./data/dashboard";
+import { auditEntries } from "./data/audit";
+import { succeeded } from "@/lib/audit";
 import { users, userDevices, findUser } from "./data/users";
 import { rooms, roomMembers, findRoom } from "./data/rooms";
 import { ALL_SCOPES, type Scope } from "@/lib/auth";
@@ -80,6 +81,23 @@ function paginate<T>(items: T[], url: URL) {
   const next_cursor = nextOffset < items.length ? encodeCursor(nextOffset) : null;
   const prev_cursor = offset > 0 ? encodeCursor(Math.max(offset - limit, 0)) : null;
   return { items: page, next_cursor, prev_cursor };
+}
+
+function filteredAuditEntries(url: URL, datesOnly = false) {
+  const q = url.searchParams;
+  return [...configAuditEntries, ...auditEntries]
+    .filter(
+      (entry) =>
+        (!q.get("recorded_after") || entry.recorded_at >= q.get("recorded_after")!) &&
+        (!q.get("recorded_before") || entry.recorded_at < q.get("recorded_before")!) &&
+        (datesOnly ||
+          ((!q.get("actor") || entry.actor.id === q.get("actor")) &&
+            (!q.get("action") || entry.action === q.get("action")) &&
+            (!q.get("target_type") || entry.target.type === q.get("target_type")) &&
+            (!q.get("target_id") || entry.target.id === q.get("target_id")) &&
+            (!q.get("outcome") || succeeded(entry) === (q.get("outcome") === "success")))),
+    )
+    .sort((a, b) => b.recorded_at.localeCompare(a.recorded_at));
 }
 
 const registeredIds = new Set(appservices.map((a) => a.id));
@@ -203,23 +221,18 @@ export const handlers = [
   }),
   http.get(`${API}/audit-log`, ({ request }) => {
     const url = new URL(request.url);
-    const targetType = url.searchParams.get("target_type");
-    const targetId = url.searchParams.get("target_id");
-    const action = url.searchParams.get("action");
-    // Configuration writes are audit entries like any other; the
-    // Configuration page reads its change history back out of here, since
-    // there is no /config/{section}/history operation on the real API.
-    const all = [...configAuditEntries, ...recentAuditEntries].sort((a, b) =>
-      b.recorded_at.localeCompare(a.recorded_at),
-    );
-    const filtered = all.filter(
-      (entry) =>
-        (!targetType || entry.target.type === targetType) &&
-        (!targetId || entry.target.id === targetId) &&
-        (!action || entry.action === action),
-    );
-    const { items, next_cursor, prev_cursor } = paginate(filtered, url);
+    const { items, next_cursor, prev_cursor } = paginate(filteredAuditEntries(url), url);
     return HttpResponse.json({ items, next_cursor, prev_cursor });
+  }),
+  http.get(`${API}/audit-log/export`, ({ request }) => {
+    const entries = filteredAuditEntries(new URL(request.url), true).slice(0, 10_000);
+    return new HttpResponse(entries.map((entry) => JSON.stringify(entry) + "\n").join(""), {
+      headers: { "Content-Type": "application/x-ndjson" },
+    });
+  }),
+  http.get(`${API}/audit-log/:id`, ({ params }) => {
+    const entry = [...configAuditEntries, ...auditEntries].find((entry) => entry.id === params.id);
+    return entry ? HttpResponse.json(entry) : problem(404, "not-found", "Audit entry not found");
   }),
 
   // ---- Bridge types ----

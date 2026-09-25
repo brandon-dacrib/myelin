@@ -8,6 +8,7 @@ import {
 } from "@tanstack/react-router";
 import { AppShell } from "@/components/shell/AppShell";
 import { WIZARD_STEPS, type WizardStep } from "@/pages/bridges/wizard/wizard-state";
+import { validateAuditSearch } from "@/pages/audit/audit-search";
 
 // Route-level code splitting: each page (and its own dependency graph —
 // react-query hooks, mock-independent UI, etc.) lands in its own chunk,
@@ -53,6 +54,11 @@ const ConfigSectionPage = lazyRouteComponent(
 const PlaceholderPage = lazyRouteComponent(
   () => import("@/pages/PlaceholderPage"),
   "PlaceholderPage",
+);
+const AuditPage = lazyRouteComponent(() => import("@/pages/audit/AuditPage"), "AuditPage");
+const AuditEntryPage = lazyRouteComponent(
+  () => import("@/pages/audit/AuditEntryPage"),
+  "AuditEntryPage",
 );
 
 function NotFoundPage() {
@@ -201,7 +207,18 @@ const reportsRoute = placeholderRoute("/reports");
 const mediaRoute = placeholderRoute("/media");
 const clusterRoute = placeholderRoute("/cluster");
 const migrationRoute = placeholderRoute("/migration");
-const auditRoute = placeholderRoute("/audit");
+const auditRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/audit",
+  validateSearch: validateAuditSearch,
+  component: AuditPage,
+});
+const auditEntryRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/audit/$entryId",
+  validateSearch: validateAuditSearch,
+  component: AuditEntryPage,
+});
 const settingsRoute = placeholderRoute("/settings");
 
 const routeTree = rootRoute.addChildren([
@@ -224,6 +241,7 @@ const routeTree = rootRoute.addChildren([
   clusterRoute,
   migrationRoute,
   auditRoute,
+  auditEntryRoute,
   settingsRoute,
 ]);
 
