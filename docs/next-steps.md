@@ -658,6 +658,7 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | In-process server cannot be restarted over its data directory | `hs-cli` | background tasks hold the store's lock after `shutdown()`; restart tests need the real binary |
 | The release binaries job's web build has never run | `.github` | it only runs on a `v*` tag; the image path is verified, this one is not |
 | The chart is published only on a `v*` tag | `.github` | `helm install oci://...` is not possible yet; it installs from a checkout |
+| A locked-out sole administrator has no offline way back in | `hs-cli`, `hs-auth` | the setup link is re-offered only once no active administrator exists, and deactivating one takes an administrator; the way back in today is a registration shared secret and `hs register --admin`, which on Kubernetes means a `helm upgrade` and a restart before the reset can start (hit on the demo, 2026-09-26, minutes after the first administrator was made); an `hs reset-password --data-dir`, or a re-offer of the setup link the operator can trigger, would make it one step |
 | A pod does not know its own mesh address | `hs-cli`, `hs-cluster` | `advertise_host` falls back to the bind address or `127.0.0.1`; cluster mode between two pods has not been tried |
 | The operator creates no workloads | `hs-operator` | `Homeserver` reconciles to a status only; the chart is the only way to deploy |
 | A cold boot in the image takes about five seconds | `hs-cli`, `hs-kv` | the first startup probe is refused every time; harmless, unmeasured |
