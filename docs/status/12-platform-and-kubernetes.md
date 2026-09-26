@@ -92,7 +92,7 @@ helm upgrade ...                                                           # rec
 The demo's failed revision 3 was rolled back to revision 2 (`helm rollback myelin 2`, now
 revision 4), the pod untouched throughout: `/api/v1/setup` (`needs_setup: false`, so the
 administrator is still there) and `/_matrix/client/versions` answered through Traefik before,
-during and after. DEMO_MIGRATION_SENTENCE
+during and after. The demo has not been migrated yet: it stays on the checkout chart at revision 4 until the operator runs the two commands above (the `--cascade=orphan` delete was not something this session was permitted to run on the standing install), and the corrected chart reaches the registry only when `main` is green again -- at the time of writing CI on `main` fails on an unrelated admin API contract test from a commit in flight in another session, so CD run 62 skipped the chart job.
 
 ### Not verified
 
