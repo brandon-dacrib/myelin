@@ -3303,6 +3303,13 @@ impl<B: KvBackend> RoomActor<B> {
         Ok(Some(StateAtEvent { state, auth_chain }))
     }
 
+    /// The room-local short ID this actor holds `event_id` under, if it holds it at all: what
+    /// [`RoomActor::send_event_citing`] takes as `prev_events`.
+    #[must_use]
+    pub fn event_sn_of(&self, event_id: &EventId) -> Option<EventSn> {
+        self.event_id_index.get(event_id).copied()
+    }
+
     /// One event by ID, if this actor holds it (its own room's events only).
     #[must_use]
     pub fn event_by_id(&self, event_id: &EventId) -> Option<&Event> {
@@ -3533,7 +3540,16 @@ impl<B: KvBackend> RoomActor<B> {
 
         // Rule 3's "the user joined the room at any point after the event was sent": true if any
         // later timeline entry is an `m.room.member` event for `requester` with `membership:
-        // join`, regardless of whether they are still joined now.
+        // join`, regardless of whether they are still joined now -- or if they were joined when
+        // the event *arrived*, as of the timeline entry just before it. The second half is for
+        // an event that is concurrent with their join rather than after it: sent on a branch
+        // that had not seen the join, so the state at the event does not have them, and not
+        // followed by a join either, because they were already in. A member of a `shared` room
+        // sees everything that reaches it while they are in it, whichever branch it came down
+        // (Synapse shows a joined member every event of such a room); by the state at the
+        // event alone, Complement's `TestNetworkPartitionOrdering` -- a message from a
+        // partitioned server, made before that server had received bob's join -- was hidden
+        // from bob or not depending on which of two servers' events arrived first.
         let joined_later = self
             .timeline
             .range((std::ops::Bound::Excluded(pos), std::ops::Bound::Unbounded))
@@ -3542,7 +3558,8 @@ impl<B: KvBackend> RoomActor<B> {
                 e.header().event_type == "m.room.member"
                     && e.header().state_key.as_deref() == Some(requester.as_str())
                     && content_str(e, "membership") == Some("join")
-            });
+            })
+            || self.was_joined_at(requester, pos - 1)?;
 
         let prev_sns: Vec<EventSn> = pipeline::decode_event_ids(event.json().get("prev_events"))
             .iter()

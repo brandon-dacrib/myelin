@@ -226,6 +226,14 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
   private CA (`crates/hs-federation/scripts/two-server-federation.sh`): it passed on 2026-09-25, join through `/join`, state on B, a message each way. Between two
   instances of this server; a Synapse on the other end has not been tried. Not yet: EDUs,
   invites, leaves and knocks over federation; the outbound queue is in memory.
+- **An event that raced a member's join is visible to them** (2026-09-26). In a `shared` room a
+  member could see an event if they were joined in the state at it or joined later in the
+  timeline; an event sent on a branch that had not seen their join was neither, and was
+  hidden from them or not depending on which server's events arrived first (the federation
+  package's `TestNetworkPartitionOrdering` moved between two runs of the same code, and this
+  was why). Joined when the event arrived counts now. Somebody who had left still does not
+  see what came after they left. Unit-tested; the federation package has not been re-run
+  from the fixed commit yet.
 - **A rejoin goes through the room, not through a stale copy of it** (2026-09-26). A server
   holds its copy of a room after its last user leaves, and stops receiving events for it. A join
   made against that copy is a join against the room as it was then: authorized against rules

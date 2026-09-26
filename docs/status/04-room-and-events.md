@@ -24,6 +24,15 @@ and the gap a leave-and-rejoin leaves in the middle of a timeline is not filled,
 is fetched before the *oldest* held event and positions are a stream order, not a topological
 one.)
 
+Same day, later still: `RoomActor::event_visible_to`'s `shared` rule counts a requester who
+was joined when the event *arrived* (the state as of the timeline entry before it) as well as
+one joined in the state at the event or later in the timeline. An event concurrent with their
+join -- sent on a branch that had not seen it -- is neither of the old two, and Complement's
+`TestNetworkPartitionOrdering` showed or hid it from bob by which server's events arrived
+first (`docs/status/14-test-and-conformance.md`, run 6). Somebody who had left before it
+arrived still does not see it; `tests/remote_join.rs` builds the branch with
+`send_event_citing` and checks both.
+
 Same day, later: `RoomActor::servers_to_join_through` and the `act_join` branch that uses it. A
 room this server holds but nobody of this server is joined to is a copy that stopped receiving
 events when the last one left; a join made against it (the old behaviour, since the registry

@@ -130,6 +130,74 @@ fn timeline_ids<B: hs_kv::KvBackend>(actor: &RoomActor<B>) -> Vec<OwnedEventId> 
         .collect()
 }
 
+/// An event concurrent with a member's join -- sent on a branch that had not seen the join, so
+/// the state at the event does not have the member -- is visible to that member in a `shared`
+/// room, because they were in the room when it arrived; and stays invisible to somebody who
+/// had left before it arrived. `TestNetworkPartitionOrdering` hid such an event from bob or not
+/// depending on which server's events arrived first.
+#[test]
+fn an_event_concurrent_with_a_join_is_visible_to_the_member_it_raced() {
+    let mut resident = resident_with_bob_joined();
+    let alice = user_id!("@alice:a.example").to_owned();
+    let bob = user_id!("@bob:b.example");
+    let carol = user_id!("@carol:a.example").to_owned();
+
+    // Carol was in the room and left before bob joined.
+    let carol_join = resident
+        .actor
+        .membership_action(carol.clone(), Action::Join, carol.clone(), json!({}), 2)
+        .expect("carol joins");
+    let _ = carol_join;
+    resident
+        .actor
+        .membership_action(carol.clone(), Action::Leave, carol.clone(), json!({}), 3)
+        .expect("carol leaves");
+
+    // A branch from before bob's join: alice's message citing her earlier message, not the
+    // join. Its state has no bob.
+    let earlier_sn = resident
+        .actor
+        .event_sn_of(resident.message.event_id())
+        .expect("the message is held");
+    let concurrent = resident
+        .actor
+        .send_event_citing(
+            alice,
+            "m.room.message".to_owned(),
+            None,
+            json!({"msgtype": "m.text", "body": "sent without having seen bob's join"}),
+            None,
+            10,
+            &[earlier_sn],
+        )
+        .expect("a concurrent branch");
+    assert!(
+        !resident
+            .actor
+            .state_at_event(concurrent.event_id())
+            .expect("state")
+            .expect("known")
+            .state
+            .iter()
+            .any(|e| e.header().state_key.as_deref() == Some(bob.as_str())),
+        "the branch must not have bob in its state for this test to mean anything"
+    );
+
+    // Bob was in the room when it arrived: he sees it. Carol had left: she does not.
+    assert!(
+        resident
+            .actor
+            .event_visible_to(&concurrent, bob)
+            .expect("visibility")
+    );
+    assert!(
+        !resident
+            .actor
+            .event_visible_to(&concurrent, &carol)
+            .expect("visibility")
+    );
+}
+
 /// The whole RFC 0015 claim, end to end: the joining server can read the room's state, see its
 /// members, post into it, accept the resident's next event, survive a reload identically, and
 /// leave again -- from a snapshot whose `prev_events` it never held.

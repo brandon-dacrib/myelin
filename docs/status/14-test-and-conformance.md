@@ -18,6 +18,32 @@ package has a named baseline now, `docs/status/complement-federation-results.txt
 | 3 (2026-09-25) | `867caa4` | 61 / 246 | 7 / 88 | `TestUnrejectRejectedEvents`-adjacent gains only; every join through Complement's own server or between hs1 and hs2 still failed, see below |
 | 4 (2026-09-26) | `13195aa` | 72 / 250 | 11 / 88 | `TestJoinViaRoomIDAndServerName`, `TestJoinFederatedRoomFailOver`, `TestJoinFederatedRoomWithUnverifiableEvents`, `TestUnrejectRejectedEvents` FAIL -> PASS; nothing regressed |
 | 5 (2026-09-26) | `82359fb` | 73 / 250 | 12 / 88 | `TestNetworkPartitionOrdering` FAIL -> PASS; nothing regressed. The baseline. |
+| 6 (2026-09-26) | `9672d61` | 72 / 250 | 11 / 88 | `TestNetworkPartitionOrdering` PASS -> FAIL, and nothing else moved. Not the baseline; read on. |
+
+Run 6 was from the commit that fetches a room's history before a join on a client's behalf,
+and the one test that moved had nothing to do with that: it moved because of which of two
+servers' events arrived first. The test has hs1 join a room hosted on Complement's server,
+sends events 1-4 from hs1, then has that server inject an event `1'` made *before it had
+received bob's join* -- so `1'` is a branch whose state does not have bob -- and expects
+bob's next `/sync` to show `1'` among the newest four. Bob got three: `1'` was on the page
+(the page's `prev_batch` was its position) and `/sync`'s per-event visibility dropped it. The
+rule this server ported from the spec allowed a `shared`-room event to a member either
+joined in the state *at the event* or joined *later in the timeline*; `1'` is neither for bob,
+who joined before it arrived on a branch that never saw him. Whether bob's join was on the
+branch depended on whether hs1's sender had delivered it to Complement's server before the
+test built `1'`: in run 5 it had, in run 6 it had not. The rule is wider now
+(`RoomActor::event_visible_to`: joined when the event arrived, as of the timeline entry before
+it, counts too -- Synapse shows a joined member every event of a `shared` room), with a unit
+test that builds the concurrent branch on purpose
+(`tests/remote_join.rs::an_event_concurrent_with_a_join_is_visible_to_the_member_it_raced`)
+and checks somebody who had left still does not see it. Not re-measured at the time of
+writing; the baseline stays at run 5 until a run from the fixed commit says.
+
+The same run's triage warned of a wait that saw 159,546 `/sync` responses in fifty seconds
+(`TestDeviceListUpdates`' remote halves). That one is Complement's own doing: the wait is a
+`MustSyncUntil` with `timeout=0`, a busy loop by construction, against an invitation over
+federation that this server does not deliver yet. Nothing to fix on the `/sync` side; the
+invitation is item 3's seam.
 
 Run 3 was the interesting one: the join that worked between two of this server did not work
 against anything else, for three reasons none of this server's own tests could have found.
