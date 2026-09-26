@@ -826,6 +826,9 @@ pub struct ServeHandle {
     cluster: hs_cluster::Cluster,
     /// The mesh listener, if this replica is clustered.
     mesh: Option<crate::cluster::MeshRuntime>,
+    /// What `/health/ready` reads. `true` from the moment the listeners are bound;
+    /// [`ServeHandle::withdraw_readiness`] makes it `false`, and nothing makes it `true` again.
+    ready: Arc<AtomicBool>,
 }
 
 /// [`ServeHandle`]'s type-erased call into the session hub. See its `release_long_polls` field.
@@ -841,12 +844,27 @@ type ReleaseLongPolls =
 const CLUSTER_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 impl ServeHandle {
-    /// Runs the cluster's graceful handoff (releasing every shard this replica owns and waiting,
-    /// up to [`CLUSTER_DRAIN_DEADLINE`], for a peer to claim it), stops the mesh listener, then
-    /// answers every `/sync` that is waiting for news, signals every HTTP listener to begin
-    /// graceful shutdown and waits for them to finish draining in-flight requests. `hs serve`'s
-    /// `SIGTERM` handler calls this.
+    /// Answers `/health/ready` with `503` from now on, while everything else keeps serving.
+    ///
+    /// This is the first thing [`ServeHandle::shutdown`] does, and it is separate so a test can
+    /// observe it. Kubernetes routes a Service to a pod for as long as its readiness probe
+    /// passes, and a cluster drain can take up to [`CLUSTER_DRAIN_DEADLINE`]: until this flag
+    /// was withdrawn a replica kept answering "ready" for the whole of its own handoff, so new
+    /// requests kept arriving at a pod that was busy giving its rooms away. Liveness is not
+    /// touched: a process that is shutting down on purpose is not one to restart.
+    pub fn withdraw_readiness(&self) {
+        self.ready.store(false, Ordering::SeqCst);
+    }
+
+    /// Withdraws readiness, runs the cluster's graceful handoff (releasing every shard this
+    /// replica owns and waiting, up to [`CLUSTER_DRAIN_DEADLINE`], for a peer to claim it),
+    /// stops the mesh listener, then answers every `/sync` that is waiting for news, signals
+    /// every HTTP listener to begin graceful shutdown and waits for them to finish draining
+    /// in-flight requests. `hs serve`'s `SIGTERM` handler calls this.
     pub async fn shutdown(self) {
+        // First, before the drain: a readiness probe that still passes during the drain keeps
+        // the Service sending new requests here.
+        self.withdraw_readiness();
         let report = self.cluster.drain(CLUSTER_DRAIN_DEADLINE).await;
         if report.handed_off > 0 || report.released_unclaimed > 0 {
             tracing::info!(
@@ -1211,7 +1229,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         auth_state,
         mounts,
         metrics,
-        ready,
+        ready.clone(),
         unstable_features,
         well_known,
         &cluster_handles,
@@ -1316,6 +1334,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         _storage: Box::new(backend.clone()),
         cluster,
         mesh,
+        ready,
     })
 }
 
@@ -1410,6 +1429,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ready.status(), reqwest::StatusCode::OK);
+        handle.shutdown().await;
+    }
+
+    /// A pod that is shutting down must fail its readiness probe *before* it starts draining,
+    /// or the Service keeps routing new requests to it for the length of the drain. Liveness
+    /// and ordinary requests are untouched: the process is not broken, it is leaving.
+    #[tokio::test]
+    async fn readiness_is_withdrawn_before_anything_else_stops() {
+        let (config, _dir) = test_config(reserve_ephemeral_port());
+        let handle = spawn_serve(config, ServeOptions::default()).await.unwrap();
+        let base = handle.base_url();
+        let client = reqwest::Client::new();
+
+        handle.withdraw_readiness();
+
+        let ready = client
+            .get(format!("{base}/health/ready"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let live = client
+            .get(format!("{base}/health/live"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(live.status(), reqwest::StatusCode::OK);
+        let versions = client
+            .get(format!("{base}/_matrix/client/versions"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(versions.status(), reqwest::StatusCode::OK);
+
         handle.shutdown().await;
     }
 
