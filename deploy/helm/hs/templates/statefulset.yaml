@@ -286,8 +286,16 @@ spec:
   volumeClaimTemplates:
     - metadata:
         name: data
+        ## Selector labels only, on purpose. Everything in a StatefulSet's spec outside
+        ## replicas, template, updateStrategy and a few others is immutable once created, and
+        ## that includes these labels. The standard label set carries the chart version and the
+        ## appVersion, both of which change with every published chart (the appVersion is the
+        ## commit), so with them here every `helm upgrade` to a newer chart was refused
+        ## ("Forbidden: updates to statefulset spec for fields other than ..."). Name and
+        ## instance never change. An install made before this fix has the old labels baked in:
+        ## `kubectl delete statefulset <name> --cascade=orphan` (pod and claim stay), then upgrade.
         labels:
-          {{- include "hs.labels" . | nindent 10 }}
+          {{- include "hs.selectorLabels" . | nindent 10 }}
         {{- if eq (.Values.storage.embedded.resourcePolicy | default .Values.storagePolicy.resourcePolicy) "keep" }}
         annotations:
           helm.sh/resource-policy: keep
