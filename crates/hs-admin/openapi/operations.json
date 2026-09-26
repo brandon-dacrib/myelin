@@ -1331,6 +1331,96 @@
       "public": false,
       "tag": "Users",
       "idempotent_post": true
+    },
+    {
+      "method": "GET",
+      "path": "/bridge-deployment-target",
+      "operation_id": "bridge_deployments.target",
+      "scope": "bridges:read",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/bridge-offerings",
+      "operation_id": "bridge_offerings.list",
+      "scope": "bridges:read",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/bridge-offerings/{type}",
+      "operation_id": "bridge_offerings.get",
+      "scope": "bridges:read",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
+    },
+    {
+      "method": "PUT",
+      "path": "/bridge-offerings/{type}",
+      "operation_id": "bridge_offerings.put",
+      "scope": "bridges:write",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
+    },
+    {
+      "method": "DELETE",
+      "path": "/bridge-offerings/{type}",
+      "operation_id": "bridge_offerings.delete",
+      "scope": "bridges:write",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/bridge-offerings/{type}/instances",
+      "operation_id": "bridge_instances.list",
+      "scope": "bridges:read",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/bridge-offerings/{type}/instances/{user_id}",
+      "operation_id": "bridge_instances.get",
+      "scope": "bridges:read",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
+    },
+    {
+      "method": "PUT",
+      "path": "/bridge-offerings/{type}/instances/{user_id}",
+      "operation_id": "bridge_instances.put",
+      "scope": "bridges:write",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
+    },
+    {
+      "method": "DELETE",
+      "path": "/bridge-offerings/{type}/instances/{user_id}",
+      "operation_id": "bridge_instances.delete",
+      "scope": "bridges:write",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/bridge-offerings/{type}/instances/{user_id}/files",
+      "operation_id": "bridge_instances.files",
+      "scope": "bridges:write",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
     }
   ]
 }
