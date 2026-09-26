@@ -166,6 +166,23 @@ impl Default for ClientConfig {
     }
 }
 
+/// `error`'s message followed by every cause underneath it. `reqwest::Error`'s own `Display`
+/// says only "error sending request for url (...)"; the reason -- a certificate rejected for its
+/// name, a refused connection, a resolver with no answer -- is in its source chain, and a
+/// destination that cannot be reached is not worth much in a log without it. Found the hard way
+/// twice: a doubled port in the URL (seventh session), and a federation certificate with no
+/// subject alternative name (eighth), each of which this crate reported as the bare sentence.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut cause = error.source();
+    while let Some(source) = cause {
+        message.push_str(": ");
+        message.push_str(&source.to_string());
+        cause = source.source();
+    }
+    message
+}
+
 /// A JSON federation response: status code plus parsed body.
 #[derive(Debug, Clone)]
 pub struct FederationResponse {
@@ -386,7 +403,7 @@ impl FederationClient {
         let response = request
             .send()
             .await
-            .map_err(|e| ClientError::Request(destination.to_string(), e.to_string()))?;
+            .map_err(|e| ClientError::Request(destination.to_string(), error_chain(&e)))?;
         let status = response.status().as_u16();
 
         let bytes = read_capped(response, MAX_RESPONSE_BODY_BYTES)

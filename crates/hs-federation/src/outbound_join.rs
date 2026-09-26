@@ -314,6 +314,12 @@ pub async fn join_room_with_content(
 /// spec-compliant verifier always redacts before checking, so signing the full object instead
 /// produces a signature that mismatches for any event whose content redaction does not fully
 /// retain.
+///
+/// The template is the resident's suggestion, not the event: `origin_server_ts` is always this
+/// server's own clock (the join is this server's event, timestamped when it made it, the same
+/// as Synapse's `make_membership_event`), and `origin` is this server's name when the template
+/// left it out. Complement's reference federation server, for one, hands out a template with
+/// neither, and an event without `origin_server_ts` does not even parse.
 fn sign_join_template(
     template: &Value,
     rules: &hs_model::room_version::RoomVersionRules,
@@ -322,6 +328,13 @@ fn sign_join_template(
 ) -> Result<Value, String> {
     let mut canonical = to_canonical_object(template, rules.strict_canonical_json)
         .map_err(|e| format!("join template is not valid canonical JSON: {e}"))?;
+    canonical.insert(
+        "origin_server_ts".to_owned(),
+        CanonicalJsonValue::Integer(now_ms()),
+    );
+    canonical
+        .entry("origin".to_owned())
+        .or_insert_with(|| CanonicalJsonValue::String(own_server_name.to_string()));
     let content_hash = hs_model::hash::content_hash_base64(&canonical);
     canonical.insert(
         "hashes".to_owned(),
@@ -344,9 +357,25 @@ fn sign_join_template(
         .map_err(|e| format!("signed join event did not round-trip to JSON: {e}"))
 }
 
-/// Reads `body[field]` as an array of raw PDUs and verifies each one, failing on the first that
-/// does not verify (a resident server that hands back even one unverifiable event in its own
-/// state snapshot is not a resident server worth trusting further).
+fn now_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+/// Reads `body[field]` as an array of raw PDUs and verifies each one, **dropping** any that do
+/// not verify. A resident relays events from every server that was ever in the room, and one of
+/// those servers' keys being unobtainable, or one event arriving with its signatures stripped,
+/// says nothing about the rest: the spec's rule for a received event that fails verification is
+/// to drop that event, and a join must not fail because of it (Complement's
+/// `TestJoinFederatedRoomWithUnverifiableEvents`, which strips or corrupts the signature on one
+/// state event and expects the join to succeed). What was dropped is logged with its reason, and
+/// [`OutboundJoinError::UnverifiedEvent`] is kept for the one case that is not survivable: a
+/// snapshot in which nothing verified at all.
 async fn verify_array(
     body: &Value,
     field: &'static str,
@@ -361,14 +390,30 @@ async fn verify_array(
         )
     })?;
     let mut verified = Vec::with_capacity(raw_events.len());
+    let mut first_failure: Option<PduError> = None;
     for raw in raw_events {
-        let event = verify_pdu(raw, room_version, key_cache)
-            .await
-            .map_err(|source| OutboundJoinError::UnverifiedEvent {
-                destination: destination.to_owned(),
-                source,
-            })?;
-        verified.push(event);
+        match verify_pdu(raw, room_version, key_cache).await {
+            Ok(event) => verified.push(event),
+            Err(failure) => {
+                tracing::warn!(
+                    destination,
+                    field,
+                    event_type = raw.get("type").and_then(serde_json::Value::as_str).unwrap_or("?"),
+                    sender = raw.get("sender").and_then(serde_json::Value::as_str).unwrap_or("?"),
+                    %failure,
+                    "dropping an event from a send_join response that did not verify"
+                );
+                first_failure.get_or_insert(failure);
+            }
+        }
+    }
+    if verified.is_empty()
+        && let Some(source) = first_failure
+    {
+        return Err(OutboundJoinError::UnverifiedEvent {
+            destination: destination.to_owned(),
+            source,
+        });
     }
     Ok(verified)
 }
@@ -825,6 +870,90 @@ mod tests {
                  always redacts before checking a signature",
             );
         assert!(err.to_string().contains("does not verify"), "{err}");
+    }
+
+    /// Complement's reference federation server answers `make_join` with a template that has
+    /// neither `origin_server_ts` nor `origin`; the joiner supplies both, or the signed event
+    /// does not even parse and every join through that server fails.
+    #[test]
+    fn a_template_without_a_timestamp_or_origin_is_completed_before_signing() {
+        let keys = OwnSigningKeys::from_keys(vec![own_signing_key()]);
+        let server_name = ServerName::parse("joiner.example.org").unwrap();
+        let rules = hs_model::room_version::rules_for(&RoomVersionId::V11).unwrap();
+        let template = serde_json::json!({
+            "type": "m.room.member",
+            "room_id": "!room:resident.example.org",
+            "sender": "@alice:joiner.example.org",
+            "state_key": "@alice:joiner.example.org",
+            "content": {"membership": "join"},
+            "prev_events": ["$prev"],
+            "auth_events": ["$create"],
+            "depth": 4,
+        });
+        let before = now_ms();
+        let signed = sign_join_template(&template, &rules, &server_name, keys.primary()).unwrap();
+        let ts = signed["origin_server_ts"].as_i64().unwrap();
+        assert!(
+            ts >= before && ts <= now_ms(),
+            "origin_server_ts is this server's clock"
+        );
+        assert_eq!(signed["origin"], "joiner.example.org");
+        Event::parse(&signed, RoomVersionId::V11).expect("the completed event parses");
+    }
+
+    /// One event with its signatures stripped does not sink the join: it is dropped, the rest
+    /// are kept, and only a snapshot in which nothing verifies is an error.
+    #[tokio::test]
+    async fn verify_array_drops_what_does_not_verify_and_keeps_the_rest() {
+        let keys = OwnSigningKeys::from_keys(vec![own_signing_key()]);
+        let cache = key_cache(&keys, "resident.example.org");
+        let good = signed_state_event(
+            &keys,
+            "!r:resident.example.org",
+            "m.room.name",
+            "@creator:resident.example.org",
+            "",
+            serde_json::json!({"name": "signed"}),
+            vec![],
+            vec![],
+            2,
+        );
+        let mut stripped = signed_state_event(
+            &keys,
+            "!r:resident.example.org",
+            "m.room.name",
+            "@creator:resident.example.org",
+            "",
+            serde_json::json!({"name": "no signature"}),
+            vec![],
+            vec![],
+            3,
+        );
+        stripped["signatures"] = serde_json::json!({});
+
+        let body = serde_json::json!({"state": [good.clone(), stripped.clone()]});
+        let kept = verify_array(&body, "state", &RoomVersionId::V11, &cache, "resident")
+            .await
+            .unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].event_id().as_str(), event_id_of(&good));
+
+        let nothing = serde_json::json!({"state": [stripped]});
+        let err = verify_array(&nothing, "state", &RoomVersionId::V11, &cache, "resident")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, OutboundJoinError::UnverifiedEvent { .. }),
+            "{err}"
+        );
+
+        let empty = serde_json::json!({"state": []});
+        assert!(
+            verify_array(&empty, "state", &RoomVersionId::V11, &cache, "resident")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

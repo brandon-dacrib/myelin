@@ -17,9 +17,19 @@ if [ ! -f "$CERT_DIR/server.crt" ]; then
   openssl req -new -sha256 -key "$CERT_DIR/server.key" \
     -subj "/C=US/ST=CA/O=hs-reimplement complement/CN=$SERVER_NAME" \
     -out "$CERT_DIR/server.csr"
+  # Complement's recipe stops at a CN. A certificate with no subject alternative name is
+  # rejected by rustls, which is what this server's own outbound client is built on, so the
+  # federation requests between two homeservers in one blueprint (hs1 joining hs2's room) all
+  # failed at the TLS handshake -- invisibly, until the client's error started reporting its
+  # cause. A real deployment's certificate always carries a SAN; this one now does too.
+  case "$SERVER_NAME" in
+    *[!0-9.]*) SAN="DNS:${SERVER_NAME%%:*}" ;;
+    *) SAN="IP:${SERVER_NAME%%:*}" ;;
+  esac
+  printf 'subjectAltName = %s\n' "$SAN" > "$CERT_DIR/server.ext"
   openssl x509 -req -in "$CERT_DIR/server.csr" \
     -CA /complement/ca/ca.crt -CAkey /complement/ca/ca.key -CAcreateserial \
-    -out "$CERT_DIR/server.crt" -days 1 -sha256
+    -out "$CERT_DIR/server.crt" -days 1 -sha256 -extfile "$CERT_DIR/server.ext"
 fi
 
 # Complement runs several homeservers in one blueprint that federate with each other, so this
