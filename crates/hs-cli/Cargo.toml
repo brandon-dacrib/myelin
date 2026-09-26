@@ -34,6 +34,8 @@ hs-media = { path = "../hs-media" }
 hs-appservice = { path = "../hs-appservice" }
 hs-admin = { path = "../hs-admin" }
 hs-model = { path = "../hs-model" }
+# `hs operator`: the Bridge controller (docs/rfcs/0017).
+hs-operator = { path = "../hs-operator" }
 object_store = { workspace = true }
 
 async-trait = { workspace = true }

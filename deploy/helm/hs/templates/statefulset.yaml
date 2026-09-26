@@ -161,6 +161,17 @@ spec:
             - name: HS__TELEMETRY__SENTRY__DSN_FILE
               value: /etc/hs/secrets/sentry-dsn
             {{- end }}
+            {{- if .Values.bridges.enabled }}
+            ## The server deploys bridges (docs/rfcs/0017, 4.5): with both set it writes `Bridge`
+            ## resources into this namespace with its service account's token (bridges-rbac.yaml
+            ## allows it), and each bridge reaches the server at the in-cluster URL.
+            - name: MYELIN_BRIDGES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: MYELIN_BRIDGES_HOMESERVER_URL
+              value: {{ printf "http://%s.%s.svc:%v" (include "hs.fullname" .) .Release.Namespace .Values.service.clientPort | quote }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

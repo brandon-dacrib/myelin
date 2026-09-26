@@ -42,6 +42,25 @@ app.kubernetes.io/name: {{ include "hs.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
+{{/*
+The bridge operator's labels. A name of its own (`<name>-bridges-operator`), so nothing that
+selects the server's pods by hs.selectorLabels selects the operator's too.
+*/}}
+{{- define "hs.bridgesOperatorSelectorLabels" -}}
+app.kubernetes.io/name: {{ printf "%s-bridges-operator" (include "hs.name" .) | trunc 63 | trimSuffix "-" }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+
+{{- define "hs.bridgesOperatorLabels" -}}
+helm.sh/chart: {{ include "hs.chart" . }}
+{{ include "hs.bridgesOperatorSelectorLabels" . }}
+app.kubernetes.io/component: bridges-operator
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end -}}
+
 {{- define "hs.serviceAccountName" -}}
 {{- if .Values.serviceAccount.create -}}
 {{ default (include "hs.fullname" .) .Values.serviceAccount.name }}

@@ -1,5 +1,103 @@
 # 12. Platform and Kubernetes
 
+## The operator deploys bridges: RFC 0017's Kubernetes half (2026-09-26, evening)
+
+`docs/rfcs/0017-the-server-deploys-its-own-bridges.md` sections 2, 4.4 and 4.5. Built, and
+verified by unit tests and `helm template`; **nothing here has run against a cluster yet.** The
+next step is a kind (or the dacrib0 demo) run: install the chart, apply a `Bridge` by hand and
+watch it reach `Ready`, then let `crates/hs-bridges` drive it.
+
+### What was built
+
+- **`Bridge` CRD, new shape** (`crates/hs-operator/src/crds/bridge.rs`): `bridgeType`,
+  `appserviceId`, `image`, `port`, `filesSecret`, `args`, `storage {size: 1Gi,
+  storageClassName}`, `resources`. No `replicas` (one process owns the remote sessions;
+  `Recreate`, never two at once). Print columns Phase, BridgeType, Appservice, Ready.
+  `deploy/crds/*.yaml` regenerated, and copied to `deploy/helm/hs/crds/bridge.yaml` by
+  `gen-crds`; `crds::tests::generated_files_are_up_to_date` fails if either drifts.
+- **Wire fixes to shared types** (`crds/common.rs`): `OperatorStatus` is now camelCase
+  (`observedGeneration`, `readyReplicas`; it was snake_case, so the `Ready` print column never
+  matched), and `ImageSpec.pull_policy` is `pullPolicy`. Nothing had stored a status or a pull
+  policy, so no migration. `ImageSpec::reference()` renders `repo@digest` / `repo:tag` / `repo`.
+- **Builders** (`crates/hs-operator/src/bridge.rs`, pure, 20 tests): `desired_pvc`
+  (`<name>-data`, RWO), `desired_deployment` (1 replica, Recreate, labels
+  `app.kubernetes.io/{name=myelin-bridge,instance,managed-by=myelin-operator}`,
+  `myelin.dev/bridge-type`, label-safe `myelin.dev/appservice-id` with the exact id in an
+  annotation; init container `files` copying each Secret file into `/data` only if absent,
+  Secret mode 0600; the image's own entrypoint, `args`, port `appservice`, TCP readiness 5s/5s,
+  TCP liveness 60s/20s x6, default resources 32Mi/10m, limit 512Mi; no `runAsNonRoot`, no
+  service-account token, no service links; pod annotation `myelin.dev/spec-hash`),
+  `desired_service`, `status_from` (Ready / Degraded on ImagePullBackOff, ErrImagePull,
+  InvalidImageName, CrashLoopBackOff, CreateContainer(Config)Error in init or main containers /
+  Pending with the waiting reason or the scheduler's message; one `Available` condition whose
+  `lastTransitionTime` is kept while its status holds, so an unchanged state compares equal).
+  Everything carries a controller ownerReference to the `Bridge`. The copy script is run for
+  real against temp directories in a test (existing file kept, missing file written, `..data`
+  skipped).
+- **Controller** (`src/controller.rs`): `run(client, namespace)` and `run_with(.., Options {
+  default_storage_class })`. A `kube::runtime::Controller` on the namespace's `Bridge`s, owning
+  Deployments, Services and claims, and watching pods labelled
+  `app.kubernetes.io/managed-by=myelin-operator` mapped back by `app.kubernetes.io/instance`.
+  Reconcile: server-side apply (manager `myelin-operator`, force) of claim, Deployment, Service;
+  list the pods; merge-patch the status only when it changed. Requeue 15s while not Ready, 300s
+  when Ready, 30s after an error. SIGTERM/Ctrl-C shut it down gracefully. The stub reconcilers
+  for the other kinds are untouched and not run.
+- **Client for the homeserver** (`src/deploy.rs`): `KubeBridgeClient` with `new`, `in_cluster`,
+  `namespace`, `service_url`, `apply`, `status`, `delete`, `manifest_yaml`, plus
+  `BridgeInstanceSpec`, `BridgeInstanceStatus`, `DeployError`; additionally `validate`,
+  `files_secret_name`, `FIELD_MANAGER` (`myelin-homeserver`). `apply` validates (DNS-1035 name,
+  port range, Secret-key file names), applies the `Bridge`, then the Secret `<name>-files` with
+  an ownerReference to it. It writes the Secret's `data`, not `stringData`: server-side apply
+  does not track `stringData` keys, so a removed file would never leave the Secret.
+  `manifest_yaml` (for a bridge run on another cluster) does use `stringData`. `delete` is
+  background propagation and also deletes the Secret by name; 404s are success.
+  `hs_operator::connect()` installs `ring` as the rustls provider (the `hs` binary links more
+  than one) and builds a client from kubeconfig or the service account.
+- **`hs operator`** (`crates/hs-cli/src/cli.rs`): `--namespace` (else `POD_NAMESPACE`, else the
+  service account's namespace file), `--default-storage-class`. Telemetry via
+  `hs_telemetry::init` with service name `hs-operator`.
+- **Chart**: `crds/bridge.yaml`; `bridges.{enabled: true, operator.{resources, extraArgs},
+  defaultStorageClassName}`; `templates/bridges-operator.yaml` (ServiceAccount, Role,
+  RoleBinding, one-replica Recreate Deployment running `operator --namespace <release ns>` from
+  the server's image with the chart's security contexts; its pods are labelled
+  `app.kubernetes.io/name: <name>-bridges-operator` so the server's Service, PDB and
+  NetworkPolicy never select them); `templates/bridges-rbac.yaml` (the server's service account
+  may write `bridges` and `secrets` in the release namespace); the StatefulSet gets
+  `MYELIN_BRIDGES_NAMESPACE` (downward API) and `MYELIN_BRIDGES_HOMESERVER_URL`
+  (`http://<fullname>.<ns>.svc:<clientPort>`); NOTES.txt says bridges are deployed by the
+  operator. The server's pod keeps its service-account token (nothing sets
+  `automountServiceAccountToken: false`). CD's chart job also renders `bridges.enabled=false`
+  and fails if any bridge object appears, and diffs the two CRD copies.
+
+### Verified
+
+```
+cargo fmt --all --check                                                  clean
+cargo clippy -p hs-operator -p hs-cli --all-targets -- -D warnings       clean
+cargo test -p hs-operator                                                52 passed
+cargo build -p hs-cli --bin hs                                           ok
+hs operator --help                                                       prints the two flags
+hs operator            (no namespace anywhere)                           exit 2, says how to pass one
+KUBECONFIG=/nonexistent hs operator --namespace myelin                   exit 1, "cannot reach the Kubernetes API"
+helm lint deploy/helm/hs --set serverName=example.org                    0 failed
+helm template (singleNode; cluster with postgres/s3/signing key)         Deployment + 2 Roles + 2 RoleBindings + 2 SAs added
+helm template --set bridges.enabled=false                                none of them, no MYELIN_BRIDGES_*
+diff deploy/crds/bridge.yaml deploy/helm/hs/crds/bridge.yaml             identical
+```
+
+### Not verified, and known limits
+
+- No cluster run: server-side apply of the three objects, the pod watch, the status patch and
+  the RBAC are all unexercised against a real API server.
+- Helm installs `crds/` on `helm install` only, never on upgrade, and regardless of
+  `bridges.enabled` (Helm cannot template `crds/`); `--skip-crds` skips it. After a CRD change,
+  `kubectl apply -f deploy/helm/hs/crds/bridge.yaml`. This install of the CRD is harmless with
+  bridges off.
+- A change to a bridge's files Secret does not roll its pod, by design: files are only copied
+  when missing. A spec change does (spec-hash annotation).
+- Changing `bridges.defaultStorageClassName` affects new bridges only (a claim's class is
+  immutable; applying a different one to an existing claim would fail its reconcile).
+
 ## A demo an operator can reach: myelin.dacrib.net (2026-09-26, later the same day)
 
 The section below proved the install through a port-forward and tore it down. This one leaves

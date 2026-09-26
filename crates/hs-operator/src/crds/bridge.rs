@@ -1,8 +1,13 @@
-//! The `Bridge` custom resource: runs a bridge process (`mautrix-irc`, a `mautrix-go`-family
-//! bridge, or any other appservice-shaped workload) and links it to an
-//! [`super::appservice::AppService`] registration. `PLAN.md`'s "the `Bridge` flow end to end with
-//! `mautrix-irc`" Phase 1/2 deliverable is what exercises this kind for real; today it is schema
-//! and a stub reconciler only (`docs/status/12-platform-and-kubernetes.md`).
+//! The `Bridge` custom resource: one bridge process (a mautrix bridge, heisenbridge, or any other
+//! appservice-shaped workload), deployed by the operator as a one-replica `Deployment`, a
+//! `Service` and a `PersistentVolumeClaim` (`docs/rfcs/0017-the-server-deploys-its-own-bridges.md`
+//! section 4.4). The operator knows nothing about users: one `Bridge` is one process. The
+//! homeserver's bridge manager (`crates/hs-bridges`) creates them through
+//! [`crate::deploy::KubeBridgeClient`]; [`crate::bridge`] builds the objects each one becomes and
+//! [`crate::controller`] keeps them converged.
+//!
+//! The draft schema this replaces (`appServiceRef`, `replicas`, inline `config`) was never
+//! reconciled by anything; `v1alpha1` allows the break (RFC 0017, 4.4).
 
 use k8s_openapi::api::core::v1::ResourceRequirements;
 use kube::CustomResource;
@@ -12,7 +17,12 @@ use serde::{Deserialize, Serialize};
 use super::common::{ImageSpec, OperatorStatus};
 
 /// `spec` of a `Bridge`.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, CustomResource)]
+///
+/// There is deliberately no `replicas` field. A bridge owns its remote-network sessions (a
+/// WhatsApp or Signal login is one client) and its SQLite database, so two copies running at once
+/// would be two clients on one session. The operator always runs exactly one replica and rolls it
+/// out with the `Recreate` strategy, so an old and a new pod never overlap.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, CustomResource)]
 #[kube(
     group = "hs.matrix.org",
     version = "v1alpha1",
@@ -22,41 +32,65 @@ use super::common::{ImageSpec, OperatorStatus};
     status = "OperatorStatus",
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"BridgeType","type":"string","jsonPath":".spec.bridgeType"}"#,
+    printcolumn = r#"{"name":"Appservice","type":"string","jsonPath":".spec.appserviceId"}"#,
     printcolumn = r#"{"name":"Ready","type":"integer","jsonPath":".status.readyReplicas"}"#
 )]
 #[serde(rename_all = "camelCase")]
 pub struct BridgeSpec {
-    /// A free-form identifier for which bridge implementation this is (`"mautrix-irc"`,
-    /// `"mautrix-whatsapp"`, ...). Not validated against a fixed enum: new bridges should not
-    /// need a CRD schema change to be deployable.
+    /// Which bridge implementation this is (`"mautrix-whatsapp"`, `"heisenbridge"`, ...), from the
+    /// homeserver's bridge catalogue. Free-form: a new bridge type must not need a CRD change.
     pub bridge_type: String,
-    /// The name of the [`super::appservice::AppService`] this bridge process registers as (same
-    /// namespace).
-    pub app_service_ref: String,
-    /// The bridge's own image.
+    /// The appservice registration id this process answers for (`whatsapp-alice`). Informational
+    /// for the operator (it labels the objects with it); the homeserver's registry is where the
+    /// registration itself lives.
+    pub appservice_id: String,
+    /// The bridge's own image. The container runs the image's own entrypoint.
     pub image: ImageSpec,
-    /// Number of replicas. Most bridge implementations are not horizontally scalable (a single
-    /// process owns the remote-network connection state), so this is expected to stay `1` for
-    /// most bridge types; the field exists for the bridges that do support it.
-    #[serde(default = "default_replicas")]
-    pub replicas: i32,
-    /// The bridge's own configuration file contents (bridge-specific YAML/TOML/JSON — this
-    /// operator does not parse or validate it, it only mounts it), inline. Prefer
-    /// `config_secret_ref` when the config contains credentials.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config: Option<String>,
-    /// A `Secret` key holding the bridge's config file instead of `config` inline, for
-    /// bridge-specific config formats that embed a database password or an API token alongside
-    /// non-secret settings.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config_secret_ref: Option<super::common::SecretKeyRef>,
-    /// Kubernetes resource requests/limits for the bridge container.
+    /// The port the bridge listens on for the homeserver's appservice transactions. The Service
+    /// exposes it under the same number, and the readiness probe is a TCP connect to it.
+    pub port: i32,
+    /// A `Secret` in the same namespace whose every key is copied into `/data` as a file on the
+    /// first start, and only then: a mautrix bridge completes and rewrites its `config.yaml` and
+    /// generates secrets it was not given (`encryption.pickle_key`), so overwriting the file on a
+    /// later start would make its crypto store unreadable.
+    pub files_secret: String,
+    /// Arguments passed to the image's entrypoint (heisenbridge takes its flags here). Empty
+    /// means the image's default command.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// The bridge's volume, mounted at `/data`: its configuration, registration and SQLite
+    /// database.
+    #[serde(default)]
+    pub storage: BridgeStorage,
+    /// Resource requests and limits for the bridge container. When unset the operator requests
+    /// 32Mi and 10m and limits memory to 512Mi.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourceRequirements>,
 }
 
-fn default_replicas() -> i32 {
-    1
+/// The volume a [`BridgeSpec`] keeps its state on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeStorage {
+    /// Requested size, a Kubernetes quantity (`1Gi`).
+    #[serde(default = "default_storage_size")]
+    pub size: String,
+    /// The StorageClass to request; the cluster's default when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_class_name: Option<String>,
+}
+
+impl Default for BridgeStorage {
+    fn default() -> Self {
+        Self {
+            size: default_storage_size(),
+            storage_class_name: None,
+        }
+    }
+}
+
+fn default_storage_size() -> String {
+    "1Gi".to_owned()
 }
 
 #[cfg(test)]
@@ -65,34 +99,56 @@ mod tests {
 
     fn sample() -> BridgeSpec {
         BridgeSpec {
-            bridge_type: "mautrix-irc".to_owned(),
-            app_service_ref: "irc-bridge".to_owned(),
+            bridge_type: "mautrix-whatsapp".to_owned(),
+            appservice_id: "whatsapp-alice".to_owned(),
             image: ImageSpec {
-                repository: "dock.mau.dev/mautrix/irc".to_owned(),
+                repository: "dock.mau.dev/mautrix/whatsapp".to_owned(),
                 tag: Some("latest".to_owned()),
                 digest: None,
                 pull_policy: None,
             },
-            replicas: 1,
-            config: Some("homeserver:\n  address: http://hs:8008\n".to_owned()),
-            config_secret_ref: None,
+            port: 29318,
+            files_secret: "bridge-1a2b3c4d-files".to_owned(),
+            args: Vec::new(),
+            storage: BridgeStorage::default(),
             resources: None,
         }
     }
 
     #[test]
-    fn spec_round_trips_through_json() {
+    fn spec_round_trips_through_json_in_camel_case() {
         let spec = sample();
         let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["bridgeType"], "mautrix-whatsapp");
+        assert_eq!(json["appserviceId"], "whatsapp-alice");
+        assert_eq!(json["filesSecret"], "bridge-1a2b3c4d-files");
+        assert_eq!(json["storage"]["size"], "1Gi");
         let back: BridgeSpec = serde_json::from_value(json).unwrap();
-        assert_eq!(back.bridge_type, spec.bridge_type);
+        assert_eq!(back, spec);
     }
 
     #[test]
-    fn spec_round_trips_through_yaml() {
-        let spec = sample();
-        let yaml = serde_yaml_ng::to_string(&spec).unwrap();
-        let back: BridgeSpec = serde_yaml_ng::from_str(&yaml).unwrap();
-        assert_eq!(back.app_service_ref, spec.app_service_ref);
+    fn the_rfc_example_parses_with_defaults() {
+        let yaml = r"
+bridgeType: mautrix-whatsapp
+appserviceId: whatsapp-alice
+image: { repository: dock.mau.dev/mautrix/whatsapp, tag: latest }
+port: 29318
+filesSecret: bridge-1a2b3c4d-files
+";
+        let spec: BridgeSpec = serde_yaml_ng::from_str(yaml).unwrap();
+        assert!(spec.args.is_empty());
+        assert_eq!(spec.storage, BridgeStorage::default());
+        assert!(spec.resources.is_none());
+    }
+
+    #[test]
+    fn the_schema_has_no_replicas_field() {
+        use kube::CustomResourceExt as _;
+        let crd = serde_json::to_value(Bridge::crd()).unwrap();
+        let props = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"];
+        assert!(props.get("replicas").is_none());
+        assert!(props.get("appserviceId").is_some());
     }
 }
