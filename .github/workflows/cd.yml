@@ -24,6 +24,14 @@ name: cd
 # runners rather than under emulation: a Rust compile under QEMU takes long enough to dominate the
 # whole pipeline, and this workspace is large.
 #
+# # What has to be true before anything is tagged
+#
+# Each `image` leg boots the image it just built with the README's `docker run` line and checks
+# it answers; the amd64 leg then installs the Helm chart with that image on a kind cluster, one
+# value, and claims the server through the setup link the pod logs. Both happen inside `image`,
+# so a failure there means `manifest` never runs: no tag moves, no chart is published. The
+# `chart` job's own check afterwards is of what reached the registry, not a second gate.
+#
 # # Provenance
 #
 # Each image gets an SBOM and build provenance attached. That is not ceremony for a homeserver:
@@ -218,6 +226,51 @@ jobs:
           echo "/admin/ serves the interface, and the log offers a setup link"
           docker rm -f myelin-smoke >/dev/null
 
+      - name: Start a kind cluster
+        # For the next step; only on the leg that runs it. The action installs kind and kubectl
+        # and waits for the node to be Ready (about a minute on these runners). Helm is on the
+        # runner image already, and set up explicitly below as the `chart` job does.
+        if: matrix.arch == 'amd64'
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: smoke
+
+      - uses: azure/setup-helm@v4
+        if: matrix.arch == 'amd64'
+
+      - name: Prove the chart installs that image with one value, before anything is tagged
+        # The docker step above proves the image boots under `docker run`. This proves the
+        # other half of the quickstart, `helm install myelin <chart> --set serverName=...`,
+        # with the same image: a kind cluster, the chart from this checkout, `myelin:smoke`
+        # loaded onto the node and pinned with pullPolicy Never so nothing is pulled, and then
+        # what an operator does next -- wait for Ready, read the setup link out of the pod log,
+        # check /health/ready and that /admin/ is the interface through a port-forward, and
+        # claim the server through that link. deploy/helm/hs/ci/install-smoke.sh does it, as a
+        # script rather than steps, so the same check runs by hand against any cluster and its
+        # output reads as a transcript.
+        #
+        # Why here, and not a job of its own or the `chart` job:
+        #
+        # - It has to run before `manifest`. `manifest` creates the tags an operator can pull,
+        #   and `chart` (which needs `manifest`) publishes the chart that names them. A check
+        #   that fails after either has happened is a report, not a gate: the broken image is
+        #   already `main`. A failing step here fails this job, `manifest` never runs, and
+        #   neither does anything after it.
+        # - The image is already here. `myelin:smoke` was built and loaded by the step above,
+        #   from the same context and layer cache as the digest that was pushed. A job of its
+        #   own would build it a third time, or log in and pull the untagged digest back, and
+        #   would then need a special case for a manual dispatch that pushed nothing.
+        # - Only the amd64 leg. The chart does not know what architecture it runs on, and the
+        #   arm64 binary is already proven by the docker step on its native runner; a second
+        #   kind cluster there would cost the same minute and prove nothing new. Measured on
+        #   2026-09-26 (docs/status/12-platform-and-kubernetes.md): the install itself is
+        #   seventeen seconds from `helm install` to Ready on kind.
+        #
+        # The `chart` job keeps its own check, pulling the *published* chart back and rendering
+        # it, because that is the one thing this step cannot see: what reached the registry.
+        if: matrix.arch == 'amd64'
+        run: deploy/helm/hs/ci/install-smoke.sh myelin:smoke --kind smoke
+
       - name: Export the digest
         id: export
         if: github.event_name != 'workflow_dispatch' || inputs.publish
@@ -355,7 +408,9 @@ jobs:
   # to see `main` again, since `0.1.0-main.N` sorts below `0.1.0`.
   #
   # It waits for the manifest list rather than the gate so the image it points at exists before
-  # anything can pull the chart that names it.
+  # anything can pull the chart that names it. That the chart *installs* was already proven by
+  # then, in `image`'s amd64 leg, with this same commit's image and before its tags existed;
+  # this job's check at the end is of the published artifact.
   # ---------------------------------------------------------------------------------------------
   chart:
     name: helm chart
@@ -457,7 +512,8 @@ jobs:
             ```
 
             Multi-architecture (`linux/amd64`, `linux/arm64`), with an SBOM and build provenance
-            attached, and smoke-tested on both architectures before publication.
+            attached, smoke-tested on both architectures before publication, and installed with
+            the Helm chart below on a kind cluster before anything was tagged.
 
             ## Helm chart
 
