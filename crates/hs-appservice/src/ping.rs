@@ -261,6 +261,11 @@ impl<B: KvBackend> PingService<B> {
         match outcome {
             Ok(()) => {
                 health.last_ping_success = Some(true);
+                // A ping that works ends the last failure. The error a page shows is the
+                // current one, not the one from before the retry that succeeded: a bridge
+                // whose first ping raced its own listener is healthy, not "healthy, with an
+                // error".
+                health.last_error = None;
             }
             Err(failure) => {
                 health.last_ping_success = Some(false);
@@ -385,6 +390,23 @@ mod tests {
 
         let health = registry.health("a").unwrap();
         assert!(health.last_error.is_some());
+    }
+
+    /// A mautrix bridge pings the moment its listener starts, and the first one can lose that
+    /// race; it retries five seconds later. The health has to say what is true now.
+    #[tokio::test]
+    async fn a_ping_that_works_clears_the_error_from_the_one_before() {
+        let registry = registry_with("a", Some("http://bridge.local"));
+        let transport = Arc::new(MockTransport::failing("connection refused"));
+        let service = PingService::new(registry.clone(), transport.clone());
+
+        service.ping("a", None).await.unwrap().unwrap_err();
+        assert!(registry.health("a").unwrap().last_error.is_some());
+
+        *transport.result.lock().unwrap() = Ok(());
+        service.ping("a", None).await.unwrap().unwrap();
+        let health = registry.health("a").unwrap();
+        assert!(health.last_error.is_none(), "{health:?}");
     }
 
     #[tokio::test]
