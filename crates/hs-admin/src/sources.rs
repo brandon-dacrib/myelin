@@ -1792,6 +1792,10 @@ impl InMemoryAppserviceDirectory {
                 row.health.status.clone()
             },
             created_at: row.created_at.clone(),
+            bridge_type: r
+                .get(crate::bridge_types::BRIDGE_TYPE_KEY)
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             links: AdminAppserviceLinks::default(),
         }
     }

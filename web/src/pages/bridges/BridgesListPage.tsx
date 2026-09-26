@@ -3,37 +3,41 @@ import { useNavigate, useSearch, Link } from "@tanstack/react-router";
 import { Cable, Play, Pause } from "lucide-react";
 import {
   useAppservices,
+  useBridgeTypes,
   usePauseAppservice,
   useResumeAppservice,
-  deriveDisplayName,
-  deriveKindLabel,
   type AppService,
+  type AppServiceHealthStatus,
 } from "@/api/bridges";
+import { useServerInfo } from "@/api/dashboard";
+import { BridgeGlyph } from "@/components/BridgeGlyph";
 import { Button } from "@/components/ui/button/Button";
 import { Badge } from "@/components/ui/badge/Badge";
-import { Select } from "@/components/ui/select/Select";
 import { DataTable, type Column, type SortState } from "@/components/ui/table/DataTable";
 import { EmptyState } from "@/components/ui/empty-state/EmptyState";
 import { ForbiddenState } from "@/components/ui/error-state/ErrorState";
 import { QueryProblemState } from "@/components/QueryProblemState";
 import { toast } from "@/components/ui/toast/toast-store";
 import { hasScope } from "@/lib/auth";
+import {
+  bridgeKind,
+  bridgeTitle,
+  bridgeTypeOf,
+  botMatrixId,
+  healthCounts,
+  sortByAttention,
+} from "@/lib/bridge-catalogue";
 import { bridgeHealthMeta, healthKeyOf } from "@/lib/bridge-state";
+import { cn } from "@/lib/cn";
 
-const HEALTH_OPTIONS = [
-  { value: "healthy", label: "Healthy" },
-  { value: "degraded", label: "Degraded" },
-  { value: "down", label: "Down" },
-  { value: "paused", label: "Paused" },
-  { value: "unknown", label: "Unknown" },
-];
+const HEALTH_ORDER: AppServiceHealthStatus[] = ["down", "degraded", "unknown", "healthy", "paused"];
 
 /**
  * `/bridges` — "are the bridges connected and keeping up?"
- * (information-architecture.md, Bridges). `GET /appservices` has no
- * `state`/`kind` filter parameter (only free-text `q`), so the health
- * filter below applies client-side to the loaded page only; see the
- * reconciliation note in api/bridges.ts and
+ * (information-architecture.md, Bridges). The summary strip answers that before the table
+ * does, and the table reads attention-first. `GET /appservices` has no `state`/`kind` filter
+ * parameter (only free-text `q`), so the health filter applies client-side to the loaded page
+ * only; see the reconciliation note in api/bridges.ts and
  * docs/status/16-management-web-interface.md.
  */
 export function BridgesListPage() {
@@ -42,6 +46,7 @@ export function BridgesListPage() {
   const [sort, setSort] = useState<SortState | undefined>();
   const [cursorStack, setCursorStack] = useState<(string | undefined)[]>([]);
   const canRead = hasScope("bridges:read");
+  const canWrite = hasScope("bridges:write");
 
   // Every hook below runs unconditionally regardless of scope (rules of
   // hooks); the scope gate only affects what is rendered, further down.
@@ -49,46 +54,63 @@ export function BridgesListPage() {
     cursor: search.cursor,
     limit: 20,
   });
+  const { data: types } = useBridgeTypes();
+  const { data: server } = useServerInfo();
 
   const pause = usePauseAppservice();
   const resume = useResumeAppservice();
 
+  const all = useMemo(() => data?.items ?? [], [data]);
+  const counts = useMemo(() => healthCounts(all), [all]);
+
   const rows = useMemo(() => {
-    let items = data?.items ?? [];
+    let items = all;
     if (search.state) {
       items = items.filter((b) =>
         search.state === "paused" ? b.paused : !b.paused && b.health === search.state,
       );
     }
-    if (!sort) return items;
+    if (!sort) return sortByAttention(items);
     const sorted = [...items].sort((a, b) => {
-      if (sort.key === "name") return deriveDisplayName(a).localeCompare(deriveDisplayName(b));
+      if (sort.key === "name")
+        return bridgeTitle(a, bridgeTypeOf(a, types)).localeCompare(
+          bridgeTitle(b, bridgeTypeOf(b, types)),
+        );
       return 0;
     });
     return sort.direction === "desc" ? sorted.reverse() : sorted;
-  }, [data, sort, search.state]);
+  }, [all, sort, search.state, types]);
 
   const columns: Column<AppService>[] = [
     {
       key: "name",
-      header: "Name",
+      header: "Bridge",
       sortable: true,
       priority: 1,
       // Renders a real link: this is the row's desktop activation control
       // (DataTable's onRowClick doc comment explains why the row itself
       // isn't one).
       interactive: true,
-      render: (b) => (
-        <Link
-          to="/bridges/$bridgeId"
-          params={{ bridgeId: b.id ?? "" }}
-          className="font-medium text-text hover:text-accent hover:underline"
-        >
-          {deriveDisplayName(b)}
-        </Link>
-      ),
+      render: (b) => {
+        const type = bridgeTypeOf(b, types);
+        return (
+          <span className="flex items-center gap-3">
+            <BridgeGlyph category={type?.category} size="sm" />
+            <span className="flex min-w-0 flex-col">
+              <Link
+                to="/bridges/$bridgeId"
+                params={{ bridgeId: b.id ?? "" }}
+                className="truncate font-medium text-text hover:text-accent hover:underline"
+              >
+                {bridgeTitle(b, type)}
+              </Link>
+              <span className="truncate text-xs text-text-muted">{bridgeKind(b, type)}</span>
+            </span>
+          </span>
+        );
+      },
+      renderCompact: (b) => bridgeTitle(b, bridgeTypeOf(b, types)),
     },
-    { key: "kind", header: "Kind", priority: 2, render: (b) => deriveKindLabel(b) },
     {
       key: "state",
       header: "State",
@@ -100,63 +122,69 @@ export function BridgesListPage() {
       renderCompact: (b) => bridgeHealthMeta[healthKeyOf(b)].label,
     },
     {
-      key: "sender_localpart",
-      header: "Sender",
+      key: "bot",
+      header: "Bot",
       priority: 2,
-      render: (b) => <span className="font-identifier">{b.sender_localpart}</span>,
+      render: (b) => (
+        <span className="font-identifier text-text-muted">
+          {botMatrixId(b.sender_localpart, server?.name)}
+        </span>
+      ),
     },
     {
       key: "created_at",
-      header: "Created",
+      header: "Added",
       priority: 3,
-      render: (b) => (b.created_at ? new Date(b.created_at).toLocaleDateString() : "\u2014"),
+      render: (b) => (b.created_at ? new Date(b.created_at).toLocaleDateString() : "—"),
     },
     {
       key: "actions",
       header: "Actions",
       priority: 1,
+      align: "end",
       // Renders real buttons: must stay outside the card fallback's tap
       // target (see the `interactive` doc comment on Column).
       interactive: true,
-      render: (b) => (
-        <div className="flex justify-end gap-1">
-          {b.paused ? (
-            <Button
-              variant="ghost"
-              size="icon"
-              aria-label={`Resume ${deriveDisplayName(b)}`}
-              disabled={!hasScope("bridges:write")}
-              title={!hasScope("bridges:write") ? "Needs bridges:write" : undefined}
-              onClick={() => {
-                resume.mutate(b.id ?? "", {
-                  onSuccess: () => toast({ title: `Bridge ${deriveDisplayName(b)} resumed` }),
-                  onError: () =>
-                    toast({ title: `Couldn't resume ${deriveDisplayName(b)}`, variant: "danger" }),
-                });
-              }}
-            >
-              <Play size={14} aria-hidden="true" />
-            </Button>
-          ) : (
-            <Button
-              variant="ghost"
-              size="icon"
-              aria-label={`Pause ${deriveDisplayName(b)}`}
-              disabled={!hasScope("bridges:write")}
-              title={!hasScope("bridges:write") ? "Needs bridges:write" : undefined}
-              onClick={() => {
-                pause.mutate(b.id ?? "", {
-                  onSuccess: () => toast({ title: `Bridge ${deriveDisplayName(b)} paused` }),
-                  onError: () =>
-                    toast({ title: `Couldn't pause ${deriveDisplayName(b)}`, variant: "danger" }),
-                });
-              }}
-            >
-              <Pause size={14} aria-hidden="true" />
-            </Button>
-          )}
-        </div>
-      ),
+      render: (b) => {
+        const title = bridgeTitle(b, bridgeTypeOf(b, types));
+        return (
+          <div className="flex justify-end gap-1">
+            {b.paused ? (
+              <Button
+                variant="ghost"
+                size="icon"
+                aria-label={`Resume ${title}`}
+                disabled={!canWrite}
+                title={!canWrite ? "Needs bridges:write" : undefined}
+                onClick={() => {
+                  resume.mutate(b.id ?? "", {
+                    onSuccess: () => toast({ title: `Bridge ${title} resumed` }),
+                    onError: () => toast({ title: `Couldn't resume ${title}`, variant: "danger" }),
+                  });
+                }}
+              >
+                <Play size={14} aria-hidden="true" />
+              </Button>
+            ) : (
+              <Button
+                variant="ghost"
+                size="icon"
+                aria-label={`Pause ${title}`}
+                disabled={!canWrite}
+                title={!canWrite ? "Needs bridges:write" : undefined}
+                onClick={() => {
+                  pause.mutate(b.id ?? "", {
+                    onSuccess: () => toast({ title: `Bridge ${title} paused` }),
+                    onError: () => toast({ title: `Couldn't pause ${title}`, variant: "danger" }),
+                  });
+                }}
+              >
+                <Pause size={14} aria-hidden="true" />
+              </Button>
+            )}
+          </div>
+        );
+      },
     },
   ];
 
@@ -172,32 +200,44 @@ export function BridgesListPage() {
   return (
     <div className="mx-auto max-w-[90rem] p-6">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <h1 className="text-xl text-text">Bridges</h1>
+        <div>
+          <h1 className="text-xl text-text">Bridges</h1>
+          <p className="mt-0.5 text-sm text-text-muted">
+            Other networks, connected to this server. Each bridge runs as its own process and
+            registers here.
+          </p>
+        </div>
         <Button
-          disabled={!hasScope("bridges:write")}
-          title={!hasScope("bridges:write") ? "Needs bridges:write" : undefined}
+          disabled={!canWrite}
+          title={!canWrite ? "Needs bridges:write" : undefined}
           onClick={() => navigate({ to: "/bridges/new" })}
         >
           Add bridge
         </Button>
       </div>
 
-      <div className="mt-4 flex flex-wrap gap-3">
-        <div className="w-48">
-          <Select
-            aria-label="Filter by state"
-            placeholder="All states"
-            options={HEALTH_OPTIONS}
-            value={search.state ?? ""}
-            onValueChange={(v) => navigate({ search: { ...search, state: v || undefined } })}
+      {!isError && all.length > 0 && (
+        <div className="mt-5 flex flex-wrap items-center gap-2" aria-label="Filter by state">
+          <FilterChip
+            label="All"
+            count={all.length}
+            active={!search.state}
+            onClick={() => navigate({ search: { ...search, state: undefined } })}
           />
+          {HEALTH_ORDER.filter((h) => counts[h] > 0).map((h) => (
+            <FilterChip
+              key={h}
+              label={bridgeHealthMeta[h].label}
+              count={counts[h]}
+              status={bridgeHealthMeta[h].status}
+              active={search.state === h}
+              onClick={() =>
+                navigate({ search: { ...search, state: search.state === h ? undefined : h } })
+              }
+            />
+          ))}
         </div>
-        {search.state && (
-          <Button variant="ghost" onClick={() => navigate({ search: {} })}>
-            Clear filters
-          </Button>
-        )}
-      </div>
+      )}
 
       {isError && (
         <div className="mt-6">
@@ -228,10 +268,13 @@ export function BridgesListPage() {
                 <EmptyState
                   variant="filtered"
                   icon={<Cable aria-hidden="true" />}
-                  title="No bridges match these filters"
+                  title="No bridges in this state"
                   action={
-                    <Button variant="ghost" onClick={() => navigate({ search: {} })}>
-                      Clear filters
+                    <Button
+                      variant="ghost"
+                      onClick={() => navigate({ search: { ...search, state: undefined } })}
+                    >
+                      Show all
                     </Button>
                   }
                 />
@@ -239,9 +282,10 @@ export function BridgesListPage() {
                 <EmptyState
                   icon={<Cable aria-hidden="true" />}
                   title="No bridges yet"
-                  description="Bridges connect WhatsApp, Signal, Telegram and other networks to this server."
+                  description="Connect WhatsApp, Signal, Telegram, Discord, Slack, IRC and more. Adding one takes a minute; each person then signs in from a chat with the bridge's bot."
+                  docsHref="https://docs.mau.fi/bridges/"
                   action={
-                    hasScope("bridges:write") ? (
+                    canWrite ? (
                       <Button onClick={() => navigate({ to: "/bridges/new" })}>Add bridge</Button>
                     ) : undefined
                   }
@@ -266,5 +310,47 @@ export function BridgesListPage() {
         </div>
       )}
     </div>
+  );
+}
+
+/** One state and how many bridges are in it; pressing it filters the table to that state. */
+function FilterChip({
+  label,
+  count,
+  status,
+  active,
+  onClick,
+}: {
+  label: string;
+  count: number;
+  status?: "success" | "warning" | "danger" | "info" | "muted" | "neutral";
+  active: boolean;
+  onClick: () => void;
+}) {
+  const dot = {
+    success: "bg-success",
+    warning: "bg-warning",
+    danger: "bg-danger",
+    info: "bg-info",
+    muted: "bg-muted-status",
+    neutral: "bg-text-faint",
+  }[status ?? "neutral"];
+  return (
+    <button
+      type="button"
+      aria-pressed={active}
+      onClick={onClick}
+      className={cn(
+        "inline-flex items-center gap-2 rounded-full border px-3 py-1 text-sm transition-colors duration-fast",
+        active
+          ? "border-accent bg-accent-muted text-accent"
+          : "border-border bg-surface text-text-muted hover:bg-surface-sunken hover:text-text",
+        "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus)]",
+      )}
+    >
+      {status && <span aria-hidden="true" className={cn("size-2 rounded-full", dot)} />}
+      {label}
+      <span className="tabular-nums">{count}</span>
+    </button>
   );
 }

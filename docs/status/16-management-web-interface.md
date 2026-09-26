@@ -1,6 +1,71 @@
 # 16. Management web interface: status
 
-## Current update: 2026-09-23
+## Current update: 2026-09-25
+
+**Bridges are the marquee page they were meant to be, and a real mautrix bridge came through
+them.** Read against <https://docs.mau.fi/bridges/> and the `bridgev2` example config, the
+section now does what an operator otherwise reads those pages to do:
+
+- **The catalogue says what each bridge is.** `GET /bridge-types` entries carry a one-line
+  description, a category (`messaging`, `social`, `irc`, `integrations`), the project's
+  documentation link, the port the bridge listens on, whether a render writes its config, and
+  the bridge's own sign-in steps (`sign_in.steps`, `{bot}` for the bot's Matrix ID, plus the
+  documentation's caveats as `notes`). The Kind step groups by category, searches, shows what
+  each needs, and links the chosen one's documentation.
+- **A render writes the bridge's `config.yaml`**, not only its registration: everything that
+  ties a mautrix bridge to this server (addresses both ways, tokens, bot, ghost template,
+  database, permissions with the operator as administrator, backfill, double puppeting through
+  the bridge's own token, encryption in appservice mode). The bridge completes the rest on
+  first start; verified, see below. Non-mautrix runtimes get the registration and the Compose
+  notes as before.
+- **The registration remembers its bridge type** (`io.myelin.bridge_type`, kept by the
+  registry with the other unknown keys), and `AppService.bridge_type` reads it back. The list
+  and detail pages show the catalogue's name and glyph instead of "Custom appservice", and the
+  detail's **Sign in** tab (was "Logins") shows the numbered steps for *this* bridge with its
+  bot's real Matrix ID, or says honestly that an appservice added outside the catalogue has no
+  guide.
+- **Deployment asks for both addresses**: this server as the bridge reaches it and the bridge
+  as this server reaches it, each defaulting to the Compose or Kubernetes service name and
+  following the id, namespace and deployment until the operator types into them
+  (`applyPatch` in `wizard-state.ts`, unit-tested). That is what makes "bridge in Docker,
+  server on this laptop" work without editing a file.
+- **The Created page is a runbook**: save the files (config, registration, Compose or Bridge
+  resource, tokens shown once), start it (the exact command), watch it connect (the page polls
+  every five seconds and turns green on the first ping; down or degraded shows the error and
+  where the log is), sign in (the guide). "Open bridge" is a link styled as a button, not a
+  button inside a link.
+- **The list reads attention-first** (down, degraded, unknown, healthy, paused), with a
+  summary strip of counts that filters the table, a glyph and the kind under each name, and
+  the bot's Matrix ID.
+
+**Verified against the real binary, in a real browser, with a real bridge**
+(`docs/bridges/mautrix.md`, `web/e2e-real/add-mautrix-bridge.spec.ts`): WhatsApp chosen,
+both addresses set for Docker-beside-the-host, created, the two files saved as the page
+showed them, `docker run`, and the Created page turned green in about seven seconds while the
+bridge logged MSC4190 device creation and "End-to-bridge encryption is in appservice mode".
+The bridge completed the wizard's 40-line config to 666 lines itself. The run found one
+server defect, fixed in track 11: a ping that succeeded did not clear the error from the one
+before it, so a bridge whose first ping raced its own listener was "healthy, with an error".
+Screenshots: `docs/design/screenshots/bridge-*-real-whatsapp.png` (real) and
+`bridges-list.png`, `bridge-wizard-kind.png`, `bridge-wizard-deployment.png`,
+`bridge-detail-sign-in.png` (mock).
+
+Checks: `npm run check` green; `cargo test -p hs-admin -p hs-appservice` green; all 22 mock
+Playwright tests pass (the add-bridge spec now asserts the config preview, the runbook, the
+sign-in guide and the detail's Sign in tab; the list spec asserts the order and the summary
+strip); the real suite's stale "bridges are 501" test now asserts the real list; the new real
+bridge spec passes and is opt-in (`HS_REAL_BRIDGE_RUN=1`).
+
+API changes, additive, recorded in 15's status: `BridgeType.{description,category,docs_url,
+port,renders_config,sign_in}`, `BridgeTypeRenderResult.config_yaml`,
+`AppService.bridge_type`; the render request takes `homeserverAddress`, `bridgeAddress` and
+`adminUser`.
+
+Still open in this section: per-user login *state* (who is signed in to the bridge) is not
+something the admin API can see, because the bridges keep it; `links.login_url` is still
+never set; Kubernetes deployment produces a resource for an operator not yet written.
+
+## Update: 2026-09-23
 
 The Audit log is a working section at `/audit`, backed by the real `audit_log.list/get/export`
 operations. Filters and cursor are in the URL; the list links to entry details and resource

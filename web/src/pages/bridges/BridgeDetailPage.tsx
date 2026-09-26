@@ -7,14 +7,16 @@ import {
   useAppserviceHealth,
   useAppserviceBacklog,
   useAppserviceRegistration,
+  useBridgeTypes,
   usePauseAppservice,
   useResumeAppservice,
   useRotateAppserviceTokens,
   useReplayAppserviceBacklog,
   useDeleteAppservice,
-  deriveDisplayName,
-  deriveKindLabel,
 } from "@/api/bridges";
+import { useServerInfo } from "@/api/dashboard";
+import { BridgeGlyph } from "@/components/BridgeGlyph";
+import { BridgeSignInGuide } from "@/components/BridgeSignInGuide";
 import { Button } from "@/components/ui/button/Button";
 import { Badge } from "@/components/ui/badge/Badge";
 import { Dialog, DialogTrigger, DialogClose, DialogContent } from "@/components/ui/dialog/Dialog";
@@ -25,17 +27,26 @@ import { CopyableId } from "@/components/CopyableId";
 import { RelativeTime } from "@/components/RelativeTime";
 import { toast } from "@/components/ui/toast/toast-store";
 import { hasScope } from "@/lib/auth";
+import { bridgeKind, bridgeTitle, bridgeTypeOf, botMatrixId } from "@/lib/bridge-catalogue";
 import { bridgeHealthMeta, formatBacklogEntry, healthKeyOf } from "@/lib/bridge-state";
 import { cn } from "@/lib/cn";
 
-const TABS = ["overview", "logins", "registration", "transactions", "danger"] as const;
+const TABS = ["overview", "sign-in", "registration", "transactions", "danger"] as const;
+const TAB_LABELS: Record<(typeof TABS)[number], string> = {
+  overview: "Overview",
+  "sign-in": "Sign in",
+  registration: "Registration",
+  transactions: "Transactions",
+  danger: "Danger",
+};
 
 /**
  * `/bridges/:id` — bridge detail (information-architecture.md, Bridges >
  * Bridge detail). Reconciled 2026-09-18 against the real `AppService`
- * resource: see api/bridges.ts's doc comment for what changed. The Logins
- * tab is honest about a real gap rather than fabricating data the API does
- * not expose — see that tab's content below.
+ * resource: see api/bridges.ts's doc comment for what changed. The Sign in
+ * tab says how a person signs in to *this* bridge, from its catalogue entry
+ * (`bridge_type`), rather than fabricating per-user login state the API does
+ * not expose.
  */
 export function BridgeDetailPage() {
   const { bridgeId } = useParams({ from: "/bridges/$bridgeId" });
@@ -44,6 +55,8 @@ export function BridgeDetailPage() {
   const [activeTab, setActiveTab] = useState<(typeof TABS)[number]>("overview");
   const { data: bridge, isLoading, isError, error, refetch } = useAppservice(bridgeId);
   const { data: health } = useAppserviceHealth(bridgeId);
+  const { data: types } = useBridgeTypes();
+  const { data: server } = useServerInfo();
   const {
     data: backlog,
     isError: backlogIsError,
@@ -90,7 +103,9 @@ export function BridgeDetailPage() {
   // only ever has one fetched by its route param, so that param is the
   // reliable fallback if the resource ever omitted its own id.
   const id = bridge.id ?? bridgeId;
-  const name = deriveDisplayName(bridge);
+  const type = bridgeTypeOf(bridge, types);
+  const name = bridgeTitle(bridge, type);
+  const botId = botMatrixId(bridge.sender_localpart, server?.name);
   const meta = bridgeHealthMeta[healthKeyOf(bridge)];
   const pendingBacklog = (backlog?.items ?? []).filter((e) => !e.dead_lettered);
   const deadLettered = (backlog?.items ?? []).filter((e) => e.dead_lettered);
@@ -106,14 +121,33 @@ export function BridgeDetailPage() {
       </Link>
 
       <div className="mt-2 flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <div className="flex items-center gap-3">
-            <h1 className="text-xl text-text">{name}</h1>
-            <Badge status={meta.status}>{meta.label}</Badge>
+        <div className="flex items-start gap-3">
+          <BridgeGlyph category={type?.category} size="lg" className="mt-0.5" />
+          <div>
+            <div className="flex items-center gap-3">
+              <h1 className="text-xl text-text">{name}</h1>
+              <Badge status={meta.status}>{meta.label}</Badge>
+            </div>
+            <p className="mt-1 flex flex-wrap items-center gap-x-2 text-sm text-text-muted">
+              <span>{bridgeKind(bridge, type)}</span>
+              <span aria-hidden="true">&middot;</span>
+              <CopyableId value={id} />
+              {type?.docs_url && (
+                <>
+                  <span aria-hidden="true">&middot;</span>
+                  <a
+                    href={type.docs_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1 text-accent hover:underline"
+                  >
+                    <ExternalLink size={12} aria-hidden="true" />
+                    Documentation
+                  </a>
+                </>
+              )}
+            </p>
           </div>
-          <p className="mt-1 text-sm text-text-muted">
-            <CopyableId value={id} /> &middot; {deriveKindLabel(bridge)}
-          </p>
         </div>
         <div className="flex flex-wrap gap-2">
           {bridge.paused ? (
@@ -204,49 +238,56 @@ export function BridgeDetailPage() {
               key={tab}
               value={tab}
               className={cn(
-                "border-b-2 border-transparent px-3 py-2 text-sm font-medium capitalize text-text-muted",
+                "border-b-2 border-transparent px-3 py-2 text-sm font-medium text-text-muted",
                 "data-[state=active]:border-accent data-[state=active]:text-accent",
                 "hover:text-text focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus)]",
               )}
             >
-              {tab === "danger" ? "Danger" : tab}
+              {TAB_LABELS[tab]}
             </Trigger>
           ))}
         </List>
 
         <Content value="overview" className="py-6">
-          <dl className="grid grid-cols-1 gap-x-8 gap-y-4 sm:grid-cols-2 xl:grid-cols-3">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <Tile label="Connection">
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge status={meta.status}>{meta.label}</Badge>
+                <span className="text-sm text-text-muted">
+                  last ping <RelativeTime at={health?.last_ping_at} />
+                </span>
+              </div>
+            </Tile>
+            <Tile label="Backlog">
+              {backlogIsError ? (
+                <QueryProblemState error={backlogError} resource="the backlog" compact />
+              ) : (backlog?.items.length ?? 0) === 0 ? (
+                <span className="text-sm text-text">Nothing waiting</span>
+              ) : (
+                <span className="text-sm text-text">
+                  {pendingBacklog.length} pending
+                  {deadLettered.length > 0 && (
+                    <span className="text-danger">, {deadLettered.length} dead-lettered</span>
+                  )}
+                </span>
+              )}
+            </Tile>
+            <Tile label="Bot">
+              <CopyableId value={botId} />
+            </Tile>
+          </div>
+          <dl className="mt-6 grid grid-cols-1 gap-x-8 gap-y-4 sm:grid-cols-2 xl:grid-cols-3">
             <Fact
-              label="Backlog"
-              value={
-                backlogIsError ? (
-                  <QueryProblemState error={backlogError} resource="the backlog" compact />
-                ) : (backlog?.items.length ?? 0) === 0 ? (
-                  "No backlog"
-                ) : (
-                  `${pendingBacklog.length} pending, ${deadLettered.length} dead-lettered`
-                )
-              }
+              label="Reached at"
+              value={<span className="font-identifier">{bridge.url ?? "never pushed to"}</span>}
             />
-            <Fact label="Last ping" value={<RelativeTime at={health?.last_ping_at} />} />
-            <Fact label="Sender localpart" value={bridge.sender_localpart} />
-            <Fact label="Rate limited" value={bridge.rate_limited ? "Yes" : "No"} />
-            <Fact
-              label="URL"
-              value={<span className="font-identifier">{bridge.url ?? "—"}</span>}
-            />
-            <Fact label="Created" value={<RelativeTime at={bridge.created_at} />} />
+            <Fact label="Rate limited" value={bridge.rate_limited ? "Yes" : "No, exempt"} />
+            <Fact label="Added" value={<RelativeTime at={bridge.created_at} />} />
           </dl>
         </Content>
 
-        <Content value="logins" className="py-6">
-          <p className="text-sm text-text-muted">
-            Remote-account login state is not exposed by the admin API yet (tracked as feedback to
-            15/11 in{" "}
-            <code className="font-identifier">docs/status/16-management-web-interface.md</code>).
-            Logins happen in the bridge itself once it is running: the bot command{" "}
-            <code className="font-identifier">login</code>, or its provisioning API.
-          </p>
+        <Content value="sign-in" className="py-6">
+          <BridgeSignInGuide type={type} botId={botId} />
           {bridge.links?.login_url && (
             <a
               href={bridge.links.login_url}
@@ -402,6 +443,15 @@ function redactTokens(registration: Record<string, unknown>): Record<string, unk
     if (key in redacted) redacted[key] = "•".repeat(24);
   }
   return redacted;
+}
+
+function Tile({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="rounded-md border border-border bg-surface px-4 py-3">
+      <p className="text-xs text-text-muted">{label}</p>
+      <div className="mt-1.5">{children}</div>
+    </div>
+  );
 }
 
 function Fact({ label, value }: { label: string; value: ReactNode }) {

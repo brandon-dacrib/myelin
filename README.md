@@ -17,6 +17,14 @@ change to an already-open tab, creates rooms (encrypted ones included), invites,
 through history. Screenshots are in `docs/design/screenshots/`; the reproduction is
 `web/element-testing/README.md`.
 
+**A WhatsApp bridge is a wizard away.** The admin interface's Bridges section knows fourteen
+bridges people actually run: what each is, what it needs, and how to sign in to it. Choosing
+one renders the bridge's own `config.yaml` and its registration, already pointed at this
+server; the Created page says where to put them, how to start the bridge, turns green when it
+connects, and gives the sign-in steps for that network with the bot's real name.
+mautrix-whatsapp was added exactly that way and connected in seconds
+(`docs/bridges/mautrix.md`).
+
 **Two encrypted clients exchange a message this server cannot read.** `matrix-rust-sdk` with
 encryption enabled: keys upload, cross-signing bootstraps, one-time keys are claimed atomically,
 Megolm establishes, the recipient decrypts. `cargo test -p hs-loadgen --test real_client_encrypted`.
@@ -69,7 +77,7 @@ pleasant, and is not yet.
 
 ## How far along is it
 
-Roughly **55-60% of a homeserver somebody else could run**, but the number only means something
+Roughly **60% of a homeserver somebody else could run**, but the number only means something
 broken up, because the parts are nowhere near each other. This table is kept current with
 `docs/next-steps.md`, which has the basis for each figure.
 
@@ -79,8 +87,8 @@ broken up, because the parts are nowhere near each other. This table is kept cur
 | Storage, rooms, state resolution | ~85% | 1,600+ tests, two backends through one conformance suite |
 | Configuration and first run | ~90% | database-backed, edited in the UI, one command from nothing to a server |
 | Admin API | ~40% | 58 of 145 operations have a real handler; the rest answer an honest 501 |
-| Management web interface | ~70% | users, rooms, bridges, federation, configuration and the audit log are real against the real server |
-| Bridges | ~65% | heisenbridge works end to end; all 16 bridge operations are real; no mautrix bridge has connected yet |
+| Management web interface | ~75% | users, rooms, bridges (catalogue, wizard, runbook, sign-in guides), federation, configuration and the audit log are real against the real server |
+| Bridges | ~75% | heisenbridge works end to end; mautrix-whatsapp, added through the wizard, connects and starts encrypted; no mautrix bridge has carried a message yet |
 | Operations (HA, scale-out) | ~40% | runs on Kubernetes with a chart and a tested image; the cluster path has not carried real traffic |
 | **Federation** | **~15%** | 59/246 assertions; a two-server join works one way only |
 

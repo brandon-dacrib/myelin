@@ -98,17 +98,15 @@ test.describe("real server", () => {
       await page.screenshot({ path: "test-results/real-users.png", fullPage: true });
     });
 
-    test("bridges list honestly reports not-implemented (GET /appservices still 501)", async ({
-      page,
-    }) => {
+    // `appservices.list` used to answer 501 and this test asserted the interface said so. All
+    // sixteen bridge operations are real now (docs/status/11-appservices-and-bridges.md), so the
+    // honest assertion is a table of bridges or the empty state -- never a bare error.
+    test("bridges list is real (GET /appservices is wired)", async ({ page }) => {
       await page.goto("/admin/bridges");
-      await expect(page.getByText(/isn't implemented on this server yet/i)).toBeVisible({
+      await expect(page.getByRole("table").or(page.getByRole("status"))).toBeVisible({
         timeout: 10_000,
       });
-      await page.screenshot({
-        path: "test-results/real-bridges-not-implemented.png",
-        fullPage: true,
-      });
+      await page.screenshot({ path: "test-results/real-bridges.png", fullPage: true });
     });
 
     test("user detail is real, and its sub-resource gap is honest", async ({ page }) => {

@@ -10,6 +10,8 @@ const KEY = "hs-admin:last-created-bridge-artifacts";
 
 export interface CreatedArtifacts {
   registrationYaml: string;
+  /** The bridge's own config, for the types whose render writes one. */
+  configYaml?: string;
   composeYaml?: string;
   bridgeResourceYaml?: string;
 }

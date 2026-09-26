@@ -391,13 +391,35 @@ impl std::fmt::Debug for AdminPasswordReset {
 pub struct BridgeType {
     pub id: String,
     pub name: String,
+    /// One line on what it connects.
+    pub description: String,
+    /// `messaging`, `social`, `irc` or `integrations`: how the wizard groups the catalogue.
+    pub category: String,
     pub upstream_project: String,
+    /// The project's own documentation.
+    pub docs_url: String,
     pub image: String,
+    /// The port the bridge listens on for this server by default: what its own config generator
+    /// writes, and what a render's `url` names.
+    pub port: u16,
     /// `users`/`aliases`/`rooms`, each a list of `{regex, exclusive}`, written for this server.
     pub default_namespaces: serde_json::Value,
     pub config_keys: Vec<BridgeTypeConfigKey>,
     pub supports_double_puppeting: bool,
     pub required_features: Vec<String>,
+    /// Whether a render of this type produces a `config_yaml` the bridge reads as it is
+    /// (mautrix bridges), or only the registration and the notes to run it.
+    pub renders_config: bool,
+    /// How a person signs in to the bridge once it runs.
+    pub sign_in: BridgeTypeSignIn,
+}
+
+/// [`BridgeType::sign_in`]: the bridge's own documented login flow, one step per line. `{bot}`
+/// in a step stands for the bridge bot's Matrix ID, which the interface substitutes.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BridgeTypeSignIn {
+    pub steps: Vec<String>,
+    pub notes: Option<String>,
 }
 
 /// One of a [`BridgeType`]'s `config_keys`: something the operator has to have.
@@ -414,6 +436,10 @@ pub struct BridgeTypeConfigKey {
 pub struct BridgeTypeRenderResult {
     pub registration: serde_json::Value,
     pub registration_yaml: String,
+    /// The bridge's own `config.yaml`, with everything that ties it to this server filled in;
+    /// `None` for a bridge whose configuration the render does not write (see
+    /// [`BridgeType::renders_config`]).
+    pub config_yaml: Option<String>,
     pub compose_yaml: String,
     pub bridge_resource_yaml: String,
 }
@@ -470,6 +496,10 @@ pub struct AdminAppservice {
     pub health: String,
     /// RFC 3339 millisecond-precision UTC.
     pub created_at: String,
+    /// The catalogue entry (`GET /bridge-types`) this appservice was created from, read from
+    /// the registration's `io.myelin.bridge_type` key; `None` for a registration that did not
+    /// come through the catalogue.
+    pub bridge_type: Option<String>,
     /// Where an operator can go from here. `login_url` is where a bridge with its own login
     /// flow puts it; nothing sets it yet.
     pub links: AdminAppserviceLinks,

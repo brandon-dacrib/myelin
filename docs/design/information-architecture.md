@@ -55,11 +55,11 @@ Every route is under the app base `/admin/`. Appservices that are not bridges (a
 
 ### Bridges (`/bridges`)
 
-- **List** (`/bridges`): every registry entry. Columns: name, kind (bridge type or "Appservice"), state (with the mautrix state vocabulary), backlog (depth and age), last success, logins connected / total, actions. Filters: state, kind, paused. Sort: attention first by default. Row actions: pause, resume, open logs, replay dead letters.
+- **List** (`/bridges`): every registry entry, with a summary strip of counts per state that filters the table. Columns: bridge (the catalogue's glyph, the name, the kind under it), state, bot (its Matrix ID), added, actions. Sort: attention first by default (down, degraded, unknown, healthy, paused). Row actions: pause, resume. Backlog depth, last success and logins per bridge are not on the list resource (see 16's status) and live on the detail page.
 - **Add bridge** (`/bridges/new`): the wizard in `flows.md` flow 1.
 - **Bridge detail** (`/bridges/:id`): header with name, kind, state pill, `user_action` callout when the bridge asks for one, primary actions (Open bridge login, Pause, Rotate tokens, Remove). Tabs:
   - **Overview**: state timeline (last 24 h), backlog depth and age, transaction latency, error rate, last error with message, ping round-trip, deployment (Kubernetes `Bridge` resource status or "self-managed"), links to logs and metrics.
-  - **Logins**: per-Matrix-user remote logins with state, remote name and profile, `user_action`; "Open login flow" deep link to the bridge's provisioning login (`/_matrix/provision/v3/login/flows` through the bridge's own URL) or bot command instructions.
+  - **Sign in**: how a person signs in to this bridge, from its catalogue entry (`bridge_type`): the bot's Matrix ID to message, the bridge's own numbered steps and caveats, the documentation link; or an honest note for an appservice added outside the catalogue. Per-user login *state* (who is signed in, `user_action`) is kept by the bridges and is not in the admin API; a deep link to a bridge's own provisioning login (`links.login_url`) is shown when set, which nothing sets yet.
   - **Registration**: `id`, `url`, `sender_localpart`, namespaces (users, aliases, rooms with exclusive flags), `rate_limited`, feature flags (`receive_ephemeral`, MSC3202, MSC4190), protocols; tokens masked with reveal and rotate; export registration YAML; the Compose or Kubernetes snippet regenerated from current values.
   - **Transactions**: recent transactions with status; dead letters with reason and replay (single or all); pause and resume the queue.
   - **Rooms and users**: portal rooms and puppet users owned by this bridge's namespaces, with counts and links.

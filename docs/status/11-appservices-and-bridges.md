@@ -1,6 +1,21 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-09-22.
+Last updated: 2026-09-25.
+
+**A mautrix bridge works, added through the interface.** mautrix-whatsapp, against the real
+binary, from the registration and `config.yaml` the interface's wizard rendered, with nothing
+edited by hand: it reached the server, pinged itself through it (MSC2659), created its bot
+device without a login (MSC4190), queried keys with device masquerading (MSC3202), and
+started in appservice-mode encryption, all within seconds. The server attributed the bot to
+the bridge and reported it healthy. What it has not done yet is carry a message: signing in
+needs a phone. Reproduction and the exact list: `docs/bridges/mautrix.md`. It found one
+defect here: `PingService::record` kept the previous failure in `last_error` after a ping
+that worked, so a bridge whose first ping raced its own listener (mautrix does this; it
+retries in five seconds) was reported healthy with an error. Fixed, with a test.
+
+The bridge catalogue (`hs_admin::bridge_types`, shared with 15 and 16) now stamps every
+registration it renders with `io.myelin.bridge_type`, which this crate's registry keeps in
+`extra` and `admin_directory` reads back as `AppService.bridge_type`.
 
 **A real bridge works.** heisenbridge, against the real binary and a local IRC server: it
 registers its bot, drives the server with masqueraded requests, receives every event in its

@@ -2133,6 +2133,8 @@ export interface components {
             user_agent?: string;
         };
         AppService: {
+            /** @description The bridge-type catalogue entry this appservice was created from, read from the registration's `io.myelin.bridge_type` key. Null for a registration that did not come through the catalogue. */
+            bridge_type?: string | null;
             /** Format: date-time */
             created_at?: string;
             /** @enum {string} */
@@ -2215,16 +2217,37 @@ export interface components {
             items: components["schemas"]["AuditEntry"][];
         };
         BridgeType: {
+            /**
+             * @description How the catalogue is grouped.
+             * @enum {string}
+             */
+            category?: "messaging" | "social" | "irc" | "integrations";
             config_keys?: {
                 description?: string;
                 key?: string;
                 required?: boolean;
             }[];
             default_namespaces?: Record<string, never>;
+            /** @description One line on what the bridge connects. */
+            description?: string;
+            /**
+             * Format: uri
+             * @description The bridge project's own documentation.
+             */
+            docs_url?: string;
             id?: string;
             image?: string;
             name?: string;
+            /** @description The port the bridge listens on for this server by default, which a render's registration `url` names. */
+            port?: number;
+            /** @description Whether a render of this type produces a `config_yaml` the bridge reads as it is (mautrix bridges), or only the registration and the notes to run it. */
+            renders_config?: boolean;
             required_features?: string[];
+            /** @description The bridge's own documented login flow. `{bot}` in a step stands for the bridge bot's Matrix ID, which the interface substitutes. */
+            sign_in?: {
+                notes?: string | null;
+                steps?: string[];
+            };
             supports_double_puppeting?: boolean;
             upstream_project?: string;
         };
@@ -2238,6 +2261,8 @@ export interface components {
         BridgeTypeRenderResult: {
             bridge_resource_yaml?: string;
             compose_yaml?: string;
+            /** @description The bridge's own `config.yaml` with everything that ties it to this server filled in (mautrix bridges); null when the render writes no config for this type. */
+            config_yaml?: string | null;
             registration?: Record<string, never>;
             registration_yaml?: string;
         };

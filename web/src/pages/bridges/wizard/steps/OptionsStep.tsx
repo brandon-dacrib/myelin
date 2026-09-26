@@ -1,4 +1,5 @@
 import { Root, Thumb } from "radix-ui/switch";
+import { Field, Input } from "@/components/ui/input/Input";
 import { cn } from "@/lib/cn";
 import type { WizardFormState } from "../wizard-state";
 
@@ -40,6 +41,10 @@ function Toggle({
   );
 }
 
+/**
+ * flows.md flow 1 step 5. Each toggle says what it actually does to the registration and the
+ * bridge's config -- not what an operator might hope it does.
+ */
 export function OptionsStep({
   state,
   onChange,
@@ -55,13 +60,13 @@ export function OptionsStep({
       <div className="mt-6 flex flex-col gap-3">
         <Toggle
           label="Double puppeting"
-          description="Creates or reuses the shared non-exclusive registration and tells the bridge about it."
+          description="What you send from any Matrix client appears on the other network as you, and what the bridge posts here is posted as you. The registration gets a non-exclusive claim on every local user and the bridge's config the matching secret."
           checked={state.doublePuppeting}
           onChange={(v) => onChange({ doublePuppeting: v })}
         />
         <Toggle
           label="Encryption"
-          description="MSC2409 ephemeral, MSC3202 device lists and OTK counts, MSC4190 device management."
+          description="Encrypted rooms stay encrypted through the bridge. The registration asks for device lists and to-device messages in its transactions (MSC3202, MSC4203) and a device made without a login (MSC4190); the bridge's config turns end-to-bridge encryption on."
           checked={state.encryption}
           onChange={(v) => onChange({ encryption: v })}
         />
@@ -71,6 +76,23 @@ export function OptionsStep({
           checked={state.rateLimitExempt}
           onChange={(v) => onChange({ rateLimitExempt: v })}
         />
+      </div>
+
+      <div className="mt-6 max-w-lg">
+        <Field
+          label="Bridge administrator"
+          hint="The Matrix user the bridge takes admin commands from. Everyone else on this server can sign in and chat; nobody from another server can."
+        >
+          {(f) => (
+            <Input
+              {...f}
+              value={state.adminUser}
+              placeholder="@you:example.org"
+              onChange={(e) => onChange({ adminUser: e.target.value })}
+              className="font-identifier"
+            />
+          )}
+        </Field>
       </div>
     </div>
   );

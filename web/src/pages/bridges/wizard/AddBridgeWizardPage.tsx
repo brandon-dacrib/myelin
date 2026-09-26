@@ -10,7 +10,7 @@ import {
 } from "@/api/bridges";
 import { useClusterStatus } from "@/api/dashboard";
 import { classifyError } from "@/api/problem";
-import { hasScope } from "@/lib/auth";
+import { getSession, hasScope } from "@/lib/auth";
 import { newIdempotencyKey } from "@/api/client";
 import { StepRail } from "./StepRail";
 import { KindStep } from "./steps/KindStep";
@@ -18,7 +18,13 @@ import { IdentityStep, type IdentityConflict } from "./steps/IdentityStep";
 import { DeploymentStep } from "./steps/DeploymentStep";
 import { OptionsStep } from "./steps/OptionsStep";
 import { ReviewStep } from "./steps/ReviewStep";
-import { WIZARD_STEPS, initialWizardState, defaultsForKind, type WizardStep } from "./wizard-state";
+import {
+  WIZARD_STEPS,
+  applyPatch,
+  initialWizardState,
+  defaultsForKind,
+  type WizardStep,
+} from "./wizard-state";
 import { stashCreatedArtifacts } from "./created-artifacts-store";
 
 /**
@@ -43,7 +49,12 @@ export function AddBridgeWizardPage() {
   const search = useSearch({ from: "/bridges/new" });
   const navigate = useNavigate({ from: "/bridges/new" });
   const step = search.step ?? "kind";
-  const [state, setState] = useState(initialWizardState);
+  const [state, setState] = useState<typeof initialWizardState>(() => {
+    // The operator adding the bridge is the natural first administrator of it; the real
+    // server's principal id is their Matrix ID (hs_auth::admin_verifier), the mock's likewise.
+    const subject = getSession()?.operator.subject ?? "";
+    return { ...initialWizardState, adminUser: subject.startsWith("@") ? subject : "" };
+  });
   const [furthest, setFurthest] = useState<WizardStep>("kind");
   const [conflict, setConflict] = useState<IdentityConflict | null>(null);
   const [idempotencyKey] = useState(() => newIdempotencyKey());
@@ -73,7 +84,7 @@ export function AddBridgeWizardPage() {
   }
 
   function patch(p: Partial<typeof state>) {
-    setState((s) => ({ ...s, ...p }));
+    setState((s) => applyPatch(s, p));
   }
 
   const stepIndex = WIZARD_STEPS.indexOf(step);
@@ -98,6 +109,7 @@ export function AddBridgeWizardPage() {
           // "deployment" concept to filter by itself.
           stashCreatedArtifacts(createdId, {
             registrationYaml,
+            configYaml: renderResult.config_yaml ?? undefined,
             composeYaml:
               state.deployment === "self-managed" ? renderResult.compose_yaml : undefined,
             bridgeResourceYaml:
@@ -159,9 +171,7 @@ export function AddBridgeWizardPage() {
           {step === "kind" && (
             <KindStep
               selected={state.kind}
-              onSelect={(kindId, kind) =>
-                setState((s) => ({ ...s, ...defaultsForKind(kindId, kind) }))
-              }
+              onSelect={(kindId, kind) => patch(defaultsForKind(kindId, kind))}
             />
           )}
           {step === "identity" && (

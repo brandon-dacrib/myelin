@@ -29,40 +29,60 @@ export function ReviewStep({
     <div>
       <h2 className="text-lg text-text">Review</h2>
       <p className="mt-1 text-sm text-text-muted">
-        Creating registers the appservice with the homeserver immediately (hot registration).
+        Creating registers the appservice with the homeserver at once, with the two tokens below.
+        Nothing runs yet: the next page has the files to start the bridge with, and how to sign in
+        once it does.
       </p>
 
       <div className="mt-6 flex flex-col gap-4">
         <ReviewGroup title="Kind" onEdit={() => onEdit("kind")}>
-          <p className="text-sm text-text">{state.kind || "—"}</p>
+          <p className="text-sm text-text">
+            {state.name || "—"}
+            {state.kind && <span className="text-text-muted"> · {state.kind}</span>}
+          </p>
         </ReviewGroup>
         <ReviewGroup title="Identity" onEdit={() => onEdit("identity")}>
           <dl className="grid grid-cols-2 gap-2 text-sm">
             <Row label="Name" value={state.name} />
             <Row label="ID" value={state.id} />
-            <Row label="Sender localpart" value={state.senderLocalpart} />
+            <Row label="Bot" value={state.senderLocalpart} />
             <Row label="User namespace" value={state.userNamespace || "—"} />
           </dl>
         </ReviewGroup>
         <ReviewGroup title="Deployment" onEdit={() => onEdit("deployment")}>
-          <p className="text-sm text-text">
-            {state.deployment === "kubernetes" ? `Kubernetes (${state.namespace})` : "Self-managed"}
-          </p>
+          <dl className="grid grid-cols-2 gap-2 text-sm">
+            <Row
+              label="Runs on"
+              value={
+                state.deployment === "kubernetes"
+                  ? `Kubernetes (${state.namespace})`
+                  : "Self-managed"
+              }
+            />
+            <Row label="Reaches this server at" value={state.homeserverAddress} />
+            <Row label="Reached by this server at" value={state.bridgeAddress} />
+          </dl>
         </ReviewGroup>
         <ReviewGroup title="Options" onEdit={() => onEdit("options")}>
-          <p className="text-sm text-text">
-            {[
-              state.doublePuppeting && "Double puppeting",
-              state.encryption && "Encryption",
-              state.rateLimitExempt && "Rate-limit exempt",
-            ]
-              .filter(Boolean)
-              .join(", ") || "None"}
-          </p>
+          <dl className="grid grid-cols-2 gap-2 text-sm">
+            <Row
+              label="Enabled"
+              value={
+                [
+                  state.doublePuppeting && "Double puppeting",
+                  state.encryption && "Encryption",
+                  state.rateLimitExempt && "Rate-limit exempt",
+                ]
+                  .filter(Boolean)
+                  .join(", ") || "None"
+              }
+            />
+            <Row label="Administrator" value={state.adminUser || "—"} />
+          </dl>
         </ReviewGroup>
       </div>
 
-      <div className="mt-6">
+      <div className="mt-6 flex flex-col gap-4">
         {isRendering && <SkeletonText lines={6} />}
         {!isRendering && renderError && (
           <ErrorState
@@ -71,11 +91,20 @@ export function ReviewStep({
           />
         )}
         {!isRendering && renderResult && (
-          <CopyBlock
-            label="registration.yaml (preview)"
-            content={renderResult.registration_yaml ?? ""}
-            filename={`${state.id || "bridge"}-registration.yaml`}
-          />
+          <>
+            <CopyBlock
+              label="registration.yaml (preview)"
+              content={renderResult.registration_yaml ?? ""}
+              filename={`${state.id || "bridge"}-registration.yaml`}
+            />
+            {renderResult.config_yaml && (
+              <CopyBlock
+                label="config.yaml (preview)"
+                content={renderResult.config_yaml}
+                filename={`${state.id || "bridge"}-config.yaml`}
+              />
+            )}
+          </>
         )}
       </div>
 

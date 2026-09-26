@@ -139,7 +139,7 @@ export const handlers = [
       access_token: `mock-admin-token.${crypto.randomUUID()}`,
       token_type: "Bearer",
       scopes,
-      operator: { name: "Operator", subject: "mock-operator" },
+      operator: { name: "Operator", subject: "@ops:example.org" },
     });
   }),
 
@@ -262,9 +262,11 @@ export const handlers = [
     const asToken = `as_token_${id}_${crypto.randomUUID().slice(0, 8)}`;
     const hsToken = `hs_token_${id}_${crypto.randomUUID().slice(0, 8)}`;
     const url =
-      deployment === "kubernetes"
-        ? `http://${id}.${namespace}.svc:29999`
-        : "http://localhost:29999";
+      typeof values.bridgeAddress === "string" && values.bridgeAddress
+        ? values.bridgeAddress
+        : deployment === "kubernetes"
+          ? `http://${id}.${namespace}.svc:29999`
+          : `http://${id}:29999`;
 
     // The same shape the server renders: namespace *objects*, which `appservices.create`
     // parses; a bare pattern string is not a registration.
@@ -286,6 +288,7 @@ export const handlers = [
       rate_limited: false,
       "de.sorunome.msc2409.push_ephemeral": true,
       ...(values.encryption ? { "org.matrix.msc3202": true, "io.element.msc4190": true } : {}),
+      "io.myelin.bridge_type": typeId,
     };
     const registration_yaml = [
       `id: ${id}`,
@@ -297,7 +300,37 @@ export const handlers = [
       `  users:${values.userNamespace ? `\n    - exclusive: true\n      regex: '${values.userNamespace}'` : " []"}`,
       "de.sorunome.msc2409.push_ephemeral: true",
       `org.matrix.msc3202: ${Boolean(values.encryption)}`,
+      `io.myelin.bridge_type: ${typeId}`,
     ].join("\n");
+    // A mautrix bridge's own config.yaml, the way the real render writes it (the essentials;
+    // the bridge completes the rest on first start). Other runtimes get no config file.
+    const homeserverAddress = String(values.homeserverAddress ?? "http://myelin:8008");
+    const config_yaml = typeId.startsWith("mautrix-")
+      ? [
+          "homeserver:",
+          `  address: ${homeserverAddress}`,
+          "  domain: example.org",
+          "appservice:",
+          `  address: ${url}`,
+          "  hostname: 0.0.0.0",
+          "  port: 29999",
+          `  id: ${id}`,
+          "  bot:",
+          `    username: ${senderLocalpart}`,
+          `  as_token: ${asToken}`,
+          `  hs_token: ${hsToken}`,
+          "database:",
+          "  type: sqlite3-fk-wal",
+          `  uri: file:/data/${id}.db?_txlock=immediate`,
+          "bridge:",
+          "  permissions:",
+          '    "*": relay',
+          '    "example.org": user',
+          ...(values.adminUser ? [`    "${String(values.adminUser)}": admin`] : []),
+          "encryption:",
+          `  allow: ${Boolean(values.encryption)}`,
+        ].join("\n")
+      : null;
     const compose_yaml = [
       "services:",
       `  ${id}:`,
@@ -320,6 +353,7 @@ export const handlers = [
     return HttpResponse.json({
       registration,
       registration_yaml,
+      config_yaml,
       compose_yaml,
       bridge_resource_yaml,
     });
@@ -343,7 +377,12 @@ export const handlers = [
 
   http.post(`${API}/appservices`, async ({ request }) => {
     const body = (await request.json()) as {
-      registration?: { id?: string; sender_localpart?: string; url?: string };
+      registration?: {
+        id?: string;
+        sender_localpart?: string;
+        url?: string;
+        "io.myelin.bridge_type"?: string;
+      };
     };
     const id = body.registration?.id;
     if (!id) {
@@ -379,6 +418,7 @@ export const handlers = [
       paused: false,
       health: "unknown",
       created_at: new Date().toISOString(),
+      bridge_type: body.registration?.["io.myelin.bridge_type"] ?? null,
       links: { login_url: null },
     };
     appservices.unshift(created);

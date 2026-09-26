@@ -69,6 +69,11 @@ impl<B: KvBackend + 'static> RegistryAppserviceDirectory<B> {
             created_at: hs_http::time::rfc3339_from_millis(
                 i64::try_from(row.created_at_ms).unwrap_or(i64::MAX),
             ),
+            bridge_type: row
+                .extra
+                .get(hs_admin::bridge_types::BRIDGE_TYPE_KEY)
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             links: AdminAppserviceLinks::default(),
         })
     }

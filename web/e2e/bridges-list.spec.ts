@@ -24,6 +24,18 @@ test.describe("Bridges list", () => {
     await page.getByRole("link", { name: "Bridges" }).first().click();
     await expect(page.getByRole("heading", { name: "Bridges" })).toBeVisible();
     await expect(page.getByRole("table")).toBeVisible();
+
+    // Attention first: the one that is down leads, the paused one trails.
+    const names = page.getByRole("table").getByRole("link");
+    await expect(names.first()).toHaveText("Signal");
+    await expect(names.last()).toHaveText("Discord");
+    // The summary strip counts each state and filters the table.
+    await page.getByRole("button", { name: /^Down 1$/ }).click();
+    await expect(page).toHaveURL(/state=down/);
+    await expect(names).toHaveCount(1);
+    await page.getByRole("button", { name: /^All 5$/ }).click();
+    await expect(names).toHaveCount(5);
+    await expectNoAxeViolations(page, "bridges list");
     domGuard.assertClean();
   });
 

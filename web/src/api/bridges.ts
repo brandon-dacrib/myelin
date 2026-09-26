@@ -39,6 +39,7 @@ export type AppServiceHealth = components["schemas"]["AppServiceHealth"];
 export type AppServiceBacklogEntry = components["schemas"]["AppServiceBacklogEntry"];
 export type AppServiceTokens = components["schemas"]["AppServiceTokens"];
 export type BridgeType = components["schemas"]["BridgeType"];
+export type BridgeTypeSignIn = NonNullable<BridgeType["sign_in"]>;
 export type BridgeTypeRenderResult = components["schemas"]["BridgeTypeRenderResult"];
 export type Task = components["schemas"]["Task"];
 
@@ -77,7 +78,11 @@ export function useAppservices(filters: AppserviceListFilters) {
   });
 }
 
-export function useAppservice(id: string | undefined) {
+/**
+ * `refetchInterval` defaults to the list's cadence; the Created page, which is watching for
+ * the bridge's first ping, asks for a faster one.
+ */
+export function useAppservice(id: string | undefined, options: { refetchInterval?: number } = {}) {
   return useQuery({
     queryKey: ["appservice", id],
     enabled: Boolean(id),
@@ -85,11 +90,14 @@ export function useAppservice(id: string | undefined) {
       const result = await api.GET("/appservices/{id}", { params: { path: { id: id! } } });
       return unwrap(result);
     },
-    refetchInterval: 15_000,
+    refetchInterval: options.refetchInterval ?? 15_000,
   });
 }
 
-export function useAppserviceHealth(id: string | undefined) {
+export function useAppserviceHealth(
+  id: string | undefined,
+  options: { refetchInterval?: number } = {},
+) {
   return useQuery({
     queryKey: ["appservice-health", id],
     enabled: Boolean(id),
@@ -99,7 +107,7 @@ export function useAppserviceHealth(id: string | undefined) {
       });
       return unwrap(result);
     },
-    refetchInterval: 15_000,
+    refetchInterval: options.refetchInterval ?? 15_000,
   });
 }
 

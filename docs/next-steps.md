@@ -70,6 +70,21 @@ file, create, and the bot's `as_token` answering `/whoami` a moment later
 (`docs/design/screenshots/bridge-created-real.png`). Bridges are 16 of 16. What is left:
 `links.login_url`, which nothing sets, and the operator the resource is for.
 
+**And a mautrix bridge connected, added the way an operator adds one** (2026-09-25,
+`docs/bridges/mautrix.md`). The Bridges section was rebuilt around what
+<https://docs.mau.fi/bridges/> actually asks of a person: the catalogue says what each bridge
+is, what it needs and how to sign in to it; a render writes the bridge's `config.yaml` as well
+as its registration; the Deployment step asks where each side is; the Created page is a
+runbook that watches for the first ping; the detail page's Sign in tab gives the numbered
+steps for that bridge with its bot's real Matrix ID. Then mautrix-whatsapp was added through
+that wizard in a real browser, started in Docker from the two files the page showed, and
+connected in about seven seconds: MSC2659 ping, MSC4190 device, MSC3202 key query, encryption
+in appservice mode, "Bridge started". The bridge completed the wizard's 40-line config to 666
+lines itself. Found and fixed on the way: a ping that succeeded left the previous failure in
+`last_error`, so a bridge whose first ping raced its own listener was "healthy, with an error".
+Not yet done: signing in (a phone), so no message has crossed a mautrix bridge, and the
+encryption path is set up on both sides but has not carried traffic.
+
 **Configuration lives in the database** (RFC 0016). The file is a bootstrap and a seed; the database outranks it, `HS__` variables outrank the database, and the admin API refuses a write the environment would shadow rather than storing one that gets ignored. The web interface has a Configuration section that builds its forms from the server's own JSON Schema, and `hs config show|get|set|unset|import|export|history` is the same thing without a browser.
 
 **A first run is one command, and the first administrator is one link.** `hs serve --data-dir ./data --server-name example.org` in an empty directory produces a working server — database, signing key, media path, all underneath that directory — and so does `docker run -p 8008:8008 -v myelin:/data -e HS__SERVER__SERVER_NAME=example.org <image>`, which CD now boots verbatim before it will publish. It was 158 lines of generated YAML with four mandatory hand-edits.
@@ -165,7 +180,7 @@ two-line change if the conformance points are wanted instead.
 
 ## How far along is this?
 
-A number, because it gets asked. **Roughly 55-60% of a homeserver somebody else could run** --
+A number, because it gets asked. **Roughly 60% of a homeserver somebody else could run** --
 but the number is only meaningful broken up, because the parts are nowhere near each other:
 
 | Area | Where it is | Basis |
@@ -174,9 +189,9 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 | Storage, rooms, state resolution | ~85% | the engine underneath; 1600+ tests, two backends through one conformance suite, state bake-off done |
 | Configuration and first run | ~90% | database-backed, editable in the UI, one command from nothing to a working server |
 | Admin API | ~40% | 58 of 145 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Config 6/6, Server 5/5, AuditLog 3/3, Setup 2/2, Bridges 16/16, Users 14/41, Rooms 6/23, Federation 3/7, Statistics 1/4, Cluster 1/6, and Media 0/9, RegistrationTokens 0/5 |
-| Management web interface | ~70% | users (with devices, sign-out and password reset), rooms (with members), bridges (with the wizard), federation destinations and configuration are real against the real server; the media and reports pages still read from operations that answer 501; arrays-of-objects are a JSON textarea |
+| Management web interface | ~75% | users (with devices, sign-out and password reset), rooms (with members), bridges (the catalogue, the wizard with the bridge's own config, the runbook, sign-in guides), federation destinations, configuration and the audit log are real against the real server; the media and reports pages still read from operations that answer 501; arrays-of-objects are a JSON textarea |
 | **Federation** | **~15%** | 59/246 assertions, 6/88 top-level; a two-server join works one way only |
-| Bridges | ~65% | a real bridge (heisenbridge) works end to end against the real binary, both directions, `docs/bridges/heisenbridge.md`; all 16 bridge operations are real, and the interface's Bridges section was watched adding a bridge through the wizard and pausing and resuming a live one; no mautrix-* bridge with an external service has been run |
+| Bridges | ~75% | heisenbridge works end to end both directions (`docs/bridges/heisenbridge.md`); mautrix-whatsapp, added through the wizard, connects and starts in appservice-mode encryption (`docs/bridges/mautrix.md`); all 16 bridge operations are real; no mautrix bridge has carried a message yet, because signing in needs a phone |
 | Operations (HA, scale-out) | ~40% | it runs on Kubernetes with a chart and a tested image; the cluster path has never carried real traffic |
 
 Federation is the honest answer to "when could I use this". Everything else is far enough along
@@ -185,8 +200,8 @@ server cannot really talk to the rest of Matrix yet. That, not the client-server
 what stands between this and a server somebody else would run.
 
 What is *not* in those percentages, and should temper them: no security review, no load testing
-beyond a loadgen harness, `cargo fuzz` never run, Sytest never run, and no real bridge
-(mautrix-*) has ever connected. Each of those has historically found things.
+beyond a loadgen harness, `cargo fuzz` never run, Sytest never run, and no bridge has yet
+carried a message through an encrypted room. Each of those has historically found things.
 
 ## What to do next, in order
 
@@ -413,7 +428,7 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | Postgres `tls`/`pool_size`/schema | `hs-kv`, `hs-cli` | encrypt in front of the database for now |
 | `/createRoom` not shard-gated | `hs-cli` | first actor may be built on a non-owner |
 | `e2e/configuration.spec.ts` failed once in 112 runs | `web` | unreproduced, and the machine was running Complement at the time; if it recurs, the error is the first thing to capture |
-| Overview's Bridges and Federation panels are 501s | `hs-admin`, `hs-cli` | the first page still says "isn't implemented" twice, and its all-clear is qualified accordingly |
+| A bridge's per-user sign-in state is invisible to the admin API | `hs-admin`, bridges | the Sign in tab says how to sign in, not who has; the bridges keep that state themselves |
 | Overview counts media, failing destinations and reports as unknown | `hs-cli` | three dashes where numbers should be; the sources exist in `hs-media`, `hs-federation` and nowhere respectively |
 | Setup link assumes `localhost:<bound port>` without `public_baseurl` | `hs-cli` | wrong behind a remapped port or an undescribed proxy |
 | The shard-gated appservice pump has only been tested with a scripted ownership | `hs-cli` | it moves with the global and appservice shards in the unit test; a real two-replica handoff of bridge delivery on the cluster has not been watched |

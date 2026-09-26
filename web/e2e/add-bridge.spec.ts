@@ -26,7 +26,12 @@ test.describe("Add a bridge", () => {
     await expect(page).toHaveURL(/\/bridges\/new/);
     await expectNoAxeViolations(page, "wizard: kind");
 
-    await page.getByRole("radio", { name: /Zulip/ }).click();
+    // The catalogue is grouped; a search narrows it. Bluesky is not among the seeded bridges.
+    await page.getByRole("heading", { name: "Messaging" }).waitFor();
+    await page.getByLabel("Search bridges").fill("blue");
+    await expect(page.getByRole("radio", { name: /WhatsApp/ })).toHaveCount(0);
+    await page.getByRole("radio", { name: /Bluesky/ }).click();
+    await expect(page.getByRole("link", { name: "Documentation" })).toBeVisible();
     await page.getByRole("button", { name: "Continue" }).click();
 
     await expect(page.getByRole("heading", { name: "Identity" })).toBeVisible();
@@ -44,25 +49,45 @@ test.describe("Add a bridge", () => {
     await page.getByRole("button", { name: "Continue" }).click();
 
     await expect(page.getByRole("heading", { name: "Options" })).toBeVisible();
+    // The operator adding the bridge is prefilled as its administrator.
+    await expect(page.getByLabel("Bridge administrator")).toHaveValue("@ops:example.org");
     await expectNoAxeViolations(page, "wizard: options");
     await page.getByRole("button", { name: "Continue" }).click();
 
     await expect(page.getByRole("heading", { name: "Review" })).toBeVisible();
     await expectNoAxeViolations(page, "wizard: review");
     await expect(page.getByText("registration.yaml (preview)")).toBeVisible();
+    // A mautrix bridge's own config is rendered too, pointed at this server.
+    const configPreview = page.getByRole("region", { name: "config.yaml (preview)" });
+    await expect(configPreview).toContainText("address: http://myelin:8008");
+    await expect(configPreview).toContainText('"@ops:example.org": admin');
 
     await page.getByRole("button", { name: "Create bridge" }).click();
 
-    await expect(page.getByRole("heading", { name: /Bridge Zulip created/ })).toBeVisible();
+    await expect(page.getByRole("heading", { name: /Bridge Bluesky created/ })).toBeVisible();
+    await expect(page.getByText("config.yaml", { exact: true })).toBeVisible();
     await expect(page.getByText("registration.yaml", { exact: true })).toBeVisible();
     await expect(page.getByText("docker-compose.yaml")).toBeVisible();
+    // The runbook: how to start it, that the page is watching for its first ping, and how to
+    // sign in, with the bot named for this server.
+    await expect(page.getByText("docker compose up -d bluesky")).toBeVisible();
+    await expect(page.getByRole("status")).toContainText("Waiting for the bridge's first ping");
+    await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
+    await expect(page.getByText("@blueskybot:example.org").first()).toBeVisible();
+    await expect(page.getByText(/app password/)).toBeVisible();
     await expectNoAxeViolations(page, "wizard: created");
 
-    await page.getByRole("button", { name: "Open bridge" }).click();
-    await expect(page).toHaveURL(/\/bridges\/zulip$/);
-    await expect(page.getByRole("heading", { name: "Zulip" })).toBeVisible();
-    await expect(page.getByText("Unknown")).toBeVisible();
+    await page.getByRole("link", { name: "Open bridge" }).click();
+    await expect(page).toHaveURL(/\/bridges\/bluesky$/);
+    await expect(page.getByRole("heading", { name: "Bluesky" })).toBeVisible();
+    await expect(page.getByText("Unknown").first()).toBeVisible();
     await expectNoAxeViolations(page, "bridge detail");
+
+    // The detail page knows what it is and how to sign in to it.
+    await page.getByRole("tab", { name: "Sign in" }).click();
+    await expect(page.getByText(/app password/)).toBeVisible();
+    await expect(page.getByRole("link", { name: /Bluesky documentation/ })).toBeVisible();
+    await expectNoAxeViolations(page, "bridge detail: sign in");
     domGuard.assertClean();
   });
 
@@ -81,7 +106,7 @@ test.describe("Add a bridge", () => {
     await page.getByRole("button", { name: "Add bridge" }).click();
     await expect(page).toHaveURL(/\/bridges\/new/);
 
-    await page.getByRole("radio", { name: /IRC \(mautrix\)/ }).click();
+    await page.getByRole("radio", { name: /LinkedIn/ }).click();
     await page.getByRole("button", { name: "Continue" }).click();
     await page.getByRole("button", { name: "Continue" }).click(); // identity
 
@@ -89,6 +114,10 @@ test.describe("Add a bridge", () => {
     await expect(page.getByRole("radio", { name: "Kubernetes" })).toBeVisible();
     await page.getByRole("radio", { name: "Kubernetes" }).click();
     await expect(page.getByLabel("Namespace")).toBeVisible();
+    // The server's address follows the deployment until the operator types one.
+    await expect(page.getByLabel(/This server, as the bridge reaches it/)).toHaveValue(
+      "http://myelin.bridges.svc:8008",
+    );
     await expectNoAxeViolations(page, "wizard: deployment (kubernetes)");
 
     await page.getByRole("button", { name: "Continue" }).click();
@@ -99,8 +128,10 @@ test.describe("Add a bridge", () => {
     await page.getByRole("button", { name: "Create bridge" }).click();
 
     await expect(page.getByRole("heading", { name: /created/ })).toBeVisible();
-    // Kubernetes deployments do not get a Compose snippet.
+    // Kubernetes deployments do not get a Compose snippet; they get the resource and its apply line.
     await expect(page.getByText("docker-compose.yaml")).toHaveCount(0);
+    await expect(page.getByText("Bridge resource (Kubernetes)")).toBeVisible();
+    await expect(page.getByText("kubectl apply -f linkedin-bridge.yaml")).toBeVisible();
     domGuard.assertClean();
   });
 

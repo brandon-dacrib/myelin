@@ -104,6 +104,20 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
 
 ### Bridges
 
+- **Adding a bridge is a wizard, and it ends in a running bridge.** The interface's catalogue
+  says what each of fourteen bridges is, what it needs and how to sign in to it (from the
+  bridges' own documentation); choosing one renders the bridge's `config.yaml` and its
+  registration from one set of choices, already pointed at this server, with the operator as
+  the bridge's administrator, double puppeting through the bridge's own token and encryption
+  in appservice mode; the Deployment step asks where each side is, so a bridge in Docker
+  beside a server on a laptop needs no edited file; the Created page is a runbook that turns
+  green on the bridge's first ping and then gives the sign-in steps with the bot's real Matrix
+  ID. Verified 2026-09-25 with mautrix-whatsapp: added through the wizard in a real browser,
+  started from the two files the page showed, connected in about seven seconds, MSC4190 device
+  made, MSC3202 keys queried, encryption in appservice mode, "Bridge started". The bridge
+  completed the wizard's 40-line config to 666 lines itself. No message has crossed it yet:
+  signing in needs a phone. `docs/bridges/mautrix.md`. Found on the way and fixed: a ping that
+  succeeded did not clear the error from the one before it.
 - **A real bridge works.** heisenbridge, the IRC bouncer bridge, against the real binary and a
   local IRC server: it registers its bot, drives the server as an appservice, is sent every event
   in its rooms, answers commands, and relays both ways -- an IRC user appears in Matrix as a ghost
