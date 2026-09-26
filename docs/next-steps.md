@@ -307,8 +307,14 @@ one polling test can print the same line twenty times.
   sessions. Needs pushers to remember which device made them, and a revocation hook from
   `hs-auth` into `hs-push`.
 - ~~`min_depth` on `/get_missing_events`, still parsed nowhere.~~ **Done 2026-09-26**: a floor the
-  walk does not return below or continue past (`hs-cli` test). History visibility is still not
-  applied per event there or on `/backfill`.
+  walk does not return below or continue past (`hs-cli` test). ~~History visibility is still not
+  applied per event there or on `/backfill`.~~ **Done the same day**: both serve a server the
+  events it was not in the room for *redacted* (`RoomActor::server_may_see`, the server-side
+  rules as Synapse's `filter_events_for_server` applies them: `joined` needs one of that
+  server's users joined as of the event, `invited` joined or invited, `shared` and
+  `world_readable` anyone past the room gate), still signed and hashed so the requester can
+  verify and place them; `hs-cli` test with a members-only room. `TestInboundCanReturnMissingEvents`
+  checks this for both visibilities and then the `guest_access` ordering it has always failed on.
 
 #### What the first Complement runs with two-way joins found (2026-09-25/26)
 
@@ -535,7 +541,6 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 
 | Gap | Where | Consequence |
 |---|---|---|
-| history visibility not applied per event on `/get_missing_events` | `hs-cli` | pre-join events served unredacted |
 | Restricted joins rejected | `hs-federation`, `hs-room` | ten conformance tests, a common room type |
 | A rejoined room's gap is never filled | `hs-room` | history is fetched before the oldest held event; what happened between a leave and a rejoin stays on the resident |
 | The state at a backfilled event is walked, not asked for | `hs-room` | exact while the history is linear and the previous event for each reverted key is within reach; a key set before the fetched history reads as unset until that history arrives; no auth check runs on backfilled events |

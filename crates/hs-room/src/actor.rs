@@ -3598,6 +3598,59 @@ impl<B: KvBackend> RoomActor<B> {
         Ok(allowed)
     }
 
+    /// Whether `server` may be served `event` over federation (`/backfill`,
+    /// `/get_missing_events`): the spec's history-visibility rules as a *server* is subject to
+    /// them, the way Synapse's `filter_events_for_server` applies them. `world_readable` and
+    /// `shared` allow any server that passes the room-level gate (a member of it now, which the
+    /// caller checks); `joined` needs a user of `server` joined in the state as of `event`;
+    /// `invited`, joined or invited. An outlier -- no place in the timeline, no meaningful state
+    /// of its own -- is a piece of the room's state and is allowed by the room-level gate alone.
+    /// A server that may not see an event is served its redacted form rather than nothing
+    /// (`hs-cli`'s room source does the redacting): a hole in a batch would read as missing
+    /// history to the caller, and the redacted form still verifies.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::EventNotFound`] if this actor does not hold `event`, or
+    /// [`RoomError::State`] if the state store fails.
+    pub fn server_may_see(&self, event: &Event, server: &str) -> Result<bool, RoomError> {
+        if event.header().flags.is_outlier() {
+            return Ok(true);
+        }
+        let sn = *self
+            .event_id_index
+            .get(event.event_id())
+            .ok_or_else(|| RoomError::EventNotFound(event.event_id().to_string()))?;
+        let after = self.state_view_at_sn(sn)?;
+        let visibility = history_visibility::HistoryVisibility::parse(
+            after
+                .event_for("m.room.history_visibility", "")
+                .map_err(|e| RoomError::State(e.to_string()))?
+                .and_then(|e| content_str(e, "history_visibility")),
+        );
+        if matches!(
+            visibility,
+            history_visibility::HistoryVisibility::WorldReadable
+                | history_visibility::HistoryVisibility::Shared
+        ) {
+            return Ok(true);
+        }
+        let invited_counts = visibility == history_visibility::HistoryVisibility::Invited;
+        Ok(self.state_at_root(after.root)?.into_iter().any(|member| {
+            member.header().event_type == "m.room.member"
+                && member
+                    .header()
+                    .state_key
+                    .as_deref()
+                    .and_then(|k| UserId::parse(k).ok())
+                    .is_some_and(|user| user.server_name().as_str() == server)
+                && match content_str(member, "membership") {
+                    Some("join") => true,
+                    Some("invite") => invited_counts,
+                    _ => false,
+                }
+        }))
+    }
+
     /// The state event `event` replaced: the event that held `(event.type, event.state_key)` in
     /// this room's current state *at the point `event` was sent*, which is what the client-server
     /// API's `unsigned.prev_content`, `unsigned.replaces_state` and `unsigned.prev_sender` are

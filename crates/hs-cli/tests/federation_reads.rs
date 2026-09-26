@@ -428,6 +428,139 @@ async fn the_auth_chain_of_an_event_is_the_events_it_transitively_cites() {
 /// than a state event it dereferences a nil pointer, which kills the Go test binary and silently
 /// discards every test scheduled after it. That is why the whole federation suite has been run
 /// with `-skip TestInboundCanReturnMissingEvents`.
+/// History a server was not in the room for is served to it redacted, not whole and not left
+/// out: in a members-only room, a message from before that server's member joined comes back
+/// through `/backfill` and `/get_missing_events` with its content stripped and its signatures
+/// intact; a message from after the join comes back whole. `TestInboundCanReturnMissingEvents`
+/// checks exactly this for the `joined` and `invited` visibilities, and until now both
+/// endpoints applied only the room-level gate and served everything whole.
+#[tokio::test]
+async fn history_a_server_was_not_there_for_is_served_redacted() {
+    let harness = Harness::new().await;
+    let creator = ruma::UserId::parse(format!("@alice:{US}")).unwrap();
+    let bob = ruma::UserId::parse(format!("@bob:{REMOTE}")).unwrap();
+    let handle = harness
+        .rooms
+        .create_room(
+            creator.clone(),
+            hs_room::actor::CreateRoomRequest {
+                preset: Some("public_chat".to_owned()),
+                ..Default::default()
+            },
+            1_000,
+        )
+        .await
+        .expect("room creation");
+    handle
+        .send_event(
+            creator.clone(),
+            "m.room.history_visibility".to_owned(),
+            Some(String::new()),
+            serde_json::json!({ "history_visibility": "joined" }),
+            None,
+            2_000,
+        )
+        .await
+        .expect("members-only history");
+    handle
+        .send_event(
+            creator.clone(),
+            "m.room.message".to_owned(),
+            None,
+            serde_json::json!({ "msgtype": "m.text", "body": "before bob" }),
+            None,
+            3_000,
+        )
+        .await
+        .expect("message before the join");
+    handle
+        .membership(
+            bob.clone(),
+            hs_room::membership::Action::Join,
+            bob.clone(),
+            serde_json::json!({}),
+            4_000,
+        )
+        .await
+        .expect("bob joins from the remote");
+    handle
+        .send_event(
+            creator.clone(),
+            "m.room.message".to_owned(),
+            None,
+            serde_json::json!({ "msgtype": "m.text", "body": "after bob" }),
+            None,
+            5_000,
+        )
+        .await
+        .expect("message after the join");
+    // One more, to ask from: the newest end of a `/get_missing_events` gap is not echoed back.
+    let newest = handle
+        .send_event(
+            creator,
+            "m.room.message".to_owned(),
+            None,
+            serde_json::json!({ "msgtype": "m.text", "body": "newest" }),
+            None,
+            6_000,
+        )
+        .await
+        .expect("a newest message");
+    let room_id = handle.query(|actor| actor.room_id().to_string()).await;
+    let create_id = harness.create_event_id(&room_id).await;
+
+    // A PDU on the wire carries no `event_id` at this room version; the two messages are told
+    // apart by the timestamps they were sent with.
+    let check = |pdus: &[Value], what: &str| {
+        let find = |ts: i64| {
+            pdus.iter()
+                .find(|p| p["type"] == "m.room.message" && p["origin_server_ts"] == ts)
+                .unwrap_or_else(|| {
+                    panic!("{what}: the message sent at {ts} must be in the answer: {pdus:?}")
+                })
+        };
+        let redacted = find(3_000);
+        assert!(
+            redacted["content"].get("body").is_none(),
+            "{what}: the message before bob's join must be served redacted: {redacted}"
+        );
+        assert!(
+            redacted.get("signatures").is_some() && redacted.get("hashes").is_some(),
+            "{what}: a redacted PDU is still a PDU: {redacted}"
+        );
+        let whole = find(5_000);
+        assert_eq!(
+            whole["content"]["body"], "after bob",
+            "{what}: the message after the join is served whole"
+        );
+    };
+
+    let (status, body) = harness
+        .signed_get(&format!(
+            "/backfill/{room_id}?limit=20&v={}",
+            newest.event_id()
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    check(body["pdus"].as_array().expect("pdus"), "/backfill");
+
+    let (status, body) = harness
+        .signed_post(
+            &format!("/get_missing_events/{room_id}"),
+            serde_json::json!({
+                "earliest_events": [create_id],
+                "latest_events": [newest.event_id()],
+                "limit": 20,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    check(
+        body["events"].as_array().expect("events"),
+        "/get_missing_events",
+    );
+}
+
 #[tokio::test]
 async fn missing_events_come_back_oldest_first() {
     let harness = Harness::new().await;

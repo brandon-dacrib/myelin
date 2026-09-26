@@ -1,5 +1,17 @@
 # 06 Federation: status
 
+> **Integration note, 2026-09-26, last (integration lead): what a server is served.**
+> `/backfill` and `/get_missing_events` applied only the room-level gate (a member of the
+> requesting server now, or `world_readable`) and served everything whole, so a server whose
+> member joined a members-only room yesterday could fetch the whole of last year. Both now serve
+> an event the requesting server was not in the room for in its redacted form
+> (`hs_cli::federation::pdu_for_server` over `RoomActor::server_may_see`): `joined` needs one of
+> that server's users joined as of the event, `invited` joined or invited, `shared` and
+> `world_readable` allow anyone past the gate. Redacted rather than omitted, because a hole in a
+> batch reads as missing history to the requester and the redacted form still verifies. Also
+> `min_depth` on `/get_missing_events`, parsed and applied as a floor. Both tested in
+> `crates/hs-cli/tests/federation_reads.rs`.
+
 > **Integration note, 2026-09-26, later (integration lead): the gap-shaped request.** Reading
 > `TestGetMissingEventsGapFilling` for why it failed found that Complement's reference federation
 > server answers exactly one request when a homeserver receives an event with unknown ancestors:

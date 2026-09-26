@@ -226,8 +226,14 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
   private CA (`crates/hs-federation/scripts/two-server-federation.sh`): it passed on 2026-09-25, join through `/join`, state on B, a message each way. Between two
   instances of this server; a Synapse on the other end has not been tried. Not yet: EDUs,
   invites, leaves and knocks over federation; the outbound queue is in memory.
-- `/get_missing_events` honours `min_depth` (2026-09-26): a floor below which nothing is returned
-  and the walk does not continue. It used to be parsed nowhere.
+- **A server is served only the history it was there for** (2026-09-26). `/backfill` and
+  `/get_missing_events` checked only that the requesting server had a member in the room and then
+  served every event whole, so a server whose user joined a members-only room today could fetch
+  everything said before. Both now serve an event the requesting server was not in the room for
+  in its redacted form (still signed, still verifiable), per the room's history visibility as of
+  the event, the way Synapse does. `/get_missing_events` also honours `min_depth`, a floor below
+  which nothing is returned; it used to be parsed nowhere. Both tested end to end through the
+  signed federation router.
 - **An event that raced a member's join is visible to them** (2026-09-26). In a `shared` room a
   member could see an event if they were joined in the state at it or joined later in the
   timeline; an event sent on a branch that had not seen their join was neither, and was

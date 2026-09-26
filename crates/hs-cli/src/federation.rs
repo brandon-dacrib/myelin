@@ -185,6 +185,36 @@ fn full_pdu(event: &Event) -> Value {
     canonical_to_json(event.json())
 }
 
+/// `event` as `requesting_server` may have it: whole if the room's history visibility as of the
+/// event lets that server see it (`RoomActor::server_may_see`), its redacted form otherwise --
+/// still signed, still hashed, still a PDU the requester can verify and place, just without
+/// the content it was not there for. `None` only if the event cannot be redacted at all (no
+/// `type`, a non-object `content`), which a stored event never is; leaving such an event out is
+/// the safe side of a visibility gate.
+fn pdu_for_server<B: KvBackend>(
+    actor: &RoomActor<B>,
+    event: &Event,
+    requesting_server: &str,
+) -> Option<Value> {
+    match actor.server_may_see(event, requesting_server) {
+        Ok(true) => Some(full_pdu(event)),
+        Ok(false) => {
+            let rules = hs_model::room_version::rules_for(actor.room_version())?;
+            match hs_model::redaction::redact(event.json(), &rules.redaction) {
+                Ok(redacted) => Some(canonical_to_json(&redacted)),
+                Err(error) => {
+                    tracing::warn!(event_id = %event.event_id(), %error, "could not redact an event for a server that may not see it whole; leaving it out");
+                    None
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(event_id = %event.event_id(), %error, "could not decide whether a server may see an event; leaving it out");
+            None
+        }
+    }
+}
+
 /// The event IDs in an event's `auth_events`, handling both the room version 1/2 shape (a
 /// `[event_id, hashes]` pair per entry) and the version 3+ shape (a bare event ID string).
 fn auth_event_ids(event: &Event) -> Vec<String> {
@@ -386,9 +416,13 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
         // because `room_pos` -- what `paginate` is keyed by -- is only carried on the persisted
         // row, not on the in-memory event.
         let token = self.backfill_token(room_id, from_event_ids);
+        let server = requesting_server.to_owned();
         self.with_visible_room(room_id, requesting_server, move |actor| {
             let (events, _) = actor.paginate(token, Direction::Backward, limit);
-            Ok(events.into_iter().map(full_pdu).collect())
+            Ok(events
+                .into_iter()
+                .filter_map(|event| pdu_for_server(actor, event, &server))
+                .collect())
         })
         .await
     }
@@ -404,6 +438,7 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
     ) -> Result<Vec<EventJson>, RoomSourceError> {
         let earliest: HashSet<String> = earliest_events.iter().cloned().collect();
         let latest = latest_events.to_vec();
+        let server = requesting_server.to_owned();
         self.with_visible_room(room_id, requesting_server, move |actor| {
             // Walk back over `prev_events` from what the caller has, stopping at the events it
             // says it already knows. This is the gap-filling request a remote makes when an
@@ -451,7 +486,10 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
                     .cmp(&b.header().depth)
                     .then_with(|| a.event_id().as_str().cmp(b.event_id().as_str()))
             });
-            Ok(found.into_iter().map(full_pdu).collect())
+            Ok(found
+                .into_iter()
+                .filter_map(|event| pdu_for_server(actor, event, &server))
+                .collect())
         })
         .await
     }
