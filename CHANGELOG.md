@@ -12,10 +12,23 @@ Versions follow [semantic versioning](https://semver.org). Nothing is released y
 ## Unreleased
 
 Everything below exists on `main` and has never been tagged. The container image is published
-continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
+continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`, and the Helm chart
+to `oci://ghcr.io/brandon-dacrib/charts/hs` as a pre-release, `0.1.0-main.<run>.g<commit>`, that
+pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Installing and administering it
 
+- **The Helm chart is on the registry.** `helm install myelin oci://ghcr.io/brandon-dacrib/charts/hs
+  --devel --set serverName=example.org` is a running server. Every push to `main` publishes the
+  chart as a pre-release, `0.1.0-main.<run>.g<commit>`, whose default image is the one built
+  from that same commit, after CD has pulled the chart back and checked that image exists; the
+  package is public. Verified 2026-09-26, twice, on a real cluster: Ready in about two minutes,
+  `/health/ready` answering from inside the cluster, the setup link in the pod's log. Upgrading
+  the standing demo to it was refused, which found that the volume claim template carried the
+  chart version and app version as labels, immutable in a StatefulSet and different in every
+  published chart, so no upgrade from one published chart to the next would have worked; fixed
+  the same day (an install made before it needs one `kubectl delete statefulset
+  --cascade=orphan` before its next upgrade). `--devel` is needed until the first tag.
 - **A locked-out administrator gets back in with one command.** `hs recover`, run where the
   server keeps its signing key (`kubectl exec <pod> -- hs recover`, `docker exec <container> hs
   recover`, `hs recover --data-dir ./data` on a host), signs a request with that key and prints
@@ -48,8 +61,8 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
   Before this the chart demanded a hand-made signing-key Secret and a rendered config file and
   defaulted to an image tag that did not exist. Helm-managed settings now reach the server as
   environment variables, which outrank the database, so they hold on every upgrade and the
-  interface shows them as pinned. The chart is published as an OCI artifact by the first `v*`
-  tag, which has not happened; until then it installs from a checkout.
+  interface shows them as pinned. Later the same day the chart reached the registry too (the
+  bullet above).
 - **A replica that is shutting down says so before it drains.** `/health/ready` answered 200
   for the whole of a shutdown, including a cluster drain of up to twenty seconds, so a Service
   kept routing new requests to a pod that was handing its rooms away. Readiness is withdrawn

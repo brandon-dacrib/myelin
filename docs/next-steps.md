@@ -213,6 +213,14 @@ The key is the credential because holding it already means being the server. `do
 is the runbook; the design is in `hs_auth::recovery`'s module documentation; a test drives the
 real binary through the whole thing, wrong key included.
 
+**And on the registry** (2026-09-26, later again). Every push to `main` publishes the chart to
+`oci://ghcr.io/brandon-dacrib/charts/hs` as a pre-release pinned to the image built from the
+same commit, and `helm install myelin oci://ghcr.io/brandon-dacrib/charts/hs --devel --set
+serverName=example.org` was run twice against the cluster: Ready in about two minutes, the
+setup link in the log. Upgrading the demo to it found that no upgrade between two published
+charts could ever have succeeded (immutable labels on the volume claim template), fixed the
+same day; `docs/status/12-platform-and-kubernetes.md` has the transcript.
+
 **The admin interface ships.** Until 2026-09-21 it did not: every binary and every published image served a placeholder at `/admin/` saying the interface had not been built in, because nothing embedded `web/dist`. `crates/hs-admin/build.rs` now stages the built interface (or the placeholder, for a Rust-only checkout, and says so at startup); release builds set `HS_ADMIN_WEB_DIST` and *fail* without a built interface; CD refuses to publish an image whose `/admin/` is not the interface. Verified on the published artifact: `ghcr.io/brandon-dacrib/myelin:main`, pulled from the registry on 2026-09-21 and run with the README's exact command, serves the interface at `/admin/`, answers `needs_setup: true`, and logs the setup link. What has still never run is the `v*` binaries job's new Node step, which only a tag exercises.
 
 **Complement, `csapi`: 317 of 384 assertions pass** (78 of 106 top-level), measured 2026-09-26 at
@@ -320,7 +328,7 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 | Management web interface | ~75% | users (with devices, sign-out and password reset), rooms (with members), bridges (the catalogue, the wizard with the bridge's own config, the runbook, sign-in guides), federation destinations, configuration and the audit log are real against the real server; the media and reports pages still read from operations that answer 501; arrays-of-objects are a JSON textarea |
 | **Federation** | **~30%** | 75/250 assertions, 14/88 top-level (run 7); a user here joins a room hosted elsewhere through the client API, messages flow both ways between two real servers, and the room's history from before the join is fetched as the client scrolls back; in-memory outbound queue, no EDUs, no invites/leaves/knocks over federation |
 | Bridges | ~75% | heisenbridge works end to end both directions (`docs/bridges/heisenbridge.md`); mautrix-whatsapp, added through the wizard, connects and starts in appservice-mode encryption (`docs/bridges/mautrix.md`); all 16 bridge operations are real; no mautrix bridge has carried a message yet, because signing in needs a phone |
-| Operations (HA, scale-out) | ~50% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; a standing demo behind a Traefik Ingress with a Let's Encrypt certificate, scraped by Prometheus, its setup page opened in a browser at the public hostname; a locked-out administrator gets back in with `hs recover` run where the key is; readiness withdrawn the moment a shutdown begins; two replicas shared a room on one PostgreSQL in an experiment; the cluster path has never carried real traffic on a cluster and the operator creates nothing yet |
+| Operations (HA, scale-out) | ~50% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; the chart is published from `main` and installs from the registry in one sentence; a standing demo behind a Traefik Ingress with a Let's Encrypt certificate, scraped by Prometheus, its setup page opened in a browser at the public hostname; a locked-out administrator gets back in with `hs recover` run where the key is; readiness withdrawn the moment a shutdown begins; two replicas shared a room on one PostgreSQL in an experiment; the cluster path has never carried real traffic on a cluster and the operator creates nothing yet |
 
 Federation is still the honest answer to "when could I use this". Everything else is far enough
 along that the gaps are specific and listed. As of 2026-09-25 a user here can join a room on
@@ -343,10 +351,21 @@ would do it; each ends in a transcript in `docs/status/12-platform-and-kubernete
 
 - ~~Install with one value, for real, with the published image.~~ **Done 2026-09-26** (see the
   state of things).
-- **Publish the chart on `main`, not only on a tag.** `helm install myelin oci://ghcr.io/
-  brandon-dacrib/charts/hs` is the sentence the README wants to say and cannot yet: the chart
-  job in `cd.yml` runs on `v*` only. Tagging `v0.0.1` (housekeeping, below) or publishing the
-  chart from `main` too, either closes it.
+- ~~Publish the chart on `main`, not only on a tag.~~ **Done 2026-09-26**: the chart job in
+  `cd.yml` runs on every push to `main`, publishing `oci://ghcr.io/brandon-dacrib/charts/hs` as
+  a pre-release (`0.1.0-main.<run>.g<commit>`) whose appVersion is the `sha-<commit>` image the
+  same run just published, after the manifest list so the image exists first, and it pulls the
+  chart back and checks the image it renders is in the registry before the job passes.
+  `helm install ... --devel --set serverName=example.org` is the README's sentence now; a plain
+  `helm install` will take the first `v*` tag, and after that tag Chart.yaml's version has to
+  move (the job's comment says so) for `--devel` to see `main` again. Verified on the cluster
+  the same day, twice: install from the registry to Ready in 128 s and 131 s, the pod on the
+  commit's own image, `/health/ready` 200 from inside the cluster, the setup link logged.
+  Upgrading the demo to it was refused: `volumeClaimTemplates` carried the chart and app
+  version labels, immutable in a StatefulSet and different in every published chart, so no
+  upgrade between published charts would ever have worked; fixed (selector labels only), with
+  a one-time `--cascade=orphan` step for installs made before
+  (`docs/status/12-platform-and-kubernetes.md`).
 - **Cluster mode with real traffic on a real cluster.** `mode=cluster` with CloudNativePG (the
   verification cluster has `cnpg-system`), media on S3 or a ReadWriteMany claim, a shared
   signing-key Secret, two replicas: Element signed in through the Service, a bridge registered,
@@ -669,7 +688,8 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | The shard-gated appservice pump has only been tested with a scripted ownership | `hs-cli` | it moves with the global and appservice shards in the unit test; a real two-replica handoff of bridge delivery on the cluster has not been watched |
 | In-process server cannot be restarted over its data directory | `hs-cli` | background tasks hold the store's lock after `shutdown()`; restart tests need the real binary |
 | The release binaries job's web build has never run | `.github` | it only runs on a `v*` tag; the image path is verified, this one is not |
-| The chart is published only on a `v*` tag | `.github` | `helm install oci://...` is not possible yet; it installs from a checkout |
+| The `main` chart needs `--devel`, and a first tag hides it until Chart.yaml's version moves on | `.github`, `deploy/helm` | pre-releases sort below the release they precede; bump `version` in Chart.yaml right after tagging |
+| An install from a chart before 2026-09-26's label fix cannot be upgraded in place | `deploy/helm` | one `kubectl delete statefulset --cascade=orphan` before the next `helm upgrade`; only the demo existed |
 | A pod does not know its own mesh address | `hs-cli`, `hs-cluster` | `advertise_host` falls back to the bind address or `127.0.0.1`; cluster mode between two pods has not been tried |
 | The operator creates no workloads | `hs-operator` | `Homeserver` reconciles to a status only; the chart is the only way to deploy |
 | A cold boot in the image takes about five seconds | `hs-cli`, `hs-kv` | the first startup probe is refused every time; harmless, unmeasured |

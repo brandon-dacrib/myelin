@@ -89,8 +89,14 @@ Without Docker, `hs serve --data-dir ./data --server-name example.org` is the sa
 On Kubernetes it is one value:
 
 ```sh
-helm install myelin deploy/helm/hs --set serverName=example.org
+helm install myelin oci://ghcr.io/brandon-dacrib/charts/hs --devel --set serverName=example.org
 ```
+
+`--devel` because nothing is tagged yet: every push to `main` publishes the chart as a
+pre-release (`0.1.0-main.<run>.g<commit>`) whose default image is the one built from that same
+commit, and a plain `helm install` takes releases only. From a checkout,
+`helm install myelin deploy/helm/hs --set serverName=example.org` is the same chart with the
+`main` image.
 
 That produces a single replica with a 10 GiB volume holding the database, the signing key and
 media, probes, a Service, and the same setup link in the pod's log (`helm install` prints the
@@ -102,8 +108,14 @@ Ingress with a Let's Encrypt certificate, scraped by Prometheus through the char
 ServiceMonitor, and its setup page opened in a browser at the public hostname; that found the
 Ingress routing `/_matrix` only, which would have made the setup link a 404, and it routes the
 interface now. Locked out of it later: `kubectl exec <pod> -- hs recover`, and the link it
-prints. The chart is published as an OCI artifact by the first `v*`
-tag, which has not happened yet, so for now it installs from a checkout. Cluster mode
+prints. The chart has been on the registry since 2026-09-26, published by every push to
+`main`, and the sentence above was run twice against the same cluster that day: Install
+complete in about two minutes, the pod on the image built from the chart's own commit,
+`/health/ready` answering, the setup link in the log. Upgrading the standing demo to it was
+refused, which found that the chart's volume claim template carried labels that change with
+every publish and that Kubernetes never lets change; fixed the same day, and
+`docs/status/12-platform-and-kubernetes.md` has the one manual step an install made before the
+fix needs. Cluster mode
 (`mode=cluster`, PostgreSQL or CloudNativePG, media on S3, a shared signing-key Secret) renders
 and has run as two processes on one PostgreSQL, but has not yet carried real traffic on a
 cluster; that is the top of `docs/next-steps.md`. `docs/scaling.md` says exactly what adding a
@@ -129,7 +141,7 @@ broken up, because the parts are nowhere near each other. This table is kept cur
 | Admin API | ~40% | 58 of 145 operations have a real handler; the rest answer an honest 501 |
 | Management web interface | ~75% | users, rooms, bridges (catalogue, wizard, runbook, sign-in guides), federation, configuration and the audit log are real against the real server |
 | Bridges | ~75% | heisenbridge works end to end; mautrix-whatsapp, added through the wizard, connects and starts encrypted; no mautrix bridge has carried a message yet |
-| Operations (HA, scale-out) | ~50% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; a standing demo behind an Ingress with a real certificate, scraped by Prometheus, its setup page opened in a browser; a locked-out administrator gets back in with one command run where the key is; readiness is withdrawn the moment a shutdown begins; the cluster path has not carried real traffic and the operator creates nothing yet |
+| Operations (HA, scale-out) | ~50% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; the chart is published from `main` and installs from the registry in one sentence; a standing demo behind an Ingress with a real certificate, scraped by Prometheus, its setup page opened in a browser; a locked-out administrator gets back in with one command run where the key is; readiness is withdrawn the moment a shutdown begins; the cluster path has not carried real traffic and the operator creates nothing yet |
 | **Federation** | **~30%** | 75/250 assertions, 14/88 tests; a user joins a room hosted elsewhere through the client API, messages flow both ways between two instances of this server, and the room's history from before the join is fetched as the client scrolls back; no EDUs, in-memory outbound queue, not yet tried against Synapse |
 
 Federation is the honest answer to "when could I use this": a user here cannot really talk to

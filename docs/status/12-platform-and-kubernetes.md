@@ -1,5 +1,105 @@
 # 12. Platform and Kubernetes
 
+## The chart is on the registry, and the install is one sentence (2026-09-26, later again)
+
+Until this session the chart job in `cd.yml` ran on a `v*` tag only, and there has never been
+one, so `helm install myelin oci://ghcr.io/brandon-dacrib/charts/hs` was a sentence the README
+could not say, and the demo below installed from a checkout. The job runs on every push to
+`main` now, after the manifest list rather than the gate, and publishes a pre-release of
+Chart.yaml's version, `<version>-main.<run number>.g<short sha>`, whose appVersion is the
+`sha-<commit>` image tag the same run has just published, so a chart and the image it pulls
+always come from one commit. After `helm push` it pulls the chart back by version, renders it,
+and checks the image it would run is in the registry, because a push succeeding is not an
+install working. `helm install --devel` picks the newest pre-release; a plain `helm install`
+picks releases only, which is what the first tag will be for -- and after that tag Chart.yaml's
+`version` has to move on (`0.1.0-main.N` sorts below `0.1.0`) for `--devel` to see `main`
+again; the job's comment says so.
+
+### What was verified
+
+CD run 61 from `e3853d0` published `ghcr.io/brandon-dacrib/charts/hs:0.1.0-main.61.ge3853d0`
+(digest `sha256:89ed85ba...`); its own pull-back rendered
+`ghcr.io/brandon-dacrib/myelin:sha-e3853d0f...` and found it in the registry. From this machine,
+with no registry credentials of any kind:
+
+```
+$ curl "https://ghcr.io/token?scope=repository:brandon-dacrib/charts/hs:pull"      # anonymous token
+$ curl -H "Authorization: Bearer $tok" https://ghcr.io/v2/brandon-dacrib/charts/hs/tags/list
+  {"name":"brandon-dacrib/charts/hs","tags":["0.1.0-main.61.ge3853d0"]}           # the package is public
+$ helm show chart oci://ghcr.io/brandon-dacrib/charts/hs
+  Error: could not locate a version matching provided version string             # pre-releases only, as designed
+$ helm show chart oci://ghcr.io/brandon-dacrib/charts/hs --devel
+  version: 0.1.0-main.61.ge3853d0   appVersion: sha-e3853d0f1f46230c7d11b8e90dc8f88009d0210a
+```
+
+Then the README's sentence, twice, on the same Talos cluster as the sections below (helm
+v4.2.4 on the client), each time into a throwaway namespace that was deleted afterwards:
+
+```
+$ helm install myelin oci://ghcr.io/brandon-dacrib/charts/hs --devel --set serverName=example.org \
+    -n myelin-oci-check --create-namespace --wait --timeout 6m
+  Pulled: ghcr.io/brandon-dacrib/charts/hs:0.1.0-main.61.ge3853d0
+  STATUS: deployed   DESCRIPTION: Install complete            real 2m08s (the second run: 2m11s)
+$ helm list      myelin  hs-0.1.0-main.61.ge3853d0  sha-e3853d0f1f46230c7d11b8e90dc8f88009d0210a
+$ kubectl get pods ...
+  myelin-hs-0  ready=true  ghcr.io/brandon-dacrib/myelin:sha-e3853d0f1f46230c7d11b8e90dc8f88009d0210a  black0n0
+  events: claim provisioned by Longhorn in 2 s; the image pull started 39 s after that and took
+          42 s (21.8 MB); the container started 14 s after the pull; the first startup probe,
+          4 s later, was refused (connection refused: the cold boot in the known-gaps table)
+$ kubectl run curl --image=curlimages/curl --rm -i -- curl -s -w ' %{http_code}' http://myelin-hs:8008/health/ready
+  ready 200
+# the second run's pod log, relative to its first line (the configuration seed):
+  +0.7 s  INFO  generated this server's signing key  path=/var/lib/hs/data/keys/hs.signing.key
+  +4.3 s  INFO  appservice event delivery starts here: what has already happened ... will not be sent
+  +4.7 s  INFO  listening addr=[::]:8008
+  +4.7 s  WARN  this server has no administrator yet: open the setup link to create one ...
+                setup_link=http://localhost:8008/admin/setup#token=...        # no publicBaseUrl set
+```
+
+The 3.6 s between the signing key and the first line after storage has opened is the cold boot
+the known-gaps table lists; it is being measured and shortened separately.
+
+### What upgrading the demo to it found
+
+`helm upgrade --install myelin oci://ghcr.io/brandon-dacrib/charts/hs --devel -n myelin -f
+values.yaml --wait`, against the demo installed from a checkout as `hs-0.1.0` / `main`, was
+refused after 64 s:
+
+```
+Error: UPGRADE FAILED: server-side apply failed for object myelin/myelin-hs apps/v1,
+Kind=StatefulSet: StatefulSet.apps "myelin-hs" is invalid: spec: Forbidden: updates to
+statefulset spec for fields other than 'replicas', 'ordinals', 'template', 'updateStrategy',
+'revisionHistoryLimit', 'persistentVolumeClaimRetentionPolicy' and 'minReadySeconds' are forbidden
+```
+
+`helm get manifest --revision 2` diffed against `helm template` of the new chart said why: the
+`volumeClaimTemplates` entry carried the chart's standard label set, `helm.sh/chart:
+hs-<version>` and `app.kubernetes.io/version: <appVersion>` among them, and Kubernetes treats
+everything in a StatefulSet's spec outside the listed fields as immutable, those labels
+included. Both change with every published chart -- the version by construction, the appVersion
+because it is the commit -- so not only this upgrade but **every upgrade from one published
+chart to the next** would have been refused, on every install. The template carries the
+selector labels only now (name and instance, which never change), with a comment saying why.
+An install made from the chart before this fix has the old labels baked in and cannot be
+upgraded to any later chart without one manual step, the standard one for immutable
+StatefulSet fields, which loses nothing:
+
+```
+kubectl -n <namespace> delete statefulset <release>-hs --cascade=orphan   # the pod and its claim stay
+helm upgrade ...                                                           # recreates it, adopts the pod, rolls it once
+```
+
+The demo's failed revision 3 was rolled back to revision 2 (`helm rollback myelin 2`, now
+revision 4), the pod untouched throughout: `/api/v1/setup` (`needs_setup: false`, so the
+administrator is still there) and `/_matrix/client/versions` answered through Traefik before,
+during and after. DEMO_MIGRATION_SENTENCE
+
+### Not verified
+
+The tagged-release path (`v*`: the binaries job, the chart at a release version, the GitHub
+release) has still never run. Nothing has been installed from the registry on any cluster but
+this one, nor with Helm 3.
+
 ## A demo an operator can reach: myelin.dacrib.net (2026-09-26, later the same day)
 
 The section below proved the install through a port-forward and tore it down. This one leaves
