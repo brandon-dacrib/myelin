@@ -341,6 +341,31 @@ What is *not* in those percentages, and should temper them: no security review, 
 beyond a loadgen harness, `cargo fuzz` never run, Sytest never run, and no bridge has yet
 carried a message through an encrypted room. Each of those has historically found things.
 
+## In flight right now (2026-09-26, evening)
+
+Five agents were started in parallel, each in its own git worktree under `.claude/worktrees/`
+(excluded from git locally, not ignored in the repository) on a branch named after the
+worktree, committing there and never pushing; the lead merges each branch into `main`, runs
+the checks and pushes. If a session ends before that, the work is still on these branches
+(`git branch --list 'worktree-agent-*'`, `git log main..<branch>`), and the worktree's own
+`docs/status/NN-*.md` has the agent's account of what was verified. Merge with
+`git merge --no-ff <branch>`, then `cargo fmt --all --check`, clippy and the touched crates'
+tests, then update this file, `README.md`'s table and `CHANGELOG.md`, which the agents were told
+not to touch. All five share the main checkout's `target/` through a symlink.
+
+| Branch | Track | Task |
+|---|---|---|
+| `worktree-agent-a24fa2b7f44661e43` | 12 platform | the chart install as a CD gate: a `kind` install in `cd.yml` before anything is tagged, as a script under `deploy/helm/hs/ci/` |
+| `worktree-agent-a909b00192bc83196` | 01 storage | measure the five-second cold boot and halve it; before/after in `docs/status/01-storage-engine.md`; it will say what the startup probe can become |
+| `worktree-agent-a368732bc30d06e73` | 03 cluster | a pod knows its own mesh address (config field + Downward API in the chart), mesh mTLS wired from `hs-cli` and the chart, `/createRoom` shard-gated; verified as two processes on one PostgreSQL; a values file for the two-pod cluster experiment |
+| `worktree-agent-a2d1e568234dc9ca4` | 05 sync | `/sync` cluster-aware: the room owner wakes the replica holding the user's session over the mesh, read-your-writes across replicas; two-process transcript in `docs/status/05-sync.md`, `docs/scaling.md` kept true |
+| `worktree-agent-a64e3554e25e92d1a` | 06 federation | the outbound federation queue and per-destination backoff survive a restart; verified by restarting the real binary |
+
+The two other worktrees at `f1ebdbc` belong to the session building the operator (RFC 0017,
+bridge offerings) and are not the lead's to merge. When the cluster and sync branches are in
+and CD has published an image with them, the two-pod experiment on the real cluster is the next
+thing (item 1 below), with the values file the cluster agent leaves behind.
+
 ## What to do next, in order
 
 ### 1. The standout: make the operations story true on a cluster
