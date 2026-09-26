@@ -107,13 +107,15 @@ pub trait RoomDataSource: Send + Sync {
     ) -> Result<Vec<EventJson>, RoomSourceError>;
 
     /// `/get_missing_events`: events reachable from `latest_events` but not in
-    /// `earliest_events`, depth-limited and count-limited (both already clamped by the caller).
+    /// `earliest_events`, count-limited (already clamped by the caller) and none with a `depth`
+    /// below `min_depth` (the request's, `0` when it gave none).
     async fn missing_events(
         &self,
         room_id: &str,
         earliest_events: &[String],
         latest_events: &[String],
         limit: usize,
+        min_depth: i64,
         requesting_server: &str,
     ) -> Result<Vec<EventJson>, RoomSourceError>;
 
@@ -347,6 +349,7 @@ impl RoomDataSource for InMemoryRoomSource {
         earliest_events: &[String],
         latest_events: &[String],
         limit: usize,
+        min_depth: i64,
         requesting_server: &str,
     ) -> Result<Vec<EventJson>, RoomSourceError> {
         let room = self
@@ -356,7 +359,7 @@ impl RoomDataSource for InMemoryRoomSource {
         if !self.is_visible_to(room_id, requesting_server).await {
             return Err(RoomSourceError::NotVisible);
         }
-        let _ = (earliest_events, latest_events);
+        let _ = (earliest_events, latest_events, min_depth);
         Ok(room.events.values().take(limit).cloned().collect())
     }
 

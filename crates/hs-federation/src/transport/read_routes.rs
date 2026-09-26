@@ -414,6 +414,10 @@ struct MissingEventsBody {
     latest_events: Vec<String>,
     #[serde(default)]
     limit: Option<usize>,
+    /// "The minimum depth of events to retrieve. Defaults to 0." A walk back from
+    /// `latest_events` stops at the first event below it: prev events are always shallower.
+    #[serde(default)]
+    min_depth: Option<i64>,
 }
 
 async fn get_missing_events(
@@ -431,6 +435,7 @@ async fn get_missing_events(
             earliest_events: Vec::new(),
             latest_events: Vec::new(),
             limit: None,
+            min_depth: None,
         }
     } else {
         match serde_json::from_slice(&body) {
@@ -449,6 +454,7 @@ async fn get_missing_events(
             &params.earliest_events,
             &params.latest_events,
             limit,
+            params.min_depth.unwrap_or(0),
             &requester,
         )
         .await

@@ -399,6 +399,7 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
         earliest_events: &[String],
         latest_events: &[String],
         limit: usize,
+        min_depth: i64,
         requesting_server: &str,
     ) -> Result<Vec<EventJson>, RoomSourceError> {
         let earliest: HashSet<String> = earliest_events.iter().cloned().collect();
@@ -420,6 +421,11 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
                 let Some(event) = event_by_str(actor, &id) else {
                     continue;
                 };
+                // Below the caller's floor: not returned, and not walked past either, since
+                // everything behind it is shallower still.
+                if event.header().depth < min_depth {
+                    continue;
+                }
                 if !latest.contains(&id) {
                     found.push(event);
                 }

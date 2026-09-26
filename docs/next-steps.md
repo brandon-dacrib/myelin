@@ -306,8 +306,9 @@ one polling test can print the same line twenty times.
 - **`TestChangePasswordPushers` (2)**: a password change should delete pushers made by other
   sessions. Needs pushers to remember which device made them, and a revocation hook from
   `hs-auth` into `hs-push`.
-- **`min_depth` on `/get_missing_events`**, still parsed nowhere, and history visibility still not
-  applied per event there.
+- ~~`min_depth` on `/get_missing_events`, still parsed nowhere.~~ **Done 2026-09-26**: a floor the
+  walk does not return below or continue past (`hs-cli` test). History visibility is still not
+  applied per event there or on `/backfill`.
 
 #### What the first Complement runs with two-way joins found (2026-09-25/26)
 
@@ -534,7 +535,6 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 
 | Gap | Where | Consequence |
 |---|---|---|
-| `min_depth` ignored on `/get_missing_events` | `hs-cli` | a conformance gap, no longer a crash |
 | history visibility not applied per event on `/get_missing_events` | `hs-cli` | pre-join events served unredacted |
 | Restricted joins rejected | `hs-federation`, `hs-room` | ten conformance tests, a common room type |
 | A rejoined room's gap is never filled | `hs-room` | history is fetched before the oldest held event; what happened between a leave and a rejoin stays on the resident |

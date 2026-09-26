@@ -479,4 +479,39 @@ async fn missing_events_come_back_oldest_first() {
     for event in events {
         assert_ne!(event["type"], "m.room.create", "{event}");
     }
+
+    // `min_depth` is a floor: nothing below it comes back, and the walk does not continue
+    // past it. Asked from one below the newest gap event's depth, only that event and its
+    // depth-mates answer.
+    let deepest = *sorted.last().expect("at least one event");
+    let (status, body) = harness
+        .signed_post(
+            &format!("/get_missing_events/{room_id}"),
+            serde_json::json!({
+                "earliest_events": [create_id],
+                "latest_events": [message_id],
+                "limit": 10,
+                "min_depth": deepest,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let floored: Vec<i64> = body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|e| e["depth"].as_i64().expect("depth"))
+        .collect();
+    assert!(
+        !floored.is_empty(),
+        "the newest gap event is at the floor: {body}"
+    );
+    assert!(
+        floored.iter().all(|d| *d >= deepest),
+        "nothing below min_depth {deepest} may come back: {floored:?}"
+    );
+    assert!(
+        floored.len() < depths.len(),
+        "the floor must have cut something: {floored:?} vs {depths:?}"
+    );
 }
