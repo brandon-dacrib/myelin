@@ -5,3 +5,6 @@
 *.tmp
 *.orig
 .DS_Store
+# The install smoke test CD runs against a checkout (ci/install-smoke.sh). It is for this
+# repository, not for the operator who pulls the chart, so `helm package` leaves it out.
+ci/

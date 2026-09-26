@@ -1,5 +1,137 @@
 # 12. Platform and Kubernetes
 
+## The chart install is a CD gate (2026-09-26, evening)
+
+Until this session nothing installed the chart in CD. `cd.yml` booted the image with `docker
+run` on both architectures, published it, published the chart, and pulled the chart back to
+check it *rendered* an image that existed; whether `helm install` still produced a server was
+known only from the two hand-run transcripts below. A chart change that broke the one-value
+install would have shipped, been noticed by the next person to install it, and the pre-release
+chart would already have been in the registry. Now the install runs on a kind cluster inside
+the workflow, before anything is tagged.
+
+### What was done
+
+- **`deploy/helm/hs/ci/install-smoke.sh`** (new). Takes an image reference and splits it into
+  the chart's `image.registry` / `image.repository` / `image.tag` (or `image.digest`) by
+  Docker's own normalization rule, so `myelin:smoke` becomes `docker.io/library/myelin:smoke`,
+  which is what a kind node calls the image after `kind load docker-image`. With `--kind NAME`
+  it loads the image into that cluster and pins `image.pullPolicy=Never`, so the node runs
+  exactly those bytes and never asks a registry. Then, in a fresh namespace: `helm install`
+  with `serverName` and nothing else, `--wait` for Ready; the pod's own timestamps and events
+  (so the transcript says what the install cost and whether a probe was refused); the log with
+  the setup token redacted; the setup link found in it; a port-forward to the Service;
+  `/health/ready` 200, `/_matrix/client/versions`, `/admin/` containing `<div id="root">`,
+  `/api/v1/setup` saying `needs_setup:true`; and then one step the brief did not ask for: it
+  **claims the server through the link**, `POST /api/v1/setup` with the token, expecting a
+  201 and a session for `@smoke:smoke.invalid`, then `needs_setup:false`. The link the NOTES
+  tell the operator to open is the whole first-run promise, and checking that it is logged
+  without checking that it works is half a check. On failure the pods, events, `describe` and
+  log are printed, then the release and the namespace are removed either way (`--keep` to
+  look). Every command it runs is echoed, so the output is a transcript. The header says how
+  to run it against any cluster.
+- **`cd.yml`, job `image`, amd64 leg**, after the docker smoke: `helm/kind-action@v1` creates
+  a cluster named `smoke`, `azure/setup-helm@v4`, then
+  `deploy/helm/hs/ci/install-smoke.sh myelin:smoke --kind smoke`. The placement is argued at
+  length in the workflow comment; the short form: it must run before `manifest` (a gate that
+  fails after the tags exist is a report), the image is already built and loaded in that leg
+  by the docker smoke, a job of its own would rebuild or pull it back and need a special case
+  for a dispatch that pushed nothing, and the arm64 leg would prove nothing the chart does not
+  already prove on amd64 while the arm64 *binary* is proven by its own docker smoke. The
+  header's new "What has to be true before anything is tagged" says the same in two sentences;
+  the `chart` job's comment and the release notes mention it.
+- **`deploy/helm/hs/.helmignore`** gains `ci/`, so `helm package` does not ship the test to
+  operators. Confirmed: the packaged tarball has no `ci/` entry.
+
+### What the pod log looks like, and the one thing the brief got slightly wrong
+
+The chart's ConfigMap asks for JSON logs, so in the pod the link is
+`"setup_link":"http://localhost:8008/admin/setup#token=..."`, not the `setup_link=http://...`
+key=value form the docker smoke greps (the `docker run` default format). The first version of
+the script grepped the docker form and failed on a perfectly good install; it now matches the
+URL itself, whatever the format. The URL *is* the same: rooted at `http://localhost:8008`
+without `publicBaseUrl`, which the port-forward makes true. The 2026-09-26 transcript further
+down shows the pod log in the key=value form; that was hand-condensed.
+
+### Verified, locally, by running it
+
+`kind` was not on this machine and is now (`brew install kind`, v0.33.0); Docker is OrbStack.
+`kind create cluster --name smoke` gave one arm64 node, Kubernetes v1.37.0, `local-path` as the
+default StorageClass. The image was built from this worktree with the exact command CD uses,
+`docker buildx build --load -f deploy/Dockerfile -t myelin:smoke .`: 5m39s, most of it the
+release build of `hs-cli` with a warm cargo cache mount, 58 MB, `linux/arm64`.
+
+```
+$ deploy/helm/hs/ci/install-smoke.sh myelin:smoke --kind smoke          exit 0
+  kind load docker-image myelin:smoke --name smoke
+  helm install myelin deploy/helm/hs --set serverName=smoke.invalid
+    --set-string image.registry=docker.io --set-string image.repository=library/myelin
+    --set-string image.tag=smoke --set-string image.pullPolicy=Never --wait --timeout 5m
+  helm install returned after 17s
+  pod myelin-hs-0 runs image docker.io/library/myelin:smoke
+  pod created 20:31:00Z; container started +8s (local-path provisioning 6s, image already
+  on the node); Ready +9s after the container started
+  20:31:12Z Warning Unhealthy  Startup probe failed: ... connect: connection refused
+  log: 8 lines, JSON; first line at 20:31:08.77, "listening" at 20:31:15.90, 7.1s later;
+  found a setup link rooted at http://localhost:8008, 40 characters of token
+  GET /health/ready 200; GET /_matrix/client/versions 200; GET /admin/ 200 and it is the
+  interface; GET /api/v1/setup {"needs_setup":true}
+  POST /api/v1/setup 201 {"user_id":"@smoke:smoke.invalid",...}; then {"needs_setup":false}
+  helm uninstall; namespace deleted; kubectl get pv,ns afterwards: nothing left
+```
+
+The same against the published `ghcr.io/brandon-dacrib/myelin:main` (the 2026-09-21 build,
+already in the local daemon; this exercises the `ghcr.io` / `brandon-dacrib/myelin` / `main`
+split): exit 0, `helm install` returned after 10s, container started +4s, Ready +5s, listening
+3.3s after the container started, no `Unhealthy` event, every check the same.
+
+And the failure path, because a gate that cannot fail is decoration:
+`install-smoke.sh alpine:latest --kind smoke --timeout 45s` (an image whose entrypoint is not
+`hs`): `helm install` timed out at `Ready: 0/1`, the diagnostics showed `CrashLoopBackOff` and
+the kubelet's `exec: "serve": executable file not found in $PATH`, the release and namespace
+were removed, exit 1.
+
+`helm lint deploy/helm/hs --set serverName=example.org` clean (icon recommended, as before);
+both mode renders pass; `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/cd.yml'))"`
+parses and lists the image job's steps in the intended order.
+
+### What the kind install says about boot time and probes (not acted on here)
+
+Not touched, per the brief -- another session is measuring the boot in `hs-kv`/`hs-cli` -- but
+this is what three boots on the same kind node showed, all with the chart's default probes:
+
+- **First log line to `listening`: 4.2 s and 7.1 s for today's build, 3.3 s for the
+  2026-09-21 image** (the container starts within a second before the first line; Kubernetes
+  only records that to the second). From the log's own timestamps, today's build takes 0.9 s
+  and 1.4 s from its first line to "generated this server's signing key" where the 09-21
+  image takes 0.3 s, and then **3.0 s and 5.2 s from the key to the appservice pump's line**
+  (the 09-21 image has no pump line; its next line, `.well-known`, comes 2.9 s after the
+  key), which is where the storage engine opens. So in the fast boot the two builds spend
+  the same three seconds opening storage and today's spends 0.6 s more before the key; in
+  the slow boot everything is slower, and other agents' cargo builds were running on this
+  machine at the time, so 7.1 s is an upper bound, not a measurement of the code.
+- **The first startup probe was refused in one boot of three** (at +4 s after the container
+  started, in the 7.1 s boot), and not in the other two. Kubelet starts the first probe at a
+  random point within `periodSeconds` (5 s), so a 5 s boot loses that coin toss about half
+  the time and a 3 s boot rarely. It costs one `Unhealthy` event and up to 5 s of Ready time;
+  the startup probe absorbs it as designed.
+- **`helm install` to Ready: 17 s and 10 s** on kind, against 1m36s on the Talos cluster
+  (Longhorn) and 4m05s for the demo, because there is no volume to attach and no image to
+  pull. The chart is not the slow part anywhere; local-path provisioning was 6-9 s of it here.
+
+### Not verified
+
+- **The workflow itself on GitHub's runners.** `helm/kind-action@v1` on `ubuntu-24.04`, the
+  cluster coming up in time, `kind load` from a buildx-loaded image on a `docker-container`
+  builder, the amd64 image: none of that has run, because it needs a push to `main` and this
+  branch is not pushed. The lead will push and watch the `image (amd64)` job; the step's whole
+  output is the transcript.
+- The script's `@sha256:` digest form is parsed but was not run.
+- The local proof was arm64 (this machine). CD's is amd64. The chart does not know the
+  difference, and the docker smoke already boots each architecture's binary natively.
+- Nothing about the demo install, cluster mode, or an upgrade; the gate is the one-value
+  install from empty, which is what the README and the NOTES promise.
+
 ## A demo an operator can reach: myelin.dacrib.net (2026-09-26, later the same day)
 
 The section below proved the install through a port-forward and tore it down. This one leaves
