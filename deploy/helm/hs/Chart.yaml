@@ -12,8 +12,10 @@ description: >-
 type: application
 version: 0.1.0
 # The image tag the chart pulls when `image.tag` is unset. `main` is the continuously published
-# build (there is no tagged release yet); CD's `helm package --app-version <version>` replaces it
-# on a `v*` tag so a released chart pulls the matching image.
+# build, and is what a chart installed from a checkout pulls. CD's `helm package --app-version`
+# replaces it in every chart it publishes: with `sha-<commit>` on a push to `main`, so the
+# pre-release chart pulls the image built from the same commit, and with the version on a `v*`
+# tag.
 appVersion: "main"
 keywords:
   - matrix

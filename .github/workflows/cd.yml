@@ -12,7 +12,7 @@ name: cd
 #
 # | trigger | images | binaries | chart | published |
 # |---|---|---|---|---|
-# | push to `main` | yes, tagged `main` and the commit sha | no | no | yes |
+# | push to `main` | yes, tagged `main` and the commit sha | no | yes, a pre-release pinned to that image | yes |
 # | tag `v*` | yes, tagged with the version and `latest` | yes, attached to the release | yes | yes |
 # | manual dispatch | yes, tagged `manual-<sha>` | if asked | no | only if asked |
 #
@@ -343,12 +343,24 @@ jobs:
 
   # ---------------------------------------------------------------------------------------------
   # The Helm chart, published as an OCI artifact beside the image so `helm install` can pull it
-  # from the same place.
+  # from the same place -- on every push to `main` as well as on a tag, because "install is one
+  # value" is only true when there is something to install from.
+  #
+  # A push to `main` publishes a pre-release of the version in Chart.yaml,
+  # `<version>-main.<run number>.g<short sha>`, whose appVersion is the `sha-<commit>` image tag
+  # this same workflow run has just published, so a chart and the image it pulls always come
+  # from one commit. `helm install --devel` picks the newest of them. A plain `helm install`
+  # picks releases only, so the day `v0.1.0` is tagged the pre-releases stop being what an
+  # operator gets by default -- and Chart.yaml's version has to move on (to 0.2.0) for `--devel`
+  # to see `main` again, since `0.1.0-main.N` sorts below `0.1.0`.
+  #
+  # It waits for the manifest list rather than the gate so the image it points at exists before
+  # anything can pull the chart that names it.
   # ---------------------------------------------------------------------------------------------
   chart:
     name: helm chart
-    needs: gate
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: manifest
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -368,13 +380,52 @@ jobs:
             --set storage.backend=postgres --set storage.postgres.host=db --set media.storage.backend=s3 \
             --set media.storage.s3.bucket=media --set secrets.signingKey.existingSecret=example > /dev/null
 
-      - name: Package and push
+      - name: Work out the chart version and the image it pulls
+        id: version
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          helm package deploy/helm/hs --version "$version" --app-version "$version"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            app_version="$version"
+          else
+            base="$(helm show chart deploy/helm/hs | sed -n 's/^version: *//p')"
+            version="${base}-main.${GITHUB_RUN_NUMBER}.g${GITHUB_SHA::7}"
+            app_version="sha-${GITHUB_SHA}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "app_version=$app_version" >> "$GITHUB_OUTPUT"
+          echo "chart $version, pulling image tag $app_version"
+
+      - name: Package and push
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          helm package deploy/helm/hs --version "$VERSION" --app-version "$APP_VERSION"
           echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
-          helm push "hs-$version.tgz" "oci://$REGISTRY/${{ github.repository_owner }}/charts"
+          helm push "hs-$VERSION.tgz" "oci://$REGISTRY/${{ github.repository_owner }}/charts"
+
+      - name: Prove the published chart pulls back, and names an image that exists
+        # `helm push` succeeding is not the same as `helm install` working. Pull the chart back
+        # from the registry by the version just published, render it, and check that the image
+        # it would run is in the registry too -- the whole point of publishing them together.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          mkdir pulled
+          helm pull "oci://$REGISTRY/${{ github.repository_owner }}/charts/hs" --version "$VERSION" -d pulled
+          image="$(helm template myelin "pulled/hs-$VERSION.tgz" --set serverName=example.org \
+                    | sed -n 's/^ *image: *//p' | tr -d '"' | head -1)"
+          echo "the published chart renders image $image"
+          if [ "${image##*:}" != "$APP_VERSION" ]; then
+            echo "expected it to pull the tag $APP_VERSION" >&2
+            exit 1
+          fi
+          docker buildx imagetools inspect "$image" > /dev/null
+          echo "and that image is in the registry"
 
   # ---------------------------------------------------------------------------------------------
   # The release itself, only once everything that feeds it has succeeded.
