@@ -203,7 +203,11 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
 - `make_join` and `send_join` build and authorize real joins against real room state and persist
   them; a remote's join reads back with the remote's own signature intact.
 - Backfill resolves missing ancestors with layered limits (100 events per fetch, 10 rounds, 500
-  events, 20 seconds), so a hostile peer cannot force unbounded work.
+  events, 20 seconds), so a hostile peer cannot force unbounded work. Since 2026-09-26 the first
+  request for a gap is the one every other implementation expects, `POST /get_missing_events`
+  with this server's extremities and the event that exposed the gap; `/backfill` rounds follow
+  only if that does not close it. Complement's reference server serves nothing else for this,
+  so the loop could not begin against it before. Unit-tested; not yet re-measured.
 - A real `/_matrix/federation/v2` router, replacing three v2 endpoints that had been registered
   under v1 with a literal `/v2/` path segment.
 - Private certificate authorities can be trusted (`federation.custom_ca_certificates`); running

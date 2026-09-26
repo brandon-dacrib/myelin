@@ -1,5 +1,23 @@
 # 06 Federation: status
 
+> **Integration note, 2026-09-26, later (integration lead): the gap-shaped request.** Reading
+> `TestGetMissingEventsGapFilling` for why it failed found that Complement's reference federation
+> server answers exactly one request when a homeserver receives an event with unknown ancestors:
+> `POST /get_missing_events` with `earliest_events` naming the homeserver's forward extremities
+> and `latest_events` naming the event just received. It has no `/backfill` handler, and it
+> checks both lists. This crate's `backfill::resolve_missing_ancestors` only ever asked
+> `/backfill`, so against that server -- and against Synapse, which serves both but is asked the
+> gap-shaped one by every other implementation -- the loop could not begin. It asks
+> `/get_missing_events` first now (`GapContext`, filled by `inbound::process_transaction` from
+> `RoomDataSource::forward_extremities` and the triggering event), and only when that does not
+> close the gap does it fall back to the `/backfill` rounds, under the same limits; three unit
+> tests cover closed-by-the-first-request, unsupported-then-backfill, and partial-then-backfill.
+> Found on the way: `hs_cli::federation::RegistryRoomSource::forward_extremities` answered
+> "the newest timeline event", an assumption from before remote joins, forks over `/send` and
+> fetched history existed; it reads the actor's real extremity set now
+> (`RoomActor::forward_extremity_ids`). Not re-measured yet: the federation package run in
+> progress at the time was from the commit before this.
+
 > **Integration note, 2026-09-26 (integration lead):** the other trigger for `/backfill`. This
 > crate's `backfill::resolve_missing_ancestors` fetches the missing *ancestors* of an event that
 > arrived over `/send`; `hs_cli::backfill::FederationBackfill` (implementing

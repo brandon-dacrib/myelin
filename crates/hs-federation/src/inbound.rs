@@ -408,11 +408,23 @@ pub async fn process_transaction(
                 if !rejected.missing_ancestors.is_empty() && ancestor_fetcher.is_some() =>
             {
                 let fetcher = ancestor_fetcher.expect("checked Some above");
+                // What this server holds, for the gap-shaped request (`crate::backfill`'s
+                // module docs): its forward extremities are the oldest end of the gap, this
+                // event the newest.
+                let context = crate::backfill::GapContext {
+                    latest_event_id: Some(event_id.clone()),
+                    earliest_events: rooms
+                        .forward_extremities(room_id)
+                        .await
+                        .map(|extremities| extremities.into_iter().map(|(id, _)| id).collect())
+                        .unwrap_or_default(),
+                };
                 let outcome = crate::backfill::resolve_missing_ancestors(
                     origin,
                     room_id,
                     &room_version,
                     rejected.missing_ancestors.clone(),
+                    &context,
                     fetcher,
                     key_cache,
                     sink,

@@ -456,6 +456,39 @@ impl FederationClient {
             .unwrap_or_default())
     }
 
+    /// The outbound half of `/get_missing_events`: asks `destination` for up to `limit` PDUs on
+    /// the paths from `latest_events` back to, not including, `earliest_events`, none below
+    /// `min_depth`. Oldest first, per the spec. Like [`FederationClient::backfill`], the returned
+    /// events are **not verified**; `crate::backfill::resolve_missing_ancestors` is the caller
+    /// and verifies each one.
+    ///
+    /// # Errors
+    /// See [`ClientError`].
+    pub async fn get_missing_events(
+        &self,
+        destination: &str,
+        room_id: &str,
+        earliest_events: &[String],
+        latest_events: &[String],
+        limit: usize,
+        min_depth: i64,
+    ) -> Result<Vec<serde_json::Value>, ClientError> {
+        let path = format!("/_matrix/federation/v1/get_missing_events/{room_id}");
+        let body = serde_json::json!({
+            "earliest_events": earliest_events,
+            "latest_events": latest_events,
+            "limit": limit,
+            "min_depth": min_depth,
+        });
+        let response = self.send(destination, "POST", &path, Some(&body)).await?;
+        Ok(response
+            .body
+            .get("events")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
     /// Returns a pooled `reqwest::Client` pinned (via `.resolve()`) so that connecting to
     /// `outcome.server.tls_server_name` actually opens a TCP connection to
     /// `outcome.server.connect_host`'s resolved address, while TLS SNI / the HTTP `Host` header

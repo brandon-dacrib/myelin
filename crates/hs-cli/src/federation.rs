@@ -550,18 +550,17 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
         &self,
         room_id: &str,
     ) -> Result<Vec<(String, i64)>, RoomSourceError> {
-        // The single-extremity assumption `crate::join`'s (well, `hs_federation::join`'s) module
-        // doc names explicitly: `paginate`'s most recent event is this actor's one forward
-        // extremity in every room this server can currently produce (nothing that reaches it
-        // introduces a fork other than `RoomActor::send_event_citing`, used only by this
-        // workspace's own state-resolution tests).
+        // The actor's own set, not the newest timeline event: a room this server's user joined
+        // elsewhere, an event accepted over `/send` that forked, and a batch of fetched history
+        // all put the two apart, and `/get_missing_events` is asked with these as the oldest
+        // end of a gap, so they have to be what a new event here would actually cite.
         let handle = self.handle(room_id).await?;
         handle
             .query(|actor| {
-                let (events, _) = actor.paginate(None, Direction::Backward, 1);
-                Ok(events
+                Ok(actor
+                    .forward_extremity_ids()
                     .into_iter()
-                    .map(|event| (event.event_id().to_string(), event.header().depth))
+                    .map(|(id, depth)| (id.to_string(), depth))
                     .collect())
             })
             .await

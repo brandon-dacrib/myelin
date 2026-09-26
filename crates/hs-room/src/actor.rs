@@ -3797,6 +3797,18 @@ impl<B: KvBackend> RoomActor<B> {
         Some(crate::backfill::BackfillAnchor { event_id, servers })
     }
 
+    /// The room's current forward extremities -- the events nothing held cites as a
+    /// `prev_events` entry, which a new event here would cite -- as `(event_id, depth)`, in
+    /// interning order. Usually one; more is a fork this actor holds unresolved.
+    #[must_use]
+    pub fn forward_extremity_ids(&self) -> Vec<(OwnedEventId, i64)> {
+        self.forward_extremities
+            .iter()
+            .filter_map(|sn| self.events.get(sn))
+            .map(|e| (e.event_id().to_owned(), e.header().depth))
+            .collect()
+    }
+
     /// The timeline position of `event_id`, if this actor holds it in the timeline -- negative
     /// for history fetched from another server after the fact
     /// ([`RoomActor::accept_backfilled_events`]), `None` for an outlier that has not been

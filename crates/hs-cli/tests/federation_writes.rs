@@ -860,12 +860,13 @@ async fn send_gives_up_when_the_remote_serves_an_endless_backfill_chain() {
         "expected the transaction to report a clean backfill give-up, got: {response}"
     );
 
-    // Bounded: exactly `max_rounds` requests reached the hostile peer, not one per hop of the
-    // (literally endless) chain it kept offering.
+    // Bounded: one gap-shaped `/get_missing_events` request (this peer answers it with no
+    // `events`, so it closes nothing), then exactly `max_rounds` `/backfill` rounds -- not one
+    // per hop of the (literally endless) chain it kept offering.
     let limits = hs_federation::backfill::BackfillLimits::default();
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        limits.max_rounds,
-        "expected exactly max_rounds requests to the hostile peer"
+        limits.max_rounds + 1,
+        "expected the gap-shaped request plus exactly max_rounds backfill requests to the hostile peer"
     );
 }
