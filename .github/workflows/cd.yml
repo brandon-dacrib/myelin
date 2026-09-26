@@ -434,6 +434,14 @@ jobs:
           helm template myelin deploy/helm/hs --set serverName=example.org --set mode=cluster \
             --set storage.backend=postgres --set storage.postgres.host=db --set media.storage.backend=s3 \
             --set media.storage.s3.bucket=media --set secrets.signingKey.existingSecret=example > /dev/null
+          # Bridges off renders no operator, no RBAC and no bridge environment on the server.
+          if helm template myelin deploy/helm/hs --set serverName=example.org --set bridges.enabled=false \
+              | grep -E 'bridges-operator|MYELIN_BRIDGES|hs\.matrix\.org'; then
+            echo "bridges.enabled=false still rendered bridge objects" >&2
+            exit 1
+          fi
+          # The chart's copy of the Bridge CRD is the generated one (gen-crds writes both).
+          diff -u deploy/crds/bridge.yaml deploy/helm/hs/crds/bridge.yaml
 
       - name: Work out the chart version and the image it pulls
         id: version

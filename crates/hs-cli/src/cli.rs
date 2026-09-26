@@ -51,6 +51,10 @@ pub enum Command {
     /// represented locally afterward.
     #[command(name = "federation-join-room")]
     FederationJoinRoom(FederationJoinRoomArgs),
+    /// Runs the bridge operator: deploys each `Bridge` resource in one namespace as a pod, a
+    /// Service and a volume, and reports its state back (`docs/rfcs/0017`). The Helm chart runs
+    /// it as its own Deployment; it is not part of `hs serve`.
+    Operator(OperatorArgs),
     /// Prints the `hs` version.
     Version,
 }
@@ -136,6 +140,21 @@ pub struct ServeArgs {
     /// cannot live in `-c`/`--config`'s native config file yet).
     #[arg(long = "media-scanning-config")]
     pub media_scanning_config: Option<PathBuf>,
+}
+
+/// `hs operator` arguments.
+#[derive(Debug, Args)]
+pub struct OperatorArgs {
+    /// The namespace whose `Bridge` resources to run. Defaults to `POD_NAMESPACE`, else the
+    /// namespace of the pod's service account
+    /// (`/var/run/secrets/kubernetes.io/serviceaccount/namespace`).
+    #[arg(long = "namespace")]
+    pub namespace: Option<String>,
+
+    /// The StorageClass a bridge's volume asks for when its `Bridge` names none; the cluster's
+    /// default when unset.
+    #[arg(long = "default-storage-class")]
+    pub default_storage_class: Option<String>,
 }
 
 /// `hs routes-manifest` arguments.
@@ -362,6 +381,59 @@ pub async fn dispatch(cli: Cli) -> i32 {
         Command::RoutesManifest(args) => run_routes_manifest(&args),
         Command::Serve(args) => run_serve(&args).await,
         Command::FederationJoinRoom(args) => crate::federation::run_join_room(&args).await,
+        Command::Operator(args) => run_operator(&args).await,
+    }
+}
+
+/// Where a pod finds its own namespace when `POD_NAMESPACE` is not set.
+const SERVICE_ACCOUNT_NAMESPACE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
+
+/// `--namespace`, else `POD_NAMESPACE`, else the service account's namespace file.
+fn operator_namespace(args: &OperatorArgs) -> Option<String> {
+    args.namespace
+        .clone()
+        .or_else(|| std::env::var("POD_NAMESPACE").ok())
+        .or_else(|| std::fs::read_to_string(SERVICE_ACCOUNT_NAMESPACE).ok())
+        .map(|ns| ns.trim().to_owned())
+        .filter(|ns| !ns.is_empty())
+}
+
+async fn run_operator(args: &OperatorArgs) -> i32 {
+    // No configuration file here: the level comes from `RUST_LOG` or the default, and the format
+    // is JSON, as `hs serve`'s default.
+    let _telemetry_guard = match hs_telemetry::init(&hs_telemetry::Options {
+        service_name: "hs-operator".to_owned(),
+        ..hs_telemetry::Options::default()
+    }) {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            eprintln!("hs operator: failed to initialize telemetry: {e}");
+            None
+        }
+    };
+    let Some(namespace) = operator_namespace(args) else {
+        eprintln!(
+            "hs operator: no namespace: pass --namespace, set POD_NAMESPACE, or run in a pod \
+             ({SERVICE_ACCOUNT_NAMESPACE})"
+        );
+        return 2;
+    };
+    let client = match hs_operator::connect().await {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("hs operator: cannot reach the Kubernetes API: {e}");
+            return 1;
+        }
+    };
+    let options = hs_operator::controller::Options {
+        default_storage_class: args.default_storage_class.clone().filter(|c| !c.is_empty()),
+    };
+    match hs_operator::controller::run_with(client, namespace, options).await {
+        Ok(()) => 0,
+        Err(e) => {
+            tracing::error!(error = %e, "hs operator stopped with an error");
+            1
+        }
     }
 }
 

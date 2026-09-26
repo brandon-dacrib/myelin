@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 
 /// A container image reference, split into repository and tag/digest so a `Kustomize`-style
 /// image override (`newTag`, `newName`) can target just the field it needs.
+///
+/// camelCase on the wire (`pullPolicy`), like a container's own `imagePullPolicy`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ImageSpec {
     /// The image repository, e.g. `ghcr.io/matrix-org/hs`.
     pub repository: String,
@@ -24,6 +27,20 @@ pub struct ImageSpec {
     /// `Always` otherwise) when omitted, same as `deploy/helm/hs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_policy: Option<String>,
+}
+
+impl ImageSpec {
+    /// The image reference a container's `image` field takes: `repository@digest` when a digest
+    /// is set (it wins over a tag), else `repository:tag`, else the bare repository (which the
+    /// container runtime reads as `:latest`).
+    #[must_use]
+    pub fn reference(&self) -> String {
+        match (&self.digest, &self.tag) {
+            (Some(digest), _) if !digest.is_empty() => format!("{}@{digest}", self.repository),
+            (_, Some(tag)) if !tag.is_empty() => format!("{}:{tag}", self.repository),
+            _ => self.repository.clone(),
+        }
+    }
 }
 
 /// A reference to a key within a `Secret` in the same namespace as the CRD instance — the same
@@ -58,7 +75,12 @@ pub enum Phase {
 /// The status sub-resource every kind in this operator uses. Identical shape across all five
 /// kinds by design: one dashboard query, one `kubectl get -o jsonpath='{.status.phase}'` habit,
 /// works against any of them.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+///
+/// camelCase on the wire (`observedGeneration`, `readyReplicas`), like every Kubernetes status;
+/// until 2026-09-26 it was snake_case, which the `Ready` print column (`.status.readyReplicas`)
+/// never matched. Nothing wrote a status before then, so nothing stored the old spelling.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct OperatorStatus {
     /// Coarse lifecycle phase.
     #[serde(default)]
@@ -92,5 +114,36 @@ mod tests {
         let status = OperatorStatus::default();
         assert_eq!(status.phase, Phase::Pending);
         assert!(status.conditions.is_empty());
+    }
+
+    #[test]
+    fn operator_status_is_camel_case_on_the_wire() {
+        let status = OperatorStatus {
+            ready_replicas: Some(1),
+            observed_generation: Some(2),
+            ..OperatorStatus::default()
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["readyReplicas"], 1);
+        assert_eq!(json["observedGeneration"], 2);
+    }
+
+    #[test]
+    fn image_reference_prefers_digest_then_tag() {
+        let mut image = ImageSpec {
+            repository: "dock.mau.dev/mautrix/whatsapp".to_owned(),
+            tag: Some("v0.12.0".to_owned()),
+            digest: None,
+            pull_policy: None,
+        };
+        assert_eq!(image.reference(), "dock.mau.dev/mautrix/whatsapp:v0.12.0");
+        image.digest = Some("sha256:abc".to_owned());
+        assert_eq!(
+            image.reference(),
+            "dock.mau.dev/mautrix/whatsapp@sha256:abc"
+        );
+        image.digest = None;
+        image.tag = None;
+        assert_eq!(image.reference(), "dock.mau.dev/mautrix/whatsapp");
     }
 }

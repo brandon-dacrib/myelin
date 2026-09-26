@@ -24,6 +24,14 @@ interface. The link works once. It is rooted at http://localhost:{{ .Values.serv
 port-forward above makes true; set publicBaseUrl to have it rooted at your real address instead.
 {{- end }}
 
+{{- if .Values.bridges.enabled }}
+
+Bridges: the server deploys them itself. Enable one under Bridges in the admin interface and
+the bridge operator ({{ include "hs.fullname" . }}-bridges-operator) runs each person's bridge
+as its own pod in this namespace:
+  kubectl -n {{ .Release.Namespace }} get bridges
+{{- end }}
+
 Locked out? When nobody can sign in as an administrator, run this where the server keeps its
 signing key -- the pod -- and open the link it prints:
   kubectl -n {{ .Release.Namespace }} exec {{ include "hs.fullname" . }}-0 -- hs recover

@@ -1,0 +1,115 @@
+{{- if .Values.bridges.enabled }}
+{{- /*
+The bridge operator (docs/rfcs/0017): `hs operator`, the server's own image, one replica, turning
+each `Bridge` in this namespace into a pod, a Service and a volume. Its pods carry their own
+`app.kubernetes.io/name`, so the server's Service, PodDisruptionBudget and NetworkPolicy
+(which select on hs.selectorLabels) never pick them up.
+*/}}
+{{- $name := printf "%s-bridges-operator" (include "hs.fullname" .) | trunc 63 | trimSuffix "-" }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hs.bridgesOperatorLabels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hs.bridgesOperatorLabels" . | nindent 4 }}
+rules:
+  - apiGroups: ["hs.matrix.org"]
+    resources: ["bridges", "bridges/status"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["", "events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hs.bridgesOperatorLabels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hs.bridgesOperatorLabels" . | nindent 4 }}
+spec:
+  ## One controller at a time: two would race each other's status writes.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "hs.bridgesOperatorSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "hs.bridgesOperatorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ $name }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: operator
+          image: {{ include "hs.image" . }}
+          imagePullPolicy: {{ include "hs.imagePullPolicy" . }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          args:
+            - operator
+            - --namespace
+            - {{ .Release.Namespace | quote }}
+            {{- with .Values.bridges.defaultStorageClassName }}
+            - --default-storage-class
+            - {{ . | quote }}
+            {{- end }}
+            {{- with .Values.bridges.operator.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          resources:
+            {{- toYaml .Values.bridges.operator.resources | nindent 12 }}
+{{- end }}

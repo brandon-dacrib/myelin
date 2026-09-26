@@ -36,7 +36,7 @@ spec:
                     description: An image digest (`sha256:...`), for a pinned, content-addressed reference.
                     nullable: true
                     type: string
-                  pull_policy:
+                  pullPolicy:
                     description: Pull policy. Defaults to the cluster/Kubernetes default (`IfNotPresent` for a tag, `Always` otherwise) when omitted, same as `deploy/helm/hs`.
                     nullable: true
                     type: string
@@ -100,7 +100,10 @@ spec:
             - publicBaseUrl
             type: object
           status:
-            description: 'The status sub-resource every kind in this operator uses. Identical shape across all five kinds by design: one dashboard query, one `kubectl get -o jsonpath=''{.status.phase}''` habit, works against any of them.'
+            description: |-
+              The status sub-resource every kind in this operator uses. Identical shape across all five kinds by design: one dashboard query, one `kubectl get -o jsonpath='{.status.phase}'` habit, works against any of them.
+
+              camelCase on the wire (`observedGeneration`, `readyReplicas`), like every Kubernetes status; until 2026-09-26 it was snake_case, which the `Ready` print column (`.status.readyReplicas`) never matched. Nothing wrote a status before then, so nothing stored the old spelling.
             nullable: true
             properties:
               conditions:
@@ -137,7 +140,7 @@ spec:
                   - type
                   type: object
                 type: array
-              observed_generation:
+              observedGeneration:
                 description: The `.metadata.generation` this status was computed from, for a caller to tell whether `status` reflects the current `spec` or a stale one the controller has not caught up to yet (the standard Kubernetes "observedGeneration" convention).
                 format: int64
                 nullable: true
@@ -150,7 +153,7 @@ spec:
                 - Ready
                 - Degraded
                 type: string
-              ready_replicas:
+              readyReplicas:
                 description: How many replicas of the managed workload are currently ready.
                 format: int32
                 nullable: true

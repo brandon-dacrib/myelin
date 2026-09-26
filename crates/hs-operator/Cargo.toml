@@ -32,10 +32,13 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
-# Only used by the `live-smoke` bin: `kube`'s `rustls-tls` feature needs a process-level
-# `rustls::crypto::CryptoProvider` installed before the first TLS connection, which nothing else
-# in this crate does for it (unlike `hs-cli`, which pulls one in transitively through other
-# crates). See `src/bin/live_smoke.rs`'s `main` for the `install_default()` call, and
+# The pod-template spec hash (`bridge::spec_hash`) that rolls a bridge's pod when its spec changes.
+sha2 = { workspace = true }
+hex = { workspace = true }
+# `kube`'s `rustls-tls` feature needs a process-level `rustls::crypto::CryptoProvider` installed
+# before the first TLS connection, and a binary linking more than one provider has no default.
+# `connect()` in `src/lib.rs` (used by `hs operator` and the homeserver's bridge client) and the
+# `live-smoke` bin install `ring`. See `src/bin/live_smoke.rs`'s `main`, and
 # `crates/hs-cluster/src/mesh/tls.rs::provider` for the same `ring` choice made elsewhere in this
 # workspace (matching the workspace's own `rustls` feature pin: `features = ["ring", ...]`).
 rustls = { workspace = true }

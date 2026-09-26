@@ -2300,6 +2300,7 @@ dependencies = [
  "hs-kv",
  "hs-media",
  "hs-model",
+ "hs-operator",
  "hs-push",
  "hs-room",
  "hs-tables",
@@ -2595,6 +2596,7 @@ name = "hs-operator"
 version = "0.0.1"
 dependencies = [
  "futures",
+ "hex",
  "k8s-openapi",
  "kube",
  "rustls",
@@ -2602,6 +2604,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "sha2 0.10.9",
  "thiserror 2.0.20",
  "tokio",
  "tracing",

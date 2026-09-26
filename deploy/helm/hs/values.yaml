@@ -349,6 +349,35 @@ serviceMonitor:
 networkPolicy:
   enabled: false
 
+## -- Bridges ----------------------------------------------------------------------------------
+## The server deploys bridges itself, one instance per person (docs/rfcs/0017). With this on, the
+## chart installs the `Bridge` CRD (`crds/bridge.yaml`), runs `hs operator` -- the same image,
+## one replica -- which turns each `Bridge` into a pod, a Service and a volume in this namespace,
+## and lets the server's service account write `Bridge`s and their Secrets in this namespace
+## only. The server learns it can deploy from `MYELIN_BRIDGES_NAMESPACE` and
+## `MYELIN_BRIDGES_HOMESERVER_URL`, set on it here. Off, none of that is rendered and bridges can
+## only run elsewhere, from files downloaded in the admin interface.
+##
+## Helm installs `crds/` on `helm install` only and never upgrades or deletes it; after a chart
+## upgrade that changes the CRD, `kubectl apply -f crds/bridge.yaml` (or --skip-crds on a
+## cluster where someone else owns it). The file is generated: `cargo run -p hs-operator --bin
+## gen-crds` writes it beside deploy/crds/bridge.yaml, and a test fails if the two drift.
+bridges:
+  enabled: true
+  operator:
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        memory: 128Mi
+    ## Extra arguments after `operator --namespace <release namespace>`.
+    extraArgs: []
+  ## The StorageClass a bridge's volume asks for when its `Bridge` names none; empty for the
+  ## cluster's default. Passed to the operator (`--default-storage-class`). A claim's class
+  ## cannot change once it exists, so this applies to bridges created after it is set.
+  defaultStorageClassName: ""
+
 extraEnv: []
 extraVolumes: []
 extraVolumeMounts: []
