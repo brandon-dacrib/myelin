@@ -506,6 +506,12 @@ pub struct BridgeType {
     pub renders_config: bool,
     /// How a person signs in to the bridge once it runs.
     pub sign_in: BridgeTypeSignIn,
+    /// `per_user` (each user gets their own instance, RFC 0017) or `shared` (one instance
+    /// bridges a network or a server for everyone).
+    pub mode: String,
+    /// Whether this server can run the type from a rendered config alone, with nothing written
+    /// by hand.
+    pub deployable: bool,
 }
 
 /// [`BridgeType::sign_in`]: the bridge's own documented login flow, one step per line. `{bot}`
@@ -541,6 +547,138 @@ pub struct BridgeTypeRenderResult {
 impl std::fmt::Debug for BridgeTypeRenderResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("BridgeTypeRenderResult(<redacted>)")
+    }
+}
+
+/// The OpenAPI `BridgeDeploymentTarget` schema: whether this server can deploy bridge
+/// instances itself (RFC 0017 section 4.5), and where.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BridgeDeploymentTarget {
+    pub available: bool,
+    pub namespace: Option<String>,
+    /// How a bridge in `namespace` reaches this server.
+    pub homeserver_url: Option<String>,
+    /// Why deployment is unavailable, when it is.
+    pub reason: Option<String>,
+}
+
+/// Who may have an instance of an offering.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BridgeOfferingAccess {
+    #[serde(default = "yes")]
+    pub all_local_users: bool,
+    /// When not `all_local_users`, the Matrix IDs that may.
+    #[serde(default)]
+    pub users: Vec<String>,
+}
+
+impl Default for BridgeOfferingAccess {
+    fn default() -> Self {
+        Self {
+            all_local_users: true,
+            users: Vec::new(),
+        }
+    }
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// How an offering's instances are configured. Unset fields take the catalogue's default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BridgeOfferingOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub double_puppeting: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backfill: Option<bool>,
+}
+
+/// The body of `PUT /bridge-offerings/{type}`. Every field is optional: an absent one keeps the
+/// offering's current value, or the default for a new offering.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BridgeOfferingRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// `cluster` or `elsewhere`.
+    #[serde(default)]
+    pub runtime: Option<String>,
+    #[serde(default)]
+    pub image_tag: Option<String>,
+    #[serde(default)]
+    pub access: Option<BridgeOfferingAccess>,
+    #[serde(default)]
+    pub options: Option<BridgeOfferingOptions>,
+}
+
+/// The OpenAPI `BridgeOffering` schema: a bridge type switched on for this server.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BridgeOffering {
+    #[serde(rename = "type")]
+    pub bridge_type: String,
+    pub name: String,
+    /// `per_user` or `shared`.
+    pub mode: String,
+    pub enabled: bool,
+    /// `cluster` or `elsewhere`.
+    pub runtime: String,
+    pub image: String,
+    /// The Matrix ID users message to get an instance; `per_user` offerings only.
+    pub front_door: Option<String>,
+    pub access: BridgeOfferingAccess,
+    pub options: BridgeOfferingOptions,
+    /// Instance counts by state.
+    pub instances: std::collections::BTreeMap<String, u64>,
+    pub created_at: String,
+}
+
+/// The OpenAPI `BridgeDeployment` schema: the `Bridge` resource running an instance.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BridgeDeployment {
+    pub namespace: String,
+    pub name: String,
+    pub image: String,
+    pub service_url: String,
+    /// `Pending`, `Ready` or `Degraded`.
+    pub phase: String,
+    pub ready: bool,
+    pub message: Option<String>,
+}
+
+/// The OpenAPI `BridgeInstance` schema: one user's bridge.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BridgeInstance {
+    #[serde(rename = "type")]
+    pub bridge_type: String,
+    /// The owner; `None` for a shared type's instance.
+    pub user_id: Option<String>,
+    /// `requested`, `registered`, `deploying`, `starting`, `ready`, `failed` or `removing`.
+    pub state: String,
+    pub reason: Option<String>,
+    pub appservice_id: Option<String>,
+    /// The instance's own bot, which the user talks to.
+    pub bot: Option<String>,
+    pub deployment: Option<BridgeDeployment>,
+    /// The registry's word for its ping health.
+    pub health: Option<String>,
+    pub created_at: String,
+    pub ready_at: Option<String>,
+}
+
+/// The OpenAPI `BridgeInstanceFiles` schema. Carries tokens; Debug shows none of it.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BridgeInstanceFiles {
+    pub config_yaml: Option<String>,
+    pub registration_yaml: String,
+    pub compose_yaml: String,
+    pub manifest_yaml: String,
+}
+
+impl std::fmt::Debug for BridgeInstanceFiles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BridgeInstanceFiles(<redacted>)")
     }
 }
 

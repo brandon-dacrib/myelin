@@ -2254,6 +2254,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "hs-bridges"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "hex",
+ "hs-admin",
+ "hs-kv",
+ "hs-tables",
+ "rand 0.9.5",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "hs-cli"
 version = "0.0.1"
 dependencies = [

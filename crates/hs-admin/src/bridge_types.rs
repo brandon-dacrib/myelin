@@ -343,6 +343,26 @@ const CATALOGUE: &[Entry] = &[
     },
 ];
 
+/// `per_user` for a bridge of one person's account (every mautrix bridge; heisenbridge, which is
+/// one person's IRC bouncer), `shared` for one that bridges a network or a server for everyone.
+fn mode(entry: &Entry) -> &'static str {
+    match entry.runtime {
+        Runtime::Mautrix | Runtime::Heisenbridge => "per_user",
+        Runtime::AppserviceIrc | Runtime::Hookshot => "shared",
+    }
+}
+
+/// Whether an instance runs from what a render writes alone. Not matrix-appservice-irc or
+/// hookshot, whose configs name networks and services only an operator knows; not Telegram,
+/// whose config needs the operator's own API ID and hash.
+fn deployable(entry: &Entry) -> bool {
+    matches!(entry.runtime, Runtime::Mautrix | Runtime::Heisenbridge)
+        && !entry
+            .needs
+            .iter()
+            .any(|(key, _, required)| *required && *key == "api_id")
+}
+
 fn entry(id: &str) -> Option<&'static Entry> {
     CATALOGUE.iter().find(|e| e.id == id)
 }
@@ -388,6 +408,8 @@ fn bridge_type(entry: &Entry, server_name: &str) -> BridgeType {
         supports_double_puppeting: entry.double_puppeting,
         required_features: entry.features.iter().map(|f| (*f).to_owned()).collect(),
         renders_config: entry.runtime == Runtime::Mautrix,
+        mode: mode(entry).to_owned(),
+        deployable: deployable(entry),
         sign_in: BridgeTypeSignIn {
             steps: entry
                 .sign_in
@@ -574,15 +596,26 @@ pub fn render(type_id: &str, server_name: &str, values: &Value) -> Option<Bridge
     let registration_yaml = serde_yaml_ng::to_string(&registration).unwrap_or_default();
 
     let config_yaml = (entry.runtime == Runtime::Mautrix).then(|| {
-        mautrix_config(
-            entry,
-            &c,
+        let mut permissions = vec![("*".to_owned(), "relay"), (server_name.to_owned(), "user")];
+        if let Some(admin) = &c.admin_user {
+            permissions.push((admin.clone(), "admin"));
+        }
+        mautrix_config(&MautrixParams {
+            name: entry.name,
+            homeserver_address: &c.homeserver_address,
             server_name,
-            &url,
-            &as_token,
-            &hs_token,
+            url: &url,
+            port: entry.port,
+            id: &c.id,
+            bot: &c.sender_localpart,
+            ghost_prefix: entry.ghost_prefix,
+            as_token: &as_token,
+            hs_token: &hs_token,
+            permissions,
+            backfill: true,
             double_puppeting,
-        )
+            encryption: c.encryption,
+        })
     });
     let compose_yaml = compose(entry, &c, &image, server_name);
     let bridge_resource_yaml = bridge_resource(entry, &c, &image);
@@ -596,88 +629,90 @@ pub fn render(type_id: &str, server_name: &str, values: &Value) -> Option<Bridge
     })
 }
 
+/// What a mautrix `config.yaml` says, for either a render or an instance.
+struct MautrixParams<'a> {
+    name: &'a str,
+    homeserver_address: &'a str,
+    server_name: &'a str,
+    url: &'a str,
+    port: u16,
+    id: &'a str,
+    bot: &'a str,
+    /// The ghosts' localpart prefix, `whatsapp_` or `whatsapp_alice_`.
+    ghost_prefix: &'a str,
+    as_token: &'a str,
+    hs_token: &'a str,
+    /// `(who, level)`, in order.
+    permissions: Vec<(String, &'static str)>,
+    backfill: bool,
+    double_puppeting: bool,
+    encryption: bool,
+}
+
 /// The `config.yaml` a mautrix `bridgev2` bridge reads, with everything that ties it to this
 /// server filled in: where the server is, what it is called, the bridge's own address and
 /// port (the registration's `url`), the same two tokens, a database, who may use it, backfill,
 /// double puppeting through its own token, and encryption in the appservice mode the
 /// registration asked for. Every key not written here keeps the bridge's default: the bridge
 /// completes and rewrites this file on its first start (its config upgrader), which is also
-/// what its own `-e` generator does with an empty one.
-fn mautrix_config(
-    entry: &Entry,
-    c: &Choices,
-    server_name: &str,
-    url: &str,
-    as_token: &str,
-    hs_token: &str,
-    double_puppeting: bool,
-) -> String {
+/// what its own `-e` generator does with an empty one. The database is SQLite in the bridge's
+/// own volume, which is all one bridge process needs (RFC 0017 section 4.4).
+fn mautrix_config(p: &MautrixParams<'_>) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "# {} bridge configuration, written by Myelin for the registration it created.\n",
-        entry.name
+        p.name
     ));
     out.push_str("# Every setting not listed here keeps the bridge's own default; the bridge\n");
     out.push_str("# fills the rest in and rewrites this file on its first start.\n");
     out.push_str("homeserver:\n");
-    out.push_str(&format!("  address: {}\n", c.homeserver_address));
-    out.push_str(&format!("  domain: {server_name}\n"));
+    out.push_str(&format!("  address: {}\n", p.homeserver_address));
+    out.push_str(&format!("  domain: {}\n", p.server_name));
     out.push_str("appservice:\n");
-    out.push_str(&format!("  address: {url}\n"));
+    out.push_str(&format!("  address: {}\n", p.url));
     out.push_str("  hostname: 0.0.0.0\n");
-    out.push_str(&format!("  port: {}\n", entry.port));
-    out.push_str(&format!("  id: {}\n", c.id));
+    out.push_str(&format!("  port: {}\n", p.port));
+    out.push_str(&format!("  id: {}\n", p.id));
     out.push_str("  bot:\n");
-    out.push_str(&format!("    username: {}\n", c.sender_localpart));
+    out.push_str(&format!("    username: {}\n", p.bot));
     out.push_str(&format!(
         "  username_template: \"{}{{{{.}}}}\"\n",
-        entry.ghost_prefix
+        p.ghost_prefix
     ));
     out.push_str("  ephemeral_events: true\n");
-    out.push_str(&format!("  as_token: {as_token}\n"));
-    out.push_str(&format!("  hs_token: {hs_token}\n"));
+    out.push_str(&format!("  as_token: {}\n", p.as_token));
+    out.push_str(&format!("  hs_token: {}\n", p.hs_token));
     out.push_str("database:\n");
-    if c.kubernetes {
-        out.push_str(
-            "  # The operator provisions this database; until it does, fill in the URI.\n",
-        );
-        out.push_str("  type: postgres\n");
-        out.push_str(&format!(
-            "  uri: postgres://{id}:PASSWORD@{id}-db.{ns}.svc/{id}?sslmode=disable\n",
-            id = c.id,
-            ns = c.k8s_namespace
-        ));
-    } else {
-        out.push_str("  # SQLite in the bridge's own volume. For Postgres: type: postgres and a\n");
-        out.push_str("  # postgres:// URI to a database of its own.\n");
-        out.push_str("  type: sqlite3-fk-wal\n");
-        out.push_str(&format!(
-            "  uri: file:/data/{}.db?_txlock=immediate\n",
-            c.id
-        ));
-    }
+    out.push_str("  # SQLite in the bridge's own volume. For Postgres: type: postgres and a\n");
+    out.push_str("  # postgres:// URI to a database of its own.\n");
+    out.push_str("  type: sqlite3-fk-wal\n");
+    out.push_str(&format!(
+        "  uri: file:/data/{}.db?_txlock=immediate\n",
+        p.id
+    ));
     out.push_str("bridge:\n");
     out.push_str("  # Who may use the bridge: relay (only through someone else's login),\n");
     out.push_str("  # user (sign in and chat), admin (bridge commands as well).\n");
     out.push_str("  permissions:\n");
-    out.push_str("    \"*\": relay\n");
-    out.push_str(&format!("    \"{server_name}\": user\n"));
-    if let Some(admin) = &c.admin_user {
-        out.push_str(&format!("    \"{admin}\": admin\n"));
+    for (who, level) in &p.permissions {
+        out.push_str(&format!("    \"{who}\": {level}\n"));
     }
     out.push_str("backfill:\n");
-    out.push_str("  enabled: true\n");
-    if double_puppeting {
+    out.push_str(&format!("  enabled: {}\n", p.backfill));
+    if p.double_puppeting {
         out.push_str(
             "# The bridge sends as your users through its own token: the registration's\n",
         );
-        out.push_str("# non-exclusive claim on every local user is what allows it.\n");
+        out.push_str("# non-exclusive claim on them is what allows it.\n");
         out.push_str("double_puppet:\n");
         out.push_str("  secrets:\n");
-        out.push_str(&format!("    \"{server_name}\": \"as_token:{as_token}\"\n"));
+        out.push_str(&format!(
+            "    \"{}\": \"as_token:{}\"\n",
+            p.server_name, p.as_token
+        ));
     }
     out.push_str("encryption:\n");
-    if c.encryption {
+    if p.encryption {
         out.push_str(
             "  # End-to-bridge encryption, with the device lists and to-device messages\n",
         );
@@ -762,17 +797,306 @@ fn compose(entry: &Entry, c: &Choices, image: &str, server_name: &str) -> String
 }
 
 fn bridge_resource(entry: &Entry, c: &Choices, image: &str) -> String {
+    let (repository, tag) = image.rsplit_once(':').unwrap_or((image, "latest"));
     format!(
-        "# For the Bridge operator, which is not written yet: what it will take to run this.\n\
-         apiVersion: bridges.myelin.dev/v1alpha1\n\
+        "# For a cluster running the Myelin operator (RFC 0017). The Secret named in\n\
+         # filesSecret holds config.yaml and registration.yaml, from the files above.\n\
+         apiVersion: hs.matrix.org/v1alpha1\n\
          kind: Bridge\n\
          metadata:\n  name: {id}\n  namespace: {ns}\n\
-         spec:\n  type: {kind}\n  image: {image}\n  port: {port}\n  registrationSecret: {id}-registration\n",
+         spec:\n  bridgeType: {kind}\n  appserviceId: {id}\n  image:\n    repository: {repository}\n    tag: {tag}\n  port: {port}\n  filesSecret: {id}-files\n",
         id = c.id,
         ns = c.k8s_namespace,
         kind = entry.id,
         port = entry.port,
     )
+}
+
+// ---------------------------------------------------------------------------------------------
+// Instances (RFC 0017): one person's bridge, with namespaces, permissions and double puppeting
+// that reach that person and nobody else.
+// ---------------------------------------------------------------------------------------------
+
+/// The registration key that marks an appservice as an instance of an offering, holding its
+/// owner's Matrix ID (or `_` for a shared type's instance).
+pub const BRIDGE_INSTANCE_KEY: &str = "io.myelin.bridge_instance";
+
+/// A localpart, encoded so that it can sit between two `_`s in another localpart without one
+/// user's namespace ever containing another's (RFC 0017 section 3): lowercase letters, digits,
+/// `.`, `-` and `/` are kept; every other byte, `_` and `=` included, becomes `=` and two hex
+/// digits.
+#[must_use]
+pub fn encode_localpart(localpart: &str) -> String {
+    let mut out = String::with_capacity(localpart.len());
+    for b in localpart.bytes() {
+        match b {
+            b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'/' => out.push(b as char),
+            other => out.push_str(&format!("={other:02x}")),
+        }
+    }
+    out
+}
+
+/// Everything an instance is rendered from. The tokens and addresses are the instance's own,
+/// decided by whoever keeps it (the manager): a render here mints nothing.
+#[derive(Clone, Copy)]
+pub struct InstanceSpec<'a> {
+    pub type_id: &'a str,
+    pub server_name: &'a str,
+    pub appservice_id: &'a str,
+    /// The owner's Matrix ID; `None` for a shared type's instance.
+    pub owner: Option<&'a str>,
+    pub as_token: &'a str,
+    pub hs_token: &'a str,
+    /// Where this server reaches the bridge: the registration's `url`.
+    pub url: &'a str,
+    /// Where the bridge reaches this server.
+    pub homeserver_address: &'a str,
+    pub image_tag: &'a str,
+    pub encryption: Option<bool>,
+    pub double_puppeting: Option<bool>,
+    pub backfill: Option<bool>,
+}
+
+/// An instance, rendered: its registration, the files its process reads from `/data`, and how
+/// to run it.
+#[derive(Clone)]
+pub struct InstanceRender {
+    pub registration: Value,
+    pub registration_yaml: String,
+    pub config_yaml: Option<String>,
+    /// File name in `/data` -> contents: what a deployment's Secret holds.
+    pub files: std::collections::BTreeMap<String, String>,
+    pub compose_yaml: String,
+    pub image_repository: String,
+    pub image_tag: String,
+    pub port: u16,
+    /// Arguments to the image's own entrypoint; empty for a bridge that reads `/data` itself.
+    pub args: Vec<String>,
+    /// The instance's bot's localpart.
+    pub bot_localpart: String,
+    /// The ghosts' localpart prefix.
+    pub ghost_prefix: String,
+    /// The catalogue's sign-in steps, with `{server}` filled in and `{bot}` left for the caller.
+    pub sign_in: Vec<String>,
+}
+
+impl std::fmt::Debug for InstanceRender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InstanceRender(<redacted>)")
+    }
+}
+
+/// The localparts an instance's bot and ghosts use: the catalogue's with the owner's encoded
+/// localpart added (`whatsappbot_alice`, `whatsapp_alice_`), or the catalogue's own for a shared
+/// instance. `None` for a type not in the catalogue.
+#[must_use]
+pub fn instance_names(type_id: &str, owner: Option<&str>) -> Option<(String, String)> {
+    let entry = entry(type_id)?;
+    Some(match owner.map(localpart_of) {
+        Some(localpart) => {
+            let key = encode_localpart(localpart);
+            (
+                format!("{}_{key}", entry.bot),
+                format!("{}{key}_", entry.ghost_prefix),
+            )
+        }
+        None => (entry.bot.to_owned(), entry.ghost_prefix.to_owned()),
+    })
+}
+
+/// The front door's localpart for a type: the catalogue's bot name, which users already know.
+#[must_use]
+pub fn front_door_localpart(type_id: &str) -> Option<&'static str> {
+    entry(type_id).map(|e| e.bot)
+}
+
+/// The catalogue's display name for a type.
+#[must_use]
+pub fn display_name(type_id: &str) -> Option<&'static str> {
+    entry(type_id).map(|e| e.name)
+}
+
+fn localpart_of(user_id: &str) -> &str {
+    user_id
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once(':'))
+        .map_or(user_id, |(localpart, _)| localpart)
+}
+
+/// Renders one instance. `None` for a type not in the catalogue.
+#[must_use]
+pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
+    let entry = entry(spec.type_id)?;
+    let server = regex_escape_server(spec.server_name);
+    let (bot, ghost_prefix) = instance_names(spec.type_id, spec.owner)?;
+    let encryption = spec.encryption.unwrap_or(entry.runtime == Runtime::Mautrix);
+    let double_puppeting =
+        entry.double_puppeting && spec.owner.is_some() && spec.double_puppeting.unwrap_or(true);
+    let backfill = spec.backfill.unwrap_or(true);
+
+    let mut registration = Map::new();
+    registration.insert("id".into(), json!(spec.appservice_id));
+    registration.insert("url".into(), json!(spec.url));
+    registration.insert("as_token".into(), json!(spec.as_token));
+    registration.insert("hs_token".into(), json!(spec.hs_token));
+    registration.insert("sender_localpart".into(), json!(bot));
+    registration.insert("rate_limited".into(), json!(false));
+    let mut users = vec![
+        json!({"regex": format!("@{}.*:{server}", regex_escape(&ghost_prefix)), "exclusive": true}),
+        json!({"regex": format!("@{}:{server}", regex_escape(&bot)), "exclusive": true}),
+    ];
+    if double_puppeting && let Some(owner) = spec.owner {
+        // Double puppeting as the owner, and only the owner: a compromised instance can act as
+        // one person, not as everyone on the server.
+        users.push(json!({"regex": regex_escape(owner), "exclusive": false}));
+    }
+    registration.insert(
+        "namespaces".into(),
+        json!({
+            "users": users,
+            "aliases": [{"regex": format!("#{}.*:{server}", regex_escape(&ghost_prefix)), "exclusive": true}],
+            "rooms": [],
+        }),
+    );
+    for feature in entry.features {
+        let wanted = match *feature {
+            MSC3202 | MSC4190 => encryption,
+            _ => true,
+        };
+        if wanted {
+            registration.insert((*feature).to_owned(), json!(true));
+        }
+    }
+    registration.insert(BRIDGE_TYPE_KEY.to_owned(), json!(entry.id));
+    registration.insert(
+        BRIDGE_INSTANCE_KEY.to_owned(),
+        json!(
+            spec.owner
+                .unwrap_or(crate::bridge_offerings::SHARED_INSTANCE)
+        ),
+    );
+    let registration = Value::Object(registration);
+    let registration_yaml = serde_yaml_ng::to_string(&registration).unwrap_or_default();
+
+    let mut files = std::collections::BTreeMap::new();
+    let mut args = Vec::new();
+    let config_yaml = match entry.runtime {
+        Runtime::Mautrix => {
+            let permissions = match spec.owner {
+                Some(owner) => vec![(owner.to_owned(), "admin")],
+                None => vec![
+                    ("*".to_owned(), "relay"),
+                    (spec.server_name.to_owned(), "user"),
+                ],
+            };
+            let config = mautrix_config(&MautrixParams {
+                name: entry.name,
+                homeserver_address: spec.homeserver_address,
+                server_name: spec.server_name,
+                url: spec.url,
+                port: entry.port,
+                id: spec.appservice_id,
+                bot: &bot,
+                ghost_prefix: &ghost_prefix,
+                as_token: spec.as_token,
+                hs_token: spec.hs_token,
+                permissions,
+                backfill,
+                double_puppeting,
+                encryption,
+            });
+            files.insert("config.yaml".to_owned(), config.clone());
+            Some(config)
+        }
+        Runtime::Heisenbridge => {
+            args = vec![
+                "-c".into(),
+                "/data/registration.yaml".into(),
+                "-l".into(),
+                "0.0.0.0".into(),
+                "-p".into(),
+                entry.port.to_string(),
+                "-o".into(),
+                spec.owner
+                    .map_or_else(|| format!("@OWNER:{}", spec.server_name), str::to_owned),
+                spec.homeserver_address.to_owned(),
+            ];
+            None
+        }
+        Runtime::AppserviceIrc | Runtime::Hookshot => None,
+    };
+    files.insert("registration.yaml".to_owned(), registration_yaml.clone());
+
+    let repository = entry
+        .image
+        .rsplit_once(':')
+        .map_or(entry.image, |(name, _)| name)
+        .to_owned();
+    let image_tag = if spec.image_tag.trim().is_empty() {
+        "latest".to_owned()
+    } else {
+        spec.image_tag.trim().to_owned()
+    };
+    let mut compose_yaml = String::new();
+    compose_yaml
+        .push_str("# Save config.yaml and registration.yaml into the directory mounted at\n");
+    compose_yaml
+        .push_str("# /data first. The bridge has to reach this server at the address in its\n");
+    compose_yaml.push_str(&format!(
+        "# config ({}), and this server has to reach it at {}.\n",
+        spec.homeserver_address, spec.url
+    ));
+    compose_yaml.push_str("services:\n");
+    compose_yaml.push_str(&format!("  {}:\n", spec.appservice_id));
+    compose_yaml.push_str(&format!("    image: {repository}:{image_tag}\n"));
+    compose_yaml.push_str("    restart: unless-stopped\n");
+    compose_yaml.push_str(&format!(
+        "    volumes:\n      - ./{}:/data\n",
+        spec.appservice_id
+    ));
+    compose_yaml.push_str(&format!(
+        "    ports:\n      - \"{port}:{port}\"\n",
+        port = entry.port
+    ));
+    if !args.is_empty() {
+        let quoted: Vec<String> = args.iter().map(|a| format!("\"{a}\"")).collect();
+        compose_yaml.push_str(&format!("    command: [{}]\n", quoted.join(", ")));
+    }
+
+    Some(InstanceRender {
+        registration,
+        registration_yaml,
+        config_yaml,
+        files,
+        compose_yaml,
+        image_repository: repository,
+        image_tag,
+        port: entry.port,
+        args,
+        bot_localpart: bot,
+        ghost_prefix,
+        sign_in: entry
+            .sign_in
+            .iter()
+            .map(|s| s.replace("{server}", spec.server_name))
+            .collect(),
+    })
+}
+
+/// Escapes the regex metacharacters that can appear in a Matrix ID.
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if matches!(
+            ch,
+            '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\'
+        ) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -999,13 +1323,18 @@ mod tests {
                 .contains("dock.mau.dev/mautrix/signal:v0.8.0")
         );
         assert!(result.bridge_resource_yaml.contains("namespace: chat"));
+        assert!(
+            result
+                .bridge_resource_yaml
+                .contains("apiVersion: hs.matrix.org/v1alpha1")
+        );
         let config: Value =
             serde_yaml_ng::from_str(result.config_yaml.as_deref().unwrap()).unwrap();
         assert_eq!(
             config["homeserver"]["address"],
             "http://myelin.chat.svc:8008"
         );
-        assert_eq!(config["database"]["type"], "postgres");
+        assert_eq!(config["database"]["type"], "sqlite3-fk-wal");
     }
 
     #[test]
@@ -1028,5 +1357,128 @@ mod tests {
         assert!(result.compose_yaml.contains("hif1/heisenbridge:latest"));
         assert!(result.compose_yaml.contains("\"-o\", \"@me:test.local\""));
         assert!(result.compose_yaml.contains("\"http://myelin:8008\""));
+    }
+
+    #[test]
+    fn localparts_are_encoded_so_no_namespace_contains_another() {
+        assert_eq!(encode_localpart("alice"), "alice");
+        assert_eq!(encode_localpart("alice_x"), "alice=5fx");
+        assert_eq!(encode_localpart("Bob=1"), "=42ob=3d1");
+        assert_eq!(encode_localpart("a.b-c/d"), "a.b-c/d");
+        let (bot, ghosts) = instance_names("mautrix-whatsapp", Some("@alice:x.org")).unwrap();
+        assert_eq!(bot, "whatsappbot_alice");
+        assert_eq!(ghosts, "whatsapp_alice_");
+        // alice's ghost pattern cannot match alice_x's or alice.x's ghosts.
+        let (_, other) = instance_names("mautrix-whatsapp", Some("@alice_x:x.org")).unwrap();
+        assert!(!other.starts_with(&ghosts));
+        let (_, dotted) = instance_names("mautrix-whatsapp", Some("@alice.x:x.org")).unwrap();
+        assert!(!dotted.starts_with(&ghosts));
+    }
+
+    #[test]
+    fn an_instance_reaches_its_owner_and_nobody_else() {
+        let r = render_instance(&InstanceSpec {
+            type_id: "mautrix-whatsapp",
+            server_name: "chat.example.net",
+            appservice_id: "whatsapp-alice",
+            owner: Some("@alice:chat.example.net"),
+            as_token: "a".repeat(64).as_str(),
+            hs_token: "h".repeat(64).as_str(),
+            url: "http://bridge-1234abcd.myelin.svc:29318",
+            homeserver_address: "http://myelin-hs.myelin.svc:8008",
+            image_tag: "v0.12.0",
+            encryption: None,
+            double_puppeting: None,
+            backfill: None,
+        })
+        .unwrap();
+        let reg = &r.registration;
+        assert_eq!(reg["id"], "whatsapp-alice");
+        assert_eq!(reg["sender_localpart"], "whatsappbot_alice");
+        let users = reg["namespaces"]["users"].as_array().unwrap();
+        assert_eq!(users[0]["regex"], "@whatsapp_alice_.*:chat\\.example\\.net");
+        assert_eq!(users[1]["regex"], "@whatsappbot_alice:chat\\.example\\.net");
+        assert_eq!(users[2]["regex"], "@alice:chat\\.example\\.net");
+        assert_eq!(users[2]["exclusive"], false);
+        assert_eq!(users.len(), 3, "no claim on anyone else");
+        assert_eq!(reg[BRIDGE_INSTANCE_KEY], "@alice:chat.example.net");
+        assert_eq!(reg[MSC4190], true);
+        let config: Value = serde_yaml_ng::from_str(r.config_yaml.as_deref().unwrap()).unwrap();
+        assert_eq!(config["appservice"]["bot"]["username"], "whatsappbot_alice");
+        assert_eq!(
+            config["appservice"]["username_template"],
+            "whatsapp_alice_{{.}}"
+        );
+        assert_eq!(
+            config["appservice"]["address"],
+            "http://bridge-1234abcd.myelin.svc:29318"
+        );
+        assert_eq!(
+            config["homeserver"]["address"],
+            "http://myelin-hs.myelin.svc:8008"
+        );
+        let permissions = config["bridge"]["permissions"].as_object().unwrap();
+        assert_eq!(permissions.len(), 1);
+        assert_eq!(permissions["@alice:chat.example.net"], "admin");
+        assert_eq!(
+            config["database"]["uri"],
+            "file:/data/whatsapp-alice.db?_txlock=immediate"
+        );
+        assert_eq!(r.files.len(), 2);
+        assert!(r.files.contains_key("config.yaml") && r.files.contains_key("registration.yaml"));
+        assert_eq!(r.image_repository, "dock.mau.dev/mautrix/whatsapp");
+        assert_eq!(r.image_tag, "v0.12.0");
+        assert!(r.args.is_empty());
+        assert!(
+            r.compose_yaml
+                .contains("dock.mau.dev/mautrix/whatsapp:v0.12.0")
+        );
+
+        let heisen = render_instance(&InstanceSpec {
+            type_id: "heisenbridge",
+            owner: Some("@bob:x.org"),
+            server_name: "x.org",
+            appservice_id: "heisenbridge-bob",
+            url: "http://b:9898",
+            homeserver_address: "http://hs:8008",
+            image_tag: "",
+            ..InstanceSpec {
+                type_id: "",
+                server_name: "",
+                appservice_id: "",
+                owner: None,
+                as_token: "a",
+                hs_token: "b",
+                url: "",
+                homeserver_address: "",
+                image_tag: "",
+                encryption: None,
+                double_puppeting: None,
+                backfill: None,
+            }
+        })
+        .unwrap();
+        assert!(heisen.config_yaml.is_none());
+        assert_eq!(heisen.args.last().unwrap(), "http://hs:8008");
+        assert!(heisen.args.contains(&"@bob:x.org".to_owned()));
+        assert_eq!(heisen.bot_localpart, "heisenbridge_bob");
+        assert_eq!(heisen.image_tag, "latest");
+    }
+
+    #[test]
+    fn every_type_says_whether_it_is_per_user_and_deployable() {
+        let whatsapp = get("mautrix-whatsapp", "x.org").unwrap();
+        assert_eq!(
+            (whatsapp.mode.as_str(), whatsapp.deployable),
+            ("per_user", true)
+        );
+        let telegram = get("mautrix-telegram", "x.org").unwrap();
+        assert!(!telegram.deployable, "needs the operator's own API ID");
+        let hookshot = get("matrix-hookshot", "x.org").unwrap();
+        assert_eq!(
+            (hookshot.mode.as_str(), hookshot.deployable),
+            ("shared", false)
+        );
+        assert_eq!(get("heisenbridge", "x.org").unwrap().mode, "per_user");
     }
 }

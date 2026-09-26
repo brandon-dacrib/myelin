@@ -90,6 +90,9 @@ pub struct AdminState {
     /// tried to reach. `None` until wired with [`AdminState::with_federation`]; until then they
     /// answer `503 unavailable`.
     pub federation: Option<Arc<dyn FederationSource>>,
+    /// What the `bridge_deployments.*`, `bridge_offerings.*` and `bridge_instances.*` operations
+    /// read and write (RFC 0017). `None` until wired with [`AdminState::with_bridge_offerings`].
+    pub bridge_offerings: Option<Arc<dyn crate::bridge_offerings::BridgeOfferingSource>>,
     /// The `Idempotency-Key` cache every mutating handler that declares it consults (see
     /// [`crate::idempotency`]). Always present (never `None`): a client is never told its
     /// idempotency key was ignored.
@@ -117,6 +120,7 @@ impl AdminState {
             overview: None,
             appservices: None,
             federation: None,
+            bridge_offerings: None,
             idempotency: Arc::new(IdempotencyStore::new()),
         }
     }
@@ -150,6 +154,16 @@ impl AdminState {
     #[must_use]
     pub fn with_appservices(mut self, appservices: Arc<dyn AppserviceDirectory>) -> Self {
         self.appservices = Some(appservices);
+        self
+    }
+
+    /// Wires the bridge manager (RFC 0017), making the bridge offering operations real.
+    #[must_use]
+    pub fn with_bridge_offerings(
+        mut self,
+        offerings: Arc<dyn crate::bridge_offerings::BridgeOfferingSource>,
+    ) -> Self {
+        self.bridge_offerings = Some(offerings);
         self
     }
 
@@ -272,6 +286,16 @@ const REAL_HANDLERS: &[&str] = &[
     "bridge_types.list",
     "bridge_types.get",
     "bridge_types.render",
+    "bridge_deployments.target",
+    "bridge_offerings.list",
+    "bridge_offerings.get",
+    "bridge_offerings.put",
+    "bridge_offerings.delete",
+    "bridge_instances.list",
+    "bridge_instances.get",
+    "bridge_instances.put",
+    "bridge_instances.delete",
+    "bridge_instances.files",
     "federation.destinations.list",
     "federation.destinations.get",
     "federation.destinations.reset",
@@ -2332,6 +2356,297 @@ async fn bridge_types_render(
 }
 
 // -------------------------------------------------------------------------------------------
+// bridge offerings and instances (RFC 0017), over `crate::bridge_offerings::BridgeOfferingSource`.
+// Reads need `admin:read`; writes `admin:write` (the files carry tokens), audited and published.
+// -------------------------------------------------------------------------------------------
+
+/// Runs `f` against the bridge offering source once the scope is checked, turning its result
+/// into a response. `write` names the audit action and event type of a mutation.
+async fn with_offerings<T, F, Fut>(
+    state: &AdminState,
+    headers: &HeaderMap,
+    instance: &str,
+    scope: Scope,
+    write: Option<(&str, &str, ResourceRef)>,
+    ok_status: StatusCode,
+    f: F,
+) -> Response
+where
+    T: serde::Serialize,
+    F: FnOnce(Arc<dyn crate::bridge_offerings::BridgeOfferingSource>) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<T>, SourceError>>,
+{
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(headers),
+        Some(scope),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(principal) => {
+            let Some(source) = state.bridge_offerings.clone() else {
+                return source_unavailable("bridge manager", instance);
+            };
+            match f(source).await {
+                Ok(value) => {
+                    if let Some((action, event_type, target)) = write
+                        && let Err(resp) = record_mutation(
+                            state,
+                            &principal,
+                            action,
+                            event_type,
+                            target.clone(),
+                            Vec::new(),
+                            json!({ "id": target.id }),
+                        )
+                        .await
+                    {
+                        return resp;
+                    }
+                    match value {
+                        Some(v) => (ok_status, axum::Json(v)).into_response(),
+                        None => StatusCode::NO_CONTENT.into_response(),
+                    }
+                }
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+fn not_found_if_none<T>(v: Option<T>) -> Result<Option<T>, SourceError> {
+    v.map(Some).ok_or(SourceError::NotFound)
+}
+
+/// `GET /api/v1/bridge-deployment-target`.
+async fn bridge_deployments_target(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Response {
+    with_offerings(
+        &state,
+        &headers,
+        "/api/v1/bridge-deployment-target",
+        Scope::AdminRead,
+        None,
+        StatusCode::OK,
+        |s| async move { Ok(Some(s.target().await)) },
+    )
+    .await
+}
+
+/// `GET /api/v1/bridge-offerings`.
+async fn bridge_offerings_list(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    with_offerings(
+        &state,
+        &headers,
+        "/api/v1/bridge-offerings",
+        Scope::AdminRead,
+        None,
+        StatusCode::OK,
+        |s| async move {
+            let all = s.list().await?;
+            Ok(Some(Page::paginate(all, None, None, false)))
+        },
+    )
+    .await
+}
+
+/// `GET /api/v1/bridge-offerings/{type}`.
+async fn bridge_offerings_get(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(t): Path<String>,
+) -> Response {
+    let instance = format!("/api/v1/bridge-offerings/{t}");
+    with_offerings(
+        &state,
+        &headers,
+        &instance,
+        Scope::AdminRead,
+        None,
+        StatusCode::OK,
+        |s| async move { not_found_if_none(s.get(&t).await?) },
+    )
+    .await
+}
+
+/// `PUT /api/v1/bridge-offerings/{type}`.
+async fn bridge_offerings_put(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(t): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let instance = format!("/api/v1/bridge-offerings/{t}");
+    let request: crate::model::BridgeOfferingRequest =
+        match parse_optional_json::<serde_json::Value>(&body) {
+            Ok(serde_json::Value::Null) => crate::model::BridgeOfferingRequest::default(),
+            Ok(v) => match serde_json::from_value(v) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Problem::validation_failed()
+                        .with_detail(e.to_string())
+                        .with_instance(instance)
+                        .into_response();
+                }
+            },
+            Err(p) => return p.with_instance(instance).into_response(),
+        };
+    let target = ResourceRef::new("bridge_offering", t.clone());
+    with_offerings(
+        &state,
+        &headers,
+        &instance,
+        Scope::AdminWrite,
+        Some(("bridge_offerings.put", "bridge_offering.updated", target)),
+        StatusCode::OK,
+        |s| async move { Ok(Some(s.put(&t, request).await?)) },
+    )
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoveInstancesQuery {
+    remove_instances: Option<bool>,
+}
+
+/// `DELETE /api/v1/bridge-offerings/{type}`.
+async fn bridge_offerings_delete(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(t): Path<String>,
+    Query(q): Query<RemoveInstancesQuery>,
+) -> Response {
+    let instance = format!("/api/v1/bridge-offerings/{t}");
+    let target = ResourceRef::new("bridge_offering", t.clone());
+    with_offerings::<(), _, _>(
+        &state,
+        &headers,
+        &instance,
+        Scope::AdminWrite,
+        Some(("bridge_offerings.delete", "bridge_offering.deleted", target)),
+        StatusCode::NO_CONTENT,
+        |s| async move {
+            s.delete(&t, q.remove_instances.unwrap_or(false)).await?;
+            Ok(None)
+        },
+    )
+    .await
+}
+
+/// `GET /api/v1/bridge-offerings/{type}/instances`.
+async fn bridge_instances_list(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(t): Path<String>,
+) -> Response {
+    let instance = format!("/api/v1/bridge-offerings/{t}/instances");
+    with_offerings(
+        &state,
+        &headers,
+        &instance,
+        Scope::AdminRead,
+        None,
+        StatusCode::OK,
+        |s| async move {
+            let all = s.instances(&t).await?;
+            Ok(Some(Page::paginate(all, None, None, false)))
+        },
+    )
+    .await
+}
+
+/// `GET /api/v1/bridge-offerings/{type}/instances/{user_id}`.
+async fn bridge_instances_get(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path((t, user)): Path<(String, String)>,
+) -> Response {
+    let instance = format!("/api/v1/bridge-offerings/{t}/instances/{user}");
+    with_offerings(
+        &state,
+        &headers,
+        &instance,
+        Scope::AdminRead,
+        None,
+        StatusCode::OK,
+        |s| async move { not_found_if_none(s.instance(&t, &user).await?) },
+    )
+    .await
+}
+
+/// `PUT /api/v1/bridge-offerings/{type}/instances/{user_id}`.
+async fn bridge_instances_put(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path((t, user)): Path<(String, String)>,
+) -> Response {
+    let instance = format!("/api/v1/bridge-offerings/{t}/instances/{user}");
+    let target = ResourceRef::new("bridge_instance", format!("{t}/{user}"));
+    with_offerings(
+        &state,
+        &headers,
+        &instance,
+        Scope::AdminWrite,
+        Some(("bridge_instances.put", "bridge_instance.requested", target)),
+        StatusCode::OK,
+        |s| async move { Ok(Some(s.put_instance(&t, &user).await?)) },
+    )
+    .await
+}
+
+/// `DELETE /api/v1/bridge-offerings/{type}/instances/{user_id}`.
+async fn bridge_instances_delete(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path((t, user)): Path<(String, String)>,
+) -> Response {
+    let instance = format!("/api/v1/bridge-offerings/{t}/instances/{user}");
+    let target = ResourceRef::new("bridge_instance", format!("{t}/{user}"));
+    with_offerings::<(), _, _>(
+        &state,
+        &headers,
+        &instance,
+        Scope::AdminWrite,
+        Some(("bridge_instances.delete", "bridge_instance.deleted", target)),
+        StatusCode::NO_CONTENT,
+        |s| async move {
+            s.delete_instance(&t, &user).await?;
+            Ok(None)
+        },
+    )
+    .await
+}
+
+/// `POST /api/v1/bridge-offerings/{type}/instances/{user_id}/files`: tokens included, so
+/// `admin:write`, and audited like a registration export.
+async fn bridge_instances_files(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path((t, user)): Path<(String, String)>,
+) -> Response {
+    let instance = format!("/api/v1/bridge-offerings/{t}/instances/{user}/files");
+    let target = ResourceRef::new("bridge_instance", format!("{t}/{user}"));
+    with_offerings(
+        &state,
+        &headers,
+        &instance,
+        Scope::AdminWrite,
+        Some((
+            "bridge_instances.files",
+            "bridge_instance.files_rendered",
+            target,
+        )),
+        StatusCode::OK,
+        |s| async move { Ok(Some(s.instance_files(&t, &user).await?)) },
+    )
+    .await
+}
+
+// -------------------------------------------------------------------------------------------
 // appservices (bridges): the thirteen `appservices.*` operations, over
 // `crate::sources::AppserviceDirectory`. Reads need `admin:read`; everything that changes the
 // registry, or makes the server do something (a ping, a replay), needs `admin:write`, writes one
@@ -4242,6 +4557,18 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         "bridge_types.list" => builder.add(method, &full_path, bridge_types_list, meta),
         "bridge_types.get" => builder.add(method, &full_path, bridge_types_get, meta),
         "bridge_types.render" => builder.add(method, &full_path, bridge_types_render, meta),
+        "bridge_deployments.target" => {
+            builder.add(method, &full_path, bridge_deployments_target, meta)
+        }
+        "bridge_offerings.list" => builder.add(method, &full_path, bridge_offerings_list, meta),
+        "bridge_offerings.get" => builder.add(method, &full_path, bridge_offerings_get, meta),
+        "bridge_offerings.put" => builder.add(method, &full_path, bridge_offerings_put, meta),
+        "bridge_offerings.delete" => builder.add(method, &full_path, bridge_offerings_delete, meta),
+        "bridge_instances.list" => builder.add(method, &full_path, bridge_instances_list, meta),
+        "bridge_instances.get" => builder.add(method, &full_path, bridge_instances_get, meta),
+        "bridge_instances.put" => builder.add(method, &full_path, bridge_instances_put, meta),
+        "bridge_instances.delete" => builder.add(method, &full_path, bridge_instances_delete, meta),
+        "bridge_instances.files" => builder.add(method, &full_path, bridge_instances_files, meta),
         "federation.destinations.list" => {
             builder.add(method, &full_path, federation_destinations_list, meta)
         }
