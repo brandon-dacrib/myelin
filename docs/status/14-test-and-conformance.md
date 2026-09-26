@@ -94,7 +94,9 @@ run 7's baseline by name. Run 11 (2026-09-26, `9672d61`, the history before a jo
 client's behalf): **317 of 384, 78 of 106**, eleven minutes; `TestMessagesOverFederation` went
 from 0 of 6 subtests to 3 of 6 -- both "after joining new room" cases pass, the "after
 re-joining" case does not (the gap between a leave and a rejoin is not filled) -- and no
-top-level test moved either way. It is the csapi baseline now. `TestMessagesOverFederation` and `TestPushRuleRoomUpgrade`, whose
+top-level test moved either way. Run 12 (`63c226f`, the visibility rule widened and the
+rejoin through a resident): **317 of 384, 78 of 106**, identical to run 11 by name. It is the
+csapi baseline now. `TestMessagesOverFederation` and `TestPushRuleRoomUpgrade`, whose
 federated joins used to 404, now join and fail afterwards -- on the history before the join,
 which is not backfilled, and on the upgrade -- which is what a fixed join and an unfixed rest
 look like. The csapi baseline file carries run 10's note; nothing in it moved.

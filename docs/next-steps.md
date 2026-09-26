@@ -158,7 +158,8 @@ While the server has no administrator it logs a one-time setup link at every sta
 **The admin interface ships.** Until 2026-09-21 it did not: every binary and every published image served a placeholder at `/admin/` saying the interface had not been built in, because nothing embedded `web/dist`. `crates/hs-admin/build.rs` now stages the built interface (or the placeholder, for a Rust-only checkout, and says so at startup); release builds set `HS_ADMIN_WEB_DIST` and *fail* without a built interface; CD refuses to publish an image whose `/admin/` is not the interface. Verified on the published artifact: `ghcr.io/brandon-dacrib/myelin:main`, pulled from the registry on 2026-09-21 and run with the README's exact command, serves the interface at `/admin/`, answers `needs_setup: true`, and logs the setup link. What has still never run is the `v*` binaries job's new Node step, which only a tag exercises.
 
 **Complement, `csapi`: 317 of 384 assertions pass** (78 of 106 top-level), measured 2026-09-26 at
-`9672d61` (run 11): the two "after joining new room" subtests of `TestMessagesOverFederation`
+`63c226f` (run 12, identical by name to run 11 at `9672d61` -- the day's later changes moved
+nothing here either way). Run 11: the two "after joining new room" subtests of `TestMessagesOverFederation`
 moved to passing with the history before a join fetched (see "the room's history from before
 the join"), its "after re-joining" subtest did not, and no top-level test moved either way. Run
 10 (`82359fb`) was 314 of 384, identical by name to run 7 (2026-09-21, `318f8f4`) after a day
