@@ -18,7 +18,9 @@ Concretely, the properties this project holds itself to, in priority order:
 2. **Scale is a replica count.** `replicas: N` behind one Service, no worker types, no
    path-routing map at the ingress. Rooms and users are owned by lease, forwarded over a mesh,
    handed off before a pod stops. A rolling update drops no request. The store is the only
-   stateful dependency.
+   stateful dependency. `docs/scaling.md` says what that buys and what it does not, and the
+   documentation must never let "scale" mean more than it does: more rooms and clients in
+   flight and availability, not one room's throughput and not the database's.
 3. **Administration is a page in a browser, on a public API.** Everything an operator does
    day to day is in the management interface, and everything the interface does is an
    operation in the admin API with OpenAPI, scopes and an audit entry. Configuration lives in

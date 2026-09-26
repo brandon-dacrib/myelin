@@ -314,6 +314,8 @@ Global keyspaces (small): server config snapshot, signing keys, server key cache
 
 ### 7.3 Scaling and high availability
 
+`docs/scaling.md` states what a replica adds (rooms and clients in flight, availability) and what it does not (one room's throughput, database capacity), and what of this is built.
+
 - Scale-out is `replicas: N`. No worker types, no path-based routing map at the ingress; one Service. This alone removes the most error-prone part of running Synapse at scale.
 - Horizontal Pod Autoscaler on CPU and on custom metrics (sync connections, actor queue depth, federation backlog); PodDisruptionBudget; pod anti-affinity; topology spread across zones.
 - Storage HA: CloudNativePG with synchronous replication for the PostgreSQL backend; object storage for media and for the SlateDB backend; the store is the only stateful dependency in the default cluster mode.

@@ -333,7 +333,15 @@ would do it; each ends in a transcript in `docs/status/12-platform-and-kubernete
   `status.podIP` into a config field that does not exist yet); the mesh's mutual TLS is built
   in `hs-cluster` and not wired from `hs-cli`; `/createRoom` is not shard-gated; the outbound
   federation sender and the appservice pump are shard-gated in a unit test with scripted
-  ownership only.
+  ownership only. And the one that matters most to a client: **`/sync` is not cluster-aware**.
+  The session hub watches only its own replica's room stream, so a long-poll on replica B for
+  a room replica A owns is never woken. The design's user-session owner, woken by room owners
+  over the mesh (`PLAN.md` 5.4), is not built; until it is, N replicas are an availability
+  feature for clients, not a capacity one. `docs/scaling.md` has the whole adds/does-not-add
+  table and is the document to keep true as this lands.
+- **Measure the slope.** `hs-loadgen` against one replica, then two, then three, on the same
+  PostgreSQL: connected users and active rooms at a fixed sync p99. Every number in `PLAN.md`
+  section 13 is a target; this is the first fact.
 - **A rolling update that drops nothing.** With two replicas under a loadgen client,
   `kubectl rollout restart` and count failed requests; the target is zero. Readiness is
   withdrawn first now and the drain hands shards off, but nobody has measured it. A `preStop`

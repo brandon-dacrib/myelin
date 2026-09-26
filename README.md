@@ -94,7 +94,9 @@ the pod and the key unchanged again. The chart is published as an OCI artifact b
 tag, which has not happened yet, so for now it installs from a checkout. Cluster mode
 (`mode=cluster`, PostgreSQL or CloudNativePG, media on S3, a shared signing-key Secret) renders
 and has run as two processes on one PostgreSQL, but has not yet carried real traffic on a
-cluster; that is the top of `docs/next-steps.md`.
+cluster; that is the top of `docs/next-steps.md`. `docs/scaling.md` says exactly what adding a
+replica buys (rooms and clients in flight, availability) and what it does not (one room's
+throughput, database capacity), and which of that is built today.
 
 `CHANGELOG.md` is the full record of what has been built, and is honest about the difference
 between a route that is registered and a route that works. `docs/next-steps.md` is what comes next
@@ -125,6 +127,7 @@ the rest of Matrix yet.
 
 - `PLAN.md`: the plan, design decisions, architecture, roadmap.
 - `docs/landscape.md`: the other homeservers as they are today, and where this one stands.
+- `docs/scaling.md`: what a replica adds, what it does not, and what is built versus designed.
 - `CHANGELOG.md`: what has been built, and what is verified rather than merely written.
 - `docs/next-steps.md`: the current resume point, priorities, and known gaps.
 - `docs/workstreams/`: the sixteen expert tracks, their interfaces, and the rules for parallel work.

@@ -35,6 +35,13 @@
 mode: singleNode
 
 ## Number of replicas in `cluster` mode. Ignored (forced to 1) in `singleNode` mode.
+##
+## What another replica buys: more rooms being written to at once, more clients connected at
+## once, and a replica that can die without losing anything but cache. What it does not buy:
+## a faster single room (one room has one owner) or more database capacity (every replica
+## writes to the same PostgreSQL primary, which is the ceiling). docs/scaling.md has the full
+## table, and what of it is built today: as of 2026-09-26 room writes are partitioned and
+## proven, but /sync is not yet routed to a room's owner, so clients must reach one replica.
 replicaCount: 3
 
 image:

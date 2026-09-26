@@ -145,7 +145,8 @@ What is real today, verified by running it (`docs/next-steps.md` has the basis f
   distroless and non-root on amd64 and arm64; readiness reflects cluster ownership and is
   withdrawn the moment a shutdown begins; a shutdown answers waiting long-polls rather than
   waiting out their timeout; the chart has probes, a PodDisruptionBudget, anti-affinity, an HPA
-  and a ServiceMonitor.
+  and a ServiceMonitor. `docs/scaling.md` says precisely what a replica does and does not
+  buy, and that `/sync` is not yet cluster-aware.
 
 What is not, and should temper any comparison:
 
