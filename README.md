@@ -7,7 +7,16 @@ without altering the signal itself. That is this project's ambition: the Matrix 
 as specified, carried a great deal faster, named in the tradition its predecessors set (Synapse,
 Dendrite).
 
-Kubernetes-native, horizontally scalable, and equally at home as a single static binary on a small ARM host. Synapse-compatible at the API and operations level with a migration path. Bridges are first-class. Full specification coverage is enforced mechanically.
+**What sets it apart is operations.** Install is one value: a server name, to `docker run` or
+to `helm install`, and there is a working server with its key, database and media on one volume
+and a link in the log that makes the first administrator. Scale is a replica count behind one
+Service, with no worker types and no routing map. Administration is a web interface on a public
+admin API with an audit log, and the configuration lives in the database where that interface
+edits it. It is built for Kubernetes from birth and is the same static binary on a small ARM
+host. Synapse-compatible at the API and operations level with a migration path; bridges are
+first-class; specification coverage is measured mechanically. `docs/landscape.md` sets this
+against Synapse, Dendrite, Conduit, continuwuity, tuwunel and Palpo, and
+`docs/decisions/0008-the-standout-is-operations.md` is the decision to make this the product.
 
 ## What works today
 
@@ -70,6 +79,23 @@ one that does not answer `/health/live`, serve the admin interface and log a set
 
 Without Docker, `hs serve --data-dir ./data --server-name example.org` is the same thing.
 
+On Kubernetes it is one value:
+
+```sh
+helm install myelin deploy/helm/hs --set serverName=example.org
+```
+
+That produces a single replica with a 10 GiB volume holding the database, the signing key and
+media, probes, a Service, and the same setup link in the pod's log (`helm install` prints the
+`kubectl logs` line that finds it). Verified on 2026-09-26 against a real cluster with the
+published image: install to Ready, the interface at `/admin/`, the first administrator made
+through the link, the pod deleted and the signing key unchanged, a `helm upgrade` that replaced
+the pod and the key unchanged again. The chart is published as an OCI artifact by the first `v*`
+tag, which has not happened yet, so for now it installs from a checkout. Cluster mode
+(`mode=cluster`, PostgreSQL or CloudNativePG, media on S3, a shared signing-key Secret) renders
+and has run as two processes on one PostgreSQL, but has not yet carried real traffic on a
+cluster; that is the top of `docs/next-steps.md`.
+
 `CHANGELOG.md` is the full record of what has been built, and is honest about the difference
 between a route that is registered and a route that works. `docs/next-steps.md` is what comes next
 and the gaps as they actually stand — the largest being that administering this server should be
@@ -89,7 +115,7 @@ broken up, because the parts are nowhere near each other. This table is kept cur
 | Admin API | ~40% | 58 of 145 operations have a real handler; the rest answer an honest 501 |
 | Management web interface | ~75% | users, rooms, bridges (catalogue, wizard, runbook, sign-in guides), federation, configuration and the audit log are real against the real server |
 | Bridges | ~75% | heisenbridge works end to end; mautrix-whatsapp, added through the wizard, connects and starts encrypted; no mautrix bridge has carried a message yet |
-| Operations (HA, scale-out) | ~40% | runs on Kubernetes with a chart and a tested image; the cluster path has not carried real traffic |
+| Operations (HA, scale-out) | ~45% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; readiness is withdrawn the moment a shutdown begins; the cluster path has not carried real traffic and the operator creates nothing yet |
 | **Federation** | **~30%** | 75/250 assertions, 14/88 tests; a user joins a room hosted elsewhere through the client API, messages flow both ways between two instances of this server, and the room's history from before the join is fetched as the client scrolls back; no EDUs, in-memory outbound queue, not yet tried against Synapse |
 
 Federation is the honest answer to "when could I use this": a user here cannot really talk to
@@ -98,6 +124,7 @@ the rest of Matrix yet.
 ## Where things are
 
 - `PLAN.md`: the plan, design decisions, architecture, roadmap.
+- `docs/landscape.md`: the other homeservers as they are today, and where this one stands.
 - `CHANGELOG.md`: what has been built, and what is verified rather than merely written.
 - `docs/next-steps.md`: the current resume point, priorities, and known gaps.
 - `docs/workstreams/`: the sixteen expert tracks, their interfaces, and the rules for parallel work.

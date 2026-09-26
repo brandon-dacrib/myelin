@@ -1,6 +1,6 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-09-26. `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`.
+Written 2026-09-20 by the integration lead, last revised 2026-09-26. `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
@@ -155,6 +155,40 @@ backfilled event is walked rather than asked for (`/state_ids`), and no auth che
 
 While the server has no administrator it logs a one-time setup link at every start (`/admin/setup#token=...`, `hs_auth::setup`). Opening it asks for a username and a password and signs you in as the first administrator. Watched working in a real browser against the real binary on 2026-09-21, from an empty directory to the Users page showing the new account. It was: configure a shared secret, `hs register --admin`, `curl /login`, paste a token.
 
+**The standout is operations, decided** (2026-09-26, decision 0008). The user set the
+product's distinguishing feature: Kubernetes and cloud nativity, and absolute ease of install,
+scaling and administration. The field was re-checked the same day (`docs/landscape.md`): the
+Rust servers people run, continuwuity (v26.9.0, 2026-09-16) and tuwunel (v1.9.3, 2026-09-25,
+sponsored by the Swiss government, full-time staff, a Synapse-compatible admin API since 1.8.1),
+are excellent single-process servers and both say on their own Kubernetes pages that they do
+not scale horizontally; Synapse scales through hand-assigned worker types and a routing map.
+Nobody offers install-as-one-value, scale-as-a-replica-count and a web admin together. The
+priorities below now start there, and every feature has to answer "how does the operator turn
+it on".
+
+**Kubernetes install is one value, verified** (2026-09-26). `helm install myelin deploy/helm/hs
+--set serverName=example.org` was run against a real cluster (the Talos one previous sessions
+used, in a throwaway namespace, torn down after) with the published `ghcr.io/brandon-dacrib/
+myelin:main` image, and it worked the first time: Ready in about two minutes (volume
+provisioning and the image pull are most of it), the signing key generated into `keys/` on the
+data volume with no ephemeral-key warning, `/health/ready` 200, `/admin/` serving the real
+interface, the setup link in the log, the first administrator created through it, the pod
+deleted and the key unchanged, a `helm upgrade` that replaced the pod and the key unchanged
+again with the new `publicBaseUrl` served from `.well-known`. Full transcript at the top of
+`docs/status/12-platform-and-kubernetes.md`. Before this the chart demanded a hand-made
+signing-key Secret and a rendered config file, pulled an image tag that did not exist
+(`appVersion: 0.0.1`), and had never been installed with a pullable image. What the chart does
+now: Helm-managed settings (server name, public base URL, signing-key path, the database
+connection) are `HS__` environment variables, which outrank the database (RFC 0016) so they
+apply on every upgrade and the interface shows them as pinned; the rest is a ConfigMap that
+seeds the database once; the signing-key Secret is required only in cluster mode. Found on the
+way and fixed: `RUST_LOG=info` in the pod overrode the server's own log directives and put
+sixty `lsm_tree` lines above the setup link on every first boot; two `HS__AUTH__*_FILE`
+variables named files whose Secrets were optional; `/health/ready` kept answering 200 for the
+whole of a shutdown, including a cluster drain of up to twenty seconds, so a Service would keep
+routing new requests to a replica busy giving its rooms away. It is withdrawn first now
+(`ServeHandle::withdraw_readiness`, with a test through the real HTTP path).
+
 **The admin interface ships.** Until 2026-09-21 it did not: every binary and every published image served a placeholder at `/admin/` saying the interface had not been built in, because nothing embedded `web/dist`. `crates/hs-admin/build.rs` now stages the built interface (or the placeholder, for a Rust-only checkout, and says so at startup); release builds set `HS_ADMIN_WEB_DIST` and *fail* without a built interface; CD refuses to publish an image whose `/admin/` is not the interface. Verified on the published artifact: `ghcr.io/brandon-dacrib/myelin:main`, pulled from the registry on 2026-09-21 and run with the README's exact command, serves the interface at `/admin/`, answers `needs_setup: true`, and logs the setup link. What has still never run is the `v*` binaries job's new Node step, which only a tag exercises.
 
 **Complement, `csapi`: 317 of 384 assertions pass** (78 of 106 top-level), measured 2026-09-26 at
@@ -262,7 +296,7 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 | Management web interface | ~75% | users (with devices, sign-out and password reset), rooms (with members), bridges (the catalogue, the wizard with the bridge's own config, the runbook, sign-in guides), federation destinations, configuration and the audit log are real against the real server; the media and reports pages still read from operations that answer 501; arrays-of-objects are a JSON textarea |
 | **Federation** | **~30%** | 75/250 assertions, 14/88 top-level (run 7); a user here joins a room hosted elsewhere through the client API, messages flow both ways between two real servers, and the room's history from before the join is fetched as the client scrolls back; in-memory outbound queue, no EDUs, no invites/leaves/knocks over federation |
 | Bridges | ~75% | heisenbridge works end to end both directions (`docs/bridges/heisenbridge.md`); mautrix-whatsapp, added through the wizard, connects and starts in appservice-mode encryption (`docs/bridges/mautrix.md`); all 16 bridge operations are real; no mautrix bridge has carried a message yet, because signing in needs a phone |
-| Operations (HA, scale-out) | ~40% | it runs on Kubernetes with a chart and a tested image; the cluster path has never carried real traffic |
+| Operations (HA, scale-out) | ~45% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; readiness withdrawn the moment a shutdown begins; two replicas shared a room on one PostgreSQL in an experiment; the cluster path has never carried real traffic on a cluster and the operator creates nothing yet |
 
 Federation is still the honest answer to "when could I use this". Everything else is far enough
 along that the gaps are specific and listed. As of 2026-09-25 a user here can join a room on
@@ -277,7 +311,46 @@ carried a message through an encrypted room. Each of those has historically foun
 
 ## What to do next, in order
 
-### 1. Keep pulling on the measurement
+### 1. The standout: make the operations story true on a cluster
+
+Decision 0008 puts this first. Each item is something an operator would do, in the order they
+would do it; each ends in a transcript in `docs/status/12-platform-and-kubernetes.md` or
+`docs/status/03-cluster.md`, not a test that is satisfied either way.
+
+- ~~Install with one value, for real, with the published image.~~ **Done 2026-09-26** (see the
+  state of things).
+- **Publish the chart on `main`, not only on a tag.** `helm install myelin oci://ghcr.io/
+  brandon-dacrib/charts/hs` is the sentence the README wants to say and cannot yet: the chart
+  job in `cd.yml` runs on `v*` only. Tagging `v0.0.1` (housekeeping, below) or publishing the
+  chart from `main` too, either closes it.
+- **Cluster mode with real traffic on a real cluster.** `mode=cluster` with CloudNativePG (the
+  verification cluster has `cnpg-system`), media on S3 or a ReadWriteMany claim, a shared
+  signing-key Secret, two replicas: Element signed in through the Service, a bridge registered,
+  a room created and used from both replicas. The two-process experiment on one PostgreSQL
+  (`docs/status/03-cluster.md`) proved the ownership gate; nothing has proved the mesh between
+  two *pods*. Known blockers, in order: `crate::cluster::advertise_host` falls back to the first
+  listener's bind address or `127.0.0.1`, so a pod must be told its own IP (the Downward API
+  `status.podIP` into a config field that does not exist yet); the mesh's mutual TLS is built
+  in `hs-cluster` and not wired from `hs-cli`; `/createRoom` is not shard-gated; the outbound
+  federation sender and the appservice pump are shard-gated in a unit test with scripted
+  ownership only.
+- **A rolling update that drops nothing.** With two replicas under a loadgen client,
+  `kubectl rollout restart` and count failed requests; the target is zero. Readiness is
+  withdrawn first now and the drain hands shards off, but nobody has measured it. A `preStop`
+  sleep for endpoint propagation (Kubernetes 1.30+ has a native `sleep` action, which matters
+  because the image has no shell) may be needed; find out.
+- **The operator creates something.** `reconcile_homeserver` computes a status and creates no
+  `StatefulSet`, `Service` or `ConfigMap`. Phase 1 is exactly what the chart renders, owned by
+  a `Homeserver` resource, with status from `/health/ready` and the shard map. `Bridge` after
+  that: the wizard already renders the resource it would reconcile.
+- **The chart install as a CD gate.** CD boots the image with `docker run` before publishing;
+  the same for `helm install` on a `kind` cluster in the workflow, to Ready, with the setup
+  link read from the log. That is what keeps the one-value story from regressing.
+- **The first-boot startup probe.** The first probe at four seconds is refused (the image's
+  cold boot is about five seconds, opening sixty keyspaces with a synchronous flush each); the
+  startup probe absorbs it, but the boot itself is worth measuring and halving.
+
+### 2. Keep pulling on the measurement
 
 `python3 tools/complement_triage.py <log>` against run 7 (2026-09-21, `318f8f4`, the baseline
 in `docs/status/complement-csapi-results.txt`), largest first. Count by test, not by log line:
@@ -287,9 +360,9 @@ one polling test can print the same line twenty times.
   (`ServerNotices` is 0 of 2 in the admin API too).
 - **`TestSearch` (8)**: `/search` needs a cross-room index the room-actor model has no place for.
 - **`TestDeviceListUpdates` (5)**: every local case passes; the five that remain are the
-  remote-user halves, which need device-list EDUs over federation (item 3).
+  remote-user halves, which need device-list EDUs over federation (item 4).
 - **`TestMessagesOverFederation` (6), `TestPushRuleRoomUpgrade` (6)**: both used to die joining
-  a room over federation with `404 room not found`; the room bootstrap API is in (item 3).
+  a room over federation with `404 room not found`; the room bootstrap API is in (item 4).
   Run 10 (2026-09-26, `82359fb`): 314 of 384, 78 of 106, identical to run 7 by name -- the join
   now succeeds in both tests, and both still fail after it: `TestMessagesOverFederation` on the
   history before the join, which was not backfilled, and `TestPushRuleRoomUpgrade` on the
@@ -404,7 +477,7 @@ an ordinary empty response and asks again. Not looked at: the other requests tha
 purpose, of which `GET /media/.../download?timeout_ms=` for a not-yet-uploaded file is the one
 that comes to mind.
 
-### 2. Make it fun to administer — the half that is left
+### 3. Make it fun to administer — the half that is left
 
 First run is done (see the state of things). The admin interface can now *change* the
 configuration rather than only display it, which was the stated product priority. What it still
@@ -490,7 +563,7 @@ defect found while fixing the first; see the chart's commit). What is left there
   the signing key and binding the listener. Unmeasured; opening ~60 keyspaces with a synchronous
   flush each is the suspect.
 
-### 3. Federation: after the join
+### 4. Federation: after the join
 
 The join is two-way now (see "Two servers, both directions" above; RFC 0015 is implemented).
 What a room joined elsewhere still lacks, in the order a user would notice:
@@ -520,7 +593,7 @@ What a room joined elsewhere still lacks, in the order a user would notice:
   Pointing it at a Synapse (Complement's federation package does, and its numbers are the
   measure) is where the next round of real bugs is.
 
-### 4. The rest of the Complement triage
+### 5. The rest of the Complement triage
 
 Full detail, by owning track, at the top of `docs/status/14-test-and-conformance.md`:
 
@@ -530,11 +603,11 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 - ~~Half-done: error responses that are not JSON.~~ **Done, and it had been for a while**: `hs_http::fallback` answers `404`/`405 M_UNRECOGNIZED` in the Matrix shape, no `/_matrix` route takes a bare `axum::Json` any more (`hs_http::body::PermissiveJson` everywhere), and `TestRequestEncodingFails` has been passing since the run-7 baseline. This bullet was stale (checked 2026-09-26).
 - **Inbound gap-filling asked the wrong endpoint** (found and fixed 2026-09-26; run 7 moved both tests named below to passing). Complement's reference server, and every other implementation, expects a homeserver that receives an event with unknown ancestors to ask `POST /get_missing_events` with its forward extremities as `earliest_events` and the new event as `latest_events`; ours only asked `/backfill`, which the reference server does not serve, so `TestGetMissingEventsGapFilling` could never pass and `TestOutboundFederationEventSizeGetMissingEvents` ran into the same wall. `hs_federation::backfill::resolve_missing_ancestors` asks the gap-shaped request first now and falls back to `/backfill` rounds; `RegistryRoomSource::forward_extremities` reads the actor's real extremity set rather than the newest timeline event. Both moved in run 7, and nothing else did.
 
-### 5. Housekeeping worth doing deliberately
+### 6. Housekeeping worth doing deliberately
 
 - **Rename the crates** from `hs-` to the project's own prefix. Mechanical across twenty-six crates, and best done when nothing else is in flight.
 - **Tag `v0.0.1`** to exercise the untested half of CD: binaries for three targets, the Helm chart as an OCI artifact, and a GitHub release.
-- **`cd.yml` documents an `edge` tag it does not produce** — pushes to `main` tag the image `main`. Fix the tag or the table; they disagree.
+- ~~`cd.yml` documents an `edge` tag it does not produce.~~ **Done 2026-09-26**: the tag is produced as an explicit `main` and the table says so.
 - ~~`web`'s unit tests and lint have never run on this machine.~~ **Done, and it was never the machine.** `vite.config.ts` excluded `e2e/**` but not `e2e-real/**`, so vitest collected a Playwright spec and died at import; and `openapi-fetch` builds a `new URL()` per request, so the app's relative `/api/v1` base threw `ERR_INVALID_URL` under jsdom and no page test could ever have passed. `npm run check` — typecheck, lint, test, build — is green, and the suite runs in about three seconds.
 - **Receipts and presence are in-memory**, so a restart forgets read state and presence. Postgres ignores `pool_size`, refuses `tls`, and hardcodes the `public` schema. `/createRoom` is not shard-gated. UIA on `/keys/device_signing/upload` needs a coordinated change with the loadgen scenario that bootstraps cross-signing without auth data.
 
@@ -564,6 +637,10 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | The shard-gated appservice pump has only been tested with a scripted ownership | `hs-cli` | it moves with the global and appservice shards in the unit test; a real two-replica handoff of bridge delivery on the cluster has not been watched |
 | In-process server cannot be restarted over its data directory | `hs-cli` | background tasks hold the store's lock after `shutdown()`; restart tests need the real binary |
 | The release binaries job's web build has never run | `.github` | it only runs on a `v*` tag; the image path is verified, this one is not |
+| The chart is published only on a `v*` tag | `.github` | `helm install oci://...` is not possible yet; it installs from a checkout |
+| A pod does not know its own mesh address | `hs-cli`, `hs-cluster` | `advertise_host` falls back to the bind address or `127.0.0.1`; cluster mode between two pods has not been tried |
+| The operator creates no workloads | `hs-operator` | `Homeserver` reconciles to a status only; the chart is the only way to deploy |
+| A cold boot in the image takes about five seconds | `hs-cli`, `hs-kv` | the first startup probe is refused every time; harmless, unmeasured |
 | User-directory scope is computed by walking rooms on every search | `hs-user` | fine today; the first thing to index if a public room gets very large |
 | `TestThreadsEndpoint` flapped between runs | `hs-room` | ordering tie on a millisecond timestamp; fixed 2026-09-21, not yet graded -- if any test still moves between identical runs, that is a bug to find, not noise |
 | `TestNetworkPartitionOrdering` moved PASS to FAIL between runs 5 and 6 | `hs-room` | found: an event concurrent with a member's join was hidden from them or not depending on which server's events arrived first; the `shared` rule counts "joined when it arrived" now (2026-09-26), and run 7 has it passing again |

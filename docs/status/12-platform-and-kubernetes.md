@@ -1,5 +1,128 @@
 # 12. Platform and Kubernetes
 
+## One value on Kubernetes, verified against a real cluster (2026-09-26)
+
+Decision 0008 makes operations the product, and the first thing an operator does is install.
+Until this session the chart had never been installed with an image a cluster could pull (the
+2026-09-19 install below stopped at `ErrImageNeverPull`), it *required* a hand-made signing-key
+Secret, it rendered a config file for everything, and its default image tag was `appVersion:
+0.0.1`, which has never been published. The `docker run` quickstart had been one variable since
+2026-09-21; the chart was still four steps and a YAML file.
+
+**Now:** `helm install myelin deploy/helm/hs --set serverName=example.org`, and that is all.
+
+### What changed in the chart
+
+- **The signing key is generated on the data volume** in `singleNode` mode: the StatefulSet runs
+  `serve --data-dir /var/lib/hs/data -c /etc/hs/config/homeserver.yaml`, so `db/`, `keys/` and
+  `media/` sit under the one PersistentVolumeClaim exactly as the image's `docker run` layout
+  does, and `crates/hs-cli/src/identity.rs` writes a key there on the first start and reads it
+  back after. The volume is kept on `helm uninstall` by default, so a reinstall keeps the key.
+  `secrets.signingKey.existingSecret` is still honoured when set, and still *required* in
+  `cluster` mode, where replicas share no volume (`hs.validate` fails the render with the
+  commands to make one).
+- **Helm-owned settings go through the environment, not the ConfigMap.** RFC 0016's layers are
+  file < database < environment, and the file only *seeds* the database on the first start.
+  A server name, public base URL or signing-key path rendered into the ConfigMap would apply
+  once and then be outranked by the database forever, so `helm upgrade --set publicBaseUrl=...`
+  would silently do nothing. They are `HS__SERVER__SERVER_NAME`, `HS__SERVER__PUBLIC_BASEURL`
+  and `HS__SERVER__SIGNING_KEY_PATH` now (the last only with a Secret), the database connection
+  already was, and the admin API reports the section as `"source":"environment"`, which is what
+  the interface reads to show a setting as pinned by the deployment. Listeners, telemetry and
+  the media/storage backends stay in the ConfigMap as the seed, and `values.yaml` says so at
+  the top.
+- **`RUST_LOG` is gone from the pod.** The server's own default directives hold `lsm_tree` and
+  `fjall` to `warn` at `info` (`crates/hs-telemetry/src/init.rs`), and `RUST_LOG` overrides
+  them; the chart set `RUST_LOG=info`, and the first boot's log was 60 "Finished ingestion
+  writer" lines with the setup link underneath. Eight lines now, link included.
+- **Two `HS__AUTH__*_FILE` variables were unconditional** while the Secrets they named were
+  optional, pointing the server at files that did not exist. Conditional now.
+- **`Chart.yaml`'s `appVersion` is `main`**, the tag CD actually publishes; a `v*` tag's
+  `helm package --app-version` replaces it. `home` and `sources` point at this repository
+  (they pointed at ess-helm). The description no longer says nothing has been validated.
+- **`cd.yml`** lints and templates both modes, its trigger table says `main` rather than the
+  `edge` it never produced (and the tag is now an explicit `type=raw,value=main`), and the
+  release notes' install line is one value.
+
+### What changed in the server
+
+`ServeHandle::withdraw_readiness` (`crates/hs-cli/src/serve.rs`), called first thing in
+`shutdown`. `/health/ready` used to answer 200 for the whole of a shutdown, including a cluster
+drain of up to `CLUSTER_DRAIN_DEADLINE` (20 s), so the Service kept routing new requests to a
+replica that was handing its shards away; the 2026-09-19 section below flagged it and left it.
+Liveness is untouched. `readiness_is_withdrawn_before_anything_else_stops` checks it through
+the real HTTP path: 503 on ready, 200 on live and on `/versions`.
+
+### The transcript (run 2 of 2; run 1 differed only in my script's log parsing)
+
+Same Talos cluster as 2026-09-19, throwaway namespace `myelin-verify`, everything
+namespace-scoped, torn down after (`kubectl get ns myelin-verify` → NotFound, no PV left).
+Script at `/private/tmp/.../scratchpad/helm-verify.sh` for the session; the steps are what an
+operator would type.
+
+```
+$ kubectl create ns myelin-verify
+$ helm install myelin deploy/helm/hs -n myelin-verify --set serverName=verify.myelin.local --wait
+  ... Install complete                                     real 1m36s
+$ kubectl -n myelin-verify get pods,pvc
+  pod/myelin-hs-0   1/1  Running    image ghcr.io/brandon-dacrib/myelin:main
+    @sha256:fad0f69a4e5851d65bb71a50375f712b22b428d64e1fbd39ea1a2ffecd2d27c2
+  persistentvolumeclaim/data-myelin-hs-0   Bound  10Gi  RWO  longhorn
+$ kubectl -n myelin-verify logs myelin-hs-0               # 8 lines, in full:
+  INFO first run: copied this configuration into the database ...
+  INFO configuration resolved from file, database and environment  revision=1
+  INFO generated this server's signing key  path=/var/lib/hs/data/keys/hs.signing.key
+  INFO appservice event delivery starts here ...  rooms=0
+  INFO no .well-known documents are published ...
+  INFO listening addr=[::]:8008
+  INFO listening addr=[::]:9090
+  WARN this server has no administrator yet: open the setup link ...
+       setup_link=http://localhost:8008/admin/setup#token=hCKI...NavT
+  (lsm_tree lines: 0; ephemeral-key warning: none)
+$ kubectl -n myelin-verify port-forward svc/myelin-hs 18008:8008
+$ curl :18008/health/live                     200
+$ curl :18008/health/ready                    200 ready
+$ curl :18008/_matrix/client/versions         {"versions":["r0.0.1",...
+$ curl :18008/admin/ | grep -c 'has not been built'   0     # the real interface
+$ curl :18008/_matrix/key/v2/server           verify.myelin.local  ed25519:a_vL0Psc
+$ curl :18008/api/v1/setup                    {"needs_setup":true}
+$ curl -X POST :18008/api/v1/setup -d '{"setup_token":"hCKI...","username":"admin","password":"..."}'
+  {"user_id":"@admin:verify.myelin.local","access_token":"syt_...","device_id":"n9Z0i4xnQB"}
+$ curl :18008/api/v1/setup                    {"needs_setup":false}
+$ POST /_matrix/client/v3/login (password)    200; whoami → @admin:verify.myelin.local
+$ curl :18008/api/v1/config/server -H 'Authorization: Bearer ...'
+  {"name":"server","source":"environment","values":{"server_name":"verify.myelin.local",
+   "signing_key_path":"/var/lib/hs/data/keys", ...}}
+
+$ kubectl -n myelin-verify delete pod myelin-hs-0 && kubectl rollout status statefulset/myelin-hs
+$ curl :18008/_matrix/key/v2/server           verify.myelin.local  ed25519:a_vL0Psc   # same key
+$ kubectl logs myelin-hs-0 | grep -c setup_link   0      # used once, never offered again
+$ curl :18008/health/ready                    200;  admin login 200
+
+$ helm upgrade myelin deploy/helm/hs -n myelin-verify --set serverName=verify.myelin.local \
+    --set publicBaseUrl=https://verify.myelin.local --wait           real 2m10s
+$ curl :18008/.well-known/matrix/client       {"m.homeserver":{"base_url":"https://verify.myelin.local"}}
+$ curl :18008/_matrix/key/v2/server           ed25519:a_vL0Psc   # same key, third boot
+
+$ helm uninstall myelin -n myelin-verify; kubectl -n myelin-verify delete pvc --all; kubectl delete ns myelin-verify
+```
+
+### What the run showed that is not fixed
+
+- **Every pod replacement pulls the image again** (18 s and 40 s in the events above): the
+  chart defaults `pullPolicy` to `Always` for a mutable tag, as ESS does. Right for `main`,
+  and most of a restart's wall-clock. A digest pin (`image.digest`) makes it `IfNotPresent`.
+- **The first startup probe is refused every time.** The container starts and the listener is
+  bound about five seconds later (opening ~60 keyspaces with a synchronous flush each is the
+  suspect, unmeasured). The startup probe absorbs it, so it costs nothing but an `Unhealthy`
+  event on every boot; it is in `docs/next-steps.md` as something to halve.
+- **The setup link says `localhost:8008`**, which the port-forward makes true and an Ingress
+  would not; `publicBaseUrl` fixes it and the NOTES say so. Unchanged from the Docker path.
+- **The `helm upgrade` replaced the pod** rather than rolling, because there is one replica.
+  What a rolling update does with two, under load, is the next item in `docs/next-steps.md`.
+- **Cluster mode was rendered, not installed.** `mode=cluster` with PostgreSQL, S3 media and a
+  key Secret templates cleanly and fails closed without the Secret; nothing here ran it.
+
 ## First run: a config file is now optional (2026-09-20)
 
 `docs/next-steps.md` item 2, second half. The measurement it set out from: against the published

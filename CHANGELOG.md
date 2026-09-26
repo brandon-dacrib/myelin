@@ -16,6 +16,21 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
 
 ### Installing and administering it
 
+- **Installing on Kubernetes is one value.** `helm install myelin deploy/helm/hs --set
+  serverName=example.org` is a running server: one replica, a volume holding the database, the
+  signing key and media, probes, a Service, and the same one-time setup link in the pod's log.
+  Verified 2026-09-26 on a real cluster with the published image: install to Ready, the real
+  interface at `/admin/`, the first administrator made through the link, the pod deleted and
+  the signing key unchanged, a `helm upgrade` that replaced the pod and the key unchanged again.
+  Before this the chart demanded a hand-made signing-key Secret and a rendered config file and
+  defaulted to an image tag that did not exist. Helm-managed settings now reach the server as
+  environment variables, which outrank the database, so they hold on every upgrade and the
+  interface shows them as pinned. The chart is published as an OCI artifact by the first `v*`
+  tag, which has not happened; until then it installs from a checkout.
+- **A replica that is shutting down says so before it drains.** `/health/ready` answered 200
+  for the whole of a shutdown, including a cluster drain of up to twenty seconds, so a Service
+  kept routing new requests to a pod that was handing its rooms away. Readiness is withdrawn
+  first now; liveness and ordinary requests are untouched. Tested through the real HTTP path.
 - **Installation is one command, and the first administrator is one link.**
   `docker run -p 8008:8008 -v myelin:/data -e HS__SERVER__SERVER_NAME=example.org <image>` is a
   working server with no configuration file. While it has no administrator it logs a one-time
