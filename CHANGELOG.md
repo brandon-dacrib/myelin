@@ -18,6 +18,14 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Installing and administering it
 
+- **The chart install is a CD gate.** CD installs the Helm chart on a kind cluster with the
+  freshly built amd64 image, waits for Ready, reads the setup link from the pod log, checks
+  `/health/ready` and the management interface through a port-forward, and creates the first
+  administrator through the link, before any image tag or chart is published. The check is
+  `deploy/helm/hs/ci/install-smoke.sh`, runnable by hand against any cluster; the packaged chart
+  no longer includes `ci/`. Verified 2026-09-26 on a local kind cluster with the image built
+  from the tree (17 s to Ready), with the published `main` image, and with a deliberately wrong
+  image to see the failure path; the workflow step itself has not yet run on GitHub's runners.
 - **The Helm chart is on the registry.** `helm install myelin oci://ghcr.io/brandon-dacrib/charts/hs
   --devel --set serverName=example.org` is a running server. Every push to `main` publishes the
   chart as a pre-release, `0.1.0-main.<run>.g<commit>`, whose default image is the one built

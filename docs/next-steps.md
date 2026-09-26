@@ -221,6 +221,21 @@ setup link in the log. Upgrading the demo to it found that no upgrade between tw
 charts could ever have succeeded (immutable labels on the volume claim template), fixed the
 same day; `docs/status/12-platform-and-kubernetes.md` has the transcript.
 
+**And gated** (2026-09-26, evening). Nothing installed the chart in CD until now: the docker
+smoke proved the image booted, the `chart` job proved the published chart rendered an image that
+existed, and whether `helm install` still produced a server was known from hand-run transcripts.
+Now the amd64 leg of the `image` job, after its docker smoke and before any tag exists, creates a
+kind cluster, loads the image it just built, installs `deploy/helm/hs` with `serverName` and
+nothing else, waits for Ready, reads the setup link out of the pod log, checks `/health/ready`
+and `/admin/` through a port-forward, and creates the first administrator through that link; if
+any of it fails, `manifest` never runs and nothing is tagged or published. The check is
+`deploy/helm/hs/ci/install-smoke.sh`, which runs by hand against any cluster and prints a
+transcript (and is left out of the packaged chart). On a local kind cluster the install is 17
+seconds from `helm install` to Ready; the first startup probe was refused in one boot of three;
+the boot from first log line to `listening` was 4 to 7 s for today's build against 3.3 s for the
+2026-09-21 image, which the storage track is now measuring. What has not run is the workflow on
+GitHub's runners; the push that carries it is the test.
+
 **The admin interface ships.** Until 2026-09-21 it did not: every binary and every published image served a placeholder at `/admin/` saying the interface had not been built in, because nothing embedded `web/dist`. `crates/hs-admin/build.rs` now stages the built interface (or the placeholder, for a Rust-only checkout, and says so at startup); release builds set `HS_ADMIN_WEB_DIST` and *fail* without a built interface; CD refuses to publish an image whose `/admin/` is not the interface. Verified on the published artifact: `ghcr.io/brandon-dacrib/myelin:main`, pulled from the registry on 2026-09-21 and run with the README's exact command, serves the interface at `/admin/`, answers `needs_setup: true`, and logs the setup link. What has still never run is the `v*` binaries job's new Node step, which only a tag exercises.
 
 **Complement, `csapi`: 317 of 384 assertions pass** (78 of 106 top-level), measured 2026-09-26 at
@@ -419,9 +434,9 @@ would do it; each ends in a transcript in `docs/status/12-platform-and-kubernete
   `StatefulSet`, `Service` or `ConfigMap`. Phase 1 is exactly what the chart renders, owned by
   a `Homeserver` resource, with status from `/health/ready` and the shard map. `Bridge` after
   that: the wizard already renders the resource it would reconcile.
-- **The chart install as a CD gate.** CD boots the image with `docker run` before publishing;
-  the same for `helm install` on a `kind` cluster in the workflow, to Ready, with the setup
-  link read from the log. That is what keeps the one-value story from regressing.
+- ~~The chart install as a CD gate.~~ **Done 2026-09-26** (see "And gated"): `helm install` on
+  a kind cluster in the amd64 image leg, to Ready, the setup link read from the log and used,
+  before anything is tagged. First run on GitHub's runners pending the push.
 - **The first-boot startup probe.** The first probe at four seconds is refused (the image's
   cold boot is about five seconds, opening sixty keyspaces with a synchronous flush each); the
   startup probe absorbs it, but the boot itself is worth measuring and halving.

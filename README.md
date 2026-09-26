@@ -82,7 +82,9 @@ once. `docs/recovery.md` has the details, and the same command works in a pod
 (`kubectl exec <pod> -- hs recover`) and on a host (`hs recover --data-dir ./data`).
 
 CD boots the image with exactly this command before it will publish it, and refuses to publish
-one that does not answer `/health/live`, serve the admin interface and log a setup link.
+one that does not answer `/health/live`, serve the admin interface and log a setup link. It then
+installs the Helm chart on a kind cluster with that same image, waits for Ready, and creates the
+first administrator through the setup link, before the image is tagged or the chart published.
 
 Without Docker, `hs serve --data-dir ./data --server-name example.org` is the same thing.
 
