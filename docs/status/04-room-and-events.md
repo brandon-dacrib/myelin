@@ -208,9 +208,9 @@ hs-state --lib`: 71 (was 70). All four commands were run clean at the end of the
   `registry.bootstrap_from_remote_join(&room_id, room_version, state, auth_chain, join_event).await`
   on the `Arc<RoomRegistry<B>>` `hs serve` already holds. That is the whole integration.
   `crates/hs-cli/src/federation.rs::run_join_room` (the `hs federation-join-room` command) opens
-  no storage today by design and prints the RFC's "cannot yet represent this room locally"
-  message; the client-server `/join` route for a room ID this server does not host (with `via`
-  / `server_name` hints) is where this belongs in `hs serve`. The RFC's suggested
+  no storage by design and stays a diagnostic of the handshake alone (it says so now); the
+  client-server `/join` route for a room ID this server does not host (with `via` /
+  `server_name` hints) is where this lives in `hs serve` -- see the integration note at the top. The RFC's suggested
   `RoomWriteSink` extension is track 06's call; this crate's handle method is what it would call.
 - **06 (federation)** -- backfill. Nothing before the join is in the timeline; `/messages`
   backward from the join stops at the join. `Tables::extremities_bwd` and negative `room_pos`

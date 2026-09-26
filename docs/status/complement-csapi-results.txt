@@ -1,7 +1,7 @@
 # Complement tests/csapi, top-level results. One line per test so that two runs can be compared
 # by name: a change is worth something when it moves a *named* test and that survives a re-run.
 # Written and read by tools/complement_triage.py (--write-baseline, --diff).
-# Run of 2026-09-21 at commit 318f8f4: 314 of 384 assertions, 78 of 106 top-level (0 skipped).
+# Run 10, 2026-09-26, 82359fb: 314 of 384 assertions, 78 of 106 top-level (0 skipped).
 PASS TestAddAccountData
 PASS TestArchivedRoomsHistory
 PASS TestAsyncUpload

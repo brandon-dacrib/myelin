@@ -34,9 +34,9 @@ Megolm establishes, the recipient decrypts. `cargo test -p hs-loadgen --test rea
 | | |
 |---|---|
 | Complement `csapi` | 314 / 384 assertions (78 / 106 tests) |
-| Complement federation | 59 / 246 assertions (6 / 88 tests), the whole package for the first time |
+| Complement federation | 73 / 250 assertions (12 / 88 tests), measured 2026-09-26; 59 / 246 (6 / 88) five days earlier |
 | Spec routes served | 138 / 235 (58.7%) — client-server 108/166, server-server 30/36 |
-| Rust | 26 crates, ~126k lines, 1,686 tests |
+| Rust | 26 crates, ~154k lines, 1,678 tests |
 
 **It runs for real.** PostgreSQL or an embedded store, a distroless non-root image on amd64 and
 arm64, a Helm chart, and a Kubernetes operator. Two replicas share a room without forking its
@@ -90,7 +90,7 @@ broken up, because the parts are nowhere near each other. This table is kept cur
 | Management web interface | ~75% | users, rooms, bridges (catalogue, wizard, runbook, sign-in guides), federation, configuration and the audit log are real against the real server |
 | Bridges | ~75% | heisenbridge works end to end; mautrix-whatsapp, added through the wizard, connects and starts encrypted; no mautrix bridge has carried a message yet |
 | Operations (HA, scale-out) | ~40% | runs on Kubernetes with a chart and a tested image; the cluster path has not carried real traffic |
-| **Federation** | **~15%** | 59/246 assertions; a two-server join works one way only |
+| **Federation** | **~25%** | 73/250 assertions, 12/88 tests; a user joins a room hosted elsewhere through the client API and messages flow both ways between two instances of this server; no pre-join history, no EDUs, in-memory outbound queue, not yet tried against Synapse |
 
 Federation is the honest answer to "when could I use this": a user here cannot really talk to
 the rest of Matrix yet.

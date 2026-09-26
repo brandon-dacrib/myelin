@@ -1,6 +1,6 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-09-21. `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`.
+Written 2026-09-20 by the integration lead, last revised 2026-09-25. `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
@@ -85,6 +85,30 @@ lines itself. Found and fixed on the way: a ping that succeeded left the previou
 Not yet done: signing in (a phone), so no message has crossed a mautrix bridge, and the
 encryption path is set up on both sides but has not carried traffic.
 
+**Two servers, both directions** (2026-09-25). Until this session a user on this server could
+not join a room hosted anywhere else, and nothing this server's users said in any room ever left
+the process. Three pieces, built together: `POST /join/{roomIdOrAlias}?server_name=` (and
+`/rooms/{roomId}/join`) fall through to federation when the registry does not hold the room --
+`hs_room::remote_join::RemoteJoin`, implemented in `hs-cli` over the real `make_join`/`send_join`
+handshake, asking each `via` in turn, with a remote alias resolved through its server's
+directory; the verified snapshot becomes a resident room (RFC 0015, `hs_room::registry::
+RoomRegistry::bootstrap_from_remote_join`: the state and auth chain persisted as outliers, the
+join as the room's first timeline event with its state set explicitly to the snapshot, durable
+across eviction and reload, the room's own `m.room.create` authored elsewhere); and
+`hs_federation::sender::FederationSender` sends every locally created event to the servers of the
+room's members over `PUT /send/{txnId}`, one worker per destination, fifty PDUs a transaction,
+in order, retried with backoff (and a resident forwards a join it accepts to the room's other
+servers). `crates/hs-cli/tests/federation_two_servers.rs` runs two in-process servers over plain
+HTTP: bob on B joins alice's room on A through the client API, his `/sync` on B carries the
+room's state and his join, his message reaches alice's `/sync` on A, and her reply reaches his.
+The TLS script (`crates/hs-federation/scripts/two-server-federation.sh`) does the same between two
+real binaries with stunnel and a private CA: it passed on 2026-09-25, join through `/join`, state on B, a message each way. The joining side also sends `?ver=` with
+every supported room version now, which Synapse requires of a joiner, and carries the user's
+profile on the join. What is not there: the room's history from before the join is not
+backfilled (bob's timeline starts at his join; `/messages` backwards stops there), the outbound
+queue is in memory (a restart loses it), no EDUs (typing, receipts, presence) cross servers, and
+invites, leaves and knocks over federation are still seams.
+
 **Configuration lives in the database** (RFC 0016). The file is a bootstrap and a seed; the database outranks it, `HS__` variables outrank the database, and the admin API refuses a write the environment would shadow rather than storing one that gets ignored. The web interface has a Configuration section that builds its forms from the server's own JSON Schema, and `hs config show|get|set|unset|import|export|history` is the same thing without a browser.
 
 **A first run is one command, and the first administrator is one link.** `hs serve --data-dir ./data --server-name example.org` in an empty directory produces a working server — database, signing key, media path, all underneath that directory — and so does `docker run -p 8008:8008 -v myelin:/data -e HS__SERVER__SERVER_NAME=example.org <image>`, which CD now boots verbatim before it will publish. It was 158 lines of generated YAML with four mandatory hand-edits.
@@ -93,8 +117,10 @@ While the server has no administrator it logs a one-time setup link at every sta
 
 **The admin interface ships.** Until 2026-09-21 it did not: every binary and every published image served a placeholder at `/admin/` saying the interface had not been built in, because nothing embedded `web/dist`. `crates/hs-admin/build.rs` now stages the built interface (or the placeholder, for a Rust-only checkout, and says so at startup); release builds set `HS_ADMIN_WEB_DIST` and *fail* without a built interface; CD refuses to publish an image whose `/admin/` is not the interface. Verified on the published artifact: `ghcr.io/brandon-dacrib/myelin:main`, pulled from the registry on 2026-09-21 and run with the README's exact command, serves the interface at `/admin/`, answers `needs_setup: true`, and logs the setup link. What has still never run is the `v*` binaries job's new Node step, which only a tag exercises.
 
-**Complement, `csapi`: 314 of 384 assertions pass** (78 of 106 top-level), measured 2026-09-21 at
-`318f8f4` (run 7). The same morning it was 241 of 370 (61 of 104); before that 191/296, 148/293
+**Complement, `csapi`: 314 of 384 assertions pass** (78 of 106 top-level), measured 2026-09-26 at
+`82359fb` (run 10), identical by name to run 7 (2026-09-21, `318f8f4`) after a day of federation
+work -- and after run 9, from the commit before the `/messages` fix, hung for thirty minutes on
+`TestMessagesOverFederation` and ran 64 tests. The same morning it was 241 of 370 (61 of 104); before that 191/296, 148/293
 and 125/293. The denominator grew because the harness image now configures Complement's shared
 secret, which un-skipped two tests: `TestCanRegisterAdmin` passes, and `TestServerNotices` runs
 for the first time and fails, since server notices do not exist here.
@@ -143,7 +169,7 @@ read*). What is left of the same family, known and not yet done: a very large ("
 joined after the token is still resumed from the join rather than sent whole, and a requester
 with no device -- some appservice callers -- never records a feed cursor at all.
 
-**Complement, federation package: 59 of 246 assertions** (6 of 88 top-level), measured 2026-09-21 — and for the first time that is the *whole* package. The suite used to segfault Complement's own Go binary 21 tests in and silently discard everything after, so every federation number before this one was "however far it got before dying". There are no panics in the log now and `-skip` is retired.
+**Complement, federation package: 73 of 250 assertions** (12 of 88 top-level), measured 2026-09-26 at `82359fb` (run 5); 59 of 246 (6 of 88) on 2026-09-21, and for the first time then it was the *whole* package. The suite used to segfault Complement's own Go binary 21 tests in and silently discard everything after, so every federation number before that was "however far it got before dying". There are no panics in the log now and `-skip` is retired. This package has a named baseline now too: `python3 tools/complement_triage.py <log> --suite=federation` reads it against `docs/status/complement-federation-results.txt`. Runs 3, 4 and 5 are one session: 61/246 and 7/88 at `867caa4`, then 72/250 and 11/88 at `13195aa` with `TestJoinViaRoomIDAndServerName`, `TestJoinFederatedRoomFailOver`, `TestJoinFederatedRoomWithUnverifiableEvents` and `TestUnrejectRejectedEvents` moved to passing, then `TestNetworkPartitionOrdering` at `82359fb`; nothing regressed in any of them.
 
 **Spec coverage: 138 of 235 routes (58.7%)** — client-server 108/166, server-server 30/36. Generated from the manifest the binary emits, so it cannot overclaim. Registered still is not the same as working.
 
@@ -155,12 +181,12 @@ Reproduce the conformance numbers:
 ./tests/complement/build.sh complement-hs-reimplement:dev
 cd refs/complement
 COMPLEMENT_BASE_IMAGE=complement-hs-reimplement:dev go test -v -timeout 30m ./tests/csapi/...
-COMPLEMENT_BASE_IMAGE=complement-hs-reimplement:dev go test -v -timeout 30m -skip 'TestInboundCanReturnMissingEvents' ./tests
+COMPLEMENT_BASE_IMAGE=complement-hs-reimplement:dev go test -v -timeout 30m ./tests
 ```
 
 A cold image build is ~4 minutes idle, up to 19 under load; each suite run is ~13-15 minutes.
 
-Both numbers above are from these commands, run on 2026-09-21 against this code.
+Both numbers above are from these commands, run on 2026-09-25 against this code.
 
 The re-measurement paid for itself immediately: `TestRoomCreate` still failed after `/createRoom`
 was fixed, and chasing why found that `invite_state` omitted the invitee's own `m.room.member`
@@ -190,14 +216,16 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 | Configuration and first run | ~90% | database-backed, editable in the UI, one command from nothing to a working server |
 | Admin API | ~40% | 58 of 145 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Config 6/6, Server 5/5, AuditLog 3/3, Setup 2/2, Bridges 16/16, Users 14/41, Rooms 6/23, Federation 3/7, Statistics 1/4, Cluster 1/6, and Media 0/9, RegistrationTokens 0/5 |
 | Management web interface | ~75% | users (with devices, sign-out and password reset), rooms (with members), bridges (the catalogue, the wizard with the bridge's own config, the runbook, sign-in guides), federation destinations, configuration and the audit log are real against the real server; the media and reports pages still read from operations that answer 501; arrays-of-objects are a JSON textarea |
-| **Federation** | **~15%** | 59/246 assertions, 6/88 top-level; a two-server join works one way only |
+| **Federation** | **~25%** | 73/250 assertions, 12/88 top-level (run 5); a user here joins a room hosted elsewhere through the client API and messages flow both ways between two real servers; no backfill of pre-join history, in-memory outbound queue, no EDUs, no invites/leaves/knocks over federation |
 | Bridges | ~75% | heisenbridge works end to end both directions (`docs/bridges/heisenbridge.md`); mautrix-whatsapp, added through the wizard, connects and starts in appservice-mode encryption (`docs/bridges/mautrix.md`); all 16 bridge operations are real; no mautrix bridge has carried a message yet, because signing in needs a phone |
 | Operations (HA, scale-out) | ~40% | it runs on Kubernetes with a chart and a tested image; the cluster path has never carried real traffic |
 
-Federation is the honest answer to "when could I use this". Everything else is far enough along
-that the gaps are specific and listed; federation is the one where "6 of 88" means a user on this
-server cannot really talk to the rest of Matrix yet. That, not the client-server percentage, is
-what stands between this and a server somebody else would run.
+Federation is still the honest answer to "when could I use this". Everything else is far enough
+along that the gaps are specific and listed. As of 2026-09-25 a user here can join a room on
+another server and talk in it, and the other side hears them -- between two instances of this
+server. What has not been tried is another implementation: a Synapse on the other end will
+exercise every ambiguity this server and its twin happen to agree on. That, not the client-server
+percentage, is what stands between this and a server somebody else would run.
 
 What is *not* in those percentages, and should temper them: no security review, no load testing
 beyond a loadgen harness, `cargo fuzz` never run, Sytest never run, and no bridge has yet
@@ -215,9 +243,12 @@ one polling test can print the same line twenty times.
   (`ServerNotices` is 0 of 2 in the admin API too).
 - **`TestSearch` (8)**: `/search` needs a cross-room index the room-actor model has no place for.
 - **`TestDeviceListUpdates` (5)**: every local case passes; the five that remain are the
-  remote-user halves, which need federation (item 3).
-- **`TestMessagesOverFederation` (6), `TestPushRuleRoomUpgrade` (6)**: both die joining a room
-  over federation with `404 room not found` -- item 3, the room bootstrap API.
+  remote-user halves, which need device-list EDUs over federation (item 3).
+- **`TestMessagesOverFederation` (6), `TestPushRuleRoomUpgrade` (6)**: both used to die joining
+  a room over federation with `404 room not found`; the room bootstrap API is in (item 3).
+  Run 10 (2026-09-26, `82359fb`): 314 of 384, 78 of 106, identical to run 7 by name -- the join
+  now succeeds in both tests, and both still fail after it: `TestMessagesOverFederation` on the
+  history before the join, which is not backfilled, and `TestPushRuleRoomUpgrade` on the upgrade.
 - **`TestSync` (4)**: "Newly joined room has correct timeline in incremental sync" and the
   lazy-loading `device_lists.left` case; read the reasons.
 - **`TestChangePasswordPushers` (2)**: a password change should delete pushers made by other
@@ -225,6 +256,22 @@ one polling test can print the same line twenty times.
   `hs-auth` into `hs-push`.
 - **`min_depth` on `/get_missing_events`**, still parsed nowhere, and history visibility still not
   applied per event there.
+
+#### What the first Complement runs with two-way joins found (2026-09-25/26)
+
+The join that worked between two instances of this server did not, at first, work against
+anything else. Run 3 of the federation package (`867caa4`) moved two assertions; reading it by
+name found three things, none of which a test with this server on both ends could have: the
+reference federation server's `make_join` template has no `origin_server_ts` (the joiner stamps
+its own now, as Synapse does); the harness's certificate had no subject alternative name, which
+rustls refuses and which the client's error did not say (the certificate has one, the error
+prints its cause); and one unverifiable event in a `send_join` response failed the whole join
+(dropped now, per spec). Run 4 (`13195aa`): 72 of 250, 11 of 88, four tests moved by name. Then
+the csapi suite hung for its full thirty minutes inside `TestMessagesOverFederation`: with the
+join working, the test paginated `/messages` backwards until no `end` came back, and this server
+answered the page past the room's first event with `"end": null` rather than no `end` at all.
+Fixed in `82359fb`; the numbers above are from the run after it. Full detail at the top of
+`docs/status/14-test-and-conformance.md`.
 
 #### Run 6, and what opening Element found
 
@@ -316,7 +363,8 @@ cannot do, in rough order of how often an operator will hit it:
   attempt, and a reset clears the backoff so the next request is tried at once. The overview
   counts failing destinations (zero, not absent, when nothing is failing; with federation off
   the list is honestly empty rather than a 503). Pending PDU/EDU counts are zero because there
-  is no outbound queue yet, which is true rather than a placeholder.
+  was no outbound queue; since 2026-09-25 the PDU count reads the sender's queues, and the EDU
+  count is zero because no EDUs are sent.
 - ~~Open and export the Audit log from the interface.~~ **Done 2026-09-23.**
   `/audit` now lists the server's durable entries with URL-backed actor, action, resource,
   outcome and UTC date filters, cursor pagination, and an entry detail page showing the actor,
@@ -382,16 +430,30 @@ defect found while fixing the first; see the chart's commit). What is left there
   the signing key and binding the listener. Unmeasured; opening ~60 keyspaces with a synchronous
   flush each is the suspect.
 
-### 3. Federation: finish the join
+### 3. Federation: after the join
 
+The join is two-way now (see "Two servers, both directions" above; RFC 0015 is implemented).
+What a room joined elsewhere still lacks, in the order a user would notice:
+
+- **History before the join.** `/messages` backwards stops at the join event; nothing calls
+  `/backfill` on a client's behalf. `hs_federation::backfill` fetches missing *ancestors* of an
+  incoming event, which is the same fetch with a different trigger; `Tables::extremities_bwd`
+  and negative `room_pos` are the intended shape on the room side.
+- **Ephemeral data over federation.** No EDUs are sent or acted on: typing, receipts, presence
+  and device-list updates stay on their own server. `TestDeviceListUpdates`' remote halves are
+  this.
+- **Invites, leaves and knocks over federation** are still seams (`make_leave`/`send_leave`,
+  `make_knock`/`send_knock`, `/invite`): a user cannot leave a room hosted elsewhere in a way the
+  resident hears about, or be invited into one.
+- **The outbound queue is in memory.** An event sent while the other server is down is retried
+  for as long as this process lives; a restart loses it. `PLAN.md` section 5.2 wants persisted
+  per-destination queues sharded across replicas; the sender is not shard-gated on the cluster
+  either, so two replicas would both send.
 - **Restricted and knock-restricted joins fail across the board** — ten top-level tests, all
   `M_FORBIDDEN: invalid join_authorised_via_users_server`. Tracks 06 and 04.
-- **Two-way federation needs a room bootstrap API.** Two instances of this server complete a real
-  join handshake over TLS with a private CA, verified end to end — but only one way, because
-  `hs-room` can create a new room or extend one it already has, and has no way to build a room
-  from a join's verified state snapshot. Specified in
-  `docs/rfcs/0015-outbound-join-needs-a-room-bootstrap-api.md`; the script that demonstrates the
-  gap is `crates/hs-federation/scripts/two-server-federation.sh`.
+- **Another implementation.** Everything above was proven between two instances of this server.
+  Pointing it at a Synapse (Complement's federation package does, and its numbers are the
+  measure) is where the next round of real bugs is.
 
 ### 4. The rest of the Complement triage
 
@@ -417,7 +479,10 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | `min_depth` ignored on `/get_missing_events` | `hs-cli` | a conformance gap, no longer a crash |
 | history visibility not applied per event on `/get_missing_events` | `hs-cli` | pre-join events served unredacted |
 | Restricted joins rejected | `hs-federation`, `hs-room` | ten conformance tests, a common room type |
-| No room bootstrap from a join | `hs-room` | federation completes one way only |
+| A room joined elsewhere has no history before the join | `hs-room`, `hs-federation` | `/messages` stops at the join; nothing backfills on a client's behalf |
+| The outbound federation queue is in memory | `hs-federation` | a restart loses unsent events; two replicas would both send |
+| No EDUs over federation | `hs-federation` | typing, receipts, presence and device-list changes stay local |
+| Invites, leaves and knocks over federation are seams | `hs-federation` | a user cannot leave a remote room audibly, or be invited into one |
 | Federation media fetch broken | `hs-media` | remote avatars and attachments fail |
 | `/search` unimplemented | `hs-room` | needs a cross-room index the actor model has no place for |
 | Admin UI cannot edit arrays of objects | `web` | listeners and OIDC providers are a JSON textarea |

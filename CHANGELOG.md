@@ -184,13 +184,14 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
 
 ### Conformance
 
-- **Complement `csapi`: 314 of 384 assertions**, 78 of 106 top-level tests, measured 2026-09-21;
+- **Complement `csapi`: 314 of 384 assertions**, 78 of 106 top-level tests, measured 2026-09-21
+  and again, identical by name, on 2026-09-26;
   241 of 370 that morning, 191 of 296 the run before that. The first run this project ever took was 125; the suite had never
   been run before that.
-- **Complement federation package: 59 of 246 assertions**, 6 of 88 top-level, and for the first
-  time the whole package rather than however far it got before crashing. Measured with
-  certificate verification *on*, trusting Complement's CA the way a deployment trusts a private
-  one, after the harness stopped disabling verification.
+- **Complement federation package: 73 of 250 assertions**, 12 of 88 top-level, measured 2026-09-26; 59 of 246 (6 of 88) on
+  2026-09-21, which was the first time the whole package ran rather than however far it got
+  before crashing. Measured with certificate verification *on*, trusting Complement's CA the way
+  a deployment trusts a private one, after the harness stopped disabling verification.
 - **Spec coverage: 138 of 235 routes (58.7%)** — client-server 108/166, server-server 30/36.
   Generated from the route manifest the binary itself emits, so it cannot overclaim.
 
@@ -207,9 +208,23 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
   under v1 with a literal `/v2/` path segment.
 - Private certificate authorities can be trusted (`federation.custom_ca_certificates`); running
   without certificate verification remains possible and now warns loudly at startup.
-- Two instances of this server complete a real join handshake over TLS —
-  `crates/hs-federation/scripts/two-server-federation.sh`. One direction only; the other needs a
-  room-bootstrap API (`docs/rfcs/0015`).
+- **A user joins a room hosted on another server, and messages flow both ways** (2026-09-25).
+  `POST /join/{roomIdOrAlias}?server_name=` on a room this server does not hold runs the real
+  `make_join`/`send_join` handshake against each named server in turn (a remote alias is
+  resolved through its server's directory first), verifies every event that comes back, and
+  makes the room resident from that snapshot (`docs/rfcs/0015`): the joining user's next `/sync`
+  carries the room's state and their join, `/state` and `/members` read it, and it survives
+  eviction and reload. Every event a local user sends in a room with remote members is then
+  sent to those servers over `PUT /send/{txnId}` -- one worker per destination, fifty PDUs a
+  transaction, in order, retried with backoff -- and a resident forwards a join it accepts to
+  the room's other servers. Verified by two in-process servers over plain HTTP
+  (`crates/hs-cli/tests/federation_two_servers.rs`) and by two real binaries over TLS with a
+  private CA (`crates/hs-federation/scripts/two-server-federation.sh`): it passed on 2026-09-25, join through `/join`, state on B, a message each way. Between two
+  instances of this server; a Synapse on the other end has not been tried. Not yet: history
+  from before the join (the timeline starts at the join), EDUs, invites, leaves and knocks over
+  federation; the outbound queue is in memory.
+- The joining side sends `?ver=` with every supported room version, which Synapse requires
+  before it will hand out a join template, and carries the user's profile on the join.
 - **Event signing was wrong from the beginning and is fixed.** The spec signs the *redacted* form
   of an event; this server signed the full one, so every event it ever originated would have been
   rejected by a compliant homeserver. Nothing caught it because the signer and the verifier shared
@@ -222,6 +237,11 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
 - **History visibility is enforced on every read path.** A user who has left a non-world-readable
   room can no longer read it — found by Complement, and the most serious privacy bug this project
   has had.
+- **`/messages` says when it has reached the start of the room** (2026-09-26): the spec's signal
+  is no `end` property at all, and this server sent one more token and then `"end": null`, which
+  a client that paginates "until no `end` is returned" reads as a token and starts over. Found
+  when Complement's `TestMessagesOverFederation`, joining over federation for the first time,
+  did exactly that for thirty minutes.
 - Sync: `/sync` v2 with filters that honour event-type and sender rules, lazy-loaded members, room
   summaries with heroes, typing, presence, read receipts and `m.fully_read`, to-device messages,
   device lists, one-time-key counts, and push rules as account data.
@@ -278,7 +298,7 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
 
 ### Numbers
 
-26 crates, ~126,000 lines of Rust, 1,562 passing tests, plus a TypeScript management interface
+26 crates, ~154,000 lines of Rust (`wc -l` over `crates/**/*.rs`, tests included), 1,678 passing tests, plus a TypeScript management interface
 with its own unit and end-to-end suites.
 
 ## Notes on how this was built

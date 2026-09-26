@@ -1,5 +1,73 @@
 # 14 Test and conformance (integration lead): status
 
+## Re-measurement (2026-09-25/26, session 4): two-way federation, and what the suite found underneath it
+
+The day's code: `POST /join` reaching a room hosted elsewhere through the real handshake, the
+room built from the verified snapshot (RFC 0015), and an outbound sender -- proven between two
+instances of this server before any of this was run (`crates/hs-cli/tests/federation_two_servers.rs`
+and the TLS script). Then Complement, which is the only thing here that puts a *different*
+implementation on the other end of the wire.
+
+**Federation package, three runs, all from the same session** (`go test ./tests`, no `-skip`; the
+package has a named baseline now, `docs/status/complement-federation-results.txt`, read with
+`python3 tools/complement_triage.py <log> --suite=federation --diff`):
+
+| Run | Commit | Assertions | Top-level | Moved by name |
+|---|---|---|---|---|
+| 2 (2026-09-21) | `318f8f4` | 59 / 246 | 6 / 88 | -- |
+| 3 (2026-09-25) | `867caa4` | 61 / 246 | 7 / 88 | `TestUnrejectRejectedEvents`-adjacent gains only; every join through Complement's own server or between hs1 and hs2 still failed, see below |
+| 4 (2026-09-26) | `13195aa` | 72 / 250 | 11 / 88 | `TestJoinViaRoomIDAndServerName`, `TestJoinFederatedRoomFailOver`, `TestJoinFederatedRoomWithUnverifiableEvents`, `TestUnrejectRejectedEvents` FAIL -> PASS; nothing regressed |
+| 5 (2026-09-26) | `82359fb` | 73 / 250 | 12 / 88 | `TestNetworkPartitionOrdering` FAIL -> PASS; nothing regressed. The baseline. |
+
+Run 3 was the interesting one: the join that worked between two of this server did not work
+against anything else, for three reasons none of this server's own tests could have found.
+
+1. **Complement's reference federation server hands out a `make_join` template with neither
+   `origin_server_ts` nor `origin`.** The joiner signed it as it was, and the signed event did not
+   parse: thirteen joins in the run died on "event is missing required field `origin_server_ts`".
+   Synapse's joiner stamps its own clock and its own name on the template; ours does now
+   (`hs_federation::outbound_join::sign_join_template`).
+2. **Every request between hs1 and hs2 failed at the TLS handshake**, reported as "error sending
+   request for url" with the reason nowhere. The harness's federation certificate, made with the
+   recipe from Complement's own README, carries a CN and no subject alternative name, and rustls
+   -- this server's outbound client -- rejects such a certificate outright. Synapse's client
+   evidently does not. The harness's certificate carries a SAN now (`tests/complement/startup.sh`),
+   and `hs_federation::client::ClientError::Request` prints the error's source chain, so the next
+   one of these says what it is.
+3. **One unverifiable event in a `send_join` response failed the whole join.** The spec's rule
+   (and `TestJoinFederatedRoomWithUnverifiableEvents`, which strips or corrupts the signature on
+   one state event, or signs it with a key nobody can fetch) is to drop that event and carry on;
+   it is dropped now, with its reason logged, and only a snapshot in which nothing verifies is an
+   error.
+
+Run 4, with the three fixed, moved the four tests above. What the remaining failures are, by
+family, from `complement_triage.py`: `TestFederationRoomsInvite` (11) and everything else that
+needs an invite to arrive over federation -- `/invite` is still a seam; the leave/knock
+"CannotSend..." families (28 assertions across four tests) -- `make_leave`/`send_leave` and
+`make_knock`/`send_knock` are seams; `TestJumpToDateEndpoint` (14) -- `/timestamp_to_event` over
+federation; the restricted-join families -- `join_authorised_via_users_server`; device lists,
+to-device, typing and presence over federation -- no EDUs are sent; `/hierarchy` and
+`/room_summary` -- unregistered; media over federation; and the MSC4289/4291/4297/4311 room
+version 12 families. Read the baseline file for the full list; every one is named there.
+
+**csapi hung.** Run 9 of the client-server package (from `13195aa`, the first with the two-way join)
+ran 64 of 106 top-level tests and then sat inside `TestMessagesOverFederation` until Go's
+thirty-minute limit killed it, with a 1.6 GB log. The test joins a room on hs1 from hs2 -- which
+now succeeds -- and then paginates `/messages` backwards "until no `end` property is returned",
+as the spec says a client should. This server's `/messages` handed out a continuation token for
+every non-empty page, including the one that had reached the room's first event, and answered
+the empty page after it with `"end": null` -- present, to a reader that checks presence, and the
+test started over from the newest event, forever. `RoomActor::paginate` now stops at the
+timeline's own edge and `/messages` leaves `end` out (`82359fb`). Nothing in the csapi baseline
+had ever paginated a room to its start and checked.
+
+The 64 tests that did run in run 9 matched the baseline by name. Run 10, from `82359fb`, is the
+full package again: **314 of 384, 78 of 106**, the whole suite in fifteen minutes, identical to
+run 7's baseline by name. `TestMessagesOverFederation` and `TestPushRuleRoomUpgrade`, whose
+federated joins used to 404, now join and fail afterwards -- on the history before the join,
+which is not backfilled, and on the upgrade -- which is what a fixed join and an unfixed rest
+look like. The csapi baseline file carries run 10's note; nothing in it moved.
+
 ## Re-measurement (2026-09-19, session 3): the CA fix verified end to end, csapi and federation both re-run
 
 Per the coordinator's brief: a great deal landed since the last measurement below (session 2:
