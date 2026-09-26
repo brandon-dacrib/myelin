@@ -668,6 +668,324 @@ paths:
           $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
+  /bridge-deployment-target:
+    get:
+      summary: Whether this server can deploy bridges
+      description: Available when the server runs in Kubernetes with the chart's bridges enabled (RFC 0017); `namespace` is where bridge instances run and `homeserver_url` is how they reach this server.
+      operationId: bridge_deployments.target
+      tags:
+      - Bridges
+      security:
+      - OAuth2:
+        - bridges:read
+      responses:
+        '200':
+          description: The deployment target.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BridgeDeploymentTarget'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /bridge-offerings:
+    get:
+      summary: List bridge offerings
+      description: The bridge types switched on for this server (RFC 0017), each with its instance counts.
+      operationId: bridge_offerings.list
+      tags:
+      - Bridges
+      security:
+      - OAuth2:
+        - bridges:read
+      responses:
+        '200':
+          description: Offerings.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - data
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/BridgeOffering'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /bridge-offerings/{type}:
+    get:
+      summary: Get a bridge offering
+      operationId: bridge_offerings.get
+      tags:
+      - Bridges
+      security:
+      - OAuth2:
+        - bridges:read
+      parameters:
+      - $ref: '#/components/parameters/BridgeTypeId'
+      responses:
+        '200':
+          description: The offering.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BridgeOffering'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+    put:
+      summary: Offer a bridge on this server, or change the offering
+      description: 'Creates or replaces the offering. Registers its front door (`@<bot>:server`), which users message to get their own instance. For a `shared` type, also creates its one instance. 400 for `runtime: cluster` when this server cannot deploy, or for a type that cannot run from a rendered config alone.'
+      operationId: bridge_offerings.put
+      tags:
+      - Bridges
+      security:
+      - OAuth2:
+        - bridges:write
+      parameters:
+      - $ref: '#/components/parameters/BridgeTypeId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BridgeOfferingRequest'
+      responses:
+        '200':
+          description: The offering.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BridgeOffering'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+    delete:
+      summary: Stop offering a bridge
+      description: Removes the offering and its front door. 409 while it has instances, unless `remove_instances=true`, which removes every instance (their pods, volumes and everyone's sign-ins) first.
+      operationId: bridge_offerings.delete
+      tags:
+      - Bridges
+      security:
+      - OAuth2:
+        - bridges:write
+      parameters:
+      - $ref: '#/components/parameters/BridgeTypeId'
+      - $ref: '#/components/parameters/RemoveInstances'
+      responses:
+        '204':
+          description: Done.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /bridge-offerings/{type}/instances:
+    get:
+      summary: List a bridge offering's instances
+      operationId: bridge_instances.list
+      tags:
+      - Bridges
+      security:
+      - OAuth2:
+        - bridges:read
+      parameters:
+      - $ref: '#/components/parameters/BridgeTypeId'
+      responses:
+        '200':
+          description: Instances.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - data
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/BridgeInstance'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /bridge-offerings/{type}/instances/{user_id}:
+    get:
+      summary: Get a user's bridge instance
+      operationId: bridge_instances.get
+      tags:
+      - Bridges
+      security:
+      - OAuth2:
+        - bridges:read
+      parameters:
+      - $ref: '#/components/parameters/BridgeTypeId'
+      - $ref: '#/components/parameters/BridgeInstanceUser'
+      responses:
+        '200':
+          description: The instance.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BridgeInstance'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+    put:
+      summary: Create a user's bridge instance
+      description: 'Starts provisioning an instance for the user, exactly as their message to the front door would; the user is invited to their bridge when it is ready. Idempotent: an existing instance is returned as it is (a failed one is retried).'
+      operationId: bridge_instances.put
+      tags:
+      - Bridges
+      security:
+      - OAuth2:
+        - bridges:write
+      parameters:
+      - $ref: '#/components/parameters/BridgeTypeId'
+      - $ref: '#/components/parameters/BridgeInstanceUser'
+      responses:
+        '200':
+          description: The instance.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BridgeInstance'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+    delete:
+      summary: Remove a user's bridge instance
+      description: 'Stops the instance and removes its registration, and in a cluster its pod, Service and volume: the user''s sign-ins are gone.'
+      operationId: bridge_instances.delete
+      tags:
+      - Bridges
+      security:
+      - OAuth2:
+        - bridges:write
+      parameters:
+      - $ref: '#/components/parameters/BridgeTypeId'
+      - $ref: '#/components/parameters/BridgeInstanceUser'
+      responses:
+        '204':
+          description: Done.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /bridge-offerings/{type}/instances/{user_id}/files:
+    post:
+      summary: Render the files to run an instance elsewhere
+      description: The instance's config, registration, a Compose service and a Kubernetes manifest (Secret and `Bridge`, for a cluster running the Myelin operator), with the instance's own tokens. Creates nothing.
+      operationId: bridge_instances.files
+      tags:
+      - Bridges
+      security:
+      - OAuth2:
+        - bridges:write
+      parameters:
+      - $ref: '#/components/parameters/BridgeTypeId'
+      - $ref: '#/components/parameters/BridgeInstanceUser'
+      responses:
+        '200':
+          description: The files.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BridgeInstanceFiles'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
   /bridge-types:
     get:
       summary: List the bridge type catalog
@@ -5808,6 +6126,19 @@ components:
       required: true
       schema:
         type: string
+    BridgeInstanceUser:
+      name: user_id
+      in: path
+      description: The Matrix user the instance belongs to (`@alice:example.org`, URL-encoded), or `_` for a shared type's one instance.
+      required: true
+      schema:
+        type: string
+    RemoveInstances:
+      name: remove_instances
+      in: query
+      required: false
+      schema:
+        type: boolean
     BridgeTypeId:
       name: type
       in: path
@@ -6940,6 +7271,15 @@ components:
         renders_config:
           type: boolean
           description: Whether a render of this type produces a `config_yaml` the bridge reads as it is (mautrix bridges), or only the registration and the notes to run it.
+        mode:
+          type: string
+          enum:
+          - per_user
+          - shared
+          description: '`per_user`: each user gets their own instance (RFC 0017). `shared`: one instance bridges a network or server for everyone.'
+        deployable:
+          type: boolean
+          description: Whether this server can run the type from a rendered config alone.
         sign_in:
           type: object
           description: The bridge's own documented login flow. `{bot}` in a step stands for the bridge bot's Matrix ID, which the interface substitutes.
@@ -6972,6 +7312,208 @@ components:
           type: string
         bridge_resource_yaml:
           type: string
+    BridgeDeploymentTarget:
+      type: object
+      required:
+      - available
+      properties:
+        available:
+          type: boolean
+        namespace:
+          type:
+          - string
+          - 'null'
+        homeserver_url:
+          type:
+          - string
+          - 'null'
+          description: How a bridge in `namespace` reaches this server.
+        reason:
+          type:
+          - string
+          - 'null'
+          description: Why deployment is unavailable, when it is.
+    BridgeOfferingAccess:
+      type: object
+      properties:
+        all_local_users:
+          type: boolean
+          description: Every local user may have an instance.
+        users:
+          type: array
+          items:
+            type: string
+          description: When not `all_local_users`, the users who may.
+    BridgeOfferingOptions:
+      type: object
+      properties:
+        encryption:
+          type: boolean
+        double_puppeting:
+          type: boolean
+        backfill:
+          type: boolean
+    BridgeOfferingRequest:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+          description: A disabled offering keeps its instances running but its front door turns new users away.
+        runtime:
+          type: string
+          enum:
+          - cluster
+          - elsewhere
+          description: '`cluster`: this server deploys each instance. `elsewhere`: an administrator runs each instance from its files.'
+        image_tag:
+          type: string
+        access:
+          $ref: '#/components/schemas/BridgeOfferingAccess'
+        options:
+          $ref: '#/components/schemas/BridgeOfferingOptions'
+    BridgeOffering:
+      type: object
+      required:
+      - type
+      - mode
+      - enabled
+      - runtime
+      properties:
+        type:
+          type: string
+          description: The bridge type (catalogue id).
+        name:
+          type: string
+        mode:
+          type: string
+          enum:
+          - per_user
+          - shared
+        enabled:
+          type: boolean
+        runtime:
+          type: string
+          enum:
+          - cluster
+          - elsewhere
+        image:
+          type: string
+        front_door:
+          type:
+          - string
+          - 'null'
+          description: The Matrix ID users message to get an instance (`per_user` only).
+        access:
+          $ref: '#/components/schemas/BridgeOfferingAccess'
+        options:
+          $ref: '#/components/schemas/BridgeOfferingOptions'
+        instances:
+          type: object
+          description: Instance counts by state.
+          additionalProperties:
+            type: integer
+        created_at:
+          type: string
+          format: date-time
+    BridgeInstance:
+      type: object
+      required:
+      - type
+      - user_id
+      - state
+      properties:
+        type:
+          type: string
+        user_id:
+          type:
+          - string
+          - 'null'
+          description: The owner; null for a shared type's instance.
+        state:
+          type: string
+          enum:
+          - requested
+          - registered
+          - deploying
+          - starting
+          - ready
+          - failed
+          - removing
+        reason:
+          type:
+          - string
+          - 'null'
+          description: Why it failed, or what it is waiting for.
+        appservice_id:
+          type:
+          - string
+          - 'null'
+        bot:
+          type:
+          - string
+          - 'null'
+          description: The instance's own bot, which the user talks to.
+        deployment:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/BridgeDeployment'
+        health:
+          type:
+          - string
+          - 'null'
+          description: The registry's word for its ping health (`healthy`, `down`, ...).
+        created_at:
+          type: string
+          format: date-time
+        ready_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+    BridgeDeployment:
+      type: object
+      required:
+      - namespace
+      - name
+      - phase
+      - ready
+      properties:
+        namespace:
+          type: string
+        name:
+          type: string
+          description: The `Bridge` resource's name, which its Deployment and Service share.
+        image:
+          type: string
+        service_url:
+          type: string
+        phase:
+          type: string
+          enum:
+          - Pending
+          - Ready
+          - Degraded
+        ready:
+          type: boolean
+        message:
+          type:
+          - string
+          - 'null'
+          description: What the operator last said (a pull failure, a crash loop, waiting for the pod).
+    BridgeInstanceFiles:
+      type: object
+      properties:
+        config_yaml:
+          type:
+          - string
+          - 'null'
+        registration_yaml:
+          type: string
+        compose_yaml:
+          type: string
+        manifest_yaml:
+          type: string
+          description: A Secret with the files and a `Bridge` resource, for a cluster running the Myelin operator.
     ClusterStatus:
       type: object
       properties:
