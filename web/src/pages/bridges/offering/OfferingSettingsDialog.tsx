@@ -101,10 +101,8 @@ function SettingsForm({
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
-    if (!accessIsValid(draft.allLocalUsers, draft.usersText)) {
-      setError("List at least one person by Matrix ID, or let everyone have one.");
-      return;
-    }
+    // The access field already says what is wrong with it.
+    if (!accessIsValid(draft.allLocalUsers, draft.usersText)) return;
     setError(null);
     try {
       await put.mutateAsync({

@@ -144,6 +144,29 @@ describe("Bridge offering page", () => {
     await waitFor(() => expect(router.state.location.pathname).toBe("/bridges"));
   });
 
+  it("changes who can have one, and the page says so", async () => {
+    renderOffering("mautrix-whatsapp");
+    await userEvent.click(await screen.findByRole("button", { name: "Edit settings" }));
+    const dialog = await screen.findByRole("dialog", { name: "WhatsApp settings" });
+    await userEvent.click(within(dialog).getByRole("radio", { name: /Only the people I list/ }));
+    const save = within(dialog).getByRole("button", { name: "Save settings" });
+    await userEvent.click(save);
+    expect(await within(dialog).findByText(/List at least one person/)).toBeInTheDocument();
+
+    await userEvent.type(
+      within(dialog).getByLabelText("People who can have one"),
+      "@alice:example.org, @ops:example.org",
+    );
+    await userEvent.click(save);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(await screen.findByText("@alice:example.org, @ops:example.org")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Anyone allowed can message @whatsappbot:example.org to get their own WhatsApp bridge.",
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("shows a shared bridge as one status panel, not a table", async () => {
     putOffering("heisenbridge", { runtime: "cluster", enabled: true });
     renderOffering("heisenbridge");

@@ -83,7 +83,7 @@ export function AccessFields({
           selected={allLocalUsers}
           onSelect={() => onChange({ allLocalUsers: true })}
           title="Everyone on this server"
-          description={`Any local user${serverName ? ` (:${serverName})` : ""} can ask for their own.`}
+          description={`Anyone with an account on ${serverName ?? "this server"} can ask for their own.`}
         />
         <ChoiceCard
           selected={!allLocalUsers}

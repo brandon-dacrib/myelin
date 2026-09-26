@@ -509,7 +509,7 @@ function SettingsSummary({ offering }: { offering: BridgeOffering }) {
       <dl className="mt-3 grid grid-cols-1 gap-x-8 gap-y-3 text-sm sm:grid-cols-2 xl:grid-cols-4">
         <Detail label="Runs">{runtimeMeta[offering.runtime].label}</Detail>
         <Detail label="Image">
-          <span className="font-identifier break-all">
+          <span className="font-identifier [overflow-wrap:anywhere]">
             {offering.image ?? `tag ${imageTag(offering.image)}`}
           </span>
         </Detail>
@@ -552,8 +552,8 @@ function HealthCell({ health }: { health: string | null | undefined }) {
   const meta = health ? HEALTH[health] : undefined;
   if (meta) return <Badge status={meta.status}>{meta.label}</Badge>;
   return (
-    <span className="text-text-muted">
-      {!health || health === "unknown" ? "No answer yet" : health}
+    <span className="whitespace-nowrap text-text-muted">
+      {!health || health === "unknown" ? "Not yet" : health}
     </span>
   );
 }
@@ -572,7 +572,7 @@ function DeploymentCell({
     );
   }
   return (
-    <div className="flex max-w-xs flex-col gap-0.5">
+    <div className="flex max-w-[15rem] flex-col gap-0.5">
       <span className="text-text">
         {d.phase}
         <span className="text-text-muted"> · {d.name}</span>
