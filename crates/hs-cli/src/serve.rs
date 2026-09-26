@@ -607,6 +607,9 @@ fn admin_state<B: KvBackend + 'static>(
     // What lets the management interface create this server's first administrator, instead of
     // that taking a shared secret, `hs register --admin`, a `curl` and a pasted token.
     .with_setup(sources.setup)
+    // What gets an operator back in when nobody can sign in: `hs recover`, run where the
+    // server keeps its signing key, and the link it prints.
+    .with_recovery(sources.recovery)
     // The Overview page's numbers: until this, its tiles read "Not implemented".
     .with_overview(sources.overview)
     // The Bridges section: until this, all thirteen of its operations answered 503, and the
@@ -642,6 +645,7 @@ fn admin_state<B: KvBackend + 'static>(
 struct AdminSources {
     config: Option<Arc<dyn hs_admin::sources::ConfigSource>>,
     setup: Arc<hs_auth::setup::FirstRunSetup>,
+    recovery: Arc<hs_auth::recovery::AdministratorRecovery>,
     overview: Arc<dyn hs_admin::sources::OverviewSource>,
     appservices: Arc<dyn hs_admin::sources::AppserviceDirectory>,
     federation: Arc<dyn hs_admin::sources::FederationSource>,
@@ -972,6 +976,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     let mut auth_state = AuthState::with_store(auth_store, auth_config);
 
     let identity = crate::identity::load_or_generate(&config)?;
+    // Kept for the recovery source below, which needs the key's public half after `identity`
+    // itself has been handed to the federation layer.
+    let signing_key = identity.signing_key.clone();
     let server_name = identity.server_name.clone();
 
     let metrics = Arc::new(Metrics::new());
@@ -1158,6 +1165,11 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     .map_err(|e| ServeError::Sessions(Box::new(e)))?;
 
     let setup = Arc::new(hs_auth::setup::FirstRunSetup::from_auth_state(&auth_state));
+    let recovery = Arc::new(hs_auth::recovery::AdministratorRecovery::new(
+        &auth_state,
+        signing_key.key_id(),
+        signing_key.verifying_key(),
+    ));
     let overview = Arc::new(crate::overview::ServerOverview::new(
         &auth_state,
         rooms.clone(),
@@ -1185,6 +1197,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             AdminSources {
                 config: options.config_source.clone(),
                 setup: setup.clone(),
+                recovery: recovery.clone(),
                 overview: overview.clone(),
                 appservices: appservice_delivery.admin_directory(),
                 federation: federation_source.clone(),
@@ -1309,6 +1322,8 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // Asked last, once the listeners are bound, because the link needs a port that is real. A
     // server that cannot work out whether to offer setup still serves: everything else about it
     // is fine, and `hs register --admin` remains a way in.
+    // The recovery link `hs recover` is handed is rooted the same way, at the same moment.
+    recovery.set_link_base(link_base(config.server.public_baseurl.as_deref(), &addrs));
     let setup_link = match setup.offer().await {
         Ok(token) => {
             token.map(|token| setup_link(config.server.public_baseurl.as_deref(), &addrs, &token))
@@ -1348,14 +1363,22 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
 /// cannot land in an access log, a reverse proxy's log or a `Referer` header on its way to the
 /// page that reads it.
 fn setup_link(public_baseurl: Option<&str>, addrs: &[SocketAddr], token: &str) -> String {
-    let base = match public_baseurl.map(str::trim).filter(|s| !s.is_empty()) {
+    format!(
+        "{}/admin/setup#token={token}",
+        link_base(public_baseurl, addrs)
+    )
+}
+
+/// Where the setup and recovery links are rooted: `server.public_baseurl` without its trailing
+/// slash, or `http://localhost:<first bound port>`.
+fn link_base(public_baseurl: Option<&str>, addrs: &[SocketAddr]) -> String {
+    match public_baseurl.map(str::trim).filter(|s| !s.is_empty()) {
         Some(url) => url.trim_end_matches('/').to_owned(),
         None => format!(
             "http://localhost:{}",
             addrs.first().map_or(8008, SocketAddr::port)
         ),
-    };
-    format!("{base}/admin/setup#token={token}")
+    }
 }
 
 /// `hs-config`'s `bind_addresses` defaults to `"::"` (all interfaces, IPv6-mapped), matching

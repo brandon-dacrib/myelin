@@ -27,6 +27,7 @@ pub mod identity;
 pub mod media;
 pub mod metrics_layer;
 pub mod overview;
+pub mod recover;
 pub mod register;
 pub mod remote_join;
 pub mod serve;

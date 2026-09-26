@@ -23,7 +23,8 @@ use crate::model::{
     AdminAppserviceLinks, AdminAppserviceReplay, AdminAppserviceTokens, AdminDestination,
     AdminDevice, AdminPasswordReset, AdminRoom, AdminRoomMember, AdminUser, ClusterStatus,
     ConfigChange, ConfigReloadReport, ConfigSection, ConfigValidateReport, ExternalId,
-    SetupRequest, SetupSession, StatisticsOverview, ThreePid,
+    RecoveryAdministrator, RecoveryInspection, RecoveryLink, RecoveryLinkKind, RecoveryLinkRequest,
+    RecoveryResetRequest, SetupRequest, SetupSession, StatisticsOverview, ThreePid,
 };
 
 /// Why a data-source call failed. Mirrors [`crate::auth::AuthError`]'s "only unavailable escapes
@@ -1244,6 +1245,218 @@ impl SetupError {
                 hs_http::Problem::unavailable().with_detail(detail.clone())
             }
         }
+    }
+}
+
+/// Why a recovery operation was refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RecoveryError {
+    /// The signed request did not verify: the wrong key, a bad signature, a timestamp outside
+    /// the window, or a nonce seen before. `401 unauthenticated`, and deliberately one variant,
+    /// so the response does not say which.
+    #[error("the request is not signed by this server's signing key, or is stale or replayed")]
+    NotSigned,
+    /// No recovery link is outstanding: none was issued, the last one was used, or it expired.
+    /// `409 conflict`.
+    #[error(
+        "no recovery link is open; run `hs recover` where the server keeps its signing key to get one"
+    )]
+    Closed,
+    /// The token is not the outstanding link's. `401 unauthenticated`: the token is this
+    /// operation's credential.
+    #[error("that is not this server's recovery link")]
+    BadToken,
+    /// A field of the request cannot be used. `400 validation-failed`, with `pointer` naming the
+    /// field so the interface can put the message beside it.
+    #[error("{detail}")]
+    Invalid {
+        /// A JSON pointer into the request body, `/user_id` or `/password`.
+        pointer: &'static str,
+        detail: String,
+    },
+    /// The store could not be reached. `503 unavailable`.
+    #[error("recovery is temporarily unavailable: {0}")]
+    Unavailable(String),
+}
+
+impl RecoveryError {
+    /// Maps this error onto the RFC 9457 problem catalog.
+    pub fn to_problem(&self) -> hs_http::Problem {
+        match self {
+            RecoveryError::NotSigned | RecoveryError::BadToken => {
+                hs_http::Problem::unauthenticated().with_detail(self.to_string())
+            }
+            RecoveryError::Closed => hs_http::Problem::conflict().with_detail(self.to_string()),
+            RecoveryError::Invalid { pointer, detail } => hs_http::Problem::validation_failed()
+                .with_detail(detail.clone())
+                .with_errors(vec![hs_http::ValidationError::new(
+                    *pointer,
+                    detail.clone(),
+                )]),
+            RecoveryError::Unavailable(detail) => {
+                hs_http::Problem::unavailable().with_detail(detail.clone())
+            }
+        }
+    }
+}
+
+/// What the three `recovery.*` operations call. The real implementation is track 07's
+/// (`hs_auth::recovery`), which owns the accounts, the passwords and the server's signing key;
+/// this crate owns only the HTTP shape.
+///
+/// The contract an implementation must honour:
+///
+/// - [`issue_link`](Self::issue_link) accepts a request only if it is signed by this server's
+///   own signing key, was signed within a few minutes of now, and carries a nonce not seen
+///   before; it answers every refusal with [`RecoveryError::NotSigned`] and nothing else. On
+///   success it stores a fresh one-time token with an expiry (replacing any earlier one) and
+///   returns the link -- or, when no active administrator exists, the first-run setup link,
+///   because a server with nobody to recover needs setting up, not recovering.
+/// - [`inspect`](Self::inspect) and [`reset_password`](Self::reset_password) check the token
+///   before anything else, so a caller without it learns nothing.
+/// - `reset_password` consumes the token atomically before it changes anything, so of any number
+///   of concurrent callers presenting the right token exactly one proceeds; it signs out every
+///   session of the account, sets the password, and returns a fresh session.
+#[async_trait]
+pub trait RecoverySource: Send + Sync + 'static {
+    async fn issue_link(&self, request: RecoveryLinkRequest)
+    -> Result<RecoveryLink, RecoveryError>;
+    async fn inspect(&self, recovery_token: &str) -> Result<RecoveryInspection, RecoveryError>;
+    async fn reset_password(
+        &self,
+        request: RecoveryResetRequest,
+    ) -> Result<SetupSession, RecoveryError>;
+}
+
+/// A [`RecoverySource`] over one token held in memory, for this crate's tests and
+/// `hs-admin-mock`. It honours the contract above with two simplifications: the "signature" it
+/// accepts is a fixed string rather than a real Ed25519 signature, and its "accounts" are the
+/// user IDs it was given.
+pub struct InMemoryRecoverySource {
+    accepted_signature: String,
+    link_base: String,
+    administrators: Vec<String>,
+    /// The outstanding token and when it expires.
+    token: RwLock<Option<(String, u64)>>,
+    issued: std::sync::atomic::AtomicUsize,
+}
+
+impl InMemoryRecoverySource {
+    /// How long a link this source issues is good for, the same fifteen minutes as the real one.
+    pub const LINK_LIFETIME_MS: u64 = 15 * 60 * 1000;
+
+    /// A server whose links are rooted at `link_base`, whose active administrators are
+    /// `administrators`, and which accepts exactly `accepted_signature` as a signature.
+    pub fn open(
+        link_base: impl Into<String>,
+        accepted_signature: impl Into<String>,
+        administrators: Vec<String>,
+    ) -> Self {
+        Self {
+            accepted_signature: accepted_signature.into(),
+            link_base: link_base.into(),
+            administrators,
+            token: RwLock::new(None),
+            issued: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn current(&self, presented: &str) -> Result<(String, u64), RecoveryError> {
+        let token = self
+            .token
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some((current, expires_at_ms)) = token.as_ref() else {
+            return Err(RecoveryError::Closed);
+        };
+        if current != presented {
+            return Err(RecoveryError::BadToken);
+        }
+        Ok((current.clone(), *expires_at_ms))
+    }
+}
+
+#[async_trait]
+impl RecoverySource for InMemoryRecoverySource {
+    async fn issue_link(
+        &self,
+        request: RecoveryLinkRequest,
+    ) -> Result<RecoveryLink, RecoveryError> {
+        if request.signature != self.accepted_signature {
+            return Err(RecoveryError::NotSigned);
+        }
+        if self.administrators.is_empty() {
+            return Ok(RecoveryLink {
+                kind: RecoveryLinkKind::Setup,
+                link: format!("{}/admin/setup#token=the-setup-token", self.link_base),
+                expires_at_ms: None,
+            });
+        }
+        let n = self
+            .issued
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let token = format!("recovery-token-{n}");
+        let expires_at_ms = request.requested_at_ms + Self::LINK_LIFETIME_MS;
+        *self
+            .token
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((token.clone(), expires_at_ms));
+        Ok(RecoveryLink {
+            kind: RecoveryLinkKind::Recovery,
+            link: format!("{}/admin/recover#token={token}", self.link_base),
+            expires_at_ms: Some(expires_at_ms),
+        })
+    }
+
+    async fn inspect(&self, recovery_token: &str) -> Result<RecoveryInspection, RecoveryError> {
+        let (_, expires_at_ms) = self.current(recovery_token)?;
+        Ok(RecoveryInspection {
+            administrators: self
+                .administrators
+                .iter()
+                .map(|user_id| RecoveryAdministrator {
+                    user_id: user_id.clone(),
+                })
+                .collect(),
+            expires_at_ms,
+        })
+    }
+
+    async fn reset_password(
+        &self,
+        request: RecoveryResetRequest,
+    ) -> Result<SetupSession, RecoveryError> {
+        self.current(&request.recovery_token)?;
+        if !self.administrators.contains(&request.user_id) {
+            return Err(RecoveryError::Invalid {
+                pointer: "/user_id",
+                detail: format!("{} is not an active administrator here", request.user_id),
+            });
+        }
+        if request.password.len() < 8 {
+            return Err(RecoveryError::Invalid {
+                pointer: "/password",
+                detail: "must be at least 8 characters".to_owned(),
+            });
+        }
+        // Consume, then act: the same order as the real one.
+        {
+            let mut token = self
+                .token
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match token.as_ref() {
+                Some((current, _)) if *current == request.recovery_token => *token = None,
+                _ => return Err(RecoveryError::Closed),
+            }
+        }
+        Ok(SetupSession {
+            user_id: request.user_id.clone(),
+            access_token: format!("recovered-{}", request.user_id),
+            device_id: "RECOVERY".to_owned(),
+        })
     }
 }
 

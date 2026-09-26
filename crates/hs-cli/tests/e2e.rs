@@ -1436,6 +1436,197 @@ async fn the_real_binary_logs_the_same_setup_link_until_it_is_used_and_never_aft
     assert!(log.contains("listening"));
 }
 
+/// Runs `hs recover` the way an operator would, against a signing key on disk and a server
+/// address, and returns what it printed and how it exited.
+fn hs_recover(signing_key: &std::path::Path, server_url: &str) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+        .args(["recover", "--signing-key"])
+        .arg(signing_key)
+        .args(["--server", server_url])
+        .env_remove("HS_DATA_DIR")
+        .env_remove("HS__SERVER__SIGNING_KEY_PATH")
+        .output()
+        .expect("the hs binary should run")
+}
+
+/// The way back in when the only administrator's password is lost, with the real binary and the
+/// real key on disk: `hs recover` where the key is, the link it prints, the reset through it,
+/// the old password and the old session dead after, the link spent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hs_recover_gets_a_locked_out_administrator_back_in_with_the_real_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = reserve_ephemeral_port();
+    let data_dir = dir.path().join("data");
+    let keys = dir.path().join("keys");
+    let config_path = dir.path().join("homeserver.yaml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "server:\n  server_name: example.org\n  signing_key_path: {keys:?}\n\
+             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health]\n\
+             storage:\n  backend: embedded\n  data_dir: {data_dir:?}\n\
+             media:\n  storage:\n    backend: local\n    path: {:?}\n",
+            data_dir.join("media")
+        ),
+    )
+    .unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+
+    let mut server = HsProcess::serve(&config_path);
+    let line = server.wait_for("setup_link=");
+    let setup_link = line.split_once("setup_link=").unwrap().1;
+    let setup_token: String = setup_token_of(setup_link)
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect();
+    assert!(
+        keys.join("hs.signing.key").is_file(),
+        "the server wrote its key"
+    );
+
+    // Before anybody is an administrator there is nobody to recover, and `hs recover` says so
+    // by handing over the setup link: the very one in the log.
+    let out = hs_recover(&keys, &base);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let printed = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        printed.trim(),
+        format!("http://localhost:{port}/admin/setup#token={setup_token}")
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no active administrator"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The first administrator, made through the setup link, whose password is about to be lost.
+    let response = client
+        .post(format!("{base}/api/v1/setup"))
+        .json(&json!({"setup_token": setup_token, "username": "ops", "password": "the-first-password"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let first: serde_json::Value = response.json().await.unwrap();
+    let first_token = first["access_token"].as_str().unwrap().to_owned();
+
+    // Somebody with a key that is not this server's gets nothing, and nothing is issued.
+    let other_dir = dir.path().join("other");
+    std::fs::create_dir_all(&other_dir).unwrap();
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+        .args(["generate-signing-key", "-o"])
+        .arg(other_dir.join("signing.key"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let out = hs_recover(&other_dir, &base);
+    assert!(!out.status.success(), "a stranger's key got a link");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("refused"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The operator, where the key is: a link on stdout, what it is on stderr.
+    let out = hs_recover(&keys, &base);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let link = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+    assert!(
+        link.starts_with(&format!("http://localhost:{port}/admin/recover#token=")),
+        "{link}"
+    );
+    let token = link.split_once("#token=").unwrap().1.to_owned();
+    assert_eq!(token.len(), 40);
+    let explanation = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(explanation.contains("works once"), "{explanation}");
+    assert!(explanation.contains("15 minutes"), "{explanation}");
+
+    // What the page asks first: who can be recovered.
+    let response = client
+        .post(format!("{base}/api/v1/recovery/inspect"))
+        .json(&json!({"recovery_token": token}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let inspection: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        inspection["administrators"],
+        json!([{"user_id": "@ops:example.org"}])
+    );
+
+    // The reset, and a session for the account.
+    let response = client
+        .post(format!("{base}/api/v1/recovery/reset"))
+        .json(&json!({"recovery_token": token, "user_id": "@ops:example.org", "password": "the-second-password"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let recovered: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(recovered["user_id"], "@ops:example.org");
+    let recovered_token = recovered["access_token"].as_str().unwrap();
+
+    // The new password signs in, the old one does not, the old session is dead, the new one
+    // is an administrator's.
+    for (password, expected) in [
+        ("the-second-password", reqwest::StatusCode::OK),
+        ("the-first-password", reqwest::StatusCode::FORBIDDEN),
+    ] {
+        let response = client
+            .post(format!("{base}/_matrix/client/v3/login"))
+            .json(&json!({"type": "m.login.password", "identifier": {"type": "m.id.user", "user": "ops"}, "password": password}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{password}");
+    }
+    for (bearer, expected) in [
+        (first_token.as_str(), reqwest::StatusCode::UNAUTHORIZED),
+        (recovered_token, reqwest::StatusCode::OK),
+    ] {
+        let response = client
+            .get(format!("{base}/api/v1/me"))
+            .bearer_auth(bearer)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+
+    // And that was the only time.
+    let response = client
+        .post(format!("{base}/api/v1/recovery/inspect"))
+        .json(&json!({"recovery_token": token}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+
+    // The log says what happened and to whom, and carries neither the token nor a password.
+    let log = server.stop();
+    assert!(log.contains("recovery link was issued"), "{log}");
+    assert!(
+        log.contains("password was reset through a recovery link"),
+        "{log}"
+    );
+    assert!(
+        log.contains("did not verify"),
+        "the stranger's attempt left no trace: {log}"
+    );
+    assert!(!log.contains(&token), "the token reached the log");
+    assert!(!log.contains("the-first-password") && !log.contains("the-second-password"));
+}
+
 /// With `server.public_baseurl` set, the link is one the operator's browser can actually open:
 /// the address the server is reached at, not the one it happens to be bound to.
 #[tokio::test]

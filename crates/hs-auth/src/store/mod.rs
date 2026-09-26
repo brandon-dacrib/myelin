@@ -481,6 +481,32 @@ pub trait SetupStore: Send + Sync {
     /// Removes the stored token, whatever it is. For when an administrator came to exist some
     /// other way and the offer should be withdrawn.
     async fn clear_setup_token(&self) -> Result<(), StoreError>;
+
+    /// Stores `token` as the one outstanding administrator-recovery token
+    /// ([`crate::recovery`]), expiring at `expires_at_ms`, replacing any earlier one: a newer
+    /// `hs recover` supersedes an older link.
+    async fn set_recovery_token(&self, token: &str, expires_at_ms: u64) -> Result<(), StoreError>;
+
+    /// The outstanding recovery token and when it expires, if there is one. Whether it *has*
+    /// expired is the caller's to judge against its clock; the store only keeps the number.
+    async fn recovery_token(&self) -> Result<Option<RecoveryTokenRecord>, StoreError>;
+
+    /// Removes the stored recovery token if, and only if, it equals `presented`, and says
+    /// whether it did. Atomic, and the comparison does not leak how much of the token matched,
+    /// exactly as [`consume_setup_token`](Self::consume_setup_token).
+    async fn consume_recovery_token(&self, presented: &str) -> Result<bool, StoreError>;
+
+    /// Removes the recovery token, whatever it is.
+    async fn clear_recovery_token(&self) -> Result<(), StoreError>;
+}
+
+/// An outstanding administrator-recovery token and its expiry, as [`SetupStore`] keeps them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryTokenRecord {
+    /// The 40-character token the link carries.
+    pub token: String,
+    /// Milliseconds since the Unix epoch.
+    pub expires_at_ms: u64,
 }
 
 /// Whether two tokens are equal, in time that depends on their lengths and nothing else.

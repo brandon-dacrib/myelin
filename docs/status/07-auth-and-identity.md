@@ -2,12 +2,52 @@
 
 Track brief: `docs/workstreams/07-auth-and-identity.md`. Owner crate: `hs-auth`.
 
-Last updated: 2026-09-19 (session 7: audited the login handshake against a real browser client
+Last updated: 2026-09-26 (session 8: administrator recovery, below). Session 7 (2026-09-19)
+audited the login handshake against a real browser client
 (Element Web was being pointed at this server for the first time in the same integration window),
 found and fixed a real case-sensitivity bug in `POST /login`, re-confirmed `/capabilities` is still
 unfixed (held by another track this session), checked for Element-Web findings in
 `docs/status/16-management-web-interface.md` (none landed as of this write-up), and designed
 (without implementing) a UIA session-correlation scheme left open at the end of session 5).
+
+## Session 8 (2026-09-26): administrator recovery
+
+**A locked-out administrator gets back in with one command.** Found on the first reachable
+install, minutes after its first administrator was made through the setup link: the password
+was lost, and the only way back was a registration shared secret (a `helm upgrade` and a
+restart on Kubernetes), `hs register --admin` for a second administrator, a reset from the
+interface, and a deactivation. `hs_auth::recovery` is the fix; its module documentation is the
+design, in short:
+
+- `hs recover` (in `hs-cli`, `crate::recover`), run where the server keeps its signing key,
+  signs `hs.recovery-link.v1\n<requested_at_ms>\n<nonce>\n` with it and posts the key ID,
+  time, nonce and signature to `POST /api/v1/recovery/links`. The server (`AdministratorRecovery`,
+  a `hs_admin::sources::RecoverySource`) accepts it only under its own current key, within five
+  minutes of its clock, with a nonce it has not seen; every refusal is one error, with the
+  reason in the log. **Holding the signing key is the credential** because holding it already
+  means being the server; the alternatives (a start-up flag, a loopback-only endpoint, a
+  separate operator secret) are weighed in the module doc.
+- The link carries a 40-character token in the fragment, stored with a fifteen-minute expiry
+  by two new `SetupStore` methods on both backends (`set_recovery_token`, `recovery_token`,
+  `consume_recovery_token`, `clear_recovery_token`; shared tests cover replace, near-miss,
+  single consumption, independence from the setup token). `inspect` lists active
+  administrators; `reset_password` checks the token before anything else, validates the account
+  (this server's, an administrator, not deactivated) and the password policy, hashes, consumes
+  the token atomically, signs out every session through `AuthStoreUserDirectory::
+  logout_everywhere`, sets the hash, and returns a session; a failed sign-out or set puts the
+  token back. A server with no active administrator is handed the setup link (`FirstRunSetup::
+  offer`), which is also how a deactivated sole administrator's operator gets back in.
+- Tests: unit (wrong key, renamed key, tampered message, both window edges, malformed nonces,
+  replay, replacement, the setup fallback, the full reset with the old session dead and the
+  other administrator untouched, expiry with a fixed clock) and `crates/hs-cli/tests/e2e.rs::
+  hs_recover_gets_a_locked_out_administrator_back_in_with_the_real_binary`, which runs the real
+  binary and the real `hs recover` against a key the server wrote to disk, a stranger's key
+  included, and checks the log for what it says and does not carry.
+
+Not done: rate limiting beyond what `/setup` has (the token is 40 random characters; the signed
+request is verified at Ed25519 speed); a `hs recover` for a server whose signing key is in a
+Kubernetes Secret the operator can read but cannot exec near (it works from anywhere with
+`--signing-key` and `--server`, documented, not tested against a cluster in this session).
 
 ## Session 7 (2026-09-19): login handshake audit for a real browser client
 

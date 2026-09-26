@@ -2,7 +2,23 @@
 
 Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-admin`, `hs-modules`, `hs-identity`, `hs-http` (shared with 07 and 14).
 
-Last updated: 2026-09-25 (additive schema change for the bridges wizard, below); the session log that follows is from 2026-09-19 (session 6).
+Last updated: 2026-09-26 (three public recovery operations, below); before that 2026-09-25 (additive schema change for the bridges wizard); the session log that follows is from 2026-09-19 (session 6).
+
+> **2026-09-26, additive.** Three operations under a new `Recovery` tag, all public (`security:
+> []`, rate-limited, `no-store`), the siblings of `setup.*`: `recovery.links.create` (`POST
+> /recovery/links`, authenticated by a signature under the server's own signing key; what `hs
+> recover` calls), `recovery.inspect` and `recovery.reset` (authenticated by the one-time token
+> the link carries; what the recovery page calls). Schemas `RecoveryLinkRequest`, `RecoveryLink`,
+> `RecoveryInspectRequest`, `RecoveryInspection`, `RecoveryAdministrator`, `RecoveryResetRequest`;
+> the reset answers a `SetupSession`. In this crate: the models, `sources::RecoverySource` with
+> `RecoveryError` (`NotSigned` and `BadToken` are both `401`, so a refusal does not say which;
+> `Closed` is `409`), `InMemoryRecoverySource` for tests and the mock, `AdminState::with_recovery`,
+> the three handlers with audit entries `recovery.link_issued` (actor: the key, as
+> `signing-key:<key id>`) and `recovery.password_reset` (actor: the account) and events
+> `recovery.link_issued` and `recovery.completed`; router tests cover the 503 when nothing is
+> wired, refusal without issuance, the setup-link fallback, inspection, the field pointers, the
+> single use and what the audit log does and does not carry. The real source is
+> `hs_auth::recovery` (track 07's status has the design); the page is track 16's.
 
 > **2026-09-25, additive.** `openapi.yaml` grew, without removing or renaming anything:
 > `BridgeType` gained `description`, `category` (`messaging|social|irc|integrations`),

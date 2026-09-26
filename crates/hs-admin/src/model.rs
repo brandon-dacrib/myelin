@@ -325,6 +325,100 @@ impl std::fmt::Debug for SetupSession {
     }
 }
 
+/// The OpenAPI `RecoveryLinkRequest` schema: the body of `POST /recovery/links`, a request
+/// signed by this server's own signing key. Nothing in it is secret (the signature is over a
+/// message anybody may see; only the private key that made it is), so `Debug` is derived.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryLinkRequest {
+    /// `ed25519:<version>`, as `/_matrix/key/v2/server` publishes it.
+    pub key_id: String,
+    /// When the request was signed, milliseconds since the Unix epoch.
+    pub requested_at_ms: u64,
+    /// Random, never reused.
+    pub nonce: String,
+    /// Unpadded base64 of the Ed25519 signature over the shared message layout.
+    pub signature: String,
+}
+
+/// Which link `POST /recovery/links` answered with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecoveryLinkKind {
+    /// A link to the recovery page, which resets an existing administrator's password.
+    Recovery,
+    /// The first-run setup link: this server has no active administrator, so the way in is to
+    /// create one.
+    Setup,
+}
+
+/// The OpenAPI `RecoveryLink` schema: the body of a successful `POST /recovery/links`. `Debug`
+/// hides the link, which carries the token.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryLink {
+    pub kind: RecoveryLinkKind,
+    pub link: String,
+    /// When a `recovery` link stops working; absent for a `setup` link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+}
+
+impl std::fmt::Debug for RecoveryLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveryLink")
+            .field("kind", &self.kind)
+            .field("link", &"<redacted>")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
+/// The OpenAPI `RecoveryInspectRequest` schema: the body of `POST /recovery/inspect`.
+#[derive(Clone, Deserialize)]
+pub struct RecoveryInspectRequest {
+    pub recovery_token: String,
+}
+
+impl std::fmt::Debug for RecoveryInspectRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveryInspectRequest")
+            .field("recovery_token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// One account a recovery link may reset the password of.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryAdministrator {
+    pub user_id: String,
+}
+
+/// The OpenAPI `RecoveryInspection` schema: what the recovery page shows before it asks for a
+/// password.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryInspection {
+    pub administrators: Vec<RecoveryAdministrator>,
+    pub expires_at_ms: u64,
+}
+
+/// The OpenAPI `RecoveryResetRequest` schema: the body of `POST /recovery/reset`. `Debug` hides
+/// the token and the password.
+#[derive(Clone, Deserialize)]
+pub struct RecoveryResetRequest {
+    pub recovery_token: String,
+    pub user_id: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for RecoveryResetRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveryResetRequest")
+            .field("recovery_token", &"<redacted>")
+            .field("user_id", &self.user_id)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
 /// The OpenAPI `User` schema (`crates/hs-admin/openapi/openapi.yaml`): one row of `GET /users`
 /// and the body of `GET /users/{user_id}`. Field-for-field match with that schema. Served by
 /// whatever implements [`crate::sources::UserDirectory`] (track 07's real implementation, or

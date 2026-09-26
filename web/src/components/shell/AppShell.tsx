@@ -5,6 +5,7 @@ import { TopBar } from "./TopBar";
 import { CommandPalette } from "./CommandPalette";
 import { SignIn } from "./SignIn";
 import { Setup } from "./Setup";
+import { Recover } from "./Recover";
 import { Sheet, SheetContent } from "../ui/sheet/Sheet";
 import { Toaster } from "../ui/toast/Toaster";
 import { getSession, subscribeSession } from "@/lib/auth";
@@ -69,9 +70,15 @@ export function AppShell() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [navigate]);
 
-  // A server with no administrator cannot be signed in to, so its setup page is served here, in
-  // place of the sign-in form, rather than as a route behind it.
-  if (!session) return pathname.replace(/^\/admin/, "") === "/setup" ? <Setup /> : <SignIn />;
+  // A server with no administrator cannot be signed in to, and neither can one whose
+  // administrators are locked out, so the setup page and its sibling the recovery page are
+  // served here, in place of the sign-in form, rather than as routes behind it.
+  if (!session) {
+    const page = pathname.replace(/^\/admin/, "");
+    if (page === "/setup") return <Setup />;
+    if (page === "/recover") return <Recover />;
+    return <SignIn />;
+  }
 
   return (
     <div className="flex h-screen flex-col bg-canvas">

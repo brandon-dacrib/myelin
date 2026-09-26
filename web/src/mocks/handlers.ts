@@ -31,6 +31,13 @@ import {
 import { auditEntries } from "./data/audit";
 import { succeeded } from "@/lib/audit";
 import { users, userDevices, findUser } from "./data/users";
+import {
+  MOCK_RECOVERY_TOKEN,
+  mockRecoveryExpiresAt,
+  mockRecoveryLinkOpen,
+  recoveryAdministrators,
+  useMockRecoveryLink,
+} from "./data/recovery";
 import { rooms, roomMembers, findRoom } from "./data/rooms";
 import { ALL_SCOPES, type Scope } from "@/lib/auth";
 import type { AppService } from "@/api/bridges";
@@ -118,6 +125,25 @@ function configNotFound(name: string) {
   });
 }
 
+/**
+ * Why the mock refuses a recovery request, or `null` to let it through. The order is the
+ * server's: whether a link is open at all comes before whether this is it, so a used link
+ * answers 409 whatever token is sent.
+ */
+function recoveryRefusal(token: string | undefined) {
+  if (!mockRecoveryLinkOpen()) {
+    return problem(409, "conflict", "Conflict", {
+      detail: "no recovery link is open: none was issued, or it was used or expired",
+    });
+  }
+  if (token !== MOCK_RECOVERY_TOKEN) {
+    return problem(401, "unauthenticated", "Unauthenticated", {
+      detail: "that is not this server's recovery link",
+    });
+  }
+  return null;
+}
+
 function configSectionBody(name: string) {
   const meta = configSchemaDocument.sections.find((s) => s.name === name);
   return {
@@ -188,6 +214,51 @@ export const handlers = [
         device_id: "SETUP",
       },
       { status: 201, headers: NO_STORE },
+    );
+  }),
+  // ---- Administrator recovery ----
+  // Open by default (see `data/recovery.ts`): the link `hs recover` would print is
+  // `/admin/recover#token=mock-recovery-token`. It lists two administrators, and a reset
+  // succeeds once, after which the link is used, as on the real server.
+  http.post(`${API}/recovery/inspect`, async ({ request }) => {
+    const body = (await request.json()) as { recovery_token?: string };
+    const refused = recoveryRefusal(body.recovery_token);
+    if (refused) return refused;
+    return HttpResponse.json(
+      { administrators: recoveryAdministrators, expires_at_ms: mockRecoveryExpiresAt() },
+      { headers: NO_STORE },
+    );
+  }),
+  http.post(`${API}/recovery/reset`, async ({ request }) => {
+    const body = (await request.json()) as {
+      recovery_token?: string;
+      user_id?: string;
+      password?: string;
+    };
+    const refused = recoveryRefusal(body.recovery_token);
+    if (refused) return refused;
+    const userId = body.user_id ?? "";
+    if (!recoveryAdministrators.some((a) => a.user_id === userId)) {
+      const detail = `${userId || "(none)"} is not an active administrator on this server`;
+      return problem(400, "validation-failed", "Validation failed", {
+        detail,
+        errors: [{ pointer: "/user_id", detail }],
+      });
+    }
+    if ((body.password ?? "").length < 8) {
+      return problem(400, "validation-failed", "Validation failed", {
+        detail: "Password too short (minimum 8 characters)",
+        errors: [{ pointer: "/password", detail: "Password too short (minimum 8 characters)" }],
+      });
+    }
+    useMockRecoveryLink();
+    return HttpResponse.json(
+      {
+        user_id: userId,
+        access_token: `mock-admin-token.${crypto.randomUUID()}`,
+        device_id: "RECOVERY",
+      },
+      { status: 200, headers: NO_STORE },
     );
   }),
   // What `signInWithToken` verifies a token against. Any mock-issued token is a full

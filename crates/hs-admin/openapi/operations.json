@@ -541,6 +541,33 @@
       "idempotent_post": false
     },
     {
+      "method": "POST",
+      "path": "/recovery/links",
+      "operation_id": "recovery.links.create",
+      "scope": null,
+      "public": true,
+      "tag": "Recovery",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/recovery/inspect",
+      "operation_id": "recovery.inspect",
+      "scope": null,
+      "public": true,
+      "tag": "Recovery",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/recovery/reset",
+      "operation_id": "recovery.reset",
+      "scope": null,
+      "public": true,
+      "tag": "Recovery",
+      "idempotent_post": false
+    },
+    {
       "method": "GET",
       "path": "/registration-tokens",
       "operation_id": "registration_tokens.list",

@@ -36,8 +36,9 @@ use ruma::{DeviceId, OwnedUserId, UserId};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AccessTokenRecord, DeviceRecord, DeviceStore, LoginTokenRecord, RefreshTokenRecord, SetupStore,
-    StoreError, TokenStore, UiaStore, UserRecord, UserStore, tokens_match,
+    AccessTokenRecord, DeviceRecord, DeviceStore, LoginTokenRecord, RecoveryTokenRecord,
+    RefreshTokenRecord, SetupStore, StoreError, TokenStore, UiaStore, UserRecord, UserStore,
+    tokens_match,
 };
 use crate::token::TokenHash;
 
@@ -807,6 +808,74 @@ impl<B: KvBackend> SetupStore for TablesAuthStore<B> {
         })
         .map_err(store_err)
     }
+
+    async fn set_recovery_token(&self, token: &str, expires_at_ms: u64) -> Result<(), StoreError> {
+        let key = (RECOVERY_TOKEN_KEY.to_owned(),);
+        let value = encode_recovery_token(token, expires_at_ms);
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            self.setup.put(txn, &key, &value).map_err(to_kv)
+        })
+        .map_err(store_err)
+    }
+
+    async fn recovery_token(&self) -> Result<Option<RecoveryTokenRecord>, StoreError> {
+        let snap = self.backend.snapshot();
+        let key = (RECOVERY_TOKEN_KEY.to_owned(),);
+        match self
+            .setup
+            .get(&snap, &key)
+            .map_err(|e| StoreError::Backend(e.to_string()))?
+        {
+            Some(bytes) => Ok(Some(decode_recovery_token(&bytes).map_err(store_err)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn consume_recovery_token(&self, presented: &str) -> Result<bool, StoreError> {
+        let key = (RECOVERY_TOKEN_KEY.to_owned(),);
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let Some(bytes) = self.setup.get(txn, &key).map_err(to_kv)? else {
+                return Ok(false);
+            };
+            if !tokens_match(&decode_recovery_token(&bytes)?.token, presented) {
+                return Ok(false);
+            }
+            self.setup.delete(txn, &key).map_err(to_kv)?;
+            Ok(true)
+        })
+        .map_err(store_err)
+    }
+
+    async fn clear_recovery_token(&self) -> Result<(), StoreError> {
+        let key = (RECOVERY_TOKEN_KEY.to_owned(),);
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            self.setup.delete(txn, &key).map_err(to_kv)
+        })
+        .map_err(store_err)
+    }
+}
+
+/// The other key in the `hs_auth.setup` keyspace: the outstanding administrator-recovery token,
+/// stored as `<token>\n<expires_at_ms>`.
+const RECOVERY_TOKEN_KEY: &str = "recovery";
+
+fn encode_recovery_token(token: &str, expires_at_ms: u64) -> Vec<u8> {
+    format!("{token}\n{expires_at_ms}").into_bytes()
+}
+
+fn decode_recovery_token(bytes: &[u8]) -> Result<RecoveryTokenRecord, KvError> {
+    let text = String::from_utf8(bytes.to_vec())
+        .map_err(|e| KvError::backend(DecodeFail(e.to_string())))?;
+    let (token, expires) = text
+        .split_once('\n')
+        .ok_or_else(|| KvError::backend(DecodeFail("recovery token row has no expiry".into())))?;
+    let expires_at_ms = expires
+        .parse()
+        .map_err(|e: std::num::ParseIntError| KvError::backend(DecodeFail(e.to_string())))?;
+    Ok(RecoveryTokenRecord {
+        token: token.to_owned(),
+        expires_at_ms,
+    })
 }
 
 #[async_trait::async_trait]

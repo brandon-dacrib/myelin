@@ -33,6 +33,9 @@ pub enum Command {
     GenerateSigningKey(GenerateSigningKeyArgs),
     /// Registers a user against a running server via the shared-secret admin protocol.
     Register(RegisterArgs),
+    /// Prints a one-time link that gets an administrator back into a running server nobody can
+    /// sign in to. Run it where the server keeps its signing key: the request is signed with it.
+    Recover(RecoverArgs),
     /// Writes the `routes.json` manifest (`docs/rfcs/0005-routes-json-manifest.md`) without
     /// booting a server — routes are static, independent of runtime config.
     RoutesManifest(RoutesManifestArgs),
@@ -267,6 +270,27 @@ pub struct GenerateSigningKeyArgs {
     pub output: Option<PathBuf>,
 }
 
+/// `hs recover` arguments. See `hs_auth::recovery` for what the link does and why holding the
+/// signing key is what entitles somebody to one.
+#[derive(Debug, Args)]
+pub struct RecoverArgs {
+    /// The running server's base URL. The default is right from inside its pod or container
+    /// (`kubectl exec <pod> -- hs recover`, `docker exec <container> hs recover`).
+    #[arg(long = "server", default_value = "http://127.0.0.1:8008")]
+    pub server_url: String,
+
+    /// The server's signing key: a key file, or the directory holding one. Defaults to
+    /// `HS__SERVER__SIGNING_KEY_PATH` when set (a Helm chart in cluster mode sets it to the
+    /// mounted Secret), else `<data-dir>/keys`.
+    #[arg(long = "signing-key")]
+    pub signing_key: Option<PathBuf>,
+
+    /// The data directory, as `hs serve --data-dir` (or `HS_DATA_DIR`): its `keys/` holds the
+    /// signing key.
+    #[arg(long = "data-dir")]
+    pub data_dir: Option<PathBuf>,
+}
+
 /// `hs register` arguments (`register_new_matrix_user`-compatible; see
 /// `docs/compat/cli-shims.md`).
 #[derive(Debug, Args)]
@@ -334,6 +358,7 @@ pub async fn dispatch(cli: Cli) -> i32 {
         Command::HashPassword(args) => run_hash_password(&args),
         Command::GenerateSigningKey(args) => run_generate_signing_key(&args),
         Command::Register(args) => run_register(&args).await,
+        Command::Recover(args) => run_recover(&args).await,
         Command::RoutesManifest(args) => run_routes_manifest(&args),
         Command::Serve(args) => run_serve(&args).await,
         Command::FederationJoinRoom(args) => crate::federation::run_join_room(&args).await,
@@ -469,6 +494,72 @@ fn run_generate_signing_key(args: &GenerateSigningKeyArgs) -> i32 {
         None => print!("{line}"),
     }
     0
+}
+
+/// `hs recover`: the link on stdout and nothing else there, so `$(hs recover)` is the link;
+/// what it is and how long it lasts on stderr.
+async fn run_recover(args: &RecoverArgs) -> i32 {
+    let key_path = match crate::recover::signing_key_path(
+        args.signing_key.as_deref(),
+        args.data_dir.as_deref(),
+        |name| {
+            std::env::var_os(name)
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+        },
+    ) {
+        Some(path) => path,
+        None => {
+            eprintln!(
+                "hs recover: nowhere to look for the server's signing key. Run this where the \
+                 server keeps it (its pod or container), or say where with --signing-key <file \
+                 or directory> or --data-dir <the directory hs serve was given>"
+            );
+            return 1;
+        }
+    };
+    let Some(key) = crate::identity::load_signing_key(&key_path) else {
+        eprintln!(
+            "hs recover: no ed25519 signing key at {}. The server writes one to <data-dir>/keys \
+             on its first start; --signing-key names another file or directory",
+            key_path.display()
+        );
+        return 1;
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let request = crate::recover::signed_request(&key, now_ms);
+    let client = reqwest::Client::new();
+    match crate::recover::request_link(&client, &args.server_url, &request).await {
+        Ok(link) => {
+            println!("{}", link.link);
+            match link.kind {
+                hs_admin::model::RecoveryLinkKind::Recovery => {
+                    let minutes = link
+                        .expires_at_ms
+                        .map_or(0, |at| at.saturating_sub(now_ms) / 60_000);
+                    eprintln!(
+                        "Open this link to reset an administrator's password and sign in as \
+                         them. It works once and expires in {minutes} minutes; running hs \
+                         recover again replaces it."
+                    );
+                }
+                hs_admin::model::RecoveryLinkKind::Setup => {
+                    eprintln!(
+                        "This server has no active administrator, so this is its setup link: \
+                         open it to create one. It works once."
+                    );
+                }
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("hs recover: {e}");
+            1
+        }
+    }
 }
 
 async fn run_register(args: &RegisterArgs) -> i32 {

@@ -31,6 +31,8 @@ tags:
   description: Server identity, health and the caller's own principal.
 - name: Setup
   description: Creating the first administrator on a server that has none.
+- name: Recovery
+  description: Getting an administrator back into a server nobody can sign in to, with a link issued to whoever holds the server's signing key.
 - name: Users
   description: Users, devices, sessions and their moderation actions.
 - name: Rooms
@@ -2190,6 +2192,118 @@ paths:
           $ref: '#/components/responses/Unauthenticated'
         '403':
           $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /recovery/links:
+    post:
+      summary: Issue a one-time administrator recovery link
+      operationId: recovery.links.create
+      tags:
+      - Recovery
+      security: []
+      description: |
+        Unauthenticated by bearer token, because it exists for when nobody has one. The credential
+        is a signature by this server's own Ed25519 signing key over a short message carrying a
+        timestamp and a nonce: whoever can read the key -- from the data volume, the mounted
+        Secret, or the directory `hs serve` was given -- is the operator, and already holds
+        everything the server is. `hs recover`, run where the key is, builds the request and
+        prints the link this answers with.
+
+        The link opens the recovery page, where an existing administrator's password is reset and
+        a session for it is returned. It works once and expires fifteen minutes after issue; a
+        newer link replaces an older one. When the server has no active administrator at all,
+        the answer is the first-run setup link instead, since that is the way in then.
+
+        A request is refused when its signature does not verify, its timestamp is more than five
+        minutes from this server's clock, or its nonce was seen before. Nothing about the server
+        is revealed on refusal.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecoveryLinkRequest'
+      responses:
+        '201':
+          description: The link, and when it stops working.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryLink'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /recovery/inspect:
+    post:
+      summary: What a recovery link can do
+      operationId: recovery.inspect
+      tags:
+      - Recovery
+      security: []
+      description: The recovery page's first call. The token is the credential; with the right one the answer is the list of administrator accounts whose password the link may reset, and when the link expires. With the wrong one, or once the link is used or expired, it answers only that.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecoveryInspectRequest'
+      responses:
+        '200':
+          description: The accounts this link can recover.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryInspection'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /recovery/reset:
+    post:
+      summary: Reset an administrator's password through a recovery link
+      operationId: recovery.reset
+      tags:
+      - Recovery
+      security: []
+      description: Consumes the link. The named account must be an active administrator; its password is replaced, every one of its sessions is signed out, and a fresh session for it is returned so the operator lands in the interface signed in. The password is checked against the server's policy and appears in nothing but the request.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecoveryResetRequest'
+      responses:
+        '200':
+          description: The password was reset, and this is a session for the account.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SetupSession'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '429':
           $ref: '#/components/responses/RateLimited'
         '500':
@@ -7253,6 +7367,90 @@ components:
           description: An ordinary access token for the new account, which, being an administrator's, this API accepts.
         device_id:
           type: string
+    RecoveryLinkRequest:
+      type: object
+      required:
+      - key_id
+      - requested_at_ms
+      - nonce
+      - signature
+      properties:
+        key_id:
+          type: string
+          description: The signing key's ID, `ed25519:<version>`, as `/_matrix/key/v2/server` publishes it. Must be this server's current key.
+        requested_at_ms:
+          type: integer
+          format: int64
+          description: When the request was signed, milliseconds since the Unix epoch. Accepted within five minutes of the server's clock.
+        nonce:
+          type: string
+          description: Random, 8 to 64 characters, never reused. A request whose nonce this server has seen is refused.
+        signature:
+          type: string
+          description: Unpadded base64 of the Ed25519 signature over the message `hs.recovery-link.v1\n<requested_at_ms>\n<nonce>\n`, the layout `hs recover` and the server share.
+    RecoveryLink:
+      type: object
+      required:
+      - kind
+      - link
+      properties:
+        kind:
+          type: string
+          enum:
+          - recovery
+          - setup
+          description: '`recovery` is a link to the recovery page. `setup` means this server has no active administrator, so the first-run setup link was issued instead, which creates one.'
+        link:
+          type: string
+          description: Rooted at the public base URL when there is one, otherwise at `localhost` on the client port. The token is in the fragment, so it is never sent to the server by a browser.
+        expires_at_ms:
+          type: integer
+          format: int64
+          description: When a `recovery` link stops working. Absent for a `setup` link, which is offered until it is used.
+    RecoveryInspectRequest:
+      type: object
+      required:
+      - recovery_token
+      properties:
+        recovery_token:
+          type: string
+          description: The token from the link's fragment.
+    RecoveryInspection:
+      type: object
+      required:
+      - administrators
+      - expires_at_ms
+      properties:
+        administrators:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecoveryAdministrator'
+          description: The active administrator accounts, any of whose password this link may reset.
+        expires_at_ms:
+          type: integer
+          format: int64
+    RecoveryAdministrator:
+      type: object
+      required:
+      - user_id
+      properties:
+        user_id:
+          type: string
+    RecoveryResetRequest:
+      type: object
+      required:
+      - recovery_token
+      - user_id
+      - password
+      properties:
+        recovery_token:
+          type: string
+        user_id:
+          type: string
+          description: The administrator account to reset, a full user ID on this server.
+        password:
+          type: string
+          description: The new password, checked against the server's password policy.
     ServerHealth:
       type: object
       properties:

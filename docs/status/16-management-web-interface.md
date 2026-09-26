@@ -1,6 +1,55 @@
 # 16. Management web interface: status
 
-## Current update: 2026-09-25
+## Current update: 2026-09-26
+
+**The recovery page: the setup link's sibling, for when the only administrator is locked out.**
+`hs recover`, run where the server keeps its signing key, prints a one-time link
+`<publicBaseUrl>/admin/recover#token=...` that expires fifteen minutes after issue. Opening it
+resets an existing administrator's password and signs the operator in. Built against the contract
+in `crates/hs-admin/openapi/openapi.yaml` (`recovery.inspect`, `recovery.reset`; the Rust side is
+being written in parallel by tracks 07 and 15), with the client regenerated
+(`npm run generate:client`, `src/api/schema.d.ts`).
+
+- **`src/lib/recovery.ts`** beside `lib/setup.ts`: `recoveryTokenFromHash` (the fragment only,
+  never the query string), `inspectRecoveryLink`, `resetAdministratorPassword` (stores the session
+  through `signInWithToken` exactly as setup does), `recoveryTimeLeft` ("in 14 minutes", whole
+  minutes rounded down), and `RecoveryError` with a `refusal` of `wrong-link` (401), `no-link-open`
+  (409), `invalid` (400, with the field from `errors[0].pointer`) or `failed`.
+- **`src/components/shell/Recover.tsx`** beside `Setup.tsx`, rendered by `AppShell` in place of the
+  sign-in form at `/recover` while there is no session; `routes.tsx` sends `/recover` home when
+  there is one, like `/setup`. It inspects the link as soon as it opens; one administrator is
+  preselected and shown, several are a radio list (a real `fieldset`, no preselection, the choice
+  is required); new password and confirm; "Reset password and sign in"; it says plainly that every
+  other session of the account will be signed out; the expiry sentence is re-read every half
+  minute. 401 and 409 replace the form with the agreed copy and a "Go to sign in" button; a link
+  used *under* the form (409 on reset) does the same. A 400 lands beside its field. No token in
+  the fragment explains how to get a link.
+- **`SignIn.tsx`**: one quiet line under both forms, "Locked out? Run `hs recover` where the server
+  runs to get a recovery link."
+- **Mock** (`src/mocks/data/recovery.ts`, handlers in `src/mocks/handlers.ts`): open by default at
+  `/admin/recover#token=mock-recovery-token`, two administrators, a reset succeeds once per tab
+  (`sessionStorage`), then 409; expiry is fifteen minutes from the first inspect.
+- **Tests**: `src/lib/recovery.test.ts` (9) and `src/components/shell/Recover.test.tsx` (10, through
+  the real `AppShell` like `Setup.test.tsx`): administrators rendered from inspect, fragment-only
+  token, 401 copy, 409 copy, account required, mismatched passwords, policy error beside the
+  password field, successful reset storing the session and leaving the page, a link used under the
+  form, and the sign-in hint. `e2e/recovery.spec.ts` (3, axe clean at desktop and phone width).
+- Screenshots: `docs/design/screenshots/recover.png`, `recover-wrong-link.png`,
+  `sign-in-locked-out.png`.
+
+Checks: `npm run check` green (eslint 0 errors, 4 pre-existing react-refresh warnings; Prettier
+clean; 21 files / 155 tests; build); `npx playwright test e2e/recovery.spec.ts` 3/3.
+
+Read into the contract, for tracks 07 and 15 to confirm or correct: (1) the mock answers 409
+before 401, so a used or expired link says "no link is open" whatever token is sent; the page
+shows the right copy either way. (2) `expires_at_ms` is on the server's clock and the page compares
+it with the browser's; once the browser thinks the link has expired the page says so but keeps the
+form usable, because the server is the authority and a fast browser clock must not lock anybody
+out. (3) `POST /recovery/reset` answers 200, not 201 as `/setup` does; the page checks for 200.
+(4) A validation failure is placed by `errors[0].pointer` (`/user_id`, `/password`); a 400 without
+a pointer is shown under the form.
+
+## Update: 2026-09-25
 
 **Bridges are the marquee page they were meant to be, and a real mautrix bridge came through
 them.** Read against <https://docs.mau.fi/bridges/> and the `bridgev2` example config, the

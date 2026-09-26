@@ -201,6 +201,18 @@ there, two and a half of them between the volume attaching and the image pull st
 is the cluster's storage, not the chart, and is written down in the status document because an
 operator would see it.
 
+**And recoverable** (2026-09-26, later still). Minutes after the demo's first administrator was
+made, its password was lost, and the only way back in was a registration shared secret (a
+`helm upgrade` and a restart), `hs register --admin` for a second administrator, a reset from
+the interface, and a deactivation: four tools for the most predictable thing an operator will
+ever need. Now `hs recover`, run where the server keeps its signing key (`kubectl exec <pod> --
+hs recover`, `docker exec <container> hs recover`, or `--data-dir` on a host), signs a request
+with that key and prints a one-time link; the recovery page at `/admin/recover` resets an
+administrator's password, signs out every session that account had, and signs the operator in.
+The key is the credential because holding it already means being the server. `docs/recovery.md`
+is the runbook; the design is in `hs_auth::recovery`'s module documentation; a test drives the
+real binary through the whole thing, wrong key included.
+
 **The admin interface ships.** Until 2026-09-21 it did not: every binary and every published image served a placeholder at `/admin/` saying the interface had not been built in, because nothing embedded `web/dist`. `crates/hs-admin/build.rs` now stages the built interface (or the placeholder, for a Rust-only checkout, and says so at startup); release builds set `HS_ADMIN_WEB_DIST` and *fail* without a built interface; CD refuses to publish an image whose `/admin/` is not the interface. Verified on the published artifact: `ghcr.io/brandon-dacrib/myelin:main`, pulled from the registry on 2026-09-21 and run with the README's exact command, serves the interface at `/admin/`, answers `needs_setup: true`, and logs the setup link. What has still never run is the `v*` binaries job's new Node step, which only a tag exercises.
 
 **Complement, `csapi`: 317 of 384 assertions pass** (78 of 106 top-level), measured 2026-09-26 at
@@ -308,7 +320,7 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 | Management web interface | ~75% | users (with devices, sign-out and password reset), rooms (with members), bridges (the catalogue, the wizard with the bridge's own config, the runbook, sign-in guides), federation destinations, configuration and the audit log are real against the real server; the media and reports pages still read from operations that answer 501; arrays-of-objects are a JSON textarea |
 | **Federation** | **~30%** | 75/250 assertions, 14/88 top-level (run 7); a user here joins a room hosted elsewhere through the client API, messages flow both ways between two real servers, and the room's history from before the join is fetched as the client scrolls back; in-memory outbound queue, no EDUs, no invites/leaves/knocks over federation |
 | Bridges | ~75% | heisenbridge works end to end both directions (`docs/bridges/heisenbridge.md`); mautrix-whatsapp, added through the wizard, connects and starts in appservice-mode encryption (`docs/bridges/mautrix.md`); all 16 bridge operations are real; no mautrix bridge has carried a message yet, because signing in needs a phone |
-| Operations (HA, scale-out) | ~50% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; a standing demo behind a Traefik Ingress with a Let's Encrypt certificate, scraped by Prometheus, its setup page opened in a browser at the public hostname; readiness withdrawn the moment a shutdown begins; two replicas shared a room on one PostgreSQL in an experiment; the cluster path has never carried real traffic on a cluster and the operator creates nothing yet |
+| Operations (HA, scale-out) | ~50% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; a standing demo behind a Traefik Ingress with a Let's Encrypt certificate, scraped by Prometheus, its setup page opened in a browser at the public hostname; a locked-out administrator gets back in with `hs recover` run where the key is; readiness withdrawn the moment a shutdown begins; two replicas shared a room on one PostgreSQL in an experiment; the cluster path has never carried real traffic on a cluster and the operator creates nothing yet |
 
 Federation is still the honest answer to "when could I use this". Everything else is far enough
 along that the gaps are specific and listed. As of 2026-09-25 a user here can join a room on
@@ -658,7 +670,6 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | In-process server cannot be restarted over its data directory | `hs-cli` | background tasks hold the store's lock after `shutdown()`; restart tests need the real binary |
 | The release binaries job's web build has never run | `.github` | it only runs on a `v*` tag; the image path is verified, this one is not |
 | The chart is published only on a `v*` tag | `.github` | `helm install oci://...` is not possible yet; it installs from a checkout |
-| A locked-out sole administrator has no offline way back in | `hs-cli`, `hs-auth` | the setup link is re-offered only once no active administrator exists, and deactivating one takes an administrator; the way back in today is a registration shared secret and `hs register --admin`, which on Kubernetes means a `helm upgrade` and a restart before the reset can start (hit on the demo, 2026-09-26, minutes after the first administrator was made); an `hs reset-password --data-dir`, or a re-offer of the setup link the operator can trigger, would make it one step |
 | A pod does not know its own mesh address | `hs-cli`, `hs-cluster` | `advertise_host` falls back to the bind address or `127.0.0.1`; cluster mode between two pods has not been tried |
 | The operator creates no workloads | `hs-operator` | `Homeserver` reconciles to a status only; the chart is the only way to deploy |
 | A cold boot in the image takes about five seconds | `hs-cli`, `hs-kv` | the first startup probe is refused every time; harmless, unmeasured |

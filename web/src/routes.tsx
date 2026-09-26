@@ -91,6 +91,14 @@ const setupRoute = createRoute({
   component: () => <Navigate to="/" replace />,
 });
 
+// `/recover` likewise: the recovery link from `hs recover` opens it (see `Recover.tsx`), and with
+// a session there is nobody locked out to recover.
+const recoverRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/recover",
+  component: () => <Navigate to="/" replace />,
+});
+
 interface BridgesListSearch {
   state?: string;
   kind?: string;
@@ -224,6 +232,7 @@ const settingsRoute = placeholderRoute("/settings");
 const routeTree = rootRoute.addChildren([
   indexRoute,
   setupRoute,
+  recoverRoute,
   bridgesListRoute,
   bridgesNewRoute,
   bridgeCreatedRoute,

@@ -57,7 +57,8 @@ function MockSignIn() {
           Sign in read-only (demo)
         </Button>
       </div>
-      <p className="mt-6 text-xs text-text-faint">
+      <LockedOutHint />
+      <p className="mt-2 text-xs text-text-faint">
         Mock mode (<code className="font-identifier">VITE_HS_MOCK=1</code>): this stands in for
         track 07&apos;s issuer. See docs/decisions/0003-web-stack.md.
       </p>
@@ -181,7 +182,21 @@ function RealSignIn() {
           {pending ? "Signing in…" : "Sign in"}
         </Button>
       </form>
+      <LockedOutHint />
     </SignInShell>
+  );
+}
+
+/**
+ * One quiet line under the form. It reveals nothing an attacker can use -- the command needs the
+ * server's own signing key -- and it is exactly what a locked-out operator needs to read.
+ */
+function LockedOutHint() {
+  return (
+    <p className="mt-6 text-xs text-text-faint">
+      Locked out? Run <code className="font-identifier">hs recover</code> where the server runs to
+      get a recovery link.
+    </p>
   );
 }
 

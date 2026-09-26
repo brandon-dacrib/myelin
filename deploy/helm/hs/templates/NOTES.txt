@@ -24,6 +24,12 @@ interface. The link works once. It is rooted at http://localhost:{{ .Values.serv
 port-forward above makes true; set publicBaseUrl to have it rooted at your real address instead.
 {{- end }}
 
+Locked out? When nobody can sign in as an administrator, run this where the server keeps its
+signing key -- the pod -- and open the link it prints:
+  kubectl -n {{ .Release.Namespace }} exec {{ include "hs.fullname" . }}-0 -- hs recover
+It resets an administrator's password and signs you in. The link works once and expires in
+fifteen minutes; only whoever can run a command in the pod, and so read the server's signing
+key, can get one. If the server has no administrator at all, it prints the setup link instead.
 {{- if not .Values.secrets.signingKey.existingSecret }}
 
 Signing key: generated on the first start into keys/ on the data volume, and read back on every

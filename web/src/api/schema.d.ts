@@ -956,6 +956,80 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/recovery/inspect": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * What a recovery link can do
+         * @description The recovery page's first call. The token is the credential; with the right one the answer is the list of administrator accounts whose password the link may reset, and when the link expires. With the wrong one, or once the link is used or expired, it answers only that.
+         */
+        post: operations["recovery.inspect"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/recovery/links": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Issue a one-time administrator recovery link
+         * @description Unauthenticated by bearer token, because it exists for when nobody has one. The credential
+         *     is a signature by this server's own Ed25519 signing key over a short message carrying a
+         *     timestamp and a nonce: whoever can read the key -- from the data volume, the mounted
+         *     Secret, or the directory `hs serve` was given -- is the operator, and already holds
+         *     everything the server is. `hs recover`, run where the key is, builds the request and
+         *     prints the link this answers with.
+         *
+         *     The link opens the recovery page, where an existing administrator's password is reset and
+         *     a session for it is returned. It works once and expires fifteen minutes after issue; a
+         *     newer link replaces an older one. When the server has no active administrator at all,
+         *     the answer is the first-run setup link instead, since that is the way in then.
+         *
+         *     A request is refused when its signature does not verify, its timestamp is more than five
+         *     minutes from this server's clock, or its nonce was seen before. Nothing about the server
+         *     is revealed on refusal.
+         */
+        post: operations["recovery.links.create"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/recovery/reset": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reset an administrator's password through a recovery link
+         * @description Consumes the link. The named account must be an active administrator; its password is replaced, every one of its sessions is signed out, and a fresh session for it is returned so the operator lands in the interface signed in. The password is checked against the server's policy and appears in nothing but the request.
+         */
+        post: operations["recovery.reset"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/registration-tokens": {
         parameters: {
             query?: never;
@@ -2485,6 +2559,53 @@ export interface components {
             /** @default false */
             notify: boolean;
             reason?: string;
+        };
+        RecoveryAdministrator: {
+            user_id: string;
+        };
+        RecoveryInspection: {
+            /** @description The active administrator accounts, any of whose password this link may reset. */
+            administrators: components["schemas"]["RecoveryAdministrator"][];
+            /** Format: int64 */
+            expires_at_ms: number;
+        };
+        RecoveryInspectRequest: {
+            /** @description The token from the link's fragment. */
+            recovery_token: string;
+        };
+        RecoveryLink: {
+            /**
+             * Format: int64
+             * @description When a `recovery` link stops working. Absent for a `setup` link, which is offered until it is used.
+             */
+            expires_at_ms?: number;
+            /**
+             * @description `recovery` is a link to the recovery page. `setup` means this server has no active administrator, so the first-run setup link was issued instead, which creates one.
+             * @enum {string}
+             */
+            kind: "recovery" | "setup";
+            /** @description Rooted at the public base URL when there is one, otherwise at `localhost` on the client port. The token is in the fragment, so it is never sent to the server by a browser. */
+            link: string;
+        };
+        RecoveryLinkRequest: {
+            /** @description The signing key's ID, `ed25519:<version>`, as `/_matrix/key/v2/server` publishes it. Must be this server's current key. */
+            key_id: string;
+            /** @description Random, 8 to 64 characters, never reused. A request whose nonce this server has seen is refused. */
+            nonce: string;
+            /**
+             * Format: int64
+             * @description When the request was signed, milliseconds since the Unix epoch. Accepted within five minutes of the server's clock.
+             */
+            requested_at_ms: number;
+            /** @description Unpadded base64 of the Ed25519 signature over the message `hs.recovery-link.v1\n<requested_at_ms>\n<nonce>\n`, the layout `hs recover` and the server share. */
+            signature: string;
+        };
+        RecoveryResetRequest: {
+            /** @description The new password, checked against the server's password policy. */
+            password: string;
+            recovery_token: string;
+            /** @description The administrator account to reset, a full user ID on this server. */
+            user_id: string;
         };
         RegistrationToken: {
             completed?: number;
@@ -5000,6 +5121,95 @@ export interface operations {
             };
             401: components["responses"]["Unauthenticated"];
             403: components["responses"]["InsufficientScope"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "recovery.inspect": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RecoveryInspectRequest"];
+            };
+        };
+        responses: {
+            /** @description The accounts this link can recover. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecoveryInspection"];
+                };
+            };
+            400: components["responses"]["ValidationFailed"];
+            401: components["responses"]["Unauthenticated"];
+            409: components["responses"]["Conflict"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "recovery.links.create": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RecoveryLinkRequest"];
+            };
+        };
+        responses: {
+            /** @description The link, and when it stops working. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecoveryLink"];
+                };
+            };
+            400: components["responses"]["ValidationFailed"];
+            401: components["responses"]["Unauthenticated"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "recovery.reset": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RecoveryResetRequest"];
+            };
+        };
+        responses: {
+            /** @description The password was reset, and this is a session for the account. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SetupSession"];
+                };
+            };
+            400: components["responses"]["ValidationFailed"];
+            401: components["responses"]["Unauthenticated"];
+            409: components["responses"]["Conflict"];
             429: components["responses"]["RateLimited"];
             500: components["responses"]["Internal"];
             503: components["responses"]["Unavailable"];

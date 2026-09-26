@@ -16,6 +16,20 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
 
 ### Installing and administering it
 
+- **A locked-out administrator gets back in with one command.** `hs recover`, run where the
+  server keeps its signing key (`kubectl exec <pod> -- hs recover`, `docker exec <container> hs
+  recover`, `hs recover --data-dir ./data` on a host), signs a request with that key and prints
+  a one-time link. Opening it shows the administrator accounts, takes a new password for one,
+  signs out every session that account had, and signs the operator in. The link expires in
+  fifteen minutes, works once, and a newer one replaces it; a server with no active
+  administrator is handed its setup link instead. The key is the credential because holding it
+  already means being the server, so this adds no new power; a request from any other key, or
+  more than five minutes from the server's clock, or replayed, is refused with nothing said.
+  Issuance and the reset are in the audit log and the server log, without the token or the
+  password. Verified 2026-09-26 by a test that drives the real binary with a real key on disk
+  through the whole thing, a stranger's key included, and by `npm run check` and a Playwright
+  run of the page. `docs/recovery.md` is the runbook. Before this the way back in was a
+  registration shared secret, a restart, a second administrator and a deactivation.
 - **The install is reachable through an Ingress, and the setup link works through it.** The
   chart's Ingress and HTTPRoute route the management interface (`/admin/`), its API (`/api/v1`)
   and the Synapse-compatible admin API (`/_synapse`) on the client host, on by default

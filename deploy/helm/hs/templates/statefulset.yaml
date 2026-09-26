@@ -143,6 +143,12 @@ spec:
               value: {{ .Values.storage.postgres.password.value | quote }}
             {{- end }}
             {{- end }}
+            {{- if eq $backend "embedded" }}
+            ## The same directory `--data-dir` names above, so `kubectl exec <pod> -- hs recover`
+            ## finds the signing key with no flags (see NOTES.txt, "Locked out").
+            - name: HS_DATA_DIR
+              value: {{ include "hs.dataDir" . | quote }}
+            {{- end }}
             {{- if .Values.secrets.registrationSharedSecret.existingSecret }}
             - name: HS__AUTH__REGISTRATION_SHARED_SECRET_FILE
               value: /etc/hs/secrets/registration-shared-secret

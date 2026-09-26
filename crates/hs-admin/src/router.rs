@@ -32,13 +32,14 @@ use crate::idempotency::{IdempotencyStore, Replay, StoredResponse};
 use crate::model::{
     Actor, ActorKind, AdminAppserviceCreate, AdminAppserviceReplay, AuditChange, AuditEntry,
     AuditOutcome, ConfigSchema, ConfigSection, ConfigSectionInfo, ConfigSettingInfo, Event, Page,
-    Principal, ResourceRef, Scope, ServerHealth, ServerInfo, SetupRequest, SetupStatus,
+    Principal, RecoveryInspectRequest, RecoveryLinkRequest, RecoveryResetRequest, ResourceRef,
+    Scope, ServerHealth, ServerInfo, SetupRequest, SetupStatus,
 };
 use crate::operations::{OperationDef, load as load_operations};
 use crate::sources::{
     AppserviceDirectory, ConfigPatch, ConfigSource, FederationSource, OverviewSource,
-    RoomDirectory, RoomFilter, SetupSource, SourceError, UserCreateRequest, UserDirectory,
-    UserFilter, UserLookupQuery,
+    RecoverySource, RoomDirectory, RoomFilter, SetupSource, SourceError, UserCreateRequest,
+    UserDirectory, UserFilter, UserLookupQuery,
 };
 
 /// Everything an `hs-admin` handler needs. Cloned per-request by axum (cheap: everything inside
@@ -75,6 +76,10 @@ pub struct AdminState {
     /// wired with [`AdminState::with_setup`]; until then `GET /setup` says no setup is on offer
     /// (which is true: nothing here could perform one) and `POST /setup` answers `503`.
     pub setup: Option<Arc<dyn SetupSource>>,
+    /// What the three `recovery.*` operations call to get an administrator back into a server
+    /// nobody can sign in to. `None` until wired with [`AdminState::with_recovery`]; until then
+    /// they answer `503`.
+    pub recovery: Option<Arc<dyn RecoverySource>>,
     /// What `GET /statistics/overview` and `GET /cluster` read. `None` until wired with
     /// [`AdminState::with_overview`]; until then both answer `503 unavailable`.
     pub overview: Option<Arc<dyn OverviewSource>>,
@@ -108,6 +113,7 @@ impl AdminState {
             rooms: None,
             config: None,
             setup: None,
+            recovery: None,
             overview: None,
             appservices: None,
             federation: None,
@@ -168,6 +174,14 @@ impl AdminState {
     #[must_use]
     pub fn with_setup(mut self, setup: Arc<dyn SetupSource>) -> Self {
         self.setup = Some(setup);
+        self
+    }
+
+    /// Wires a real [`RecoverySource`], making `POST /recovery/links`, `POST /recovery/inspect`
+    /// and `POST /recovery/reset` work instead of answering `503 unavailable`.
+    #[must_use]
+    pub fn with_recovery(mut self, recovery: Arc<dyn RecoverySource>) -> Self {
+        self.recovery = Some(recovery);
         self
     }
 
@@ -3901,6 +3915,174 @@ async fn setup_create(State(state): State<AdminState>, body: axum::body::Bytes) 
         .into_response()
 }
 
+// Administrator recovery. Three more operations that take no bearer token, because they exist
+// for when nobody has one: `POST /recovery/links` is signed by this server's own signing key
+// (what `hs recover` sends), and the other two carry the one-time token the link holds. Every
+// response is `no-store`: a link, an administrator list and a session are not for a cache.
+
+async fn recovery_link_create(
+    State(state): State<AdminState>,
+    body: axum::body::Bytes,
+) -> Response {
+    let instance = "/api/v1/recovery/links";
+    let Some(recovery) = &state.recovery else {
+        return source_unavailable("administrator recovery", instance);
+    };
+    let request: RecoveryLinkRequest = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return Problem::validation_failed()
+                .with_detail(format!("invalid JSON body: {e}"))
+                .with_instance(instance)
+                .into_response();
+        }
+    };
+    let key_id = request.key_id.clone();
+    let link = match recovery.issue_link(request).await {
+        Ok(link) => link,
+        Err(e) => {
+            // Refusals are worth a line: a run of them is somebody trying keys against this
+            // server, and one of them is an operator whose clock is wrong.
+            tracing::warn!(key_id = %key_id, error = %e, "a recovery link was requested and refused");
+            return e.to_problem().with_instance(instance).into_response();
+        }
+    };
+
+    // The actor is the key: nobody is signed in, and the request was authenticated by a
+    // signature only the holder of the server's private signing key could have made.
+    let actor = Actor {
+        kind: ActorKind::System,
+        id: format!("signing-key:{key_id}"),
+        display_name: Some("hs recover, signed by this server's signing key".to_owned()),
+        token_id: None,
+        ip: None,
+        user_agent: None,
+    };
+    let target = ResourceRef::new("server", state.server_info.name.clone());
+    let mut entry = AuditEntry::new(
+        "recovery.link_issued",
+        actor.clone(),
+        target.clone(),
+        AuditOutcome::success(201),
+    );
+    entry.changes = vec![AuditChange {
+        pointer: "/recovery_link".to_owned(),
+        from: None,
+        to: Some(json!({ "kind": link.kind, "expires_at_ms": link.expires_at_ms })),
+    }];
+    // The link exists whether or not this write lands, and whoever asked for it holds the
+    // server's key already; refusing to hand it over would keep an operator locked out for the
+    // sake of a record. So, as for first-run setup, a failed audit write is logged, not a 503.
+    if let Err(e) = state.audit.append(entry).await {
+        tracing::error!(error = %e, "a recovery link was issued but the audit entry for it could not be written");
+    }
+    state.events.publish(
+        Event::new("recovery.link_issued", json!({ "kind": link.kind }))
+            .with_resource(target)
+            .with_actor(actor),
+    );
+    tracing::warn!(
+        kind = ?link.kind,
+        expires_at_ms = ?link.expires_at_ms,
+        "an administrator recovery link was issued to the holder of this server's signing key"
+    );
+
+    (
+        StatusCode::CREATED,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        axum::Json(link),
+    )
+        .into_response()
+}
+
+async fn recovery_inspect(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
+    let instance = "/api/v1/recovery/inspect";
+    let Some(recovery) = &state.recovery else {
+        return source_unavailable("administrator recovery", instance);
+    };
+    let request: RecoveryInspectRequest = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return Problem::validation_failed()
+                .with_detail(format!("invalid JSON body: {e}"))
+                .with_instance(instance)
+                .into_response();
+        }
+    };
+    match recovery.inspect(&request.recovery_token).await {
+        Ok(inspection) => (
+            StatusCode::OK,
+            [(axum::http::header::CACHE_CONTROL, "no-store")],
+            axum::Json(inspection),
+        )
+            .into_response(),
+        Err(e) => e.to_problem().with_instance(instance).into_response(),
+    }
+}
+
+async fn recovery_reset(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
+    let instance = "/api/v1/recovery/reset";
+    let Some(recovery) = &state.recovery else {
+        return source_unavailable("administrator recovery", instance);
+    };
+    let request: RecoveryResetRequest = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            // `e` names a position and a field, never a value, so it cannot echo the token or
+            // the password back.
+            return Problem::validation_failed()
+                .with_detail(format!("invalid JSON body: {e}"))
+                .with_instance(instance)
+                .into_response();
+        }
+    };
+    let session = match recovery.reset_password(request).await {
+        Ok(session) => session,
+        Err(e) => return e.to_problem().with_instance(instance).into_response(),
+    };
+
+    // The actor is the account itself: the link was made by whoever holds the server's key, and
+    // whoever used it now holds this account. What is recorded is that the password changed and
+    // through what; the password is in the request and nowhere else.
+    let actor = Actor {
+        kind: ActorKind::User,
+        id: session.user_id.clone(),
+        display_name: None,
+        token_id: None,
+        ip: None,
+        user_agent: None,
+    };
+    let target = ResourceRef::new("user", session.user_id.clone());
+    let mut entry = AuditEntry::new(
+        "recovery.password_reset",
+        actor.clone(),
+        target.clone(),
+        AuditOutcome::success(200),
+    );
+    entry.changes = vec![AuditChange {
+        pointer: "/password".to_owned(),
+        from: None,
+        to: Some(json!("<redacted>")),
+    }];
+    // The password is reset whether or not this write lands; see `setup_create`.
+    if let Err(e) = state.audit.append(entry).await {
+        tracing::error!(error = %e, user_id = %session.user_id, "an administrator's password was reset through a recovery link but the audit entry for it could not be written");
+    }
+    state.events.publish(
+        Event::new("recovery.completed", json!({ "user_id": session.user_id }))
+            .with_resource(target)
+            .with_actor(actor),
+    );
+    tracing::warn!(user_id = %session.user_id, "an administrator's password was reset through a recovery link, and every other session of the account was signed out");
+
+    (
+        StatusCode::OK,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        axum::Json(session),
+    )
+        .into_response()
+}
+
 /// Builds the full router: every declared `/api/v1` operation (enforced but not implemented),
 /// the OpenAPI document endpoints, and `/admin/` static assets (`crate::assets`). Returns the
 /// manifest alongside so callers can write `routes.json` (RFC 0005) or run the contract check.
@@ -3945,6 +4127,30 @@ pub fn build_router(state: AdminState) -> (axum::Router, RouteManifest) {
         setup_create,
         RouteMeta::new(Surface::Admin, AuthKind::None)
             .with_operation_id("setup.create")
+            .rate_limited(),
+    );
+    builder = builder.add(
+        axum::http::Method::POST,
+        "/api/v1/recovery/links",
+        recovery_link_create,
+        RouteMeta::new(Surface::Admin, AuthKind::None)
+            .with_operation_id("recovery.links.create")
+            .rate_limited(),
+    );
+    builder = builder.add(
+        axum::http::Method::POST,
+        "/api/v1/recovery/inspect",
+        recovery_inspect,
+        RouteMeta::new(Surface::Admin, AuthKind::None)
+            .with_operation_id("recovery.inspect")
+            .rate_limited(),
+    );
+    builder = builder.add(
+        axum::http::Method::POST,
+        "/api/v1/recovery/reset",
+        recovery_reset,
+        RouteMeta::new(Surface::Admin, AuthKind::None)
+            .with_operation_id("recovery.reset")
             .rate_limited(),
     );
 
@@ -6362,6 +6568,279 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Administrator recovery.
+    // ---------------------------------------------------------------------------------------
+
+    fn state_with_recovery(audit: Arc<InMemoryAuditSink>, administrators: &[&str]) -> AdminState {
+        use crate::sources::InMemoryRecoverySource;
+        AdminState::new(
+            Arc::new(StaticVerifier::new()),
+            audit,
+            Arc::new(EventBus::new()),
+        )
+        .with_recovery(Arc::new(InMemoryRecoverySource::open(
+            "https://matrix.example.org",
+            "a-real-signature",
+            administrators.iter().map(|s| (*s).to_owned()).collect(),
+        )))
+    }
+
+    async fn post_recovery(
+        router: &axum::Router,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, Option<String>, serde_json::Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let cache = response
+            .headers()
+            .get("cache-control")
+            .map(|v| v.to_str().unwrap().to_owned());
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, cache, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn signed_by(signature: &str) -> serde_json::Value {
+        json!({
+            "key_id": "ed25519:a_key",
+            "requested_at_ms": 1_700_000_000_000u64,
+            "nonce": "nonce-1",
+            "signature": signature,
+        })
+    }
+
+    fn token_of(link: &str) -> String {
+        link.split_once("#token=").unwrap().1.to_owned()
+    }
+
+    #[tokio::test]
+    async fn a_recovery_link_is_issued_only_to_a_signed_request_and_is_recorded() {
+        // Nothing wired: an honest 503, not a 404 and not a link.
+        let (router, _manifest) = build_router(test_state());
+        let (status, _, _) = post_recovery(
+            &router,
+            "/api/v1/recovery/links",
+            signed_by("a-real-signature"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let audit = Arc::new(InMemoryAuditSink::new());
+        let (router, _manifest) =
+            build_router(state_with_recovery(audit.clone(), &["@ops:example.org"]));
+
+        let (status, _, problem) =
+            post_recovery(&router, "/api/v1/recovery/links", signed_by("forged")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{problem}");
+        assert!(
+            audit
+                .query(&AuditFilter {
+                    action: Some("recovery.link_issued".into()),
+                    limit: 10,
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .is_empty(),
+            "a refusal is not an issuance"
+        );
+
+        let (status, cache, link) = post_recovery(
+            &router,
+            "/api/v1/recovery/links",
+            signed_by("a-real-signature"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{link}");
+        assert_eq!(cache.as_deref(), Some("no-store"));
+        assert_eq!(link["kind"], "recovery");
+        assert!(
+            link["link"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://matrix.example.org/admin/recover#token="),
+            "{link}"
+        );
+        assert_eq!(link["expires_at_ms"], 1_700_000_000_000u64 + 15 * 60 * 1000);
+
+        let entries = audit
+            .query(&AuditFilter {
+                action: Some("recovery.link_issued".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].actor.id, "signing-key:ed25519:a_key");
+        assert!(
+            !serde_json::to_string(&entries[0])
+                .unwrap()
+                .contains(&token_of(link["link"].as_str().unwrap())),
+            "the token reached the audit log"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_with_no_administrator_is_handed_its_setup_link_instead() {
+        let (router, _manifest) =
+            build_router(state_with_recovery(Arc::new(InMemoryAuditSink::new()), &[]));
+        let (status, _, link) = post_recovery(
+            &router,
+            "/api/v1/recovery/links",
+            signed_by("a-real-signature"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{link}");
+        assert_eq!(link["kind"], "setup");
+        assert!(
+            link["link"]
+                .as_str()
+                .unwrap()
+                .contains("/admin/setup#token="),
+            "{link}"
+        );
+        assert!(link.get("expires_at_ms").is_none(), "{link}");
+    }
+
+    #[tokio::test]
+    async fn the_link_inspects_and_resets_once_and_says_which_field_is_wrong() {
+        let audit = Arc::new(InMemoryAuditSink::new());
+        let (router, _manifest) = build_router(state_with_recovery(
+            audit.clone(),
+            &["@ops:example.org", "@sam:example.org"],
+        ));
+
+        // Before any link is issued there is nothing to inspect, and it says so.
+        let (status, _, problem) = post_recovery(
+            &router,
+            "/api/v1/recovery/inspect",
+            json!({"recovery_token": "anything"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{problem}");
+
+        let (_, _, link) = post_recovery(
+            &router,
+            "/api/v1/recovery/links",
+            signed_by("a-real-signature"),
+        )
+        .await;
+        let token = token_of(link["link"].as_str().unwrap());
+
+        let (status, _, problem) = post_recovery(
+            &router,
+            "/api/v1/recovery/inspect",
+            json!({"recovery_token": "not-it"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{problem}");
+
+        let (status, cache, inspection) = post_recovery(
+            &router,
+            "/api/v1/recovery/inspect",
+            json!({"recovery_token": token}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{inspection}");
+        assert_eq!(cache.as_deref(), Some("no-store"));
+        assert_eq!(
+            inspection["administrators"],
+            json!([{"user_id": "@ops:example.org"}, {"user_id": "@sam:example.org"}])
+        );
+
+        // A request that cannot be used says which field, and does not spend the link.
+        for (body, pointer) in [
+            (
+                json!({"recovery_token": token, "user_id": "@mallory:example.org", "password": "correct horse battery"}),
+                "/user_id",
+            ),
+            (
+                json!({"recovery_token": token, "user_id": "@ops:example.org", "password": "short"}),
+                "/password",
+            ),
+        ] {
+            let (status, _, problem) = post_recovery(&router, "/api/v1/recovery/reset", body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+            assert_eq!(problem["errors"][0]["pointer"], pointer, "{problem}");
+        }
+        // And the wrong token learns nothing about the user or the password.
+        let (status, _, problem) = post_recovery(
+            &router,
+            "/api/v1/recovery/reset",
+            json!({"recovery_token": "not-it", "user_id": "@mallory:example.org", "password": "x"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{problem}");
+        assert!(problem.get("errors").is_none(), "{problem}");
+
+        let (status, cache, session) = post_recovery(
+            &router,
+            "/api/v1/recovery/reset",
+            json!({"recovery_token": token, "user_id": "@ops:example.org", "password": "correct horse battery"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{session}");
+        assert_eq!(cache.as_deref(), Some("no-store"));
+        assert_eq!(session["user_id"], "@ops:example.org");
+        assert!(
+            session["access_token"]
+                .as_str()
+                .is_some_and(|t| !t.is_empty())
+        );
+
+        let entries = audit
+            .query(&AuditFilter {
+                action: Some("recovery.password_reset".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].actor.id, "@ops:example.org");
+        assert_eq!(entries[0].target.id, "@ops:example.org");
+        let recorded = serde_json::to_string(&entries[0]).unwrap();
+        assert!(
+            !recorded.contains("correct horse"),
+            "the password reached the audit log"
+        );
+        assert!(
+            !recorded.contains(&token),
+            "the token reached the audit log"
+        );
+
+        // Used: the same token opens nothing now, in either direction.
+        let (status, _, _) = post_recovery(
+            &router,
+            "/api/v1/recovery/inspect",
+            json!({"recovery_token": token}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _, _) = post_recovery(
+            &router,
+            "/api/v1/recovery/reset",
+            json!({"recovery_token": token, "user_id": "@sam:example.org", "password": "correct horse battery"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 
     // ---------------------------------------------------------------------------------------

@@ -67,24 +67,33 @@ fn first_signing_key_in_dir(dir: &Path) -> Option<SigningKeyPair> {
     // Deterministic order: `read_dir` gives no ordering guarantee, and picking "the first key
     // found" should not depend on filesystem-specific directory-entry ordering.
     paths.sort();
-    for path in paths {
-        if !path.is_file() {
-            continue;
-        }
-        let Ok(contents) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        for line in contents.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some(pair) = parse_signing_key_line(line) {
-                return Some(pair);
-            }
-        }
+    paths
+        .into_iter()
+        .filter(|path| path.is_file())
+        .find_map(|path| first_signing_key_in_file(&path))
+}
+
+/// The first parseable key line in one file, or `None` if there is none or it cannot be read.
+fn first_signing_key_in_file(path: &Path) -> Option<SigningKeyPair> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .find_map(parse_signing_key_line)
+}
+
+/// The signing key at `path`, which is either a key file or a directory holding one (the
+/// `keys/` under a data directory, or a mounted Secret). Read, never generated: this is what
+/// `hs recover` uses to prove it is run by whoever holds the server's key, and a key it made
+/// up would prove nothing.
+#[must_use]
+pub fn load_signing_key(path: &Path) -> Option<SigningKeyPair> {
+    if path.is_dir() {
+        first_signing_key_in_dir(path)
+    } else {
+        first_signing_key_in_file(path)
     }
-    None
 }
 
 /// Writes a newly generated signing key into `dir` and returns it, or `None` if the directory

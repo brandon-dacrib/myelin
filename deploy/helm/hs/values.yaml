@@ -176,7 +176,9 @@ secrets:
   ## `/etc/hs/secrets/signing-key` and `server.signing_key_path` is pinned there through the
   ## environment (`hs-cli` scans every file in that directory, Synapse-style, for the first
   ## parseable key); `key` documents which data key inside the Secret should hold it
-  ## (`kubectl create secret generic <name> --from-file=signing.key=<path>`). It is not
+  ## (`kubectl create secret generic <name> --from-file=signing.key=<path>`). Wherever the key
+  ## is, `kubectl exec <pod> -- hs recover` finds it there and prints a one-time link that gets a
+  ## locked-out administrator back in (NOTES.txt says how). It is not
   ## `subPath`-mounted as a single file, since that silently defeated key persistence (see
   ## docs/status/12-platform-and-kubernetes.md, 2026-09-19).
   signingKey:

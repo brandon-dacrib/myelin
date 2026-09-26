@@ -181,6 +181,27 @@ path: Synapse never has its database written to, and if an operator rolls
 back per `PLAN.md` 9.4 step 5, Synapse's own signing key file — untouched
 throughout — is exactly what Synapse resumes with).
 
+## `hs recover` (no Synapse equivalent)
+
+Synapse has no way back in for an operator who cannot sign in as an
+administrator short of a SQL `UPDATE` on `users.password_hash` or
+`register_new_matrix_user -a` for a second one. This server has one:
+
+**Flags:** `hs recover [--server URL] [--signing-key FILE_OR_DIR]
+[--data-dir DIR]`. Run where the server keeps its signing key; the
+request it sends is signed with that key, which is what entitles the
+caller to a link. `--server` defaults to `http://127.0.0.1:8008` (right
+from inside the pod or the container); the key is looked for at
+`--signing-key`, else `HS__SERVER__SIGNING_KEY_PATH`, else `keys/` under
+`--data-dir` or `HS_DATA_DIR`.
+
+**Output:** the link on stdout, alone, so `$(hs recover)` is the link;
+what it is and when it expires on stderr. The link opens
+`/admin/recover`, resets an administrator's password, signs out that
+account's sessions and signs the operator in. It works once and expires
+in fifteen minutes. A server with no active administrator gets its setup
+link instead. Runbook: `docs/recovery.md`; design: `hs_auth::recovery`.
+
 ## Docker entrypoint environment variables
 
 Joint with track 12 (who owns the image and entrypoint script); this

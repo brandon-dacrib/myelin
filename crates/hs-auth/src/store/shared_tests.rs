@@ -11,7 +11,10 @@
 
 use ruma::{device_id, user_id};
 
-use super::{AccessTokenRecord, AuthStore, DeviceRecord, LoginTokenRecord, StoreError, UserRecord};
+use super::{
+    AccessTokenRecord, AuthStore, DeviceRecord, LoginTokenRecord, RecoveryTokenRecord, StoreError,
+    UserRecord,
+};
 use crate::token::TokenHash;
 
 pub(crate) async fn create_user_then_get_round_trips<S: AuthStore>(s: &S) {
@@ -535,7 +538,41 @@ pub(crate) async fn clear_setup_token_withdraws_it_and_is_idempotent<S: AuthStor
     s.clear_setup_token().await.unwrap();
 }
 
+pub(crate) async fn recovery_token_is_replaced_consumed_once_and_cleared<S: AuthStore>(s: &S) {
+    assert_eq!(s.recovery_token().await.unwrap(), None);
+    assert!(!s.consume_recovery_token("").await.unwrap());
+
+    s.set_recovery_token("first", 1_000).await.unwrap();
+    // A newer link replaces the older one, expiry included.
+    s.set_recovery_token("second", 2_000).await.unwrap();
+    assert_eq!(
+        s.recovery_token().await.unwrap(),
+        Some(RecoveryTokenRecord {
+            token: "second".into(),
+            expires_at_ms: 2_000
+        })
+    );
+    // The replaced token is gone, and a near miss is a miss.
+    assert!(!s.consume_recovery_token("first").await.unwrap());
+    assert!(!s.consume_recovery_token("secon").await.unwrap());
+    assert!(!s.consume_recovery_token("second ").await.unwrap());
+    assert!(s.recovery_token().await.unwrap().is_some());
+
+    assert!(s.consume_recovery_token("second").await.unwrap());
+    assert!(!s.consume_recovery_token("second").await.unwrap());
+    assert_eq!(s.recovery_token().await.unwrap(), None);
+
+    // Clearing is idempotent and independent of the setup token beside it.
+    s.setup_token_or_insert("setup").await.unwrap();
+    s.set_recovery_token("third", 3_000).await.unwrap();
+    s.clear_recovery_token().await.unwrap();
+    s.clear_recovery_token().await.unwrap();
+    assert_eq!(s.recovery_token().await.unwrap(), None);
+    assert_eq!(s.setup_token().await.unwrap().as_deref(), Some("setup"));
+}
+
 pub(crate) async fn run_all<S: AuthStore>(make_store: impl Fn() -> S) {
+    recovery_token_is_replaced_consumed_once_and_cleared(&make_store()).await;
     create_user_then_get_round_trips(&make_store()).await;
     create_user_conflict_is_case_insensitive(&make_store()).await;
     create_user_exact_duplicate_is_conflict(&make_store()).await;

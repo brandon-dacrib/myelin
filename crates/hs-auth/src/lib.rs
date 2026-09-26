@@ -41,6 +41,7 @@ pub mod middleware;
 pub mod password;
 pub mod ratelimit;
 pub mod reauth;
+pub mod recovery;
 pub mod requester;
 pub mod routes;
 pub mod session;
