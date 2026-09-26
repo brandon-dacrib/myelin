@@ -12,7 +12,7 @@ name: cd
 #
 # | trigger | images | binaries | chart | published |
 # |---|---|---|---|---|
-# | push to `main` | yes, tagged `edge` and the commit sha | no | no | yes |
+# | push to `main` | yes, tagged `main` and the commit sha | no | no | yes |
 # | tag `v*` | yes, tagged with the version and `latest` | yes, attached to the release | yes | yes |
 # | manual dispatch | yes, tagged `manual-<sha>` | if asked | no | only if asked |
 #
@@ -251,7 +251,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch,enable=${{ github.ref == 'refs/heads/main' }},value=edge
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
             type=sha,format=long
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -358,12 +358,15 @@ jobs:
       - uses: azure/setup-helm@v4
 
       - name: Lint and template before publishing anything
-        # The chart requires a server name and a signing-key secret by design and fails closed
-        # without them, so both are supplied here purely to make rendering possible.
+        # A server name is the one value the chart requires, so it is supplied to make rendering
+        # possible. Cluster mode is rendered too, with the signing-key Secret it insists on.
         run: |
           set -euo pipefail
-          helm lint deploy/helm/hs --set serverName=example.org --set secrets.signingKey.existingSecret=example
-          helm template myelin deploy/helm/hs --set serverName=example.org --set secrets.signingKey.existingSecret=example > /dev/null
+          helm lint deploy/helm/hs --set serverName=example.org
+          helm template myelin deploy/helm/hs --set serverName=example.org > /dev/null
+          helm template myelin deploy/helm/hs --set serverName=example.org --set mode=cluster \
+            --set storage.backend=postgres --set storage.postgres.host=db --set media.storage.backend=s3 \
+            --set media.storage.s3.bucket=media --set secrets.signingKey.existingSecret=example > /dev/null
 
       - name: Package and push
         run: |
@@ -410,6 +413,5 @@ jobs:
             ```
             helm install myelin oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts/hs \
               --version ${GITHUB_REF_NAME#v} \
-              --set serverName=example.org \
-              --set secrets.signingKey.existingSecret=myelin-signing-key
+              --set serverName=example.org
             ```

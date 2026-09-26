@@ -26,8 +26,10 @@ port-forward above makes true; set publicBaseUrl to have it rooted at your real 
 
 {{- if not .Values.secrets.signingKey.existingSecret }}
 
-WARNING: secrets.signingKey.existingSecret is not set. The workload will fail to start (see
-templates/_helpers.tpl's hs.validate check). Generate a key and create the Secret first:
+Signing key: generated on the first start into keys/ on the data volume, and read back on every
+restart. The volume is kept on `helm uninstall` (storage.embedded.resourcePolicy), so a reinstall
+keeps the key too. To bring your own instead, or before moving to cluster mode:
   hs generate-signing-key -o signing.key
   kubectl -n {{ .Release.Namespace }} create secret generic my-hs-signing-key --from-file=signing.key
+  helm upgrade ... --set secrets.signingKey.existingSecret=my-hs-signing-key
 {{- end }}

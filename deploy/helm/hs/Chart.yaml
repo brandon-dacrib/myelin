@@ -1,22 +1,27 @@
 apiVersion: v2
 name: hs
 description: >-
-  A modern Matrix homeserver written in Rust. Values are modeled so this chart can replace the
-  Synapse component of an Element Server Suite Community (element-hq/ess-helm) deployment:
-  single-node and cluster modes, CloudNativePG integration, object storage, probes, a
-  PodDisruptionBudget, anti-affinity, an HPA on custom metrics, a ServiceMonitor, and
-  Ingress/Gateway API routing. See docs/status/12-platform-and-kubernetes.md for what has
-  actually been validated against a live cluster (nothing yet — no kind/cluster access in this
-  environment; validated so far only via `helm template`/`helm lint`).
+  Myelin, a modern Matrix homeserver in Rust. One value installs it: `helm install myelin
+  <chart> --set serverName=example.org` is a running server with its signing key, database and
+  media on one volume and a one-time setup link for the first administrator in its log. Values
+  are modeled on element-hq/ess-helm's Synapse component so the chart can take its place in an
+  Element Server Suite Community deployment: single-node and cluster modes, CloudNativePG
+  integration, object storage, probes, a PodDisruptionBudget, anti-affinity, an HPA, a
+  ServiceMonitor, and Ingress/Gateway API routing. docs/status/12-platform-and-kubernetes.md
+  records what has been verified against a real cluster and what has only been rendered.
 type: application
 version: 0.1.0
-appVersion: "0.0.1"
+# The image tag the chart pulls when `image.tag` is unset. `main` is the continuously published
+# build (there is no tagged release yet); CD's `helm package --app-version <version>` replaces it
+# on a `v*` tag so a released chart pulls the matching image.
+appVersion: "main"
 keywords:
   - matrix
   - homeserver
   - chat
-home: https://github.com/element-hq/ess-helm
+home: https://github.com/brandon-dacrib/myelin
 sources:
+  - https://github.com/brandon-dacrib/myelin
   - https://github.com/element-hq/ess-helm
 maintainers:
   - name: track-12-platform-and-kubernetes

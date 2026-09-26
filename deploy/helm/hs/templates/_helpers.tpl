@@ -125,7 +125,16 @@ otherwise on the dedicated claim's own mount.
 {{- if and (eq (include "hs.storageBackend" .) "postgres") (not .Values.cloudNativePG.enabled) (not .Values.storage.postgres.host) -}}
 {{- fail "storage.backend is postgres but neither cloudNativePG.enabled nor storage.postgres.host is set" -}}
 {{- end -}}
-{{- if not .Values.secrets.signingKey.existingSecret -}}
-{{- fail "secrets.signingKey.existingSecret is required; generate one with `hs generate-signing-key` and create the Secret out of band (this chart never generates or stores a signing key itself, since it must survive `helm uninstall`/reinstall)" -}}
+{{- if and (eq .Values.mode "cluster") (not .Values.secrets.signingKey.existingSecret) -}}
+{{- fail "secrets.signingKey.existingSecret is required in cluster mode: replicas share no volume and must sign with the same key. Generate one with `hs generate-signing-key -o signing.key` and `kubectl create secret generic <name> --from-file=signing.key`. (singleNode mode generates its key on the data volume and needs no Secret.)" -}}
 {{- end -}}
+{{- end -}}
+
+{{/*
+The data volume's root in singleNode mode: `hs serve --data-dir` puts the database in `db/`,
+signing keys in `keys/` and media in `media/` underneath it, exactly as the container image's
+`HS_DATA_DIR=/data` does for `docker run`.
+*/}}
+{{- define "hs.dataDir" -}}
+/var/lib/hs/data
 {{- end -}}

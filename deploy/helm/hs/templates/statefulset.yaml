@@ -62,7 +62,13 @@ spec:
           imagePullPolicy: {{ include "hs.imagePullPolicy" . }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          {{- if eq $backend "embedded" }}
+          ## `--data-dir`: database, signing keys and media under the data volume, the layout the
+          ## image's own `docker run` quickstart uses. The ConfigMap is the seed layer on top.
+          args: ["serve", "--data-dir", {{ include "hs.dataDir" . | quote }}, "-c", "/etc/hs/config/homeserver.yaml"]
+          {{- else }}
           args: ["serve", "-c", "/etc/hs/config/homeserver.yaml"]
+          {{- end }}
           ports:
             - name: client
               containerPort: {{ .Values.service.clientPort }}
@@ -74,8 +80,29 @@ spec:
               containerPort: {{ .Values.service.metricsPort }}
               protocol: TCP
           env:
-            - name: RUST_LOG
-              value: {{ .Values.telemetry.logging.level | quote }}
+            ## No RUST_LOG here: `telemetry.logging.level` in the ConfigMap sets the level, and
+            ## the server's own directives for it hold the embedded storage engine to `warn`
+            ## (crates/hs-telemetry/src/init.rs). A `RUST_LOG=info` in the environment overrode
+            ## that and put sixty `lsm_tree` lines above the setup link on every first boot
+            ## (seen 2026-09-26). Set RUST_LOG through `extraEnv` to debug something specific.
+            ## Pinned through the environment rather than written to the ConfigMap: the
+            ## environment outranks the database (docs/rfcs/0016), so these always mean what the
+            ## chart says, `helm upgrade` after `helm upgrade`, and the admin interface shows
+            ## them as set by the deployment rather than offering to change them.
+            - name: HS__SERVER__SERVER_NAME
+              value: {{ .Values.serverName | quote }}
+            {{- if .Values.publicBaseUrl }}
+            - name: HS__SERVER__PUBLIC_BASEURL
+              value: {{ .Values.publicBaseUrl | quote }}
+            {{- end }}
+            {{- if .Values.secrets.signingKey.existingSecret }}
+            ## A *directory*, not a file: the loader (crates/hs-cli/src/identity.rs) reads every
+            ## regular file in it, Synapse-style, for the first parseable key. Pointing it at a
+            ## `subPath`-mounted file made `read_dir` fail silently and gave every restart a
+            ## fresh key (2026-09-19); the Secret is mounted whole, below.
+            - name: HS__SERVER__SIGNING_KEY_PATH
+              value: /etc/hs/secrets/signing-key
+            {{- end }}
             {{- if eq $backend "postgres" }}
             {{- if .Values.cloudNativePG.enabled }}
             - name: HS__STORAGE__BACKEND
@@ -116,10 +143,14 @@ spec:
               value: {{ .Values.storage.postgres.password.value | quote }}
             {{- end }}
             {{- end }}
+            {{- if .Values.secrets.registrationSharedSecret.existingSecret }}
             - name: HS__AUTH__REGISTRATION_SHARED_SECRET_FILE
               value: /etc/hs/secrets/registration-shared-secret
+            {{- end }}
+            {{- if .Values.secrets.sessionSecret.existingSecret }}
             - name: HS__AUTH__SESSION_SECRET_FILE
               value: /etc/hs/secrets/session-secret
+            {{- end }}
             {{- if and .Values.telemetry.sentry.enabled .Values.telemetry.sentry.dsn.secret }}
             - name: HS__TELEMETRY__SENTRY__DSN_FILE
               value: /etc/hs/secrets/sentry-dsn
@@ -131,13 +162,12 @@ spec:
             - name: config
               mountPath: /etc/hs/config
               readOnly: true
-            ## Mounted as a directory (no `subPath`): `server.signing_key_path` in the rendered
-            ## config points at this directory, not a single file — see configmap.yaml's comment
-            ## on `signing_key_path` for why a file mount here silently produces a fresh signing
-            ## key on every restart instead of failing loudly.
+            {{- if .Values.secrets.signingKey.existingSecret }}
+            ## Mounted as a directory (no `subPath`); see HS__SERVER__SIGNING_KEY_PATH above.
             - name: secrets-signing-key
               mountPath: /etc/hs/secrets/signing-key
               readOnly: true
+            {{- end }}
             {{- if .Values.secrets.registrationSharedSecret.existingSecret }}
             - name: secrets-registration-shared-secret
               mountPath: /etc/hs/secrets/registration-shared-secret
@@ -158,7 +188,7 @@ spec:
             {{- end }}
             {{- if eq $backend "embedded" }}
             - name: data
-              mountPath: /var/lib/hs/data
+              mountPath: {{ include "hs.dataDir" . }}
             {{- end }}
             {{- if and (eq .Values.media.storage.backend "local") .Values.media.storage.local.existingClaim }}
             - name: media
@@ -206,9 +236,11 @@ spec:
         - name: config
           configMap:
             name: {{ .Values.existingConfigMap | default (printf "%s-config" (include "hs.fullname" .)) }}
+        {{- if .Values.secrets.signingKey.existingSecret }}
         - name: secrets-signing-key
           secret:
             secretName: {{ .Values.secrets.signingKey.existingSecret }}
+        {{- end }}
         {{- if .Values.secrets.registrationSharedSecret.existingSecret }}
         - name: secrets-registration-shared-secret
           secret:

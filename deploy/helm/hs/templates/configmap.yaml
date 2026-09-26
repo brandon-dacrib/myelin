@@ -7,23 +7,13 @@ metadata:
   labels:
     {{- include "hs.labels" . | nindent 4 }}
 data:
+  # The *file* layer of the server's configuration (docs/rfcs/0016): it seeds the database on
+  # the first start and is outranked by the database after that, so what is here is what an
+  # operator may later change in the admin interface. What must always apply -- the server name,
+  # the public base URL, the signing-key path, the database connection -- is not here: the
+  # StatefulSet passes those as `HS__` environment variables, which outrank everything.
   homeserver.yaml: |
     {{- $backend := include "hs.storageBackend" . }}
-    server:
-      server_name: {{ .Values.serverName | quote }}
-      {{- if .Values.publicBaseUrl }}
-      public_baseurl: {{ .Values.publicBaseUrl | quote }}
-      {{- end }}
-      # A *directory*, not a file: `hs-cli`'s identity loader
-      # (crates/hs-cli/src/identity.rs::first_signing_key_in_dir) does a non-recursive
-      # `read_dir` over every regular file here, Synapse-style, and reads the first parseable
-      # `ed25519 <key-id> <base64-seed>` line it finds. Pointing this at a file (as an earlier
-      # version of this chart did, `subPath`-mounting the Secret directly onto this path) makes
-      # `read_dir` fail silently, and `hs serve` falls back to a fresh in-memory key every
-      # restart — verified live against the built image, 2026-09-19 (see
-      # docs/status/12-platform-and-kubernetes.md). The volume below mounts the whole Secret as a
-      # directory instead, with no `subPath`.
-      signing_key_path: /etc/hs/secrets/signing-key
     listeners:
       listeners:
         - port: {{ .Values.service.clientPort }}
@@ -32,14 +22,10 @@ data:
         - port: {{ .Values.service.metricsPort }}
           bind_addresses: ["::"]
           resources: [metrics]
+    {{- if ne $backend "embedded" }}
     storage:
       backend: {{ $backend }}
-      {{- if eq $backend "embedded" }}
-      # The same layout `hs serve --data-dir` makes on a first run: `db/` and `media/` side by
-      # side under one root, here the data volume. The database does not get the volume's root
-      # to itself because media has to live on this volume too.
-      data_dir: /var/lib/hs/data/db
-      {{- else if eq $backend "postgres" }}
+      {{- if eq $backend "postgres" }}
       {{- if .Values.cloudNativePG.enabled }}
       # host/port/database/user/password are supplied via HS__STORAGE__* environment variables
       # sourced from the CloudNativePG-generated Secret (see templates/deployment.yaml /
@@ -57,9 +43,16 @@ data:
       bucket_url: {{ .Values.storage.objectStorage.bucketUrl | quote }}
       shard_count: {{ .Values.storage.objectStorage.shardCount }}
       {{- end }}
-    # Always set. Left out, `media.storage.path` defaults to the *relative* `./media-store`,
-    # which is the container's working directory: not on any volume, and not writable at all
-    # under `readOnlyRootFilesystem: true`, where every upload fails.
+    {{- end }}
+    {{- /*
+    Embedded storage says nothing here: `hs serve --data-dir` (see statefulset.yaml's args)
+    derives `db/`, `keys/` and `media/` under the data volume, and a path written here would
+    outrank that derivation for no gain. Media is rendered only when it is somewhere other than
+    the data volume: an S3 bucket, or a dedicated claim. Left unset in *that* case,
+    `media.storage.path` would default to the relative `./media-store` -- the container's working
+    directory, on no volume and not writable under `readOnlyRootFilesystem: true`.
+    */}}
+    {{- if or (eq .Values.media.storage.backend "s3") .Values.media.storage.local.existingClaim (ne $backend "embedded") }}
     media:
       storage:
         {{- if eq .Values.media.storage.backend "s3" }}
@@ -81,6 +74,7 @@ data:
         backend: local
         path: {{ include "hs.mediaPath" . }}
         {{- end }}
+    {{- end }}
     telemetry:
       metrics:
         enabled: {{ .Values.telemetry.metrics.enabled }}

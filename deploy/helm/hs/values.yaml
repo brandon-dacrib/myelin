@@ -1,5 +1,20 @@
 # Default values for the `hs` chart.
 #
+# One value is required: `serverName`. With nothing else set this installs a single replica with
+# its database, signing key and media on one PersistentVolumeClaim (the same layout `hs serve
+# --data-dir` and the `docker run -v myelin:/data` quickstart make), and the first administrator
+# is created from the one-time setup link the pod logs -- `helm install` prints how to read it.
+#
+# How the values reach the server, and why it matters on `helm upgrade` (docs/rfcs/0016): the
+# server's configuration has three layers, file < database < environment. Values an operator
+# expects to *always* apply -- server name, public base URL, signing-key path, the database
+# connection -- are passed as `HS__` environment variables, which outrank the database, so the
+# admin interface shows them as pinned by the deployment and refuses to store a value that would
+# be ignored. The rest (listeners, telemetry, media backend) is rendered into a ConfigMap, which
+# is the *file* layer: it seeds the database on the first start and is outranked by it after
+# that, so a change made in the admin interface wins over a later `helm upgrade` of the same
+# setting. `hs config show` in the pod says which layer set what.
+#
 # Naming follows element-hq/ess-helm's `matrix-stack` chart conventions where a direct analog
 # exists (refs/ess-helm/charts/matrix-stack/values.yaml: `image.{registry,repository,tag,digest,
 # pullPolicy,pullSecrets}`, `postgres.{host,port,user,database,sslMode,password:{value|secret+
@@ -144,14 +159,19 @@ secrets:
   sessionSecret:
     existingSecret: ""
     key: session-secret
-  ## The Ed25519 signing key (`hs generate-signing-key` format). Required; there is no generated
-  ## default, since a signing key must be stable across restarts and (for federation) across the
-  ## cluster. The whole Secret named by `existingSecret` is mounted as a directory at
-  ## `server.signing_key_path` (`hs-cli` scans every file in that directory, Synapse-style, for
-  ## the first parseable key) — `key` documents which data key inside that Secret should hold it
-  ## (`kubectl create secret generic <name> --from-file=signing.key=<path>`); it is no longer
-  ## used to `subPath`-mount a single file, since that silently defeated key persistence (see
-  ## templates/configmap.yaml's comment on `signing_key_path`).
+  ## The Ed25519 signing key (`hs generate-signing-key` format).
+  ##
+  ## Optional in `singleNode` mode: the server generates one on its first start into `keys/` on
+  ## the data volume, beside the database, and reads it back on every restart after (the volume
+  ## is kept on `helm uninstall` by default, see `storage.embedded.resourcePolicy`, so the key
+  ## survives a reinstall too). Required in `cluster` mode, where replicas share no volume and
+  ## must sign with the same key. When set, the whole Secret is mounted as a directory at
+  ## `/etc/hs/secrets/signing-key` and `server.signing_key_path` is pinned there through the
+  ## environment (`hs-cli` scans every file in that directory, Synapse-style, for the first
+  ## parseable key); `key` documents which data key inside the Secret should hold it
+  ## (`kubectl create secret generic <name> --from-file=signing.key=<path>`). It is not
+  ## `subPath`-mounted as a single file, since that silently defeated key persistence (see
+  ## docs/status/12-platform-and-kubernetes.md, 2026-09-19).
   signingKey:
     existingSecret: ""
     key: signing.key
