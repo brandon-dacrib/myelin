@@ -207,7 +207,9 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
   request for a gap is the one every other implementation expects, `POST /get_missing_events`
   with this server's extremities and the event that exposed the gap; `/backfill` rounds follow
   only if that does not close it. Complement's reference server serves nothing else for this,
-  so the loop could not begin against it before. Unit-tested; not yet re-measured.
+  so the loop could not begin against it before. Federation run 7 (`63c226f`): 75 of 250
+  assertions and 14 of 88 tests, from 73 and 12, with `TestGetMissingEventsGapFilling` and
+  `TestOutboundFederationEventSizeGetMissingEvents` moved to passing and nothing regressed.
 - A real `/_matrix/federation/v2` router, replacing three v2 endpoints that had been registered
   under v1 with a literal `/v2/` path segment.
 - Private certificate authorities can be trusted (`federation.custom_ca_certificates`); running
@@ -240,8 +242,8 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
   hidden from them or not depending on which server's events arrived first (the federation
   package's `TestNetworkPartitionOrdering` moved between two runs of the same code, and this
   was why). Joined when the event arrived counts now. Somebody who had left still does not
-  see what came after they left. Unit-tested; the federation package has not been re-run
-  from the fixed commit yet.
+  see what came after they left. The federation package, re-run from the fixed commit, has the
+  test passing again.
 - **A rejoin goes through the room, not through a stale copy of it** (2026-09-26). A server
   holds its copy of a room after its last user leaves, and stops receiving events for it. A join
   made against that copy is a join against the room as it was then: authorized against rules

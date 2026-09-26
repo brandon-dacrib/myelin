@@ -1,7 +1,7 @@
 # Complement tests, top-level results. One line per test so that two runs can be compared
 # by name: a change is worth something when it moves a *named* test and that survives a re-run.
 # Written and read by tools/complement_triage.py (--write-baseline, --diff).
-# Run 5, 2026-09-26, 82359fb: 73 of 250 assertions, 12 of 88 top-level (1 skipped).
+# Run 7, 2026-09-26, 63c226f: 75 of 250 assertions, 14 of 88 top-level (1 skipped).
 FAIL TestACLs
 FAIL TestACLsForEDUs
 PASS TestBannedUserCannotSendJoin
@@ -25,7 +25,7 @@ FAIL TestFederationRedactSendsWithoutEvent
 FAIL TestFederationRejectInvite
 FAIL TestFederationRoomsInvite
 FAIL TestFederationThumbnail
-FAIL TestGetMissingEventsGapFilling
+PASS TestGetMissingEventsGapFilling
 FAIL TestInboundCanReturnMissingEvents
 PASS TestInboundFederationKeys
 FAIL TestInboundFederationProfile
@@ -62,7 +62,7 @@ FAIL TestMediaFilenames
 FAIL TestMediaWithoutFileName
 FAIL TestMediaWithoutFileNameCSMediaV1
 PASS TestNetworkPartitionOrdering
-FAIL TestOutboundFederationEventSizeGetMissingEvents
+PASS TestOutboundFederationEventSizeGetMissingEvents
 FAIL TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6
 FAIL TestOutboundFederationProfile
 FAIL TestOutboundFederationSend

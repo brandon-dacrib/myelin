@@ -90,7 +90,7 @@ broken up, because the parts are nowhere near each other. This table is kept cur
 | Management web interface | ~75% | users, rooms, bridges (catalogue, wizard, runbook, sign-in guides), federation, configuration and the audit log are real against the real server |
 | Bridges | ~75% | heisenbridge works end to end; mautrix-whatsapp, added through the wizard, connects and starts encrypted; no mautrix bridge has carried a message yet |
 | Operations (HA, scale-out) | ~40% | runs on Kubernetes with a chart and a tested image; the cluster path has not carried real traffic |
-| **Federation** | **~30%** | 73/250 assertions, 12/88 tests; a user joins a room hosted elsewhere through the client API, messages flow both ways between two instances of this server, and the room's history from before the join is fetched as the client scrolls back; no EDUs, in-memory outbound queue, not yet tried against Synapse |
+| **Federation** | **~30%** | 75/250 assertions, 14/88 tests; a user joins a room hosted elsewhere through the client API, messages flow both ways between two instances of this server, and the room's history from before the join is fetched as the client scrolls back; no EDUs, in-memory outbound queue, not yet tried against Synapse |
 
 Federation is the honest answer to "when could I use this": a user here cannot really talk to
 the rest of Matrix yet.

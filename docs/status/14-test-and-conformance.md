@@ -19,6 +19,7 @@ package has a named baseline now, `docs/status/complement-federation-results.txt
 | 4 (2026-09-26) | `13195aa` | 72 / 250 | 11 / 88 | `TestJoinViaRoomIDAndServerName`, `TestJoinFederatedRoomFailOver`, `TestJoinFederatedRoomWithUnverifiableEvents`, `TestUnrejectRejectedEvents` FAIL -> PASS; nothing regressed |
 | 5 (2026-09-26) | `82359fb` | 73 / 250 | 12 / 88 | `TestNetworkPartitionOrdering` FAIL -> PASS; nothing regressed. The baseline. |
 | 6 (2026-09-26) | `9672d61` | 72 / 250 | 11 / 88 | `TestNetworkPartitionOrdering` PASS -> FAIL, and nothing else moved. Not the baseline; read on. |
+| 7 (2026-09-26) | `63c226f` | 75 / 250 | 14 / 88 | against run 5: `TestGetMissingEventsGapFilling` and `TestOutboundFederationEventSizeGetMissingEvents` FAIL -> PASS (the gap-shaped `/get_missing_events` request, see track 06's note), nothing regressed; `TestNetworkPartitionOrdering` passes again with the visibility rule widened. The baseline. |
 
 Run 6 was from the commit that fetches a room's history before a join on a client's behalf,
 and the one test that moved had nothing to do with that: it moved because of which of two
@@ -36,8 +37,8 @@ test built `1'`: in run 5 it had, in run 6 it had not. The rule is wider now
 it, counts too -- Synapse shows a joined member every event of a `shared` room), with a unit
 test that builds the concurrent branch on purpose
 (`tests/remote_join.rs::an_event_concurrent_with_a_join_is_visible_to_the_member_it_raced`)
-and checks somebody who had left still does not see it. Not re-measured at the time of
-writing; the baseline stays at run 5 until a run from the fixed commit says.
+and checks somebody who had left still does not see it. Run 7, from the fixed commit, has it
+passing again, and is the baseline.
 
 The same run's triage warned of a wait that saw 159,546 `/sync` responses in fifty seconds
 (`TestDeviceListUpdates`' remote halves). That one is Complement's own doing: the wait is a
