@@ -23,6 +23,17 @@ spec:
         - path:
             type: PathPrefix
             value: /.well-known/matrix
+        {{- if .Values.gatewayApi.admin }}
+        - path:
+            type: PathPrefix
+            value: /admin
+        - path:
+            type: PathPrefix
+            value: /api/v1
+        - path:
+            type: PathPrefix
+            value: /_synapse
+        {{- end }}
       backendRefs:
         - name: {{ include "hs.fullname" . }}
           port: {{ .Values.service.clientPort }}

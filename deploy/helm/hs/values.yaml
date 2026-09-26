@@ -318,6 +318,12 @@ ingress:
   ## different `host:port` than the client-facing one.
   clientHost: ""
   federationHost: ""
+  ## Whether `clientHost` also routes the management interface (`/admin/`), its API (`/api/v1`)
+  ## and the Synapse-compatible admin API (`/_synapse`). On by default because the setup link
+  ## the server logs is `<publicBaseUrl>/admin/setup#token=...`, and an Ingress that routed only
+  ## `/_matrix` answered it with a 404 (found installing the first reachable demo, 2026-09-26).
+  ## Set it to false to keep the interface off the Ingress and reach it by port-forward instead.
+  admin: true
 
 ## Gateway API routing (HTTPRoute), as an alternative to `ingress.*`. Mutually exclusive in
 ## practice (enable one or the other); the chart does not enforce that, it just renders both if
@@ -328,6 +334,8 @@ gatewayApi:
   gatewayNamespace: ""
   clientHostnames: []
   federationHostnames: []
+  ## As `ingress.admin`: route `/admin/`, `/api/v1` and `/_synapse` on the client hostnames.
+  admin: true
 
 serviceMonitor:
   enabled: false

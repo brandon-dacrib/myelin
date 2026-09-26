@@ -16,6 +16,15 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
 
 ### Installing and administering it
 
+- **The install is reachable through an Ingress, and the setup link works through it.** The
+  chart's Ingress and HTTPRoute route the management interface (`/admin/`), its API (`/api/v1`)
+  and the Synapse-compatible admin API (`/_synapse`) on the client host, on by default
+  (`ingress.admin`, `gatewayApi.admin`). Before, they routed `/_matrix` and `/.well-known/matrix`
+  only, so the setup link the install notes tell an operator to open would have been a 404 on
+  any cluster with an Ingress. Verified 2026-09-26 with a standing demo on a real cluster:
+  Traefik, a Let's Encrypt certificate, a LAN hostname, every routed path answering over HTTPS,
+  Prometheus scraping the chart's ServiceMonitor, and the setup page opened in a browser at the
+  public address (`docs/status/12-platform-and-kubernetes.md`).
 - **Installing on Kubernetes is one value.** `helm install myelin deploy/helm/hs --set
   serverName=example.org` is a running server: one replica, a volume holding the database, the
   signing key and media, probes, a Service, and the same one-time setup link in the pod's log.

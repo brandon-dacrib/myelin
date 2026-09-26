@@ -1,5 +1,101 @@
 # 12. Platform and Kubernetes
 
+## A demo an operator can reach: myelin.dacrib.net (2026-09-26, later the same day)
+
+The section below proved the install through a port-forward and tore it down. This one leaves
+it running where a browser can get to it, the way the other applications on that cluster are
+reached, because "install is one value" is only true if the setup link the NOTES tell the
+operator to open actually opens. It did not: **the chart's Ingress routed `/_matrix` and
+`/.well-known/matrix` and nothing else**, so `https://<host>/admin/setup#token=...` would have
+been Traefik's 404 on every cluster with an Ingress, and so would the interface and its API.
+Found by reading `templates/ingress.yaml` before installing, not by the install, and fixed
+first: the client host also routes `/admin`, `/api/v1` and `/_synapse` (the Synapse-compatible
+admin API, for synapse-admin tooling), on by default as `ingress.admin`, with the same three
+prefixes and switch (`gatewayApi.admin`) on the HTTPRoute. `helm lint` clean; both modes still
+render; `ingress.admin=false` renders the old two paths.
+
+### The cluster, and what the demo borrows from it
+
+The Talos cluster the earlier sections used (`admin@dacrib0`: five nodes, one amd64 and four
+arm64, Kubernetes 1.33), which already runs Traefik on a MetalLB address on the LAN,
+cert-manager with a Let's Encrypt ClusterIssuer that solves DNS-01 through Cloudflare,
+external-dns writing LAN records into AdGuard, Longhorn as the default StorageClass, and
+kube-prometheus-stack configured to select every ServiceMonitor in the cluster. Every other
+application there is an Ingress with three annotations and a hostname under `dacrib.net`; the
+demo is the same. Its manifests live in the (private) infrastructure repository beside them,
+`talos-clusters/dacrib0/apps/myelin/`: a Namespace and a values file, installed from this
+checkout because the chart is not published until a `v*` tag.
+
+The values, in full: `serverName` and `publicBaseUrl` (`myelin.dacrib.net`, the same host, so
+no delegation), `ingress` enabled with class `traefik`, the cluster's cert-manager and
+external-dns annotations, a TLS Secret name and `clientHost`; `serviceMonitor.enabled`. No
+`federationHost`: the Traefik address is LAN-only, nothing outside can federate with it, and
+the demo does not pretend otherwise. Everything else is the chart default: one replica,
+embedded storage, a 10Gi Longhorn volume, 256Mi requested and 1Gi limit.
+
+### The transcript
+
+```
+$ kubectl apply -f apps/myelin/namespace.yaml
+$ helm install myelin deploy/helm/hs -n myelin -f apps/myelin/values.yaml --wait --timeout 5m
+  ... Install complete                                     real 4m05s
+$ kubectl -n myelin get pods,pvc,ingress,certificate,servicemonitor
+  pod/myelin-hs-0        1/1  Running   on black0n0 (amd64)
+     ghcr.io/brandon-dacrib/myelin@sha256:808557ff...   (21.7 MB, pulled in 27 s)
+  pvc/data-myelin-hs-0   Bound  10Gi  RWO  longhorn
+  ingress/myelin-hs      traefik  myelin.dacrib.net  192.168.115.100  80, 443
+  certificate/myelin-dacrib-net-tls   READY True   le-prod-cf-dns
+  servicemonitor/myelin-hs
+$ kubectl -n myelin logs statefulset/myelin-hs      # 8 lines again; the last:
+  WARN this server has no administrator yet: open the setup link ...
+       setup_link=https://myelin.dacrib.net/admin/setup#token=...        # publicBaseUrl, not localhost
+$ dig +short myelin.dacrib.net                              192.168.115.100   # external-dns -> AdGuard
+
+# Through Traefik, with the certificate verified (curl's ssl_verify_result 0;
+# issuer "Let's Encrypt", subject CN=myelin.dacrib.net, 90 days):
+$ curl https://myelin.dacrib.net/_matrix/client/versions     200 {"versions":["r0.0.1",...
+$ curl https://myelin.dacrib.net/.well-known/matrix/client   200 {"m.homeserver":{"base_url":"https://myelin.dacrib.net"}}
+$ curl https://myelin.dacrib.net/_matrix/key/v2/server       200 myelin.dacrib.net ed25519:a_JBQV7r
+$ curl https://myelin.dacrib.net/api/v1/setup                200 {"needs_setup":true}
+$ curl https://myelin.dacrib.net/admin/                      200 <!doctype html> ... the interface
+$ curl https://myelin.dacrib.net/health/ready                404   # not routed; probes are in-cluster
+
+$ curl https://prometheus.dacrib.net/api/v1/targets | ... serviceMonitor/myelin/myelin-hs/0  up
+$ up{namespace="myelin"}                                     1
+```
+
+Then Chrome, on this machine, opened the setup link at the public hostname: the "Create the
+first administrator" form, over TLS, no warning. It was not submitted; the first administrator
+is the operator's to make, and the link is still in the log.
+
+### What the four minutes were
+
+The earlier install took 1m36s; this one 4m05s, and the difference is not the chart. From the
+pod's events: the claim was bound two seconds after creation, the pod scheduled, the Longhorn
+volume attached ten seconds after that, and then **nothing for 2m26s until the kubelet began
+pulling the image**. The pull itself was 27 s and the container was running three seconds
+later; the certificate's DNS-01 order took 75 s in parallel and was ready long before the pod.
+The gap is between volume attach and container creation on that node, which is the kubelet
+waiting for the volume to be mounted and formatted, or something in between; the events do not
+say and this session did not go further. It is the cluster's to explain, but it is what
+"install to Ready" cost here, and an operator would see it.
+
+### What this does and does not show
+
+- It shows the one-value install becoming a server a browser can reach, with a real
+  certificate, a LAN name, and its metrics in the cluster's Prometheus, using the values an
+  operator of that cluster would write from its own conventions. Nothing had to be done that
+  the chart did not offer a value for.
+- It found a real defect in the chart's Ingress that every previous "verified" claim had
+  walked around with a port-forward.
+- It does not show federation (LAN-only address), cluster mode (single replica, embedded
+  storage), an upgrade of a server with data (the earlier section did that, empty), or the
+  interface being used past the setup page (that is track 16's territory, and the first
+  administrator is not made yet).
+- It is a standing install, not a test. `helm uninstall myelin -n myelin` and deleting the
+  namespace (which is what removes the kept volume) take it down; the infrastructure repository
+  says so beside the values.
+
 ## One value on Kubernetes, verified against a real cluster (2026-09-26)
 
 Decision 0008 makes operations the product, and the first thing an operator does is install.

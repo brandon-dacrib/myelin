@@ -189,6 +189,18 @@ whole of a shutdown, including a cluster drain of up to twenty seconds, so a Ser
 routing new requests to a replica busy giving its rooms away. It is withdrawn first now
 (`ServeHandle::withdraw_readiness`, with a test through the real HTTP path).
 
+**And reachable** (2026-09-26, later). The same cluster now has a standing demo in its own
+namespace, installed the way every other application there is: an Ingress with the cluster's
+Traefik class and cert-manager and external-dns annotations, a Let's Encrypt certificate, a
+LAN hostname, the chart's ServiceMonitor scraped by the cluster's Prometheus, and the setup
+page opened in a browser at the public address. Doing it found that the chart's Ingress routed
+`/_matrix` and `/.well-known/matrix` only, so the setup link the NOTES tell the operator to open
+would have been a 404 through it; it routes `/admin`, `/api/v1` and `/_synapse` now
+(`ingress.admin`, on by default, and the same on the HTTPRoute). The install took four minutes
+there, two and a half of them between the volume attaching and the image pull starting, which
+is the cluster's storage, not the chart, and is written down in the status document because an
+operator would see it.
+
 **The admin interface ships.** Until 2026-09-21 it did not: every binary and every published image served a placeholder at `/admin/` saying the interface had not been built in, because nothing embedded `web/dist`. `crates/hs-admin/build.rs` now stages the built interface (or the placeholder, for a Rust-only checkout, and says so at startup); release builds set `HS_ADMIN_WEB_DIST` and *fail* without a built interface; CD refuses to publish an image whose `/admin/` is not the interface. Verified on the published artifact: `ghcr.io/brandon-dacrib/myelin:main`, pulled from the registry on 2026-09-21 and run with the README's exact command, serves the interface at `/admin/`, answers `needs_setup: true`, and logs the setup link. What has still never run is the `v*` binaries job's new Node step, which only a tag exercises.
 
 **Complement, `csapi`: 317 of 384 assertions pass** (78 of 106 top-level), measured 2026-09-26 at
@@ -296,7 +308,7 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 | Management web interface | ~75% | users (with devices, sign-out and password reset), rooms (with members), bridges (the catalogue, the wizard with the bridge's own config, the runbook, sign-in guides), federation destinations, configuration and the audit log are real against the real server; the media and reports pages still read from operations that answer 501; arrays-of-objects are a JSON textarea |
 | **Federation** | **~30%** | 75/250 assertions, 14/88 top-level (run 7); a user here joins a room hosted elsewhere through the client API, messages flow both ways between two real servers, and the room's history from before the join is fetched as the client scrolls back; in-memory outbound queue, no EDUs, no invites/leaves/knocks over federation |
 | Bridges | ~75% | heisenbridge works end to end both directions (`docs/bridges/heisenbridge.md`); mautrix-whatsapp, added through the wizard, connects and starts in appservice-mode encryption (`docs/bridges/mautrix.md`); all 16 bridge operations are real; no mautrix bridge has carried a message yet, because signing in needs a phone |
-| Operations (HA, scale-out) | ~45% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; readiness withdrawn the moment a shutdown begins; two replicas shared a room on one PostgreSQL in an experiment; the cluster path has never carried real traffic on a cluster and the operator creates nothing yet |
+| Operations (HA, scale-out) | ~50% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; a standing demo behind a Traefik Ingress with a Let's Encrypt certificate, scraped by Prometheus, its setup page opened in a browser at the public hostname; readiness withdrawn the moment a shutdown begins; two replicas shared a room on one PostgreSQL in an experiment; the cluster path has never carried real traffic on a cluster and the operator creates nothing yet |
 
 Federation is still the honest answer to "when could I use this". Everything else is far enough
 along that the gaps are specific and listed. As of 2026-09-25 a user here can join a room on

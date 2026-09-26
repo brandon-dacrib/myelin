@@ -43,6 +43,19 @@ spec:
                 name: {{ include "hs.fullname" . }}
                 port:
                   number: {{ .Values.service.clientPort }}
+          {{- if .Values.ingress.admin }}
+          {{- /* The management interface, its API and the Synapse-compatible admin API: what
+               the setup link in the pod's log opens, and what synapse-admin tooling calls. */}}
+          {{- range list "/admin" "/api/v1" "/_synapse" }}
+          - path: {{ . }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "hs.fullname" $ }}
+                port:
+                  number: {{ $.Values.service.clientPort }}
+          {{- end }}
+          {{- end }}
     {{- end }}
     {{- if and .Values.ingress.federationHost (ne .Values.ingress.federationHost .Values.ingress.clientHost) }}
     - host: {{ .Values.ingress.federationHost }}

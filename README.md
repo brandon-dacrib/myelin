@@ -90,7 +90,11 @@ media, probes, a Service, and the same setup link in the pod's log (`helm instal
 `kubectl logs` line that finds it). Verified on 2026-09-26 against a real cluster with the
 published image: install to Ready, the interface at `/admin/`, the first administrator made
 through the link, the pod deleted and the signing key unchanged, a `helm upgrade` that replaced
-the pod and the key unchanged again. The chart is published as an OCI artifact by the first `v*`
+the pod and the key unchanged again. The same day it was installed for keeps behind a Traefik
+Ingress with a Let's Encrypt certificate, scraped by Prometheus through the chart's
+ServiceMonitor, and its setup page opened in a browser at the public hostname; that found the
+Ingress routing `/_matrix` only, which would have made the setup link a 404, and it routes the
+interface now. The chart is published as an OCI artifact by the first `v*`
 tag, which has not happened yet, so for now it installs from a checkout. Cluster mode
 (`mode=cluster`, PostgreSQL or CloudNativePG, media on S3, a shared signing-key Secret) renders
 and has run as two processes on one PostgreSQL, but has not yet carried real traffic on a
@@ -117,7 +121,7 @@ broken up, because the parts are nowhere near each other. This table is kept cur
 | Admin API | ~40% | 58 of 145 operations have a real handler; the rest answer an honest 501 |
 | Management web interface | ~75% | users, rooms, bridges (catalogue, wizard, runbook, sign-in guides), federation, configuration and the audit log are real against the real server |
 | Bridges | ~75% | heisenbridge works end to end; mautrix-whatsapp, added through the wizard, connects and starts encrypted; no mautrix bridge has carried a message yet |
-| Operations (HA, scale-out) | ~45% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; readiness is withdrawn the moment a shutdown begins; the cluster path has not carried real traffic and the operator creates nothing yet |
+| Operations (HA, scale-out) | ~50% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; a standing demo behind an Ingress with a real certificate, scraped by Prometheus, its setup page opened in a browser; readiness is withdrawn the moment a shutdown begins; the cluster path has not carried real traffic and the operator creates nothing yet |
 | **Federation** | **~30%** | 75/250 assertions, 14/88 tests; a user joins a room hosted elsewhere through the client API, messages flow both ways between two instances of this server, and the room's history from before the join is fetched as the client scrolls back; no EDUs, in-memory outbound queue, not yet tried against Synapse |
 
 Federation is the honest answer to "when could I use this": a user here cannot really talk to
