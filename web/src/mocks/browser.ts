@@ -3,6 +3,7 @@ import { http, HttpResponse } from "msw";
 import { handlers } from "./handlers";
 import { clusterStatus } from "./data/dashboard";
 import { configRevisions } from "./data/config";
+import { setDeploymentTarget } from "./data/bridge-offerings";
 import { queryClient } from "@/lib/query-client";
 
 /** Started from src/main.tsx when VITE_HS_MOCK=1 (npm run dev:mock / build:mock). */
@@ -29,6 +30,7 @@ declare global {
         extra?: { detail?: string; required_scope?: string },
       ): Promise<void>;
       bumpConfigRevision(section: string): Promise<void>;
+      setBridgeDeploymentTarget(available: boolean, reason?: string): Promise<void>;
     };
   }
 }
@@ -119,5 +121,15 @@ window.__hsAdminMock = {
   bumpConfigRevision(section) {
     configRevisions[section] = (configRevisions[section] ?? 0) + 1;
     return Promise.resolve();
+  },
+
+  /**
+   * Makes `GET /bridge-deployment-target` say this server can (the default) or cannot deploy
+   * bridges, so the Offer-a-bridge wizard's Runtime step can be seen both ways (RFC 0017 4.5).
+   * Module state like `bumpConfigRevision`, so it holds until the next full page load.
+   */
+  setBridgeDeploymentTarget(available, reason) {
+    setDeploymentTarget(available, reason);
+    return queryClient.invalidateQueries({ queryKey: ["bridge-deployment-target"] });
   },
 };

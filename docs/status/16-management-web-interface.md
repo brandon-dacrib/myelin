@@ -1,6 +1,86 @@
 # 16. Management web interface: status
 
-## Current update: 2026-09-26
+## Current update: 2026-09-26 (bridge offerings, RFC 0017)
+
+**Bridges are offerings first.** The management half of RFC 0017
+(`docs/rfcs/0017-the-server-deploys-its-own-bridges.md`): an administrator offers a bridge type,
+each person gets their own instance by messaging its front door, and the administrator sees and
+manages everybody's instance. Built against the committed contract only
+(`bridge_deployments.target`, `bridge_offerings.*`, `bridge_instances.*`, `BridgeType.mode` and
+`deployable` in `crates/hs-admin/openapi/openapi.yaml`); the server side is being built in
+parallel, so everything here runs on MSW mocks. Client regenerated (`npm run generate:client`).
+
+- **Hooks** (`src/api/bridges.ts`): `useBridgeDeploymentTarget`, `useBridgeOfferings`,
+  `useBridgeOffering`, `usePutBridgeOffering`, `useDeleteBridgeOffering` (`removeInstances`),
+  `useBridgeInstances`, `useBridgeInstance`, `usePutBridgeInstance` (also Retry: the PUT retries a
+  failed one), `useDeleteBridgeInstance`, `useBridgeInstanceFiles` (a mutation: it is a POST that
+  carries tokens). Instances poll every 5 s while any is not `ready`/`failed`, offerings while
+  their counts show one moving, 30 s otherwise. Writes invalidate the offering, its instances, the
+  offerings list and `appservices` (every instance is a registration).
+- **Routes**: `/bridges` is now the offered bridges (`BridgeOfferingsPage`); `/bridges/new` the
+  Offer-a-bridge wizard; `/bridges/offerings/$type` one offering (`offering/BridgeOfferingPage`).
+  The appservice registrations list moved to `/bridges/registrations` (a "Registrations" tab beside
+  "Offered bridges", `BridgesTabs.tsx`) and the render-and-register wizard to
+  `/bridges/registrations/new` as "Register a bridge you run yourself", self-managed only.
+  `/bridges/$bridgeId` (registration detail) and `/bridges/$bridgeId/created` are unchanged, so
+  audit links, the command palette and the overview keep working.
+- **Offer a bridge** (`wizard/OfferBridgeWizardPage.tsx`, `offer-state.ts`,
+  `steps/RuntimeStep.tsx`, shared fields in `pages/bridges/offering-fields.tsx`): Kind (the
+  catalogue, each card saying "Each person gets their own"/"One bridge for everyone", "Runs
+  elsewhere only" for `deployable: false`, already-offered types disabled) → Access (everyone, or
+  listed Matrix IDs, validated) → Runtime (`cluster` only with a deployment target and a deployable
+  type; otherwise the card says why and a note quotes the target's `reason`; `elsewhere`; image tag)
+  → Options (encryption, double puppeting, backfill, defaulted from the catalogue's
+  `required_features`/`supports_double_puppeting`/`renders_config`) → Review → "Offer WhatsApp"
+  (PUT) → the offering page.
+- **Offering page**: header (Offered/Disabled, runtime, per-person/shared), "How people get one"
+  with the one line to tell people ("Anyone here can message @whatsappbot:example.org to get their
+  own WhatsApp bridge.") and the bot to copy; settings summary and an Edit settings dialog (the
+  whole PUT again); People's bridges table, failed first (person, state badge with reason, ping
+  health, deployment phase + name + operator message, asked/ready times, Retry for failed, Files,
+  Remove with a confirm that says their sign-ins go); Add for a user (PUT, server's refusal shown
+  in the field); Stop offering (DELETE; on 409 the dialog becomes a type-the-name confirm and sends
+  `remove_instances=true`). A shared offering shows its one instance as a status panel. Files
+  opens a dialog with CopyBlocks (copy and download) for config.yaml, registration.yaml, the
+  Compose service and the Kubernetes manifest, with a warning that they carry tokens.
+- **Removed**: the Kubernetes deployment card, namespace/database fields and the "apply the Bridge
+  resource and the operator does the rest" copy from the register wizard and its Created page.
+- **Mock** (`src/mocks/data/bridge-offerings.ts`, handlers in `handlers.ts`): a WhatsApp offering
+  in the cluster (alice and ops ready, carol starting, dave failed with an `ImagePullBackOff`
+  message) and an iMessage offering that runs elsewhere (alice, waiting for its first ping);
+  `mautrix-imessage` added to the mock catalogue; `mode`/`deployable` on every type (heisenbridge,
+  appservice-irc and hookshot shared). Instances created in the mock walk requested → registered →
+  deploying → starting → ready in about nine seconds. PUT refuses `cluster` without a target or
+  for a non-deployable type (400), instance PUT refuses non-local users (400), DELETE offering 409s
+  with instances. Target available by default; `window.__hsAdminMock.setBridgeDeploymentTarget(false, reason)`
+  in the browser, `setDeploymentTarget` in Vitest; fixtures reset after every Vitest test.
+- **Tests**: `lib/bridge-offerings.test.ts` (8), `wizard/steps/RuntimeStep.test.tsx` (4: available,
+  unavailable with the server's reason, non-deployable, image tag), `offering/BridgeOfferingPage.test.tsx`
+  (11: front door and failed-first table, files, add for a user incl. invalid and refused, remove,
+  retry, stop offering through the strong confirm, edit access, shared panel, read-only, 501),
+  `BridgeOfferingsPage.test.tsx` (2). `e2e/offer-bridge.spec.ts` (2): stop offering WhatsApp →
+  offer it again through the wizard → offering page → add for a user → the row appears and reaches
+  Healthy by polling; and the target-unavailable runtime. axe clean at every step.
+  `add-bridge.spec.ts`, `bridges-list.spec.ts`, `degrade-honestly.spec.ts` and
+  `e2e-real/add-mautrix-bridge.spec.ts` moved to the Registrations paths; the Kubernetes e2e is gone.
+- Screenshots: `docs/design/screenshots/bridge-offerings-*.png` (list, whatsapp, imessage, files,
+  settings, add-for-user, instance-deploying, registrations, wizard-kind, wizard-runtime,
+  wizard-runtime-unavailable, wizard-review).
+
+Checks: `npm run check` green (eslint 0 errors, the 4 pre-existing react-refresh warnings; 25 test
+files, 180 tests; build), `npm run test:e2e` 26 passed.
+
+**Contract notes for track 15** (not changed here): list operations return `{data: [...]}` where
+every other list is `{items, next_cursor}`, and are unpaginated; `BridgeOffering` returns `image`
+(a full reference) but `BridgeOfferingRequest` takes `image_tag`, so an edit has to parse the tag
+out; `instances` counts are an open map rather than keyed by the state enum; `deployable: false`
+has no reason string, so the interface writes its own; `BridgeInstance` has `health` but no
+`last_ping_at`/`last_error` (the registration's health resource has them); the 409 on DELETE has no
+structured instance count; whether an administrator's instance PUT bypasses `access.users` is
+unspecified (the mock lets it); RFC 0017 section 5 says `admin:read`/`admin:write` while the
+OpenAPI document uses `bridges:read`/`bridges:write` (the interface follows the document).
+
+## Update: 2026-09-26 (recovery page)
 
 **The recovery page: the setup link's sibling, for when the only administrator is locked out.**
 `hs recover`, run where the server keeps its signing key, prints a one-time link
@@ -807,6 +887,14 @@ Element.
 
 ## Decisions made
 
+- **Bridges are offerings first (RFC 0017, 2026-09-26).** `/bridges` lists offerings; the
+  registrations list lives at `/bridges/registrations` and the register-it-yourself wizard at
+  `/bridges/registrations/new`, self-managed only. Registration detail keeps `/bridges/$bridgeId`
+  so existing links hold (a registration whose id is `new`, `registrations` or `offerings` is
+  shadowed by the static routes, as `new` already was). The Kubernetes option left the register
+  wizard: a bridge the server runs is an offering. Retry for a failed instance is the idempotent
+  instance PUT, as the contract says. Stop offering tries a plain DELETE first and only on 409 asks
+  for the bridge's name before `remove_instances=true`.
 - Stack and its two open points (route style: code-based; OpenAPI source order: prefer track 15's document whenever it exists) — `docs/decisions/0003-web-stack.md`.
 - Tailwind v4 tokens use the native CSS `light-dark()` function (compiled to a `--lightningcss-light`/`-dark` toggle by Lightning CSS, driven by the `color-scheme` property under `[data-theme]`) instead of duplicating every token block per theme.
 - Body text defaults to 14px (not the web-default 16px): a deliberate density choice for a dense operator tool, AAA-contrast-checked regardless.

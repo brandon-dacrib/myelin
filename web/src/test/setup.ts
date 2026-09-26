@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { afterEach, afterAll } from "vitest";
 import { cleanup } from "@testing-library/react";
 import { server } from "@/mocks/node";
+import { resetBridgeOfferings } from "@/mocks/data/bridge-offerings";
 
 /**
  * Give the API client an absolute base URL before anything imports it.
@@ -53,5 +54,7 @@ server.listen({ onUnhandledRequest: "error" });
 afterEach(() => {
   cleanup();
   server.resetHandlers();
+  // The mock's bridge offerings are mutable module state (PUT and DELETE change them).
+  resetBridgeOfferings();
 });
 afterAll(() => server.close());

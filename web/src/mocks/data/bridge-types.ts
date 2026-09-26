@@ -15,6 +15,10 @@ interface Spec {
   prefix?: string;
   mautrix?: boolean;
   port?: number;
+  /** RFC 0017: `per_user` unless the bridge serves a network rather than a person. */
+  mode?: "per_user" | "shared";
+  /** RFC 0017: whether the server can run it from a rendered config alone. */
+  deployable?: boolean;
 }
 
 const PORTS: Record<string, number> = {
@@ -32,6 +36,7 @@ const PORTS: Record<string, number> = {
   heisenbridge: 9898,
   "matrix-appservice-irc": 9999,
   "matrix-hookshot": 9993,
+  "mautrix-imessage": 29337,
 };
 
 /**
@@ -70,6 +75,8 @@ function type(spec: Spec): BridgeType {
       ? ["de.sorunome.msc2409.push_ephemeral", "org.matrix.msc3202", "io.element.msc4190"]
       : [],
     renders_config: mautrix,
+    mode: spec.mode ?? "per_user",
+    deployable: spec.deployable ?? mautrix,
     sign_in: { steps: spec.steps, notes: spec.notes ?? null },
   };
 }
@@ -135,6 +142,20 @@ export const bridgeTypes: BridgeType[] = [
     steps: ["Start a direct chat with {bot} and send `login`."],
   }),
   type({
+    id: "mautrix-imessage",
+    name: "iMessage",
+    category: "messaging",
+    description: "iMessage and SMS, through a Mac signed in to Messages.",
+    needs: ["mac", "A Mac signed in to iMessage, which runs the bridge"],
+    // It runs beside Messages on the person's own Mac; no cluster can run it for them.
+    deployable: false,
+    steps: [
+      "Start the bridge on the Mac with the files an administrator gave you; it signs in with the Mac's own Messages account.",
+      "Start a direct chat with {bot} and send `help`. Your iMessage chats appear as rooms as messages arrive.",
+    ],
+    notes: "The Mac has to stay on and signed in to Messages for the bridge to work.",
+  }),
+  type({
     id: "mautrix-meta",
     name: "Messenger and Instagram",
     category: "messaging",
@@ -193,6 +214,8 @@ export const bridgeTypes: BridgeType[] = [
   }),
   type({
     id: "heisenbridge",
+    mode: "shared",
+    deployable: true,
     name: "IRC (heisenbridge)",
     category: "irc",
     description: "An IRC bouncer: one person's networks, channels and queries, in Matrix.",
@@ -211,6 +234,8 @@ export const bridgeTypes: BridgeType[] = [
   }),
   type({
     id: "matrix-appservice-irc",
+    mode: "shared",
+    deployable: false,
     name: "IRC (matrix-appservice-irc)",
     category: "irc",
     description: "Whole IRC channels as Matrix rooms, for many users at once.",
@@ -227,6 +252,8 @@ export const bridgeTypes: BridgeType[] = [
   }),
   type({
     id: "matrix-hookshot",
+    mode: "shared",
+    deployable: false,
     name: "Hookshot",
     category: "integrations",
     description: "Webhooks, GitHub, GitLab, Jira and RSS feeds, posted into rooms.",

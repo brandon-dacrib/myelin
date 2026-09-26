@@ -43,7 +43,6 @@ export function BridgeCreatedPage() {
   const name = bridgeTitle(bridge, type);
   const id = bridge.id ?? bridgeId;
   const botId = botMatrixId(bridge.sender_localpart, server?.name);
-  const kubernetes = Boolean(artifacts?.bridgeResourceYaml);
   const dir = `./${id}/`;
 
   return (
@@ -67,9 +66,9 @@ export function BridgeCreatedPage() {
           {artifacts ? (
             <>
               <p className="text-sm text-text-muted">
-                {kubernetes
-                  ? "The registration is already in this server. Apply the Bridge resource; the operator keeps the registration secret for you."
-                  : `Put them in ${dir} next to your Compose file. The registration is already in this server; the bridge needs its own copy, and the config is complete enough to start with.`}
+                Put them in {dir} next to your Compose file. The registration is already in this
+                server; the bridge needs its own copy, and the config is complete enough to start
+                with.
               </p>
               <p className="mt-2 rounded-md border border-warning-border bg-warning-bg px-3 py-2 text-sm text-warning">
                 The tokens are shown once, here. They can be rotated later from the bridge&apos;s
@@ -95,13 +94,6 @@ export function BridgeCreatedPage() {
                     filename={`${id}-compose.yaml`}
                   />
                 )}
-                {artifacts.bridgeResourceYaml && (
-                  <CopyBlock
-                    label="Bridge resource (Kubernetes)"
-                    content={artifacts.bridgeResourceYaml}
-                    filename={`${id}-bridge.yaml`}
-                  />
-                )}
               </div>
             </>
           ) : (
@@ -116,14 +108,12 @@ export function BridgeCreatedPage() {
 
         <Step n={2} title="Start the bridge">
           <p className="text-sm text-text-muted">
-            {kubernetes
-              ? "Apply the resource and the operator does the rest."
-              : type?.renders_config
-                ? "With both files in place the bridge starts straight away, completes its config with its own defaults, and registers its bot with this server."
-                : "The Compose file says what else this bridge needs before it runs; its own documentation has the details."}
+            {type?.renders_config
+              ? "With both files in place the bridge starts straight away, completes its config with its own defaults, and registers its bot with this server."
+              : "The Compose file says what else this bridge needs before it runs; its own documentation has the details."}
           </p>
           <pre className="mt-3 overflow-x-auto rounded-md border border-border bg-surface-sunken p-3 font-identifier text-xs text-text">
-            {kubernetes ? `kubectl apply -f ${id}-bridge.yaml` : `docker compose up -d ${id}`}
+            {`docker compose up -d ${id}`}
           </pre>
         </Step>
 
@@ -132,7 +122,7 @@ export function BridgeCreatedPage() {
             health={bridge.paused ? "paused" : (health?.status ?? bridge.health ?? "unknown")}
             lastPingAt={health?.last_ping_at}
             lastError={health?.last_error}
-            logsHint={kubernetes ? `kubectl logs deploy/${id}` : `docker compose logs ${id}`}
+            logsHint={`docker compose logs ${id}`}
           />
         </Step>
 

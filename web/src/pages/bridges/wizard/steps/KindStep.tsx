@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { ExternalLink, Search } from "lucide-react";
 import { useBridgeTypes, type BridgeType } from "@/api/bridges";
 import { BridgeGlyph } from "@/components/BridgeGlyph";
@@ -17,9 +17,17 @@ import { cn } from "@/lib/cn";
 export function KindStep({
   selected,
   onSelect,
+  annotate,
+  intro,
 }: {
   selected: string;
   onSelect: (kindId: string, kind: BridgeType) => void;
+  /**
+   * Extra lines for a card, and whether it can be chosen at all (the Offer-a-bridge wizard marks
+   * shared types, types that only run elsewhere, and types already offered).
+   */
+  annotate?: (kind: BridgeType) => { disabled?: boolean; notes?: string[] };
+  intro?: ReactNode;
 }) {
   const { data: kinds, isLoading, isError, refetch } = useBridgeTypes();
   const [query, setQuery] = useState("");
@@ -33,8 +41,12 @@ export function KindStep({
     <div>
       <h2 className="text-lg text-text">What are you connecting?</h2>
       <p className="mt-1 text-sm text-text-muted">
-        Choosing a network fills sensible defaults for every later step. Signing in happens later,
-        from a chat with the bridge&apos;s bot; the last page tells you exactly how.
+        {intro ?? (
+          <>
+            Choosing a network fills sensible defaults for every later step. Signing in happens
+            later, from a chat with the bridge&apos;s bot; the last page tells you exactly how.
+          </>
+        )}
       </p>
 
       <div className="relative mt-5 max-w-sm">
@@ -81,18 +93,21 @@ export function KindStep({
                 .map((d) => d.charAt(0).toLowerCase() + d.slice(1))
                 .join("; ");
               const isSelected = selected === kind.id;
+              const extra = annotate?.(kind);
               return (
                 <button
                   key={kind.id}
                   type="button"
                   role="radio"
                   aria-checked={isSelected}
+                  disabled={extra?.disabled}
                   onClick={() => onSelect(kind.id ?? "", kind)}
                   className={cn(
                     "flex items-start gap-3 rounded-md border p-4 text-left transition-colors duration-fast",
                     isSelected
                       ? "border-accent bg-accent-muted"
-                      : "border-border bg-surface hover:bg-surface-sunken",
+                      : "border-border bg-surface enabled:hover:bg-surface-sunken",
+                    "disabled:cursor-not-allowed disabled:bg-surface-sunken",
                     "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus)]",
                   )}
                 >
@@ -107,6 +122,11 @@ export function KindStep({
                         <span className="font-medium">Needs</span> {needs}
                       </span>
                     )}
+                    {extra?.notes?.map((note) => (
+                      <span key={note} className="text-xs text-text-muted">
+                        {note}
+                      </span>
+                    ))}
                   </span>
                 </button>
               );

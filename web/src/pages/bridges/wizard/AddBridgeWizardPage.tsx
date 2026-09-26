@@ -8,7 +8,6 @@ import {
   useRenderBridgeType,
   type BridgeTypeRenderResult,
 } from "@/api/bridges";
-import { useClusterStatus } from "@/api/dashboard";
 import { classifyError } from "@/api/problem";
 import { getSession, hasScope } from "@/lib/auth";
 import { newIdempotencyKey } from "@/api/client";
@@ -44,10 +43,23 @@ function wizardErrorMessage(err: unknown, fallback: string): string {
   return problem?.detail ?? problem?.title ?? fallback;
 }
 
-/** `/bridges/new` — flows.md flow 1: add a bridge. */
+const STEP_LABELS: Record<WizardStep, string> = {
+  kind: "Kind",
+  identity: "Identity",
+  deployment: "Addresses",
+  options: "Options",
+  review: "Review",
+};
+
+/**
+ * `/bridges/registrations/new` -- registers a bridge the operator runs themselves (flows.md flow
+ * 1, as it was before RFC 0017): renders the files, creates the registration, and hands over the
+ * files. Bridges this server runs are offered from `/bridges/new` instead; this stays for custom
+ * bridges and anything the catalogue does not cover.
+ */
 export function AddBridgeWizardPage() {
-  const search = useSearch({ from: "/bridges/new" });
-  const navigate = useNavigate({ from: "/bridges/new" });
+  const search = useSearch({ from: "/bridges/registrations/new" });
+  const navigate = useNavigate({ from: "/bridges/registrations/new" });
   const step = search.step ?? "kind";
   const [state, setState] = useState<typeof initialWizardState>(() => {
     // The operator adding the bridge is the natural first administrator of it; the real
@@ -60,8 +72,6 @@ export function AddBridgeWizardPage() {
   const [idempotencyKey] = useState(() => newIdempotencyKey());
   const [renderResult, setRenderResult] = useState<BridgeTypeRenderResult | null>(null);
 
-  const { data: cluster } = useClusterStatus();
-  const singleNode = (cluster?.replica_count ?? 1) <= 1;
   const render = useRenderBridgeType();
   const create = useCreateAppservice();
 
@@ -103,17 +113,13 @@ export function AddBridgeWizardPage() {
         onSuccess: (appservice) => {
           const createdId = appservice?.id;
           if (!createdId) return;
-          // The render result always carries every artifact; which ones the
-          // operator asked to see is a presentational choice this track
-          // made (api/bridges.ts's doc comment) — the admin API has no
-          // "deployment" concept to filter by itself.
+          // A bridge registered here is one the operator runs themselves, so the files are
+          // its config, its registration and a Compose service. A bridge this server runs is
+          // an offering (RFC 0017), not this path.
           stashCreatedArtifacts(createdId, {
             registrationYaml,
             configYaml: renderResult.config_yaml ?? undefined,
-            composeYaml:
-              state.deployment === "self-managed" ? renderResult.compose_yaml : undefined,
-            bridgeResourceYaml:
-              state.deployment === "kubernetes" ? renderResult.bridge_resource_yaml : undefined,
+            composeYaml: renderResult.compose_yaml,
           });
           navigate({ to: "/bridges/$bridgeId/created", params: { bridgeId: createdId } });
         },
@@ -154,17 +160,32 @@ export function AddBridgeWizardPage() {
   return (
     <div className="mx-auto max-w-5xl p-6">
       <Link
-        to="/bridges"
+        to="/bridges/registrations"
         className="inline-flex items-center gap-1 text-sm text-text-muted hover:text-text"
       >
         <ChevronLeft size={14} aria-hidden="true" />
-        Bridges
+        Registrations
       </Link>
-      <h1 className="mt-2 text-xl text-text">Add bridge</h1>
+      <h1 className="mt-2 text-xl text-text">Register a bridge you run yourself</h1>
+      <p className="mt-0.5 text-sm text-text-muted">
+        For a bridge you start and keep running yourself. To have this server run a bridge for
+        everyone who wants one,{" "}
+        <Link to="/bridges/new" className="text-accent underline underline-offset-2">
+          offer it
+        </Link>{" "}
+        instead.
+      </p>
 
       <div className="mt-6 flex flex-col gap-8 lg:flex-row">
         <div className="lg:w-48 lg:shrink-0">
-          <StepRail current={step} furthestAllowed={furthest} onSelect={goTo} />
+          <StepRail
+            steps={WIZARD_STEPS}
+            labels={STEP_LABELS}
+            label="Register a bridge steps"
+            current={step}
+            furthestAllowed={furthest}
+            onSelect={goTo}
+          />
         </div>
 
         <div className="flex-1">
@@ -182,9 +203,7 @@ export function AddBridgeWizardPage() {
               onClearConflict={() => setConflict(null)}
             />
           )}
-          {step === "deployment" && (
-            <DeploymentStep state={state} onChange={patch} singleNode={singleNode} />
-          )}
+          {step === "deployment" && <DeploymentStep state={state} onChange={patch} />}
           {step === "options" && <OptionsStep state={state} onChange={patch} />}
           {step === "review" && (
             <ReviewStep

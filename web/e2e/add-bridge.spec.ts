@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
 import {
   signInAsOperator,
   signInReadOnly,
@@ -6,24 +6,33 @@ import {
   installDomNestingGuard,
 } from "./utils";
 
-// flows.md flow 1: add a bridge. Covers the happy paths (self-managed and
-// Kubernetes), the namespace-conflict branch, and the forbidden branch, with
-// an axe pass at every step (accessibility.md) and a React DOM-nesting guard
-// (see installDomNestingGuard's doc comment for why axe alone missed the
-// bridges-list nested-button defect).
+// Registering a bridge you run yourself (flows.md flow 1, as it was before RFC 0017): the
+// render-and-register path, now reached from Bridges > Registrations. Bridges this server runs
+// are offered instead (offer-bridge.spec.ts). Covers the happy path, the namespace-conflict
+// branch and the forbidden branch, with an axe pass at every step (accessibility.md) and a
+// React DOM-nesting guard (see installDomNestingGuard's doc comment).
 
-test.describe("Add a bridge", () => {
-  test("happy path: self-managed", async ({ page }) => {
+async function openRegistrations(page: Page) {
+  await page.getByRole("link", { name: "Bridges" }).first().click();
+  await expect(page.getByRole("heading", { name: "Bridges" })).toBeVisible();
+  await page.getByRole("link", { name: "Registrations" }).click();
+  await expect(page).toHaveURL(/\/bridges\/registrations$/);
+}
+
+test.describe("Register a bridge you run yourself", () => {
+  test("happy path", async ({ page }) => {
     const domGuard = installDomNestingGuard(page);
     await signInAsOperator(page);
     await expectNoAxeViolations(page, "overview");
 
-    await page.getByRole("link", { name: "Bridges" }).first().click();
-    await expect(page.getByRole("heading", { name: "Bridges" })).toBeVisible();
-    await expectNoAxeViolations(page, "bridges list");
+    await openRegistrations(page);
+    await expectNoAxeViolations(page, "registrations list");
 
-    await page.getByRole("button", { name: "Add bridge" }).click();
-    await expect(page).toHaveURL(/\/bridges\/new/);
+    await page.getByRole("button", { name: "Register a bridge you run yourself" }).click();
+    await expect(page).toHaveURL(/\/bridges\/registrations\/new/);
+    await expect(
+      page.getByRole("heading", { name: "Register a bridge you run yourself" }),
+    ).toBeVisible();
     await expectNoAxeViolations(page, "wizard: kind");
 
     // The catalogue is grouped; a search narrows it. Bluesky is not among the seeded bridges.
@@ -38,14 +47,13 @@ test.describe("Add a bridge", () => {
     await expectNoAxeViolations(page, "wizard: identity");
     await page.getByRole("button", { name: "Continue" }).click();
 
-    await expect(page.getByRole("heading", { name: "Deployment" })).toBeVisible();
-    await expectNoAxeViolations(page, "wizard: deployment");
-    // Single-node mode: only Self-managed is offered.
+    // Self-managed only: no Kubernetes choice (a bridge this server runs is an offering).
+    await expect(page.getByRole("heading", { name: "Addresses" })).toBeVisible();
     await expect(page.getByRole("radio", { name: "Kubernetes" })).toHaveCount(0);
-    await expect(page.getByRole("radio", { name: "Self-managed" })).toHaveAttribute(
-      "aria-checked",
-      "true",
+    await expect(page.getByLabel(/This server, as the bridge reaches it/)).toHaveValue(
+      "http://myelin:8008",
     );
+    await expectNoAxeViolations(page, "wizard: addresses");
     await page.getByRole("button", { name: "Continue" }).click();
 
     await expect(page.getByRole("heading", { name: "Options" })).toBeVisible();
@@ -62,14 +70,14 @@ test.describe("Add a bridge", () => {
     await expect(configPreview).toContainText("address: http://myelin:8008");
     await expect(configPreview).toContainText('"@ops:example.org": admin');
 
-    await page.getByRole("button", { name: "Create bridge" }).click();
+    await page.getByRole("button", { name: "Register bridge" }).click();
 
     await expect(page.getByRole("heading", { name: /Bridge Bluesky created/ })).toBeVisible();
     await expect(page.getByText("config.yaml", { exact: true })).toBeVisible();
     await expect(page.getByText("registration.yaml", { exact: true })).toBeVisible();
     await expect(page.getByText("docker-compose.yaml")).toBeVisible();
-    // The runbook: how to start it, that the page is watching for its first ping, and how to
-    // sign in, with the bot named for this server.
+    // Nothing about a Bridge resource or an operator: this bridge is run by hand.
+    await expect(page.getByText(/kubectl|operator does the rest/)).toHaveCount(0);
     await expect(page.getByText("docker compose up -d bluesky")).toBeVisible();
     await expect(page.getByRole("status")).toContainText("Waiting for the bridge's first ping");
     await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
@@ -91,62 +99,18 @@ test.describe("Add a bridge", () => {
     domGuard.assertClean();
   });
 
-  test("happy path: kubernetes", async ({ page }) => {
+  test("namespace conflict is shown on the Identity step", async ({ page }) => {
     const domGuard = installDomNestingGuard(page);
     await signInAsOperator(page);
-    // Kubernetes is only offered in cluster mode (flows.md flow 1 step 4);
-    // override the mock overview response for this test to exercise it (see
-    // the doc comment on window.__hsAdminMock in src/mocks/browser.ts for
-    // why this goes through the worker rather than page.route()). The
-    // override lives in the page's JS, not the service worker, so getting
-    // there has to stay client-side routing (no page.goto/full reload).
-    await page.evaluate(() => window.__hsAdminMock?.setClusterMode("cluster", 3));
-    await page.getByRole("link", { name: "Bridges" }).first().click();
-    await expect(page.getByRole("heading", { name: "Bridges" })).toBeVisible();
-    await page.getByRole("button", { name: "Add bridge" }).click();
-    await expect(page).toHaveURL(/\/bridges\/new/);
-
-    await page.getByRole("radio", { name: /LinkedIn/ }).click();
-    await page.getByRole("button", { name: "Continue" }).click();
-    await page.getByRole("button", { name: "Continue" }).click(); // identity
-
-    await expect(page.getByRole("heading", { name: "Deployment" })).toBeVisible();
-    await expect(page.getByRole("radio", { name: "Kubernetes" })).toBeVisible();
-    await page.getByRole("radio", { name: "Kubernetes" }).click();
-    await expect(page.getByLabel("Namespace")).toBeVisible();
-    // The server's address follows the deployment until the operator types one.
-    await expect(page.getByLabel(/This server, as the bridge reaches it/)).toHaveValue(
-      "http://myelin.bridges.svc:8008",
-    );
-    await expectNoAxeViolations(page, "wizard: deployment (kubernetes)");
-
-    await page.getByRole("button", { name: "Continue" }).click();
-    await page.getByRole("button", { name: "Continue" }).click(); // options -> review
-
-    await expect(page.getByRole("heading", { name: "Review" })).toBeVisible();
-    await expect(page.getByText(/Kubernetes \(bridges\)/)).toBeVisible();
-    await page.getByRole("button", { name: "Create bridge" }).click();
-
-    await expect(page.getByRole("heading", { name: /created/ })).toBeVisible();
-    // Kubernetes deployments do not get a Compose snippet; they get the resource and its apply line.
-    await expect(page.getByText("docker-compose.yaml")).toHaveCount(0);
-    await expect(page.getByText("Bridge resource (Kubernetes)")).toBeVisible();
-    await expect(page.getByText("kubectl apply -f linkedin-bridge.yaml")).toBeVisible();
-    domGuard.assertClean();
-  });
-
-  test("namespace conflict is shown on the Identity step with a link", async ({ page }) => {
-    const domGuard = installDomNestingGuard(page);
-    await signInAsOperator(page);
-    await page.goto("/admin/bridges/new");
+    await page.goto("/admin/bridges/registrations/new");
 
     // WhatsApp's default id and user namespace collide with the seeded fixture.
     await page.getByRole("radio", { name: /WhatsApp/ }).click();
     await page.getByRole("button", { name: "Continue" }).click(); // -> identity
-    await page.getByRole("button", { name: "Continue" }).click(); // -> deployment
+    await page.getByRole("button", { name: "Continue" }).click(); // -> addresses
     await page.getByRole("button", { name: "Continue" }).click(); // -> options
     await page.getByRole("button", { name: "Continue" }).click(); // -> review
-    await page.getByRole("button", { name: "Create bridge" }).click();
+    await page.getByRole("button", { name: "Register bridge" }).click();
 
     await expect(page.getByRole("heading", { name: "Identity" })).toBeVisible();
     const conflict = page.getByRole("alert");
@@ -159,14 +123,20 @@ test.describe("Add a bridge", () => {
     const domGuard = installDomNestingGuard(page);
     await signInReadOnly(page);
 
-    // The Bridges list itself is readable...
+    // The lists themselves are readable...
     await page.getByRole("link", { name: "Bridges" }).first().click();
-    await expect(page.getByRole("button", { name: "Add bridge" })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Offer a bridge" })).toBeDisabled();
+    await page.getByRole("link", { name: "Registrations" }).click();
+    await expect(
+      page.getByRole("button", { name: "Register a bridge you run yourself" }),
+    ).toBeDisabled();
 
-    // ...but the wizard route itself refuses outright when linked to directly.
-    await page.goto("/admin/bridges/new");
-    await expect(page.getByText("bridges:write")).toBeVisible();
-    await expect(page.getByText("Ask an administrator to grant it.")).toBeVisible();
+    // ...but the wizards refuse outright when linked to directly.
+    for (const path of ["/admin/bridges/registrations/new", "/admin/bridges/new"]) {
+      await page.goto(path);
+      await expect(page.getByText("bridges:write")).toBeVisible();
+      await expect(page.getByText("Ask an administrator to grant it.")).toBeVisible();
+    }
     await expectNoAxeViolations(page, "wizard: forbidden");
     domGuard.assertClean();
   });

@@ -29,7 +29,7 @@ export function ReviewStep({
     <div>
       <h2 className="text-lg text-text">Review</h2>
       <p className="mt-1 text-sm text-text-muted">
-        Creating registers the appservice with the homeserver at once, with the two tokens below.
+        Registering adds the appservice to the homeserver at once, with the two tokens below.
         Nothing runs yet: the next page has the files to start the bridge with, and how to sign in
         once it does.
       </p>
@@ -49,16 +49,9 @@ export function ReviewStep({
             <Row label="User namespace" value={state.userNamespace || "—"} />
           </dl>
         </ReviewGroup>
-        <ReviewGroup title="Deployment" onEdit={() => onEdit("deployment")}>
+        <ReviewGroup title="Addresses" onEdit={() => onEdit("deployment")}>
           <dl className="grid grid-cols-2 gap-2 text-sm">
-            <Row
-              label="Runs on"
-              value={
-                state.deployment === "kubernetes"
-                  ? `Kubernetes (${state.namespace})`
-                  : "Self-managed"
-              }
-            />
+            <Row label="Runs on" value="Your own machine (self-managed)" />
             <Row label="Reaches this server at" value={state.homeserverAddress} />
             <Row label="Reached by this server at" value={state.bridgeAddress} />
           </dl>
@@ -120,7 +113,7 @@ export function ReviewStep({
 
       <div className="mt-6 flex justify-end">
         <Button size="lg" onClick={onCreate} disabled={isPending || isRendering || !renderResult}>
-          {isPending ? "Creating..." : "Create bridge"}
+          {isPending ? "Registering..." : "Register bridge"}
         </Button>
       </div>
     </div>
