@@ -215,6 +215,12 @@ fn percent_decode(raw: &str) -> String {
 /// for a room ID that carries a server name, as every room version before 12 does -- that
 /// server, are asked in turn to sponsor the join, and the room becomes resident here. With no
 /// hook installed the room is not found, as before.
+///
+/// So is a room the registry holds but nobody of this server is in any more
+/// (`RoomActor::servers_to_join_through`): a copy nobody here is joined to has not received an
+/// event since the last one left, so a join made against it is made against the room as it
+/// was then. The resident's answer brings the room's current state with it, the same as a first
+/// join does. With no hook installed the join is made here regardless, as before.
 async fn act_join<B: KvBackend + 'static>(
     state: &RoomState<B>,
     room_id: &str,
@@ -226,6 +232,17 @@ async fn act_join<B: KvBackend + 'static>(
     let content = extra(state, Action::Join, &sender, body).await;
     match state.rooms.get_or_load(&room_id).await {
         Ok(handle) => {
+            if let Some(remote) = &state.remote_join
+                && let Some(servers) = handle.query(|actor| actor.servers_to_join_through()).await
+            {
+                for server in servers {
+                    if !via.contains(&server) {
+                        via.push(server);
+                    }
+                }
+                let joined = remote.join(&sender, &room_id, &via, content).await?;
+                return Ok(Json(json!({ "room_id": joined })).into_response());
+            }
             handle
                 .membership(sender.clone(), Action::Join, sender, content, now_ms())
                 .await?;
@@ -565,6 +582,87 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, RoomError::RoomNotFound(_)), "{err}");
+    }
+
+    /// A room this server holds, whose last local member left while a remote member stayed, is
+    /// rejoined through that member's server rather than against the stale copy; a room with a
+    /// local member still in it is joined here, as always.
+    #[tokio::test]
+    async fn a_held_room_nobody_here_is_in_is_rejoined_through_a_resident() {
+        let remote = Arc::new(RecordingRemoteJoin::default());
+        let state = state(Some(remote.clone()));
+        let alice_id = UserId::parse("@alice:hs1").unwrap().to_owned();
+        let bob_id = UserId::parse("@bob:remote.example").unwrap().to_owned();
+        let carol_id = UserId::parse("@carol:hs1").unwrap().to_owned();
+        // Alice creates the room here; bob, elsewhere, joins it.
+        let handle = state
+            .rooms
+            .create_room(
+                alice_id.clone(),
+                crate::actor::CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|actor| actor.room_id().to_owned()).await;
+        handle
+            .membership(bob_id.clone(), Action::Join, bob_id.clone(), json!({}), 2)
+            .await
+            .unwrap();
+
+        // Carol, here, joins while alice is still in the room: made here, no resident asked.
+        let response = post_join::<MemoryBackend>(
+            State(state.clone()),
+            Path(room_id.to_string()),
+            RawQuery(None),
+            RoomRequester(Requester::for_user(carol_id.clone())),
+            PermissiveJson(json!({})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(remote.joins.lock().unwrap().is_empty());
+
+        // Everybody here leaves; bob stays. Alice's rejoin goes through bob's server.
+        handle
+            .membership(
+                alice_id.clone(),
+                Action::Leave,
+                alice_id.clone(),
+                json!({}),
+                3,
+            )
+            .await
+            .unwrap();
+        handle
+            .membership(
+                carol_id.clone(),
+                Action::Leave,
+                carol_id.clone(),
+                json!({}),
+                4,
+            )
+            .await
+            .unwrap();
+        let response = post_join::<MemoryBackend>(
+            State(state.clone()),
+            Path(room_id.to_string()),
+            RawQuery(Some("server_name=sponsor.example".to_owned())),
+            alice(),
+            PermissiveJson(json!({})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let joins = remote.joins.lock().unwrap();
+        assert_eq!(joins.len(), 1, "the rejoin went through federation");
+        let (user, room, via, _) = &joins[0];
+        assert_eq!(user, "@alice:hs1");
+        assert_eq!(room, room_id.as_str());
+        assert_eq!(via, &["sponsor.example", "remote.example"]);
     }
 
     #[tokio::test]

@@ -24,6 +24,15 @@ and the gap a leave-and-rejoin leaves in the middle of a timeline is not filled,
 is fetched before the *oldest* held event and positions are a stream order, not a topological
 one.)
 
+Same day, later: `RoomActor::servers_to_join_through` and the `act_join` branch that uses it. A
+room this server holds but nobody of this server is joined to is a copy that stopped receiving
+events when the last one left; a join made against it (the old behaviour, since the registry
+held the room) was a join against the room as it was then. It goes through a member's server now
+when the remote-join hook is installed, and the resident's answer -- applied to the existing
+actor by `accept_remote_join_with_state`, which already handled a rejoin -- carries the current
+state. Route test in `routes::membership`; end to end in the two-server test. With no hook
+(this crate's tests, federation off) nothing changed.
+
 Previously: 2026-09-25 (session 8: RFC 0015 implemented -- a room this server's own user
 joined on another server is built here from the verified `send_join` response, as outliers plus a
 join with explicit state; `RoomRegistry::bootstrap_from_remote_join` is the entry point `hs-cli`

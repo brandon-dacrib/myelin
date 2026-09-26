@@ -439,21 +439,102 @@ async fn a_user_joins_a_room_on_another_server_and_messages_flow_both_ways() {
 
     // The joined room survives B being asked cold: the actor was made from a snapshot and is
     // reloaded from what was persisted.
-    let state: Value = client
-        .get(format!(
-            "{}/_matrix/client/v3/rooms/{room_id}/state/m.room.name",
+    let room_name = |base: &str, token: &str| {
+        let url = format!("{base}/_matrix/client/v3/rooms/{room_id}/state/m.room.name");
+        let client = client.clone();
+        let token = token.to_owned();
+        async move {
+            let state: Value = client
+                .get(url)
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            state
+        }
+    };
+    let state = room_name(&b.base, &bob_token).await;
+    assert_eq!(
+        state["name"], "two servers",
+        "B's copy of the room state: {state}"
+    );
+
+    // Bob leaves, the room changes while nobody from B is in it, and bob comes back. B still
+    // holds its copy of the room, so the rejoin could be made against it -- and would then be
+    // a join made against the room as it was when bob left. It goes through A instead, the
+    // same way the first join did, and the answer carries the room as it is now.
+    let leave = client
+        .post(format!(
+            "{}/_matrix/client/v3/rooms/{room_id}/leave",
             b.base
         ))
         .bearer_auth(&bob_token)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(leave.status(), 200);
+    sync_until(&client, &a.base, &alice_token, |s| {
+        s["rooms"]["leave"].get(&room_id).is_some()
+            || s["rooms"]["join"][&room_id]["timeline"]["events"]
+                .as_array()
+                .is_some_and(|events| {
+                    events.iter().any(|e| {
+                        e["type"] == "m.room.member"
+                            && e["state_key"] == bob
+                            && e["content"]["membership"] == "leave"
+                    })
+                })
+    })
+    .await;
+    let renamed: Value = client
+        .put(format!(
+            "{}/_matrix/client/v3/rooms/{room_id}/state/m.room.name",
+            a.base
+        ))
+        .bearer_auth(&alice_token)
+        .json(&json!({"name": "renamed while bob was out"}))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
+    assert!(renamed["event_id"].is_string(), "{renamed}");
+    let rejoin = client
+        .post(format!(
+            "{}/_matrix/client/v3/join/{room_id}?server_name={}",
+            b.base, a.name
+        ))
+        .bearer_auth(&bob_token)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejoin.status(), 200);
+    let state = room_name(&b.base, &bob_token).await;
     assert_eq!(
-        state["name"], "two servers",
-        "B's copy of the room state: {state}"
+        state["name"], "renamed while bob was out",
+        "B's copy of the room after the rejoin must be the room as it is now: {state}"
+    );
+    let members: Value = client
+        .get(format!(
+            "{}/_matrix/client/v3/rooms/{room_id}/joined_members",
+            a.base
+        ))
+        .bearer_auth(&alice_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        members["joined"].get(&bob).is_some(),
+        "A knows bob is back before the join returned: {members}"
     );
 
     a.handle.shutdown().await;

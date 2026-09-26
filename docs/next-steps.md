@@ -108,6 +108,21 @@ profile on the join. What is not there: the outbound queue is in memory (a resta
 EDUs (typing, receipts, presence) cross servers, and invites, leaves and knocks over federation
 are still seams.
 
+**A rejoin goes through the room, not a stale copy of it** (2026-09-26, found by reading run
+11's rejoin subtest). B holds its copy of a room after bob leaves and stops receiving events
+for it; bob's rejoin used to be made against that copy -- authorized against rules that may
+have changed, citing an extremity the room had moved past, sent to A after the fact -- and it
+never brought back what was missed. `RoomActor::servers_to_join_through` says when a join
+cannot be made here (nobody of this server joined, members of other servers are), and
+`act_join` then goes through one of those servers exactly as a first join does
+(`bootstrap_from_remote_join` applies the answer to the existing actor), so B's copy carries
+the room's current state the moment the join returns and A knew about it before that. In the
+two-server test alice renames the room while bob is out; his rejoin brings the new name. What
+is still not brought back is the timeline between the leave and the rejoin (positions are a
+stream order; a gap in the middle needs topological pagination). Also fixed: the federation
+client read a `403` from `/backfill` or `/get_missing_events` as "no events", so a refusal was
+logged as an empty answer; it is an error now, with the status and the body.
+
 **And the room's history from before the join** (2026-09-26). Until this session bob's timeline
 on B began at his join: `/messages` backwards stopped there and said it was the start of the
 room, and `/sync` offered no `prev_batch` to ask from, so Element would never have asked. Now a
@@ -142,10 +157,13 @@ While the server has no administrator it logs a one-time setup link at every sta
 
 **The admin interface ships.** Until 2026-09-21 it did not: every binary and every published image served a placeholder at `/admin/` saying the interface had not been built in, because nothing embedded `web/dist`. `crates/hs-admin/build.rs` now stages the built interface (or the placeholder, for a Rust-only checkout, and says so at startup); release builds set `HS_ADMIN_WEB_DIST` and *fail* without a built interface; CD refuses to publish an image whose `/admin/` is not the interface. Verified on the published artifact: `ghcr.io/brandon-dacrib/myelin:main`, pulled from the registry on 2026-09-21 and run with the README's exact command, serves the interface at `/admin/`, answers `needs_setup: true`, and logs the setup link. What has still never run is the `v*` binaries job's new Node step, which only a tag exercises.
 
-**Complement, `csapi`: 314 of 384 assertions pass** (78 of 106 top-level), measured 2026-09-26 at
-`82359fb` (run 10), identical by name to run 7 (2026-09-21, `318f8f4`) after a day of federation
-work -- and after run 9, from the commit before the `/messages` fix, hung for thirty minutes on
-`TestMessagesOverFederation` and ran 64 tests. The same morning it was 241 of 370 (61 of 104); before that 191/296, 148/293
+**Complement, `csapi`: 317 of 384 assertions pass** (78 of 106 top-level), measured 2026-09-26 at
+`9672d61` (run 11): the two "after joining new room" subtests of `TestMessagesOverFederation`
+moved to passing with the history before a join fetched (see "the room's history from before
+the join"), its "after re-joining" subtest did not, and no top-level test moved either way. Run
+10 (`82359fb`) was 314 of 384, identical by name to run 7 (2026-09-21, `318f8f4`) after a day
+of federation work -- and after run 9, from the commit before the `/messages` fix, hung for
+thirty minutes on `TestMessagesOverFederation` and ran 64 tests. The same morning it was 241 of 370 (61 of 104); before that 191/296, 148/293
 and 125/293. The denominator grew because the harness image now configures Complement's shared
 secret, which un-skipped two tests: `TestCanRegisterAdmin` passes, and `TestServerNotices` runs
 for the first time and fails, since server notices do not exist here.
@@ -236,7 +254,7 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 
 | Area | Where it is | Basis |
 |---|---|---|
-| Client-server API | ~75% | 314/384 csapi assertions, 78/106 top-level (run 7); two real Element sessions sign in, create an encrypted room, invite, accept, and read each other's encrypted messages. The number understates the day: four of the fixes behind it were `/sync` silently losing events, which no percentage shows |
+| Client-server API | ~75% | 317/384 csapi assertions, 78/106 top-level (run 11); two real Element sessions sign in, create an encrypted room, invite, accept, and read each other's encrypted messages. The number understates the day: four of the fixes behind it were `/sync` silently losing events, which no percentage shows |
 | Storage, rooms, state resolution | ~85% | the engine underneath; 1600+ tests, two backends through one conformance suite, state bake-off done |
 | Configuration and first run | ~90% | database-backed, editable in the UI, one command from nothing to a working server |
 | Admin API | ~40% | 58 of 145 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Config 6/6, Server 5/5, AuditLog 3/3, Setup 2/2, Bridges 16/16, Users 14/41, Rooms 6/23, Federation 3/7, Statistics 1/4, Cluster 1/6, and Media 0/9, RegistrationTokens 0/5 |
@@ -274,9 +292,15 @@ one polling test can print the same line twenty times.
   Run 10 (2026-09-26, `82359fb`): 314 of 384, 78 of 106, identical to run 7 by name -- the join
   now succeeds in both tests, and both still fail after it: `TestMessagesOverFederation` on the
   history before the join, which was not backfilled, and `TestPushRuleRoomUpgrade` on the
-  upgrade. The history is fetched now (see "the room's history from before the join" above);
-  the "after joining new room" subtests should move, and the "after re-joining" one should not,
-  because it needs the gap between a leave and a rejoin filled, which this does not do.
+  upgrade. The history is fetched now (see "the room's history from before the join" above),
+  and run 11 (`9672d61`) says what was predicted: both "after joining new room" subtests pass
+  (20 messages read in pages of ten; 300 in pages of two hundred, a hundred fetched per page),
+  the "after re-joining" one does not -- bob's page after the rejoin is his rejoin, his leave
+  and his first join, and the twenty messages sent while he was out are in the gap between
+  leave and rejoin, which nothing fills. The run also showed the rejoin itself being made
+  against B's stale copy of the room and racing its own delivery to A, which is fixed (see "a
+  rejoin goes through the room"), and a refusal from A being read as an empty answer, also
+  fixed.
 - **`TestSync` (4)**: "Newly joined room has correct timeline in incremental sync" and the
   lazy-loading `device_lists.left` case; read the reasons.
 - **`TestChangePasswordPushers` (2)**: a password change should delete pushers made by other

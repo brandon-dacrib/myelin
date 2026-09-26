@@ -3797,6 +3797,48 @@ impl<B: KvBackend> RoomActor<B> {
         Some(crate::backfill::BackfillAnchor { event_id, servers })
     }
 
+    /// The servers a join of this room by one of this server's own users has to go through,
+    /// when it cannot be made here: `Some(servers)` if no user of this server is currently
+    /// joined and users of other servers are, `None` otherwise. A copy of a room nobody here is
+    /// in stops receiving events the moment the last one leaves, so its state is whatever it was
+    /// then; a join built against it would be authorized against rules that may have changed
+    /// since, cite extremities the room has long moved past, and -- accepted or not by the
+    /// resident -- never bring back what was missed. Synapse makes the same call
+    /// (`is_host_in_room`). The servers are the room ID's own first, then every joined member's.
+    #[must_use]
+    pub fn servers_to_join_through(&self) -> Option<Vec<String>> {
+        let own = self.identity.server_name.as_str();
+        let mut servers: Vec<String> = Vec::new();
+        let mut local_joined = false;
+        for member in self.joined_members().unwrap_or_default() {
+            let Some(user) = member
+                .header()
+                .state_key
+                .as_deref()
+                .and_then(|k| UserId::parse(k).ok())
+            else {
+                continue;
+            };
+            let server = user.server_name().as_str();
+            if server == own {
+                local_joined = true;
+            } else if !servers.iter().any(|s| s == server) {
+                servers.push(server.to_owned());
+            }
+        }
+        if local_joined || servers.is_empty() {
+            return None;
+        }
+        if let Some(server) = self.room_id.server_name()
+            && server.as_str() != own
+            && let Some(at) = servers.iter().position(|s| s == server.as_str())
+        {
+            servers.rotate_left(at);
+            servers[1..].sort();
+        }
+        Some(servers)
+    }
+
     /// The room's current forward extremities -- the events nothing held cites as a
     /// `prev_events` entry, which a new event here would cite -- as `(event_id, depth)`, in
     /// interning order. Usually one; more is a fork this actor holds unresolved.

@@ -83,7 +83,7 @@ broken up, because the parts are nowhere near each other. This table is kept cur
 
 | Area | Done | Basis |
 |---|---|---|
-| Client-server API | ~75% | 314/384 Complement csapi assertions; two Element sessions chat encrypted |
+| Client-server API | ~75% | 317/384 Complement csapi assertions; two Element sessions chat encrypted |
 | Storage, rooms, state resolution | ~85% | 1,600+ tests, two backends through one conformance suite |
 | Configuration and first run | ~90% | database-backed, edited in the UI, one command from nothing to a server |
 | Admin API | ~40% | 58 of 145 operations have a real handler; the rest answer an honest 501 |

@@ -104,6 +104,26 @@ pub enum ClientError {
     ResponseTooLarge(String),
     #[error("response from `{0}` was not valid JSON: {1}")]
     BadResponseJson(String, String),
+    /// The destination answered, with a status that is not success. For the calls that read a
+    /// list out of the body ([`FederationClient::backfill`],
+    /// [`FederationClient::get_missing_events`]) this is what a `403` or `404` becomes, so that
+    /// a refusal is logged as one and never read as "the remote has nothing".
+    #[error("`{destination}` answered HTTP {status}: {body}")]
+    Rejected {
+        destination: String,
+        status: u16,
+        body: String,
+    },
+}
+
+/// The body of a non-success response, cut to what a log line can carry.
+fn rejection_body(body: &serde_json::Value) -> String {
+    let text = body.to_string();
+    if text.len() > 200 {
+        format!("{}...", &text[..text.floor_char_boundary(200)])
+    } else {
+        text
+    }
 }
 
 /// Configuration the client needs from `hs-config::FederationConfig`, copied into this crate's
@@ -448,6 +468,13 @@ impl FederationClient {
             path.push_str(id);
         }
         let response = self.send(destination, "GET", &path, None).await?;
+        if response.status / 100 != 2 {
+            return Err(ClientError::Rejected {
+                destination: destination.to_owned(),
+                status: response.status,
+                body: rejection_body(&response.body),
+            });
+        }
         Ok(response
             .body
             .get("pdus")
@@ -481,6 +508,13 @@ impl FederationClient {
             "min_depth": min_depth,
         });
         let response = self.send(destination, "POST", &path, Some(&body)).await?;
+        if response.status / 100 != 2 {
+            return Err(ClientError::Rejected {
+                destination: destination.to_owned(),
+                status: response.status,
+                body: rejection_body(&response.body),
+            });
+        }
         Ok(response
             .body
             .get("events")

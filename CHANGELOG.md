@@ -184,7 +184,7 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
 
 ### Conformance
 
-- **Complement `csapi`: 314 of 384 assertions**, 78 of 106 top-level tests, measured 2026-09-21
+- **Complement `csapi`: 317 of 384 assertions**, 78 of 106 top-level tests, measured 2026-09-26 (run 11, `9672d61`: the two "after joining new room" subtests of `TestMessagesOverFederation` moved to passing with the history before a join fetched; nothing moved the other way). Before that 314 of 384, measured 2026-09-21
   and again, identical by name, on 2026-09-26;
   241 of 370 that morning, 191 of 296 the run before that. The first run this project ever took was 125; the suite had never
   been run before that.
@@ -226,6 +226,17 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
   private CA (`crates/hs-federation/scripts/two-server-federation.sh`): it passed on 2026-09-25, join through `/join`, state on B, a message each way. Between two
   instances of this server; a Synapse on the other end has not been tried. Not yet: EDUs,
   invites, leaves and knocks over federation; the outbound queue is in memory.
+- **A rejoin goes through the room, not through a stale copy of it** (2026-09-26). A server
+  holds its copy of a room after its last user leaves, and stops receiving events for it. A join
+  made against that copy is a join against the room as it was then: authorized against rules
+  that may have changed, citing extremities the room has moved past, and never bringing back
+  what was missed. When nobody of this server is joined and members of other servers are, a
+  join now goes through one of those servers exactly as a first join does, and the answer
+  carries the room's current state. The two-server test has bob leave, alice rename the room
+  while he is out, and bob rejoin: B's copy carries the new name at once, and A knows bob is
+  back before the join returns. Also: a `/backfill` or `/get_missing_events` the other server
+  refuses is now logged as a refusal, where the client used to read a `403` as "the remote has
+  nothing".
 - **A room joined elsewhere has its history** (2026-09-26). Until now the timeline of such a
   room began at the join: `/messages` backwards stopped there and said it was the start of the
   room, and `/sync` offered no `prev_batch` to ask from. Now a backward page that reaches the
