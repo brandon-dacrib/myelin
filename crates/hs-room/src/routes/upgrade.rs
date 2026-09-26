@@ -284,6 +284,7 @@ mod tests {
             auth: AuthState::in_memory(),
             rooms,
             identity,
+            remote_join: None,
         }
     }
 

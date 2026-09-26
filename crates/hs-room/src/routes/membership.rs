@@ -29,7 +29,7 @@
 //! converge on the same idempotent re-send.
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::response::{IntoResponse, Response};
 use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
@@ -150,55 +150,156 @@ async fn act<B: KvBackend + 'static>(
     Ok(Json(json!({})).into_response())
 }
 
+/// The servers a client named as candidates to sponsor a join it asked for: every `server_name`
+/// (the spec's parameter) and every `via` (the newer spelling, MSC4156) in the query string, in
+/// the order given. Read from the raw query rather than through a typed `Query` extractor
+/// because the parameter repeats (`?server_name=a&server_name=b`), which the form decoder axum
+/// uses does not represent.
+fn requested_via(raw_query: Option<&str>) -> Vec<String> {
+    let mut via = Vec::new();
+    for pair in raw_query.unwrap_or_default().split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == "server_name" || key == "via" {
+            let value = percent_decode(value);
+            if !value.is_empty() && !via.contains(&value) {
+                via.push(value);
+            }
+        }
+    }
+    via
+}
+
+/// Decodes `%XX` escapes and `+` in one query-string value. Lenient: a malformed escape is kept
+/// as it was, since the worst outcome is a server name that does not resolve.
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                match u8::from_str_radix(hex, 16) {
+                    Ok(byte) => {
+                        out.push(byte);
+                        i += 3;
+                    }
+                    Err(_) => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Like [`act`], but for the two join endpoints: per the spec, `POST /rooms/{roomId}/join` and
 /// `POST /join/{roomIdOrAlias}` respond `{"room_id": "!..."}`, not `{}`. Found by
 /// `crates/hs-loadgen`'s `matrix-rust-sdk` scenario: the SDK's `join_room_by_id` deserializes the
 /// response strictly and rejected the empty body `act` had been sending on every join
 /// (`missing field `room_id``), which every unit test speaking this crate's own dialect had
 /// missed because none of them asserted the join response body, only that joining succeeded.
+///
+/// A room the registry does not hold is joined through federation
+/// (`RoomState::remote_join`, when installed): the servers the client named (`via`), or --
+/// for a room ID that carries a server name, as every room version before 12 does -- that
+/// server, are asked in turn to sponsor the join, and the room becomes resident here. With no
+/// hook installed the room is not found, as before.
 async fn act_join<B: KvBackend + 'static>(
     state: &RoomState<B>,
     room_id: &str,
+    mut via: Vec<String>,
     sender: ruma::OwnedUserId,
     body: &Value,
 ) -> Result<Response, RoomError> {
     let room_id = parse_room_id(room_id)?;
-    let handle = state.rooms.get_or_load(&room_id).await?;
     let content = extra(state, Action::Join, &sender, body).await;
-    handle
-        .membership(sender.clone(), Action::Join, sender, content, now_ms())
-        .await?;
-    Ok(Json(json!({ "room_id": room_id })).into_response())
+    match state.rooms.get_or_load(&room_id).await {
+        Ok(handle) => {
+            handle
+                .membership(sender.clone(), Action::Join, sender, content, now_ms())
+                .await?;
+            Ok(Json(json!({ "room_id": room_id })).into_response())
+        }
+        Err(RoomError::RoomNotFound(_)) if state.remote_join.is_some() => {
+            let remote = state
+                .remote_join
+                .as_ref()
+                .expect("checked by the match guard");
+            if let Some(server) = room_id.server_name()
+                && server != &*state.identity.server_name
+                && !via.iter().any(|v| v == server.as_str())
+            {
+                via.push(server.to_string());
+            }
+            if via.is_empty() {
+                return Err(RoomError::RoomNotFound(room_id.to_string()));
+            }
+            let joined = remote.join(&sender, &room_id, &via, content).await?;
+            Ok(Json(json!({ "room_id": joined })).into_response())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// `POST /rooms/{roomId}/join`.
 pub async fn post_join<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
     RoomRequester(requester): RoomRequester,
     PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
-    act_join(&state, &room_id, requester.user_id, &body).await
+    let via = requested_via(raw_query.as_deref());
+    act_join(&state, &room_id, via, requester.user_id, &body).await
 }
 
-/// `POST /join/{roomIdOrAlias}`.
+/// `POST /join/{roomIdOrAlias}`. An alias on another server is resolved through that server's
+/// directory (`RoomState::remote_join`), and the servers its directory names are added to the
+/// candidates for the join.
 pub async fn post_join_by_id_or_alias<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_id_or_alias): Path<String>,
+    RawQuery(raw_query): RawQuery,
     RoomRequester(requester): RoomRequester,
     PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
+    let mut via = requested_via(raw_query.as_deref());
     let room_id = if room_id_or_alias.starts_with('!') {
         parse_room_id(&room_id_or_alias)?
     } else {
         let alias = ruma::RoomAliasId::parse(&room_id_or_alias)
             .map_err(|e| RoomError::BadRequest(e.to_string()))?;
-        state
-            .rooms
-            .resolve_alias(&alias)?
-            .ok_or_else(|| RoomError::RoomNotFound(room_id_or_alias.clone()))?
+        match state.rooms.resolve_alias(&alias)? {
+            Some(room_id) => room_id,
+            None => match &state.remote_join {
+                Some(remote) if alias.server_name() != &*state.identity.server_name => {
+                    let (room_id, servers) = remote.resolve_alias(&alias).await?;
+                    for server in servers {
+                        if !via.contains(&server) {
+                            via.push(server);
+                        }
+                    }
+                    if !via.iter().any(|v| v == alias.server_name().as_str()) {
+                        via.push(alias.server_name().to_string());
+                    }
+                    room_id
+                }
+                _ => return Err(RoomError::RoomNotFound(room_id_or_alias.clone())),
+            },
+        }
     };
-    act_join(&state, room_id.as_str(), requester.user_id, &body).await
+    act_join(&state, room_id.as_str(), via, requester.user_id, &body).await
 }
 
 /// `POST /rooms/{roomId}/leave`.
@@ -352,4 +453,206 @@ pub async fn post_knock_by_id_or_alias<B: KvBackend + 'static>(
         &body,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use axum::http::StatusCode;
+    use hs_auth::requester::Requester;
+    use hs_auth::state::AuthState;
+    use hs_kv::memory::MemoryBackend;
+    use ruma::{OwnedRoomId, RoomAliasId, UserId};
+
+    use super::*;
+    use crate::identity::HomeserverIdentity;
+    use crate::registry::RoomRegistry;
+
+    #[test]
+    fn requested_via_reads_both_spellings_in_order_without_repeats() {
+        let via = requested_via(Some(
+            "server_name=a.example&via=b.example&server_name=a.example&server_name=127.0.0.1%3A8448&other=x",
+        ));
+        assert_eq!(via, vec!["a.example", "b.example", "127.0.0.1:8448"]);
+        assert!(requested_via(None).is_empty());
+        assert!(requested_via(Some("server_name=")).is_empty());
+    }
+
+    #[test]
+    fn percent_decode_is_lenient() {
+        assert_eq!(percent_decode("a%3Ab+c"), "a:b c");
+        assert_eq!(percent_decode("bad%zz"), "bad%zz");
+        assert_eq!(percent_decode("trailing%4"), "trailing%4");
+    }
+
+    /// One recorded join request: user, room, the `via` list, the member content.
+    type RecordedJoin = (String, String, Vec<String>, Value);
+
+    /// Records what the route asked for, and answers as a federation join would.
+    #[derive(Default)]
+    struct RecordingRemoteJoin {
+        joins: Mutex<Vec<RecordedJoin>>,
+        resolved: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl crate::remote_join::RemoteJoin for RecordingRemoteJoin {
+        async fn join(
+            &self,
+            user_id: &UserId,
+            room_id: &RoomId,
+            via: &[String],
+            content: Value,
+        ) -> Result<OwnedRoomId, RoomError> {
+            self.joins.lock().unwrap().push((
+                user_id.to_string(),
+                room_id.to_string(),
+                via.to_vec(),
+                content,
+            ));
+            Ok(room_id.to_owned())
+        }
+
+        async fn resolve_alias(
+            &self,
+            alias: &RoomAliasId,
+        ) -> Result<(OwnedRoomId, Vec<String>), RoomError> {
+            self.resolved.lock().unwrap().push(alias.to_string());
+            Ok((
+                RoomId::parse("!resolved:remote.example")
+                    .unwrap()
+                    .to_owned(),
+                vec!["remote.example".to_owned(), "third.example".to_owned()],
+            ))
+        }
+    }
+
+    fn state(remote: Option<Arc<RecordingRemoteJoin>>) -> RoomState<MemoryBackend> {
+        let identity = HomeserverIdentity::for_tests("hs1");
+        let rooms = Arc::new(RoomRegistry::open(MemoryBackend::new(), identity.clone()).unwrap());
+        RoomState {
+            auth: AuthState::in_memory(),
+            rooms,
+            identity,
+            remote_join: remote.map(|r| r as Arc<dyn crate::remote_join::RemoteJoin>),
+        }
+    }
+
+    fn alice() -> RoomRequester {
+        RoomRequester(Requester::for_user(
+            UserId::parse("@alice:hs1").unwrap().to_owned(),
+        ))
+    }
+
+    async fn body_json(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_unknown_room_is_not_found_without_a_remote_join_hook() {
+        let err = post_join::<MemoryBackend>(
+            State(state(None)),
+            Path("!nowhere:remote.example".to_owned()),
+            RawQuery(Some("server_name=remote.example".to_owned())),
+            alice(),
+            PermissiveJson(json!({})),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, RoomError::RoomNotFound(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_room_is_joined_through_the_servers_the_client_named() {
+        let remote = Arc::new(RecordingRemoteJoin::default());
+        let response = post_join::<MemoryBackend>(
+            State(state(Some(remote.clone()))),
+            Path("!nowhere:remote.example".to_owned()),
+            RawQuery(Some(
+                "server_name=sponsor.example&via=other.example".to_owned(),
+            )),
+            alice(),
+            PermissiveJson(json!({"reason": "curious"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await,
+            json!({"room_id": "!nowhere:remote.example"})
+        );
+        let joins = remote.joins.lock().unwrap();
+        let (user, room, via, content) = &joins[0];
+        assert_eq!(user, "@alice:hs1");
+        assert_eq!(room, "!nowhere:remote.example");
+        // The client's servers first, then the room ID's own server as a last resort.
+        assert_eq!(via, &["sponsor.example", "other.example", "remote.example"]);
+        assert_eq!(content["reason"], "curious");
+        assert!(
+            content.get("membership").is_none(),
+            "membership is the actor's to set"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_room_ids_server_is_enough_to_try_when_the_client_named_none() {
+        let remote = Arc::new(RecordingRemoteJoin::default());
+        post_join::<MemoryBackend>(
+            State(state(Some(remote.clone()))),
+            Path("!nowhere:remote.example".to_owned()),
+            RawQuery(None),
+            alice(),
+            PermissiveJson(json!({})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(remote.joins.lock().unwrap()[0].2, vec!["remote.example"]);
+    }
+
+    #[tokio::test]
+    async fn a_remote_alias_is_resolved_through_its_server_and_joined_via_its_servers() {
+        let remote = Arc::new(RecordingRemoteJoin::default());
+        let response = post_join_by_id_or_alias::<MemoryBackend>(
+            State(state(Some(remote.clone()))),
+            Path("#somewhere:remote.example".to_owned()),
+            RawQuery(None),
+            alice(),
+            PermissiveJson(json!({})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            body_json(response).await,
+            json!({"room_id": "!resolved:remote.example"})
+        );
+        assert_eq!(
+            remote.resolved.lock().unwrap().as_slice(),
+            ["#somewhere:remote.example"]
+        );
+        assert_eq!(
+            remote.joins.lock().unwrap()[0].2,
+            vec!["remote.example", "third.example"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_local_alias_is_not_resolved_remotely() {
+        let remote = Arc::new(RecordingRemoteJoin::default());
+        let err = post_join_by_id_or_alias::<MemoryBackend>(
+            State(state(Some(remote.clone()))),
+            Path("#nowhere:hs1".to_owned()),
+            RawQuery(None),
+            alice(),
+            PermissiveJson(json!({})),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, RoomError::RoomNotFound(_)), "{err}");
+        assert!(remote.resolved.lock().unwrap().is_empty());
+    }
 }

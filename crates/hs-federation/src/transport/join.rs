@@ -126,6 +126,8 @@ async fn send_join(
         &event_id,
         &signed_event,
         &origin,
+        &state.own_server_name,
+        state.sender.as_deref(),
     )
     .await
     {
@@ -262,6 +264,7 @@ mod tests {
             transactions: std::sync::Arc::new(InMemoryTransactionStore::new()),
             ancestor_fetcher: None,
             backfill_limits: crate::backfill::BackfillLimits::default(),
+            sender: None,
         }
     }
 

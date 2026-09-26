@@ -1,5 +1,16 @@
 # 06 Federation: status
 
+> **Integration note, 2026-09-25 (integration lead):** the eighth session's sender (below) and
+> track 04's RFC 0015 bootstrap landed together with the piece between them: `POST /join` on a
+> room this server does not hold now runs `crate::outbound_join::join_room_with_content` against
+> each `via` and hands the verified snapshot to `RoomRegistry::bootstrap_from_remote_join`
+> (`hs_room::remote_join::RemoteJoin`, implemented by `hs_cli::remote_join`). The joining side
+> also sends `?ver=` with every supported room version on `make_join` (Synapse refuses a joiner
+> that does not) and merges the user's profile into the join template. Proven end to end by
+> `crates/hs-cli/tests/federation_two_servers.rs` (two in-process servers, plain HTTP, join
+> through the client API, messages both ways) and by the TLS script. The sender's "B cannot hold
+> the room yet" caveat in section 8 below was true when written and is closed.
+
 > **Integration note, 2026-09-19 (integration lead):** the gap this file describes below as "the
 > one gap this session could not close" — no way to persist a newly received foreign event — was
 > **closed** by track 04's `hs_room::actor::RoomActor::accept_remote_event`. The fifth session
@@ -16,7 +27,10 @@
 > URL, and nothing in this workspace could *initiate* an outbound join at all — only answer one.**
 > All three are fixed; see "Seventh session" below.
 
-Updated: 2026-09-19 (seventh session -- the two-instance session: two real `hs serve` processes,
+Updated: 2026-09-25 (eighth session -- the outbound sender: this server now sends its own events
+to the servers of a room's remote members over `PUT /send/{txnId}`, and a resident forwards a join
+it accepts to the room's other servers. In memory only, no EDUs, not shard-gated; see "Eighth
+session" below). Previously updated 2026-09-19 (seventh session -- the two-instance session: two real `hs serve` processes,
 different server names, federated over real HTTPS with a private CA and real X-Matrix signatures,
 for the first time. Found and fixed a `hs-cli` wiring bug that silently no-op'd
 `federation.custom_ca_certificates` on every real deployment, a `hs-federation` discovery bug that
@@ -34,12 +48,159 @@ is retried; see "Fifth session: the backfill loop" below). Before that, 2026-09-
 session, the mounting session; see "Mounted into `hs serve`" below for what changed then). The
 first session wrote the threat model and the plan below but stopped before any crate code existed;
 the second implemented items 1-7 of that plan.
-`crates/hs-federation` is no longer a placeholder: 124 passing lib tests (up from 120), plus 24 real
-end-to-end tests in `hs-cli` (9 e2e + 7 federation_reads + 8 federation_writes, all passing --
-RFC-0014's fix has landed in `hs-room` since the sixth session, so `federation_writes` is 8/8
-again, not 4/8), `cargo clippy -p hs-federation --all-targets --no-deps -- -D warnings` clean (see
-"Seventh session"'s verification section for why `--no-deps` is named explicitly this time), five
-fuzz targets that type-check. Read this file before touching `hs-federation` further.
+`crates/hs-federation` is no longer a placeholder: 136 passing lib tests (up from 124), plus the
+`hs-cli` end-to-end suites (8 federation_reads, 8 federation_writes, 2 federation_sender -- new
+this session -- and e2e, all passing), `cargo clippy -p hs-federation -p hs-cli --all-targets --
+-D warnings` clean (without `--no-deps`: the `hs-http` breakage the seventh session noted is
+gone), five fuzz targets that type-check. Read this file before touching `hs-federation` further.
+
+## Eighth session (2026-09-25): the outbound sender
+
+Scope, per this session's brief: build the outbound federation sender. Before it, this server
+never sent a locally created event to any other server -- there was no `sender` module, and
+`docs/next-steps.md`'s "there is no outbound queue yet" was true. After it, an event a local user
+sends in a room with remote members reaches those servers via `PUT
+/_matrix/federation/v1/send/{txnId}`. Ownership this session: `crates/hs-federation/**`, the
+named parts of `crates/hs-cli` (a new `federation_sender.rs`, `FederationMount`/`build_mount`,
+`RegistryRoomSource`, the minimum in `serve.rs`, tests), this file. `crates/hs-room` and the
+client `/join` routes were another agent's and were not touched.
+
+### 1. `crate::sender`: `FederationSender`, what is real
+
+`FederationSender::new(client: Arc<FederationClient>, own_server_name)` (or `with_config` with an
+explicit `SenderConfig { initial_backoff, max_backoff }`); `enqueue_pdu(destinations, pdu)`;
+`pending_pdus()`, `pending_pdus_for(dest)`, `pending_by_destination()`; `shutdown()`. Plus the
+`OutboundPduSink` trait (one method, `enqueue_pdu(Vec<String>, Value)`) that `FederationSender`
+implements, so the transport server and `send_join` take an `Arc<dyn OutboundPduSink>` and are
+tested with a recording sink.
+
+- **One worker per destination**, spawned on the first `enqueue_pdu` naming it, on the current
+  Tokio runtime (outside one: logged and dropped, never a panic). It drains its queue into
+  transactions of at most `MAX_PDUS_PER_TRANSACTION` (50, the same constant `crate::inbound`
+  enforces on receipt), body `{"origin", "origin_server_ts", "pdus", "edus": []}`, sent through
+  `FederationClient::send` -- so discovery, TLS/CA trust, `X-Matrix` signing, the per-destination
+  concurrency semaphore and the destination-store backoff records all apply unchanged.
+- **`txnId` is `{process_start_ms}-{counter}`**: unique across restarts, monotonic within one.
+  **A retry reuses the same `txnId`**, so a receiver whose response was lost replays its cached
+  answer (`crate::inbound::TransactionStore`) rather than applying the PDUs twice.
+- **Retried, in order, until accepted**: a non-2xx status or a connection/discovery error waits a
+  doubling delay from `initial_backoff` (1s) capped at `max_backoff` (the client's own
+  `max_retry_backoff`, so the two backoffs an operator sees on one destination share a ceiling).
+  `ClientError::Backoff { retry_at_ms }` (the destination store's judgement, set by the client on
+  connection-level failures) is slept out in slices of at most `BACKOFF_POLL_INTERVAL` (30s), so an
+  administrator's reset of the destination (`federation.destinations.reset`) is honoured within
+  30s instead of at the end of an hour-long wait. Only `Disabled`/`DomainDenied`/`IpDenied` --
+  this server's own policy -- drop the transaction (logged at `error`); everything else retries.
+- **A per-PDU `error` in a 200 response is final**: logged at `warn` with the event ID and the
+  receiver's reason, not retried. Per-destination ordering is preserved throughout; destinations
+  are independent (a failing one delays only its own queue).
+- **Nothing is ever queued for `own_server_name`**, whatever a caller passes; duplicates in one
+  call collapse to one copy.
+- **In memory only, said loudly** in the module docs and here: a restart, a crash or `shutdown()`
+  loses every unaccepted PDU, and there is no catch-up afterwards. `PLAN.md` section 5.2 item 6
+  (per-destination queues sharded by destination hash, persisting queue state so failover resumes)
+  and Synapse's `destination_rooms` catch-up are the target; a `KvBackend`-backed queue is the next
+  step, not this one. `shutdown()` logs the count it lost.
+- **Not shard-gated**: nothing consults `hs-cluster`. In a cluster this does not duplicate traffic
+  by itself (a room's actor is resident on the replica that owns its shard, and only it publishes
+  that room's updates), but a persisted, sharded sender will need to own "who sends for this
+  destination" explicitly.
+- **Not sent yet**: EDUs of every kind (typing, presence, receipts, device-list updates,
+  to-device, signing-key updates -- no `enqueue_edu` seam, since one that discarded its argument
+  would be worse than none); invites (`/invite` is its own handshake); leaves and knocks against a
+  remote resident (`make_leave`/`send_leave`, `make_knock`/`send_knock`).
+
+### 2. Resident-side forwarding of an accepted join
+
+The spec requires the resident that accepts a `send_join` to send the new join event to every
+other server in the room -- it is the only way they learn of the new member. `FederationState`
+gained `sender: Option<Arc<dyn OutboundPduSink>>`; `RoomDataSource` gained `async fn
+member_servers(&self, room_id) -> Vec<String>` (implemented on `InMemoryRoomSource` from
+`FakeRoom::joined_servers`, and on `hs_cli::federation::RegistryRoomSource` from
+`RoomActor::joined_members()`); `crate::join::send_join` takes two more parameters,
+`own_server_name: &str` and `forward: Option<&dyn OutboundPduSink>`, and after a `Stored`
+outcome (not `AlreadyKnown` -- a replayed join was forwarded the first time) enqueues the verified
+event to every member server except `origin` and itself. Member servers are read after the store.
+Every `FederationState` construction site in this crate and `hs-cli` (tests included) carries the
+new field.
+
+### 3. `hs-cli` wiring: `crate::federation_sender`
+
+`hs_cli::federation_sender::OutboundFederation::start(rooms, sender, own_server_name)` subscribes
+to `RoomRegistry::subscribe_global()` and follows it; `stop()` aborts the task and shuts the sender
+down. `serve.rs` starts it right after `build_mount`, before any listener is bound (the stream does
+not replay), and `ServeHandle::shutdown` stops it after appservice delivery, through a
+type-erased `stop_outbound_federation` closure modelled on `stop_appservice_delivery`.
+`FederationMount` gained `pub sender: Arc<FederationSender>`, built in `build_mount` over the same
+client as everything else and installed as `state.sender`.
+
+For each `RoomUpdate` whose `sender`'s server is ours, `forward_update` loads the room
+(`get_or_load`), reads the event as stored and signed (`event_by_id` ->
+`serde_json::from_slice(canonical_bytes())`, the federation form: `hashes`, `signatures`, no
+`event_id`), and computes the destinations: the servers of `RoomActor::joined_members_after(event)`
+(which exists in exactly the shape needed, so no approximation), plus, for an `m.room.member` with
+`membership` `leave` or `ban`, the target's server -- a kicked or banned user's server is not
+"joined after" the event, and if that was its last member it would otherwise never hear why its
+user is gone (this is the "state before the event" rule Synapse applies, expressed as "after, plus
+the removed target"). Our own name is dropped; invite targets are not added (the `/invite`
+handshake is not built, and an invitee's server that is not in the room would only answer
+"unknown room"). Events whose sender is remote are never re-sent. `RecvError::Lagged(n)` is logged
+at `warn` saying exactly what it means: the skipped updates' local events will not be sent to
+remote servers, because the sender has no catch-up.
+
+The admin API's Federation page now shows real pending counts:
+`DestinationStoreSource::with_sender(sender)` reports `pending_pdu_count` per destination
+(and lists a destination with a queue but no backoff record yet). `pending_edu_count` stays zero,
+truthfully.
+
+### 4. Tests (all fail, or do not compile, without the change)
+
+`crates/hs-federation/src/sender.rs` (against `hs_testkit::fake_federation::FakeFederationPeer`
+on loopback, plaintext via `ClientConfig::scheme`, explicit-port destinations, with an axum layer
+in front of the fake recording the `Authorization` header since the fake does not):
+`three_pdus_go_out_as_one_signed_transaction`,
+`sixty_pdus_split_into_transactions_of_fifty_then_ten_in_order`,
+`a_failing_destination_is_retried_in_order_after_waiting` (500, 500, 200: three attempts with
+the same `txnId`, elapsed at least 100ms + 200ms, no fourth attempt),
+`destinations_are_served_independently`, `nothing_is_ever_sent_to_our_own_server_name`,
+`a_destination_in_backoff_is_not_contacted_before_its_retry_time` (a fixed-`retry_at` destination
+store), `a_per_pdu_rejection_is_final_not_retried`, `shutdown_stops_the_workers_and_drops_the_queue`,
+`backoff_doubles_from_the_initial_delay_and_is_capped`.
+`crates/hs-federation/src/join.rs`:
+`an_accepted_join_is_forwarded_to_the_other_member_servers_but_not_the_origin`,
+`a_replayed_join_is_not_forwarded_again`.
+`crates/hs-cli/tests/federation_sender.rs` (a real `RoomRegistry`, the real feeder, sender and
+client, a fake peer; `hs serve` itself cannot be told to federate in plaintext, so the task is
+tested in isolation as the brief allowed):
+`a_local_message_reaches_the_server_of_a_remote_member_and_nothing_earlier_does` (a message from
+before the remote member joined, and the remote member's own join, are not in the transaction;
+the message after it is, byte-for-byte the stored PDU),
+`a_kick_reaches_the_kicked_users_server_and_later_events_do_not` (drives `forward_update` one
+update at a time and asserts each event's destinations). Conditions with deadlines, not sleeps.
+
+### Verification
+
+```
+cargo fmt --all
+cargo clippy -p hs-federation -p hs-cli --all-targets -- -D warnings        # clean
+cargo test -p hs-federation                                                 # 136/136
+cargo test -p hs-cli --test federation_sender --test federation_writes --test federation_reads
+                                                                            # 2/2, 8/8, 8/8
+cargo test -p hs-cli --test e2e                                             # 24/24
+bash crates/hs-federation/scripts/two-server-federation.sh                  # passes, see below
+```
+
+**Live, two real processes** (the seventh session's script, extended with a step 8): after bob's
+server B joins alice's room on A, alice posts again; A's feeder logged `queueing a local event
+for federation ... servers=1`, A's sender sent it to `127.0.0.1:8449` as
+`PUT /_matrix/federation/v1/send/1790383931330-1` over stunnel-terminated TLS with the private
+CA and a real `X-Matrix` signature, B's real inbound layer verified it (fetching A's key over the
+same TLS) and answered 200 with a per-PDU `unknown room` error -- B cannot hold the room until
+RFC-0015 -- which A logged as a final rejection and counted the transaction accepted. The wire
+path from a local `/send` on A to a verified transaction on B is proven; delivery into a room on
+B is not, and cannot be until track 04's bootstrap API lands. The script now launches both
+servers with `RUST_LOG=info,hs_federation=debug,hs_cli=debug` (overridable) so that step can
+watch A's log.
 
 ## Seventh session: two real instances, federating for real -- and three bugs only that could find
 
@@ -1051,7 +1212,11 @@ mounted in `serve.rs` yet — see "Wiring the integration lead must add" above.
 
 ## In progress
 
-Nothing mid-file. Everything listed under "Done" (second/third session) and above (fourth session)
+Nothing mid-file. The eighth session's work (`crate::sender`, the `send_join` forwarding, the
+`hs-cli` feeder and wiring, the admin pending counts) is complete and green; what it deliberately
+does not do is listed at the top of "Next" below.
+
+Earlier sessions' note, still accurate: Everything listed under "Done" (second/third session) and above (fourth session)
 is a complete, tested unit, except the one named gap (`RoomWriteSink` cannot persist a new event —
 see above) which is honestly reported as a gap, not left half-built. The sixth session's own work
 (TLS/CA config surface, `verify_pdu`'s redaction fix) is likewise complete and fully green within
@@ -1070,6 +1235,21 @@ addressed to track 04.
 Superseded from earlier sessions' lists (wiring `hs-federation` into `hs serve`, the real
 `RoomDataSource` adapter, `HttpKeyServerFetcher`, the key-server axum handlers) are all done as of
 the third and fourth sessions and removed from this list. What remains:
+
+New after the eighth session (the outbound sender exists; these are what it still lacks):
+
+- **Persist the outbound queue and add catch-up.** `crate::sender` is in memory: a restart loses
+  everything unaccepted and nothing is resent afterwards. The target is `PLAN.md` 5.2 item 6
+  (per-destination queues sharded by destination hash, persisted queue state) with a
+  `destination_rooms`-style "last position sent per destination" so an outage is caught up from
+  the room's own history rather than from a queue -- which also closes the `Lagged` hole in
+  `hs_cli::federation_sender` (a missed update is a lost event today) and makes the sender
+  shard-gated on `hs-cluster` ownership explicitly instead of relying on room-actor residency.
+- **EDUs.** Nothing outbound: typing, presence, receipts, device-list updates, to-device,
+  signing-key updates. Needs its own queue (coalescing rules differ per kind) -- deliberately no
+  `enqueue_edu` seam was left, see the module docs.
+- **Invites over federation** (`PUT /invite` v1/v2, client role) and the client role of
+  `make_leave`/`send_leave`, `make_knock`/`send_knock`: separate handshakes, not `/send`.
 
 -1. **(New, urgent, not this track's crate)** `hs-room` needs a room-bootstrap API so a federated
    join's verified state snapshot can become a real local room, not just a verified-and-discarded
@@ -1150,6 +1330,28 @@ this track can fix (`crates/hs-http/**` is out of this session's ownership).
 
 ## Interfaces provided
 
+- **`crate::sender::{FederationSender, OutboundPduSink, SenderConfig, BACKOFF_POLL_INTERVAL}`**
+  (new this eighth session): the outbound sender. `FederationSender::new(Arc<FederationClient>,
+  own_server_name) -> Self` (wrap in `Arc`), `with_config(.., SenderConfig)`,
+  `enqueue_pdu(impl IntoIterator<Item = String>, serde_json::Value)`, `pending_pdus() -> usize`,
+  `pending_pdus_for(&str) -> usize`, `pending_by_destination() -> Vec<(String, usize)>`,
+  `shutdown()`. Any track that has a PDU to distribute (a future `/invite` sender, a bridge that
+  needs to fan out) hands it here. `OutboundPduSink` is the one-method trait to take when a
+  recording double is wanted.
+- **`crate::transport::FederationState::sender: Option<Arc<dyn OutboundPduSink>>`** and
+  **`crate::room_source::RoomDataSource::member_servers(&self, room_id) -> Vec<String>`** (new
+  this session): every constructor and implementor must supply them.
+- **`crate::join::send_join(rooms, sink, key_cache, room_id, event_id, signed_event, origin,
+  own_server_name, forward: Option<&dyn OutboundPduSink>)`**: two new trailing parameters.
+- **`crate::admin_source::DestinationStoreSource::with_sender(Arc<FederationSender>)`**: makes the
+  admin Federation page's `pending_pdu_count` real. **`FederationClient::max_retry_backoff()`**:
+  the ceiling the sender shares.
+- **`hs_cli::federation_sender::{OutboundFederation, forward_update}`** (`crates/hs-cli`, new
+  this session): `OutboundFederation::start(Arc<RoomRegistry<B>>, Arc<FederationSender>,
+  OwnedServerName) -> Self`, `sender()`, `stop()`; `forward_update(&RoomRegistry<B>,
+  &FederationSender, &ServerName, &RoomUpdate) -> Result<Vec<String>, RoomError>` is the per-update
+  step, exposed so a test (or a future catch-up) can drive it one update at a time.
+  `hs_cli::federation::FederationMount::sender: Arc<FederationSender>`.
 - **`crate::outbound_join::{join_room, RemoteJoinOutcome, OutboundJoinError}`** (new this seventh
   session): the client-role join handshake -- any track that needs "make this server's user join a
   room hosted elsewhere" (a future `/join` wiring, once RFC-0015 lands, or a bridge/appservice that
@@ -1256,6 +1458,46 @@ this track can fix (`crates/hs-http/**` is out of this session's ownership).
   asks for -- see "Blockers" above.
 
 ## Decisions made
+
+New this (eighth) session:
+
+- **In memory first, persistence next.** The brief asked for the sender that makes "a local event
+  reaches remote members" true at all; a `KvBackend`-backed, sharded, catch-up-capable queue is a
+  design of its own (see "Next"). The module docs say what a restart loses, in the first
+  paragraph, so nobody mistakes this for the plan's section 5.2 sender.
+- **Retry everything except this server's own policy refusals.** A non-2xx status, a connection
+  or discovery failure, and a destination-store backoff are all "later"; only
+  `Disabled`/`DomainDenied`/`IpDenied` are "never", and those drop the transaction with an
+  `error` log. A permanently 4xx-ing destination therefore retries at the cap (1h) until restart;
+  accepted, since the alternative -- guessing which 4xx codes are permanent -- silently loses
+  events on the guesses that are wrong.
+- **A retry reuses the transaction ID.** Otherwise a receiver that processed the first attempt
+  but whose response was lost would apply the same PDUs under two IDs, defeating its own
+  idempotency cache.
+- **The sender's own backoff has no jitter.** The destination store already jitters the
+  connection-level backoff the client records; a second layer of jitter would only make the
+  retry tests non-deterministic. Doubling from 1s, capped at the client's `max_retry_backoff`.
+- **A destination in backoff is polled every 30s at most** (`BACKOFF_POLL_INTERVAL`), so an
+  administrator's reset takes effect promptly. A poll is a store read, not a network call.
+- **Per-PDU rejections are final.** The receiver looked at the event; resending gets the same
+  answer. Logged at `warn`, with the receiver's reason.
+- **Destinations are "joined after the event, plus the target of a leave/ban".** Equivalent to
+  Synapse's "hosts in the room at the event's prev_events" for a locally originated event, using
+  the `joined_members_after` `hs-room` already provides rather than asking track 04 for a
+  `joined_members_before`. Invite targets are excluded until `/invite` exists.
+- **Remote senders' events are never re-sent by the feeder**; the one exception the spec makes --
+  the resident forwarding a `send_join` it accepted -- is done at `send_join` itself, once, on
+  `Stored` only.
+- **A lagged update stream is a lost event, and the log says so.** No catch-up exists to make it
+  anything else; pretending otherwise (silently continuing) is the one thing the log must not do.
+- **Not shard-gated**, recorded rather than half-built: room-actor residency already makes each
+  local event's update reach one replica; a sharded sender belongs with the persisted queue.
+- **`hs-testkit` became an `hs-cli` dev-dependency** (path, no workspace root change) so the new
+  `hs-cli` test can use `FakeFederationPeer` like every `hs-federation` test does, reversing the
+  fifth session's "did not add it" note.
+- **`hs_cli::federation_sender::forward_update` is public** so the integration test can assert
+  each event's destinations directly rather than infer them from what a fake peer eventually did
+  or did not receive ("nothing was sent" is otherwise a claim about a timeout).
 
 New this (seventh) session:
 
@@ -1494,6 +1736,12 @@ canonical/signing/hashing, `ruma-federation-api` considered-but-not-adopted-for-
   without an explanation.
 
 ## Shared dependencies added
+
+This (eighth) session: **no root `Cargo.toml` change.** `crates/hs-cli/Cargo.toml` gained
+`hs-testkit = { path = "../hs-testkit" }` under `[dev-dependencies]` (already a workspace crate,
+already a dev-dependency of `hs-federation`; no cycle -- `hs-testkit` depends on no `hs-cli`).
+`crates/hs-federation/Cargo.toml` is unchanged: `crate::sender` is built from `tokio`,
+`serde_json` and `tracing`, all already depended on.
 
 This (seventh) session: **none.** No `Cargo.toml` in either owned crate (`hs-federation`,
 `hs-cli`) changed; `crate::outbound_join` and `hs federation-join-room` are built entirely from

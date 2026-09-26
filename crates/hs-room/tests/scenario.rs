@@ -29,6 +29,7 @@ fn app_with_registry() -> (axum::Router, Arc<RoomRegistry<MemoryBackend>>) {
         auth: auth_state.clone(),
         rooms: registry.clone(),
         identity,
+        remote_join: None,
     };
     let (room_router, _manifest) = hs_room::routes::router::<MemoryBackend>();
 

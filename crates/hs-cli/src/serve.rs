@@ -139,6 +139,11 @@ pub struct ServeOptions {
     /// answering an honest `503`, which is what a caller that has no store open -- the route
     /// manifest, the in-process tests -- should get.
     pub config_source: Option<Arc<dyn hs_admin::sources::ConfigSource>>,
+    /// The URL scheme outbound federation uses: `None` is `https`, the only value a real
+    /// deployment ever has (federation is specified as HTTPS-only). A test that runs two
+    /// in-process servers against each other over plain listeners sets `Some("http")`; nothing
+    /// in a configuration file can, on purpose.
+    pub federation_scheme: Option<&'static str>,
 }
 
 impl std::fmt::Debug for ServeOptions {
@@ -671,6 +676,7 @@ fn throwaway_mounts() -> Mounts<hs_kv::memory::MemoryBackend> {
         auth: auth.clone(),
         rooms: rooms.clone(),
         identity,
+        remote_join: None,
     };
     let (user, e2e, push) = build_session_mounts(&backend, &auth, &rooms)
         .expect("opening in-memory session/e2e/push keyspaces cannot fail");
@@ -807,6 +813,9 @@ pub struct ServeHandle {
     /// Stops appservice delivery (`crate::appservice_delivery`). Type-erased like `_storage`,
     /// and for the same reason.
     stop_appservice_delivery: Box<dyn Fn() + Send + Sync>,
+    /// Stops the outbound federation feeder and sender (`crate::federation_sender`); a no-op
+    /// when federation is disabled. Type-erased for the same reason as the one above.
+    stop_outbound_federation: Box<dyn Fn() + Send + Sync>,
     /// Keeps the opened storage backend alive for as long as the server is: Fjall holds an
     /// exclusive lock on its data directory and the Postgres backend owns a connection pool, and
     /// dropping either while listeners are still serving would take the store out from under
@@ -854,6 +863,7 @@ impl ServeHandle {
         // that would otherwise hold its listener open until the client's own timeout ran out.
         (self.release_long_polls)().await;
         (self.stop_appservice_delivery)();
+        (self.stop_outbound_federation)();
         let _ = self.shutdown_tx.send(true);
         let _ = self.join.await;
     }
@@ -965,12 +975,6 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         backend.clone(),
         identity.clone(),
     )?);
-    let room_state = RoomState {
-        auth: auth_state.clone(),
-        rooms: rooms.clone(),
-        identity,
-    };
-
     let (user_state, e2e_state, push_state) = build_session_mounts(&backend, &auth_state, &rooms)?;
     // The user directory is searched in `hs-auth`, which cannot see rooms; the hub can, and says
     // who each searcher is allowed to find.
@@ -1027,19 +1031,39 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // The admin API's view of federation. With federation off there are no destinations, and
     // an empty list is the honest answer -- not a 503, which would read as "could not check".
     let federation_source: Arc<dyn hs_admin::sources::FederationSource>;
+    let outbound_federation: Option<crate::federation_sender::OutboundFederation>;
+    // How `POST /join` reaches a room hosted elsewhere (`crate::remote_join`): over the
+    // federation mount's own client, so only when federation is on.
+    let remote_join: Option<Arc<dyn hs_room::remote_join::RemoteJoin>>;
     let federation = if config.federation.enabled {
         let mount = crate::federation::build_mount(
             &config,
-            &room_state.identity,
+            &identity,
             backend.clone(),
             rooms.clone(),
             user_state.hub.store().clone(),
             auth_state.store.clone(),
             e2e_state.store.clone(),
+            options.federation_scheme,
         )?;
-        federation_source = Arc::new(hs_federation::admin_source::DestinationStoreSource::new(
-            mount.destinations.clone(),
+        federation_source = Arc::new(
+            hs_federation::admin_source::DestinationStoreSource::new(mount.destinations.clone())
+                .with_sender(mount.sender.clone()),
+        );
+        // This server's own events reach remote servers from here. Subscribes to the room
+        // stream inside, so it is started before any listener is bound: an event sent before the
+        // subscription existed would never be sent anywhere (`crate::federation_sender`).
+        outbound_federation = Some(crate::federation_sender::OutboundFederation::start(
+            rooms.clone(),
+            mount.sender.clone(),
+            server_name.clone(),
         ));
+        remote_join = Some(Arc::new(crate::remote_join::FederationRemoteJoin::new(
+            mount.client.clone(),
+            mount.x_matrix.key_cache.clone(),
+            rooms.clone(),
+            identity.clone(),
+        )));
         Some((
             mount.state,
             mount.x_matrix,
@@ -1049,7 +1073,16 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     } else {
         tracing::info!("federation is disabled; not mounting the federation transport server");
         federation_source = Arc::new(hs_admin::sources::InMemoryFederationSource::new());
+        outbound_federation = None;
+        remote_join = None;
         None
+    };
+
+    let room_state = RoomState {
+        auth: auth_state.clone(),
+        rooms: rooms.clone(),
+        identity,
+        remote_join,
     };
 
     // What `/api/v1/server` reports as enabled: derived from what this process actually mounted
@@ -1267,6 +1300,11 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         join,
         release_long_polls,
         stop_appservice_delivery: Box::new(move || appservice_delivery.stop()),
+        stop_outbound_federation: Box::new(move || {
+            if let Some(outbound) = &outbound_federation {
+                outbound.stop();
+            }
+        }),
         _storage: Box::new(backend.clone()),
         cluster,
         mesh,
@@ -1433,9 +1471,7 @@ mod tests {
             config,
             ServeOptions {
                 capabilities_config: Some(capabilities_path),
-                routes_manifest_path: None,
-                media_scanning_config: None,
-                config_source: None,
+                ..Default::default()
             },
         )
         .await
@@ -1479,10 +1515,8 @@ mod tests {
         let handle = spawn_serve(
             config,
             ServeOptions {
-                capabilities_config: None,
                 routes_manifest_path: Some(manifest_path.clone()),
-                media_scanning_config: None,
-                config_source: None,
+                ..Default::default()
             },
         )
         .await

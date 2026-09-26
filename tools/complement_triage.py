@@ -5,6 +5,7 @@
     python3 tools/complement_triage.py run.log                    # what is failing, and why
     python3 tools/complement_triage.py run.log --diff             # what moved since the baseline
     python3 tools/complement_triage.py run.log --write-baseline   # make this run the baseline
+    python3 tools/complement_triage.py fed.log --suite=federation  # the same for the federation package
 
 The baseline is `docs/status/complement-csapi-results.txt`: one line per top-level test.
 
@@ -33,7 +34,15 @@ import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-BASELINE = ROOT / "docs/status/complement-csapi-results.txt"
+# One baseline per suite: `tests/csapi` by default, `tests` (the federation package) with
+# `--suite=federation`. Kept apart because their test names do not overlap and their runs are
+# taken separately, so a diff of one against the other's baseline would report everything as new.
+BASELINES = {
+    "csapi": ROOT / "docs/status/complement-csapi-results.txt",
+    "federation": ROOT / "docs/status/complement-federation-results.txt",
+}
+SUITE_PATHS = {"csapi": "tests/csapi", "federation": "tests"}
+BASELINE = BASELINES["csapi"]
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -104,14 +113,14 @@ def diff(log: str) -> int:
     return 0
 
 
-def write_baseline(log: str, source: str) -> None:
+def write_baseline(log: str, source: str, suite: str) -> None:
     top = results(log)
     every_pass = len(re.findall(r"^\s*--- PASS", log, re.M))
     every_fail = len(re.findall(r"^\s*--- FAIL", log, re.M))
     passed = sum(1 for s in top.values() if s == "PASS")
     failed = sum(1 for s in top.values() if s == "FAIL")
     header = [
-        "# Complement tests/csapi, top-level results. One line per test so that two runs can be compared",
+        f"# Complement {SUITE_PATHS[suite]}, top-level results. One line per test so that two runs can be compared",
         "# by name: a change is worth something when it moves a *named* test and that survives a re-run.",
         "# Written and read by tools/complement_triage.py (--write-baseline, --diff).",
         f"# {source}: {every_pass} of {every_pass + every_fail} assertions, "
@@ -123,15 +132,21 @@ def write_baseline(log: str, source: str) -> None:
 
 
 def main() -> int:
+    global BASELINE
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = {a for a in sys.argv[1:] if a.startswith("--")}
     if len(args) != 1:
         print(__doc__, file=sys.stderr)
         return 2
+    suite = next((a.split("=", 1)[1] for a in flags if a.startswith("--suite=")), "csapi")
+    if suite not in BASELINES:
+        print(f"unknown suite {suite!r}; one of {', '.join(BASELINES)}", file=sys.stderr)
+        return 2
+    BASELINE = BASELINES[suite]
     log = ANSI.sub("", pathlib.Path(args[0]).read_text(errors="replace"))
     if "--write-baseline" in flags:
         note = next((a.split("=", 1)[1] for a in flags if a.startswith("--note=")), "Run")
-        write_baseline(log, note)
+        write_baseline(log, note, suite)
         return 0
     if "--diff" in flags:
         return diff(log)

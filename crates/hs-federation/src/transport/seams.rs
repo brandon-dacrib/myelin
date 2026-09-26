@@ -177,6 +177,7 @@ mod tests {
             transactions: Arc::new(crate::inbound::InMemoryTransactionStore::new()),
             ancestor_fetcher: None,
             backfill_limits: crate::backfill::BackfillLimits::default(),
+            sender: None,
         }
     }
 

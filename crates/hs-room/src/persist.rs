@@ -48,6 +48,55 @@ pub type UserJoinedRoomKey = (String, hs_model::RoomSn);
 /// terms). See [`RoomBlock`] and `crate::actor::{set_room_blocked, room_block_reason}`.
 pub type BlockedRoomKey = (hs_model::RoomSn,);
 
+/// `(RoomSn, EventSn) -> b""`: presence means this event is held as an **outlier** -- an event
+/// this server holds the body of but has never placed in the room's timeline, because it arrived
+/// as part of a state snapshot rather than by being sent or received in order. Today that is
+/// exactly the `state` and `auth_chain` of a federation `send_join` response
+/// ([`crate::actor::RoomActor::accept_remote_join_with_state`]); the flag on the event record
+/// itself ([`hs_model::event::EventFlags::is_outlier`]) says the same thing, and this index is
+/// what lets [`crate::actor::RoomActor::load`] find a room's outliers without scanning every
+/// event on the server. Keyed by `EventSn`, which the interning table allocates in increasing
+/// order, so a scan returns them in the order they were persisted -- topological, since
+/// [`crate::actor::RoomActor::accept_remote_join_with_state`] persists them that way.
+pub type OutlierKey = (hs_model::RoomSn, hs_model::EventSn);
+
+/// `(RoomSn, EventSn) -> [EventSn; n]` (each 8 bytes big-endian, concatenated -- see
+/// [`encode_event_sns`]/[`decode_event_sns`]): the explicit state a timeline event was fed to the
+/// state store with, when its state could not be derived from its `prev_events`. Written for a
+/// federation join this server's own user made into a room hosted elsewhere -- the join's prev
+/// events are the resident's forward extremities, which this server does not hold -- so that
+/// [`crate::actor::RoomActor::load`] can feed the store the same way
+/// ([`hs_state::kv_store::KvStateStore::add_event_with_state`]) and come back identical. Absent
+/// for every ordinary event.
+pub type StateSnapshotKey = (hs_model::RoomSn, hs_model::EventSn);
+
+/// Encodes a list of `EventSn`s as the value of a [`StateSnapshotKey`] row: each as 8 bytes
+/// big-endian, concatenated, in the order given.
+#[must_use]
+pub fn encode_event_sns(sns: &[hs_model::EventSn]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(sns.len() * 8);
+    for sn in sns {
+        out.extend_from_slice(&sn.to_be_bytes());
+    }
+    out
+}
+
+/// Decodes the value of a [`StateSnapshotKey`] row written by [`encode_event_sns`]. `None` if
+/// the value's length is not a multiple of 8 (a corrupt row).
+#[must_use]
+pub fn decode_event_sns(value: &[u8]) -> Option<Vec<hs_model::EventSn>> {
+    if !value.len().is_multiple_of(8) {
+        return None;
+    }
+    let (chunks, _) = value.as_chunks::<8>();
+    Some(
+        chunks
+            .iter()
+            .map(|bytes| hs_model::EventSn::from_be_bytes(*bytes))
+            .collect(),
+    )
+}
+
 /// One event as stored durably: enough to reconstruct an [`hs_model::event::Event`] (via
 /// [`hs_model::event::Event::parse`] on `json`) plus the room-local bookkeeping
 /// [`hs_model::event::EventHeader`] does not carry.
@@ -61,8 +110,9 @@ pub struct PersistedEvent {
     pub room_version: String,
     /// Internal processing flags, encoded as [`hs_model::event::EventFlags::to_byte`].
     pub flags: u8,
-    /// This event's room-local timeline position, if it is part of the timeline (state-only
-    /// outliers are not).
+    /// This event's room-local timeline position, if it is part of the timeline. `None` for an
+    /// outlier (see [`OutlierKey`]): held for its body and its place in the room's state, never
+    /// shown in `/messages`, `/sync` or any other timeline read.
     pub room_pos: Option<i64>,
 }
 
@@ -119,6 +169,11 @@ pub struct Tables<B: KvBackend> {
     /// `(RoomSn,) -> RoomBlock`: rooms currently blocked by a server administrator. See
     /// [`BlockedRoomKey`].
     pub blocked_rooms: TypedKeyspace<B::Keyspace, BlockedRoomKey>,
+    /// `(RoomSn, EventSn) -> b""`: the room's outliers. See [`OutlierKey`].
+    pub outliers: TypedKeyspace<B::Keyspace, OutlierKey>,
+    /// `(RoomSn, EventSn) -> [EventSn; n]`: the explicit state a timeline event was fed to the
+    /// state store with. See [`StateSnapshotKey`].
+    pub state_snapshots: TypedKeyspace<B::Keyspace, StateSnapshotKey>,
 }
 
 impl<B: KvBackend> Tables<B> {
@@ -141,6 +196,8 @@ impl<B: KvBackend> Tables<B> {
             public_rooms: TypedKeyspace::new(backend.keyspace("room_public_directory")?),
             joined_rooms: TypedKeyspace::new(backend.keyspace("room_joined_by_user")?),
             blocked_rooms: TypedKeyspace::new(backend.keyspace("room_blocked")?),
+            outliers: TypedKeyspace::new(backend.keyspace("room_outliers")?),
+            state_snapshots: TypedKeyspace::new(backend.keyspace("room_state_snapshots")?),
         })
     }
 }

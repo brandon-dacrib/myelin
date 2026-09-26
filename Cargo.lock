@@ -2280,6 +2280,7 @@ dependencies = [
  "hs-room",
  "hs-tables",
  "hs-telemetry",
+ "hs-testkit",
  "hs-user",
  "http",
  "object_store",

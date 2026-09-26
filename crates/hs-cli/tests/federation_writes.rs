@@ -173,6 +173,7 @@ impl Harness {
             transactions: Arc::new(hs_federation::inbound::InMemoryTransactionStore::new()),
             ancestor_fetcher,
             backfill_limits: hs_federation::backfill::BackfillLimits::default(),
+            sender: None,
         };
 
         let fetcher = TwoServerKeys {

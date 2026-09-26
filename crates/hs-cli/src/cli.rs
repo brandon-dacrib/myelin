@@ -633,6 +633,7 @@ async fn run_serve(args: &ServeArgs) -> i32 {
         routes_manifest_path: args.routes_manifest.clone(),
         media_scanning_config: args.media_scanning_config.clone(),
         config_source: Some(config_source),
+        federation_scheme: None,
     };
     let handle = match crate::serve::spawn_serve_with_storage(booted.storage, config, options).await
     {

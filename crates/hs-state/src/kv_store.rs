@@ -165,6 +165,161 @@ impl<R: StateRepr> KvStateStore<R> {
     ) -> Result<R::Root, KvStoreError<R::Error>> {
         let mut inner = self.common.borrow_mut();
 
+        Self::record_event(
+            &mut inner,
+            event,
+            event_id,
+            room_id,
+            event_type,
+            state_key,
+            sender,
+            content,
+            depth,
+            origin_server_ts,
+            auth_events,
+            prev_events,
+            only_prev_event_is_room_create,
+        );
+
+        let prev_roots: Vec<R::Root> = prev_events
+            .iter()
+            .filter_map(|sn| inner.state_at.get(sn).copied())
+            .collect();
+        let state_before = match prev_roots.len() {
+            0 => self.repr.empty_root(),
+            1 => prev_roots[0],
+            _ => self.resolve_locked(&mut inner, &prev_roots)?,
+        };
+
+        self.apply_and_index(
+            &mut inner,
+            event,
+            event_type,
+            state_key,
+            auth_events,
+            state_before,
+        )
+    }
+
+    /// Ingests one event exactly as [`KvStateStore::add_event`] does, except that the state
+    /// *before* the event is not derived from its `prev_events` but handed in explicitly:
+    /// `state` is the complete list of events, one per `(event_type, state_key)`, that make up
+    /// the room's resolved state immediately before `event`. Every entry must already have been
+    /// ingested into this store (by either `add_event` method), in any order; its `(event_type,
+    /// state_key)` is read back from what was recorded then.
+    ///
+    /// This is what a room bootstrapped from a federation `send_join` response needs
+    /// (`docs/rfcs/0015-outbound-join-needs-a-room-bootstrap-api.md`): the joining server holds
+    /// the resident's resolved state and the join event, but not the join's `prev_events` (the
+    /// resident's forward extremities, ordinarily plain messages the response does not carry),
+    /// so there is no `state_at` of any prev event to derive the state before the join from. The
+    /// resident's `state` *is* that state, by construction, and this method records it as such:
+    /// the root for `event` is the empty state with every entry of `state` applied, then `event`'s
+    /// own entry if it is a state event -- exactly the root `add_event` would have produced had
+    /// the prev events been ingested and resolved to `state`.
+    ///
+    /// `prev_events` and `only_prev_event_is_room_create` are still recorded on the event (for
+    /// [`crate::state_res`]'s benefit, if a later fork ever resolves through it) but play no part
+    /// in computing its state; entries of `prev_events` this store does not know are skipped,
+    /// as `add_event` already does for auth events. No state resolution runs.
+    ///
+    /// # Errors
+    /// Returns [`KvStoreError::UnknownEvent`] naming the first entry of `state` this store has
+    /// not ingested (nothing is recorded in that case), or [`KvStoreError::Repr`] if the
+    /// representation fails to apply the state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_event_with_state(
+        &self,
+        event: EventSn,
+        event_id: OwnedEventId,
+        room_id: OwnedRoomId,
+        event_type: &str,
+        state_key: Option<&str>,
+        sender: OwnedUserId,
+        content: CanonicalJsonObject,
+        depth: i64,
+        origin_server_ts: i64,
+        auth_events: &[EventSn],
+        prev_events: &[EventSn],
+        only_prev_event_is_room_create: bool,
+        state: &[EventSn],
+    ) -> Result<R::Root, KvStoreError<R::Error>> {
+        let mut inner = self.common.borrow_mut();
+
+        // Resolve every snapshot entry back to its `(event_type, state_key)` before recording
+        // anything, so an unknown entry leaves the store untouched.
+        let mut keyed: Vec<(String, String, EventSn)> = Vec::with_capacity(state.len());
+        for &sn in state {
+            let recorded = inner
+                .event_id_of
+                .get(&sn)
+                .and_then(|id| inner.events.get(id))
+                .ok_or(KvStoreError::UnknownEvent(sn))?;
+            keyed.push((recorded.event_type.clone(), recorded.state_key.clone(), sn));
+        }
+        let mut added = BTreeMap::new();
+        for (state_event_type, state_state_key, sn) in keyed {
+            let key_id = Self::intern_key(&mut inner, &state_event_type, &state_state_key);
+            added.insert(key_id, sn);
+        }
+
+        Self::record_event(
+            &mut inner,
+            event,
+            event_id,
+            room_id,
+            event_type,
+            state_key,
+            sender,
+            content,
+            depth,
+            origin_server_ts,
+            auth_events,
+            prev_events,
+            only_prev_event_is_room_create,
+        );
+
+        let state_before = if added.is_empty() {
+            self.repr.empty_root()
+        } else {
+            let diff = StateDiff {
+                added,
+                removed: std::collections::BTreeSet::new(),
+            };
+            self.repr
+                .apply(self.repr.empty_root(), &diff)
+                .map_err(KvStoreError::Repr)?
+        };
+
+        self.apply_and_index(
+            &mut inner,
+            event,
+            event_type,
+            state_key,
+            auth_events,
+            state_before,
+        )
+    }
+
+    /// The first half both `add_event` methods share: interns the event's ID and records its
+    /// [`ResolutionEvent`] body, with `auth_events`/`prev_events` translated to the event IDs of
+    /// whichever entries this store already knows.
+    #[allow(clippy::too_many_arguments)]
+    fn record_event(
+        inner: &mut CommonInner<R::Root>,
+        event: EventSn,
+        event_id: OwnedEventId,
+        room_id: OwnedRoomId,
+        event_type: &str,
+        state_key: Option<&str>,
+        sender: OwnedUserId,
+        content: CanonicalJsonObject,
+        depth: i64,
+        origin_server_ts: i64,
+        auth_events: &[EventSn],
+        prev_events: &[EventSn],
+        only_prev_event_is_room_create: bool,
+    ) {
         inner.sn_of_event_id.insert(event_id.clone(), event);
         inner.event_id_of.insert(event, event_id.clone());
 
@@ -180,7 +335,7 @@ impl<R: StateRepr> KvStateStore<R> {
         inner.events.insert(
             event_id.clone(),
             ResolutionEvent {
-                event_id: event_id.clone(),
+                event_id,
                 room_id,
                 event_type: event_type.to_owned(),
                 state_key: state_key.unwrap_or_default().to_owned(),
@@ -193,19 +348,22 @@ impl<R: StateRepr> KvStateStore<R> {
                 only_prev_event_is_room_create,
             },
         );
+    }
 
-        let prev_roots: Vec<R::Root> = prev_events
-            .iter()
-            .filter_map(|sn| inner.state_at.get(sn).copied())
-            .collect();
-        let state_before = match prev_roots.len() {
-            0 => self.repr.empty_root(),
-            1 => prev_roots[0],
-            _ => self.resolve_locked(&mut inner, &prev_roots)?,
-        };
-
+    /// The second half both `add_event` methods share: applies the event's own entry (if it is a
+    /// state event) on top of `state_before`, records the result as the event's `state_at`, and
+    /// adds the event to the chain-cover index.
+    fn apply_and_index(
+        &self,
+        inner: &mut CommonInner<R::Root>,
+        event: EventSn,
+        event_type: &str,
+        state_key: Option<&str>,
+        auth_events: &[EventSn],
+        state_before: R::Root,
+    ) -> Result<R::Root, KvStoreError<R::Error>> {
         let new_root = if let Some(state_key) = state_key {
-            let key_id = Self::intern_key(&mut inner, event_type, state_key);
+            let key_id = Self::intern_key(inner, event_type, state_key);
             self.repr
                 .apply(state_before, &StateDiff::set(key_id, event))
                 .map_err(KvStoreError::Repr)?
@@ -216,7 +374,7 @@ impl<R: StateRepr> KvStateStore<R> {
         inner.state_at.insert(event, new_root);
 
         if let Some(state_key) = state_key {
-            let key_id = Self::intern_key(&mut inner, event_type, state_key);
+            let key_id = Self::intern_key(inner, event_type, state_key);
             inner.chain_index.add_event(event, key_id, auth_events);
         }
 
@@ -540,5 +698,146 @@ mod tests {
         let repr = PersistentMapRepr::new(MemoryBackend::default()).unwrap();
         let store = KvStateStore::new(RoomVersionId::V11, repr).unwrap();
         fork_and_merge_resolves(store);
+    }
+
+    /// `add_event_with_state`: the shape a room bootstrapped from a `send_join` response has.
+    /// Three snapshot events are ingested as outliers -- with no `prev_events` at all, so their
+    /// own `state_at` is deliberately meaningless -- and a join whose prev events the store has
+    /// never seen is then ingested with the snapshot as its explicit state. Its `state_at` must
+    /// be exactly the snapshot plus itself, its chain-cover position must reach the snapshot's
+    /// ancestors, and naming an unknown snapshot entry must be an error that records nothing.
+    #[test]
+    fn add_event_with_state_seeds_the_state_from_an_explicit_snapshot() {
+        let repr = FrameRepr::new(MemoryBackend::default()).unwrap();
+        let store = KvStateStore::new(RoomVersionId::V11, repr).unwrap();
+        let room_id = RoomId::parse("!r:hs1").unwrap();
+        let creator = UserId::parse("@c:hs1").unwrap();
+        let joiner = UserId::parse("@j:hs2").unwrap();
+
+        // The snapshot, as outliers: create, the creator's join, power levels. No prev events.
+        store
+            .add_event(
+                EventSn::new(1),
+                EventId::parse("$1:hs1").unwrap(),
+                room_id.clone(),
+                "m.room.create",
+                Some(""),
+                creator.clone(),
+                obj(json!({"creator": creator.as_str()})),
+                1,
+                1,
+                &[],
+                &[],
+                false,
+            )
+            .unwrap();
+        store
+            .add_event(
+                EventSn::new(2),
+                EventId::parse("$2:hs1").unwrap(),
+                room_id.clone(),
+                "m.room.member",
+                Some(creator.as_str()),
+                creator.clone(),
+                obj(json!({"membership": "join"})),
+                2,
+                2,
+                &[EventSn::new(1)],
+                &[],
+                true,
+            )
+            .unwrap();
+        store
+            .add_event(
+                EventSn::new(3),
+                EventId::parse("$3:hs1").unwrap(),
+                room_id.clone(),
+                "m.room.power_levels",
+                Some(""),
+                creator.clone(),
+                obj(json!({"users": {creator.as_str(): 100}})),
+                3,
+                3,
+                &[EventSn::new(1), EventSn::new(2)],
+                &[],
+                false,
+            )
+            .unwrap();
+
+        // An unknown snapshot entry is refused before anything is recorded.
+        let err = store
+            .add_event_with_state(
+                EventSn::new(4),
+                EventId::parse("$4:hs2").unwrap(),
+                room_id.clone(),
+                "m.room.member",
+                Some(joiner.as_str()),
+                joiner.clone(),
+                obj(json!({"membership": "join"})),
+                50,
+                50,
+                &[EventSn::new(1), EventSn::new(3)],
+                &[EventSn::new(999)],
+                false,
+                &[
+                    EventSn::new(1),
+                    EventSn::new(2),
+                    EventSn::new(3),
+                    EventSn::new(42),
+                ],
+            )
+            .unwrap_err();
+        assert!(matches!(err, KvStoreError::UnknownEvent(sn) if sn == EventSn::new(42)));
+        assert!(matches!(
+            store.state_at(EventSn::new(4)),
+            Err(KvStoreError::UnknownEvent(_))
+        ));
+
+        // The join, with the snapshot as its explicit state; its prev event ($999) is unknown.
+        let root = store
+            .add_event_with_state(
+                EventSn::new(4),
+                EventId::parse("$4:hs2").unwrap(),
+                room_id,
+                "m.room.member",
+                Some(joiner.as_str()),
+                joiner.clone(),
+                obj(json!({"membership": "join"})),
+                50,
+                50,
+                &[EventSn::new(1), EventSn::new(3)],
+                &[EventSn::new(999)],
+                false,
+                &[EventSn::new(1), EventSn::new(2), EventSn::new(3)],
+            )
+            .unwrap();
+        assert_eq!(store.state_at(EventSn::new(4)).unwrap(), root);
+
+        let full = store.diff(store.empty_root(), root).unwrap();
+        let mut sns: Vec<EventSn> = full.added.values().copied().collect();
+        sns.sort();
+        assert_eq!(
+            sns,
+            vec![
+                EventSn::new(1),
+                EventSn::new(2),
+                EventSn::new(3),
+                EventSn::new(4)
+            ],
+            "state_at(join) must be exactly the snapshot plus the join itself"
+        );
+        assert_eq!(
+            store
+                .get(root, store.intern("m.room.member", joiner.as_str()))
+                .unwrap(),
+            Some(EventSn::new(4))
+        );
+        assert_eq!(
+            store
+                .auth_chain_contains(EventSn::new(4), EventSn::new(1))
+                .unwrap(),
+            Some(true),
+            "the join's chain-cover position must reach the create event through power levels"
+        );
     }
 }

@@ -251,6 +251,7 @@ mod tests {
                 auth,
                 rooms,
                 identity,
+                remote_join: None,
             },
             room_id,
         )
@@ -330,6 +331,7 @@ mod tests {
             auth,
             rooms,
             identity,
+            remote_join: None,
         };
         let response = put_displayname::<MemoryBackend>(
             State(state),

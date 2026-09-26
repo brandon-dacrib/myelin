@@ -245,6 +245,14 @@ impl FederationClient {
         }
     }
 
+    /// The ceiling on this client's per-destination backoff (`ClientConfig::max_retry_backoff`),
+    /// so a caller layering its own retry policy on top (`crate::sender`) can share it rather
+    /// than invent a second one.
+    #[must_use]
+    pub fn max_retry_backoff(&self) -> Duration {
+        self.config.max_retry_backoff
+    }
+
     fn semaphore_for(&self, destination: &str) -> Arc<Semaphore> {
         self.semaphores
             .lock()

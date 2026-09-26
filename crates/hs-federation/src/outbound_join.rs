@@ -136,7 +136,50 @@ pub async fn join_room(
     own_server_name: &ServerName,
     signing_key: &SigningKeyPair,
 ) -> Result<RemoteJoinOutcome, OutboundJoinError> {
-    let template_path = format!("/_matrix/federation/v1/make_join/{room_id}/{user_id}");
+    join_room_with_content(
+        client,
+        key_cache,
+        destination,
+        room_id,
+        user_id,
+        own_server_name,
+        signing_key,
+        None,
+    )
+    .await
+}
+
+/// [`join_room`], with `content` -- the fields the joining user's client asked to put into its
+/// own `m.room.member` event beyond `membership` (`displayname`, `avatar_url`, `reason`) --
+/// merged into the template the resident hands back before it is signed. `membership` itself is
+/// never overridden: the template's own value stands. This is how a user's profile reaches a
+/// room hosted elsewhere, exactly as `hs-room`'s local join carries it.
+///
+/// `make_join` is asked with every room version this server supports (`?ver=`), as the spec
+/// requires: a resident that hosts a room in a version the joiner cannot handle answers
+/// `M_INCOMPATIBLE_ROOM_VERSION` up front, and Synapse in particular treats a request with no
+/// `ver` at all as "version 1 only" and refuses every modern room.
+///
+/// # Errors
+/// See [`OutboundJoinError`].
+#[allow(clippy::too_many_arguments)]
+pub async fn join_room_with_content(
+    client: &FederationClient,
+    key_cache: &DynRemoteKeyCache,
+    destination: &str,
+    room_id: &str,
+    user_id: &str,
+    own_server_name: &ServerName,
+    signing_key: &SigningKeyPair,
+    content: Option<&Value>,
+) -> Result<RemoteJoinOutcome, OutboundJoinError> {
+    let supported_versions: Vec<String> = hs_model::room_version::known_room_version_ids()
+        .map(|v| format!("ver={v}"))
+        .collect();
+    let template_path = format!(
+        "/_matrix/federation/v1/make_join/{room_id}/{user_id}?{}",
+        supported_versions.join("&")
+    );
     let make_join_response = client
         .send(destination, "GET", &template_path, None)
         .await
@@ -153,7 +196,7 @@ pub async fn join_room(
         });
     }
 
-    let template = make_join_response
+    let mut template = make_join_response
         .body
         .get("event")
         .cloned()
@@ -163,6 +206,25 @@ pub async fn join_room(
                 "missing `event`".to_owned(),
             )
         })?;
+    if let Some(overlay) = content.and_then(Value::as_object) {
+        let template_content = template
+            .as_object_mut()
+            .ok_or_else(|| {
+                OutboundJoinError::MalformedTemplate(
+                    destination.to_owned(),
+                    "`event` is not an object".to_owned(),
+                )
+            })?
+            .entry("content")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(map) = template_content.as_object_mut() {
+            for (key, value) in overlay {
+                if key != "membership" {
+                    map.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
     let room_version_str = make_join_response
         .body
         .get("room_version")
@@ -585,6 +647,7 @@ mod tests {
             transactions: Arc::new(crate::inbound::InMemoryTransactionStore::new()),
             ancestor_fetcher: None,
             backfill_limits: crate::backfill::BackfillLimits::default(),
+            sender: None,
         };
         let ctx = Arc::new(XMatrixContext {
             own_server_name: server_name.clone(),
@@ -622,7 +685,7 @@ mod tests {
         let client = make_client("joiner.example.org", joiner_signing_key.clone());
         let key_cache = key_cache(&resident_keys, &resident_name);
 
-        let outcome = join_room(
+        let outcome = join_room_with_content(
             &client,
             &key_cache,
             &resident_name,
@@ -630,6 +693,7 @@ mod tests {
             user_id,
             &joiner_server_name,
             &joiner_signing_key,
+            Some(&serde_json::json!({"displayname": "Bob", "membership": "leave"})),
         )
         .await
         .expect("a fresh join against a room that allows public joins must succeed");
@@ -639,6 +703,27 @@ mod tests {
         assert!(!outcome.members_omitted);
         assert_eq!(outcome.join_event.header().sender.as_str(), user_id);
         assert_eq!(outcome.join_event.header().event_type, "m.room.member");
+        // The caller's profile rode along on the signed join; its attempt to override
+        // `membership` did not.
+        let content = outcome
+            .join_event
+            .json()
+            .get("content")
+            .and_then(CanonicalJsonValue::as_object)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            content
+                .get("displayname")
+                .and_then(CanonicalJsonValue::as_str),
+            Some("Bob")
+        );
+        assert_eq!(
+            content
+                .get("membership")
+                .and_then(CanonicalJsonValue::as_str),
+            Some("join")
+        );
         // The resident's real state (create, power levels, join rules, creator's join) plus, once
         // persisted, the new join itself -- but `AcceptingWriteSink` does not actually mutate the
         // fixture's fake room store, so `state_for_join` still answers with the pre-join snapshot

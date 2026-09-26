@@ -171,6 +171,14 @@ pub trait RoomDataSource: Send + Sync {
     /// `hs_state::auth::check_event_auth`, before any of this is ever returned to a caller over the
     /// wire.
     async fn state_for_join(&self, room_id: &str) -> Result<StateForJoin, RoomSourceError>;
+
+    /// The server name of every currently joined member, deduplicated, including this server's
+    /// own if it has a joined member. Empty for an unknown room. What `send_join` uses to decide
+    /// which servers must be told about a join it accepted (`crate::join`), so -- like
+    /// [`RoomDataSource::state_for_join`] -- deliberately not gated by
+    /// [`RoomDataSource::is_visible_to`]: the caller is this server itself, deciding where to
+    /// send, not a remote asking to read.
+    async fn member_servers(&self, room_id: &str) -> Vec<String>;
 }
 
 /// The current state plus its auth chain, as `send_join`/`make_join` need it. See
@@ -437,6 +445,16 @@ impl RoomDataSource for InMemoryRoomSource {
             state,
             auth_chain: room.join_auth_chain.clone(),
         })
+    }
+
+    async fn member_servers(&self, room_id: &str) -> Vec<String> {
+        let Some(room) = self.rooms.get(room_id) else {
+            return Vec::new();
+        };
+        let mut servers = room.joined_servers.clone();
+        servers.sort();
+        servers.dedup();
+        servers
     }
 }
 

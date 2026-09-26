@@ -60,3 +60,6 @@ ruma = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The fake federation peer `tests/federation_sender.rs` sends real transactions to; the same
+# double `hs-federation`'s own client and sender tests use.
+hs-testkit = { path = "../hs-testkit" }

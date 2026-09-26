@@ -512,6 +512,7 @@ mod tests {
             transactions: Arc::new(crate::inbound::InMemoryTransactionStore::new()),
             ancestor_fetcher: None,
             backfill_limits: crate::backfill::BackfillLimits::default(),
+            sender: None,
         };
         build().with_state(state)
     }
@@ -532,6 +533,7 @@ mod tests {
             transactions: Arc::new(crate::inbound::InMemoryTransactionStore::new()),
             ancestor_fetcher: None,
             backfill_limits: crate::backfill::BackfillLimits::default(),
+            sender: None,
         };
         let response = router
             .with_state(state)
@@ -618,6 +620,7 @@ mod tests {
             transactions: Arc::new(crate::inbound::InMemoryTransactionStore::new()),
             ancestor_fetcher: None,
             backfill_limits: crate::backfill::BackfillLimits::default(),
+            sender: None,
         };
         let router = build();
         let header = signed_header("anyone.example.org", "GET", "/publicRooms");

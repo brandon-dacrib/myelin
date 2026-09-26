@@ -44,6 +44,7 @@ pub mod pipeline;
 pub mod protocol;
 pub mod registry;
 pub mod relations;
+pub mod remote_join;
 pub mod retention;
 pub mod routes;
 pub mod state;

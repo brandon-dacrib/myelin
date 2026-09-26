@@ -270,7 +270,8 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     /// Registers an already-constructed actor (the result of `RoomActor::create_room`), replacing
     /// any existing entry for its room ID. Installs this registry's cluster-fencing hook (if any)
     /// onto `actor` first, same as [`RoomRegistry::get_or_load`] -- every path that puts an actor
-    /// into this registry's map goes through here or through `get_or_load` directly.
+    /// into this registry's map goes through here, [`RoomRegistry::insert_if_absent`] or
+    /// `get_or_load` directly.
     pub async fn insert(&self, mut actor: RoomActor<B>) -> RoomActorHandle<B> {
         actor.set_fencing(self.fencing.get().cloned());
         actor.join_global_stream(self.global.clone());
@@ -285,6 +286,108 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             },
         );
         handle
+    }
+
+    /// [`RoomRegistry::insert`], except that an entry already present for the room ID wins: the
+    /// existing handle is returned and `actor` is dropped unused. For a caller that constructed
+    /// an actor for a room it found absent a moment ago and must not displace one a concurrent
+    /// caller registered in between (two users joining the same remote room at once). Installs
+    /// fencing and joins the global stream under the map lock, so the announcement and the
+    /// entry are one step for anyone racing to load the same room, as `get_or_load` does.
+    async fn insert_if_absent(&self, mut actor: RoomActor<B>) -> RoomActorHandle<B> {
+        actor.set_fencing(self.fencing.get().cloned());
+        let room_id = actor.room_id().to_owned();
+        let mut rooms = self.rooms.lock().await;
+        let entry = match rooms.entry(room_id) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                actor.join_global_stream(self.global.clone());
+                slot.insert(Entry {
+                    handle: RoomActorHandle::new(actor),
+                    last_used: Instant::now(),
+                })
+            }
+        };
+        entry.last_used = Instant::now();
+        entry.handle.clone()
+    }
+
+    /// Drops the registry's entry for `room_id` if it is still `handle`'s actor and that actor
+    /// holds no timeline at all -- a shell [`RoomRegistry::bootstrap_from_remote_join`] created
+    /// for a join that was then refused. Such a shell has nothing durable behind it
+    /// (`RoomActor::empty_for`), so leaving it resident would only make `get_or_load` answer a
+    /// room that does not exist. An actor another caller has since filled in is left alone.
+    async fn drop_if_unbootstrapped(&self, room_id: &ruma::RoomId, handle: &RoomActorHandle<B>) {
+        if handle.query(|actor| actor.head_update().is_some()).await {
+            return;
+        }
+        let mut rooms = self.rooms.lock().await;
+        if rooms
+            .get(room_id)
+            .is_some_and(|entry| entry.handle.ptr_eq(handle))
+        {
+            rooms.remove(room_id);
+        }
+    }
+
+    /// Makes a room this server's own user has just joined on a resident server exist here, from
+    /// that server's **verified** `send_join` response -- the entry point
+    /// `docs/rfcs/0015-outbound-join-needs-a-room-bootstrap-api.md` asked for. `state`,
+    /// `auth_chain` and `join_event` are `hs_federation::outbound_join::RemoteJoinOutcome`'s
+    /// fields of the same names, every event already hash- and signature-checked by the caller;
+    /// `room_version` is the version `make_join` reported. See
+    /// [`RoomActor::accept_remote_join_with_state`] for what is trusted, checked and written.
+    ///
+    /// If the room already exists here (a user who left and is rejoining, or a second local user
+    /// joining a room the first already brought over), the response is applied to the existing
+    /// actor. Otherwise an empty shell for the room is registered *first* and the join is applied
+    /// through its handle, so that the join's [`RoomUpdate`] -- carrying the user's
+    /// `membership_deltas`, which is how `hs-user`'s session hub learns they are in the room --
+    /// is published on the global stream from an actor that is already resident and already on
+    /// that stream. Applying the join before registering would publish it from an actor nobody
+    /// could look up yet: a consumer reacting to the update would load a second copy of the room
+    /// from disk, and the two would then diverge. A shell whose join is refused is dropped again
+    /// ([`RoomRegistry::drop_if_unbootstrapped`]); nothing durable records it.
+    ///
+    /// Returns the room's handle, whether the join was newly stored or already known.
+    ///
+    /// # Errors
+    /// Any error [`RoomActor::accept_remote_join_with_state`], `RoomActor::empty_for` or
+    /// [`RoomRegistry::get_or_load`] can return.
+    pub async fn bootstrap_from_remote_join(
+        &self,
+        room_id: &ruma::RoomId,
+        room_version: ruma::RoomVersionId,
+        state: Vec<hs_model::Event>,
+        auth_chain: Vec<hs_model::Event>,
+        join_event: hs_model::Event,
+    ) -> Result<RoomActorHandle<B>, RoomError> {
+        let handle = match self.get_or_load(room_id).await {
+            Ok(handle) => handle,
+            Err(RoomError::RoomNotFound(_)) => {
+                let backend = self.backend.clone();
+                let tables = self.tables.clone();
+                let identity = self.identity.clone();
+                let owned_room_id = room_id.to_owned();
+                let shell = tokio::task::spawn_blocking(move || {
+                    RoomActor::empty_for(backend, tables, identity, &owned_room_id, room_version)
+                })
+                .await
+                .expect("room shell task panicked")?;
+                self.insert_if_absent(shell).await
+            }
+            Err(e) => return Err(e),
+        };
+        match handle
+            .accept_remote_join_with_state(state, auth_chain, join_event)
+            .await
+        {
+            Ok(_) => Ok(handle),
+            Err(e) => {
+                self.drop_if_unbootstrapped(room_id, &handle).await;
+                Err(e)
+            }
+        }
     }
 
     /// A stream of every [`RoomUpdate`] published by any room this registry loads or creates, from

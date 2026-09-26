@@ -2,10 +2,254 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
-Last updated: 2026-09-19 (session 7: the admin API's room directory is now implemented for real
-over `hs-room`; `/context`'s `state` field is pinned to the target event instead of live current
-state; `RoomActor::persist` now checks `hs_cluster::Fence` as the documented belt-and-braces
-guard).
+Last updated: 2026-09-25 (session 8: RFC 0015 implemented -- a room this server's own user
+joined on another server is built here from the verified `send_join` response, as outliers plus a
+join with explicit state; `RoomRegistry::bootstrap_from_remote_join` is the entry point `hs-cli`
+should call).
+
+> **Integration note, 2026-09-25 (integration lead):** the caller RFC 0015 needed exists.
+> `crate::remote_join::RemoteJoin` is a hook on `RoomState` (like the registry's fencing and
+> token-resolver hooks: installed by `hs-cli`, `None` in this crate's tests), and
+> `crate::routes::membership`'s two join handlers fall through to it when `get_or_load` answers
+> `RoomNotFound`: the client's `server_name`/`via` query parameters (repeated keys, read from the
+> raw query) plus the room ID's own server as a last resort, and a remote alias resolved through
+> its server's directory. `RoomError::RemoteJoinFailed` (`502 M_UNKNOWN`) is what a join that no
+> server could sponsor answers with; a resident's `403` is `Forbidden`, its `404` is
+> `RoomNotFound`. Tests in that module; end to end in `crates/hs-cli/tests/federation_two_servers.rs`.
+
+## Session 8 (2026-09-25): RFC 0015 -- a room this server's own user joined elsewhere now exists here
+
+**Assignment**: implement `docs/rfcs/0015-outbound-join-needs-a-room-bootstrap-api.md` in this
+crate (plus one additive method in `hs-state`): build a `RoomActor` from a verified federation
+`send_join` response, so that after `hs_federation::outbound_join::join_room` completes, the
+joining user's own server can represent the room -- read its state, list its members, post into
+it, accept the resident's next events, sync it. Ownership this session: `crates/hs-room/**`,
+`crates/hs-state/src/kv_store.rs` (one additive method, by instruction), this file, the RFC's
+status line. No git.
+
+### What was built
+
+**The entry points** (`crates/hs-room/src/actor.rs`, `crates/hs-room/src/registry.rs`):
+
+- `RoomActor::accept_remote_join_with_state(&mut self, state: Vec<Event>, auth_chain: Vec<Event>,
+  join_event: Event) -> Result<RemoteEventOutcome, RoomError>` -- the core. Works on an empty
+  shell (a brand-new room) and on a room that already exists here (a user who left and rejoins,
+  or a second local user joining a room the first already brought over) alike. A join already
+  held answers `RemoteEventOutcome::AlreadyKnown` and touches nothing.
+- `RoomActor::create_from_remote_join(backend, tables, identity, room_id: &RoomId, room_version:
+  RoomVersionId, state, auth_chain, join_event) -> Result<Self, RoomError>` -- an empty shell
+  (`RoomActor::empty_for`, crate-private) with the above applied. The `now_ms` the RFC sketched is
+  gone: nothing is built or timestamped here, every event arrives already made.
+- `RoomActorHandle::accept_remote_join_with_state(...)` -- the async, `spawn_blocking` wrapper,
+  same shape as `accept_remote_event`.
+- `RoomRegistry::bootstrap_from_remote_join(&self, room_id, room_version, state, auth_chain,
+  join_event) -> Result<RoomActorHandle<B>, RoomError>` -- what `hs-cli` should call. If
+  `get_or_load` finds the room, the response is applied to the existing actor; otherwise an empty
+  shell is registered *first* (new crate-private `RoomRegistry::insert_if_absent`, which never
+  displaces an entry a concurrent caller registered in between) and the join is applied through
+  its handle, so the join's `RoomUpdate` -- with `membership_deltas: [(user, "join")]`, exactly as
+  `persist` publishes for any membership event, which is what `hs-user`'s session hub keys off --
+  is published from an actor that is already resident and already on the global stream. Applying
+  the join before registering would publish from an actor nobody could look up, and a consumer
+  reacting to it would load a second copy of the room from disk. A shell whose join is refused is
+  dropped again (`RoomRegistry::drop_if_unbootstrapped`); nothing durable records it, because
+  `Tables::room_meta` is only written with the join.
+
+**What the snapshot becomes: outliers.** `state ∪ auth_chain`, deduplicated by event ID and less
+anything already held, is persisted by the new `RoomActor::persist_outliers` with
+`hs_model::event::EventFlags::OUTLIER` set (the flag existed, unused, since track 02 defined it),
+`PersistedEvent.room_pos: None`, no timeline entry, no forward-extremity entry, no `RoomUpdate`,
+in `hs-kv` transactions of up to 256 events each with the cluster-fencing check in every one.
+They *are* written to `events`/`event_sn`, so `event_by_id`, `state_at_event`, `/state`,
+`/members`, `/event/{id}` and every auth check can see them, but `/messages`, `/sync` timelines,
+`events_after` and `paginate` never do. They are persisted and fed to the state store in
+topological order (`depth`, then `origin_server_ts`, then event ID -- `crate::actor::topological_order`)
+so each one's `auth_events` are indexed before it is, which is what lets the chain-cover index and
+any later state resolution see the snapshot's auth chains whole. **An outlier's own `state_at` in
+the state store is meaningless** -- it is fed with *no* prev events (`RoomActor::feed_store_outlier`),
+because its real prev events are mostly events this server has never seen and resolving the ones
+it happens to hold would run state resolution over a fragment -- and nothing may read it as the
+room's state at that point. The one read path that used to: `RoomActor::event_visible_to`, which
+evaluates history visibility against `state_at(event)`, now answers for an outlier by
+`can_see_current_membership(requester)` (currently joined, or the room is world-readable), since
+a snapshot event is a piece of the room's state as the join found it and has no position in
+anybody's history here.
+
+**The join is the room's first timeline event** (`room_pos` 1 for a new room), the **sole forward
+extremity**, with its state set **explicitly** to `state` + itself. `crates/hs-state/src/kv_store.rs`
+gained `KvStateStore::add_event_with_state(..same twelve parameters as add_event.., state: &[EventSn])`:
+records the event exactly as `add_event` does, but builds the state before it by applying a
+`StateDiff` of every snapshot event's interned `(type, state_key) -> EventSn` over
+`empty_root()` instead of resolving prev events, then applies the event's own key, stores
+`state_at`, and updates the chain index. Refuses (`KvStoreError::UnknownEvent`, recording nothing)
+an entry it has not ingested. The `StateStore` trait is unchanged. (`add_event`'s body was split
+into `record_event`/`apply_and_index` so the two share everything but the middle;
+`InMemoryStateStore` was deliberately *not* given a mirror -- nothing in this crate constructs
+one against a snapshot, and the reference store's "stays hand-written and small" charter in its
+module docs argued against growing it for one production caller.) The join's unknown
+`prev_events` are simply not resolved -- not `MissingAncestors`, which stays the answer for an
+ordinary `accept_remote_event` -- and `old_extremities` for the join is *every* current forward
+extremity, not only the prev events it names (there are none held): see "Decisions made".
+
+**Durable, and reloaded identically.** Two new keyspaces in `crates/hs-room/src/persist.rs`:
+
+- `Tables::outliers`, keyspace `room_outliers`, `(RoomSn, EventSn) -> b""` -- the room's outliers,
+  scanned by `RoomActor::load` before the timeline.
+- `Tables::state_snapshots`, keyspace `room_state_snapshots`, `(RoomSn, EventSn) -> bytes` -- the
+  explicit state a timeline event was fed with, as concatenated 8-byte big-endian `EventSn`s
+  (`persist::encode_event_sns`/`decode_event_sns`). Written in the join's own transaction
+  (`RoomActor::persist_with(event, PersistKind::RemoteJoin { snapshot })`; `persist` is now a thin
+  `PersistKind::Ordinary` wrapper).
+
+`RoomActor::load` now: reads every outlier row, decodes each event, re-sorts topologically (rather
+than trusting key order alone, in case a snapshot event's `EventSn` was interned early as a
+relation target), absorbs each as an outlier; reads every `state_snapshots` row; then replays the
+timeline as before, feeding an event with a snapshot row via `add_event_with_state`. **Side fix,
+found on the way**: `load` never restored `PersistedEvent.flags` onto the re-parsed `Event`
+(`Event::parse` starts every event with no flags), so a redaction's `REDACTED` flag -- which
+`crate::routes::render::readable_json` checks at render time -- was lost across an eviction and
+reload, and a redacted event would have rendered unredacted afterwards. Flags are restored for
+every loaded event now; the outlier flag needed the same line.
+
+`RoomActor::persist`'s "write `room_meta` on the first event" test changed from `events.is_empty()`
+to `timeline.is_empty()`: identical before outliers existed (the two sets were the same), and
+now correct when outliers are persisted first -- a room whose only records are outliers is not a
+room `load` may find, so a bootstrap that dies between the outliers and the join leaves nothing
+visible and the retry starts clean (re-interning the same IDs, overwriting the same records).
+
+### The trust decision
+
+`accept_remote_join_with_state` does **not** re-verify hashes or signatures (the caller,
+`hs_federation::outbound_join::join_room`, already ran `verify_pdu` over every event), does
+**not** run state resolution over the snapshot (it is the resident's already-resolved state, by
+construction), and does **not** auth-check the snapshot's own events (they *are* the auth chain
+everything else is judged against; re-deriving them would mean fetching the room's whole history,
+which is exactly what a `send_join` response exists to make unnecessary). This is the same trust
+decision every homeserver makes for a `send_join` response, Synapse included (read for behavior
+only, per this track's brief): trust the resident's state, verify its signatures, and authorize
+what you add on top. What *is* checked, before anything is written (`RoomActor::validate_remote_join`):
+every event is for this room and this room's version; every snapshot event is a state event;
+`state` holds exactly one `m.room.create` with an empty state key and no two events for one
+`(type, state_key)`; the join is an `m.room.member` with `membership: join`, `state_key == sender`,
+and a sender on `identity.server_name`; every ID in the join's `auth_events` is in the snapshot;
+and `hs_state::auth::check_auth_events_selection` then `check_event_auth` accept the join against
+both the state its `auth_events` imply and the full `state` (the two hard checks
+`accept_remote_event` already runs), so a resident cannot hand this server a join its own rules
+would reject. Shape problems are `RoomError::InvalidEvent(EventError::Format(..))`; the wrong
+server, an `auth_events` entry outside the snapshot, and an auth failure are `RoomError::Forbidden`,
+each with a message that says what was wrong.
+
+### Tests
+
+`crates/hs-room/tests/remote_join.rs` (7 tests, public API only): two backends stand in for two
+servers. `a.example` hosts the room via `RoomActor::create_room` (alice, `public_chat`, room
+version 11), alice sends a message, `@bob:b.example` joins through `membership_action` (the
+resident signs it with `a.example`'s key -- this crate never verifies signatures, and the test
+says so); the response is `state_at_event(<alice's message>)`'s `state` and `auth_chain` plus
+bob's join, whose `prev_events` is alice's message, which the snapshot does not carry.
+
+- `a_room_joined_elsewhere_is_bootstrapped_from_the_resident_snapshot`: on `b.example`,
+  `create_from_remote_join`; `full_state()` holds create, power levels, join rules, history
+  visibility, alice's and bob's member events; `joined_members()` has both; the timeline is
+  exactly the join (`events_after(0, 100).len() == 1`, `paginate` backward yields only the join);
+  alice's pre-join message is *not* held; `event_by_id(create)` is Some, flagged outlier, and
+  visible to bob; `state_at_event(join)` is the snapshot plus the join; bob's `send_event` on B
+  cites the join as its only prev; alice's next message on A (citing bob's join) is accepted on B
+  via `accept_remote_event`; `RoomActor::load` over B's backend reproduces `full_state()`, the
+  timeline, `state_at_event(join)` and the outlier flag; after the reload bob leaves via
+  `membership_action`.
+- `applying_the_same_join_response_twice_is_a_no_op`: `AlreadyKnown`, one timeline entry.
+- `a_join_by_a_user_of_another_server_is_refused` (`Forbidden`),
+  `a_snapshot_without_a_create_event_is_refused` (`InvalidEvent`),
+  `a_join_whose_auth_events_leave_the_snapshot_is_refused` (`Forbidden`; asserts first that the
+  join really does cite the join-rules event it then removes).
+- `bootstrap_from_remote_join_creates_the_room_and_announces_the_join_once`: an unknown room is
+  created through the registry; a `subscribe_global()` subscriber receives the join's
+  `RoomUpdate` with `room_pos == 1`, `global_seq >= 1` and bob's `membership_deltas`; the same
+  response again stores nothing and publishes nothing; `get_or_load` then finds a real room.
+- `a_refused_bootstrap_leaves_no_room_behind`: a refused join leaves `resident_count() == 0` and
+  `get_or_load` answering `RoomNotFound`.
+
+`crates/hs-state/src/kv_store.rs::tests::add_event_with_state_seeds_the_state_from_an_explicit_snapshot`:
+three outliers with no prev events, then a join with an unknown prev and the three as explicit
+state -- `state_at(join)` is exactly the four, the chain index reaches the create through power
+levels, and an unknown snapshot entry is `UnknownEvent` that records nothing.
+
+Mutation-checked by hand and reverted: with `load` skipping outliers, and separately with the join
+fed via plain `feed_store` instead of `feed_store_with_state`, the end-to-end test fails.
+
+### How to verify (session 8)
+
+```
+cargo fmt --all --check
+cargo clippy -p hs-room -p hs-state --all-targets -- -D warnings
+cargo test -p hs-room -p hs-state
+cargo build --workspace
+```
+
+`cargo test -p hs-room`: 70 unit + 7 `remote_join` + 12 `scenario` (was 70 + 12). `cargo test -p
+hs-state --lib`: 71 (was 70). All four commands were run clean at the end of the session.
+
+### Interfaces provided (new this session)
+
+- `hs_room::actor::RoomActor::{accept_remote_join_with_state, create_from_remote_join}`,
+  `hs_room::actor::RoomActorHandle::accept_remote_join_with_state`,
+  `hs_room::registry::RoomRegistry::bootstrap_from_remote_join` -- see "What was built".
+- `hs_room::persist::{OutlierKey, StateSnapshotKey, encode_event_sns, decode_event_sns}` and the
+  two new `Tables` fields (`outliers`, `state_snapshots`). `Tables` has public fields; nothing
+  outside this crate constructs it by struct literal (checked), so this is additive.
+- `hs_state::kv_store::KvStateStore::add_event_with_state` -- additive; `StateStore` unchanged.
+
+### Interfaces needed
+
+- **06 (federation) / `hs-cli`** -- the wiring this crate cannot do from here: after
+  `hs_federation::outbound_join::join_room` returns its `RemoteJoinOutcome { room_id, room_version,
+  join_event, state, auth_chain, .. }`, call
+  `registry.bootstrap_from_remote_join(&room_id, room_version, state, auth_chain, join_event).await`
+  on the `Arc<RoomRegistry<B>>` `hs serve` already holds. That is the whole integration.
+  `crates/hs-cli/src/federation.rs::run_join_room` (the `hs federation-join-room` command) opens
+  no storage today by design and prints the RFC's "cannot yet represent this room locally"
+  message; the client-server `/join` route for a room ID this server does not host (with `via`
+  / `server_name` hints) is where this belongs in `hs serve`. The RFC's suggested
+  `RoomWriteSink` extension is track 06's call; this crate's handle method is what it would call.
+- **06 (federation)** -- backfill. Nothing before the join is in the timeline; `/messages`
+  backward from the join stops at the join. `Tables::extremities_bwd` and negative `room_pos`
+  are still the intended shape for what backfill writes.
+
+### Decisions made this session
+
+- **A remote join supersedes every forward extremity this actor held**, not only the (unknown)
+  prev events it names. Matters only on the rejoin path: the old extremities are this server's
+  own last events from before its user left (its leave, typically), which the resident's resolved
+  state already accounts for; keeping them would make the room a permanent fork between stale
+  local state and the resident's snapshot, resolved on every read. `PersistKind::RemoteJoin`'s
+  doc comment records it.
+- **Outliers are fed to the state store with no prev events at all**, rather than with whichever
+  prev events happen to be held: deterministic, no resolution over fragments, and it makes "an
+  outlier's `state_at` is meaningless" a property rather than a matter of luck. `auth_events`
+  *are* resolved, for the chain-cover index and for state resolution's benefit.
+- **`Tables::room_meta` is written with the room's first *timeline* event**, never with outliers,
+  so a half-finished bootstrap is invisible to `load` and a retry starts clean.
+- **`event_visible_to` on an outlier answers `can_see_current_membership`** rather than the
+  history-visibility algorithm over a state that does not exist here; recorded as the one
+  deliberate consumer-side accommodation of meaningless outlier `state_at`.
+- **`load` restores persisted flags onto every event** (side fix; see "What was built").
+- **`InMemoryStateStore` did not get an `add_event_with_state` mirror** -- see above.
+
+### Not done (and not started)
+
+- **No backfill of the pre-join timeline** -- track 06's `/backfill` client is where that lands;
+  this crate has the tables for it.
+- **Outliers' own `state_at` is meaningless** by design; every consumer that could read it has
+  been redirected (`event_visible_to`) or never reads it (timeline reads). A future "state at an
+  outlier" question -- `/context` on a snapshot event, say -- should go through the current state
+  or the join's explicit state, not the store.
+- **Soft failure is still absent**: `accept_remote_event`'s third check (current state at receipt
+  time) is still not implemented, and every rejection is still a hard rejection, exactly as
+  session 3 recorded.
+- **Faster joins** (`members_omitted: true` responses) are not handled: `RemoteJoinOutcome`
+  documents the resident side never omits members, and this crate would accept such a response
+  as if it were complete. Worth a guard in the caller until partial state is a real feature.
 
 ## Session 7 (2026-09-19): the admin room directory, `/context` state pinning, cluster fencing
 
@@ -1543,6 +1787,12 @@ None. Everything this pass needed from other tracks (`hs-kv`, `hs-tables`, `hs-m
 
 ## Interfaces provided
 
+- **Session 8 (RFC 0015), most relevant to track 06 and `hs-cli`**:
+  `RoomRegistry::bootstrap_from_remote_join(room_id, room_version, state, auth_chain, join_event)`,
+  `RoomActor::{create_from_remote_join, accept_remote_join_with_state}` and
+  `RoomActorHandle::accept_remote_join_with_state` -- a room this server's own user joined on a
+  resident server, built here from that server's verified `send_join` response. See session 8
+  at the top of this file for the contract, the trust decision and the two new keyspaces.
 - **Session 5 additions, most relevant to track 05**: `RoomActor::transaction_id_for(event_id,
   viewer, viewer_device) -> Option<&str>` (call through `RoomActorHandle::query` to render
   `unsigned.transaction_id` on `/sync` timeline events the way this crate's own routes now do --
@@ -1591,6 +1841,10 @@ None. Everything this pass needed from other tracks (`hs-kv`, `hs-tables`, `hs-m
 
 ## Interfaces needed
 
+- **06 (federation) / `hs-cli`, session 8**: call `RoomRegistry::bootstrap_from_remote_join` with
+  `hs_federation::outbound_join::RemoteJoinOutcome`'s fields after a successful `join_room`; and
+  backfill, so a bootstrapped room has history before the join. Details in session 8's
+  "Interfaces needed".
 - **02 (state and model)**: `docs/rfcs/0010-room-actor-state-store-seam.md` section 2 — a way to
   intern/look up a `StateKeyId` for a known `(event_type, state_key)` pair independent of already
   holding an event that set it (`StateStore::get` alone cannot answer this today). Track 04 worked
@@ -1616,6 +1870,10 @@ None. Everything this pass needed from other tracks (`hs-kv`, `hs-tables`, `hs-m
 
 ## Decisions made
 
+- **Session 8**: a remote join supersedes every forward extremity held; outliers are fed to the
+  state store with no prev events (their `state_at` is meaningless by design); `room_meta` is
+  written with the first *timeline* event only; `load` restores persisted flags. Full list in
+  session 8's "Decisions made this session".
 - **`hs_state::StateStore`/state resolution is not wired into `RoomActor` in this pass.** The room
   actor maintains its own flat, directly-updated current-state map instead
   (`crate::pipeline::CurrentState`), which is provably correct for a single-writer actor that never
@@ -1657,6 +1915,8 @@ None. Everything this pass needed from other tracks (`hs-kv`, `hs-tables`, `hs-m
   if the same `txnId` was already used. Noted at each call site and in "Next".
 
 ## Shared dependencies added
+
+Session 8: none (no `Cargo.toml` changed).
 
 None to `[workspace.dependencies]`. `hs-room/Cargo.toml` added ordinary path dependencies on
 `hs-model`, `hs-state`, `hs-kv`, `hs-tables`, `hs-auth`, `hs-http` (all already in-tree), and a

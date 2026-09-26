@@ -119,6 +119,7 @@ mod tests {
             transactions: std::sync::Arc::new(InMemoryTransactionStore::new()),
             ancestor_fetcher: None,
             backfill_limits: crate::backfill::BackfillLimits::default(),
+            sender: None,
         }
     }
 

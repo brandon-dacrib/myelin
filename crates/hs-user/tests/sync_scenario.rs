@@ -63,6 +63,7 @@ fn setup() -> (Scenario, Registry, Hub) {
         auth: auth.clone(),
         rooms: rooms.clone(),
         identity,
+        remote_join: None,
     };
     let user_state = UserState {
         auth: auth.clone(),

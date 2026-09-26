@@ -18,5 +18,6 @@ pub mod join;
 pub mod keys;
 pub mod outbound_join;
 pub mod room_source;
+pub mod sender;
 pub mod transport;
 pub mod xmatrix;

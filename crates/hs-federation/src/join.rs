@@ -46,9 +46,10 @@ use hs_state::state_fetch::{StateEntry, StateFetch};
 use ruma::{OwnedUserId, RoomId, RoomVersionId, UserId};
 use serde_json::Value;
 
-use crate::inbound::{RoomWriteSink, event_json, verify_pdu};
+use crate::inbound::{RoomWriteSink, WriteOutcome, event_json, verify_pdu};
 use crate::keys::DynRemoteKeyCache;
 use crate::room_source::{RoomDataSource, RoomSourceError};
+use crate::sender::OutboundPduSink;
 
 /// Why a join handshake call failed.
 #[derive(Debug, Clone)]
@@ -303,8 +304,15 @@ pub struct SendJoinResult {
 /// Validates and (to the extent [`RoomWriteSink`] allows) applies a signed join event returned by
 /// a remote server after `make_join`.
 ///
+/// A join this call newly stores is also handed to `forward` (if any) for every server with a
+/// joined member in the room other than `origin` (which sent it) and `own_server_name` (which is
+/// applying it): the spec's requirement that the resident server "send the new join event to all
+/// other servers in the room", which is the only way they learn of the new member. A replayed
+/// join (`WriteOutcome::AlreadyKnown`) was forwarded the first time and is not forwarded again.
+///
 /// # Errors
 /// See [`JoinError`].
+#[allow(clippy::too_many_arguments)]
 pub async fn send_join(
     rooms: &dyn RoomDataSource,
     sink: &dyn RoomWriteSink,
@@ -313,6 +321,8 @@ pub async fn send_join(
     event_id: &str,
     signed_event: &Value,
     origin: &str,
+    own_server_name: &str,
+    forward: Option<&dyn OutboundPduSink>,
 ) -> Result<SendJoinResult, JoinError> {
     let Some(room_version_str) = rooms.room_version(room_id).await else {
         return Err(JoinError::RoomNotFound);
@@ -392,7 +402,27 @@ pub async fn send_join(
         .await
         .map_err(|e| JoinError::Store(e.error))?;
     tracing::info!(room_id, event_id, ?outcome, "send_join: event accepted");
-    let _ = outcome; // Stored vs. AlreadyKnown does not change the response shape.
+
+    // Stored vs. AlreadyKnown does not change the response shape, only whether the room's other
+    // servers still need telling. Member servers are read after the store, so a room whose only
+    // members are the creator and this joiner yields nothing to forward rather than a stale list.
+    if let (WriteOutcome::Stored, Some(forward)) = (outcome, forward) {
+        let destinations: Vec<String> = rooms
+            .member_servers(room_id)
+            .await
+            .into_iter()
+            .filter(|server| server != origin && server != own_server_name)
+            .collect();
+        if !destinations.is_empty() {
+            tracing::debug!(
+                room_id,
+                event_id,
+                servers = destinations.len(),
+                "send_join: forwarding the accepted join to the room's other servers"
+            );
+            forward.enqueue_pdu(destinations, value.clone());
+        }
+    }
 
     Ok(SendJoinResult {
         state: state.state.into_iter().map(|(_, v)| v).collect(),
@@ -429,6 +459,13 @@ mod tests {
     /// `resident.example.org` (this server, the room's host) so `FlatState` and auth checks have
     /// something real to look at. Returns `(rooms, room_id, room_version)`.
     fn room_with_creator() -> (InMemoryRoomSource, String, String) {
+        room_with_creator_and_servers(Vec::new())
+    }
+
+    /// [`room_with_creator`], with `joined_servers` as the fake's `member_servers` answer.
+    fn room_with_creator_and_servers(
+        joined_servers: Vec<String>,
+    ) -> (InMemoryRoomSource, String, String) {
         let room_id = "!r:resident.example.org".to_string();
         let create = serde_json::json!({
             "event_id": "$create",
@@ -480,10 +517,133 @@ mod tests {
                     creator_join.clone(),
                 ],
                 join_auth_chain: vec![create, power_levels, join_rules],
+                joined_servers,
                 ..FakeRoom::default()
             },
         );
         (rooms, room_id, "11".to_owned())
+    }
+
+    /// Stores everything: what `hs-cli`'s real sink does for a valid, new join.
+    struct StoringSink;
+    #[async_trait]
+    impl RoomWriteSink for StoringSink {
+        async fn accept_verified_event(
+            &self,
+            _room_id: &str,
+            _event_id: &str,
+            _event_json: &Value,
+        ) -> Result<WriteOutcome, crate::inbound::WriteRejected> {
+            Ok(WriteOutcome::Stored)
+        }
+    }
+
+    /// Records every `enqueue_pdu` call it receives.
+    #[derive(Default)]
+    struct RecordingSink(std::sync::Mutex<Vec<(Vec<String>, Value)>>);
+    impl OutboundPduSink for RecordingSink {
+        fn enqueue_pdu(&self, destinations: Vec<String>, pdu: Value) {
+            self.0.lock().unwrap().push((destinations, pdu));
+        }
+    }
+
+    /// Bob's signed join against [`room_with_creator`]'s state, and its event ID.
+    fn bobs_signed_join(keys: &OwnSigningKeys, room_id: &str) -> (Value, String) {
+        let signed = sign_member_event(
+            keys,
+            room_id,
+            "@bob:joiner.example.org",
+            vec![Value::String("$creatorjoin".to_owned())],
+            vec![
+                Value::String("$create".to_owned()),
+                Value::String("$power".to_owned()),
+                Value::String("$joinrules".to_owned()),
+            ],
+            5,
+        );
+        let event_id = hs_model::Event::parse(&signed, RoomVersionId::V11)
+            .unwrap()
+            .event_id()
+            .to_string();
+        (signed, event_id)
+    }
+
+    /// The spec's "send the new join event to all other servers in the room": a newly stored
+    /// join goes to every member server except the one that submitted it and this one.
+    #[tokio::test]
+    async fn an_accepted_join_is_forwarded_to_the_other_member_servers_but_not_the_origin() {
+        let (rooms, room_id, _) = room_with_creator_and_servers(vec![
+            "resident.example.org".to_owned(),
+            "other.example.org".to_owned(),
+            "third.example.org".to_owned(),
+            "joiner.example.org".to_owned(),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let keys = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
+        let doc = build_server_key_response("joiner.example.org", &keys, &[], 3600).unwrap();
+        let cache = RemoteKeyCache::new(Box::new(FixedFetcher(doc)) as Box<dyn KeyServerFetcher>);
+        let (signed, event_id) = bobs_signed_join(&keys, &room_id);
+        let forward = RecordingSink::default();
+
+        let result = send_join(
+            &rooms,
+            &StoringSink,
+            &cache,
+            &room_id,
+            &event_id,
+            &signed,
+            "joiner.example.org",
+            "resident.example.org",
+            Some(&forward),
+        )
+        .await
+        .unwrap();
+
+        let forwarded = forward.0.lock().unwrap().clone();
+        assert_eq!(forwarded.len(), 1, "{forwarded:?}");
+        let (destinations, pdu) = &forwarded[0];
+        assert_eq!(
+            destinations,
+            &vec![
+                "other.example.org".to_owned(),
+                "third.example.org".to_owned()
+            ]
+        );
+        assert_eq!(pdu, &result.event);
+        assert_eq!(pdu["sender"], "@bob:joiner.example.org");
+    }
+
+    /// A join the room already held (a retried `send_join`) was forwarded the first time; the
+    /// replay must not fan it out again.
+    #[tokio::test]
+    async fn a_replayed_join_is_not_forwarded_again() {
+        let (rooms, room_id, _) = room_with_creator_and_servers(vec![
+            "resident.example.org".to_owned(),
+            "other.example.org".to_owned(),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let keys = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
+        let doc = build_server_key_response("joiner.example.org", &keys, &[], 3600).unwrap();
+        let cache = RemoteKeyCache::new(Box::new(FixedFetcher(doc)) as Box<dyn KeyServerFetcher>);
+        let (signed, event_id) = bobs_signed_join(&keys, &room_id);
+        let forward = RecordingSink::default();
+
+        let sink = StaticWriteSink::new(vec![event_id.clone()], "unused");
+        send_join(
+            &rooms,
+            &sink,
+            &cache,
+            &room_id,
+            &event_id,
+            &signed,
+            "joiner.example.org",
+            "resident.example.org",
+            Some(&forward),
+        )
+        .await
+        .unwrap();
+
+        assert!(forward.0.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -601,6 +761,8 @@ mod tests {
             &event_id,
             &signed,
             "joiner.example.org",
+            "resident.example.org",
+            None,
         )
         .await
         .unwrap_err();
@@ -643,6 +805,8 @@ mod tests {
             &event_id,
             &signed,
             "impersonator.example.org",
+            "resident.example.org",
+            None,
         )
         .await
         .unwrap_err();
@@ -683,6 +847,8 @@ mod tests {
             &event_id,
             &signed,
             "joiner.example.org",
+            "resident.example.org",
+            None,
         )
         .await
         .unwrap();

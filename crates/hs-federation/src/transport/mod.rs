@@ -54,6 +54,12 @@ pub struct FederationState {
     /// Bounds applied to every backfill resolution attempt. See `crate::backfill` for what an
     /// attacker can and cannot cost this server by dangling a missing-ancestor chain.
     pub backfill_limits: crate::backfill::BackfillLimits,
+    /// Where an event this server accepts on behalf of a room it hosts is handed for delivery
+    /// to the room's other servers -- today, a join accepted by `send_join`, which the spec
+    /// requires the resident server to forward to every other server in the room. `None` means
+    /// nothing is forwarded (the manifest-only mount, and every handler test that does not care).
+    /// See `crate::sender`.
+    pub sender: Option<Arc<dyn crate::sender::OutboundPduSink>>,
 }
 
 fn matrix_federation(operation_id: &str) -> RouteMeta {
@@ -163,6 +169,7 @@ mod tests {
             transactions: Arc::new(crate::inbound::InMemoryTransactionStore::new()),
             ancestor_fetcher: None,
             backfill_limits: crate::backfill::BackfillLimits::default(),
+            sender: None,
         }
     }
 

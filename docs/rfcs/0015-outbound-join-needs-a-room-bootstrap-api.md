@@ -1,7 +1,22 @@
 # 0015. Joining a room hosted elsewhere needs a room-bootstrap API in `hs-room`
 
-Status: proposed. Owner of the fix: track 04 (room and events), `crates/hs-room/src/actor.rs` and
-`crates/hs-room/src/registry.rs`. Also affects: `crates/hs-cli/src/federation.rs` (the wiring that
+Status: implemented (2026-09-25, track 04, session 8 of `docs/status/04-room-and-events.md`).
+Entry points: `hs_room::registry::RoomRegistry::bootstrap_from_remote_join` (what `hs-cli` should
+call after `hs_federation::outbound_join::join_room` succeeds -- creates the room if it does not
+exist here, applies the join to the existing actor if it does),
+`hs_room::actor::RoomActor::create_from_remote_join` and
+`hs_room::actor::RoomActor::accept_remote_join_with_state` (the core, also on
+`RoomActorHandle`), backed by `hs_state::kv_store::KvStateStore::add_event_with_state`. The open
+questions of section 3 were settled as: the snapshot is persisted as outliers
+(`hs_model::event::EventFlags::OUTLIER`, new `Tables::outliers` keyspace), never in the timeline;
+no state resolution runs over it and its events are not re-auth-checked (the snapshot is trusted
+once every signature checks out; the join on top of it is authorized under this server's rules);
+the join is the room's sole forward extremity with its state recorded explicitly (new
+`Tables::state_snapshots` keyspace), so its unknown `prev_events` are not `MissingAncestors`. Still
+open for track 06: the `hs-cli` wiring itself, and backfill of the history before the join. The
+signature sketched in section 3 lost its `now_ms` (nothing is built or timestamped here) and the
+`create_event` parameter it never used (the create event is in `state`). Owner of the fix: track
+04 (room and events), `crates/hs-room/src/actor.rs` and `crates/hs-room/src/registry.rs`. Also affects: `crates/hs-cli/src/federation.rs` (the wiring that
 would call it). Discovered by, and worked around (not fixed) in: track 06 (federation),
 `crates/hs-federation/src/outbound_join.rs`.
 

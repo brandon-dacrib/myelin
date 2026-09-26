@@ -33,6 +33,10 @@ pub struct RoomState<B: KvBackend> {
     pub rooms: Arc<RoomRegistry<B>>,
     /// This server's identity, for constructing new rooms and events.
     pub identity: HomeserverIdentity,
+    /// How a join of a room this server does not hold reaches federation
+    /// (`crate::remote_join`). `None` -- this crate's tests, a server with federation off --
+    /// means such a room is simply not found.
+    pub remote_join: Option<Arc<dyn crate::remote_join::RemoteJoin>>,
 }
 
 impl<B: KvBackend> FromRef<RoomState<B>> for AuthState {
@@ -94,6 +98,7 @@ mod tests {
             auth: AuthState::in_memory(),
             rooms: Arc::new(registry),
             identity: HomeserverIdentity::for_tests("hs1"),
+            remote_join: None,
         };
         let _ = state.clone();
     }

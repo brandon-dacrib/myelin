@@ -114,6 +114,12 @@ pub enum RoomError {
     /// backfill these IDs and retry" apart from "this event is rejected, do not retry".
     #[error("missing {0:?}: backfill required before this event can be authorized")]
     MissingAncestors(Vec<ruma::OwnedEventId>),
+    /// [`crate::remote_join::RemoteJoin`]: a join of a room hosted elsewhere could not be
+    /// completed for a reason that is neither the room refusing it (`Forbidden`) nor no server
+    /// knowing it (`RoomNotFound`): every server asked was unreachable, or answered with
+    /// something that was not a join. `502 M_UNKNOWN`, the shape Synapse gives the same failure.
+    #[error("could not join the room through federation: {0}")]
+    RemoteJoinFailed(String),
 }
 
 impl RoomError {
@@ -173,6 +179,11 @@ impl RoomError {
             Self::MissingAncestors(_) => MatrixError::custom(
                 axum::http::StatusCode::CONFLICT,
                 MatrixErrorCode::Other("M_MISSING_PREV_EVENTS".to_owned()),
+                self.to_string(),
+            ),
+            Self::RemoteJoinFailed(_) => MatrixError::custom(
+                axum::http::StatusCode::BAD_GATEWAY,
+                MatrixErrorCode::Unknown,
                 self.to_string(),
             ),
             Self::Signing(_)

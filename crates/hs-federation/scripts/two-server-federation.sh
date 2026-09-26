@@ -97,6 +97,9 @@ fi
 
 # ---- 2. Per-server signing keys, storage and native hs-config -----------------------------------
 for name in a b; do
+  # Fresh databases every run (the CA, certificate and signing keys are kept): the users and the
+  # room this script makes must not already exist, or registration fails with M_USER_IN_USE.
+  rm -rf "$WORKDIR/$name/db" "$WORKDIR/$name/media"
   mkdir -p "$WORKDIR/$name/signing-keys" "$WORKDIR/$name/db" "$WORKDIR/$name/media"
   if [ -z "$(find "$WORKDIR/$name/signing-keys" -type f 2>/dev/null)" ]; then
     "$HS" generate-signing-key -o "$WORKDIR/$name/signing-keys/hs.signing.key" >/dev/null
@@ -203,13 +206,13 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== starting server A ($SERVER_A_NAME, plaintext :$PLAIN_PORT_A, TLS :$TLS_PORT_A)"
-"$HS" serve -c "$WORKDIR/a/config.yaml" >"$WORKDIR/a/hs.log" 2>&1 &
+RUST_LOG="${RUST_LOG:-info,hs_federation=debug,hs_cli=debug}" "$HS" serve -c "$WORKDIR/a/config.yaml" >"$WORKDIR/a/hs.log" 2>&1 &
 PIDS+=("$!")
 "$STUNNEL_BIN" "$WORKDIR/a/stunnel.conf" &
 PIDS+=("$!")
 
 echo "== starting server B ($SERVER_B_NAME, plaintext :$PLAIN_PORT_B, TLS :$TLS_PORT_B)"
-"$HS" serve -c "$WORKDIR/b/config.yaml" >"$WORKDIR/b/hs.log" 2>&1 &
+RUST_LOG="${RUST_LOG:-info,hs_federation=debug,hs_cli=debug}" "$HS" serve -c "$WORKDIR/b/config.yaml" >"$WORKDIR/b/hs.log" 2>&1 &
 PIDS+=("$!")
 "$STUNNEL_BIN" "$WORKDIR/b/stunnel.conf" &
 PIDS+=("$!")
@@ -298,26 +301,24 @@ curl -s -X PUT "http://127.0.0.1:$PLAIN_PORT_A/_matrix/client/v3/rooms/$ROOM_ID/
   -d '{"msgtype":"m.text","body":"hello from alice on server A"}' >/dev/null
 echo "== alice sent a message"
 
-# ---- 6. Bob's server (B) joins A's room via the real make_join/send_join handshake --------------
+# ---- 6. Bob joins A's room from B, the way a client does ---------------------------------------
 # This is the deliverable: server B, which has never heard of this room, asks server A (over real
 # HTTPS, with real X-Matrix request signatures, trusting A's certificate only because of the
 # private CA configured above) for a join template, signs it as $BOB_ID's own homeserver (the
-# real, spec-correct redacted-form signing RFC-0014 fixed), submits it back, and verifies every
-# event A hands back. `hs-federation::outbound_join` is new this session -- see that module's doc
-# and docs/rfcs/0015-outbound-join-needs-a-room-bootstrap-api.md for exactly what this does and
-# does not close (the join is real and persisted on A's side; B cannot yet represent the room
-# locally, so this is run as a diagnostic CLI command against B's own config, not through B's
-# ordinary client API).
-echo "== bob's server (B) joins A's room via make_join/send_join"
-set +e
-"$HS" federation-join-room -c "$WORKDIR/b/config.yaml" \
-  --destination "$SERVER_A_NAME" --room "$ROOM_ID" --user "$BOB_ID"
-JOIN_STATUS=$?
-set -e
-if [ "$JOIN_STATUS" -ne 0 ]; then
-  echo "error: federation-join-room failed (exit $JOIN_STATUS)" >&2
+# real, spec-correct redacted-form signing RFC-0014 fixed), submits it back, verifies every event
+# A hands back (`hs-federation::outbound_join`), and -- since RFC-0015 landed -- makes the room
+# resident on B from that verified snapshot (`hs-room`'s `bootstrap_from_remote_join`). It is
+# reached through B's ordinary client API: `POST /join/{roomId}?server_name=A`, which is what
+# every real client sends. (`hs federation-join-room` still exists as a diagnostic that runs
+# only the handshake, against a config file, with no storage open.)
+echo "== bob joins A's room from B: POST /join/{roomId}?server_name=$SERVER_A_NAME"
+JOIN=$(curl -s -X POST "http://127.0.0.1:$PLAIN_PORT_B/_matrix/client/v3/join/$ROOM_ID?server_name=$SERVER_A_NAME" \
+  -H "Authorization: Bearer $BOB_TOKEN" -H "Content-Type: application/json" -d '{}')
+if [ "$(echo "$JOIN" | jq -r '.room_id // empty')" != "$ROOM_ID" ]; then
+  echo "error: bob's join through B failed: $JOIN" >&2
   exit 1
 fi
+echo "   B answered: $(echo "$JOIN" | jq -c .)"
 
 # ---- 7. Verify, from A's own client API, that bob genuinely joined ------------------------------
 echo "== verifying on A: bob should now be a joined member"
@@ -334,6 +335,46 @@ STATE=$(curl -s "http://127.0.0.1:$PLAIN_PORT_A/_matrix/client/v3/rooms/$ROOM_ID
   -H "Authorization: Bearer $ALICE_TOKEN")
 echo "   bob's membership event on A: $(echo "$STATE" | jq -c .)"
 
+# ---- 8. Verify, from B's own client API, that bob can see and use the room ---------------------
+# `/sync` until the room is there: the session hub writes the membership off a background
+# stream, so the very first sync after the join can honestly come back without it.
+sync_until() {
+  local base="$1" token="$2" filter="$3" label="$4" body=""
+  for _ in $(seq 1 60); do
+    body=$(curl -s "$base/_matrix/client/v3/sync?timeout=500" -H "Authorization: Bearer $token")
+    if echo "$body" | jq -e --arg room "$ROOM_ID" "$filter" >/dev/null 2>&1; then
+      echo "$body"
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "error: $label never appeared in /sync; last response: $body" >&2
+  exit 1
+}
+
+echo "== verifying on B: bob's own /sync carries the room, its state and his join"
+BOB_SYNC=$(sync_until "http://127.0.0.1:$PLAIN_PORT_B" "$BOB_TOKEN" '.rooms.join[$room] != null' "the room")
+echo "   state types on B: $(echo "$BOB_SYNC" | jq -c --arg room "$ROOM_ID" '[(.rooms.join[$room].state.events[]?.type), (.rooms.join[$room].timeline.events[]? | select(.state_key != null) | .type)] | unique')"
+
+# ---- 9. Messages in both directions -------------------------------------------------------------
+echo "== bob sends a message on B; alice reads it on A"
+curl -s -X PUT "http://127.0.0.1:$PLAIN_PORT_B/_matrix/client/v3/rooms/$ROOM_ID/send/m.room.message/txn-bob-1" \
+  -H "Authorization: Bearer $BOB_TOKEN" -H "Content-Type: application/json" \
+  -d '{"msgtype":"m.text","body":"hello from bob on server B"}' >/dev/null
+sync_until "http://127.0.0.1:$PLAIN_PORT_A" "$ALICE_TOKEN" \
+  '[.rooms.join[$room].timeline.events[]?.content.body] | index("hello from bob on server B") != null' \
+  "bob's message on A" >/dev/null
+echo "   confirmed: alice's /sync on A has bob's message"
+
+echo "== alice answers on A; bob reads it on B"
+curl -s -X PUT "http://127.0.0.1:$PLAIN_PORT_A/_matrix/client/v3/rooms/$ROOM_ID/send/m.room.message/txn-alice-2" \
+  -H "Authorization: Bearer $ALICE_TOKEN" -H "Content-Type: application/json" \
+  -d '{"msgtype":"m.text","body":"welcome bob, from alice on server A"}' >/dev/null
+sync_until "http://127.0.0.1:$PLAIN_PORT_B" "$BOB_TOKEN" \
+  '[.rooms.join[$room].timeline.events[]?.content.body] | index("welcome bob, from alice on server A") != null' \
+  "alice's reply on B" >/dev/null
+echo "   confirmed: bob's /sync on B has alice's reply"
+
 cat <<SUMMARY
 
 ================================================================================================
@@ -343,9 +384,12 @@ Room:   $ROOM_ID
 Server A ($SERVER_A_NAME): alice created the room, sent a message, and now sees bob (from
   server B) as a real, federated, durably persisted joined member -- verified above via A's own
   client API, not just this script's say-so.
-Server B ($SERVER_B_NAME): performed the real make_join/send_join handshake against A over TLS
-  with a private CA and real X-Matrix request signatures, and independently verified every event
-  A returned (content hash + signature, against each event's own sender). This is a genuine,
+Server B ($SERVER_B_NAME): bob joined through B's ordinary client API. B performed the real
+  make_join/send_join handshake against A over TLS with a private CA and real X-Matrix request
+  signatures, independently verified every event A returned (content hash + signature, against
+  each event's own sender), made the room resident from that snapshot (RFC-0015), and bob's own
+  /sync on B carried the room. Then bob's message on B reached alice's /sync on A, and alice's
+  reply on A reached bob's /sync on B: the outbound sender, both directions. This is a genuine,
   live, cross-process proof of:
     - federation.custom_ca_certificates and the outbound TLS client (this session found and fixed
       a wiring bug: the config field existed but crates/hs-cli/src/federation.rs's client_config
@@ -354,11 +398,10 @@ Server B ($SERVER_B_NAME): performed the real make_join/send_join handshake agai
     - RFC-0014's fix: events signed over their redacted form verify against a real, independent
       peer for the first time.
 
-What is NOT proven here (see docs/rfcs/0015-outbound-join-needs-a-room-bootstrap-api.md):
-  bob's own client cannot sync this room or post into it -- hs-room has no API yet to create a
-  local room from a federation join response's state snapshot, only to originate a brand new one
-  or apply one more event to a room it already has. So this is a one-way federation proof: A sees
-  B's join; B cannot yet act on it.
+What is NOT proven here: the room's history from before bob's join is not backfilled to B
+  (bob's timeline starts at his join); ephemeral data (typing, receipts, presence) is not sent
+  between the servers; and the outbound queue is in memory, so a message sent while the other
+  server is down is retried only for as long as this process lives.
 
 What a real public join over the open internet would still exercise that this script does not:
   - DNS-based discovery (.well-known and SRV) -- this script's server names are IP literals, which

@@ -593,6 +593,28 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
             })
             .await
     }
+
+    async fn member_servers(&self, room_id: &str) -> Vec<String> {
+        let Ok(handle) = self.handle(room_id).await else {
+            return Vec::new();
+        };
+        handle.query(|actor| joined_servers(actor)).await
+    }
+}
+
+/// The server of every currently joined member, deduplicated and sorted. Empty if the state
+/// store cannot be read: a `send_join` that cannot find out who else is in the room forwards to
+/// nobody rather than failing the join it has already stored.
+fn joined_servers<B: KvBackend>(actor: &RoomActor<B>) -> Vec<String> {
+    let Ok(members) = actor.joined_members() else {
+        return Vec::new();
+    };
+    let servers: std::collections::BTreeSet<String> = members
+        .iter()
+        .filter_map(|member| member.header().state_key.as_deref().and_then(server_of))
+        .map(str::to_owned)
+        .collect();
+    servers.into_iter().collect()
 }
 
 /// The `event_id` of every event in a rendered PDU list. Federation PDUs for room version 3+ do
@@ -844,9 +866,14 @@ pub struct FederationMount {
     pub own_keys: Arc<hs_federation::keys::OwnSigningKeys>,
     /// This server's name, as it appears in the key response it signs.
     pub server_name: String,
-    /// The outbound client, kept alive because the inbound key fetcher borrows it (and because a
-    /// caller that later adds a sender needs exactly this one, sharing its backoff state).
+    /// The outbound client, kept alive because the inbound key fetcher borrows it and the sender
+    /// sends through it, sharing its backoff state.
     pub client: Arc<hs_federation::client::FederationClient>,
+    /// The outbound sender: where this server's own events are queued for the servers of a
+    /// room's remote members (`crate::federation_sender` feeds it), and where `send_join` hands
+    /// a join it accepted so the room's other servers hear of it. In memory only; see
+    /// `hs_federation::sender`'s module docs for what a restart loses.
+    pub sender: Arc<hs_federation::sender::FederationSender>,
     /// The per-destination backoff records the client keeps, for the admin API's Federation
     /// page (`hs_federation::admin_source`).
     pub destinations: Arc<dyn hs_federation::destination_store::DestinationStore>,
@@ -867,6 +894,10 @@ const KEY_VALIDITY_SECS: u64 = 24 * 60 * 60;
 ///
 /// # Errors
 /// Returns the backend's error if the destination-backoff keyspace cannot be opened.
+// Eight parameters: the stores this mount reads, plus the one test seam (`scheme`). A struct
+// of them would be built at exactly one call site and read at exactly one, which is the same
+// list twice.
+#[allow(clippy::too_many_arguments)]
 pub fn build_mount<B: KvBackend + 'static>(
     config: &hs_config::Config,
     identity: &hs_room::identity::HomeserverIdentity,
@@ -875,6 +906,7 @@ pub fn build_mount<B: KvBackend + 'static>(
     directory: hs_user::store::DynUserStore,
     auth: Arc<dyn hs_auth::store::AuthStore>,
     e2e: Arc<dyn hs_e2e::store::E2eStore>,
+    scheme: Option<&'static str>,
 ) -> Result<FederationMount, hs_kv::KvError> {
     let server_name = identity.server_name.to_string();
     let own_keys = Arc::new(hs_federation::keys::OwnSigningKeys::from_keys(vec![
@@ -892,7 +924,7 @@ pub fn build_mount<B: KvBackend + 'static>(
     let client = Arc::new(hs_federation::client::FederationClient::new(
         server_name.clone(),
         (*identity.signing_key).clone(),
-        client_config(&config.federation),
+        client_config(&config.federation, scheme),
         destinations.clone(),
         well_known,
         srv,
@@ -903,6 +935,14 @@ pub fn build_mount<B: KvBackend + 'static>(
         hs_federation::keys::RemoteKeyCache::new(Box::new(ClientKeyFetcher::new(client.clone()))
             as Box<dyn hs_federation::keys::KeyServerFetcher>),
     );
+
+    // The same client again: a transaction to a destination that is backing off waits for the
+    // same `retry_at` every other outbound call to it does, and an administrator's reset of that
+    // destination releases both.
+    let sender = Arc::new(hs_federation::sender::FederationSender::new(
+        client.clone(),
+        server_name.clone(),
+    ));
 
     let state = hs_federation::transport::FederationState {
         own_server_name: Arc::from(server_name.as_str()),
@@ -925,6 +965,7 @@ pub fn build_mount<B: KvBackend + 'static>(
         // other request to that destination.
         ancestor_fetcher: Some(client.clone() as Arc<dyn hs_federation::backfill::AncestorFetcher>),
         backfill_limits: hs_federation::backfill::BackfillLimits::default(),
+        sender: Some(sender.clone() as Arc<dyn hs_federation::sender::OutboundPduSink>),
     };
 
     let x_matrix = Arc::new(hs_federation::xmatrix::XMatrixContext {
@@ -938,6 +979,7 @@ pub fn build_mount<B: KvBackend + 'static>(
         own_keys,
         server_name,
         client,
+        sender,
         destinations,
     })
 }
@@ -967,7 +1009,10 @@ pub fn build_mount<B: KvBackend + 'static>(
 /// `FederationClient::new`'s own tolerance for a CA entry that parses but is malformed, an entry
 /// that cannot even be read (typo'd path, permissions) should be visible in the log the first time
 /// this server tries to use it, not a mysterious refusal to start.
-fn client_config(config: &hs_config::FederationConfig) -> hs_federation::client::ClientConfig {
+fn client_config(
+    config: &hs_config::FederationConfig,
+    scheme: Option<&'static str>,
+) -> hs_federation::client::ClientConfig {
     let custom_root_certificates = config
         .custom_ca_certificates
         .iter()
@@ -997,6 +1042,7 @@ fn client_config(config: &hs_config::FederationConfig) -> hs_federation::client:
         trust_os_root_store: config.trust_os_root_store,
         request_timeout: config.client_timeout.into(),
         max_retry_backoff: config.max_retry_backoff.into(),
+        scheme: scheme.unwrap_or(hs_federation::client::ClientConfig::default().scheme),
         ..hs_federation::client::ClientConfig::default()
     }
 }
@@ -1083,6 +1129,7 @@ pub fn manifest_only_mount() -> (
         transactions: Arc::new(hs_federation::inbound::InMemoryTransactionStore::new()),
         ancestor_fetcher: None,
         backfill_limits: hs_federation::backfill::BackfillLimits::default(),
+        sender: None,
     };
     let key_cache: Arc<hs_federation::keys::DynRemoteKeyCache> =
         Arc::new(hs_federation::keys::RemoteKeyCache::new(
@@ -1147,7 +1194,7 @@ pub async fn run_join_room(args: &crate::cli::FederationJoinRoomArgs) -> i32 {
     let client = Arc::new(hs_federation::client::FederationClient::new(
         identity.server_name.to_string(),
         (*identity.signing_key).clone(),
-        client_config(&config.federation),
+        client_config(&config.federation, None),
         destinations,
         well_known,
         srv,
@@ -1182,14 +1229,16 @@ pub async fn run_join_room(args: &crate::cli::FederationJoinRoomArgs) -> i32 {
                 args.destination
             );
             println!(
-                "  GET /_matrix/client/v3/rooms/{}/members there. {} cannot yet",
-                outcome.room_id, identity.server_name
+                "  GET /_matrix/client/v3/rooms/{}/members there. Nothing was stored here:",
+                outcome.room_id
             );
             println!(
-                "represent this room locally for {} to sync or post into: see",
+                "this command opens no storage. To join a room for {} and keep it, use the",
                 args.user
             );
-            println!("  docs/rfcs/0015-outbound-join-needs-a-room-bootstrap-api.md.");
+            println!(
+                "client API of a running server: POST /_matrix/client/v3/join/{{roomId}}?server_name=..."
+            );
             0
         }
         Err(e) => {

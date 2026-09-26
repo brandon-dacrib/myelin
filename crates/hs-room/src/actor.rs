@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use hs_kv::{KvBackend, RangeSpec, TransactConfig, transact};
 use hs_model::Event;
-use hs_model::canonical::CanonicalJsonValue;
+use hs_model::canonical::{CanonicalJsonObject, CanonicalJsonValue};
+use hs_model::event::EventFlags;
 use hs_model::ids::{EventSn, RoomSn};
 use hs_model::room_version::{self, RoomIdFormat, RoomVersionRules};
 use hs_state::api::StateStore;
@@ -22,7 +23,7 @@ use crate::error::RoomError;
 use crate::history_visibility;
 use crate::identity::HomeserverIdentity;
 use crate::membership::{self, Action, PriorState};
-use crate::persist::{PersistedEvent, RoomMeta, Tables};
+use crate::persist::{PersistedEvent, RoomMeta, Tables, decode_event_sns, encode_event_sns};
 use crate::pipeline::{self, EventMap, NewEvent, RoomStateView};
 use crate::protocol::{ChangedStateKey, MembershipDelta, RoomUpdate};
 use crate::relations;
@@ -157,6 +158,50 @@ fn content_str<'a>(event: &'a Event, key: &str) -> Option<&'a str> {
         .and_then(CanonicalJsonValue::as_object)
         .and_then(|c| c.get(key))
         .and_then(CanonicalJsonValue::as_str)
+}
+
+/// How many outliers [`RoomActor::persist_outliers`] writes per `hs-kv` transaction: enough to
+/// keep a large room's snapshot to a few commits, small enough that no single transaction
+/// carries megabytes of event JSON.
+const OUTLIER_BATCH: usize = 256;
+
+/// The decoded inputs [`RoomActor::store_inputs`] prepares for the state store.
+struct StoreInputs {
+    prev_sns: Vec<EventSn>,
+    auth_sns: Vec<EventSn>,
+    content: CanonicalJsonObject,
+    only_prev_is_create: bool,
+}
+
+/// The order a state snapshot's events are persisted and replayed in: ancestors before
+/// descendants. `depth` first (an event's depth is strictly greater than every prev event's, and
+/// every auth event is an ancestor along `prev_events` too), then `origin_server_ts`, then event
+/// ID -- the last two only to make the order total and deterministic.
+fn topological_order(a: &Event, b: &Event) -> std::cmp::Ordering {
+    a.header()
+        .depth
+        .cmp(&b.header().depth)
+        .then_with(|| {
+            a.header()
+                .origin_server_ts
+                .cmp(&b.header().origin_server_ts)
+        })
+        .then_with(|| a.event_id().cmp(b.event_id()))
+}
+
+/// How [`RoomActor::persist_with`] treats the event it is writing.
+enum PersistKind {
+    /// A locally built or federation-received event whose state derives from its `prev_events`,
+    /// every one of which this actor holds. The ordinary case.
+    Ordinary,
+    /// A federation join this server's own user made into a room hosted elsewhere
+    /// ([`RoomActor::accept_remote_join_with_state`]): its prev events are unknown here, its
+    /// state before it is `snapshot` (the resident's resolved state, already persisted as
+    /// outliers), and it supersedes every forward extremity this actor had.
+    RemoteJoin {
+        /// The `EventSn`s of the resident's `state`, one per `(event_type, state_key)`.
+        snapshot: Vec<EventSn>,
+    },
 }
 
 /// Parses an `m.room.member` event's `content.membership` string into a [`PriorState`]
@@ -329,13 +374,42 @@ impl<B: KvBackend> RoomActor<B> {
         };
 
         let room_sn = Self::intern_room(&backend, &tables, &final_room_id)?;
-        let (publish, _rx) = tokio::sync::broadcast::channel(64);
-        let mut actor = Self {
+        let mut actor = Self::new_shell(
             backend,
             tables,
             identity,
             room_sn,
-            room_id: final_room_id,
+            final_room_id,
+            room_version,
+            rules,
+            store,
+        );
+        actor.persist(create_event)?;
+        Ok(actor)
+    }
+
+    /// An actor holding no events at all: the common starting point of every construction path
+    /// ([`RoomActor::create`] persists the `m.room.create` into it, [`RoomActor::load`] replays
+    /// the store into it, [`RoomActor::create_from_remote_join`] applies a federation join
+    /// response to it).
+    #[allow(clippy::too_many_arguments)]
+    fn new_shell(
+        backend: B,
+        tables: Tables<B>,
+        identity: HomeserverIdentity,
+        room_sn: RoomSn,
+        room_id: OwnedRoomId,
+        room_version: RoomVersionId,
+        rules: RoomVersionRules,
+        store: ProductionStateStore<B>,
+    ) -> Self {
+        let (publish, _rx) = tokio::sync::broadcast::channel(64);
+        Self {
+            backend,
+            tables,
+            identity,
+            room_sn,
+            room_id,
             room_version,
             rules,
             store,
@@ -351,9 +425,42 @@ impl<B: KvBackend> RoomActor<B> {
             publish,
             global: None,
             fencing: None,
-        };
-        actor.persist(create_event)?;
-        Ok(actor)
+        }
+    }
+
+    /// An empty actor for `room_id` at `room_version`, holding no events and nothing persisted
+    /// beyond the room ID's interning: the shell [`RoomActor::accept_remote_join_with_state`]
+    /// fills in when this server's own user joins a room hosted elsewhere. Nothing in the store
+    /// says the room exists until that join is persisted (`Tables::room_meta` is written with the
+    /// room's first timeline event), so a shell that is never filled in is invisible to
+    /// [`RoomActor::load`].
+    ///
+    /// # Errors
+    /// Returns [`RoomError::UnsupportedRoomVersion`] if `room_version` is unknown,
+    /// [`RoomError::State`] if the state store cannot be opened, or [`RoomError::Store`] if
+    /// interning the room ID fails.
+    pub(crate) fn empty_for(
+        backend: B,
+        tables: Tables<B>,
+        identity: HomeserverIdentity,
+        room_id: &RoomId,
+        room_version: RoomVersionId,
+    ) -> Result<Self, RoomError> {
+        let rules = room_version::rules_for(&room_version)
+            .ok_or_else(|| RoomError::UnsupportedRoomVersion(room_version.as_str().to_owned()))?;
+        let store = ProductionStateStore::open(room_version.clone(), backend.clone())
+            .map_err(|e| RoomError::State(e.to_string()))?;
+        let room_sn = Self::intern_room(&backend, &tables, room_id)?;
+        Ok(Self::new_shell(
+            backend,
+            tables,
+            identity,
+            room_sn,
+            room_id.to_owned(),
+            room_version,
+            rules,
+            store,
+        ))
     }
 
     /// Reconstructs a room actor by replaying its full persisted timeline. `Ok(None)` if the room
@@ -361,6 +468,16 @@ impl<B: KvBackend> RoomActor<B> {
     ///
     /// This is `crate::registry::RoomRegistry`'s cold-load path: everything a `RoomActor` holds is
     /// derivable from the store (`PLAN.md` section 5.3), and this is the function that derives it.
+    ///
+    /// # Outliers and explicit state
+    /// A room this server's own user joined over federation
+    /// ([`RoomActor::accept_remote_join_with_state`]) holds the resident's state snapshot as
+    /// outliers (`Tables::outliers`) and its join with an explicit state (`Tables::state_snapshots`).
+    /// Those are replayed here too, in the same order they were persisted: every outlier first
+    /// (so the timeline's events find their ancestors already indexed), then the timeline, where
+    /// an event with a `state_snapshots` row is fed to the state store the way it originally was
+    /// ([`hs_state::kv_store::KvStateStore::add_event_with_state`]) rather than from its prev
+    /// events, which this server does not hold. A reloaded room comes back identical either way.
     ///
     /// # Errors
     /// Returns [`RoomError::Store`] on a storage failure, or [`RoomError::InvalidEvent`] if a
@@ -389,29 +506,64 @@ impl<B: KvBackend> RoomActor<B> {
         let store = ProductionStateStore::open(room_version.clone(), backend.clone())
             .map_err(|e| RoomError::State(e.to_string()))?;
 
-        let (publish, _rx) = tokio::sync::broadcast::channel(64);
-        let mut actor = Self {
+        let mut actor = Self::new_shell(
             backend,
             tables,
             identity,
             room_sn,
-            room_id: room_id.to_owned(),
-            room_version: room_version.clone(),
+            room_id.to_owned(),
+            room_version.clone(),
             rules,
             store,
-            events: HashMap::new(),
-            event_id_index: HashMap::new(),
-            forward_extremities: BTreeSet::new(),
-            timeline: BTreeMap::new(),
-            next_room_pos: 1,
-            relations_by_target: HashMap::new(),
-            txn_dedup: HashMap::new(),
-            event_txn: HashMap::new(),
-            forgotten: HashSet::new(),
-            publish,
-            global: None,
-            fencing: None,
+        );
+
+        // Decodes one persisted row back into an `Event`, with the processing flags it was
+        // stored with (`redacted`, `outlier`, ...) restored -- `Event::parse` starts every event
+        // with no flags, and a flag is exactly the part of the record the JSON does not carry.
+        let events_table = actor.tables.events.clone();
+        let read_event = |event_sn: EventSn| -> Result<Option<Event>, RoomError> {
+            let Some(bytes) = events_table.get(&snapshot, &(event_sn,))? else {
+                return Ok(None);
+            };
+            let persisted: PersistedEvent =
+                serde_json::from_slice(&bytes).map_err(|e| RoomError::Internal(e.to_string()))?;
+            let mut event = Event::parse(&persisted.json, room_version.clone())?;
+            *event.flags_mut() = EventFlags::from_byte(persisted.flags);
+            Ok(Some(event))
         };
+
+        // Outliers first: the state snapshot a federation join brought with it. Sorted
+        // topologically again here rather than trusting key order alone, so a snapshot event
+        // whose `EventSn` happened to be interned early (as a relation target, say) still comes
+        // after its own ancestors.
+        let outlier_spec = hs_tables::keyspace::TypedKeyspace::<
+            B::Keyspace,
+            crate::persist::OutlierKey,
+        >::prefix(&(room_sn,));
+        let mut outliers: Vec<(EventSn, Event)> = Vec::new();
+        for item in actor.tables.outliers.range(&snapshot, outlier_spec) {
+            let ((_, sn), _) = item?;
+            if let Some(event) = read_event(sn)? {
+                outliers.push((sn, event));
+            }
+        }
+        outliers.sort_by(|(_, a), (_, b)| topological_order(a, b));
+        for (sn, event) in outliers {
+            actor.absorb_loaded_outlier(sn, event)?;
+        }
+
+        // The explicit states timeline events were fed to the store with, if any.
+        let snapshot_spec = hs_tables::keyspace::TypedKeyspace::<
+            B::Keyspace,
+            crate::persist::StateSnapshotKey,
+        >::prefix(&(room_sn,));
+        let mut explicit_states: HashMap<EventSn, Vec<EventSn>> = HashMap::new();
+        for item in actor.tables.state_snapshots.range(&snapshot, snapshot_spec) {
+            let ((_, sn), value) = item?;
+            let sns = decode_event_sns(value.as_ref())
+                .ok_or_else(|| RoomError::Internal("corrupt state snapshot entry".into()))?;
+            explicit_states.insert(sn, sns);
+        }
 
         let range_spec = hs_tables::keyspace::TypedKeyspace::<
             B::Keyspace,
@@ -429,13 +581,11 @@ impl<B: KvBackend> RoomActor<B> {
         entries.sort_by_key(|(pos, _)| *pos);
 
         for (room_pos, event_sn) in entries {
-            let Some(bytes) = actor.tables.events.get(&snapshot, &(event_sn,))? else {
+            let Some(event) = read_event(event_sn)? else {
                 continue;
             };
-            let persisted: PersistedEvent =
-                serde_json::from_slice(&bytes).map_err(|e| RoomError::Internal(e.to_string()))?;
-            let event = Event::parse(&persisted.json, room_version.clone())?;
-            actor.absorb_loaded_event(event_sn, event, room_pos)?;
+            let explicit_state = explicit_states.remove(&event_sn);
+            actor.absorb_loaded_event(event_sn, event, room_pos, explicit_state.as_deref())?;
         }
 
         // The authoritative forward-extremity set is whatever `RoomActor::persist` last wrote to
@@ -465,6 +615,98 @@ impl<B: KvBackend> RoomActor<B> {
     /// # Errors
     /// Returns [`RoomError::State`] if the state store fails.
     fn feed_store(&mut self, event: &Event, event_sn: EventSn) -> Result<Vec<EventSn>, RoomError> {
+        let inputs = self.store_inputs(event);
+        self.store
+            .add_event(
+                event_sn,
+                event.event_id().to_owned(),
+                self.room_id.clone(),
+                &event.header().event_type,
+                event.header().state_key.as_deref(),
+                event.header().sender.clone(),
+                inputs.content,
+                event.header().depth,
+                event.header().origin_server_ts,
+                &inputs.auth_sns,
+                &inputs.prev_sns,
+                inputs.only_prev_is_create,
+            )
+            .map_err(|e| RoomError::State(e.to_string()))?;
+        Ok(inputs.prev_sns)
+    }
+
+    /// [`RoomActor::feed_store`] for an event whose state before it is not derivable from its
+    /// `prev_events` (this server does not hold them) and is instead `state`, handed in
+    /// explicitly -- a federation join into a room hosted elsewhere, whose state is the
+    /// resident's resolved snapshot. See
+    /// [`hs_state::kv_store::KvStateStore::add_event_with_state`].
+    ///
+    /// # Errors
+    /// Returns [`RoomError::State`] if the state store fails, including for an entry of `state`
+    /// it has not ingested.
+    fn feed_store_with_state(
+        &mut self,
+        event: &Event,
+        event_sn: EventSn,
+        state: &[EventSn],
+    ) -> Result<Vec<EventSn>, RoomError> {
+        let inputs = self.store_inputs(event);
+        self.store
+            .add_event_with_state(
+                event_sn,
+                event.event_id().to_owned(),
+                self.room_id.clone(),
+                &event.header().event_type,
+                event.header().state_key.as_deref(),
+                event.header().sender.clone(),
+                inputs.content,
+                event.header().depth,
+                event.header().origin_server_ts,
+                &inputs.auth_sns,
+                &inputs.prev_sns,
+                inputs.only_prev_is_create,
+                state,
+            )
+            .map_err(|e| RoomError::State(e.to_string()))?;
+        Ok(inputs.prev_sns)
+    }
+
+    /// [`RoomActor::feed_store`] for an outlier: the event's body and `auth_events` are recorded
+    /// (so state resolution and the chain-cover index can reach it), but its `prev_events` are
+    /// deliberately *not* -- an outlier's prev events are mostly events this server has never
+    /// seen, and resolving the ones it happens to hold would run state resolution over a
+    /// fragment. The store's `state_at` for an outlier is therefore just the event's own entry
+    /// over the empty state: **meaningless, and nothing may read it as the room's state at that
+    /// point.** Everything that answers a state question about an outlier goes through the
+    /// current state or an explicit snapshot instead (see [`RoomActor::event_visible_to`]).
+    ///
+    /// # Errors
+    /// Returns [`RoomError::State`] if the state store fails.
+    fn feed_store_outlier(&mut self, event: &Event, event_sn: EventSn) -> Result<(), RoomError> {
+        let inputs = self.store_inputs(event);
+        self.store
+            .add_event(
+                event_sn,
+                event.event_id().to_owned(),
+                self.room_id.clone(),
+                &event.header().event_type,
+                event.header().state_key.as_deref(),
+                event.header().sender.clone(),
+                inputs.content,
+                event.header().depth,
+                event.header().origin_server_ts,
+                &inputs.auth_sns,
+                &[],
+                inputs.only_prev_is_create,
+            )
+            .map_err(|e| RoomError::State(e.to_string()))?;
+        Ok(())
+    }
+
+    /// What every `feed_store` variant hands the state store: the event's `prev_events` and
+    /// `auth_events` decoded to the `EventSn`s this actor holds (entries it does not hold are
+    /// skipped), its content, and whether its only prev event is the room's `m.room.create`.
+    fn store_inputs(&self, event: &Event) -> StoreInputs {
         let prev_sns: Vec<EventSn> = pipeline::decode_event_ids(event.json().get("prev_events"))
             .iter()
             .filter_map(|id| self.event_id_index.get(id))
@@ -475,7 +717,7 @@ impl<B: KvBackend> RoomActor<B> {
             .filter_map(|id| self.event_id_index.get(id))
             .copied()
             .collect();
-        let content_obj = event
+        let content = event
             .json()
             .get("content")
             .and_then(CanonicalJsonValue::as_object)
@@ -486,31 +728,16 @@ impl<B: KvBackend> RoomActor<B> {
                 .events
                 .get(&prev_sns[0])
                 .is_some_and(|e| e.header().event_type == "m.room.create");
-        self.store
-            .add_event(
-                event_sn,
-                event.event_id().to_owned(),
-                self.room_id.clone(),
-                &event.header().event_type,
-                event.header().state_key.as_deref(),
-                event.header().sender.clone(),
-                content_obj,
-                event.header().depth,
-                event.header().origin_server_ts,
-                &auth_sns,
-                &prev_sns,
-                only_prev_is_create,
-            )
-            .map_err(|e| RoomError::State(e.to_string()))?;
-        Ok(prev_sns)
+        StoreInputs {
+            prev_sns,
+            auth_sns,
+            content,
+            only_prev_is_create,
+        }
     }
 
-    fn absorb_loaded_event(
-        &mut self,
-        event_sn: EventSn,
-        event: Event,
-        room_pos: i64,
-    ) -> Result<(), RoomError> {
+    /// Records `event`'s `m.relates_to` target in the in-memory relations index, if it has one.
+    fn index_relation(&mut self, event: &Event, event_sn: EventSn) {
         if let Some(content) = event
             .json()
             .get("content")
@@ -528,11 +755,39 @@ impl<B: KvBackend> RoomActor<B> {
                     .push(event_sn);
             }
         }
+    }
+
+    /// Absorbs one persisted timeline event on load. `explicit_state` is the `Tables::state_snapshots`
+    /// row for this event, if it has one (see [`RoomActor::load`]).
+    fn absorb_loaded_event(
+        &mut self,
+        event_sn: EventSn,
+        event: Event,
+        room_pos: i64,
+        explicit_state: Option<&[EventSn]>,
+    ) -> Result<(), RoomError> {
+        self.index_relation(&event, event_sn);
         self.event_id_index
             .insert(event.event_id().to_owned(), event_sn);
         self.timeline.insert(room_pos, event_sn);
         self.next_room_pos = self.next_room_pos.max(room_pos + 1);
-        self.feed_store(&event, event_sn)?;
+        match explicit_state {
+            Some(state) => self.feed_store_with_state(&event, event_sn, state)?,
+            None => self.feed_store(&event, event_sn)?,
+        };
+        self.events.insert(event_sn, event);
+        Ok(())
+    }
+
+    /// Absorbs one persisted outlier on load (or right after [`RoomActor::persist_outliers`]
+    /// wrote it): indexed by ID and fed to the state store, never placed in the timeline, never
+    /// a forward extremity, never published. Relations are not indexed for outliers either:
+    /// every outlier is a state event (a state snapshot and its auth chain contain nothing
+    /// else), and `/relations` is a timeline read.
+    fn absorb_loaded_outlier(&mut self, event_sn: EventSn, event: Event) -> Result<(), RoomError> {
+        self.event_id_index
+            .insert(event.event_id().to_owned(), event_sn);
+        self.feed_store_outlier(&event, event_sn)?;
         self.events.insert(event_sn, event);
         Ok(())
     }
@@ -1047,6 +1302,21 @@ impl<B: KvBackend> RoomActor<B> {
     /// # Errors
     /// Returns [`RoomError::Store`] on a storage failure.
     fn persist(&mut self, event: Event) -> Result<EventSn, RoomError> {
+        self.persist_with(event, PersistKind::Ordinary)
+    }
+
+    /// [`RoomActor::persist`], parameterized by [`PersistKind`]. For a
+    /// [`PersistKind::RemoteJoin`] the differences are exactly three: the event supersedes
+    /// *every* current forward extremity rather than only the ones its `prev_events` name (its
+    /// prev events are the resident's extremities, which this actor does not hold; the
+    /// resident's resolved state already accounts for everything this server knew about the
+    /// room, its own earlier events included, so whatever extremities it held are subsumed);
+    /// its explicit state is written to `Tables::state_snapshots` in the same transaction; and
+    /// the state store is fed with that state ([`RoomActor::feed_store_with_state`]) rather than
+    /// from the prev events. Everything else -- the timeline entry, `Tables::room_meta` for the
+    /// room's first timeline event (outliers persisted before it do not count), the membership
+    /// index, the fencing check, the [`RoomUpdate`] with its `membership_deltas` -- is the same.
+    fn persist_with(&mut self, event: Event, kind: PersistKind) -> Result<EventSn, RoomError> {
         let full_json: serde_json::Value = serde_json::from_slice(event.canonical_bytes())
             .map_err(|e| RoomError::Internal(e.to_string()))?;
         let content = full_json
@@ -1072,7 +1342,11 @@ impl<B: KvBackend> RoomActor<B> {
             None
         };
 
-        let is_first = self.events.is_empty();
+        // The room's metadata row is written with its first *timeline* event. Outliers are
+        // persisted before a federation join (`RoomActor::persist_outliers`), so "no events held
+        // yet" is not the test any more: a room whose only records are outliers is not a room
+        // `RoomActor::load` may find.
+        let is_first = self.timeline.is_empty();
         let room_meta_bytes = if is_first {
             Some(
                 serde_json::to_vec(&RoomMeta {
@@ -1109,11 +1383,18 @@ impl<B: KvBackend> RoomActor<B> {
             .filter_map(|id| self.event_id_index.get(id))
             .copied()
             .collect();
-        let old_extremities: Vec<EventSn> = prev_sns
-            .iter()
-            .copied()
-            .filter(|sn| self.forward_extremities.contains(sn))
-            .collect();
+        let old_extremities: Vec<EventSn> = match &kind {
+            PersistKind::Ordinary => prev_sns
+                .iter()
+                .copied()
+                .filter(|sn| self.forward_extremities.contains(sn))
+                .collect(),
+            PersistKind::RemoteJoin { .. } => self.forward_extremities_vec(),
+        };
+        let snapshot_bytes = match &kind {
+            PersistKind::Ordinary => None,
+            PersistKind::RemoteJoin { snapshot } => Some(encode_event_sns(snapshot)),
+        };
 
         // Set from inside the `transact` closure below when the cluster-fencing check fails, so
         // the failure can be reported as `RoomError::Fenced` with its real message rather than
@@ -1136,6 +1417,12 @@ impl<B: KvBackend> RoomActor<B> {
                 .timeline
                 .put(txn, &(room_sn, room_pos), &event_sn.to_be_bytes())
                 .map_err(to_kv)?;
+            if let Some(snapshot_bytes) = &snapshot_bytes {
+                self.tables
+                    .state_snapshots
+                    .put(txn, &(room_sn, event_sn), snapshot_bytes)
+                    .map_err(to_kv)?;
+            }
             for old in &old_extremities {
                 self.tables
                     .extremities_fwd
@@ -1178,14 +1465,7 @@ impl<B: KvBackend> RoomActor<B> {
             // for why this must run *inside* this same transaction rather than before it. A no-op
             // when `self.fencing` is unset (every construction path today, until `hs-cli` installs
             // one -- see this crate's status file).
-            if let Some(fencing) = &self.fencing
-                && let Err(msg) = fencing.check(self.room_id.as_str(), txn)
-            {
-                fence_failure.set(Some(msg.clone()));
-                return Err(hs_kv::KvError::Aborted(Box::new(std::io::Error::other(
-                    msg,
-                ))));
-            }
+            self.fence_check(txn, &fence_failure)?;
             Ok(event_sn)
         })
         .map_err(|e| match fence_failure.take() {
@@ -1201,7 +1481,14 @@ impl<B: KvBackend> RoomActor<B> {
         // narrow gap this pass's wiring introduces (there was nothing to compare against before:
         // the flat map it replaces had no separate store to fall out of sync with). Recorded in
         // this crate's status file rather than silently accepted.
-        self.feed_store(&event, event_sn)?;
+        match &kind {
+            PersistKind::Ordinary => {
+                self.feed_store(&event, event_sn)?;
+            }
+            PersistKind::RemoteJoin { snapshot } => {
+                self.feed_store_with_state(&event, event_sn, snapshot)?;
+            }
+        }
 
         let mut changed_state_keys = Vec::new();
         let mut membership_deltas = Vec::new();
@@ -1231,7 +1518,7 @@ impl<B: KvBackend> RoomActor<B> {
                 .or_default()
                 .push(event_sn);
         }
-        for old in &prev_sns {
+        for old in &old_extremities {
             self.forward_extremities.remove(old);
         }
         self.forward_extremities.insert(event_sn);
@@ -1263,6 +1550,419 @@ impl<B: KvBackend> RoomActor<B> {
         let _ = self.publish.send(update);
 
         Ok(event_sn)
+    }
+
+    /// The belt-and-braces cluster-fencing check every transaction that writes this room runs as
+    /// its last read (`docs/status/03-cluster.md` item 4; see `crate::fencing`'s module docs for
+    /// why it must run *inside* the transaction). A no-op when no fencing is installed. On
+    /// failure the message is parked in `failure` for the caller to turn into
+    /// [`RoomError::Fenced`], since it has to travel out of `transact` as a
+    /// [`hs_kv::KvError::Aborted`].
+    fn fence_check(
+        &self,
+        txn: &B::Txn,
+        failure: &std::cell::Cell<Option<String>>,
+    ) -> Result<(), hs_kv::KvError> {
+        if let Some(fencing) = &self.fencing
+            && let Err(msg) = fencing.check(self.room_id.as_str(), txn)
+        {
+            failure.set(Some(msg.clone()));
+            return Err(hs_kv::KvError::Aborted(Box::new(std::io::Error::other(
+                msg,
+            ))));
+        }
+        Ok(())
+    }
+
+    /// Persists `outliers` -- events this actor should hold the bodies of, and index by ID and in
+    /// the state store, without ever placing them in the timeline: the `state` and `auth_chain`
+    /// of a federation `send_join` response. Each is written with
+    /// [`hs_model::event::EventFlags::is_outlier`] set, no `room_pos`, and a `Tables::outliers`
+    /// row, in `hs-kv` transactions of up to [`OUTLIER_BATCH`] events with the fencing check in
+    /// each; none gets a timeline entry, a forward-extremity entry, or a [`RoomUpdate`].
+    ///
+    /// Events this actor already holds (by ID) are skipped, so a snapshot that overlaps what is
+    /// here -- a rejoin, a retried bootstrap -- adds only what is new. The rest are deduplicated
+    /// and persisted in topological order ([`topological_order`]) so that each one's ancestors
+    /// are indexed before it is fed to the state store, which is what lets the chain-cover index
+    /// and a later state resolution see the snapshot's auth chains whole.
+    ///
+    /// Returns how many were newly persisted.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::Store`] on a storage failure, [`RoomError::Fenced`] if this replica
+    /// no longer owns the room, or [`RoomError::State`] if the state store fails.
+    fn persist_outliers(&mut self, outliers: Vec<Event>) -> Result<usize, RoomError> {
+        let mut pending: Vec<Event> = Vec::with_capacity(outliers.len());
+        let mut seen: HashSet<OwnedEventId> = HashSet::new();
+        for mut event in outliers {
+            if self.event_id_index.contains_key(event.event_id())
+                || !seen.insert(event.event_id().to_owned())
+            {
+                continue;
+            }
+            event.flags_mut().set_outlier(true);
+            pending.push(event);
+        }
+        pending.sort_by(topological_order);
+        let total = pending.len();
+
+        let room_sn = self.room_sn;
+        for chunk in pending.chunks(OUTLIER_BATCH) {
+            let mut records: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(chunk.len());
+            for event in chunk {
+                let full_json: serde_json::Value = serde_json::from_slice(event.canonical_bytes())
+                    .map_err(|e| RoomError::Internal(e.to_string()))?;
+                let persisted = PersistedEvent {
+                    room_id: self.room_id.to_string(),
+                    json: full_json,
+                    room_version: self.room_version.as_str().to_owned(),
+                    flags: event.header().flags.to_byte(),
+                    room_pos: None,
+                };
+                let bytes = serde_json::to_vec(&persisted)
+                    .map_err(|e| RoomError::Internal(e.to_string()))?;
+                records.push((event.event_id().as_bytes().to_vec(), bytes));
+            }
+
+            let fence_failure: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
+            let sns: Vec<EventSn> = transact(&self.backend, TransactConfig::default(), |txn| {
+                let mut sns = Vec::with_capacity(records.len());
+                for (event_id_bytes, persisted_bytes) in &records {
+                    let event_sn = self.tables.event_sn.get_or_create(txn, event_id_bytes)?;
+                    self.tables
+                        .events
+                        .put(txn, &(event_sn,), persisted_bytes)
+                        .map_err(to_kv)?;
+                    self.tables
+                        .outliers
+                        .put(txn, &(room_sn, event_sn), b"")
+                        .map_err(to_kv)?;
+                    sns.push(event_sn);
+                }
+                self.fence_check(txn, &fence_failure)?;
+                Ok(sns)
+            })
+            .map_err(|e| match fence_failure.take() {
+                Some(msg) => RoomError::Fenced(msg),
+                None => RoomError::from(e),
+            })?;
+
+            for (event, sn) in chunk.iter().zip(sns) {
+                self.absorb_loaded_outlier(sn, event.clone())?;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Everything [`RoomActor::accept_remote_join_with_state`] checks before it writes anything.
+    /// Returns the join's `auth_events`, resolved to the snapshot events they name, and the
+    /// `state` events keyed by `(event_type, state_key)`.
+    ///
+    /// The checks, in order: every event is for this room and this room's version; every event
+    /// in `state` and `auth_chain` is a state event; `state` holds exactly one `m.room.create`
+    /// with an empty state key and no two events for one `(event_type, state_key)`; `join_event`
+    /// is an `m.room.member` with `membership: join`, `state_key` equal to its `sender`, and a
+    /// sender on this server; every ID in its `auth_events` is in the snapshot; and event
+    /// authorization ([`hs_state::auth::check_auth_events_selection`], then
+    /// [`hs_state::auth::check_event_auth`] against both the state its `auth_events` imply and
+    /// the full `state`) accepts the join under this server's own rules.
+    fn validate_remote_join(
+        &self,
+        state: &[Event],
+        auth_chain: &[Event],
+        join_event: &Event,
+    ) -> Result<(), RoomError> {
+        let shape = |msg: String| RoomError::InvalidEvent(hs_model::EventError::Format(msg));
+
+        for event in state
+            .iter()
+            .chain(auth_chain)
+            .chain(std::iter::once(join_event))
+        {
+            let room_id = event
+                .json()
+                .get("room_id")
+                .and_then(CanonicalJsonValue::as_str);
+            if room_id != Some(self.room_id.as_str()) {
+                return Err(shape(format!(
+                    "event {} is for room {} not {}",
+                    event.event_id(),
+                    room_id.unwrap_or("<none>"),
+                    self.room_id
+                )));
+            }
+            if event.header().room_version != self.room_version {
+                return Err(shape(format!(
+                    "event {} was parsed under room version {} but this room is version {}",
+                    event.event_id(),
+                    event.header().room_version,
+                    self.room_version
+                )));
+            }
+        }
+        for event in state.iter().chain(auth_chain) {
+            if event.header().state_key.is_none() {
+                return Err(shape(format!(
+                    "snapshot event {} ({}) is not a state event",
+                    event.event_id(),
+                    event.header().event_type
+                )));
+            }
+        }
+
+        let mut state_by_key: HashMap<(&str, &str), &Event> = HashMap::with_capacity(state.len());
+        for event in state {
+            let key = (
+                event.header().event_type.as_str(),
+                event.header().state_key.as_deref().unwrap_or(""),
+            );
+            if state_by_key.insert(key, event).is_some() {
+                return Err(shape(format!(
+                    "state holds two events for ({}, {:?})",
+                    key.0, key.1
+                )));
+            }
+        }
+        let creates = state
+            .iter()
+            .filter(|e| e.header().event_type == "m.room.create")
+            .count();
+        if creates != 1 {
+            return Err(shape(format!(
+                "state must hold exactly one m.room.create event, found {creates}"
+            )));
+        }
+        if !state_by_key.contains_key(&("m.room.create", "")) {
+            return Err(shape(
+                "state's m.room.create event does not have an empty state key".to_owned(),
+            ));
+        }
+
+        let sender = &join_event.header().sender;
+        if join_event.header().event_type != "m.room.member" {
+            return Err(shape(format!(
+                "join event {} is a {} not an m.room.member",
+                join_event.event_id(),
+                join_event.header().event_type
+            )));
+        }
+        if content_str(join_event, "membership") != Some("join") {
+            return Err(shape(format!(
+                "join event {}'s membership is {:?} not \"join\"",
+                join_event.event_id(),
+                content_str(join_event, "membership")
+            )));
+        }
+        if join_event.header().state_key.as_deref() != Some(sender.as_str()) {
+            return Err(shape(format!(
+                "join event {}'s state_key {:?} is not its sender {}",
+                join_event.event_id(),
+                join_event.header().state_key,
+                sender
+            )));
+        }
+        if sender.server_name() != self.identity.server_name {
+            return Err(RoomError::Forbidden(format!(
+                "join event {} is by {}, who is not on this server ({})",
+                join_event.event_id(),
+                sender,
+                self.identity.server_name
+            )));
+        }
+
+        let snapshot_by_id: HashMap<&str, &Event> = state
+            .iter()
+            .chain(auth_chain)
+            .map(|e| (e.event_id().as_str(), e))
+            .collect();
+        let auth_ids = pipeline::decode_event_ids(join_event.json().get("auth_events"));
+        let mut auth_events: Vec<&Event> = Vec::with_capacity(auth_ids.len());
+        for id in &auth_ids {
+            match snapshot_by_id.get(id.as_str()) {
+                Some(e) => auth_events.push(e),
+                None => {
+                    return Err(RoomError::Forbidden(format!(
+                        "join event {}'s auth_events name {id}, which the snapshot does not \
+                         contain",
+                        join_event.event_id()
+                    )));
+                }
+            }
+        }
+
+        // Authorization under this server's own rules: the same two snapshots
+        // `RoomActor::accept_remote_event` checks -- the state the join's `auth_events` imply,
+        // and the state before it, which for a join built against the resident's resolved state
+        // is exactly `state`.
+        let flat_from = |events: &[&Event]| {
+            let mut flat = FlatState::new();
+            for e in events {
+                flat.insert(
+                    e.header().event_type.clone(),
+                    e.header().state_key.clone().unwrap_or_default(),
+                    e.header().sender.clone(),
+                    e.json()
+                        .get("content")
+                        .and_then(CanonicalJsonValue::as_object)
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+            }
+            flat
+        };
+        let auth_flat = flat_from(&auth_events);
+        let state_refs: Vec<&Event> = state.iter().collect();
+        let state_flat = flat_from(&state_refs);
+        let auth_event_refs: Vec<AuthEventRef<'_>> = auth_events
+            .iter()
+            .map(|e| AuthEventRef {
+                event_type: &e.header().event_type,
+                state_key: e.header().state_key.as_deref().unwrap_or(""),
+                rejected: e.header().flags.is_rejected(),
+            })
+            .collect();
+        let content_obj = join_event
+            .json()
+            .get("content")
+            .and_then(CanonicalJsonValue::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let prev_count = pipeline::decode_event_ids(join_event.json().get("prev_events")).len();
+        let incoming = IncomingEvent {
+            event_type: &join_event.header().event_type,
+            sender: AsRef::<UserId>::as_ref(sender),
+            room_id: Some(&self.room_id),
+            state_key: join_event.header().state_key.as_deref(),
+            content: &content_obj,
+            prev_event_count: prev_count,
+            // The join's prev events are the resident's forward extremities, never the create
+            // event alone: a joiner is not the room's creator making their first join.
+            only_prev_event_is_room_create: false,
+            event_id: Some(join_event.event_id()),
+            redacts: None,
+        };
+        auth::check_auth_events_selection(&self.rules, &incoming, &auth_event_refs, || Ok(true))
+            .map_err(RoomError::from)?;
+        auth::check_event_auth(&self.rules, &incoming, &auth_flat).map_err(|e| {
+            RoomError::Forbidden(format!("auth-events-implied state rejected the join: {e}"))
+        })?;
+        auth::check_event_auth(&self.rules, &incoming, &state_flat).map_err(|e| {
+            RoomError::Forbidden(format!("the snapshot state rejected the join: {e}"))
+        })?;
+        Ok(())
+    }
+
+    /// Applies a **verified** federation `send_join` response to this actor: this server's own
+    /// user has joined a room hosted elsewhere, and this is how the room comes to exist here
+    /// (`docs/rfcs/0015-outbound-join-needs-a-room-bootstrap-api.md`). `state` is the resident's
+    /// full resolved state immediately *before* the join, `auth_chain` is that state's auth
+    /// chain, and `join_event` is the join the resident accepted, as it echoed it back. On an
+    /// empty actor ([`RoomActor::create_from_remote_join`]) this is the room's birth; on a room
+    /// that already exists here (a user who left and is rejoining) it is the same operation over
+    /// what is already held.
+    ///
+    /// # What this trusts, and what it checks
+    /// **Hashes and signatures are the caller's job** -- `hs_federation::outbound_join::join_room`
+    /// has already verified every event in `state`, `auth_chain` and the join itself before this
+    /// is called, and this method does not redo it. **The snapshot's own events are not
+    /// auth-checked and state resolution does not run over them**: `state` is, by construction,
+    /// the resident's already-resolved state, and its events are the auth chain everything else
+    /// is judged against. Re-deriving it would mean fetching the room's whole history, which is
+    /// exactly what a `send_join` response exists to make unnecessary. This is the same trust
+    /// decision every homeserver makes for a `send_join` response (Synapse's included): trust the
+    /// resident's state, verify its signatures, and authorize what you add on top of it.
+    ///
+    /// What *is* checked, before anything is written ([`RoomActor::validate_remote_join`]):
+    /// every event is for this room; `state` holds exactly one `m.room.create`; the join is an
+    /// `m.room.member` `join` by a user on this server, for themself; every `auth_events` entry of
+    /// the join is in the snapshot; and the join passes [`hs_state::auth::check_event_auth`]
+    /// against both the state its `auth_events` imply and the full `state`, so a resident cannot
+    /// hand this server a join its own rules would reject.
+    ///
+    /// # What is written
+    /// 1. `state ∪ auth_chain`, deduplicated and less anything already held, as **outliers**
+    ///    ([`RoomActor::persist_outliers`]): indexed by ID and in the state store so
+    ///    [`RoomActor::event_by_id`], [`RoomActor::state_at_event`], `/state`, `/members` and
+    ///    every auth check can see them, but never in the timeline, so `/messages`, `/sync` and
+    ///    [`RoomActor::paginate`] never show them. Their own `state_at` is meaningless (see
+    ///    [`RoomActor::feed_store_outlier`]).
+    /// 2. The join, as an ordinary timeline event -- the room's first, at `room_pos` 1, for a new
+    ///    room -- with its state set **explicitly** to `state` plus itself
+    ///    ([`hs_state::kv_store::KvStateStore::add_event_with_state`]; recorded durably in
+    ///    `Tables::state_snapshots` so [`RoomActor::load`] can do the same), and as the room's
+    ///    **sole forward extremity**. Its `prev_events` are the resident's extremities, which this
+    ///    server does not hold; that is expected, not [`RoomError::MissingAncestors`], because the
+    ///    explicit state makes them unnecessary. The join publishes its [`RoomUpdate`] with
+    ///    `membership_deltas` exactly as any other membership event does, which is how
+    ///    `hs-user`'s session hub learns the user is in the room.
+    ///
+    /// Nothing before the join is in the timeline: the room's history before this server's user
+    /// arrived is not held at all until backfill (track 06) fetches it.
+    ///
+    /// # Idempotency
+    /// A join this actor already holds answers [`RemoteEventOutcome::AlreadyKnown`] without
+    /// touching anything; snapshot events already held are skipped.
+    ///
+    /// # Errors
+    /// [`RoomError::InvalidEvent`] if the response's shape is wrong (see above);
+    /// [`RoomError::Forbidden`] if the join's sender is not on this server, its `auth_events`
+    /// reach outside the snapshot, or authorization rejects it; [`RoomError::Store`],
+    /// [`RoomError::Fenced`] or [`RoomError::State`] from persistence.
+    pub fn accept_remote_join_with_state(
+        &mut self,
+        state: Vec<Event>,
+        auth_chain: Vec<Event>,
+        join_event: Event,
+    ) -> Result<RemoteEventOutcome, RoomError> {
+        if self.event_id_index.contains_key(join_event.event_id()) {
+            return Ok(RemoteEventOutcome::AlreadyKnown);
+        }
+        self.validate_remote_join(&state, &auth_chain, &join_event)?;
+
+        let state_ids: Vec<OwnedEventId> = state.iter().map(|e| e.event_id().to_owned()).collect();
+        let mut outliers = state;
+        outliers.extend(auth_chain);
+        self.persist_outliers(outliers)?;
+
+        let mut snapshot = Vec::with_capacity(state_ids.len());
+        for id in &state_ids {
+            let sn = *self.event_id_index.get(id).ok_or_else(|| {
+                RoomError::Internal(format!(
+                    "snapshot event {id} was not indexed after persisting"
+                ))
+            })?;
+            snapshot.push(sn);
+        }
+        let event_sn = self.persist_with(join_event, PersistKind::RemoteJoin { snapshot })?;
+        Ok(RemoteEventOutcome::Stored(event_sn))
+    }
+
+    /// Creates the local actor for `room_id` from a **verified** federation `send_join` response:
+    /// an empty shell ([`RoomActor::empty_for`]) with
+    /// [`RoomActor::accept_remote_join_with_state`] applied to it. See that method for what is
+    /// trusted, checked and written. `room_version` is the version `make_join` reported and every
+    /// event was parsed under; a room that already exists here should go through the existing
+    /// actor instead (`crate::registry::RoomRegistry::bootstrap_from_remote_join` does both).
+    ///
+    /// # Errors
+    /// See [`RoomActor::empty_for`] and [`RoomActor::accept_remote_join_with_state`]. If the
+    /// join is refused nothing says the room exists here (`Tables::room_meta` is written with the
+    /// join), so a later attempt starts clean.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_from_remote_join(
+        backend: B,
+        tables: Tables<B>,
+        identity: HomeserverIdentity,
+        room_id: &RoomId,
+        room_version: RoomVersionId,
+        state: Vec<Event>,
+        auth_chain: Vec<Event>,
+        join_event: Event,
+    ) -> Result<Self, RoomError> {
+        let mut actor = Self::empty_for(backend, tables, identity, room_id, room_version)?;
+        actor.accept_remote_join_with_state(state, auth_chain, join_event)?;
+        Ok(actor)
     }
 
     /// Creates a room from a `POST /createRoom`-shaped request: the `m.room.create` event, the
@@ -2445,6 +3145,12 @@ impl<B: KvBackend> RoomActor<B> {
         {
             return Ok(true);
         }
+        // An outlier has no timeline position and no meaningful state of its own (see
+        // `RoomActor::feed_store_outlier`): it is a piece of the room's state as a federation
+        // join found it, and is readable by whoever may read the room's current state.
+        if event.header().flags.is_outlier() {
+            return self.can_see_current_membership(requester);
+        }
         let sn = *self
             .event_id_index
             .get(event.event_id())
@@ -3399,6 +4105,31 @@ impl<B: KvBackend> RoomActorHandle<B> {
     {
         self.with_actor(move |actor| actor.accept_remote_event(event))
             .await
+    }
+
+    /// Applies a verified federation `send_join` response to this room: this server's own user
+    /// joined it on a resident server, and `state`/`auth_chain`/`join_event` are what that
+    /// server answered with. See [`RoomActor::accept_remote_join_with_state`] for what is
+    /// trusted, checked and written; `crate::registry::RoomRegistry::bootstrap_from_remote_join`
+    /// is the entry point that also creates the room when it does not exist here yet.
+    pub async fn accept_remote_join_with_state(
+        &self,
+        state: Vec<Event>,
+        auth_chain: Vec<Event>,
+        join_event: Event,
+    ) -> Result<RemoteEventOutcome, RoomError>
+    where
+        B: 'static,
+    {
+        self.with_actor(move |actor| {
+            actor.accept_remote_join_with_state(state, auth_chain, join_event)
+        })
+        .await
+    }
+
+    /// Whether `other` is a handle to the very same actor (not merely the same room ID).
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     /// Reads the room under the lock, off the async executor thread.

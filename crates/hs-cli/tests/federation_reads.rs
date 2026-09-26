@@ -86,6 +86,7 @@ impl Harness {
             transactions: Arc::new(hs_federation::inbound::InMemoryTransactionStore::new()),
             ancestor_fetcher: None,
             backfill_limits: hs_federation::backfill::BackfillLimits::default(),
+            sender: None,
         };
 
         let remote_key = SigningKeyPair::generate("a_remote");
