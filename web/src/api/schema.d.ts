@@ -228,6 +228,133 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/bridge-deployment-target": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Whether this server can deploy bridges
+         * @description Available when the server runs in Kubernetes with the chart's bridges enabled (RFC 0017); `namespace` is where bridge instances run and `homeserver_url` is how they reach this server.
+         */
+        get: operations["bridge_deployments.target"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/bridge-offerings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List bridge offerings
+         * @description The bridge types switched on for this server (RFC 0017), each with its instance counts.
+         */
+        get: operations["bridge_offerings.list"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/bridge-offerings/{type}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a bridge offering */
+        get: operations["bridge_offerings.get"];
+        /**
+         * Offer a bridge on this server, or change the offering
+         * @description Creates or replaces the offering. Registers its front door (`@<bot>:server`), which users message to get their own instance. For a `shared` type, also creates its one instance. 400 for `runtime: cluster` when this server cannot deploy, or for a type that cannot run from a rendered config alone.
+         */
+        put: operations["bridge_offerings.put"];
+        post?: never;
+        /**
+         * Stop offering a bridge
+         * @description Removes the offering and its front door. 409 while it has instances, unless `remove_instances=true`, which removes every instance (their pods, volumes and everyone's sign-ins) first.
+         */
+        delete: operations["bridge_offerings.delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/bridge-offerings/{type}/instances": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List a bridge offering's instances */
+        get: operations["bridge_instances.list"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/bridge-offerings/{type}/instances/{user_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a user's bridge instance */
+        get: operations["bridge_instances.get"];
+        /**
+         * Create a user's bridge instance
+         * @description Starts provisioning an instance for the user, exactly as their message to the front door would; the user is invited to their bridge when it is ready. Idempotent: an existing instance is returned as it is (a failed one is retried).
+         */
+        put: operations["bridge_instances.put"];
+        post?: never;
+        /**
+         * Remove a user's bridge instance
+         * @description Stops the instance and removes its registration, and in a cluster its pod, Service and volume: the user's sign-ins are gone.
+         */
+        delete: operations["bridge_instances.delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/bridge-offerings/{type}/instances/{user_id}/files": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Render the files to run an instance elsewhere
+         * @description The instance's config, registration, a Compose service and a Kubernetes manifest (Secret and `Bridge`, for a cluster running the Myelin operator), with the instance's own tokens. Creates nothing.
+         */
+        post: operations["bridge_instances.files"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/bridge-types": {
         parameters: {
             query?: never;
@@ -2290,6 +2417,96 @@ export interface components {
         AuditEntryPage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["AuditEntry"][];
         };
+        BridgeDeployment: {
+            image?: string;
+            /** @description What the operator last said (a pull failure, a crash loop, waiting for the pod). */
+            message?: string | null;
+            /** @description The `Bridge` resource's name, which its Deployment and Service share. */
+            name: string;
+            namespace: string;
+            /** @enum {string} */
+            phase: "Pending" | "Ready" | "Degraded";
+            ready: boolean;
+            service_url?: string;
+        };
+        BridgeDeploymentTarget: {
+            available: boolean;
+            /** @description How a bridge in `namespace` reaches this server. */
+            homeserver_url?: string | null;
+            namespace?: string | null;
+            /** @description Why deployment is unavailable, when it is. */
+            reason?: string | null;
+        };
+        BridgeInstance: {
+            appservice_id?: string | null;
+            /** @description The instance's own bot, which the user talks to. */
+            bot?: string | null;
+            /** Format: date-time */
+            created_at?: string;
+            deployment?: null | components["schemas"]["BridgeDeployment"];
+            /** @description The registry's word for its ping health (`healthy`, `down`, ...). */
+            health?: string | null;
+            /** Format: date-time */
+            ready_at?: string | null;
+            /** @description Why it failed, or what it is waiting for. */
+            reason?: string | null;
+            /** @enum {string} */
+            state: "requested" | "registered" | "deploying" | "starting" | "ready" | "failed" | "removing";
+            type: string;
+            /** @description The owner; null for a shared type's instance. */
+            user_id: string | null;
+        };
+        BridgeInstanceFiles: {
+            compose_yaml?: string;
+            config_yaml?: string | null;
+            /** @description A Secret with the files and a `Bridge` resource, for a cluster running the Myelin operator. */
+            manifest_yaml?: string;
+            registration_yaml?: string;
+        };
+        BridgeOffering: {
+            access?: components["schemas"]["BridgeOfferingAccess"];
+            /** Format: date-time */
+            created_at?: string;
+            enabled: boolean;
+            /** @description The Matrix ID users message to get an instance (`per_user` only). */
+            front_door?: string | null;
+            image?: string;
+            /** @description Instance counts by state. */
+            instances?: {
+                [key: string]: number;
+            };
+            /** @enum {string} */
+            mode: "per_user" | "shared";
+            name?: string;
+            options?: components["schemas"]["BridgeOfferingOptions"];
+            /** @enum {string} */
+            runtime: "cluster" | "elsewhere";
+            /** @description The bridge type (catalogue id). */
+            type: string;
+        };
+        BridgeOfferingAccess: {
+            /** @description Every local user may have an instance. */
+            all_local_users?: boolean;
+            /** @description When not `all_local_users`, the users who may. */
+            users?: string[];
+        };
+        BridgeOfferingOptions: {
+            backfill?: boolean;
+            double_puppeting?: boolean;
+            encryption?: boolean;
+        };
+        BridgeOfferingRequest: {
+            access?: components["schemas"]["BridgeOfferingAccess"];
+            /** @description A disabled offering keeps its instances running but its front door turns new users away. */
+            enabled?: boolean;
+            image_tag?: string;
+            options?: components["schemas"]["BridgeOfferingOptions"];
+            /**
+             * @description `cluster`: this server deploys each instance. `elsewhere`: an administrator runs each instance from its files.
+             * @enum {string}
+             */
+            runtime?: "cluster" | "elsewhere";
+        };
         BridgeType: {
             /**
              * @description How the catalogue is grouped.
@@ -2302,6 +2519,8 @@ export interface components {
                 required?: boolean;
             }[];
             default_namespaces?: Record<string, never>;
+            /** @description Whether this server can run the type from a rendered config alone. */
+            deployable?: boolean;
             /** @description One line on what the bridge connects. */
             description?: string;
             /**
@@ -2311,6 +2530,11 @@ export interface components {
             docs_url?: string;
             id?: string;
             image?: string;
+            /**
+             * @description `per_user`: each user gets their own instance (RFC 0017). `shared`: one instance bridges a network or server for everyone.
+             * @enum {string}
+             */
+            mode?: "per_user" | "shared";
             name?: string;
             /** @description The port the bridge listens on for this server by default, which a render's registration `url` names. */
             port?: number;
@@ -3117,6 +3341,8 @@ export interface components {
         AppserviceId: string;
         /** @description An audit entry id (ULID). */
         AuditEntryId: string;
+        /** @description The Matrix user the instance belongs to (`@alice:example.org`, URL-encoded), or `_` for a shared type's one instance. */
+        BridgeInstanceUser: string;
         /** @description A bridge type catalog id. */
         BridgeTypeId: string;
         /** @description Opaque keyset cursor from a previous page's next_cursor or prev_cursor. */
@@ -3139,6 +3365,7 @@ export interface components {
         MediaId: string;
         /** @description Free-text search; semantics are per-resource. */
         Q: string;
+        RemoveInstances: boolean;
         /** @description A cluster replica id. */
         ReplicaId: string;
         /** @description A report id (ULID). */
@@ -3707,6 +3934,305 @@ export interface operations {
             };
             401: components["responses"]["Unauthenticated"];
             403: components["responses"]["InsufficientScope"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "bridge_deployments.target": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The deployment target. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BridgeDeploymentTarget"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "bridge_offerings.list": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Offerings. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        data: components["schemas"]["BridgeOffering"][];
+                    };
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "bridge_offerings.get": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description A bridge type catalog id. */
+                type: components["parameters"]["BridgeTypeId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The offering. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BridgeOffering"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "bridge_offerings.put": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description A bridge type catalog id. */
+                type: components["parameters"]["BridgeTypeId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BridgeOfferingRequest"];
+            };
+        };
+        responses: {
+            /** @description The offering. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BridgeOffering"];
+                };
+            };
+            400: components["responses"]["ValidationFailed"];
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "bridge_offerings.delete": {
+        parameters: {
+            query?: {
+                remove_instances?: components["parameters"]["RemoveInstances"];
+            };
+            header?: never;
+            path: {
+                /** @description A bridge type catalog id. */
+                type: components["parameters"]["BridgeTypeId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Done. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "bridge_instances.list": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description A bridge type catalog id. */
+                type: components["parameters"]["BridgeTypeId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Instances. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        data: components["schemas"]["BridgeInstance"][];
+                    };
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "bridge_instances.get": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description A bridge type catalog id. */
+                type: components["parameters"]["BridgeTypeId"];
+                /** @description The Matrix user the instance belongs to (`@alice:example.org`, URL-encoded), or `_` for a shared type's one instance. */
+                user_id: components["parameters"]["BridgeInstanceUser"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The instance. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BridgeInstance"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "bridge_instances.put": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description A bridge type catalog id. */
+                type: components["parameters"]["BridgeTypeId"];
+                /** @description The Matrix user the instance belongs to (`@alice:example.org`, URL-encoded), or `_` for a shared type's one instance. */
+                user_id: components["parameters"]["BridgeInstanceUser"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The instance. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BridgeInstance"];
+                };
+            };
+            400: components["responses"]["ValidationFailed"];
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "bridge_instances.delete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description A bridge type catalog id. */
+                type: components["parameters"]["BridgeTypeId"];
+                /** @description The Matrix user the instance belongs to (`@alice:example.org`, URL-encoded), or `_` for a shared type's one instance. */
+                user_id: components["parameters"]["BridgeInstanceUser"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Done. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "bridge_instances.files": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description A bridge type catalog id. */
+                type: components["parameters"]["BridgeTypeId"];
+                /** @description The Matrix user the instance belongs to (`@alice:example.org`, URL-encoded), or `_` for a shared type's one instance. */
+                user_id: components["parameters"]["BridgeInstanceUser"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The files. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BridgeInstanceFiles"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            404: components["responses"]["NotFound"];
             429: components["responses"]["RateLimited"];
             500: components["responses"]["Internal"];
             503: components["responses"]["Unavailable"];

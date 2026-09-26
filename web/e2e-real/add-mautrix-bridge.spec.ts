@@ -46,11 +46,11 @@ test.describe("a real mautrix bridge, added through the wizard", () => {
     await page.getByRole("button", { name: "Sign in" }).click();
     await expect(page.getByRole("tab", { name: "Access token" })).toBeHidden();
 
-    await page.goto("/admin/bridges/new");
+    await page.goto("/admin/bridges/registrations/new");
     await page.getByRole("radio", { name: /WhatsApp/ }).click();
     await page.getByRole("button", { name: "Continue" }).click(); // -> identity
     await expect(page.getByRole("heading", { name: "Identity" })).toBeVisible();
-    await page.getByRole("button", { name: "Continue" }).click(); // -> deployment
+    await page.getByRole("button", { name: "Continue" }).click(); // -> addresses
 
     // The server runs on this host and the bridge in Docker: each has to be told where the
     // other is, which is exactly what these two fields are for.
@@ -64,7 +64,7 @@ test.describe("a real mautrix bridge, added through the wizard", () => {
     await expect(page.getByRole("region", { name: "config.yaml (preview)" })).toContainText(
       "address: http://host.docker.internal:8008",
     );
-    await page.getByRole("button", { name: "Create bridge" }).click();
+    await page.getByRole("button", { name: "Register bridge" }).click();
 
     await expect(page.getByRole("heading", { name: /Bridge WhatsApp created/ })).toBeVisible({
       timeout: 15_000,

@@ -8,6 +8,20 @@ import {
 } from "./data/appservices";
 import { bridgeTypes } from "./data/bridge-types";
 import {
+  deleteInstance,
+  deleteOffering,
+  deploymentTarget,
+  findOffering,
+  getInstance,
+  instanceFiles,
+  instancesOf,
+  listOfferings,
+  offeringRefusal,
+  offeringView,
+  putInstance,
+  putOffering,
+} from "./data/bridge-offerings";
+import {
   configAuditEntries,
   configEtag,
   configLastReloaded,
@@ -40,7 +54,7 @@ import {
 } from "./data/recovery";
 import { rooms, roomMembers, findRoom } from "./data/rooms";
 import { ALL_SCOPES, type Scope } from "@/lib/auth";
-import type { AppService } from "@/api/bridges";
+import type { AppService, BridgeOfferingRequest } from "@/api/bridges";
 import type { JsonValue } from "@/api/config-schema";
 
 const API = "/api/v1";
@@ -428,6 +442,89 @@ export const handlers = [
       compose_yaml,
       bridge_resource_yaml,
     });
+  }),
+
+  // ---- Bridge offerings and instances (RFC 0017) ----
+  http.get(`${API}/bridge-deployment-target`, () => HttpResponse.json(deploymentTarget.current)),
+
+  http.get(`${API}/bridge-offerings`, () => HttpResponse.json({ data: listOfferings() })),
+
+  http.get(`${API}/bridge-offerings/:type`, ({ params }) => {
+    const offering = findOffering(String(params.type));
+    return offering
+      ? HttpResponse.json(offeringView(offering))
+      : problem(404, "not-found", "Bridge offering not found");
+  }),
+
+  http.put(`${API}/bridge-offerings/:type`, async ({ params, request }) => {
+    const type = String(params.type);
+    if (!bridgeTypes.some((t) => t.id === type)) {
+      return problem(404, "not-found", "Bridge type not found", {
+        detail: `There is no bridge type "${type}" in the catalogue.`,
+      });
+    }
+    const body = (await request.json()) as BridgeOfferingRequest;
+    const refusal = offeringRefusal(type, body);
+    if (refusal) {
+      return problem(400, "validation", "Validation failed", {
+        detail: refusal,
+        errors: [{ pointer: "/runtime", detail: refusal }],
+      });
+    }
+    return HttpResponse.json(putOffering(type, body));
+  }),
+
+  http.delete(`${API}/bridge-offerings/:type`, ({ params, request }) => {
+    const type = String(params.type);
+    if (!findOffering(type)) return problem(404, "not-found", "Bridge offering not found");
+    const removeInstances = new URL(request.url).searchParams.get("remove_instances") === "true";
+    const remaining = instancesOf(type).length;
+    if (remaining > 0 && !removeInstances) {
+      return problem(409, "conflict", "Conflict", {
+        detail: `${remaining} ${remaining === 1 ? "instance is" : "instances are"} still running; remove them first, or pass remove_instances=true.`,
+      });
+    }
+    deleteOffering(type);
+    return new HttpResponse(null, { status: 204 });
+  }),
+
+  http.get(`${API}/bridge-offerings/:type/instances`, ({ params }) => {
+    const type = String(params.type);
+    if (!findOffering(type)) return problem(404, "not-found", "Bridge offering not found");
+    return HttpResponse.json({ data: instancesOf(type) });
+  }),
+
+  http.get(`${API}/bridge-offerings/:type/instances/:user_id`, ({ params }) => {
+    const instance = getInstance(String(params.type), decodeURIComponent(String(params.user_id)));
+    return instance
+      ? HttpResponse.json(instance)
+      : problem(404, "not-found", "Bridge instance not found");
+  }),
+
+  http.put(`${API}/bridge-offerings/:type/instances/:user_id`, ({ params }) => {
+    const type = String(params.type);
+    const user = decodeURIComponent(String(params.user_id));
+    if (!findOffering(type)) return problem(404, "not-found", "Bridge offering not found");
+    if (user !== "_" && !/^@[^:]+:example\.org$/.test(user)) {
+      return problem(400, "validation", "Validation failed", {
+        detail: `${user} is not a user on this server; bridges are for local users.`,
+        errors: [{ pointer: "/user_id", detail: "not a local user" }],
+      });
+    }
+    return HttpResponse.json(putInstance(type, user));
+  }),
+
+  http.delete(`${API}/bridge-offerings/:type/instances/:user_id`, ({ params }) =>
+    deleteInstance(String(params.type), decodeURIComponent(String(params.user_id)))
+      ? new HttpResponse(null, { status: 204 })
+      : problem(404, "not-found", "Bridge instance not found"),
+  ),
+
+  http.post(`${API}/bridge-offerings/:type/instances/:user_id/files`, ({ params }) => {
+    const files = instanceFiles(String(params.type), decodeURIComponent(String(params.user_id)));
+    return files
+      ? HttpResponse.json(files)
+      : problem(404, "not-found", "Bridge instance not found");
   }),
 
   // ---- Appservices ----

@@ -13,7 +13,6 @@ export interface CreatedArtifacts {
   /** The bridge's own config, for the types whose render writes one. */
   configYaml?: string;
   composeYaml?: string;
-  bridgeResourceYaml?: string;
 }
 
 export function stashCreatedArtifacts(id: string, artifacts: CreatedArtifacts): void {

@@ -275,3 +275,207 @@ export async function checkAppserviceIdAvailable(id: string): Promise<boolean> {
   // the create call itself is still the source of truth (409 on conflict).
   return true;
 }
+
+// ---- Offerings and instances (RFC 0017: the server deploys its own bridges, one per person) ----
+//
+// An offering is a bridge type an administrator has switched on for this server; an instance is
+// one user's bridge (or, for a `shared` type, the one bridge everyone uses). Every instance is
+// also an appservice registration, so the `appservices.*` hooks above keep seeing them.
+
+export type BridgeDeploymentTarget = components["schemas"]["BridgeDeploymentTarget"];
+export type BridgeOffering = components["schemas"]["BridgeOffering"];
+export type BridgeOfferingRequest = components["schemas"]["BridgeOfferingRequest"];
+export type BridgeOfferingRuntime = BridgeOffering["runtime"];
+export type BridgeInstance = components["schemas"]["BridgeInstance"];
+export type BridgeInstanceState = BridgeInstance["state"];
+export type BridgeInstanceFiles = components["schemas"]["BridgeInstanceFiles"];
+export type BridgeMode = BridgeOffering["mode"];
+
+/** Every instance state, in the order an instance moves through them. */
+export const BRIDGE_INSTANCE_STATES: BridgeInstanceState[] = [
+  "requested",
+  "registered",
+  "deploying",
+  "starting",
+  "ready",
+  "failed",
+  "removing",
+];
+
+/** `ready` and `failed` are where an instance rests; anything else is still moving. */
+export function isSettledInstanceState(state: string): boolean {
+  return state === "ready" || state === "failed";
+}
+
+/** The path segment for an instance: its owner, or `_` for a shared type's one instance. */
+export function instanceUserSegment(instance: Pick<BridgeInstance, "user_id">): string {
+  return instance.user_id ?? "_";
+}
+
+/** How fast to poll while something is still moving (RFC 0017 4.1: a pod takes a minute or two). */
+export const MOVING_POLL_MS = 5_000;
+
+export function useBridgeDeploymentTarget() {
+  return useQuery({
+    queryKey: ["bridge-deployment-target"],
+    queryFn: async () => unwrap(await api.GET("/bridge-deployment-target")),
+    staleTime: 60_000,
+  });
+}
+
+/** Whether an offering's counts include any instance that has not settled yet. */
+export function offeringIsMoving(offering: Pick<BridgeOffering, "instances">): boolean {
+  return Object.entries(offering.instances ?? {}).some(
+    ([state, count]) => count > 0 && !isSettledInstanceState(state),
+  );
+}
+
+export function useBridgeOfferings() {
+  return useQuery({
+    queryKey: ["bridge-offerings"],
+    queryFn: async () => unwrap(await api.GET("/bridge-offerings")).data,
+    refetchInterval: (query) =>
+      (query.state.data ?? []).some(offeringIsMoving) ? MOVING_POLL_MS : 30_000,
+  });
+}
+
+export function useBridgeOffering(type: string | undefined) {
+  return useQuery({
+    queryKey: ["bridge-offering", type],
+    enabled: Boolean(type),
+    queryFn: async () =>
+      unwrap(await api.GET("/bridge-offerings/{type}", { params: { path: { type: type! } } })),
+    refetchInterval: (query) =>
+      query.state.data && offeringIsMoving(query.state.data) ? MOVING_POLL_MS : 30_000,
+  });
+}
+
+function invalidateOffering(qc: ReturnType<typeof useQueryClient>, type: string) {
+  qc.invalidateQueries({ queryKey: ["bridge-offerings"] });
+  qc.invalidateQueries({ queryKey: ["bridge-offering", type] });
+  qc.invalidateQueries({ queryKey: ["bridge-instances", type] });
+  // Each instance is a registration too.
+  qc.invalidateQueries({ queryKey: ["appservices"] });
+}
+
+/** Creates or replaces an offering (`PUT`: the whole request, not a patch). */
+export function usePutBridgeOffering() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ type, body }: { type: string; body: BridgeOfferingRequest }) =>
+      unwrap(await api.PUT("/bridge-offerings/{type}", { params: { path: { type } }, body })),
+    onSuccess: (offering, { type }) => {
+      qc.setQueryData(["bridge-offering", type], offering);
+      invalidateOffering(qc, type);
+    },
+  });
+}
+
+/** Stops offering a type. `removeInstances` removes every instance first (a 409 without it). */
+export function useDeleteBridgeOffering() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ type, removeInstances }: { type: string; removeInstances?: boolean }) => {
+      unwrap(
+        await api.DELETE("/bridge-offerings/{type}", {
+          params: {
+            path: { type },
+            query: removeInstances ? { remove_instances: true } : undefined,
+          },
+        }),
+      );
+    },
+    onSuccess: (_data, { type }) => {
+      qc.removeQueries({ queryKey: ["bridge-offering", type] });
+      qc.removeQueries({ queryKey: ["bridge-instances", type] });
+      qc.invalidateQueries({ queryKey: ["bridge-offerings"] });
+      qc.invalidateQueries({ queryKey: ["appservices"] });
+    },
+  });
+}
+
+/** An offering's instances, polled every 5 seconds while any of them is still on its way. */
+export function useBridgeInstances(type: string | undefined) {
+  return useQuery({
+    queryKey: ["bridge-instances", type],
+    enabled: Boolean(type),
+    queryFn: async () =>
+      unwrap(
+        await api.GET("/bridge-offerings/{type}/instances", {
+          params: { path: { type: type! } },
+        }),
+      ).data,
+    refetchInterval: (query) =>
+      (query.state.data ?? []).some((i) => !isSettledInstanceState(i.state))
+        ? MOVING_POLL_MS
+        : 30_000,
+  });
+}
+
+export function useBridgeInstance(type: string | undefined, userId: string | undefined) {
+  return useQuery({
+    queryKey: ["bridge-instance", type, userId],
+    enabled: Boolean(type) && Boolean(userId),
+    queryFn: async () =>
+      unwrap(
+        await api.GET("/bridge-offerings/{type}/instances/{user_id}", {
+          params: { path: { type: type!, user_id: userId! } },
+        }),
+      ),
+    refetchInterval: (query) =>
+      query.state.data && !isSettledInstanceState(query.state.data.state) ? MOVING_POLL_MS : false,
+  });
+}
+
+/**
+ * Creates a user's instance, exactly as their message to the front door would. Idempotent: an
+ * existing instance comes back as it is, and a failed one is retried, so this is also Retry.
+ */
+export function usePutBridgeInstance() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ type, userId }: { type: string; userId: string }) =>
+      unwrap(
+        await api.PUT("/bridge-offerings/{type}/instances/{user_id}", {
+          params: { path: { type, user_id: userId } },
+        }),
+      ),
+    onSuccess: (_instance, { type, userId }) => {
+      invalidateOffering(qc, type);
+      qc.invalidateQueries({ queryKey: ["bridge-instance", type, userId] });
+    },
+  });
+}
+
+/** Stops an instance and removes its registration, pod and volume: the user's sign-ins go too. */
+export function useDeleteBridgeInstance() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ type, userId }: { type: string; userId: string }) => {
+      unwrap(
+        await api.DELETE("/bridge-offerings/{type}/instances/{user_id}", {
+          params: { path: { type, user_id: userId } },
+        }),
+      );
+    },
+    onSuccess: (_data, { type, userId }) => {
+      qc.removeQueries({ queryKey: ["bridge-instance", type, userId] });
+      invalidateOffering(qc, type);
+    },
+  });
+}
+
+/**
+ * Renders an instance's files to run it elsewhere. A `POST` because they carry its tokens and
+ * need `bridges:write`; it creates nothing, so nothing is invalidated.
+ */
+export function useBridgeInstanceFiles() {
+  return useMutation({
+    mutationFn: async ({ type, userId }: { type: string; userId: string }) =>
+      unwrap(
+        await api.POST("/bridge-offerings/{type}/instances/{user_id}/files", {
+          params: { path: { type, user_id: userId } },
+        }),
+      ),
+  });
+}

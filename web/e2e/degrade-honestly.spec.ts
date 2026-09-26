@@ -22,6 +22,7 @@ test.describe("degrade honestly", () => {
 
     await page.getByRole("link", { name: "Bridges" }).first().click();
     await expect(page.getByRole("heading", { name: "Bridges" })).toBeVisible();
+    await page.getByRole("link", { name: "Registrations" }).click();
 
     // Not a fault: role="status", not role="alert"; no permanently-spinning loading indicator.
     await expect(page.getByText("isn't implemented on this server yet")).toBeVisible();

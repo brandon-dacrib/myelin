@@ -8,6 +8,7 @@ import {
 } from "@tanstack/react-router";
 import { AppShell } from "@/components/shell/AppShell";
 import { WIZARD_STEPS, type WizardStep } from "@/pages/bridges/wizard/wizard-state";
+import { OFFER_STEPS, type OfferStep } from "@/pages/bridges/wizard/offer-state";
 import { validateAuditSearch } from "@/pages/audit/audit-search";
 
 // Route-level code splitting: each page (and its own dependency graph —
@@ -18,6 +19,18 @@ import { validateAuditSearch } from "@/pages/audit/audit-search";
 // `lazyRouteComponent` (not plain `React.lazy`) is TanStack Router's own
 // wrapper: it also gets `.preload()` on route hover/intent for free.
 const DashboardPage = lazyRouteComponent(() => import("@/pages/DashboardPage"), "DashboardPage");
+const BridgeOfferingsPage = lazyRouteComponent(
+  () => import("@/pages/bridges/BridgeOfferingsPage"),
+  "BridgeOfferingsPage",
+);
+const BridgeOfferingPage = lazyRouteComponent(
+  () => import("@/pages/bridges/offering/BridgeOfferingPage"),
+  "BridgeOfferingPage",
+);
+const OfferBridgeWizardPage = lazyRouteComponent(
+  () => import("@/pages/bridges/wizard/OfferBridgeWizardPage"),
+  "OfferBridgeWizardPage",
+);
 const BridgesListPage = lazyRouteComponent(
   () => import("@/pages/bridges/BridgesListPage"),
   "BridgesListPage",
@@ -99,15 +112,45 @@ const recoverRoute = createRoute({
   component: () => <Navigate to="/" replace />,
 });
 
+// Bridges (RFC 0017): offerings first. `/bridges` lists the bridge types this server offers,
+// `/bridges/new` offers another, and `/bridges/offerings/$type` is one offering with each
+// person's instance. Every instance is also an appservice registration; the registrations list,
+// its detail pages and the register-it-yourself wizard live under `/bridges/registrations` and
+// keep their `/bridges/$bridgeId` addresses (audit links, the command palette, the overview).
+const bridgesRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/bridges",
+  component: BridgeOfferingsPage,
+});
+
+interface OfferWizardSearch {
+  step?: OfferStep;
+}
+
+const bridgesNewRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/bridges/new",
+  validateSearch: (search: Record<string, unknown>): OfferWizardSearch => ({
+    step: OFFER_STEPS.includes(search.step as OfferStep) ? (search.step as OfferStep) : undefined,
+  }),
+  component: OfferBridgeWizardPage,
+});
+
+const bridgeOfferingRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/bridges/offerings/$type",
+  component: BridgeOfferingPage,
+});
+
 interface BridgesListSearch {
   state?: string;
   kind?: string;
   cursor?: string;
 }
 
-const bridgesListRoute = createRoute({
+const bridgeRegistrationsRoute = createRoute({
   getParentRoute: () => rootRoute,
-  path: "/bridges",
+  path: "/bridges/registrations",
   validateSearch: (search: Record<string, unknown>): BridgesListSearch => ({
     state: typeof search.state === "string" ? search.state : undefined,
     kind: typeof search.kind === "string" ? search.kind : undefined,
@@ -120,9 +163,9 @@ interface WizardSearch {
   step?: WizardStep;
 }
 
-const bridgesNewRoute = createRoute({
+const bridgeRegisterRoute = createRoute({
   getParentRoute: () => rootRoute,
-  path: "/bridges/new",
+  path: "/bridges/registrations/new",
   validateSearch: (search: Record<string, unknown>): WizardSearch => ({
     step: WIZARD_STEPS.includes(search.step as WizardStep)
       ? (search.step as WizardStep)
@@ -233,8 +276,11 @@ const routeTree = rootRoute.addChildren([
   indexRoute,
   setupRoute,
   recoverRoute,
-  bridgesListRoute,
+  bridgesRoute,
   bridgesNewRoute,
+  bridgeOfferingRoute,
+  bridgeRegistrationsRoute,
+  bridgeRegisterRoute,
   bridgeCreatedRoute,
   bridgeDetailRoute,
   usersRoute,

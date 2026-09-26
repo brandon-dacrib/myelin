@@ -23,6 +23,9 @@ test.describe("Bridges list", () => {
     await signInAsOperator(page);
     await page.getByRole("link", { name: "Bridges" }).first().click();
     await expect(page.getByRole("heading", { name: "Bridges" })).toBeVisible();
+    // Every registration, each person's bridge among them, is one view over (RFC 0017).
+    await page.getByRole("link", { name: "Registrations" }).click();
+    await expect(page).toHaveURL(/\/bridges\/registrations$/);
     await expect(page.getByRole("table")).toBeVisible();
 
     // Attention first: the one that is down leads, the paused one trails.
@@ -49,6 +52,9 @@ test.describe("Bridges list", () => {
     await page.getByRole("button", { name: "Open navigation" }).click();
     await page.getByRole("link", { name: "Bridges" }).first().click();
     await expect(page.getByRole("heading", { name: "Bridges" })).toBeVisible();
+    // Every registration, each person's bridge among them, is one view over (RFC 0017).
+    await page.getByRole("link", { name: "Registrations" }).click();
+    await expect(page).toHaveURL(/\/bridges\/registrations$/);
 
     // The card fallback is what's on screen at this width, not the table.
     // (Scoped past `getByRole("list")`: the toast viewport is also an <ol>.)

@@ -113,11 +113,11 @@ export function BridgeDetailPage() {
   return (
     <div className="mx-auto max-w-[90rem] p-6">
       <Link
-        to="/bridges"
+        to="/bridges/registrations"
         className="inline-flex items-center gap-1 text-sm text-text-muted hover:text-text"
       >
         <ChevronLeft size={14} aria-hidden="true" />
-        Bridges
+        Registrations
       </Link>
 
       <div className="mt-2 flex flex-wrap items-start justify-between gap-4">
@@ -417,7 +417,7 @@ export function BridgeDetailPage() {
                         del.mutate(id, {
                           onSuccess: () => {
                             toast({ title: `Bridge ${name} removed` });
-                            navigate({ to: "/bridges" });
+                            navigate({ to: "/bridges/registrations" });
                           },
                           onError: () =>
                             toast({ title: `Couldn't remove ${name}`, variant: "danger" }),

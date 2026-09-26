@@ -1,30 +1,32 @@
 import { Check } from "lucide-react";
 import { cn } from "@/lib/cn";
-import { WIZARD_STEPS, type WizardStep } from "./wizard-state";
 
-const LABELS: Record<WizardStep, string> = {
-  kind: "Kind",
-  identity: "Identity",
-  deployment: "Deployment",
-  options: "Options",
-  review: "Review",
-};
-
-export function StepRail({
+/**
+ * A wizard's steps, as a rail beside it (a row on narrow screens). A step is reachable once the
+ * operator has been there; the ones after the furthest reached are shown but disabled.
+ */
+export function StepRail<S extends string>({
+  steps,
+  labels,
+  label,
   current,
   furthestAllowed,
   onSelect,
 }: {
-  current: WizardStep;
-  furthestAllowed: WizardStep;
-  onSelect: (step: WizardStep) => void;
+  steps: readonly S[];
+  labels: Record<S, string>;
+  /** The navigation landmark's name: "Offer a bridge steps". */
+  label: string;
+  current: S;
+  furthestAllowed: S;
+  onSelect: (step: S) => void;
 }) {
-  const currentIndex = WIZARD_STEPS.indexOf(current);
-  const furthestIndex = WIZARD_STEPS.indexOf(furthestAllowed);
+  const currentIndex = steps.indexOf(current);
+  const furthestIndex = steps.indexOf(furthestAllowed);
 
   return (
-    <nav aria-label="Add bridge steps" className="flex flex-row gap-2 lg:flex-col lg:gap-1">
-      {WIZARD_STEPS.map((step, i) => {
+    <nav aria-label={label} className="flex flex-row flex-wrap gap-2 lg:flex-col lg:gap-1">
+      {steps.map((step, i) => {
         const done = i < currentIndex;
         const active = step === current;
         const reachable = i <= furthestIndex;
@@ -52,7 +54,7 @@ export function StepRail({
             >
               {done ? <Check size={12} aria-hidden="true" /> : i + 1}
             </span>
-            {LABELS[step]}
+            {labels[step]}
           </button>
         );
       })}

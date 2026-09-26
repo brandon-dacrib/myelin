@@ -29,11 +29,12 @@ import {
 } from "@/lib/bridge-catalogue";
 import { bridgeHealthMeta, healthKeyOf } from "@/lib/bridge-state";
 import { cn } from "@/lib/cn";
+import { BridgesTabs } from "./BridgesTabs";
 
 const HEALTH_ORDER: AppServiceHealthStatus[] = ["down", "degraded", "unknown", "healthy", "paused"];
 
 /**
- * `/bridges` — "are the bridges connected and keeping up?"
+ * `/bridges/registrations` — "are the bridges connected and keeping up?"
  * (information-architecture.md, Bridges). The summary strip answers that before the table
  * does, and the table reads attention-first. `GET /appservices` has no `state`/`kind` filter
  * parameter (only free-text `q`), so the health filter applies client-side to the loaded page
@@ -41,8 +42,8 @@ const HEALTH_ORDER: AppServiceHealthStatus[] = ["down", "degraded", "unknown", "
  * docs/status/16-management-web-interface.md.
  */
 export function BridgesListPage() {
-  const search = useSearch({ from: "/bridges" });
-  const navigate = useNavigate({ from: "/bridges" });
+  const search = useSearch({ from: "/bridges/registrations" });
+  const navigate = useNavigate({ from: "/bridges/registrations" });
   const [sort, setSort] = useState<SortState | undefined>();
   const [cursorStack, setCursorStack] = useState<(string | undefined)[]>([]);
   const canRead = hasScope("bridges:read");
@@ -203,18 +204,21 @@ export function BridgesListPage() {
         <div>
           <h1 className="text-xl text-text">Bridges</h1>
           <p className="mt-0.5 text-sm text-text-muted">
-            Other networks, connected to this server. Each bridge runs as its own process and
-            registers here.
+            Every bridge registered with this server: each person&apos;s own bridge, and any you run
+            yourself. Delivery and health are looked at here.
           </p>
         </div>
         <Button
+          variant="secondary"
           disabled={!canWrite}
           title={!canWrite ? "Needs bridges:write" : undefined}
-          onClick={() => navigate({ to: "/bridges/new" })}
+          onClick={() => navigate({ to: "/bridges/registrations/new" })}
         >
-          Add bridge
+          Register a bridge you run yourself
         </Button>
       </div>
+
+      <BridgesTabs current="registrations" />
 
       {!isError && all.length > 0 && (
         <div className="mt-5 flex flex-wrap items-center gap-2" aria-label="Filter by state">
@@ -281,12 +285,14 @@ export function BridgesListPage() {
               ) : (
                 <EmptyState
                   icon={<Cable aria-hidden="true" />}
-                  title="No bridges yet"
-                  description="Connect WhatsApp, Signal, Telegram, Discord, Slack, IRC and more. Adding one takes a minute; each person then signs in from a chat with the bridge's bot."
+                  title="No bridges registered yet"
+                  description="Each person's bridge registers here when they get one. To connect people to a network, offer it from Offered bridges; register a bridge here only if you run it yourself."
                   docsHref="https://docs.mau.fi/bridges/"
                   action={
                     canWrite ? (
-                      <Button onClick={() => navigate({ to: "/bridges/new" })}>Add bridge</Button>
+                      <Button onClick={() => navigate({ to: "/bridges/new" })}>
+                        Offer a bridge
+                      </Button>
                     ) : undefined
                   }
                 />
