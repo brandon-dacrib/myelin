@@ -359,11 +359,15 @@ fn build_fresh_timeline(
         None => {
             // `raw_exhausted` is about the page as fetched, before visibility was applied: a
             // full page means there may be more behind it, whatever survived the filter.
-            let limited = if raw_exhausted {
-                false
-            } else {
-                let (more, _) = actor.paginate(next, Direction::Backward, 1);
-                !more.is_empty()
+            // No continuation token means the page ended at the room's first event: nothing
+            // is behind it, and asking from `None` would mean "from the newest", not "from
+            // here".
+            let limited = match next {
+                Some(next) if !raw_exhausted => {
+                    let (more, _) = actor.paginate(Some(next), Direction::Backward, 1);
+                    !more.is_empty()
+                }
+                _ => false,
             };
             (raw, limited)
         }

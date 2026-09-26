@@ -477,9 +477,27 @@ async fn messages_accepts_a_token_minted_by_sync_in_both_directions() {
     );
 
     // A token minted by `/messages` itself (this endpoint's own `end`) must still work exactly as
-    // before -- the "don't break what worked" half of this session's brief.
-    let room_local_token = backward.json["end"].as_str().map(str::to_owned);
-    let room_local_token = room_local_token.expect("a non-empty page returns a continuation token");
+    // before -- the "don't break what worked" half of this session's brief. Taken from a page of
+    // one, which cannot have reached the start of the room: a page that does carries no `end`
+    // at all (the spec's "no further events"), and the page above, with the default limit over
+    // a room this small, is exactly that page.
+    assert!(
+        backward.json.get("end").is_none(),
+        "a page that reached the room's first event must not offer a continuation: {}",
+        backward.json
+    );
+    let one = s
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/rooms/{room_id}/messages?dir=b&from={after_token}&limit=1"),
+            None,
+        )
+        .await;
+    one.assert_ok();
+    let room_local_token = one.json["end"].as_str().map(str::to_owned);
+    let room_local_token =
+        room_local_token.expect("a page short of the room's start returns a continuation token");
     let continued = s
         .send(
             Some("alice"),

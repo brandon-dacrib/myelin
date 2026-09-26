@@ -3271,7 +3271,14 @@ impl<B: KvBackend> RoomActor<B> {
     }
 
     /// Pages the timeline from `from` (or the live end, if `None`) in `direction`, returning up to
-    /// `limit` events and the token to continue from.
+    /// `limit` events and the token to continue from -- `None` once the page has reached the end
+    /// of what this actor holds in that direction (the room's first timeline event backwards,
+    /// its newest forwards), which the client-server spec has `GET /messages` express by leaving
+    /// `end` out of the response. A token here used to be handed out for every non-empty page,
+    /// so a client paginating to the start of a room was given one more token at the oldest
+    /// event, then an empty page with no token -- which `/messages` wrote as `"end": null`, and
+    /// a client that takes "present" literally (Complement's `TestMessagesOverFederation` does)
+    /// started over from the newest event, forever.
     #[must_use]
     pub fn paginate(
         &self,
@@ -3312,11 +3319,17 @@ impl<B: KvBackend> RoomActor<B> {
             .filter_map(|sn| self.events.get(sn))
             .collect();
 
-        // The continuation token is always the *last* position returned (oldest of the page for
+        // The continuation token is the *last* position returned (oldest of the page for
         // backward, newest of the page for forward): the boundary the next page's `range` call
-        // should exclude up to/from.
+        // should exclude up to/from -- unless that position is already the timeline's own edge
+        // in this direction, in which case there is nothing further and no token is given.
+        let edge = match direction {
+            Direction::Backward => self.timeline.keys().next().copied(),
+            Direction::Forward => self.timeline.keys().next_back().copied(),
+        };
         let next = positions
             .last()
+            .filter(|p| Some(**p) != edge)
             .map(|p| PaginationToken::new(*p, direction));
 
         (events, next)

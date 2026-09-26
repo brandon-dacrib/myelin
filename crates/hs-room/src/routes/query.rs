@@ -509,7 +509,13 @@ pub async fn get_messages<B: KvBackend + 'static>(
         })
         .await?;
 
-    Ok(Json(json!({"start": start, "chunk": chunk, "end": end})).into_response())
+    // `end` is left out, not `null`, when there is nothing further: the spec's signal for "you
+    // have reached the start of the room", and the one a paginating client stops on.
+    let mut body = json!({"start": start, "chunk": chunk});
+    if let Some(end) = end {
+        body["end"] = serde_json::Value::String(end);
+    }
+    Ok(Json(body).into_response())
 }
 
 #[cfg(test)]
@@ -757,5 +763,74 @@ mod tests {
             create["unsigned"].get("prev_content").is_none(),
             "m.room.create replaced nothing: {create}"
         );
+    }
+
+    /// A client paginating backwards stops when `end` is absent; it used to be `null` after one
+    /// extra empty page, and a reader that takes "present" literally never stopped.
+    #[tokio::test]
+    async fn paginating_backwards_reaches_the_start_of_the_room_and_says_so() {
+        let state = app();
+        let alice = user_id!("@alice:hs1");
+        let handle = state
+            .rooms
+            .create_room(
+                alice.to_owned(),
+                crate::actor::CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .expect("create should succeed");
+        let room_id = handle.query(|actor| actor.room_id().to_owned()).await;
+        for i in 0..5 {
+            handle
+                .send_event(
+                    alice.to_owned(),
+                    "m.room.message".to_owned(),
+                    None,
+                    serde_json::json!({"msgtype": "m.text", "body": format!("m{i}")}),
+                    None,
+                    10 + i,
+                )
+                .await
+                .expect("send should succeed");
+        }
+
+        let mut from: Option<String> = None;
+        let mut pages = 0;
+        let mut seen = 0;
+        loop {
+            let response = get_messages::<MemoryBackend>(
+                State(state.clone()),
+                Path(room_id.to_string()),
+                Query(MessagesQuery {
+                    from: from.clone(),
+                    dir: Some("b".to_owned()),
+                    limit: Some(2),
+                }),
+                requester(alice),
+            )
+            .await
+            .expect("messages should succeed")
+            .into_response();
+            let body = json_body(response).await;
+            pages += 1;
+            seen += body["chunk"].as_array().expect("chunk").len();
+            match body.get("end") {
+                None => break,
+                Some(serde_json::Value::String(token)) => from = Some(token.clone()),
+                Some(other) => panic!("`end` must be a token or absent, not {other}"),
+            }
+            assert!(
+                pages < 20,
+                "the pagination never reached the start of the room"
+            );
+        }
+        // Every event the room has, in as many pages as a limit of 2 needs, and then a stop.
+        let total = handle.query(|actor| actor.events_after(0, 100).len()).await;
+        assert_eq!(seen, total);
+        assert_eq!(pages, total.div_ceil(2));
     }
 }
