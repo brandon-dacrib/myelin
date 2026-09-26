@@ -127,6 +127,23 @@ pub enum RemoteEventOutcome {
     Stored(EventSn),
 }
 
+/// One page of [`RoomActor::paginate_page`].
+#[derive(Debug)]
+pub struct Page<'a> {
+    /// The events, in the order the direction reads them: newest first backwards, oldest first
+    /// forwards.
+    pub events: Vec<&'a Event>,
+    /// Where the next page continues from. `None` when there is nothing further in this
+    /// direction anywhere -- the room's newest event forwards, its very first event backwards.
+    pub next: Option<PaginationToken>,
+    /// Whether this page reached the edge of what this actor *holds* in its direction (an empty
+    /// page is at the edge too: `from` was at or beyond the last position held). Backwards,
+    /// that edge is the room's first event only when [`RoomActor::history_before_oldest`] is
+    /// false; when it is true, `next` still names the boundary, and fetching what lies before it
+    /// (`crate::backfill`) is what turns that token into a page.
+    pub reached_edge: bool,
+}
+
 /// Reads the event ID a `m.room.redaction` event redacts, from either wire shape: the top-level
 /// `redacts` field (room versions 3 and later) or `content.redacts` (room versions 1-2, and
 /// mirrored onto the top level by some senders). Used only to populate
@@ -581,6 +598,13 @@ impl<B: KvBackend> RoomActor<B> {
         entries.sort_by_key(|(pos, _)| *pos);
 
         for (room_pos, event_sn) in entries {
+            // An outlier placed in the timeline by backfill
+            // (`RoomActor::accept_backfilled_events`) was absorbed with the outliers above and
+            // stays what it was; here it only gets its position.
+            if actor.events.contains_key(&event_sn) {
+                actor.timeline.insert(room_pos, event_sn);
+                continue;
+            }
             let Some(event) = read_event(event_sn)? else {
                 continue;
             };
@@ -1653,6 +1677,354 @@ impl<B: KvBackend> RoomActor<B> {
             }
         }
         Ok(total)
+    }
+
+    /// Stores one batch of the room's history from before the oldest event this actor holds, as
+    /// fetched from another server by `crate::backfill` and verified by its caller (hashes and
+    /// signatures; this method checks neither, and runs no authorization rules -- see "What is
+    /// trusted" below).
+    ///
+    /// # Where the events go
+    /// Into the timeline, at negative positions: the newest of the batch just below the lowest
+    /// position held (`-1` for a room whose only held history is its join at `1`), the oldest
+    /// furthest down, so that a backward page from the join reads straight through them in the
+    /// order the resident's own timeline has them (`crate::timeline`'s contract for negative
+    /// positions). Order within the batch is `depth`, then `origin_server_ts`, then event ID,
+    /// newest first ([`topological_order`] reversed). Events already in the timeline are
+    /// skipped. Events already held as **outliers** -- the state events a join snapshot brought,
+    /// which are also part of the room's history and turn up in the batch once it reaches them
+    /// -- are *placed* in the timeline at their position and otherwise left as they are: still
+    /// flagged outliers, still readable by whoever may read the room's current state
+    /// ([`RoomActor::event_visible_to`]), their state in the store still the meaningless outlier
+    /// one ([`RoomActor::feed_store_outlier`]; the store cannot take an event twice). An event
+    /// with a `depth` above the anchor's is not earlier history and is dropped, so that an event
+    /// which will also arrive live is never filed as history first and then found "already
+    /// known" when it does.
+    ///
+    /// # The state at a backfilled event
+    /// Not derivable from the store: a backfilled event's `prev_events` are the next older
+    /// events in the batch (not yet held when it is fed), outliers (whose state is meaningless),
+    /// or events older than the batch (not held at all). So each is fed with an **explicit**
+    /// state ([`RoomActor::feed_store_with_state`], durable in `Tables::state_snapshots` exactly
+    /// as the join's own is, so [`RoomActor::load`] reproduces it), computed by walking the
+    /// batch backwards from the anchor: the state before the anchor is known (the join's own
+    /// snapshot; for a later batch, what the walk that placed the previous batch's oldest event
+    /// wrote for it), and passing a state event on the way back reverts its `(type, state_key)`
+    /// to the previous event for that key in the batch, or removes the key when the batch holds
+    /// none. Exact whenever the room's history is linear and the previous event for a reverted
+    /// key is within reach; where it is not, the state at events older than a key's oldest
+    /// fetched setting says the key was unset -- right when the key was first set there, one
+    /// batch behind when it was not. What reads it: history visibility (the room's
+    /// `m.room.history_visibility` and the reader's own membership at the event, which for a
+    /// user of this server reading a room joined elsewhere are the room's setting and "not yet
+    /// a member" throughout, and come out right), `unsigned.prev_content`, and the
+    /// authorization of a late event citing a backfilled one as its ancestor, which is where an
+    /// inexact state would show. Asking the resident for the state at each batch boundary
+    /// (`/state_ids`) is the exact version, and the noted next step.
+    ///
+    /// # What is trusted
+    /// The same as the join snapshot: the events are signed by their senders' servers (the
+    /// caller verified that) and the resident says they are the room's history. No auth check
+    /// runs, because a backfilled event's `auth_events` are as likely to be beyond the batch as
+    /// its `prev_events`; fetching them is the same next step as the state above.
+    ///
+    /// # What does not happen
+    /// No [`RoomUpdate`] is published -- history is not news, so nothing reaches `/sync`, push,
+    /// a bridge or the outbound federation sender -- the forward extremities and
+    /// `Tables::joined_rooms` are untouched (a backfilled join is somebody's membership *then*,
+    /// not now), and `Tables::room_meta` is not rewritten.
+    ///
+    /// Returns how many events were newly placed in the timeline, placed outliers included.
+    ///
+    /// # Errors
+    /// [`RoomError::Internal`] if this actor holds no timeline at all; [`RoomError::Store`],
+    /// [`RoomError::Fenced`] or [`RoomError::State`] from persistence.
+    pub fn accept_backfilled_events(&mut self, events: Vec<Event>) -> Result<usize, RoomError> {
+        let Some((&anchor_pos, &anchor_sn)) = self.timeline.iter().next() else {
+            return Err(RoomError::Internal(
+                "a room with no timeline cannot be backfilled".into(),
+            ));
+        };
+        let anchor_depth = self
+            .events
+            .get(&anchor_sn)
+            .ok_or_else(|| RoomError::Internal("oldest timeline event not in hot cache".into()))?
+            .header()
+            .depth;
+
+        // Select: one copy per ID, for this room, nothing already in the timeline, nothing
+        // newer than the anchor.
+        let in_timeline: HashSet<EventSn> = self.timeline.values().copied().collect();
+        let mut seen: HashSet<OwnedEventId> = HashSet::new();
+        let mut batch: Vec<Event> = Vec::with_capacity(events.len());
+        for event in events {
+            if !seen.insert(event.event_id().to_owned()) {
+                continue;
+            }
+            let room_id = event
+                .json()
+                .get("room_id")
+                .and_then(CanonicalJsonValue::as_str);
+            if room_id != Some(self.room_id.as_str()) {
+                tracing::warn!(
+                    room_id = %self.room_id,
+                    event_id = %event.event_id(),
+                    claimed_room = room_id.unwrap_or("<none>"),
+                    "dropping a backfilled event that is for another room"
+                );
+                continue;
+            }
+            if self
+                .event_id_index
+                .get(event.event_id())
+                .is_some_and(|sn| in_timeline.contains(sn))
+            {
+                continue;
+            }
+            if event.header().depth > anchor_depth {
+                tracing::warn!(
+                    room_id = %self.room_id,
+                    event_id = %event.event_id(),
+                    depth = event.header().depth,
+                    anchor_depth,
+                    "dropping a backfilled event newer than the event it was fetched from"
+                );
+                continue;
+            }
+            batch.push(event);
+        }
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        batch.sort_by(|a, b| topological_order(b, a)); // newest first
+
+        // The walk: positions and the state before each event, newest first. `state` starts as
+        // the state before the anchor, keyed by `(type, state_key)` as event IDs.
+        let mut state: BTreeMap<(String, String), OwnedEventId> =
+            self.state_before_for_backfill(anchor_sn)?;
+        let mut positions: Vec<i64> = Vec::with_capacity(batch.len());
+        let mut states_before: Vec<Vec<OwnedEventId>> = Vec::with_capacity(batch.len());
+        let mut next_pos = anchor_pos.min(0) - 1;
+        for (i, event) in batch.iter().enumerate() {
+            if let Some(state_key) = event.header().state_key.as_deref() {
+                let event_type = event.header().event_type.as_str();
+                let key = (event_type.to_owned(), state_key.to_owned());
+                let predecessor = batch[i + 1..]
+                    .iter()
+                    .find(|older| {
+                        older.header().event_type == event_type
+                            && older.header().state_key.as_deref() == Some(state_key)
+                    })
+                    .map(|older| older.event_id().to_owned());
+                match predecessor {
+                    Some(p) => {
+                        state.insert(key, p);
+                    }
+                    None => {
+                        state.remove(&key);
+                    }
+                }
+            }
+            positions.push(next_pos);
+            states_before.push(state.values().cloned().collect());
+            next_pos -= 1;
+        }
+
+        struct Planned {
+            event: Event,
+            room_pos: i64,
+            state_before: Vec<OwnedEventId>,
+            /// The `EventSn` this event is already held under, when it is an outlier being
+            /// placed rather than a new event.
+            held_as: Option<EventSn>,
+        }
+        // Persisted oldest first, so that everything an event's explicit state names is held
+        // and ingested before the event is: the anchor's own snapshot and the outliers already
+        // are, and an older batch-mate is by the time its younger one is reached.
+        let mut planned: Vec<Planned> = batch
+            .into_iter()
+            .zip(positions)
+            .zip(states_before)
+            .map(|((event, room_pos), state_before)| Planned {
+                held_as: self.event_id_index.get(event.event_id()).copied(),
+                event,
+                room_pos,
+                state_before,
+            })
+            .collect();
+        planned.reverse();
+
+        let room_sn = self.room_sn;
+        let mut added = 0usize;
+        while !planned.is_empty() {
+            let take = planned.len().min(OUTLIER_BATCH);
+            let chunk: Vec<Planned> = planned.drain(..take).collect();
+            let mut prepared: Vec<(Planned, Vec<u8>, Option<relations::Relation>)> =
+                Vec::with_capacity(chunk.len());
+            for p in chunk {
+                let full_json: serde_json::Value =
+                    serde_json::from_slice(p.event.canonical_bytes())
+                        .map_err(|e| RoomError::Internal(e.to_string()))?;
+                let relation = if p.held_as.is_some() {
+                    None
+                } else {
+                    relations::relation_of(
+                        &full_json
+                            .get("content")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                    )
+                };
+                // A placed outlier keeps the flags it is held with (outlier among them); a new
+                // event carries the none it was parsed with.
+                let flags = p
+                    .held_as
+                    .and_then(|sn| self.events.get(&sn))
+                    .map_or_else(|| p.event.header().flags, |held| held.header().flags);
+                let persisted = PersistedEvent {
+                    room_id: self.room_id.to_string(),
+                    json: full_json,
+                    room_version: self.room_version.as_str().to_owned(),
+                    flags: flags.to_byte(),
+                    room_pos: Some(p.room_pos),
+                };
+                let bytes = serde_json::to_vec(&persisted)
+                    .map_err(|e| RoomError::Internal(e.to_string()))?;
+                prepared.push((p, bytes, relation));
+            }
+
+            let fence_failure: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
+            let sns: Vec<EventSn> = transact(&self.backend, TransactConfig::default(), |txn| {
+                // Every ID first, so an explicit state naming a batch-mate in this same chunk
+                // resolves.
+                let mut local: HashMap<OwnedEventId, EventSn> =
+                    HashMap::with_capacity(prepared.len());
+                let mut sns = Vec::with_capacity(prepared.len());
+                for (p, _, _) in &prepared {
+                    let sn = match p.held_as {
+                        Some(sn) => sn,
+                        None => self
+                            .tables
+                            .event_sn
+                            .get_or_create(txn, p.event.event_id().as_bytes())?,
+                    };
+                    local.insert(p.event.event_id().to_owned(), sn);
+                    sns.push(sn);
+                }
+                for ((p, bytes, relation), &sn) in prepared.iter().zip(&sns) {
+                    self.tables.events.put(txn, &(sn,), bytes).map_err(to_kv)?;
+                    self.tables
+                        .timeline
+                        .put(txn, &(room_sn, p.room_pos), &sn.to_be_bytes())
+                        .map_err(to_kv)?;
+                    if p.held_as.is_some() {
+                        continue;
+                    }
+                    let state_sns: Vec<EventSn> = p
+                        .state_before
+                        .iter()
+                        .filter_map(|id| {
+                            local
+                                .get(id)
+                                .copied()
+                                .or_else(|| self.event_id_index.get(id).copied())
+                        })
+                        .collect();
+                    self.tables
+                        .state_snapshots
+                        .put(txn, &(room_sn, sn), &encode_event_sns(&state_sns))
+                        .map_err(to_kv)?;
+                    if let Some(rel) = relation {
+                        let target_sn = self
+                            .tables
+                            .event_sn
+                            .get_or_create(txn, rel.target.as_bytes())?;
+                        self.tables
+                            .relations
+                            .put(txn, &(room_sn, target_sn, rel.rel_type.clone(), sn), b"")
+                            .map_err(to_kv)?;
+                    }
+                }
+                self.fence_check(txn, &fence_failure)?;
+                Ok(sns)
+            })
+            .map_err(|e| match fence_failure.take() {
+                Some(msg) => RoomError::Fenced(msg),
+                None => RoomError::from(e),
+            })?;
+
+            for ((p, _, relation), sn) in prepared.into_iter().zip(sns) {
+                if p.held_as.is_some() {
+                    self.timeline.insert(p.room_pos, sn);
+                    added += 1;
+                    continue;
+                }
+                let state_sns: Vec<EventSn> = p
+                    .state_before
+                    .iter()
+                    .filter_map(|id| self.event_id_index.get(id).copied())
+                    .collect();
+                self.event_id_index
+                    .insert(p.event.event_id().to_owned(), sn);
+                self.timeline.insert(p.room_pos, sn);
+                if relation.is_some() {
+                    self.index_relation(&p.event, sn);
+                }
+                self.feed_store_with_state(&p.event, sn, &state_sns)?;
+                self.events.insert(sn, p.event);
+                added += 1;
+            }
+        }
+        tracing::debug!(
+            room_id = %self.room_id,
+            added,
+            oldest_position = self.timeline.keys().next().copied(),
+            "placed backfilled history in the timeline"
+        );
+        Ok(added)
+    }
+
+    /// The room's state immediately before the timeline event `sn`, keyed by
+    /// `(type, state_key)`, as event IDs: from the explicit snapshot it was fed with
+    /// (`Tables::state_snapshots`) when it has one -- the join, or an event
+    /// [`RoomActor::accept_backfilled_events`] placed -- else from the store's state at it with
+    /// its own entry taken out. The starting point of the backfill walk.
+    fn state_before_for_backfill(
+        &self,
+        sn: EventSn,
+    ) -> Result<BTreeMap<(String, String), OwnedEventId>, RoomError> {
+        let snapshot = self.backend.snapshot();
+        let explicit = self
+            .tables
+            .state_snapshots
+            .get(&snapshot, &(self.room_sn, sn))?
+            .and_then(|bytes| decode_event_sns(bytes.as_ref()));
+        let sns: Vec<EventSn> = match explicit {
+            Some(sns) => sns,
+            None => {
+                let root = self
+                    .store
+                    .state_at(sn)
+                    .map_err(|e| RoomError::State(e.to_string()))?;
+                let diff = self
+                    .store
+                    .diff(self.store.empty_root(), root)
+                    .map_err(|e| RoomError::State(e.to_string()))?;
+                diff.added.values().copied().filter(|s| *s != sn).collect()
+            }
+        };
+        let mut before = BTreeMap::new();
+        for s in sns {
+            if let Some(event) = self.events.get(&s)
+                && let Some(state_key) = event.header().state_key.clone()
+            {
+                before.insert(
+                    (event.header().event_type.clone(), state_key),
+                    event.event_id().to_owned(),
+                );
+            }
+        }
+        Ok(before)
     }
 
     /// Everything [`RoomActor::accept_remote_join_with_state`] checks before it writes anything.
@@ -3271,14 +3643,22 @@ impl<B: KvBackend> RoomActor<B> {
     }
 
     /// Pages the timeline from `from` (or the live end, if `None`) in `direction`, returning up to
-    /// `limit` events and the token to continue from -- `None` once the page has reached the end
-    /// of what this actor holds in that direction (the room's first timeline event backwards,
-    /// its newest forwards), which the client-server spec has `GET /messages` express by leaving
-    /// `end` out of the response. A token here used to be handed out for every non-empty page,
-    /// so a client paginating to the start of a room was given one more token at the oldest
-    /// event, then an empty page with no token -- which `/messages` wrote as `"end": null`, and
-    /// a client that takes "present" literally (Complement's `TestMessagesOverFederation` does)
-    /// started over from the newest event, forever.
+    /// `limit` events and the token to continue from. See [`RoomActor::paginate_page`], of which
+    /// this is the `(events, next)` half: `next` is `None` once the page has reached the end of
+    /// the room in that direction -- its newest event forwards, its first event backwards --
+    /// which the client-server spec has `GET /messages` express by leaving `end` out. A token
+    /// here used to be handed out for every non-empty page, so a client paginating to the start
+    /// of a room was given one more token at the oldest event, then an empty page with no token
+    /// -- which `/messages` wrote as `"end": null`, and a client that takes "present" literally
+    /// (Complement's `TestMessagesOverFederation` does) started over from the newest event,
+    /// forever.
+    ///
+    /// Backwards, the oldest event *held* is the end of the room only when the room's history
+    /// does not continue before it ([`RoomActor::history_before_oldest`]). When it does -- a
+    /// room joined elsewhere whose earlier history has not been fetched, or not all of it --
+    /// the token names that boundary instead of saying there is nothing further, so that
+    /// `/sync`'s `prev_batch` and `/messages`' `end` give a client somewhere to ask from, and
+    /// `crate::backfill` something to fetch before answering.
     #[must_use]
     pub fn paginate(
         &self,
@@ -3286,6 +3666,21 @@ impl<B: KvBackend> RoomActor<B> {
         direction: Direction,
         limit: usize,
     ) -> (Vec<&Event>, Option<PaginationToken>) {
+        let page = self.paginate_page(from, direction, limit);
+        (page.events, page.next)
+    }
+
+    /// [`RoomActor::paginate`] with the page's [`Page::reached_edge`] alongside, for a caller
+    /// that wants to act on reaching the edge of what is held -- `crate::routes::query`'s
+    /// `/messages`, which fetches earlier history at that point -- rather than on the token
+    /// alone.
+    #[must_use]
+    pub fn paginate_page(
+        &self,
+        from: Option<PaginationToken>,
+        direction: Direction,
+        limit: usize,
+    ) -> Page<'_> {
         let start = from.map_or_else(
             || match direction {
                 Direction::Backward => i64::MAX,
@@ -3322,17 +3717,94 @@ impl<B: KvBackend> RoomActor<B> {
         // The continuation token is the *last* position returned (oldest of the page for
         // backward, newest of the page for forward): the boundary the next page's `range` call
         // should exclude up to/from -- unless that position is already the timeline's own edge
-        // in this direction, in which case there is nothing further and no token is given.
+        // in this direction. An empty page is at the edge too.
         let edge = match direction {
             Direction::Backward => self.timeline.keys().next().copied(),
             Direction::Forward => self.timeline.keys().next_back().copied(),
         };
-        let next = positions
-            .last()
-            .filter(|p| Some(**p) != edge)
-            .map(|p| PaginationToken::new(*p, direction));
+        let reached_edge = positions.last().is_none_or(|p| Some(*p) == edge);
+        let next = match direction {
+            _ if !reached_edge => positions
+                .last()
+                .map(|p| PaginationToken::new(*p, direction)),
+            Direction::Forward => None,
+            // The page ends at the oldest event held. If the room's history goes on before it,
+            // the token is that boundary -- the page's own last position, or `from` itself when
+            // nothing was left to return -- which is where a page after backfill continues
+            // from; if not, this is the room's first event and there is no token.
+            Direction::Backward if self.history_before_oldest() => positions
+                .last()
+                .copied()
+                .or_else(|| from.map(|t| t.room_pos))
+                .map(|p| PaginationToken::new(p, direction)),
+            Direction::Backward => None,
+        };
 
-        (events, next)
+        Page {
+            events,
+            next,
+            reached_edge,
+        }
+    }
+
+    /// Whether the room's history continues before the oldest event this actor holds in its
+    /// timeline: that event is not the room's `m.room.create`. True for a room this server's
+    /// own user joined elsewhere ([`RoomActor::accept_remote_join_with_state`] leaves the join
+    /// as the only timeline event) until `crate::backfill` has walked all the way back to the
+    /// create event; never true for a room created here, whose first timeline event is its
+    /// create.
+    #[must_use]
+    pub fn history_before_oldest(&self) -> bool {
+        self.timeline
+            .values()
+            .next()
+            .and_then(|sn| self.events.get(sn))
+            .is_some_and(|e| e.header().event_type != "m.room.create")
+    }
+
+    /// What `crate::backfill` needs to fetch the room's earlier history: the oldest held event
+    /// to walk back from, and the servers to ask (see [`crate::backfill::BackfillAnchor`]).
+    /// `None` when the history does not continue before what is held
+    /// ([`RoomActor::history_before_oldest`]).
+    #[must_use]
+    pub fn backfill_anchor(&self) -> Option<crate::backfill::BackfillAnchor> {
+        if !self.history_before_oldest() {
+            return None;
+        }
+        let (_, sn) = self.timeline.iter().next()?;
+        let event_id = self.events.get(sn)?.event_id().to_owned();
+        let own = self.identity.server_name.as_str();
+        let mut servers: Vec<String> = Vec::new();
+        if let Some(server) = self.room_id.server_name()
+            && server.as_str() != own
+        {
+            servers.push(server.as_str().to_owned());
+        }
+        for member in self.joined_members().unwrap_or_default() {
+            let Some(user) = member
+                .header()
+                .state_key
+                .as_deref()
+                .and_then(|k| UserId::parse(k).ok())
+            else {
+                continue;
+            };
+            let server = user.server_name().as_str();
+            if server != own && !servers.iter().any(|s| s == server) {
+                servers.push(server.to_owned());
+            }
+        }
+        Some(crate::backfill::BackfillAnchor { event_id, servers })
+    }
+
+    /// The timeline position of `event_id`, if this actor holds it in the timeline -- negative
+    /// for history fetched from another server after the fact
+    /// ([`RoomActor::accept_backfilled_events`]), `None` for an outlier that has not been
+    /// placed and for an event not held at all.
+    #[must_use]
+    pub fn timeline_position(&self, event_id: &EventId) -> Option<i64> {
+        let sn = *self.event_id_index.get(event_id)?;
+        self.room_pos_of(sn)
     }
 
     /// The children of `target` recorded by `crate::relations`, optionally filtered by
@@ -4138,6 +4610,16 @@ impl<B: KvBackend> RoomActorHandle<B> {
             actor.accept_remote_join_with_state(state, auth_chain, join_event)
         })
         .await
+    }
+
+    /// Stores a verified batch of the room's earlier history. See
+    /// [`RoomActor::accept_backfilled_events`]; `crate::backfill` is the caller.
+    pub async fn accept_backfilled_events(&self, events: Vec<Event>) -> Result<usize, RoomError>
+    where
+        B: 'static,
+    {
+        self.with_actor(move |actor| actor.accept_backfilled_events(events))
+            .await
     }
 
     /// Whether `other` is a handle to the very same actor (not merely the same room ID).

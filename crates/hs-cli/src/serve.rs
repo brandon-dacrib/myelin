@@ -1064,6 +1064,14 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             rooms.clone(),
             identity.clone(),
         )));
+        // And how `GET /messages` reaches the history of such a room from before the join
+        // (`crate::backfill`): the same client, the same key cache.
+        rooms.install_backfill(Arc::new(crate::backfill::FederationBackfill::new(
+            mount.client.clone(),
+            mount.x_matrix.key_cache.clone(),
+            rooms.clone(),
+            identity.clone(),
+        )));
         Some((
             mount.state,
             mount.x_matrix,

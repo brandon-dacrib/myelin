@@ -2,7 +2,29 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
-Last updated: 2026-09-25 (session 8: RFC 0015 implemented -- a room this server's own user
+Last updated: 2026-09-26 (session 9: the history before a remote join. `RoomActor::
+accept_backfilled_events` places a verified batch of a room's earlier history in the timeline at
+negative positions below the join, each event with an explicit state computed by walking back
+from the join's snapshot -- reverting each state event passed to its predecessor in the batch --
+and durable in `Tables::state_snapshots` like the join's own; outliers the batch reaches are
+placed at their position and stay outliers. `RoomActor::history_before_oldest` says whether the
+oldest held event is the room's create; `RoomActor::backfill_anchor` says what to fetch from and
+whom to ask; `RoomActor::paginate` at the held edge hands back that boundary as a token while
+history continues before it, so `/sync`'s `prev_batch` and `/messages`' `end` give a client
+somewhere to ask from. `crate::backfill::Backfill` is the hook `/messages` calls when a backward
+page reaches that edge -- on the registry, like fencing and the token resolver, installed by
+`hs-cli` over the federation client -- and a page fetches one batch before answering. Nothing is
+published for a backfilled event; `events_after` never returns one. Tested in
+`tests/backfill.rs`: the resident's order reproduced exactly, the state at each of alice's
+messages equal to the resident's own, two batches continuing from the first's oldest event, an
+event newer than the anchor refused as history and accepted live, a reload identical. What is
+inexact and where: the state at events older than a key's oldest fetched setting says the key was
+unset; no auth check runs on backfilled events (their `auth_events` may be beyond the batch);
+and the gap a leave-and-rejoin leaves in the middle of a timeline is not filled, because history
+is fetched before the *oldest* held event and positions are a stream order, not a topological
+one.)
+
+Previously: 2026-09-25 (session 8: RFC 0015 implemented -- a room this server's own user
 joined on another server is built here from the verified `send_join` response, as outliers plus a
 join with explicit state; `RoomRegistry::bootstrap_from_remote_join` is the entry point `hs-cli`
 should call).

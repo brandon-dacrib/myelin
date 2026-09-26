@@ -114,6 +114,11 @@ pub struct RoomRegistry<B: KvBackend> {
     /// then treats a `from` token that isn't this crate's own format as a hard error, same as
     /// before this hook existed.
     global_token_resolver: OnceLock<Arc<dyn GlobalTokenResolver>>,
+    /// See [`crate::backfill::Backfill`] and [`RoomRegistry::install_backfill`]. Unset (`None`,
+    /// the default until `hs-cli` installs one) means a room's history is exactly what this
+    /// server holds: `crate::routes::query::get_messages` reaches the oldest held event and
+    /// says so, as it did before this hook existed.
+    backfill: OnceLock<Arc<dyn crate::backfill::Backfill>>,
     /// See [`crate::fencing::RoomFencing`] and [`RoomRegistry::install_fencing`]. Unset (`None`,
     /// the default until `hs-cli` installs one) means every actor this registry constructs or
     /// loads runs with no cluster-fencing check at all -- `RoomActor::persist` behaves exactly as
@@ -147,6 +152,7 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             rooms: Mutex::new(HashMap::new()),
             global,
             global_token_resolver: OnceLock::new(),
+            backfill: OnceLock::new(),
             fencing: OnceLock::new(),
         })
     }
@@ -171,6 +177,25 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     #[must_use]
     pub fn global_token_resolver(&self) -> Option<&Arc<dyn GlobalTokenResolver>> {
         self.global_token_resolver.get()
+    }
+
+    /// Installs the hook `crate::routes::query::get_messages` uses to fetch a room's history from
+    /// before the oldest event this server holds (`crate::backfill`). Idempotent past the first
+    /// call, same as [`RoomRegistry::install_global_token_resolver`]: a second install is logged
+    /// and ignored.
+    pub fn install_backfill(&self, backfill: Arc<dyn crate::backfill::Backfill>) {
+        if self.backfill.set(backfill).is_err() {
+            tracing::warn!(
+                "a backfill hook was already installed on this room registry; ignoring the \
+                 second install"
+            );
+        }
+    }
+
+    /// The installed [`crate::backfill::Backfill`] hook, if any.
+    #[must_use]
+    pub fn backfill_hook(&self) -> Option<&Arc<dyn crate::backfill::Backfill>> {
+        self.backfill.get()
     }
 
     /// Installs the cluster-fencing hook every actor this registry constructs or loads from now

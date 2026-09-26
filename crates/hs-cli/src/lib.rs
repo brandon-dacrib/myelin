@@ -11,6 +11,7 @@ pub mod appservice_manifest;
 pub mod appservices;
 pub mod audit;
 pub mod auth_manifest;
+pub mod backfill;
 pub mod bootstrap;
 pub mod capabilities;
 pub mod cli;

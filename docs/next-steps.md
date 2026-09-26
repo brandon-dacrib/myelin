@@ -1,6 +1,6 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-09-25. `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`.
+Written 2026-09-20 by the integration lead, last revised 2026-09-26. `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
@@ -104,10 +104,35 @@ room's state and his join, his message reaches alice's `/sync` on A, and her rep
 The TLS script (`crates/hs-federation/scripts/two-server-federation.sh`) does the same between two
 real binaries with stunnel and a private CA: it passed on 2026-09-25, join through `/join`, state on B, a message each way. The joining side also sends `?ver=` with
 every supported room version now, which Synapse requires of a joiner, and carries the user's
-profile on the join. What is not there: the room's history from before the join is not
-backfilled (bob's timeline starts at his join; `/messages` backwards stops there), the outbound
-queue is in memory (a restart loses it), no EDUs (typing, receipts, presence) cross servers, and
-invites, leaves and knocks over federation are still seams.
+profile on the join. What is not there: the outbound queue is in memory (a restart loses it), no
+EDUs (typing, receipts, presence) cross servers, and invites, leaves and knocks over federation
+are still seams.
+
+**And the room's history from before the join** (2026-09-26). Until this session bob's timeline
+on B began at his join: `/messages` backwards stopped there and said it was the start of the
+room, and `/sync` offered no `prev_batch` to ask from, so Element would never have asked. Now a
+backward page that reaches the oldest event this server holds, while the room's history
+continues before it (`RoomActor::history_before_oldest`: that event is not the room's
+`m.room.create`), fetches one batch of a hundred before answering -- `hs_room::backfill::
+Backfill`, a hook on the registry like fencing and the token resolver, implemented in
+`hs_cli::backfill` over the federation client's `/backfill` call, every PDU verified as an
+inbound one is -- and pages again. `RoomActor::accept_backfilled_events` puts the batch in the
+timeline at negative positions below everything held, in the resident's own order, with the
+state at each event computed by walking back from the join's snapshot (reverting each state
+event passed to its predecessor in the batch; exact while the history is linear and within
+reach), durable across reload, and published nowhere: history is not news to `/sync`, push, a
+bridge or the outbound sender, and `events_after` never returns one. A page that reaches the
+held edge with more history behind it keeps its `end`; one whose fetch brought nothing omits
+it, so a client is never handed the same token forever while a peer is down. The two-server
+test sends 120 messages before the join and reads them back through `/messages` in three pages
+of fifty, newest first, down to the create event, with nothing arriving in the next
+incremental sync; `crates/hs-room/tests/backfill.rs` checks the order, the state at each event
+against the resident's own, a second batch continuing from the first, and a reload. Not done:
+the gap a leave-and-rejoin leaves in the middle of a timeline (history is fetched before the
+*oldest* held event, and positions are a stream order, not a topological one -- Complement's
+"re-joining" subtest of `TestMessagesOverFederation` is exactly this), the state at a
+backfilled event is walked rather than asked for (`/state_ids`), and no auth check runs on one
+(its `auth_events` may be beyond the batch; the same fetch would close both).
 
 **Configuration lives in the database** (RFC 0016). The file is a bootstrap and a seed; the database outranks it, `HS__` variables outrank the database, and the admin API refuses a write the environment would shadow rather than storing one that gets ignored. The web interface has a Configuration section that builds its forms from the server's own JSON Schema, and `hs config show|get|set|unset|import|export|history` is the same thing without a browser.
 
@@ -216,7 +241,7 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 | Configuration and first run | ~90% | database-backed, editable in the UI, one command from nothing to a working server |
 | Admin API | ~40% | 58 of 145 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Config 6/6, Server 5/5, AuditLog 3/3, Setup 2/2, Bridges 16/16, Users 14/41, Rooms 6/23, Federation 3/7, Statistics 1/4, Cluster 1/6, and Media 0/9, RegistrationTokens 0/5 |
 | Management web interface | ~75% | users (with devices, sign-out and password reset), rooms (with members), bridges (the catalogue, the wizard with the bridge's own config, the runbook, sign-in guides), federation destinations, configuration and the audit log are real against the real server; the media and reports pages still read from operations that answer 501; arrays-of-objects are a JSON textarea |
-| **Federation** | **~25%** | 73/250 assertions, 12/88 top-level (run 5); a user here joins a room hosted elsewhere through the client API and messages flow both ways between two real servers; no backfill of pre-join history, in-memory outbound queue, no EDUs, no invites/leaves/knocks over federation |
+| **Federation** | **~30%** | 73/250 assertions, 12/88 top-level (run 5); a user here joins a room hosted elsewhere through the client API, messages flow both ways between two real servers, and the room's history from before the join is fetched as the client scrolls back; in-memory outbound queue, no EDUs, no invites/leaves/knocks over federation |
 | Bridges | ~75% | heisenbridge works end to end both directions (`docs/bridges/heisenbridge.md`); mautrix-whatsapp, added through the wizard, connects and starts in appservice-mode encryption (`docs/bridges/mautrix.md`); all 16 bridge operations are real; no mautrix bridge has carried a message yet, because signing in needs a phone |
 | Operations (HA, scale-out) | ~40% | it runs on Kubernetes with a chart and a tested image; the cluster path has never carried real traffic |
 
@@ -248,7 +273,10 @@ one polling test can print the same line twenty times.
   a room over federation with `404 room not found`; the room bootstrap API is in (item 3).
   Run 10 (2026-09-26, `82359fb`): 314 of 384, 78 of 106, identical to run 7 by name -- the join
   now succeeds in both tests, and both still fail after it: `TestMessagesOverFederation` on the
-  history before the join, which is not backfilled, and `TestPushRuleRoomUpgrade` on the upgrade.
+  history before the join, which was not backfilled, and `TestPushRuleRoomUpgrade` on the
+  upgrade. The history is fetched now (see "the room's history from before the join" above);
+  the "after joining new room" subtests should move, and the "after re-joining" one should not,
+  because it needs the gap between a leave and a rejoin filled, which this does not do.
 - **`TestSync` (4)**: "Newly joined room has correct timeline in incremental sync" and the
   lazy-loading `device_lists.left` case; read the reasons.
 - **`TestChangePasswordPushers` (2)**: a password change should delete pushers made by other
@@ -435,10 +463,15 @@ defect found while fixing the first; see the chart's commit). What is left there
 The join is two-way now (see "Two servers, both directions" above; RFC 0015 is implemented).
 What a room joined elsewhere still lacks, in the order a user would notice:
 
-- **History before the join.** `/messages` backwards stops at the join event; nothing calls
-  `/backfill` on a client's behalf. `hs_federation::backfill` fetches missing *ancestors* of an
-  incoming event, which is the same fetch with a different trigger; `Tables::extremities_bwd`
-  and negative `room_pos` are the intended shape on the room side.
+- ~~History before the join.~~ **Done 2026-09-26** (see "the room's history from before the
+  join" in the state of things). What is left of it: a leave-and-rejoin leaves a gap in the
+  *middle* of the timeline that nothing fills -- positions are a stream order, and history is
+  fetched before the oldest held event only; filling a gap wants the topological ordering
+  Synapse pages `/messages` by, which is a change to pagination itself. The state at a
+  backfilled event is walked back from the join rather than asked for; `/state_ids` at each
+  batch's oldest event, plus `/event` for what it names that is not held, would make it exact
+  and would let the auth check that does not run on backfilled events run. `Tables::
+  extremities_bwd` is still unused: the oldest held event *is* the backward extremity here.
 - **Ephemeral data over federation.** No EDUs are sent or acted on: typing, receipts, presence
   and device-list updates stay on their own server. `TestDeviceListUpdates`' remote halves are
   this.
@@ -479,7 +512,8 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | `min_depth` ignored on `/get_missing_events` | `hs-cli` | a conformance gap, no longer a crash |
 | history visibility not applied per event on `/get_missing_events` | `hs-cli` | pre-join events served unredacted |
 | Restricted joins rejected | `hs-federation`, `hs-room` | ten conformance tests, a common room type |
-| A room joined elsewhere has no history before the join | `hs-room`, `hs-federation` | `/messages` stops at the join; nothing backfills on a client's behalf |
+| A rejoined room's gap is never filled | `hs-room` | history is fetched before the oldest held event; what happened between a leave and a rejoin stays on the resident |
+| The state at a backfilled event is walked, not asked for | `hs-room` | exact while the history is linear and the previous event for each reverted key is within reach; a key set before the fetched history reads as unset until that history arrives; no auth check runs on backfilled events |
 | The outbound federation queue is in memory | `hs-federation` | a restart loses unsent events; two replicas would both send |
 | No EDUs over federation | `hs-federation` | typing, receipts, presence and device-list changes stay local |
 | Invites, leaves and knocks over federation are seams | `hs-federation` | a user cannot leave a remote room audibly, or be invited into one |

@@ -120,6 +120,13 @@ pub enum RoomError {
     /// something that was not a join. `502 M_UNKNOWN`, the shape Synapse gives the same failure.
     #[error("could not join the room through federation: {0}")]
     RemoteJoinFailed(String),
+    /// [`crate::backfill::Backfill`]: a room's history from before the oldest event this server
+    /// holds could not be fetched: no server in the room could be reached, or none answered with
+    /// a usable batch. `502 M_UNKNOWN` like [`RoomError::RemoteJoinFailed`], though
+    /// `GET /messages` never surfaces it -- a page is answered from what is held and the failure
+    /// is logged.
+    #[error("could not fetch the room's earlier history through federation: {0}")]
+    BackfillFailed(String),
 }
 
 impl RoomError {
@@ -181,7 +188,7 @@ impl RoomError {
                 MatrixErrorCode::Other("M_MISSING_PREV_EVENTS".to_owned()),
                 self.to_string(),
             ),
-            Self::RemoteJoinFailed(_) => MatrixError::custom(
+            Self::RemoteJoinFailed(_) | Self::BackfillFailed(_) => MatrixError::custom(
                 axum::http::StatusCode::BAD_GATEWAY,
                 MatrixErrorCode::Unknown,
                 self.to_string(),

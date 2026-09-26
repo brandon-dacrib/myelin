@@ -220,9 +220,25 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`.
   the room's other servers. Verified by two in-process servers over plain HTTP
   (`crates/hs-cli/tests/federation_two_servers.rs`) and by two real binaries over TLS with a
   private CA (`crates/hs-federation/scripts/two-server-federation.sh`): it passed on 2026-09-25, join through `/join`, state on B, a message each way. Between two
-  instances of this server; a Synapse on the other end has not been tried. Not yet: history
-  from before the join (the timeline starts at the join), EDUs, invites, leaves and knocks over
-  federation; the outbound queue is in memory.
+  instances of this server; a Synapse on the other end has not been tried. Not yet: EDUs,
+  invites, leaves and knocks over federation; the outbound queue is in memory.
+- **A room joined elsewhere has its history** (2026-09-26). Until now the timeline of such a
+  room began at the join: `/messages` backwards stopped there and said it was the start of the
+  room, and `/sync` offered no `prev_batch` to ask from. Now a backward page that reaches the
+  oldest event this server holds, while the room's history continues before it, fetches one
+  batch of a hundred from a server in the room (`GET /_matrix/federation/v1/backfill`, every
+  event verified as an inbound PDU is) before answering, and pages again: the events go into the
+  timeline below everything held, in the resident's own order, with the state at each computed
+  by walking back from the join (exact while the history is linear and within reach; the doc of
+  `RoomActor::accept_backfilled_events` says where it is not), durable across reload, and
+  published nowhere -- history is not news to `/sync`, push, a bridge or the outbound sender. A
+  page that reaches the held edge with more history behind it keeps its `end`; one whose fetch
+  brought nothing omits it, so a client is never handed the same token forever while a peer is
+  down. Verified by the two-server test: a hundred and twenty messages sent before the join
+  read back in three pages of fifty, newest first, down to the room's creation, with nothing
+  arriving in the next incremental sync. Not done: the gap left by leaving a room and rejoining
+  it later (history is fetched before the *oldest* held event, not into the middle), and the
+  state at a backfilled event is walked, not asked for (`/state_ids`).
 - The joining side sends `?ver=` with every supported room version, which Synapse requires
   before it will hand out a join template, and carries the user's profile on the join.
 - **Event signing was wrong from the beginning and is fixed.** The spec signs the *redacted* form

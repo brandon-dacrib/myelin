@@ -1,5 +1,20 @@
 # 06 Federation: status
 
+> **Integration note, 2026-09-26 (integration lead):** the other trigger for `/backfill`. This
+> crate's `backfill::resolve_missing_ancestors` fetches the missing *ancestors* of an event that
+> arrived over `/send`; `hs_cli::backfill::FederationBackfill` (implementing
+> `hs_room::backfill::Backfill`) now runs the same `FederationClient::backfill` call on a
+> client's behalf -- one batch of a hundred from the oldest event held, against the room's
+> server then the other members' servers, every PDU through `inbound::verify_pdu` -- and hands
+> the batch to `RoomActor::accept_backfilled_events`, which is the history path rather than the
+> ancestor-resolution one: the events are the history, not something newer's prerequisites. One
+> lock per room keeps two clients paging the same room from fetching the same batch twice.
+> Verified by `crates/hs-cli/tests/federation_two_servers.rs`: 120 messages before the join read
+> back in three pages of fifty, down to the create event, nothing in the next incremental sync.
+> Not done here: the state at a backfilled event is walked on the room side rather than asked
+> for (`/state_ids` would make it exact at each batch boundary), and no auth events are fetched
+> for it (`/event/{eventId}`); both are the noted next step in the actor's doc.
+
 > **Integration note, 2026-09-25 (integration lead):** the eighth session's sender (below) and
 > track 04's RFC 0015 bootstrap landed together with the piece between them: `POST /join` on a
 > room this server does not hold now runs `crate::outbound_join::join_room_with_content` against

@@ -226,7 +226,19 @@ async fn a_user_joins_a_room_on_another_server_and_messages_flow_both_ways() {
         .as_str()
         .unwrap_or_else(|| panic!("createRoom failed: {created}"))
         .to_owned();
-    send_message(&client, &a.base, &alice_token, &room_id, "hello before bob").await;
+    // More than one backfill batch's worth (`hs_cli::backfill::BATCH` is 100), so that reading
+    // it all back takes more than one fetch.
+    const BEFORE_BOB: usize = 120;
+    for i in 1..=BEFORE_BOB {
+        send_message(
+            &client,
+            &a.base,
+            &alice_token,
+            &room_id,
+            &format!("before bob {i}"),
+        )
+        .await;
+    }
 
     // Bob, on B, joins it the way a client does: the room ID and the server to ask.
     let join = client
@@ -290,11 +302,102 @@ async fn a_user_joins_a_room_on_another_server_and_messages_flow_both_ways() {
             .any(|e| e["type"] == "m.room.member" && e["state_key"] == bob),
         "bob's timeline lacks his own join: {bob_timeline}"
     );
-    // The room's history before the join is not backfilled yet; what bob sees starts at his
-    // join. Written down here so the day it changes, this line changes with it.
+    // The room's history before the join is on A and nothing has asked for it yet, so bob's
+    // first sync starts at his join -- but it hands him somewhere to ask from.
     assert!(
-        !timeline_bodies(&bob_sync, &room_id).contains(&"hello before bob".to_owned()),
-        "the pre-join history is not expected yet: {bob_sync}"
+        timeline_bodies(&bob_sync, &room_id).is_empty(),
+        "nothing before the join has been fetched yet: {bob_sync}"
+    );
+    let prev_batch = bob_sync["rooms"]["join"][&room_id]["timeline"]["prev_batch"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("a room with history before what is held must offer a prev_batch: {bob_sync}")
+        })
+        .to_owned();
+    let bob_since = bob_sync["next_batch"]
+        .as_str()
+        .expect("a sync token")
+        .to_owned();
+
+    // Bob reads backwards from there, the way a client scrolling up does, until the server says
+    // there is nothing further. Each page that reaches the edge of what B holds fetches the next
+    // batch from A before answering: 120 messages and the room's six creation events, in 50s,
+    // is a page from the first batch, a page from held events, and a page that fetches the rest
+    // and reaches the create event.
+    let mut from = Some(prev_batch);
+    let mut chunk: Vec<Value> = Vec::new();
+    let mut requests = 0;
+    loop {
+        requests += 1;
+        assert!(
+            requests <= 10,
+            "still paginating after {requests} requests: {chunk:?}"
+        );
+        let mut url = format!(
+            "{}/_matrix/client/v3/rooms/{room_id}/messages?dir=b&limit=50",
+            b.base
+        );
+        if let Some(token) = &from {
+            url.push_str("&from=");
+            url.push_str(token);
+        }
+        let page: Value = client
+            .get(url)
+            .bearer_auth(&bob_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        chunk.extend(page["chunk"].as_array().cloned().unwrap_or_default());
+        match page.get("end").and_then(Value::as_str) {
+            Some(end) => from = Some(end.to_owned()),
+            None => break,
+        }
+    }
+    assert_eq!(
+        requests, 3,
+        "one backfill batch per page that reaches the edge"
+    );
+    let bodies: Vec<String> = chunk
+        .iter()
+        .filter_map(|e| e["content"]["body"].as_str().map(str::to_owned))
+        .collect();
+    let expected: Vec<String> = (1..=BEFORE_BOB)
+        .rev()
+        .map(|i| format!("before bob {i}"))
+        .collect();
+    assert_eq!(
+        bodies, expected,
+        "every message before the join, newest first"
+    );
+    assert_eq!(
+        chunk.last().map(|e| e["type"].as_str().unwrap_or("")),
+        Some("m.room.create"),
+        "the last page reaches the room's creation"
+    );
+    assert!(
+        chunk.iter().any(|e| e["type"] == "m.room.name"),
+        "the creation-time state events are in the history too: {chunk:?}"
+    );
+
+    // History is not news: bob's next incremental sync has nothing new in the room.
+    let incremental: Value = client
+        .get(format!(
+            "{}/_matrix/client/v3/sync?since={bob_since}&timeout=0",
+            b.base
+        ))
+        .bearer_auth(&bob_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        timeline_bodies(&incremental, &room_id).is_empty(),
+        "backfilled history must not arrive as new events: {incremental}"
     );
 
     // Bob speaks on B; alice reads it on A. That is the outbound sender, and B's event being
@@ -319,11 +422,19 @@ async fn a_user_joins_a_room_on_another_server_and_messages_flow_both_ways() {
         timeline_bodies(s, &room_id).contains(&"welcome bob, from A".to_owned())
     })
     .await;
+    // A fresh sync's timeline is the newest events whatever their origin: the exchange, and
+    // the fetched history right before the join.
     let bodies = timeline_bodies(&bob_sync, &room_id);
-    assert_eq!(
-        bodies,
-        vec!["hi alice, from B", "welcome bob, from A"],
-        "bob's timeline on B"
+    assert!(
+        bodies.ends_with(&[
+            "hi alice, from B".to_owned(),
+            "welcome bob, from A".to_owned()
+        ]),
+        "bob's timeline on B: {bodies:?}"
+    );
+    assert!(
+        bodies.contains(&format!("before bob {BEFORE_BOB}")),
+        "the fetched history shows in a fresh sync: {bodies:?}"
     );
 
     // The joined room survives B being asked cold: the actor was made from a snapshot and is

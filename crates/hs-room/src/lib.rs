@@ -34,6 +34,7 @@
 
 pub mod actor;
 pub mod admin;
+pub mod backfill;
 pub mod error;
 pub mod fencing;
 pub mod history_visibility;

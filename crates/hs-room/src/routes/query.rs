@@ -469,7 +469,55 @@ pub async fn get_messages<B: KvBackend + 'static>(
         }
         Err(e) => return Err(e),
     };
-    let (start, chunk, end) = handle
+    let (mut start, mut chunk, mut end, wants_backfill) =
+        messages_page(&handle, from, direction, limit, requester.clone(), false).await?;
+
+    // The page reached the oldest event this server holds, and the room's history goes on
+    // before it (a room joined elsewhere, whose earlier history is on the resident): fetch one
+    // batch of it (`crate::backfill`) and page again, now with a continuation token if there is
+    // still more. A fetch that adds nothing -- nobody to ask, nobody answering -- leaves the
+    // first page as it was, with no `end`: the client stops here, and its next look at the room
+    // tries again, rather than being handed the same token forever while a peer is down.
+    if wants_backfill && let Some(hook) = state.rooms.backfill_hook() {
+        match hook.backfill(&room_id).await {
+            Ok(added) if added > 0 => {
+                (start, chunk, end, _) =
+                    messages_page(&handle, from, direction, limit, requester, true).await?;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %room_id,
+                    %error,
+                    "could not fetch the room's earlier history; answering from what is held"
+                );
+            }
+        }
+    }
+    // `end` is left out, not `null`, when there is nothing further: the spec's signal for "you
+    // have reached the start of the room", and the one a paginating client stops on.
+    let mut body = json!({"start": start, "chunk": chunk});
+    if let Some(end) = end {
+        body["end"] = serde_json::Value::String(end);
+    }
+    Ok(Json(body).into_response())
+}
+
+/// One page of `GET /messages`, rendered for `requester`: `(start, chunk, end,
+/// wants_backfill)`. `wants_backfill` is true when a backward page reached the oldest event this
+/// server holds and the room's history continues before it
+/// (`RoomActor::history_before_oldest`). Until `after_backfill` says the caller has fetched
+/// that history and is paging again, such a page carries no `end`: with nothing to fetch it
+/// from, the oldest held event *is* the end for this server.
+async fn messages_page<B: KvBackend + 'static>(
+    handle: &crate::actor::RoomActorHandle<B>,
+    from: Option<PaginationToken>,
+    direction: Direction,
+    limit: usize,
+    requester: hs_auth::requester::Requester,
+    after_backfill: bool,
+) -> Result<(String, Vec<serde_json::Value>, Option<String>, bool), RoomError> {
+    handle
         .query(move |actor| -> Result<_, RoomError> {
             // The entry gate: forgetting, or never having had a membership record in a
             // non-world-readable room, refuses the whole call outright -- see
@@ -480,9 +528,18 @@ pub async fn get_messages<B: KvBackend + 'static>(
                     "you aren't a member of the room".into(),
                 ));
             }
-            let (events, next) = actor.paginate(from, direction, limit);
+            let page = actor.paginate_page(from, direction, limit);
+            let wants_backfill = direction == Direction::Backward
+                && page.reached_edge
+                && actor.history_before_oldest();
+            let end = if wants_backfill && !after_backfill {
+                None
+            } else {
+                page.next
+            };
             let start_token = from.unwrap_or_else(|| PaginationToken::new(0, direction));
-            let chunk = events
+            let chunk = page
+                .events
                 .into_iter()
                 .filter(|e| {
                     actor
@@ -505,17 +562,14 @@ pub async fn get_messages<B: KvBackend + 'static>(
                     )
                 })
                 .collect::<Vec<_>>();
-            Ok((start_token.to_string(), chunk, next.map(|t| t.to_string())))
+            Ok((
+                start_token.to_string(),
+                chunk,
+                end.map(|t| t.to_string()),
+                wants_backfill,
+            ))
         })
-        .await?;
-
-    // `end` is left out, not `null`, when there is nothing further: the spec's signal for "you
-    // have reached the start of the room", and the one a paginating client stops on.
-    let mut body = json!({"start": start, "chunk": chunk});
-    if let Some(end) = end {
-        body["end"] = serde_json::Value::String(end);
-    }
-    Ok(Json(body).into_response())
+        .await
 }
 
 #[cfg(test)]
