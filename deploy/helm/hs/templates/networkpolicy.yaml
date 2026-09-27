@@ -21,6 +21,17 @@ spec:
         - port: client
         - port: federation
         - port: metrics
+    {{- if eq .Values.mode "cluster" }}
+    # The mesh: only this release's own pods may forward to one another. Mutual TLS is the
+    # real authentication (values.yaml, `cluster.mesh.tls`); this keeps the port off the
+    # cluster network besides.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "hs.selectorLabels" . | nindent 14 }}
+      ports:
+        - port: mesh
+    {{- end }}
   egress:
     # DNS.
     - ports:

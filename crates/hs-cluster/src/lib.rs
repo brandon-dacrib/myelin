@@ -11,6 +11,7 @@
 
 pub mod cluster;
 pub mod config;
+pub mod create_room;
 pub mod error;
 pub mod fence;
 pub mod hash;
@@ -24,6 +25,7 @@ pub mod types;
 
 pub use cluster::Cluster;
 pub use config::{ClusterConfig, HandoffConfig, MeshConfig};
+pub use create_room::{PREASSIGNED_ROOM_ID_HEADER, PreassignedRoomId, ViaMesh};
 pub use fence::Fence;
 pub use ownership::{DrainReport, Drainable, Ownership, OwnershipEvent, Readiness, ShardMap};
 pub use types::{Epoch, Generation, ReplicaId, ShardId, ShardKind, ShardLayout};

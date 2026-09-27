@@ -35,4 +35,5 @@ sha2 = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 rcgen = { workspace = true }
+tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
