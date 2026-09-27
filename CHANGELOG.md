@@ -274,6 +274,18 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Federation
 
+- **An event queued for a server that is down survives a restart, and arrives.** The outbound
+  queue and every destination's retry state (failing since, next attempt, last error) are in
+  the database: a PDU is written before any worker sees it and removed only when the
+  destination accepted it, and the sender resumes every queued destination at start.
+  Verified 2026-09-27 with two real binaries over TLS: the receiving server's port closed, a
+  message sent, the sending server killed and restarted over its data directory, the admin
+  API still showing the destination failing since the same moment with one pending event,
+  the port opened, and the message arriving in the recipient's `/sync` exactly once. In
+  cluster mode only the replica that owns a destination's shard sends to it; the others queue
+  and do not send (scripted ownership in a test; not yet watched on a cluster). What was
+  never queued, because the destination was already known to be failing, is still not
+  caught up from the room afterwards.
 - Inbound transactions (`PUT /send/{txnId}`): content hashes and signatures verified against the
   *sender's* server, the spec's 50 PDU / 100 EDU limits enforced, processed in order, idempotent by
   transaction id.

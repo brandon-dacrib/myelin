@@ -380,7 +380,7 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 | Configuration and first run | ~90% | database-backed, editable in the UI, one command from nothing to a working server |
 | Admin API | ~45% | 71 of 158 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Bridges 26/26, Config 6/6, Server 5/5, AuditLog 3/3, Recovery 3/3, Setup 2/2, Events 1/1, Users 14/41, Rooms 6/23, Federation 3/7, Statistics 1/4, Cluster 1/6, and Media 0/9, Migration 0/8, RegistrationTokens 0/5, Reports 0/4, Tasks 0/3, ServerNotices 0/2 |
 | Management web interface | ~75% | users (with devices, sign-out and password reset), rooms (with members), bridges (the catalogue, the wizard with the bridge's own config, the runbook, sign-in guides), federation destinations, configuration and the audit log are real against the real server; the media and reports pages still read from operations that answer 501; arrays-of-objects are a JSON textarea |
-| **Federation** | **~30%** | 75/250 assertions, 14/88 top-level (run 7); a user here joins a room hosted elsewhere through the client API, messages flow both ways between two real servers, and the room's history from before the join is fetched as the client scrolls back; in-memory outbound queue, no EDUs, no invites/leaves/knocks over federation |
+| **Federation** | **~30%** | 75/250 assertions, 14/88 top-level (run 7); a user here joins a room hosted elsewhere through the client API, messages flow both ways between two real servers, and the room's history from before the join is fetched as the client scrolls back; the outbound queue survives a restart and is shard-gated; no EDUs, no invites/leaves/knocks over federation |
 | Bridges | ~75% | heisenbridge works end to end both directions (`docs/bridges/heisenbridge.md`); mautrix-whatsapp, added through the wizard, connects and starts in appservice-mode encryption (`docs/bridges/mautrix.md`); all 26 bridge operations are real; no mautrix bridge has carried a message yet, because signing in needs a phone. Not counted: offerings and per-user instances (RFC 0017) are built end to end and have never been run, so they add nothing to the number until they have |
 | Operations (HA, scale-out) | ~50% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; the chart is published from `main` and installs from the registry in one sentence; a standing demo behind a Traefik Ingress with a Let's Encrypt certificate, scraped by Prometheus, its setup page opened in a browser at the public hostname; a locked-out administrator gets back in with `hs recover` run where the key is; readiness withdrawn the moment a shutdown begins; two replicas shared a room on one PostgreSQL in an experiment; the cluster path has never carried real traffic on a cluster; the operator reconciles a `Bridge` into a pod, a Service and a volume in unit tests and has never been run against an API server, and `Homeserver` is still status-only |
 
@@ -755,10 +755,21 @@ What a room joined elsewhere still lacks, in the order a user would notice:
 - **Invites, leaves and knocks over federation** are still seams (`make_leave`/`send_leave`,
   `make_knock`/`send_knock`, `/invite`): a user cannot leave a room hosted elsewhere in a way the
   resident hears about, or be invited into one.
-- **The outbound queue is in memory.** An event sent while the other server is down is retried
-  for as long as this process lives; a restart loses it. `PLAN.md` section 5.2 wants persisted
-  per-destination queues sharded across replicas; the sender is not shard-gated on the cluster
-  either, so two replicas would both send.
+- ~~The outbound queue is in memory.~~ **Done 2026-09-27** (track 06): per-destination queues
+  and retry state are in `hs-kv` (`hs_federation::outbound_store`), a PDU is written before any
+  worker sees it and deleted only when the destination accepted it, and the sender resumes
+  every queued destination at start. `crates/hs-cli/tests/federation_restart.rs` runs two real
+  binaries over TLS: B goes down, alice sends, A shows B failing with one pending, A is killed
+  and restarted over its data directory, the row still says failing since the same moment, B
+  comes back, bob's `/sync` gets the message exactly once. The sender is shard-gated too: only
+  the replica that owns a destination's federation shard sends to it, the others write rows
+  and do not send, and an idle worker rescans the store every ten seconds in cluster mode
+  (scripted ownership in a unit test; a real two-replica handoff has not been watched). What
+  survives is what was queued; a destination that was down for longer than the queue is not
+  caught up from the room (Synapse's `destination_rooms` is the next step). The admin API's
+  destination row merges the client's connection-level record with the sender's persisted
+  retry state, and `reset` clears both; the row has no field for the persisted `last_error`
+  yet (track 15).
 - **Restricted and knock-restricted joins fail across the board** — ten top-level tests, all
   `M_FORBIDDEN: invalid join_authorised_via_users_server`. Tracks 06 and 04.
 - **Another implementation.** Everything above was proven between two instances of this server.
@@ -790,7 +801,7 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | Restricted joins rejected | `hs-federation`, `hs-room` | ten conformance tests, a common room type |
 | A rejoined room's gap is never filled | `hs-room` | history is fetched before the oldest held event; what happened between a leave and a rejoin stays on the resident |
 | The state at a backfilled event is walked, not asked for | `hs-room` | exact while the history is linear and the previous event for each reverted key is within reach; a key set before the fetched history reads as unset until that history arrives; no auth check runs on backfilled events |
-| The outbound federation queue is in memory | `hs-federation` | a restart loses unsent events; two replicas would both send |
+| A destination down for longer than its queue is not caught up from the room | `hs-federation` | what was queued survives a restart and is sent; what was never queued because the destination was already known failing is not re-derived (Synapse's `destination_rooms`) |
 | No EDUs over federation | `hs-federation` | typing, receipts, presence and device-list changes stay local |
 | Invites, leaves and knocks over federation are seams | `hs-federation` | a user cannot leave a remote room audibly, or be invited into one |
 | Federation media fetch broken | `hs-media` | remote avatars and attachments fail |
