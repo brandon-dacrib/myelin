@@ -9,27 +9,44 @@
 //! a remote server that joined a room here was then told nothing about anything that happened in
 //! it afterwards. [`FederationSender`] is the missing half: hand it a PDU and the servers that
 //! should receive it, and each of those servers gets it in a signed transaction, in order, retried
-//! until it is accepted.
+//! until it is accepted -- across restarts of this server.
 //!
 //! # Shape
 //!
-//! - **One worker per destination**, spawned the first time anything is queued for it. The worker
-//!   drains its queue into transactions of at most [`MAX_PDUS_PER_TRANSACTION`] PDUs (the spec's
-//!   resource limit, the same constant `crate::inbound` enforces on receipt), each sent through
+//! - **The store is the source of truth; the channels are the fast path.** A PDU is written to
+//!   the [`OutboundStore`] (one row per destination, one sequence number) before it is handed to
+//!   any worker, and deleted only once its destination has accepted it or this server's own
+//!   policy has refused it. With [`crate::outbound_store::KvOutboundStore`] (what `hs serve`
+//!   uses) that is the same
+//!   backend the room's events live in; with [`InMemoryOutboundStore`] (what
+//!   [`FederationSender::new`] uses) the sender is as volatile as it was before persistence.
+//! - **One worker per destination**, spawned the first time anything is queued for it -- or by
+//!   [`FederationSender::resume`] at start, for every destination the store still holds a queue
+//!   for. A worker first drains what the store holds for its destination (the previous run's
+//!   backlog, oldest first), then follows its channel; a PDU it already delivered from the store
+//!   is recognised by its sequence number when its channel copy arrives, and skipped. It drains
+//!   into transactions of at most [`MAX_PDUS_PER_TRANSACTION`] PDUs (the spec's resource limit,
+//!   the same constant `crate::inbound` enforces on receipt), each sent through
 //!   [`FederationClient::send`] -- so discovery, TLS and CA trust, `X-Matrix` signing, the
-//!   per-destination concurrency limit and the destination backoff records all apply exactly as
-//!   they do to every other outbound call.
+//!   per-destination concurrency limit and the client's destination backoff records all apply
+//!   exactly as they do to every other outbound call.
 //! - **Per-destination ordering is preserved.** A transaction is retried, with the same
 //!   transaction ID (so a receiver that did process it but whose response was lost replays its
 //!   cached answer -- `crate::inbound::TransactionStore`'s contract), until it succeeds; nothing
 //!   queued behind it is sent first. Destinations are independent: a failing destination delays
-//!   nothing but its own queue.
-//! - **Waiting, not spinning.** On [`ClientError::Backoff`] the worker sleeps until the
-//!   destination store says the destination may be tried again (in slices of at most
-//!   [`BACKOFF_POLL_INTERVAL`], so an administrator's reset takes effect promptly). On any other
-//!   retryable failure -- a non-2xx status, a connection or discovery error -- it waits a capped,
-//!   doubling delay ([`SenderConfig`]). Jitter is left to the destination store, which already
-//!   jitters the connection-level backoff the client records.
+//!   nothing but its own queue. Across a restart the transaction ID is new (the receiver may
+//!   see the same PDUs twice, which is harmless: an event it holds is not applied again).
+//! - **The wait between attempts is persisted too.** Every failed attempt records, per
+//!   destination, how many times in a row the head transaction has failed, what went wrong and
+//!   when the next attempt is due ([`OutboundDestinationState`]); a worker that starts after a
+//!   restart waits out what is left of that rather than trying at once, and its backoff carries
+//!   on doubling from where it was. On [`ClientError::Backoff`] -- the client's own
+//!   connection-level judgement, kept in `crate::destination_store` -- the worker sleeps until
+//!   that says the destination may be tried again. Every wait is in slices of at most
+//!   [`BACKOFF_POLL_INTERVAL`], re-reading the store between slices, so an administrator's reset
+//!   ([`FederationSender::reset_destination`], `federation.destinations.reset`) takes effect
+//!   promptly. The doubling delay itself is [`SenderConfig`]; jitter is left to the client's
+//!   store, which jitters the connection-level backoff.
 //! - **A per-PDU `error` in a 200 response is final.** The receiver looked at that event and
 //!   rejected it; sending it again would get the same answer. It is logged at `warn` and not
 //!   retried, matching what the spec says a receiver's per-PDU result means.
@@ -37,15 +54,12 @@
 //!
 //! # What this is not, said loudly
 //!
-//! **The queue is in memory only.** A restart, a crash, or [`FederationSender::shutdown`] loses
-//! every PDU that has not yet been accepted by its destination, and there is no catch-up
-//! afterwards: a remote server that was unreachable across a restart of this one will never be
-//! told about the events it missed. `PLAN.md` section 5.2 item 6 wants per-destination queues
-//! sharded across replicas by destination hash, each persisting its queue state so failover
-//! resumes; Synapse's `destination_rooms` table (which remembers, per destination, the last
-//! stream position successfully sent, so a whole outage can be caught up from the room's own
-//! history) is the behavioural reference. A `KvBackend`-backed queue with that catch-up is the
-//! next step; this module is the first one, and says so rather than pretending otherwise.
+//! **No catch-up from the room.** What survives a restart is what was queued: a PDU the feeder
+//! (`hs_cli::federation_sender`) never handed over -- because the process died between the
+//! event's persistence and the queueing, or because the feeder fell behind the update stream --
+//! is not sent. Synapse's `destination_rooms` table (the last stream position successfully sent
+//! per destination, so a whole outage is caught up from the room's own history) is the
+//! behavioural reference for closing that, and is the next step, not this one.
 //!
 //! **Only PDUs.** EDUs -- typing, presence, receipts, device-list updates, to-device messages,
 //! signing-key updates -- are not sent. There is no `enqueue_edu`: adding one would have cost a
@@ -57,15 +71,25 @@
 //! (`make_leave`/`send_leave`, `make_knock`/`send_knock`) are separate handshakes, not
 //! transactions, and are not initiated here.
 //!
-//! **Not shard-gated.** Every process running a sender sends every PDU it is handed; nothing here
-//! consults `hs-cluster` ownership. In a cluster this does not by itself duplicate traffic --
-//! `hs-cli` feeds this sender from the room registry's update stream, and a room's actor is
-//! resident on exactly the replica that owns its shard -- but a persisted, sharded sender will
-//! need to own the "who sends for this destination" decision explicitly.
+//! # In a cluster
+//!
+//! A [`SendGate`] says which destinations *this* process sends for ([`SendsEverywhere`] unless
+//! [`FederationSender::set_gate`] is given another; `hs-cli` gives it one over `hs-cluster`
+//! ownership of `ShardLayout::federation_shard(destination)`). A PDU for a destination the gate
+//! refuses is still written to the store -- in a cluster the store is shared, and the replica
+//! that owns the destination's shard sends from it -- but no worker is started here, so two
+//! replicas never drain one queue. [`FederationSender::resume`] starts workers for the
+//! destinations the gate allows (the caller runs it again on acquiring a shard), and
+//! [`FederationSender::stop_workers_not_sent_here`] stops those it no longer does (on releasing
+//! or losing one), leaving their rows in the store for the new owner. A worker that is idle
+//! looks at the store again every [`SenderConfig::store_rescan_interval`], if one is set, which
+//! is how rows another replica wrote for a destination this one already sends for are found;
+//! without one (single-node, the default) the store only ever holds what this process wrote
+//! and the channels are enough. The pending counts are this process's workers' alone.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -73,6 +97,9 @@ use tokio::sync::mpsc;
 
 use crate::client::{ClientError, FederationClient};
 use crate::inbound::MAX_PDUS_PER_TRANSACTION;
+use crate::outbound_store::{
+    InMemoryOutboundStore, OutboundDestinationState, OutboundStore, OutboundStoreError,
+};
 
 /// Where an accepted event goes to reach other servers. Implemented by [`FederationSender`];
 /// defined as a trait so the transport server (`crate::transport::FederationState`) and the
@@ -96,6 +123,14 @@ pub struct SenderConfig {
     /// `max_retry_backoff` (`hs-config::FederationConfig::max_retry_backoff`), so the two backoffs
     /// an operator can observe on a destination have the same ceiling.
     pub max_backoff: Duration,
+    /// How often a worker that is waiting out a backoff re-reads the store to see whether an
+    /// administrator has reset it. [`BACKOFF_POLL_INTERVAL`] by default; tests shorten it.
+    pub reset_poll_interval: Duration,
+    /// How long an idle worker waits on its channel before looking at the store again for rows
+    /// it was not handed -- what another replica wrote for its destination, in a cluster over a
+    /// shared store. `None` (the default) never looks: a single process's store holds only what
+    /// its own channels already carried.
+    pub store_rescan_interval: Option<Duration>,
 }
 
 impl Default for SenderConfig {
@@ -103,15 +138,44 @@ impl Default for SenderConfig {
         Self {
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(3600),
+            reset_poll_interval: BACKOFF_POLL_INTERVAL,
+            store_rescan_interval: None,
         }
     }
 }
 
-/// The longest a worker sleeps in one go while its destination is backing off, whatever the
-/// destination store's `retry_at` says. The store is re-read after each slice: an administrator
-/// who resets a destination's backoff (`hs_federation::admin_source`) gets a retry within this
-/// long, not at the end of a possibly hour-long wait. Re-reading costs one store lookup and no
-/// network traffic (`FederationClient::send` refuses before resolving anything).
+/// Which destinations this process sends for. See the module docs' "In a cluster".
+pub trait SendGate: Send + Sync {
+    /// Whether a worker for `destination` belongs in this process right now.
+    fn sends_here(&self, destination: &str) -> bool;
+}
+
+/// The single-process gate: every destination is sent for here.
+pub struct SendsEverywhere;
+
+impl SendGate for SendsEverywhere {
+    fn sends_here(&self, _destination: &str) -> bool {
+        true
+    }
+}
+
+impl SenderConfig {
+    /// The default policy with its ceiling taken from `client`'s `max_retry_backoff`, which is
+    /// what [`FederationSender::new`] uses.
+    #[must_use]
+    pub fn for_client(client: &FederationClient) -> Self {
+        Self {
+            max_backoff: client.max_retry_backoff(),
+            ..Self::default()
+        }
+    }
+}
+
+/// The default [`SenderConfig::reset_poll_interval`]: the longest a worker sleeps in one go
+/// while waiting to retry, whatever the wait is. The stores are re-read after each slice: an
+/// administrator who resets a destination's backoff (`hs_federation::admin_source`) gets a retry
+/// within this long, not at the end of a possibly hour-long wait. Re-reading costs store lookups
+/// and no network traffic (`FederationClient::send` refuses before resolving anything).
 pub const BACKOFF_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The outbound sender. See the module docs. Cheap to share behind an `Arc`; every method takes
@@ -128,6 +192,8 @@ struct Shared {
     client: Arc<FederationClient>,
     own_server_name: String,
     config: SenderConfig,
+    store: Arc<dyn OutboundStore>,
+    gate: RwLock<Arc<dyn SendGate>>,
     /// Transaction IDs are `{started_ms}-{counter}`: unique across restarts (a later start has a
     /// later prefix) and monotonic within one (the counter only grows), which is what the spec
     /// asks of a `txnId` per `(origin, destination)` pair.
@@ -139,9 +205,25 @@ struct Shared {
 }
 
 struct DestinationQueue {
-    tx: mpsc::UnboundedSender<Arc<Value>>,
+    tx: mpsc::UnboundedSender<Queued>,
     pending: Arc<AtomicUsize>,
     worker: tokio::task::AbortHandle,
+}
+
+/// A PDU on its way through a destination's channel, with the sequence number the store gave
+/// it (what lets the worker tell a copy of something it already sent from the store).
+struct Queued {
+    seq: u64,
+    pdu: Arc<Value>,
+}
+
+/// What a failed attempt asks the worker to do before the next one.
+enum Wait {
+    /// Sleep this long, then try again: the client's own backoff said no, and it is the client
+    /// that will say when (so the sleep is one slice and the attempt is the check).
+    For(Duration),
+    /// Wait until this time, watching the store for a reset meanwhile.
+    Until(u64),
 }
 
 /// How one transaction's delivery ended.
@@ -158,18 +240,12 @@ enum Delivery {
 
 impl FederationSender {
     /// A sender for `own_server_name` over `client`, waiting between failed attempts with
-    /// [`SenderConfig::default`] capped at the client's own `max_retry_backoff`.
+    /// [`SenderConfig::for_client`], and keeping its queues in memory only: what is queued is
+    /// lost with the process. `hs serve` uses [`FederationSender::with_store`] instead.
     #[must_use]
     pub fn new(client: Arc<FederationClient>, own_server_name: impl Into<String>) -> Self {
-        let max_backoff = client.max_retry_backoff();
-        Self::with_config(
-            client,
-            own_server_name,
-            SenderConfig {
-                max_backoff,
-                ..SenderConfig::default()
-            },
-        )
+        let config = SenderConfig::for_client(&client);
+        Self::with_config(client, own_server_name, config)
     }
 
     /// [`FederationSender::new`] with an explicit retry policy. Tests use this to make a failing
@@ -180,11 +256,31 @@ impl FederationSender {
         own_server_name: impl Into<String>,
         config: SenderConfig,
     ) -> Self {
+        Self::with_store(
+            client,
+            own_server_name,
+            config,
+            Arc::new(InMemoryOutboundStore::new()),
+        )
+    }
+
+    /// A sender whose queues and retry state live in `store`. With a durable store (a
+    /// [`crate::outbound_store::KvOutboundStore`]) what is queued survives a restart: call
+    /// [`FederationSender::resume`] on the new sender to pick it up.
+    #[must_use]
+    pub fn with_store(
+        client: Arc<FederationClient>,
+        own_server_name: impl Into<String>,
+        config: SenderConfig,
+        store: Arc<dyn OutboundStore>,
+    ) -> Self {
         Self {
             shared: Arc::new(Shared {
                 client,
                 own_server_name: own_server_name.into(),
                 config,
+                store,
+                gate: RwLock::new(Arc::new(SendsEverywhere)),
                 started_ms: now_ms(),
                 txn_counter: AtomicU64::new(0),
                 pending_total: AtomicUsize::new(0),
@@ -200,46 +296,172 @@ impl FederationSender {
         &self.shared.own_server_name
     }
 
+    /// Replaces the gate that says which destinations this process sends for (see the module
+    /// docs' "In a cluster"). Takes effect for workers started from now on; the caller runs
+    /// [`FederationSender::resume`] and [`FederationSender::stop_workers_not_sent_here`] to
+    /// bring the existing ones in line.
+    pub fn set_gate(&self, gate: Arc<dyn SendGate>) {
+        *self
+            .shared
+            .gate
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = gate;
+    }
+
+    /// Stops the worker of every destination the gate no longer allows here, leaving what they
+    /// had queued in the store for whichever replica sends for it now. Returns those
+    /// destinations. What `hs-cli` does on releasing or losing a federation shard.
+    pub fn stop_workers_not_sent_here(&self) -> Vec<String> {
+        let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+        let released: Vec<String> = queues
+            .keys()
+            .filter(|destination| !self.shared.sends_here(destination))
+            .cloned()
+            .collect();
+        for destination in &released {
+            if let Some(queue) = queues.remove(destination) {
+                queue.worker.abort();
+                let left = queue.pending.swap(0, Ordering::AcqRel);
+                sub_saturating(&self.shared.pending_total, left);
+                tracing::info!(
+                    destination,
+                    left_in_store = left,
+                    "this replica no longer sends for the destination; its worker is stopped"
+                );
+            }
+        }
+        released
+    }
+
+    /// Whether what this sender queues outlives the process ([`OutboundStore::durable`]).
+    #[must_use]
+    pub fn is_durable(&self) -> bool {
+        self.shared.store.durable()
+    }
+
+    /// Restores a worker for every destination the store still holds a queue for and the gate
+    /// allows here, so a previous run's unsent PDUs go out, in order, from here. Returns how
+    /// many PDUs were waiting. Idempotent: a destination that already has a worker is left
+    /// alone. Must be called from within a Tokio runtime, like
+    /// [`FederationSender::enqueue_pdu`].
+    ///
+    /// # Errors
+    /// Returns the store's error if the queues cannot be read; nothing was started then.
+    pub fn resume(&self) -> Result<usize, OutboundStoreError> {
+        if self.shared.shut_down.load(Ordering::Acquire) {
+            return Ok(0);
+        }
+        let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+        let backlog = self.shared.store.queued()?;
+        let mut resumed = 0usize;
+        for (destination, count) in backlog {
+            if destination == self.shared.own_server_name
+                || queues.contains_key(&destination)
+                || !self.shared.sends_here(&destination)
+            {
+                continue;
+            }
+            if let Some(queue) = spawn_worker(&self.shared, &destination, count) {
+                tracing::info!(
+                    destination,
+                    pdus = count,
+                    "resuming an outbound federation queue left by a previous run"
+                );
+                resumed += count;
+                queues.insert(destination, queue);
+            }
+        }
+        Ok(resumed)
+    }
+
     /// Queues `pdu` for each server in `destinations` (deduplicated; this server's own name is
-    /// always skipped), starting a destination's worker the first time it is named.
+    /// always skipped), starting a destination's worker the first time it is named -- if the
+    /// gate allows the destination here; otherwise the PDU is only written to the store, for
+    /// the replica that sends for it. The PDU is in the store before this returns.
     ///
     /// Must be called from within a Tokio runtime, since a new destination's worker is spawned on
     /// the current one; outside a runtime the PDU is logged and dropped rather than panicking.
-    /// After [`FederationSender::shutdown`] every call is a logged no-op.
+    /// After [`FederationSender::shutdown`] every call is a logged no-op, as is a store that
+    /// refuses the write (logged at `error`: that is a failing disk, not a normal path).
     pub fn enqueue_pdu(&self, destinations: impl IntoIterator<Item = String>, pdu: Value) {
         if self.shared.shut_down.load(Ordering::Acquire) {
             tracing::debug!("outbound federation sender is shut down; dropping a PDU");
             return;
         }
-        let pdu = Arc::new(pdu);
         let mut seen = HashSet::new();
+        let destinations: Vec<String> = destinations
+            .into_iter()
+            .filter(|destination| {
+                !destination.is_empty()
+                    && *destination != self.shared.own_server_name
+                    && seen.insert(destination.clone())
+            })
+            .collect();
+        if destinations.is_empty() {
+            return;
+        }
         let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+        // Workers first, counting whatever the store already holds for a destination that has
+        // none yet (a queue `resume` was not asked about), and only then the write: under the
+        // one lock, so a PDU is counted exactly once, either as backlog or as this enqueue.
+        let mut targets = Vec::with_capacity(destinations.len());
         for destination in destinations {
-            if destination.is_empty()
-                || destination == self.shared.own_server_name
-                || !seen.insert(destination.clone())
-            {
-                continue;
-            }
-            let queue = match queues.entry(destination.clone()) {
-                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    match spawn_worker(&self.shared, &destination) {
-                        Some(queue) => slot.insert(queue),
-                        None => continue,
+            if !queues.contains_key(&destination) && self.shared.sends_here(&destination) {
+                let backlog = match self.shared.store.queue_len(&destination) {
+                    Ok(count) => count,
+                    Err(error) => {
+                        tracing::error!(destination, %error, "cannot read the outbound queue");
+                        0
                     }
+                };
+                match spawn_worker(&self.shared, &destination, backlog) {
+                    Some(queue) => {
+                        queues.insert(destination.clone(), queue);
+                    }
+                    None => continue,
                 }
+            }
+            targets.push(destination);
+        }
+        if targets.is_empty() {
+            return;
+        }
+        let seq = match self.shared.store.enqueue(&targets, &pdu) {
+            Ok(seq) => seq,
+            Err(error) => {
+                tracing::error!(
+                    destinations = ?targets,
+                    %error,
+                    "could not persist an outbound PDU; it will not be sent"
+                );
+                return;
+            }
+        };
+        let pdu = Arc::new(pdu);
+        for destination in targets {
+            let Some(queue) = queues.get(&destination) else {
+                tracing::debug!(
+                    destination,
+                    seq,
+                    "queued a PDU for a destination another replica sends for"
+                );
+                continue;
             };
             queue.pending.fetch_add(1, Ordering::AcqRel);
             self.shared.pending_total.fetch_add(1, Ordering::AcqRel);
-            if queue.tx.send(pdu.clone()).is_err() {
+            let queued = Queued {
+                seq,
+                pdu: pdu.clone(),
+            };
+            if queue.tx.send(queued).is_err() {
                 // The worker is gone (aborted by `shutdown`, racing this call). Undo the count;
                 // the shut-down check at the top makes this a narrow window, not a normal path.
+                // The row stays in the store for the next start.
                 queue.pending.fetch_sub(1, Ordering::AcqRel);
                 self.shared.pending_total.fetch_sub(1, Ordering::AcqRel);
                 tracing::debug!(
                     destination,
-                    "outbound federation worker is gone; dropping a PDU"
+                    "outbound federation worker is gone; the PDU waits in the store"
                 );
             }
         }
@@ -277,22 +499,62 @@ impl FederationSender {
         all
     }
 
-    /// Stops every worker at once, abandoning whatever is queued (logged at `warn` with the
-    /// count, because it is lost -- see the module docs). Idempotent; `enqueue_pdu` is a no-op
-    /// afterwards.
+    /// The persisted retry state of every destination a transaction was ever attempted for,
+    /// sorted by name. What the admin API shows alongside the client's own backoff records.
+    ///
+    /// # Errors
+    /// Returns the store's error.
+    pub fn destination_states(
+        &self,
+    ) -> Result<Vec<(String, OutboundDestinationState)>, OutboundStoreError> {
+        self.shared.store.states()
+    }
+
+    /// One destination's persisted retry state, if a transaction was ever attempted for it.
+    ///
+    /// # Errors
+    /// Returns the store's error.
+    pub fn destination_state(
+        &self,
+        destination: &str,
+    ) -> Result<Option<OutboundDestinationState>, OutboundStoreError> {
+        self.shared.store.state(destination)
+    }
+
+    /// Forgets `destination`'s persisted backoff, so its worker -- which re-reads the store
+    /// between slices of its wait -- tries again within [`BACKOFF_POLL_INTERVAL`]. What
+    /// `federation.destinations.reset` does, together with the client's own store.
+    ///
+    /// # Errors
+    /// Returns the store's error.
+    pub fn reset_destination(&self, destination: &str) -> Result<(), OutboundStoreError> {
+        self.shared.store.reset(destination)
+    }
+
+    /// Stops every worker at once. What is still queued stays in a durable store for the next
+    /// start (logged at `info` with the count); in an in-memory store it is lost (logged at
+    /// `warn`). Idempotent; `enqueue_pdu` is a no-op afterwards.
     pub fn shutdown(&self) {
         self.shared.shut_down.store(true, Ordering::Release);
         let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
         for (_, queue) in queues.drain() {
             queue.worker.abort();
         }
-        let lost = self.shared.pending_total.swap(0, Ordering::AcqRel);
-        if lost > 0 {
-            tracing::warn!(
-                lost,
-                "outbound federation sender stopped with PDUs still queued; they are lost (the \
-                 queue is in memory only)"
-            );
+        let left = self.shared.pending_total.swap(0, Ordering::AcqRel);
+        if left > 0 {
+            if self.shared.store.durable() {
+                tracing::info!(
+                    queued = left,
+                    "outbound federation sender stopped with PDUs still queued; they are kept \
+                     for the next start"
+                );
+            } else {
+                tracing::warn!(
+                    lost = left,
+                    "outbound federation sender stopped with PDUs still queued; they are lost \
+                     (this sender's queue is in memory only)"
+                );
+            }
         }
     }
 }
@@ -318,7 +580,13 @@ impl OutboundPduSink for FederationSender {
     }
 }
 
-fn spawn_worker(shared: &Arc<Shared>, destination: &str) -> Option<DestinationQueue> {
+/// Starts `destination`'s worker with `backlog` PDUs already in the store for it (counted as
+/// pending from the start; the worker sends them first).
+fn spawn_worker(
+    shared: &Arc<Shared>,
+    destination: &str,
+    backlog: usize,
+) -> Option<DestinationQueue> {
     let runtime = match tokio::runtime::Handle::try_current() {
         Ok(handle) => handle,
         Err(_) => {
@@ -330,7 +598,8 @@ fn spawn_worker(shared: &Arc<Shared>, destination: &str) -> Option<DestinationQu
         }
     };
     let (tx, rx) = mpsc::unbounded_channel();
-    let pending = Arc::new(AtomicUsize::new(0));
+    let pending = Arc::new(AtomicUsize::new(backlog));
+    shared.pending_total.fetch_add(backlog, Ordering::AcqRel);
     let worker = runtime
         .spawn(run_worker(
             shared.clone(),
@@ -346,35 +615,87 @@ fn spawn_worker(shared: &Arc<Shared>, destination: &str) -> Option<DestinationQu
     })
 }
 
-/// One destination's loop: take everything queued (up to a transaction's worth), deliver it,
-/// repeat. Ends when the queue's sending half is dropped (the sender was dropped) or on
-/// [`Delivery::ShutDown`].
+/// One destination's loop: first what the store holds for it (a previous run's backlog, or
+/// what was written before this worker's first look), then its channel; each batch delivered,
+/// acknowledged in the store, repeat. With a [`SenderConfig::store_rescan_interval`], an idle
+/// channel sends it back to the store that often. Ends when the queue's sending half is dropped
+/// (the sender was dropped) or on [`Delivery::ShutDown`].
 async fn run_worker(
     shared: Arc<Shared>,
     destination: String,
     pending: Arc<AtomicUsize>,
-    mut rx: mpsc::UnboundedReceiver<Arc<Value>>,
+    mut rx: mpsc::UnboundedReceiver<Queued>,
 ) {
-    while let Some(first) = rx.recv().await {
-        let mut batch = vec![first];
-        while batch.len() < MAX_PDUS_PER_TRANSACTION {
-            match rx.try_recv() {
-                Ok(pdu) => batch.push(pdu),
-                Err(_) => break,
+    // Everything with a sequence number up to here has left the store; a channel copy of it is
+    // a duplicate.
+    let mut acked_through: u64 = 0;
+    loop {
+        // What the store holds, oldest first, until it holds nothing.
+        loop {
+            let batch = match shared.store.peek(&destination, MAX_PDUS_PER_TRANSACTION) {
+                Ok(batch) => batch,
+                Err(error) => {
+                    tracing::error!(
+                        destination,
+                        %error,
+                        "cannot read the outbound queue; sending what arrives from here on"
+                    );
+                    break;
+                }
+            };
+            let Some(last) = batch.last() else {
+                break;
+            };
+            let through = last.seq;
+            let pdus: Vec<Arc<Value>> = batch.into_iter().map(|row| Arc::new(row.pdu)).collect();
+            if let Delivery::ShutDown = shared.send_batch(&destination, &pdus).await {
+                return;
             }
+            shared.settle(&destination, through, pdus.len(), &pending);
+            acked_through = through;
         }
-        let count = batch.len();
-        let txn_id = shared.next_txn_id();
-        let outcome = shared.deliver(&destination, &txn_id, &batch).await;
-        pending.fetch_sub(count, Ordering::AcqRel);
-        shared.pending_total.fetch_sub(count, Ordering::AcqRel);
-        if let Delivery::ShutDown = outcome {
-            return;
+        // Then the channel, until it closes or has been quiet for a rescan interval.
+        loop {
+            let first = match shared.config.store_rescan_interval {
+                None => rx.recv().await,
+                Some(interval) => match tokio::time::timeout(interval, rx.recv()).await {
+                    Ok(received) => received,
+                    Err(_elapsed) => break,
+                },
+            };
+            let Some(first) = first else {
+                return;
+            };
+            if first.seq <= acked_through {
+                continue;
+            }
+            let mut batch = vec![first];
+            while batch.len() < MAX_PDUS_PER_TRANSACTION {
+                match rx.try_recv() {
+                    Ok(queued) if queued.seq <= acked_through => {}
+                    Ok(queued) => batch.push(queued),
+                    Err(_) => break,
+                }
+            }
+            let through = batch.last().map_or(acked_through, |queued| queued.seq);
+            let pdus: Vec<Arc<Value>> = batch.into_iter().map(|queued| queued.pdu).collect();
+            if let Delivery::ShutDown = shared.send_batch(&destination, &pdus).await {
+                return;
+            }
+            shared.settle(&destination, through, pdus.len(), &pending);
+            acked_through = through;
         }
     }
 }
 
 impl Shared {
+    fn sends_here(&self, destination: &str) -> bool {
+        self.gate
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .sends_here(destination)
+    }
+
     fn next_txn_id(&self) -> String {
         let n = self.txn_counter.fetch_add(1, Ordering::AcqRel) + 1;
         format!("{}-{n}", self.started_ms)
@@ -390,6 +711,84 @@ impl Shared {
             .min(self.config.max_backoff)
     }
 
+    /// One transaction, as a new transaction ID, until it is delivered or dropped.
+    async fn send_batch(&self, destination: &str, pdus: &[Arc<Value>]) -> Delivery {
+        let txn_id = self.next_txn_id();
+        self.deliver(destination, &txn_id, pdus).await
+    }
+
+    /// Takes a delivered (or dropped) batch out of the store and the pending counts.
+    fn settle(&self, destination: &str, through: u64, count: usize, pending: &AtomicUsize) {
+        let removed = match self.store.ack(destination, through) {
+            Ok(removed) => removed,
+            Err(error) => {
+                tracing::error!(
+                    destination,
+                    through,
+                    %error,
+                    "could not remove delivered PDUs from the outbound queue; they may be sent \
+                     again after a restart"
+                );
+                count
+            }
+        };
+        // What the store had for this batch is what was counted pending for it: at enqueue, or
+        // as backlog when the worker started. A row that no longer decoded was counted and
+        // removed but never sent, and comes off here too.
+        let settled = removed.max(count);
+        sub_saturating(pending, settled);
+        sub_saturating(&self.pending_total, settled);
+    }
+
+    /// The persisted retry state for `destination`, or the default; a store that cannot be read
+    /// is logged and treated as empty.
+    fn state_of(&self, destination: &str) -> OutboundDestinationState {
+        match self.store.state(destination) {
+            Ok(state) => state.unwrap_or_default(),
+            Err(error) => {
+                tracing::error!(destination, %error, "cannot read the outbound retry state");
+                OutboundDestinationState::default()
+            }
+        }
+    }
+
+    /// Sleeps until `until_ms`, in slices of at most the configured poll interval, giving up
+    /// early when the store no longer says to wait (an administrator's reset). Returns `false`
+    /// if the sender was shut down meanwhile.
+    async fn wait_until(&self, destination: &str, until_ms: u64) -> bool {
+        let slice = self.config.reset_poll_interval;
+        loop {
+            if self.shut_down.load(Ordering::Acquire) {
+                return false;
+            }
+            let now = now_ms();
+            if now >= until_ms {
+                return true;
+            }
+            let remaining = Duration::from_millis(until_ms - now);
+            tokio::time::sleep(remaining.min(slice)).await;
+            if remaining <= slice {
+                return !self.shut_down.load(Ordering::Acquire);
+            }
+            if self.state_of(destination).is_ready(now_ms()) {
+                tracing::info!(
+                    destination,
+                    "outbound backoff was reset while waiting; trying now"
+                );
+                return true;
+            }
+        }
+    }
+
+    fn record_failure(&self, destination: &str, error: &str, next_attempt_ms: u64) {
+        if let Err(store_error) = self
+            .store
+            .record_failure(destination, error, next_attempt_ms)
+        {
+            tracing::error!(destination, error = %store_error, "cannot record an outbound failure");
+        }
+    }
+
     /// Sends one transaction until the destination accepts it, this server's own policy refuses
     /// it, or the sender is shut down. See the module docs for the retry rules.
     async fn deliver(&self, destination: &str, txn_id: &str, pdus: &[Arc<Value>]) -> Delivery {
@@ -400,12 +799,29 @@ impl Shared {
             "pdus": pdus.iter().map(|pdu| (**pdu).clone()).collect::<Vec<Value>>(),
             "edus": [],
         });
-        let mut failures: u32 = 0;
+        // Where a previous run left this destination: its run of failures carries on from
+        // there, and what is left of its wait is waited out first.
+        let persisted = self.state_of(destination);
+        let mut failures: u32 = persisted.failures;
+        if let Some(next_attempt) = persisted.next_attempt_ms
+            && next_attempt > now_ms()
+        {
+            tracing::info!(
+                destination,
+                txn_id,
+                failures,
+                next_attempt_ms = next_attempt,
+                "destination was failing before this start; waiting out its backoff"
+            );
+            if !self.wait_until(destination, next_attempt).await {
+                return Delivery::ShutDown;
+            }
+        }
         loop {
             if self.shut_down.load(Ordering::Acquire) {
                 return Delivery::ShutDown;
             }
-            let delay = match self
+            let wait = match self
                 .client
                 .send(destination, "PUT", &path, Some(&body))
                 .await
@@ -418,6 +834,9 @@ impl Shared {
                         pdus = pdus.len(),
                         "federation transaction accepted"
                     );
+                    if let Err(error) = self.store.record_success(destination) {
+                        tracing::error!(destination, %error, "cannot record an outbound success");
+                    }
                     return Delivery::Delivered;
                 }
                 Ok(response) => {
@@ -431,15 +850,18 @@ impl Shared {
                         retry_in_ms = delay.as_millis() as u64,
                         "federation transaction rejected; will retry"
                     );
-                    delay
+                    let until = now_ms().saturating_add(delay.as_millis() as u64);
+                    let error = format!("HTTP {}: {}", response.status, response.body);
+                    self.record_failure(destination, &error, until);
+                    Wait::Until(until)
                 }
                 Err(ClientError::Backoff { retry_at_ms, .. }) => {
-                    // The destination store's judgement, not this loop's: wait it out (in
-                    // slices, so a reset is noticed) without counting it as another failure of
-                    // this transaction.
+                    // The client's destination store's judgement, not this loop's: wait it out
+                    // (in slices, so a reset of that store is noticed) without counting it as
+                    // another failure of this transaction.
                     let remaining = Duration::from_millis(retry_at_ms.saturating_sub(now_ms()));
                     let floor = self.config.initial_backoff;
-                    let ceiling = BACKOFF_POLL_INTERVAL.max(floor);
+                    let ceiling = self.config.reset_poll_interval.max(floor);
                     let delay = remaining.max(floor).min(ceiling);
                     tracing::debug!(
                         destination,
@@ -448,7 +870,7 @@ impl Shared {
                         sleeping_ms = delay.as_millis() as u64,
                         "destination is backing off; waiting"
                     );
-                    delay
+                    Wait::For(delay)
                 }
                 Err(
                     error @ (ClientError::Disabled
@@ -476,10 +898,21 @@ impl Shared {
                         retry_in_ms = delay.as_millis() as u64,
                         "federation transaction failed; will retry"
                     );
-                    delay
+                    let until = now_ms().saturating_add(delay.as_millis() as u64);
+                    self.record_failure(destination, &error.to_string(), until);
+                    Wait::Until(until)
                 }
             };
-            tokio::time::sleep(delay).await;
+            let keep_going = match wait {
+                Wait::For(delay) => {
+                    tokio::time::sleep(delay).await;
+                    !self.shut_down.load(Ordering::Acquire)
+                }
+                Wait::Until(until) => self.wait_until(destination, until).await,
+            };
+            if !keep_going {
+                return Delivery::ShutDown;
+            }
         }
     }
 
@@ -505,6 +938,14 @@ impl Shared {
     }
 }
 
+/// `counter -= n`, stopping at zero: a count that is only ever an operator's number must never
+/// wrap.
+fn sub_saturating(counter: &AtomicUsize, n: usize) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_sub(n))
+    });
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -518,10 +959,12 @@ mod tests {
     use crate::client::ClientConfig;
     use crate::destination_store::{DestinationState, DestinationStore, InMemoryDestinationStore};
     use crate::discovery::{AddrResolver, SrvResolver, WellKnownFetcher, WellKnownOutcome};
+    use crate::outbound_store::KvOutboundStore;
     use async_trait::async_trait;
     use axum::extract::{Request, State};
     use axum::middleware::Next;
     use axum::response::Response;
+    use hs_kv::memory::MemoryBackend;
     use hs_model::signing::SigningKeyPair;
     use hs_testkit::fake_federation::{CannedResponse, FakeFederationPeer};
     use std::net::{IpAddr, Ipv4Addr};
@@ -579,6 +1022,8 @@ mod tests {
         SenderConfig {
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(1),
+            reset_poll_interval: Duration::from_millis(50),
+            store_rescan_interval: None,
         }
     }
 
@@ -605,6 +1050,12 @@ mod tests {
     /// for it and the recorded `Authorization` headers.
     async fn spawn_peer(peer: &FakeFederationPeer) -> (String, AuthLog) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        spawn_peer_on(peer, listener)
+    }
+
+    /// [`spawn_peer`] on a socket the test already bound, for a peer that has to come up on a
+    /// port a sender was already given.
+    fn spawn_peer_on(peer: &FakeFederationPeer, listener: TcpListener) -> (String, AuthLog) {
         let port = listener.local_addr().unwrap().port();
         let log: AuthLog = Arc::new(Mutex::new(Vec::new()));
         let app = peer.router().layer(axum::middleware::from_fn_with_state(
@@ -765,6 +1216,7 @@ mod tests {
             SenderConfig {
                 initial_backoff: Duration::from_millis(500),
                 max_backoff: Duration::from_secs(1),
+                ..fast()
             },
         );
 
@@ -876,6 +1328,7 @@ mod tests {
             SenderConfig {
                 initial_backoff: Duration::from_millis(50),
                 max_backoff: Duration::from_secs(1),
+                ..fast()
             },
         );
 
@@ -933,7 +1386,11 @@ mod tests {
             config: SenderConfig {
                 initial_backoff: Duration::from_millis(100),
                 max_backoff: Duration::from_millis(1000),
+                reset_poll_interval: BACKOFF_POLL_INTERVAL,
+                store_rescan_interval: None,
             },
+            store: Arc::new(InMemoryOutboundStore::new()),
+            gate: RwLock::new(Arc::new(SendsEverywhere)),
             started_ms: 0,
             txn_counter: AtomicU64::new(0),
             pending_total: AtomicUsize::new(0),
@@ -946,5 +1403,263 @@ mod tests {
         assert_eq!(shared.backoff(40), Duration::from_millis(1000));
         assert_eq!(shared.next_txn_id(), "0-1");
         assert_eq!(shared.next_txn_id(), "0-2");
+    }
+
+    /// The restart: a sender over a durable store fails to reach a destination and is shut
+    /// down with PDUs queued; a new sender over the same backend resumes them and they arrive,
+    /// in order, once the destination is up. The retry state is what the first sender left.
+    #[tokio::test]
+    async fn what_was_queued_is_sent_by_the_next_sender_over_the_same_store_in_order() {
+        // A port nothing listens on yet: the first sender's attempts fail at connect.
+        let reserved = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+        let destination = format!("localhost:{port}");
+        let backend = MemoryBackend::new();
+        let store: Arc<dyn OutboundStore> =
+            Arc::new(KvOutboundStore::open(backend.clone()).unwrap());
+
+        let first = FederationSender::with_store(client(), US, fast(), store.clone());
+        assert!(first.is_durable());
+        for i in 0..3 {
+            first.enqueue_pdu([destination.clone()], pdu(i));
+        }
+        assert_eq!(first.pending_pdus(), 3);
+        assert!(
+            wait_for(Duration::from_secs(10), || {
+                first
+                    .destination_state(&destination)
+                    .unwrap()
+                    .is_some_and(|state| state.failures >= 1)
+            })
+            .await
+        );
+        let before = first.destination_state(&destination).unwrap().unwrap();
+        assert!(before.last_error.is_some(), "{before:?}");
+        assert!(before.failing_since_ms.is_some());
+        assert!(before.next_attempt_ms.is_some());
+        first.shutdown();
+        assert_eq!(first.pending_pdus(), 0);
+        assert_eq!(store.queued().unwrap(), vec![(destination.clone(), 3)]);
+        drop(first);
+
+        // The destination comes up; a new sender over the same backend is the restart.
+        let peer = FakeFederationPeer::new("peer.example.org");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        spawn_peer_on(&peer, listener);
+        let second = FederationSender::with_store(
+            client(),
+            US,
+            fast(),
+            Arc::new(KvOutboundStore::open(backend).unwrap()),
+        );
+        assert_eq!(second.pending_pdus(), 0);
+        assert_eq!(second.resume().unwrap(), 3);
+        assert_eq!(second.pending_pdus(), 3);
+        assert_eq!(
+            second.pending_by_destination(),
+            vec![(destination.clone(), 3)]
+        );
+        assert_eq!(
+            second.resume().unwrap(),
+            0,
+            "resuming twice starts nothing twice"
+        );
+        assert!(wait_for(Duration::from_secs(10), || second.pending_pdus() == 0).await);
+
+        let requests = peer.requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        let pdus = requests[0].body["pdus"].as_array().unwrap();
+        assert_eq!(pdus.len(), 3);
+        for (i, pdu) in pdus.iter().enumerate() {
+            assert_eq!(pdu["i"], i);
+        }
+        let after = second.destination_state(&destination).unwrap().unwrap();
+        assert_eq!(after.failures, 0, "{after:?}");
+        assert!(after.last_success_ms.is_some());
+        assert!(after.failing_since_ms.is_none());
+        assert!(store.queued().unwrap().is_empty());
+        assert!(store.peek(&destination, 50).unwrap().is_empty());
+    }
+
+    /// What the previous run recorded as "not before then" is honoured by the next, and an
+    /// administrator's reset ends the wait within one poll interval.
+    #[tokio::test]
+    async fn a_persisted_backoff_is_waited_out_after_a_restart_and_a_reset_ends_it_early() {
+        let peer = FakeFederationPeer::new("peer.example.org");
+        let (destination, _auth) = spawn_peer(&peer).await;
+        let store: Arc<dyn OutboundStore> = Arc::new(InMemoryOutboundStore::new());
+        store
+            .enqueue(std::slice::from_ref(&destination), &pdu(0))
+            .unwrap();
+        store
+            .record_failure(&destination, "connection refused", now_ms() + 3_600_000)
+            .unwrap();
+
+        let sender = FederationSender::with_store(client(), US, fast(), store.clone());
+        assert_eq!(sender.resume().unwrap(), 1);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            peer.requests().is_empty(),
+            "sent during a backoff that was not over"
+        );
+        assert_eq!(sender.pending_pdus(), 1);
+
+        sender.reset_destination(&destination).unwrap();
+        assert!(wait_for(Duration::from_secs(5), || sender.pending_pdus() == 0).await);
+        assert_eq!(peer.requests().len(), 1);
+        let state = sender.destination_state(&destination).unwrap().unwrap();
+        assert_eq!(state.failures, 0);
+        assert!(state.last_success_ms.is_some());
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some("connection refused"),
+            "the last error is history, not cleared by a reset"
+        );
+    }
+
+    /// A queue in the store for a destination `resume` was never asked about (or that a
+    /// previous worker left behind) goes out first, before what is queued now.
+    #[tokio::test]
+    async fn a_backlog_the_sender_was_not_told_about_goes_out_before_what_is_queued_now() {
+        let peer = FakeFederationPeer::new("peer.example.org");
+        let (destination, _auth) = spawn_peer(&peer).await;
+        let store: Arc<dyn OutboundStore> = Arc::new(InMemoryOutboundStore::new());
+        store
+            .enqueue(std::slice::from_ref(&destination), &pdu(0))
+            .unwrap();
+        store
+            .enqueue(std::slice::from_ref(&destination), &pdu(1))
+            .unwrap();
+
+        let sender = FederationSender::with_store(client(), US, fast(), store.clone());
+        sender.enqueue_pdu([destination.clone()], pdu(2));
+        assert_eq!(
+            sender.pending_pdus(),
+            3,
+            "the backlog counts as pending too"
+        );
+        assert!(wait_for(Duration::from_secs(10), || sender.pending_pdus() == 0).await);
+
+        let sent: Vec<u64> = peer
+            .requests()
+            .iter()
+            .flat_map(|request| request.body["pdus"].as_array().cloned().unwrap_or_default())
+            .map(|pdu| pdu["i"].as_u64().unwrap())
+            .collect();
+        assert_eq!(sent, vec![0, 1, 2]);
+        assert!(store.queued().unwrap().is_empty());
+        assert_eq!(sender.pending_by_destination(), vec![(destination, 0)]);
+    }
+
+    /// A gate scripted by the test: the set of destinations sent for here.
+    struct Only(Mutex<HashSet<String>>);
+    impl SendGate for Only {
+        fn sends_here(&self, destination: &str) -> bool {
+            self.0.lock().unwrap().contains(destination)
+        }
+    }
+
+    /// A destination the gate refuses here is written to the store and left there: no worker,
+    /// nothing pending, nothing sent -- until the gate allows it and `resume` is run.
+    #[tokio::test]
+    async fn a_destination_another_replica_sends_for_is_stored_but_not_sent_from_here() {
+        let peer = FakeFederationPeer::new("peer.example.org");
+        let (destination, _auth) = spawn_peer(&peer).await;
+        let store: Arc<dyn OutboundStore> = Arc::new(InMemoryOutboundStore::new());
+        let gate = Arc::new(Only(Mutex::new(HashSet::new())));
+        let sender = FederationSender::with_store(client(), US, fast(), store.clone());
+        sender.set_gate(gate.clone());
+
+        sender.enqueue_pdu([destination.clone()], pdu(0));
+        assert_eq!(sender.pending_pdus(), 0);
+        assert!(sender.pending_by_destination().is_empty());
+        assert_eq!(store.queued().unwrap(), vec![(destination.clone(), 1)]);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            peer.requests().is_empty(),
+            "sent from a replica that does not own it"
+        );
+        // Neither does resuming start it.
+        assert_eq!(sender.resume().unwrap(), 0);
+
+        // The shard is this replica's now.
+        gate.0.lock().unwrap().insert(destination.clone());
+        assert_eq!(sender.resume().unwrap(), 1);
+        assert_eq!(sender.pending_pdus(), 1);
+        assert!(wait_for(Duration::from_secs(10), || sender.pending_pdus() == 0).await);
+        assert_eq!(peer.requests().len(), 1);
+        assert!(store.queued().unwrap().is_empty());
+    }
+
+    /// Losing a destination stops its worker mid-retry and leaves its queue in the store.
+    #[tokio::test]
+    async fn losing_a_destination_stops_its_worker_and_leaves_its_queue_in_the_store() {
+        let peer = FakeFederationPeer::new("peer.example.org");
+        for _ in 0..50 {
+            peer.queue_response(CannedResponse::new(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({}),
+            ));
+        }
+        let (destination, _auth) = spawn_peer(&peer).await;
+        let store: Arc<dyn OutboundStore> = Arc::new(InMemoryOutboundStore::new());
+        let gate = Arc::new(Only(Mutex::new(HashSet::from([destination.clone()]))));
+        let sender = FederationSender::with_store(client(), US, fast(), store.clone());
+        sender.set_gate(gate.clone());
+
+        sender.enqueue_pdu([destination.clone()], pdu(0));
+        assert_eq!(sender.pending_pdus(), 1);
+        assert!(wait_for(Duration::from_secs(10), || peer.request_count() >= 2).await);
+        // The gate flips while the worker is retrying.
+        gate.0.lock().unwrap().clear();
+        assert_eq!(
+            sender.stop_workers_not_sent_here(),
+            vec![destination.clone()]
+        );
+        assert_eq!(sender.pending_pdus(), 0);
+        assert!(sender.pending_by_destination().is_empty());
+        let attempts = peer.request_count();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(peer.request_count(), attempts, "the worker kept retrying");
+        assert_eq!(store.queued().unwrap(), vec![(destination.clone(), 1)]);
+        assert!(sender.stop_workers_not_sent_here().is_empty());
+    }
+
+    /// A row another replica wrote for a destination this one already has a worker for is found
+    /// by the rescan, not left until something local is queued for it.
+    #[tokio::test]
+    async fn a_row_written_behind_the_workers_back_is_found_by_the_rescan() {
+        let peer = FakeFederationPeer::new("peer.example.org");
+        let (destination, _auth) = spawn_peer(&peer).await;
+        let store: Arc<dyn OutboundStore> = Arc::new(InMemoryOutboundStore::new());
+        let sender = FederationSender::with_store(
+            client(),
+            US,
+            SenderConfig {
+                store_rescan_interval: Some(Duration::from_millis(50)),
+                ..fast()
+            },
+            store.clone(),
+        );
+        sender.enqueue_pdu([destination.clone()], pdu(0));
+        assert!(wait_for(Duration::from_secs(10), || sender.pending_pdus() == 0).await);
+        assert_eq!(peer.request_count(), 1);
+
+        // The other replica's write: straight into the store, past this sender.
+        store
+            .enqueue(std::slice::from_ref(&destination), &pdu(1))
+            .unwrap();
+        assert!(wait_for(Duration::from_secs(10), || peer.request_count() == 2).await);
+        let second = &peer.requests()[1];
+        assert_eq!(second.body["pdus"][0]["i"], 1);
+        assert!(store.queued().unwrap().is_empty());
+        assert_eq!(
+            sender.pending_pdus(),
+            0,
+            "never counted here, never negative"
+        );
     }
 }
