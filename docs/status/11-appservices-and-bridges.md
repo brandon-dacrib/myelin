@@ -1,8 +1,149 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-09-27 (the bridge manager, below); before that 2026-09-25.
+Last updated: 2026-09-27 (RFC 0017 run against the real binary, below); before that 2026-09-27
+(the bridge manager) and 2026-09-25.
 
-**The bridge manager exists, and nothing has run it** (RFC 0017 section 4.1 to 4.3,
+**RFC 0017 runs end to end against the real binary** (`docs/next-steps.md` item 1). Everything
+below marked *ran* was watched happening over the bound socket of a real `hs serve`; everything
+marked *written* is code and documentation that a test does not yet reach.
+
+Ran, in `crates/hs-cli/tests/bridge_offerings.rs` (three tests, in-process `spawn_serve`, the
+admin API as the interface calls it, the client API as a Matrix client calls it, and the
+appservice API the server delivers to; `cargo test -p hs-cli --test bridge_offerings`):
+
+- `an_offering_takes_an_instance_from_requested_to_ready_and_removes_it_again`: no cluster, so
+  `GET /bridge-deployment-target` says `available: false` with the reason and `PUT` with
+  `runtime: cluster` is a `400` at `/runtime` saying why. Before the first offering the manager's
+  registration (`myelin-bridges`) reserves `@bridges` alone and the users list holds the
+  administrator and alice, nobody else; `PUT /bridge-offerings/mautrix-whatsapp` (elsewhere,
+  everyone) grows the namespace to `@bridges` and `@whatsappbot` and the two bot accounts appear,
+  attributed to `myelin-bridges`. `PUT .../instances/@alice:example.org` (a remote user and `_`
+  are refused) is `requested` and walks to `registered` (its registration `whatsapp-alice` in
+  `appservices.list`, tagged `io.myelin.bridge_instance: @alice:example.org`, namespaces
+  `@whatsapp_alice_.*`, `@whatsappbot_alice`, non-exclusive `@alice`) and `starting` (reason:
+  waiting for someone to run it). `POST .../files` carries the instance's tokens, the server's
+  **bound** address (there is no `public_baseurl`), alice as `admin` in `permissions`, and the
+  registration the registry holds. An axum stand-in answering `/_matrix/app/v1/ping` with the
+  instance's `hs_token` is patched into the registration's `url` (`appservices.update`) and the
+  manager's next ping takes the instance to `ready` (`ready_at`, `health: healthy`,
+  `last_ping_at`); alice's `/sync` shows the invitation from `@whatsappbot_alice` with
+  `is_direct`, the chat holds the sign-in steps (`login qr`), her `m.direct` names the room
+  (written through double puppeting), and the stand-in was sent her join. `DELETE` the instance:
+  `404`, registration gone, the instance's tokens refused by the client API, the bot account
+  still an account. `DELETE` the offering: the namespace back to `@bridges`, offerings empty.
+- `a_person_gets_a_bridge_by_messaging_its_front_door_and_the_manager_bot_takes_commands`: an
+  offering open to alice only. Alice invites `@whatsappbot` to a direct chat; the server delivers
+  the invite to `/_myelin/bridges/_matrix/app/v1/transactions/{txn}` over loopback
+  (`myelin-bridges` is `healthy` afterwards), the bot joins and says an administrator runs
+  WhatsApp bridges here and it has asked for one; an instance exists for her; "hello?" gets
+  "still being set up (starting)" and no second instance. Bob invites it and is told once,
+  politely, that it is not available to his account; two more messages get nothing. The
+  stand-in is registered, the instance goes `ready`, the DM invitation arrives and the front
+  door says "Your WhatsApp bridge is ready. I've invited you to a chat with
+  @whatsappbot_alice...". `@bridges`, invited, explains itself; `list` says
+  `- WhatsApp: \`start whatsapp\` (yours: ready)`, `status` says `- WhatsApp: ready`,
+  `stop whatsapp` asks for `confirm` and changes nothing, `stop whatsapp confirm` removes the
+  instance and its registration, `status` then says there are none, `start whatsapp` asks for
+  one again, `start pigeons` and `stop signal` ask which one; bob's `list` offers nothing.
+- `a_shared_offering_has_its_one_instance_from_the_start_and_heisenbridge_runs_from_its_files`:
+  `PUT /bridge-offerings/heisenbridge` answers `mode: shared`, no front door, and one instance
+  with `user_id: null`; `.../instances/_` reaches `starting` as `heisenbridge`
+  (`@heisenbridge`), its files have no `config.yaml`, and its Compose command names no owner.
+  **heisenbridge 1.15.4 (`pip install heisenbridge`) was run from the rendered
+  `registration.yaml`** (`heisenbridge -c registration.yaml -l 127.0.0.1 -p <port> <server>`,
+  the registration's `url` patched to that port): it registered `@heisenbridge` with the
+  instance's token, answered the manager's ping, and the instance reached `ready` in about five
+  seconds. Without `heisenbridge` on the path the test says so and a stand-in answers instead.
+  `DELETE` with the instance is a `409` naming the count; with `remove_instances=true` it takes
+  the registration with it.
+
+Ran, in the interface (`web/e2e-real/bridge-offerings.spec.ts`, Playwright against the real
+binary through the Vite proxy, `HS_REAL_SERVER_URL` and `HS_REAL_ADMIN_TOKEN` set and
+`@alice:example.org` registered; screenshots `docs/design/screenshots/bridge-offerings-{list-empty,
+wizard-runtime,offering,add-refused,instance-starting,files,list-after}-real.png`): the Bridges
+page says the server cannot run bridges itself; the Offer wizard (WhatsApp, everyone) shows the
+cluster card disabled and quotes the server's own reason; the offering page with the front door
+line; Add for a user with `@bob:elsewhere.net` shows the server's refusal in the field; with
+alice the row appears and reaches Starting with the manager's reason and Runs elsewhere; the
+Files dialog shows `registration.yaml` tagged with her ID and `config.yaml` with `id:
+whatsapp-alice`, her `admin` permission and the server's bound address; Remove empties the table;
+Stop offering returns to the list without WhatsApp. (`e2e-real/real-server.spec.ts`'s "user
+detail" case fails against this server because it hard-codes `@ops:test.local`; unrelated, left.)
+
+Ran, unit: `cargo test -p hs-bridges` is now 9 (six in `tests/manager.rs` drive the manager
+over the in-memory store and `InMemoryAppserviceDirectory`: the target and the refused cluster
+runtime, the registration's namespace growing and shrinking with offerings, an instance to
+`ready` and its files, a bridge that never answers staying `starting` with the error, the shared
+type and the delete conflict, the loopback fallback, and two offerings for one encoded
+localpart); `cargo test -p hs-admin` 175; `npm run check` green (25 files, 180 tests);
+`e2e/offer-bridge.spec.ts` and `bridges-list.spec.ts` (mocks) 4 passed.
+
+Defects found and fixed, each with a test that fails without it:
+
+1. The offerings and instances list operations were documented as `{data}` and the interface
+   read `.data`; the router had always answered `{items, next_cursor, prev_cursor}`. Against the
+   real server the Bridges page and every offering page were empty. Document, client and mocks
+   moved to the page shape (`docs/decisions/0009-bridge-offering-contract-corrections.md`).
+2. An offering on a server with no `server.public_baseurl` rendered `address:` empty into a
+   bridge's `config.yaml`. The manager now gives the bound loopback address instead.
+3. The manager noticed a bridge only through its own ping, every half minute for an instance run
+   elsewhere, though a mautrix bridge pings itself through the server as it starts and an
+   administrator can press Ping. The registry's health is read first, and an instance run
+   elsewhere is pinged every tick for its first two minutes, then every half minute.
+4. The front door repeated its refusal on every message from someone the offering is not open
+   to. Once per room now (`hs_bridges.refusals`).
+5. `m.direct` was written with `PUT`, replacing the account data event; it is read and merged
+   now, and with double puppeting the owner's own `m.direct` is updated too (RFC 0017 4.1).
+6. The catalogue said heisenbridge was `per_user`; it is `shared` (decision 0009), and a shared
+   heisenbridge instance is rendered without `-o @OWNER:server`.
+7. `BridgeType.not_deployable_reason`, `BridgeOffering.image_tag`,
+   `BridgeInstance.last_ping_at`/`last_error` added, so the interface stops inventing a reason
+   and parsing the tag (track 16's contract notes of 2026-09-26, resolved on the server side; the
+   `409` count and the scopes are left, see the decision).
+8. The manager logs every instance transition (`bridge instance moved`, `removing bridge
+   instance`, `answered this server: ready`) at `info`, and what its bots are told at `debug`;
+   `crates/hs-cli/tests/bridge_offerings.rs` forwards the server's log when `RUST_LOG` is set.
+
+Observed and **not** fixed (not this track's crates):
+
+- `/sync` repeats an event across two consecutive incremental batches when it arrived while the
+  earlier batch was being assembled: seen for the manager bots' notices (sent through the
+  appservice API with `?user_id=`), confirmed by hand against the real binary (a notice's
+  `event_id` came back in the batch after the one that carried it). A real client dedupes by
+  event id, and so does the test's `Watch`; a `since` token that does not cover everything in
+  the response is track 05's to look at.
+- The overview's `users_count` is cached for a minute (`STATISTICS_TTL`), so it cannot witness
+  an account made in the last minute; the tests read the users list.
+- The shared `target/` builds a workspace crate from whichever worktree touched it last, so a
+  crate changed in another worktree (today: `hs-cluster`'s `MeshDeps.peers`) can break the
+  build here; `touch crates/<crate>/src/lib.rs` rebuilds it from this tree. Likewise
+  `target/debug/hs` is whichever tree linked it last: the Playwright flow first ran against
+  another tree's binary (no loopback fallback) until `cargo build -p hs-cli --bin hs` here.
+
+Written, not run: the `cluster` runtime (`deploying`, the operator, a `Bridge` on a kind
+cluster) is unchanged and still unexercised; `access.users` on an edit does not stop or remove
+instances people already have (as the RFC says); an instance's registration is delivered every
+event its owner sends anywhere (the non-exclusive `@alice` namespace, Synapse's rule), which is
+what double puppeting needs and what a bridge expects, but was not measured for many instances.
+
+Decisions made today: the six in `docs/decisions/0009-bridge-offering-contract-corrections.md`;
+an instance's bot account is not deactivated when the instance is removed (the server keeps its
+accounts; the registration's removal is what stops anyone acting as it); the
+`bridge_offerings.rs` test helpers stand in for a bridge with an axum listener registered by
+patching the instance's registration `url`, which is what an administrator running a bridge on
+a machine the server could not have guessed does.
+
+Shared dependencies added: none. Environment: `pip install heisenbridge` works here (1.15.4);
+Playwright 1.63 wants `chromium_headless_shell-1243` while `/opt/pw-browsers` holds 1194, so
+`chromium_headless_shell-1243/chrome-headless-shell-linux64/chrome-headless-shell` and
+`chromium-1243/chrome-linux64/chrome` were symlinked to the 1194 binaries (never `playwright
+install`).
+
+Next: the demo's shared WhatsApp registration replaced by an offering and a phone signed in
+through `@whatsappbot`; a `Bridge` on a kind cluster and a `cluster` offering through
+`deploying`; the scale measurement (hundreds of instance registrations, RFC 0017 section 6).
+
+**The bridge manager exists** (2026-09-27, before the run above) (RFC 0017 section 4.1 to 4.3,
 `crates/hs-bridges`, built 2026-09-26 by the operator and offerings session, wired into
 `hs serve` in `52649d2`). It is the admin API's data source for `bridge_offerings.*` and
 `bridge_instances.*` and the state machine behind them:

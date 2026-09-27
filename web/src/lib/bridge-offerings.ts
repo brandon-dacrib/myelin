@@ -104,10 +104,13 @@ export function imageTag(image: string | undefined): string {
 }
 
 /**
- * Why this server cannot deploy a type itself, when it cannot. The catalogue only says
- * `deployable: false`; the wording is the interface's.
+ * Why this server cannot deploy a type itself, when it cannot: the catalogue's own reason
+ * (`not_deployable_reason`), or, from a server that gives none, the interface's wording.
  */
-export function notDeployableReason(type: Pick<BridgeType, "name" | "id"> | undefined): string {
+export function notDeployableReason(
+  type: Pick<BridgeType, "name" | "id" | "not_deployable_reason"> | undefined,
+): string {
+  if (type?.not_deployable_reason) return type.not_deployable_reason;
   const name = type?.name ?? "This bridge";
   if (type?.id === "mautrix-imessage") {
     return `${name} has to run on a Mac signed in to iMessage, so it always runs elsewhere.`;
@@ -135,7 +138,8 @@ export function requestFromOffering(offering: BridgeOffering): Required<BridgeOf
   return {
     enabled: offering.enabled,
     runtime: offering.runtime,
-    image_tag: imageTag(offering.image),
+    // The server says the tag itself; an older one only the image, which names it at the end.
+    image_tag: offering.image_tag || imageTag(offering.image),
     access: {
       all_local_users: offering.access?.all_local_users ?? true,
       users: offering.access?.users ?? [],

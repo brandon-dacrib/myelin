@@ -2446,6 +2446,13 @@ export interface components {
             deployment?: null | components["schemas"]["BridgeDeployment"];
             /** @description The registry's word for its ping health (`healthy`, `down`, ...). */
             health?: string | null;
+            /** @description What went wrong, if the last ping failed. */
+            last_error?: string | null;
+            /**
+             * Format: date-time
+             * @description When this server last pinged the instance's bridge.
+             */
+            last_ping_at?: string | null;
             /** Format: date-time */
             ready_at?: string | null;
             /** @description Why it failed, or what it is waiting for. */
@@ -2463,6 +2470,9 @@ export interface components {
             manifest_yaml?: string;
             registration_yaml?: string;
         };
+        BridgeInstancePage: components["schemas"]["PageEnvelope"] & {
+            items: components["schemas"]["BridgeInstance"][];
+        };
         BridgeOffering: {
             access?: components["schemas"]["BridgeOfferingAccess"];
             /** Format: date-time */
@@ -2470,7 +2480,10 @@ export interface components {
             enabled: boolean;
             /** @description The Matrix ID users message to get an instance (`per_user` only). */
             front_door?: string | null;
+            /** @description The full image reference instances run. */
             image?: string;
+            /** @description The tag part of `image`, as `BridgeOfferingRequest.image_tag` takes it back. */
+            image_tag?: string;
             /** @description Instance counts by state. */
             instances?: {
                 [key: string]: number;
@@ -2494,6 +2507,9 @@ export interface components {
             backfill?: boolean;
             double_puppeting?: boolean;
             encryption?: boolean;
+        };
+        BridgeOfferingPage: components["schemas"]["PageEnvelope"] & {
+            items: components["schemas"]["BridgeOffering"][];
         };
         BridgeOfferingRequest: {
             access?: components["schemas"]["BridgeOfferingAccess"];
@@ -2536,6 +2552,8 @@ export interface components {
              */
             mode?: "per_user" | "shared";
             name?: string;
+            /** @description Why it cannot, when `deployable` is false, in words for an administrator. */
+            not_deployable_reason?: string | null;
             /** @description The port the bridge listens on for this server by default, which a render's registration `url` names. */
             port?: number;
             /** @description Whether a render of this type produces a `config_yaml` the bridge reads as it is (mautrix bridges), or only the registration and the notes to run it. */
@@ -3973,15 +3991,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Offerings. */
+            /** @description Offerings, as one page (there is no cursor to follow; an offering is one per catalogue type). */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        data: components["schemas"]["BridgeOffering"][];
-                    };
+                    "application/json": components["schemas"]["BridgeOfferingPage"];
                 };
             };
             401: components["responses"]["Unauthenticated"];
@@ -4096,15 +4112,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Instances. */
+            /** @description Instances, as one page (`items` holds every instance of the offering; no cursor is issued). */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        data: components["schemas"]["BridgeInstance"][];
-                    };
+                    "application/json": components["schemas"]["BridgeInstancePage"];
                 };
             };
             401: components["responses"]["Unauthenticated"];
