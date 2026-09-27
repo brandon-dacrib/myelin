@@ -96,6 +96,11 @@ pub struct ClusterHandles {
     origin_generation: Generation,
     default_deadline: Duration,
     mesh: Option<MeshStartConfig>,
+    /// The handler for replica-to-replica messages (`hs_cluster::mesh::PeerHandler`), installed
+    /// by `crate::sync_cluster::install` once the session hub exists and read by
+    /// [`ClusterHandles::spawn_mesh`]. A `OnceLock` rather than a constructor parameter so the
+    /// cluster can start before the hub is wired to it and the mesh listener after.
+    peer_handler: std::sync::OnceLock<Arc<dyn hs_cluster::mesh::PeerHandler>>,
 }
 
 struct MeshStartConfig {
@@ -204,6 +209,7 @@ pub async fn start<B: KvBackend + 'static>(
             max_in_flight_per_peer,
             ownership,
         }),
+        peer_handler: std::sync::OnceLock::new(),
     })
 }
 
@@ -223,6 +229,28 @@ impl ClusterHandles {
             origin_generation: Generation::fresh(None),
             default_deadline: Duration::from_secs(10),
             mesh: None,
+            peer_handler: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// This replica's identity on the mesh (`host:port` of its listener).
+    #[must_use]
+    pub fn origin(&self) -> &ReplicaId {
+        &self.origin
+    }
+
+    /// This process's generation: what tells a peer that a replica it knew has restarted.
+    #[must_use]
+    pub fn origin_generation(&self) -> Generation {
+        self.origin_generation
+    }
+
+    /// Installs the handler [`ClusterHandles::spawn_mesh`] serves `POST /mesh/v1/peer` with.
+    /// Must be called before `spawn_mesh`; a second install is ignored with a warning, the
+    /// convention every other `install_*` in this workspace follows.
+    pub fn install_peer_handler(&self, handler: Arc<dyn hs_cluster::mesh::PeerHandler>) {
+        if self.peer_handler.set(handler).is_err() {
+            tracing::warn!("a mesh peer handler was already installed; ignoring the second");
         }
     }
 
@@ -249,6 +277,7 @@ impl ClusterHandles {
             // (the same loop runs unconditionally on its own interval); only failover latency
             // is, and only by up to one `heartbeat_interval`. Documented in the status file.
             nudge: None,
+            peers: self.peer_handler.get().cloned(),
         });
         let server = match MeshServer::new(mesh.listen_addr.clone(), None) {
             Ok(server) => server,
@@ -731,6 +760,7 @@ mod tests {
             origin_generation: Generation::fresh(None),
             default_deadline: Duration::from_secs(10),
             mesh: None,
+            peer_handler: std::sync::OnceLock::new(),
         };
         let gate = RoomShardGate::new(&handles);
         assert!(

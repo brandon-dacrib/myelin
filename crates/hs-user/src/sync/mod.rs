@@ -177,7 +177,7 @@ async fn resume_mode<B: KvBackend + 'static, R: RoomSource<B>>(
         // into an encrypted room. They are new to the room and get it whole. Only worth asking
         // the room when their membership has changed since that position at all.
         if membership.membership == "join" && membership.room_pos > pos {
-            let handle = hub.rooms().get_or_load(room_id).await?;
+            let handle = hub.room(room_id).await?;
             let user = user_id.to_owned();
             let was_joined = handle
                 .query(move |actor| actor.was_joined_at(&user, pos))
@@ -614,11 +614,10 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     let device_id = params.device_id.clone();
 
     // Everything published before this request arrived is in the feeds before they are read:
-    // see `SessionHub::wait_for_consumed`. Taken before the long-poll, so a request that then
-    // waits for news is not also holding a stale idea of what has already happened.
-    let published = hub.rooms().global_published_seq();
-    hub.wait_for_consumed(published, READ_YOUR_WRITES_WAIT)
-        .await;
+    // see `SessionHub::wait_for_consumed`, and `SessionHub::settle_before_read` for the same
+    // promise across replicas. Taken before the long-poll, so a request that then waits for
+    // news is not also holding a stale idea of what has already happened.
+    hub.settle_before_read(READ_YOUR_WRITES_WAIT).await;
 
     if !is_initial {
         long_poll(
@@ -758,7 +757,7 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             continue;
         }
 
-        let handle = hub.rooms().get_or_load(room_id).await?;
+        let handle = hub.room(room_id).await?;
         let room_id_owned = room_id.clone();
         let membership_value = membership.membership.clone();
         let full_state_requested = params.full_state;
@@ -1288,7 +1287,7 @@ async fn has_new_data<B: KvBackend + 'static, R: RoomSource<B>>(
     let memberships = store.list_memberships(user_id).await?;
     for m in &memberships {
         if m.hot_room && matches!(m.membership.as_str(), "join" | "invite" | "knock") {
-            let handle = hub.rooms().get_or_load(&m.room_id).await?;
+            let handle = hub.room(&m.room_id).await?;
             // Copied out before the closure: `query` requires a `'static` closure, so it may not
             // borrow a field of this loop's membership row.
             let room_pos = m.room_pos;

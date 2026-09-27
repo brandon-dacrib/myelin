@@ -1,6 +1,6 @@
 //! Error types for `hs-cluster`.
 
-use crate::types::{Epoch, ShardId};
+use crate::types::{Epoch, ReplicaId, ShardId};
 
 /// Errors from the cluster store layer (built directly on [`hs_kv::KvBackend`]; see
 /// `docs/rfcs/0001-cluster-ownership.md` section 6).
@@ -106,6 +106,16 @@ pub enum ForwardError {
     /// A transport-level failure talking to a peer.
     #[error("mesh transport error: {0}")]
     Transport(String),
+
+    /// A replica-to-replica message ([`crate::mesh::Forwarder::send_to_peer`]) did not reach the
+    /// named peer within its deadline, or the peer has no handler for such messages.
+    #[error("peer {peer} unreachable: {reason}")]
+    PeerUnreachable {
+        /// The peer that was addressed.
+        peer: ReplicaId,
+        /// What went wrong.
+        reason: String,
+    },
 
     /// The peer rejected our credentials.
     #[error("mesh auth error: {0}")]

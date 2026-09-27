@@ -103,6 +103,20 @@ pub trait ShardHandler: Send + Sync {
     async fn handle(&self, env: Envelope, fence: crate::fence::Fence) -> Reply;
 }
 
+/// Handles a replica-to-replica message that is not about a shard: no ownership check, no fence,
+/// no idempotency cache, delivered to whichever replica it was addressed to, over the same
+/// authenticated transport a forward uses (`POST /mesh/v1/peer`). What `hs-user`'s session
+/// cluster carries: "these users have news" from a room's owner to every other replica, and
+/// "what have you published" from a replica about to answer a `/sync`. The mesh never interprets
+/// `route`; it is opaque dispatch for the implementor, as [`Envelope::route`] is for
+/// [`ShardHandler`].
+#[async_trait::async_trait]
+pub trait PeerHandler: Send + Sync {
+    /// Handles one message from `from` on `route`. The reply's status is relayed to the sender
+    /// as-is.
+    async fn handle(&self, from: ReplicaId, route: &str, payload: Bytes) -> Reply;
+}
+
 pub(crate) mod headers {
     pub const SHARD: &str = "x-hs-shard";
     pub const ROUTE: &str = "x-hs-route";
