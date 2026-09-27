@@ -73,6 +73,11 @@ enum ScanDecision {
 /// Synapse's observed default (`synapse/config/media.py`'s `unused_expiration_time`, 24 hours).
 pub const DEFAULT_RESERVATION_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// How stale [`MediaRecord::last_accessed_ms`] may get before a download or a thumbnail
+/// rewrites it: an hour. The bulk deletions it feeds work in days, so an hour is exact enough,
+/// and it means a popular item costs one metadata write an hour rather than one per download.
+pub const ACCESS_RESOLUTION_MS: u64 = 60 * 60 * 1000;
+
 /// Everything needed to serve a download or thumbnail response body: the record plus the actual
 /// bytes (already sliced to a [`ByteRange`] if one was requested).
 #[derive(Debug, Clone)]
@@ -224,6 +229,7 @@ impl<B: KvBackend> MediaRepository<B> {
             expires_at_ms: None,
             quarantined_by,
             safe_from_quarantine: false,
+            last_accessed_ms: None,
         };
         self.metadata.put_media(&record)?;
         self.policy.record(ctx, store_bytes.len() as u64).await;
@@ -261,6 +267,7 @@ impl<B: KvBackend> MediaRepository<B> {
             expires_at_ms: Some(expires_at),
             quarantined_by: None,
             safe_from_quarantine: false,
+            last_accessed_ms: None,
         };
         self.metadata.put_media(&record)?;
         Ok((media_id, expires_at))
@@ -662,6 +669,7 @@ impl<B: KvBackend> MediaRepository<B> {
     ) -> Result<ContentBytes, MediaError> {
         let key =
             crate::store::content_key(&record.server_name, &parse_media_id(&record.media_id)?);
+        self.note_access(record);
         let total = record.byte_length.unwrap_or(0);
         match parse_range(range_header, total) {
             RangeOutcome::Full => {
@@ -712,6 +720,7 @@ impl<B: KvBackend> MediaRepository<B> {
             return Err(MediaError::UnsupportedThumbnail);
         }
         let media_id = parse_media_id(&record.media_id)?;
+        self.note_access(record);
 
         // Try each format already cached for this exact (width, height, method): thumbnails are
         // always PNG or JPEG (`crate::thumbnail::output_format_for`), so two lookups cover it.
@@ -788,6 +797,125 @@ impl<B: KvBackend> MediaRepository<B> {
         } else {
             Err(MediaError::NotFound)
         }
+    }
+
+    /// Records that `record` is being served, if its last recorded access is older than
+    /// [`ACCESS_RESOLUTION_MS`]. A failure is logged, not returned: a download must not fail
+    /// because a bookkeeping write did.
+    fn note_access(&self, record: &MediaRecord) {
+        let now = self.now_ms();
+        if record
+            .last_accessed_ms
+            .is_some_and(|at| now.saturating_sub(at) < ACCESS_RESOLUTION_MS)
+        {
+            return;
+        }
+        if let Err(error) = self
+            .metadata
+            .update_media(&record.server_name, &record.media_id, |r| {
+                r.last_accessed_ms = Some(now);
+            })
+        {
+            tracing::warn!(%error, media_id = %record.media_id, "could not record a media access");
+        }
+    }
+
+    /// Marks a media item protected (exempt from quarantine and from the bulk deletions) or
+    /// not, returning the updated row.
+    ///
+    /// # Errors
+    /// [`MediaError::NotFound`] if no such item exists; [`MediaError::Metadata`] on a backend
+    /// failure.
+    pub fn set_protected(
+        &self,
+        server_name: &str,
+        media_id: &str,
+        protected: bool,
+    ) -> Result<MediaRecord, MediaError> {
+        self.metadata
+            .update_media(server_name, media_id, |r| {
+                r.safe_from_quarantine = protected
+            })?
+            .ok_or(MediaError::NotFound)
+    }
+
+    /// Quarantines a media item (`by` is who did it) or lifts its quarantine (`by` of `None`),
+    /// returning the updated row. [`MediaRepository::set_quarantined`] does the same without
+    /// the row.
+    ///
+    /// # Errors
+    /// [`MediaError::NotFound`] if no such item exists; [`MediaError::Metadata`] on a backend
+    /// failure.
+    pub fn quarantine(
+        &self,
+        server_name: &str,
+        media_id: &str,
+        by: Option<&str>,
+    ) -> Result<MediaRecord, MediaError> {
+        self.metadata
+            .update_media(server_name, media_id, |r| {
+                r.quarantined_by = by.map(str::to_owned);
+            })?
+            .ok_or(MediaError::NotFound)
+    }
+
+    /// Every media row this repository knows, local uploads and cached remote copies alike,
+    /// including async-upload reservations whose content has not arrived (`completed: false`).
+    ///
+    /// # Errors
+    /// [`MediaError::Metadata`] on a backend failure.
+    pub fn list_media(&self) -> Result<Vec<MediaRecord>, MediaError> {
+        self.metadata.list_media()
+    }
+
+    /// Deletes a media item for good: its bytes, its thumbnails' bytes, then its rows. Returns
+    /// the row as it was.
+    ///
+    /// The bytes go first. If removing them fails the rows stay, so the item is still listed
+    /// and the deletion can be retried; the other order could leave bytes nothing refers to
+    /// any more, which for content deleted because it must not be kept is the worse failure.
+    /// Bytes already missing from the store are not an error.
+    ///
+    /// # Errors
+    /// [`MediaError::NotFound`] if no such item exists; [`MediaError::Store`] if the object store
+    /// refused a deletion; [`MediaError::Metadata`] on a backend failure.
+    pub async fn delete_media(
+        &self,
+        server_name: &str,
+        media_id: &str,
+    ) -> Result<MediaRecord, MediaError> {
+        let record = self
+            .metadata
+            .get_media(server_name, media_id)?
+            .ok_or(MediaError::NotFound)?;
+        let id = parse_media_id(media_id)?;
+        let mut keys = vec![crate::store::content_key(server_name, &id)];
+        for thumb in self.metadata.list_thumbnails(server_name, media_id)? {
+            let variant = ThumbnailRecord::variant_key(
+                thumb.width,
+                thumb.height,
+                thumb.method,
+                &thumb.content_type,
+            );
+            keys.push(crate::store::thumbnail_key(server_name, &id, &variant));
+        }
+        for key in &keys {
+            delete_object(self.object_store.as_ref(), key).await?;
+        }
+        // A thumbnail generated between the listing above and here has its row removed below,
+        // and its bytes after it.
+        if let Some((_, variants)) = self.metadata.delete_media(server_name, media_id)? {
+            for variant in variants {
+                let key = crate::store::thumbnail_key(server_name, &id, &variant);
+                if keys.contains(&key) {
+                    continue;
+                }
+                if let Err(error) = delete_object(self.object_store.as_ref(), &key).await {
+                    tracing::warn!(%error, media_id, "could not remove a thumbnail's bytes");
+                }
+            }
+        }
+        Ok(record)
     }
 
     /// Direct access to the object store, for callers (the Synapse importer, admin tooling) that
@@ -884,6 +1012,14 @@ impl<B: KvBackend> MediaRepository<B> {
             resumed += 1;
         }
         Ok(resumed)
+    }
+}
+
+/// Removes one object; one that is already gone is not an error.
+async fn delete_object(store: &dyn ObjectStore, key: &ObjectPath) -> Result<(), MediaError> {
+    match store.delete(key).await {
+        Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+        Err(e) => Err(MediaError::from(e)),
     }
 }
 
@@ -1706,6 +1842,7 @@ mod scanning_integration {
                 // `quarantine` mode's pre-scan state: servable, not yet marked either way.
                 quarantined_by: None,
                 safe_from_quarantine: false,
+                last_accessed_ms: None,
             })
             .unwrap();
         metadata

@@ -93,6 +93,10 @@ pub struct AdminState {
     /// What the `bridge_deployments.*`, `bridge_offerings.*` and `bridge_instances.*` operations
     /// read and write (RFC 0017). `None` until wired with [`AdminState::with_bridge_offerings`].
     pub bridge_offerings: Option<Arc<dyn crate::bridge_offerings::BridgeOfferingSource>>,
+    /// What the nine `media.*` operations read and change: the media repository (see
+    /// [`crate::media`]). `None` until wired with [`AdminState::with_media`]; until then they
+    /// answer `503 unavailable`.
+    pub media: Option<Arc<dyn crate::media::MediaSource>>,
     /// The `Idempotency-Key` cache every mutating handler that declares it consults (see
     /// [`crate::idempotency`]). Always present (never `None`): a client is never told its
     /// idempotency key was ignored.
@@ -121,6 +125,7 @@ impl AdminState {
             appservices: None,
             federation: None,
             bridge_offerings: None,
+            media: None,
             idempotency: Arc::new(IdempotencyStore::new()),
         }
     }
@@ -167,6 +172,13 @@ impl AdminState {
         self
     }
 
+    /// Wires the media repository, making the `media.*` operations real.
+    #[must_use]
+    pub fn with_media(mut self, media: Arc<dyn crate::media::MediaSource>) -> Self {
+        self.media = Some(media);
+        self
+    }
+
     /// Wires a real [`FederationSource`], making the `federation.destinations.*` operations
     /// serve the outbound sender's records instead of answering `503 unavailable`.
     #[must_use]
@@ -207,7 +219,7 @@ impl AdminState {
     }
 }
 
-fn authorization_header(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn authorization_header(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -299,6 +311,15 @@ const REAL_HANDLERS: &[&str] = &[
     "federation.destinations.list",
     "federation.destinations.get",
     "federation.destinations.reset",
+    "media.list",
+    "media.get",
+    "media.delete_one",
+    "media.quarantine",
+    "media.unquarantine",
+    "media.protect",
+    "media.unprotect",
+    "media.delete_bulk",
+    "media.purge_remote_cache",
     "config.list",
     "config.schema",
     "config.get",
@@ -314,7 +335,7 @@ const REAL_HANDLERS: &[&str] = &[
 /// The `503 unavailable` problem a handler answers when its backing [`crate::sources`] trait
 /// object hasn't been wired onto [`AdminState`] yet — never a silent `501` (which would say "this
 /// handler doesn't exist yet", which is false) and never a fake `200`.
-fn source_unavailable(source_name: &str, path: &str) -> Response {
+pub(crate) fn source_unavailable(source_name: &str, path: &str) -> Response {
     hs_http::Problem::unavailable()
         .with_detail(format!(
             "the {source_name} data source is not wired into this server"
@@ -791,7 +812,7 @@ impl ToggleField {
 // mean unwrapping a `Box<Problem>` at every one of this function's call sites for no real benefit
 // here (it is returned once per request, not in a hot loop).
 #[allow(clippy::result_large_err)]
-fn parse_optional_json<T: serde::de::DeserializeOwned + Default>(
+pub(crate) fn parse_optional_json<T: serde::de::DeserializeOwned + Default>(
     body: &[u8],
 ) -> Result<T, Problem> {
     if body.is_empty() {
@@ -802,13 +823,13 @@ fn parse_optional_json<T: serde::de::DeserializeOwned + Default>(
 }
 
 /// The `idempotency-key` header, if the client sent one.
-fn idempotency_key(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn idempotency_key(headers: &HeaderMap) -> Option<&str> {
     headers.get("idempotency-key").and_then(|v| v.to_str().ok())
 }
 
 /// Rebuilds an axum [`Response`] from a [`StoredResponse`], marking it as a replay so a client
 /// (or a test) can tell the mutation did not run again.
-fn replay_response(stored: StoredResponse) -> Response {
+pub(crate) fn replay_response(stored: StoredResponse) -> Response {
     axum::http::Response::builder()
         .status(stored.status)
         .header(axum::http::header::CONTENT_TYPE, stored.content_type)
@@ -824,7 +845,7 @@ fn replay_response(stored: StoredResponse) -> Response {
 // See the identical justification on `parse_optional_json` above: `Response` is returned once
 // per request here, not on a hot path, so boxing it would only add noise at every call site.
 #[allow(clippy::result_large_err)]
-async fn record_mutation(
+pub(crate) async fn record_mutation(
     state: &AdminState,
     principal: &Principal,
     action: &str,
@@ -4578,6 +4599,24 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         "federation.destinations.reset" => {
             builder.add(method, &full_path, federation_destinations_reset, meta)
         }
+        "media.list" => builder.add(method, &full_path, crate::media::media_list, meta),
+        "media.get" => builder.add(method, &full_path, crate::media::media_get, meta),
+        "media.delete_one" => builder.add(method, &full_path, crate::media::media_delete_one, meta),
+        "media.quarantine" => builder.add(method, &full_path, crate::media::media_quarantine, meta),
+        "media.unquarantine" => {
+            builder.add(method, &full_path, crate::media::media_unquarantine, meta)
+        }
+        "media.protect" => builder.add(method, &full_path, crate::media::media_protect, meta),
+        "media.unprotect" => builder.add(method, &full_path, crate::media::media_unprotect, meta),
+        "media.delete_bulk" => {
+            builder.add(method, &full_path, crate::media::media_delete_bulk, meta)
+        }
+        "media.purge_remote_cache" => builder.add(
+            method,
+            &full_path,
+            crate::media::media_purge_remote_cache,
+            meta,
+        ),
         "config.list" => builder.add(method, &full_path, config_list, meta),
         "config.schema" => builder.add(method, &full_path, config_schema, meta),
         "config.get" => builder.add(method, &full_path, config_get, meta),

@@ -43,6 +43,10 @@ hs-tables = { path = "../hs-tables" }
 hs-auth = { path = "../hs-auth" }
 hs-http = { path = "../hs-http" }
 hs-config = { path = "../hs-config" }
+# `crate::admin_source` implements `hs_admin::media::MediaSource` over the repository, as
+# `hs-federation` does for destinations. No cycle: `hs-admin` depends on neither this crate nor
+# anything that does (and `hs-auth`, already a dependency, depends on `hs-admin` itself).
+hs-admin = { path = "../hs-admin" }
 icap-rs.workspace = true
 reqwest.workspace = true
 serde_yaml_ng.workspace = true

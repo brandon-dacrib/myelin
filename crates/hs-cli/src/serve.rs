@@ -618,6 +618,9 @@ fn admin_state<B: KvBackend + 'static>(
     .with_bridge_offerings(sources.bridge_offerings)
     // The Federation page and the Overview's last 501 panel.
     .with_federation(sources.federation)
+    // The Media page: every upload and cached remote copy, and quarantine, protection and
+    // deletion over the same repository the media routes serve from.
+    .with_media(sources.media)
     .with_server_info(hs_admin::model::ServerInfo {
         name: server_name.to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -651,6 +654,7 @@ struct AdminSources {
     overview: Arc<dyn hs_admin::sources::OverviewSource>,
     appservices: Arc<dyn hs_admin::sources::AppserviceDirectory>,
     federation: Arc<dyn hs_admin::sources::FederationSource>,
+    media: Arc<dyn hs_admin::media::MediaSource>,
 }
 
 /// The `/api/v1` state for [`route_manifest`]'s throwaway router: routes are registered the same
@@ -1214,6 +1218,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         config.cluster.single_node,
     ));
     overview.set_federation(federation_source.clone());
+    let media_repository = media_state.repository.clone();
 
     let mounts = Mounts {
         room: room_state,
@@ -1240,6 +1245,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
                 overview: overview.clone(),
                 appservices: appservice_delivery.admin_directory(),
                 federation: federation_source.clone(),
+                media: Arc::new(hs_media::admin_source::RepositoryMediaSource::new(
+                    media_repository,
+                )),
             },
         ),
     };

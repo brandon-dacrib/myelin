@@ -31,9 +31,12 @@
 //! - [`preview`]: `GET .../preview_url` — OpenGraph extraction, the SSRF guard, and the response
 //!   cache. Read this module's doc first: it states exactly what the SSRF guard does and does not
 //!   defend against, per this crate's convention for a security control.
+//! - [`admin_source`]: the admin API's Media area (`hs_admin::media::MediaSource`) over the
+//!   repository: listing, quarantine, protection, deletion.
 
 #![warn(missing_docs)]
 
+pub mod admin_source;
 pub mod error;
 pub mod id;
 pub mod metadata;

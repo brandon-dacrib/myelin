@@ -61,8 +61,17 @@ pub struct MediaRecord {
     /// doc) but its row is kept, not deleted, so an admin can un-quarantine it.
     pub quarantined_by: Option<String>,
     /// If true, this item is exempt from quarantine (an admin marked it trusted). Mirrors
-    /// Synapse's `safe_from_quarantine` column.
+    /// Synapse's `safe_from_quarantine` column. The admin API calls this "protected", and a
+    /// protected item is also skipped by the bulk deletions (`POST /api/v1/media/delete` and the
+    /// remote-cache purge).
     pub safe_from_quarantine: bool,
+    /// When this content was last served (a download or a thumbnail), milliseconds since the
+    /// Unix epoch; `None` if it never has been, or was stored before this was recorded. Kept at
+    /// a coarse resolution ([`crate::repository::ACCESS_RESOLUTION_MS`]) so a busy item costs
+    /// one write an interval, not one per download. Mirrors Synapse's `last_access_ts`, which is
+    /// what "unused since" means for the bulk deletions.
+    #[serde(default)]
+    pub last_accessed_ms: Option<u64>,
 }
 
 impl MediaRecord {
@@ -71,6 +80,13 @@ impl MediaRecord {
     #[must_use]
     pub fn is_servable(&self) -> bool {
         self.completed && (self.quarantined_by.is_none() || self.safe_from_quarantine)
+    }
+
+    /// When this item was last used: its last access, or its creation if it has never been
+    /// served. What the bulk deletions compare their "before" against.
+    #[must_use]
+    pub fn last_used_ms(&self) -> u64 {
+        self.last_accessed_ms.unwrap_or(self.created_ms)
     }
 }
 
@@ -325,6 +341,86 @@ impl<B: KvBackend> MetadataStore<B> {
         .map_err(|e| MediaError::Metadata(e.to_string()))
     }
 
+    /// Every media row, local and cached remote, in key order (by server name, then media ID).
+    /// An unbounded scan, for the admin API's listing and bulk deletions, which filter it; not
+    /// for any request path a client can reach.
+    ///
+    /// # Errors
+    /// Returns [`MediaError::Metadata`] on a backend failure or an undecodable stored row.
+    pub fn list_media(&self) -> Result<Vec<MediaRecord>, MediaError> {
+        let snapshot = self.backend.snapshot();
+        let mut out = Vec::new();
+        for item in self.media.range(&snapshot, RangeSpec::full()) {
+            let (_key, value) = item.map_err(|e| MediaError::Metadata(e.to_string()))?;
+            out.push(decode_value(&value)?);
+        }
+        Ok(out)
+    }
+
+    /// Changes one media row in a single transaction: reads it, applies `change`, writes it back
+    /// and returns the new row, or `Ok(None)` if there is no such row. `change` may run more than
+    /// once (a conflicting transaction is retried), so it must only set fields.
+    ///
+    /// # Errors
+    /// Returns [`MediaError::Metadata`] on a backend failure or an undecodable stored row.
+    pub fn update_media(
+        &self,
+        server_name: &str,
+        media_id: &str,
+        change: impl Fn(&mut MediaRecord),
+    ) -> Result<Option<MediaRecord>, MediaError> {
+        let key = (server_name.to_string(), media_id.to_string());
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let Some(bytes) = self.media.get(txn, &key).map_err(to_kv_err)? else {
+                return Ok(None);
+            };
+            let mut record: MediaRecord = serde_json::from_slice(&bytes)
+                .map_err(|e| hs_kv::KvError::backend(DecodeError(e.to_string())))?;
+            change(&mut record);
+            let value = serde_json::to_vec(&record)
+                .map_err(|e| hs_kv::KvError::backend(DecodeError(e.to_string())))?;
+            self.media.put(txn, &key, &value).map_err(to_kv_err)?;
+            Ok(Some(record))
+        })
+        .map_err(|e| MediaError::Metadata(e.to_string()))
+    }
+
+    /// Removes a media row together with its thumbnail rows and any pending-scan marker, in one
+    /// transaction. Returns the removed row and the variant keys of the removed thumbnails (so
+    /// the caller can remove their bytes), or `Ok(None)` if there was no such row. The object
+    /// bytes are not touched: see [`crate::repository::MediaRepository::delete_media`].
+    ///
+    /// # Errors
+    /// Returns [`MediaError::Metadata`] on a backend failure or an undecodable stored row.
+    pub fn delete_media(
+        &self,
+        server_name: &str,
+        media_id: &str,
+    ) -> Result<Option<(MediaRecord, Vec<String>)>, MediaError> {
+        let key = (server_name.to_string(), media_id.to_string());
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let Some(bytes) = self.media.get(txn, &key).map_err(to_kv_err)? else {
+                return Ok(None);
+            };
+            let record: MediaRecord = serde_json::from_slice(&bytes)
+                .map_err(|e| hs_kv::KvError::backend(DecodeError(e.to_string())))?;
+            let spec: RangeSpec = TypedKeyspace::<B::Keyspace, ThumbKey>::prefix(&key);
+            let mut variants = Vec::new();
+            for item in self.thumbnails.range(&*txn, spec) {
+                let ((_, _, variant), _value) = item.map_err(to_kv_err)?;
+                variants.push(variant);
+            }
+            for variant in &variants {
+                let thumb_key = (key.0.clone(), key.1.clone(), variant.clone());
+                self.thumbnails.delete(txn, &thumb_key).map_err(to_kv_err)?;
+            }
+            self.pending_scans.delete(txn, &key).map_err(to_kv_err)?;
+            self.media.delete(txn, &key).map_err(to_kv_err)?;
+            Ok(Some((record, variants)))
+        })
+        .map_err(|e| MediaError::Metadata(e.to_string()))
+    }
+
     /// Inserts or overwrites a thumbnail row.
     ///
     /// # Errors
@@ -542,6 +638,7 @@ mod tests {
             expires_at_ms: None,
             quarantined_by: None,
             safe_from_quarantine: false,
+            last_accessed_ms: None,
         }
     }
 
