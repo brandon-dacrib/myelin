@@ -1451,6 +1451,7 @@ mod tests {
             idempotency: Arc::new(IdempotencyCache::new(Duration::from_secs(5), 16)),
             in_flight: Arc::new(tokio::sync::Semaphore::new(8)),
             nudge: None,
+            peers: None,
         });
         let server = MeshServer::new(b_addr.clone(), None).unwrap();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
