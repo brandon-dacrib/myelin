@@ -330,10 +330,11 @@ export function offeringIsMoving(offering: Pick<BridgeOffering, "instances">): b
   );
 }
 
+/** Every offering. One page: there is one offering per catalogue type, so no cursor follows. */
 export function useBridgeOfferings() {
   return useQuery({
     queryKey: ["bridge-offerings"],
-    queryFn: async () => unwrap(await api.GET("/bridge-offerings")).data,
+    queryFn: async () => unwrap(await api.GET("/bridge-offerings")).items,
     refetchInterval: (query) =>
       (query.state.data ?? []).some(offeringIsMoving) ? MOVING_POLL_MS : 30_000,
   });
@@ -404,7 +405,7 @@ export function useBridgeInstances(type: string | undefined) {
         await api.GET("/bridge-offerings/{type}/instances", {
           params: { path: { type: type! } },
         }),
-      ).data,
+      ).items,
     refetchInterval: (query) =>
       (query.state.data ?? []).some((i) => !isSettledInstanceState(i.state))
         ? MOVING_POLL_MS

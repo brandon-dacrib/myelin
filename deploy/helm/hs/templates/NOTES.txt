@@ -47,3 +47,12 @@ keeps the key too. To bring your own instead, or before moving to cluster mode:
   kubectl -n {{ .Release.Namespace }} create secret generic my-hs-signing-key --from-file=signing.key
   helm upgrade ... --set secrets.signingKey.existingSecret=my-hs-signing-key
 {{- end }}
+{{- if eq .Values.mode "cluster" }}
+
+Cluster mode: {{ include "hs.replicaCount" . }} replicas, each advertising its own name under
+{{ include "hs.meshDomain" . }} to its peers, mesh authentication by
+{{- if .Values.cluster.mesh.tls.existingSecret }} mutual TLS (Secret {{ .Values.cluster.mesh.tls.existingSecret }}).
+{{- else }} a shared secret (Secret {{ .Values.cluster.mesh.sharedSecret.existingSecret }}); for a trusted pod network only.
+{{- end }}
+To see who owns what: kubectl -n {{ .Release.Namespace }} logs <pod> | grep -i 'cluster\|shard\|mesh'.
+{{- end }}

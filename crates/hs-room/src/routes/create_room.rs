@@ -82,6 +82,7 @@ const PRESETS: &[&str] = &["private_chat", "public_chat", "trusted_private_chat"
 pub async fn post_create_room<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     RoomRequester(requester): RoomRequester,
+    preassigned: Option<axum::Extension<hs_cluster::PreassignedRoomId>>,
     PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
     // `room_version` must be a JSON string if present at all -- a well-formed-but-wrong-typed
@@ -187,7 +188,13 @@ pub async fn post_create_room<B: KvBackend + 'static>(
             .get("room_alias_name")
             .and_then(Value::as_str)
             .map(str::to_owned),
-        ..Default::default()
+        // In cluster mode the shard gate chose the room's id before routing the request here,
+        // so the room is built on the replica that owns it (RFC 0019); single-node requests
+        // carry no extension and the actor mints the id as before.
+        room_id: preassigned
+            .map(|axum::Extension(p)| ruma::RoomId::parse(p.as_str()).map(|r| r.to_owned()))
+            .transpose()
+            .map_err(|e| RoomError::Internal(format!("pre-assigned room id: {e}")))?,
     };
 
     let handle = state

@@ -19,6 +19,9 @@
 //! - [`typing`]: [`typing::TypingRegistry`], in-memory `m.typing` state.
 //! - [`presence`]: [`presence::PresenceRegistry`], in-memory `m.presence` state.
 //! - [`receipts`]: [`receipts::ReceiptRegistry`], in-memory `m.receipt` state.
+//! - [`cluster`]: [`cluster::SessionCluster`], what `/sync` needs from other replicas (the
+//!   wake and read-your-writes across replicas), and [`cluster::RoomMirror`], the read-only
+//!   snapshot a replica reads a room it does not own through.
 //! - [`sync`]: `/sync` v2's response construction, full and incremental.
 //! - [`routes`]: the client-server HTTP endpoints (`/sync`, `/joined_rooms`, `/publicRooms`,
 //!   account data), as a router fragment (`routes::router`), following the same shape
@@ -31,6 +34,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod cluster;
 pub mod error;
 pub mod filter;
 pub mod hub;

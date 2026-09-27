@@ -175,6 +175,101 @@ impl Forwarder {
         }
     }
 
+    /// Sends one replica-to-replica message (`POST /mesh/v1/peer`, see
+    /// [`crate::mesh::PeerHandler`]) to `peer` and returns its reply. Unlike
+    /// [`Forwarder::forward`] there is no owner lookup (the message is for this exact replica),
+    /// no `421`/`503` retry loop (nothing to redirect to) and no idempotency key: one attempt
+    /// on the pooled connection, one inline redial if that connection turned out dead, all
+    /// within `deadline`. The reply's status is the handler's own; a `501` means the peer runs
+    /// without a peer handler and is reported as unreachable, so a caller fanning out to every
+    /// replica treats a peer from before this route existed like one that is down.
+    ///
+    /// # Errors
+    /// Returns [`ForwardError::PeerUnreachable`] if the peer could not be dialed, did not answer
+    /// within `deadline`, or has no peer handler; [`ForwardError::Transport`] for a malformed
+    /// request.
+    pub async fn send_to_peer(
+        &self,
+        peer: &ReplicaId,
+        route: &str,
+        payload: Bytes,
+        deadline: Duration,
+    ) -> Result<Reply, ForwardError> {
+        let start = Instant::now();
+        let unreachable = |reason: String| ForwardError::PeerUnreachable {
+            peer: peer.clone(),
+            reason,
+        };
+        let sent = tokio::time::timeout(deadline, self.send_peer_once(peer, route, &payload)).await;
+        let result = match sent {
+            Ok(Ok((status, _hdrs, _body))) if status == StatusCode::NOT_IMPLEMENTED => Err(
+                unreachable("the peer has no peer-message handler".to_owned()),
+            ),
+            Ok(Ok((status, _hdrs, body))) => Ok(Reply {
+                status: status.as_u16(),
+                payload: body,
+            }),
+            Ok(Err(e)) => Err(unreachable(e.to_string())),
+            Err(_elapsed) => Err(unreachable(format!(
+                "no answer within {}ms",
+                deadline.as_millis()
+            ))),
+        };
+        self.metrics.record_forward(
+            "peer",
+            if result.is_ok() { "ok" } else { "error" },
+            start.elapsed(),
+        );
+        result
+    }
+
+    async fn send_peer_once(
+        &self,
+        peer: &ReplicaId,
+        route: &str,
+        payload: &Bytes,
+    ) -> Result<(StatusCode, HeaderMap, Bytes), ForwardError> {
+        let addr = self.resolve_addr(peer)?;
+        let mut send_request = match self.pooled(&addr) {
+            Some(sr) => sr,
+            None => self.connect(&addr).await?,
+        };
+        let request = self.build_peer_request(route, payload)?;
+        match send_request.send_request(request).await {
+            Ok(response) => Self::read_response(response).await,
+            Err(e) => {
+                // The same single inline redial `send_once` makes, for the same reason.
+                self.evict_pooled(&addr);
+                tracing::debug!(%addr, error = %e, "pooled mesh connection failed, redialing");
+                let mut fresh = self.connect(&addr).await?;
+                let request = self.build_peer_request(route, payload)?;
+                let response = fresh
+                    .send_request(request)
+                    .await
+                    .map_err(|e| ForwardError::Transport(format!("send request: {e}")))?;
+                Self::read_response(response).await
+            }
+        }
+    }
+
+    fn build_peer_request(
+        &self,
+        route: &str,
+        payload: &Bytes,
+    ) -> Result<Request<Full<Bytes>>, ForwardError> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/mesh/v1/peer")
+            .header(headers::ROUTE, route)
+            .header(headers::ORIGIN, self.ownership.me().as_str());
+        if let AuthMode::SharedSecret { secret } = &self.auth {
+            builder = builder.header(http::header::AUTHORIZATION, format!("Bearer {secret}"));
+        }
+        builder
+            .body(Full::new(payload.clone()))
+            .map_err(|e| ForwardError::Transport(format!("build request: {e}")))
+    }
+
     async fn send_once(
         &self,
         owner: &ReplicaId,

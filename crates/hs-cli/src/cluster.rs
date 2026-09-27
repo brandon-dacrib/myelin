@@ -27,9 +27,15 @@
 //! `axum::Router` `hs-cli` built for its own listeners (`tower::Service::oneshot`), and ships the
 //! response back the same way. This means a forwarded request is authenticated by the *owner's*
 //! own auth middleware exactly as if it had arrived directly — the mesh transport's own
-//! authentication (a shared secret today; `hs-cluster` also supports mutual TLS, not wired here,
-//! see "Decisions made" in the status file) only proves the request came from a trusted peer, not
-//! who the end user is.
+//! authentication (mutual TLS against a private CA when `cluster.mesh.tls` is set, a shared
+//! secret otherwise) only proves the request came from a trusted peer, not who the end user is.
+//!
+//! `POST /createRoom` has no room id in its path, so it is gated differently: the gate mints the
+//! new room's id itself, hashes it, and either handles the request locally or forwards it to the
+//! shard's owner with the id in a mesh-only header, which the owner's gate turns into a
+//! [`hs_cluster::PreassignedRoomId`] request extension for the handler to create the room under.
+//! See [`hs_cluster::create_room`] for the invariants and `docs/rfcs/0019-create-room-shard-gate.md`
+//! for the one-line change `hs-room`'s handler needs to honour the extension.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,11 +50,15 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tower::ServiceExt;
 
+use hs_cluster::mesh::tls::TlsMaterial;
 use hs_cluster::mesh::{
-    Authenticator, Envelope, Forwarder, IdempotencyCache, IdempotencyKey, MeshDeps, MeshServer,
-    Reply, ShardHandler, SharedSecretAuthenticator,
+    AuthMode, Authenticator, Envelope, Forwarder, IdempotencyCache, IdempotencyKey, MeshDeps,
+    MeshServer, MutualTlsAuthenticator, Reply, ShardHandler, SharedSecretAuthenticator,
 };
-use hs_cluster::{Cluster, Fence, Generation, Ownership, ReplicaId, ShardId, ShardLayout};
+use hs_cluster::{
+    Cluster, Fence, Generation, Ownership, PREASSIGNED_ROOM_ID_HEADER, PreassignedRoomId,
+    ReplicaId, ShardId, ShardLayout, ViaMesh,
+};
 use hs_kv::KvBackend;
 
 /// The largest body this process will buffer while proxying a forwarded room request. Room
@@ -64,13 +74,12 @@ pub enum ClusterSetupError {
     /// shard layout conflicts with what is already recorded).
     #[error(transparent)]
     Cluster(#[from] hs_cluster::error::ClusterError),
-    /// The mesh forwarder's TLS material could not be built. Unreachable in the shared-secret
-    /// mode this module wires today, kept for when mutual TLS is added.
-    #[error(transparent)]
+    /// The mesh's mutual-TLS material (`cluster.mesh.tls.*`) could not be loaded or turned into
+    /// a `rustls` configuration: a missing or unreadable file, or one with no usable PEM in it.
+    #[error("cluster.mesh.tls: {0}")]
     Tls(#[from] hs_cluster::mesh::tls::TlsError),
     /// `cluster.*` in the native config does not satisfy `hs-cluster`'s own invariants (for
-    /// example `lease_ttl` too close to `heartbeat_interval`), or asks for something this module
-    /// does not implement yet (mutual TLS).
+    /// example `lease_ttl` too close to `heartbeat_interval`).
     #[error("cluster config is invalid: {0}")]
     Invalid(String),
 }
@@ -95,12 +104,33 @@ pub struct ClusterHandles {
     origin: ReplicaId,
     origin_generation: Generation,
     default_deadline: Duration,
+    /// This server's name, for minting a `/createRoom` id ahead of the handler (see
+    /// [`RoomShardGate`]). `None` in single-node mode, where nothing is pre-minted.
+    server_name: Option<ruma::OwnedServerName>,
     mesh: Option<MeshStartConfig>,
+    /// The handler for replica-to-replica messages (`hs_cluster::mesh::PeerHandler`), installed
+    /// by `crate::sync_cluster::install` once the session hub exists and read by
+    /// [`ClusterHandles::spawn_mesh`]. A `OnceLock` rather than a constructor parameter so the
+    /// cluster can start before the hub is wired to it and the mesh listener after.
+    peer_handler: std::sync::OnceLock<Arc<dyn hs_cluster::mesh::PeerHandler>>,
+}
+
+/// How the mesh listener authenticates peers, decided once in [`start`] from
+/// `cluster.mesh.tls`.
+enum MeshAuth {
+    /// `Authorization: Bearer <secret>` over plaintext HTTP/2.
+    SharedSecret(String),
+    /// Client certificates chained to the private CA in `material`, optionally restricted to a
+    /// DNS SAN suffix.
+    MutualTls {
+        material: TlsMaterial,
+        peer_san_suffix: Option<String>,
+    },
 }
 
 struct MeshStartConfig {
     listen_addr: String,
-    secret: String,
+    auth: MeshAuth,
     idempotency_ttl: Duration,
     max_in_flight_per_peer: usize,
     ownership: Arc<dyn Ownership>,
@@ -153,15 +183,42 @@ pub async fn start<B: KvBackend + 'static>(
     cluster_config
         .validate()
         .map_err(ClusterSetupError::Invalid)?;
-    let secret = match &cluster_config.mesh.auth {
-        hs_cluster::mesh::AuthMode::SharedSecret { secret } => secret.clone(),
-        hs_cluster::mesh::AuthMode::MutualTls { .. } => {
-            return Err(ClusterSetupError::Invalid(
-                "cluster.mesh.tls is set, but hs-cli only wires the shared-secret mesh auth mode \
-                 today (see docs/status/03-cluster.md, \"Decisions made\"); unset it or run \
-                 without TLS material for now"
-                    .to_owned(),
-            ));
+    if config.cluster.mesh.advertise_address.is_none() {
+        tracing::warn!(
+            advertised = %cluster_config.mesh_advertise_addr,
+            "cluster.mesh.advertise_address is unset; advertising the first listener's bind \
+             address to peers, which is only right when every replica shares this host (set \
+             HS__CLUSTER__MESH__ADVERTISE_ADDRESS per pod in Kubernetes)"
+        );
+    }
+    let auth_mode = cluster_config.mesh.auth.clone();
+    let (mesh_auth, tls_for_forwarder) = match &auth_mode {
+        AuthMode::SharedSecret { secret } => (MeshAuth::SharedSecret(secret.clone()), None),
+        AuthMode::MutualTls {
+            ca_file,
+            cert_file,
+            key_file,
+            peer_san_suffix,
+        } => {
+            let material = TlsMaterial::load(ca_file, cert_file, key_file)?;
+            // The forwarder builds its client config from a borrowed `TlsMaterial` and keeps
+            // only the resulting `rustls::ClientConfig`; the listener needs the material itself
+            // later, in `spawn_mesh`, so it is loaded twice rather than cloned (`TlsMaterial`
+            // holds a private key and deliberately is not `Clone`).
+            let for_forwarder = TlsMaterial::load(ca_file, cert_file, key_file)?;
+            tracing::info!(
+                ca = %ca_file.display(),
+                certificate = %cert_file.display(),
+                peer_san_suffix = ?peer_san_suffix,
+                "mesh authentication is mutual TLS"
+            );
+            (
+                MeshAuth::MutualTls {
+                    material,
+                    peer_san_suffix: peer_san_suffix.clone(),
+                },
+                Some(for_forwarder),
+            )
         }
     };
     let layout = cluster_config.layout;
@@ -173,16 +230,37 @@ pub async fn start<B: KvBackend + 'static>(
     let max_attempts = cluster_config.mesh.max_attempts;
     let retry_base_backoff = cluster_config.mesh.retry_base_backoff;
     let default_deadline = cluster_config.mesh.default_deadline;
+    let server_name = ruma::ServerName::parse(&config.server.server_name)
+        .map(|name| name.to_owned())
+        .map_err(|e| {
+            ClusterSetupError::Invalid(format!(
+                "server.server_name {:?} is not a valid Matrix server name: {e}",
+                config.server.server_name
+            ))
+        })?;
 
+    tracing::info!(
+        replica = %me,
+        mesh_listen = %listen_addr,
+        "starting the cluster ownership manager"
+    );
+    {
+        let store = hs_cluster::store::ClusterStore::open(backend.clone())?;
+        let lease_ttl = cluster_config.lease_ttl;
+        let me = me.clone();
+        tokio::task::spawn_blocking(move || {
+            refuse_live_duplicate(&store, &me, lease_ttl, unix_now_ms())
+        })
+        .await
+        .map_err(|e| ClusterSetupError::Invalid(format!("checking the replica registry: {e}")))??;
+    }
     let (cluster, manager) = Cluster::start(cluster_config, backend).await?;
     let ownership = cluster.ownership().clone();
     let metrics = manager.metrics();
 
     let forwarder = Arc::new(Forwarder::new(
-        hs_cluster::mesh::AuthMode::SharedSecret {
-            secret: secret.clone(),
-        },
-        None,
+        auth_mode,
+        tls_for_forwarder.as_ref(),
         max_hops,
         max_attempts,
         retry_base_backoff,
@@ -197,13 +275,15 @@ pub async fn start<B: KvBackend + 'static>(
         origin: me,
         origin_generation: Generation::fresh(None),
         default_deadline,
+        server_name: Some(server_name),
         mesh: Some(MeshStartConfig {
             listen_addr,
-            secret,
+            auth: mesh_auth,
             idempotency_ttl,
             max_in_flight_per_peer,
             ownership,
         }),
+        peer_handler: std::sync::OnceLock::new(),
     })
 }
 
@@ -222,7 +302,30 @@ impl ClusterHandles {
             origin: me,
             origin_generation: Generation::fresh(None),
             default_deadline: Duration::from_secs(10),
+            server_name: None,
             mesh: None,
+            peer_handler: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// This replica's identity on the mesh (`host:port` of its listener).
+    #[must_use]
+    pub fn origin(&self) -> &ReplicaId {
+        &self.origin
+    }
+
+    /// This process's generation: what tells a peer that a replica it knew has restarted.
+    #[must_use]
+    pub fn origin_generation(&self) -> Generation {
+        self.origin_generation
+    }
+
+    /// Installs the handler [`ClusterHandles::spawn_mesh`] serves `POST /mesh/v1/peer` with.
+    /// Must be called before `spawn_mesh`; a second install is ignored with a warning, the
+    /// convention every other `install_*` in this workspace follows.
+    pub fn install_peer_handler(&self, handler: Arc<dyn hs_cluster::mesh::PeerHandler>) {
+        if self.peer_handler.set(handler).is_err() {
+            tracing::warn!("a mesh peer handler was already installed; ignoring the second");
         }
     }
 
@@ -234,8 +337,20 @@ impl ClusterHandles {
     #[must_use]
     pub fn spawn_mesh(&self, app: axum::Router) -> Option<MeshRuntime> {
         let mesh = self.mesh.as_ref()?;
-        let authenticator: Arc<dyn Authenticator> =
-            Arc::new(SharedSecretAuthenticator::new(mesh.secret.clone()));
+        let (authenticator, tls_material): (Arc<dyn Authenticator>, Option<&TlsMaterial>) =
+            match &mesh.auth {
+                MeshAuth::SharedSecret(secret) => (
+                    Arc::new(SharedSecretAuthenticator::new(secret.clone())),
+                    None,
+                ),
+                MeshAuth::MutualTls {
+                    material,
+                    peer_san_suffix,
+                } => (
+                    Arc::new(MutualTlsAuthenticator::new(peer_san_suffix.clone())),
+                    Some(material),
+                ),
+            };
         let handler: Arc<dyn ShardHandler> = Arc::new(ProxyShardHandler { app });
         let deps = Arc::new(MeshDeps {
             authenticator,
@@ -249,8 +364,9 @@ impl ClusterHandles {
             // (the same loop runs unconditionally on its own interval); only failover latency
             // is, and only by up to one `heartbeat_interval`. Documented in the status file.
             nudge: None,
+            peers: self.peer_handler.get().cloned(),
         });
-        let server = match MeshServer::new(mesh.listen_addr.clone(), None) {
+        let server = match MeshServer::new(mesh.listen_addr.clone(), tls_material) {
             Ok(server) => server,
             Err(error) => {
                 tracing::error!(
@@ -282,37 +398,113 @@ fn single_node_replica_id() -> String {
     format!("{host}:{}", std::process::id())
 }
 
-/// The first configured listener's bind address, used as the mesh's advertised host — `None`,
-/// `"0.0.0.0"` and `"::"` (a listener bound to every interface, which is not a dialable address
-/// for a peer) fall back to `"127.0.0.1"`, correct for this session's same-host two-replica setup
-/// and for any other deployment that terminates the mesh behind a loopback-reachable sidecar.
-/// Getting the real advertised address right for a Kubernetes pod (the pod IP, not a config
-/// value) is out of scope for this pass; see `docs/status/03-cluster.md`.
-fn advertise_host(config: &hs_config::Config) -> String {
-    config
+/// The `host:port` this replica advertises to its peers as its mesh address, and uses as its
+/// replica identity (see [`to_hs_cluster_config`]).
+///
+/// `cluster.mesh.advertise_address` wins when set: a bare host gets `cluster.mesh.port`
+/// appended, a `host:port` is used as given (an IPv6 address must be bracketed, `[fd00::1]`,
+/// for its port to be told apart from its own colons). Unset, the first configured listener's
+/// bind address is used, with `0.0.0.0`/`::` (a wildcard bind, not a dialable address) and an
+/// empty value falling back to `127.0.0.1` -- right only when every replica shares one host, as
+/// in the two-process experiment in `docs/status/03-cluster.md`; [`start`] logs a warning in
+/// that case.
+fn advertise_addr(config: &hs_config::Config) -> String {
+    let port = config.cluster.mesh.port;
+    if let Some(configured) = config
+        .cluster
+        .mesh
+        .advertise_address
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return match split_host_port(configured) {
+            Some(_) => configured.to_owned(),
+            None => format!("{configured}:{port}"),
+        };
+    }
+    let host = config
         .listeners
         .listeners
         .first()
         .and_then(|listener| listener.bind_addresses.first())
         .map(String::as_str)
         .filter(|addr| !addr.is_empty() && *addr != "0.0.0.0" && *addr != "::")
-        .unwrap_or("127.0.0.1")
-        .to_owned()
+        .unwrap_or("127.0.0.1");
+    format!("{host}:{port}")
+}
+
+/// Refuses to start when the replica registry already holds a *live* row under this replica's
+/// identity: another process is advertising the same mesh address right now. Two replicas with
+/// one identity would take turns overwriting each other's registry row and each other's shard
+/// ownership, a split-brain by configuration. The usual cause is the configuration store: a
+/// per-replica `cluster.mesh.advertise_address` written into the shared database by the first
+/// replica to start is what every later replica reads unless it sets its own through the
+/// environment (`HS__CLUSTER__MESH__ADVERTISE_ADDRESS`, which outranks the database; the chart
+/// does this per pod). A *stale* row under this identity (a restart of the same pod, whose old
+/// row is past `lease_ttl`) is fine and is taken over by the normal generation rule.
+///
+/// # Errors
+/// [`ClusterSetupError::Invalid`] naming the live row and the environment variable to set.
+fn refuse_live_duplicate<B: KvBackend>(
+    store: &hs_cluster::store::ClusterStore<B>,
+    me: &ReplicaId,
+    lease_ttl: Duration,
+    now_unix_ms: u64,
+) -> Result<(), ClusterSetupError> {
+    let lease_ms = u64::try_from(lease_ttl.as_millis()).unwrap_or(u64::MAX);
+    let live_duplicate = store
+        .list_replicas()?
+        .into_iter()
+        .find(|row| &row.id == me && now_unix_ms.saturating_sub(row.heartbeat_unix_ms) < lease_ms);
+    match live_duplicate {
+        Some(row) => Err(ClusterSetupError::Invalid(format!(
+            "another replica is already live under this identity ({me}, last heartbeat {} ms \
+             ago, generation {}): every replica needs its own cluster.mesh.advertise_address. \
+             A value in the shared configuration database is read by every replica; set it per \
+             replica through the environment (HS__CLUSTER__MESH__ADVERTISE_ADDRESS), which \
+             outranks the database, or unset it there (hs config unset \
+             /cluster/mesh/advertise_address)",
+            now_unix_ms.saturating_sub(row.heartbeat_unix_ms),
+            row.generation.0
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn unix_now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// Splits `host:port` into its parts, or `None` if `addr` carries no port: a bare host name, a
+/// bare IPv4 address, or an unbracketed IPv6 address (whose colons are not a port separator).
+fn split_host_port(addr: &str) -> Option<(&str, u16)> {
+    let (host, port) = addr.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    let is_bracketed_v6 = host.starts_with('[') && host.ends_with(']');
+    if host.contains(':') && !is_bracketed_v6 {
+        return None;
+    }
+    Some((host, port))
 }
 
 /// Converts `hs-config`'s `cluster` section into `hs-cluster`'s own config type. The two shapes do
 /// not line up one-to-one (see this crate's module docs and `docs/status/03-cluster.md`): this
-/// replica's identity and mesh-advertised address are process-level facts with no config field
-/// (derived from the first listener's bind address plus `cluster.mesh.port` — see
-/// [`advertise_host`]), and federation/appservice shard counts have no `hs-config` field yet
-/// (`layout` is filled in by the caller from `hs-cluster`'s own defaults for those two kinds).
+/// replica's identity is its mesh address ([`advertise_addr`]), and federation/appservice shard
+/// counts have no `hs-config` field yet (`layout` is filled in by the caller from `hs-cluster`'s
+/// own defaults for those two kinds).
 fn to_hs_cluster_config(
     config: &hs_config::Config,
     layout: ShardLayout,
 ) -> hs_cluster::ClusterConfig {
     let cluster_cfg = &config.cluster;
-    let host = advertise_host(config);
-    let mesh_advertise_addr = format!("{host}:{}", cluster_cfg.mesh.port);
+    let mesh_advertise_addr = advertise_addr(config);
     // The forwarder dials `owner.as_str()` directly as a `host:port` (see
     // `hs_cluster::mesh::forwarder::Forwarder::resolve_addr`'s doc comment on this exact
     // convention), so this replica's identity *is* its dialable mesh address rather than a
@@ -323,26 +515,23 @@ fn to_hs_cluster_config(
     cfg.heartbeat_interval = cluster_cfg.heartbeat_interval.as_std();
     cfg.lease_ttl = cluster_cfg.lease_ttl.as_std();
     cfg.mesh.listen_addr = format!("0.0.0.0:{}", cluster_cfg.mesh.port);
-    let secret = cluster_cfg
-        .mesh
-        .shared_secret
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("dev-only-shared-secret")
-        .to_owned();
-    if cluster_cfg.mesh.tls.is_some() {
-        // Recorded via the `AuthMode` value itself rather than a separate flag: `start` above
-        // checks for this variant and refuses to boot rather than silently downgrading a
-        // TLS-configured deployment to shared-secret auth.
-        cfg.mesh.auth = hs_cluster::mesh::AuthMode::MutualTls {
-            ca_file: std::path::PathBuf::new(),
-            cert_file: std::path::PathBuf::new(),
-            key_file: std::path::PathBuf::new(),
-            peer_san_suffix: None,
-        };
-    } else {
-        cfg.mesh.auth = hs_cluster::mesh::AuthMode::SharedSecret { secret };
-    }
+    cfg.mesh.auth = match &cluster_cfg.mesh.tls {
+        Some(tls) => AuthMode::MutualTls {
+            ca_file: tls.ca_certificate_path.clone(),
+            cert_file: tls.certificate_path.clone(),
+            key_file: tls.private_key_path.clone(),
+            peer_san_suffix: tls.peer_san_suffix.clone(),
+        },
+        None => AuthMode::SharedSecret {
+            secret: cluster_cfg
+                .mesh
+                .shared_secret
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("dev-only-shared-secret")
+                .to_owned(),
+        },
+    };
     cfg
 }
 
@@ -397,26 +586,38 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
 }
 
 /// Extracts and percent-decodes the room id from a Matrix client-server path of the shape
-/// `.../rooms/{roomId}/...`. Returns `None` for any path with no `rooms` segment at all — every
-/// route this module does not need to gate (`/createRoom`, `/sync`, `/login`, `/media/...`, ...).
-///
-/// A room *created* through `/createRoom` is not gated by this function at all (there is no room
-/// id in that request's path — the id is minted inside the handler). This is a known gap, not
-/// fixed here: a `/createRoom` handled by a replica that does not end up owning the new room's
-/// shard would construct that room's first `RoomActor` on the wrong replica. See
-/// `docs/status/03-cluster.md`.
+/// `.../rooms/{roomId}/...`, or `.../join/{roomId}` and `.../knock/{roomId}` when what follows
+/// is a room id (`!...`) rather than an alias. Returns `None` for any other path — every route
+/// this module does not need to gate (`/sync`, `/login`, `/media/...`, ...) and the alias forms
+/// of `/join` and `/knock`, whose room id is only known once the handler has resolved the alias
+/// (see `docs/status/03-cluster.md`, 2026-09-27, for that gap). `/createRoom` has no room id in
+/// its path either and is gated separately, by [`is_create_room`] and
+/// [`RoomShardGate::run_create_room`].
 fn extract_room_id(path: &str) -> Option<String> {
     let mut segments = path.split('/');
     while let Some(segment) = segments.next() {
-        if segment == "rooms" {
-            let raw = segments.next()?;
-            if raw.is_empty() {
-                return None;
+        match segment {
+            "rooms" => {
+                let raw = segments.next()?;
+                if raw.is_empty() {
+                    return None;
+                }
+                return Some(percent_decode(raw));
             }
-            return Some(percent_decode(raw));
+            "join" | "knock" => {
+                let decoded = percent_decode(segments.next()?);
+                return decoded.starts_with('!').then_some(decoded);
+            }
+            _ => {}
         }
     }
     None
+}
+
+/// Whether a request is `POST /_matrix/client/{version}/createRoom`, the one room request whose
+/// room id is not in its path.
+fn is_create_room(method: &http::Method, path: &str) -> bool {
+    method == http::Method::POST && path.ends_with("/createRoom")
 }
 
 /// A minimal percent-decoder for one path segment. No external crate: a Matrix room id is a short
@@ -455,6 +656,9 @@ pub struct RoomShardGate {
     origin: ReplicaId,
     origin_generation: Generation,
     default_deadline: Duration,
+    /// For minting a `/createRoom` id ahead of the handler; `None` in single-node mode, where
+    /// `/createRoom` passes through untouched.
+    server_name: Option<ruma::OwnedServerName>,
 }
 
 impl RoomShardGate {
@@ -468,6 +672,7 @@ impl RoomShardGate {
             origin: handles.origin.clone(),
             origin_generation: handles.origin_generation,
             default_deadline: handles.default_deadline,
+            server_name: handles.server_name.clone(),
         })
     }
 
@@ -485,6 +690,9 @@ impl RoomShardGate {
     }
 
     async fn run(&self, req: Request, next: Next) -> Response {
+        if is_create_room(req.method(), req.uri().path()) {
+            return self.run_create_room(req, next).await;
+        }
         let Some(room_id) = extract_room_id(req.uri().path()) else {
             return next.run(req).await;
         };
@@ -499,6 +707,107 @@ impl RoomShardGate {
             },
             None => self.refuse(shard, "no mesh forwarder is configured on this replica"),
         }
+    }
+
+    /// Gates `POST /createRoom` (see [`hs_cluster::create_room`] for the design): mints the new
+    /// room's id, and handles the request here if this replica owns the id's shard or forwards
+    /// it to the owner with the id in the mesh-only header otherwise. On the receiving end of a
+    /// forward the header becomes a [`PreassignedRoomId`] extension, after re-checking ownership.
+    /// Any value a *client* sent under the header is dropped: only a request that re-entered the
+    /// router from the mesh (marked [`ViaMesh`] by [`ProxyShardHandler`]) may carry one.
+    async fn run_create_room(&self, mut req: Request, next: Next) -> Response {
+        let via_mesh = req.extensions().get::<ViaMesh>().is_some();
+        let header = req.headers_mut().remove(PREASSIGNED_ROOM_ID_HEADER);
+        let forwarded_id = if via_mesh {
+            header.and_then(|v| v.to_str().ok().map(str::to_owned))
+        } else {
+            None
+        };
+
+        if let Some(room_id) = forwarded_id {
+            let shard = self.layout.room_shard(&room_id);
+            if !self.ownership.is_mine(shard) {
+                return self.refuse(
+                    shard,
+                    "a forwarded /createRoom named a room whose shard this replica does not \
+                     own; ownership moved, and the sender retries against the current owner",
+                );
+            }
+            req.extensions_mut()
+                .insert(PreassignedRoomId(room_id.clone()));
+            let response = next.run(req).await;
+            return self.check_created_room(response, &room_id).await;
+        }
+
+        let (Some(server_name), Some(forwarder)) = (&self.server_name, &self.forwarder) else {
+            // Single-node mode: every shard is this replica's, so the handler's own id is as
+            // good as any and nothing is pre-minted.
+            return next.run(req).await;
+        };
+
+        let room_id = ruma::RoomId::new_v1(server_name).to_string();
+        let shard = self.layout.room_shard(&room_id);
+        if self.ownership.is_mine(shard) {
+            req.extensions_mut()
+                .insert(PreassignedRoomId(room_id.clone()));
+            let response = next.run(req).await;
+            return self.check_created_room(response, &room_id).await;
+        }
+
+        let Ok(value) = http::HeaderValue::from_str(&room_id) else {
+            // A freshly minted `!localpart:server` is always a valid header value; this arm is
+            // unreachable in practice and kept only so the gate cannot panic.
+            return self.refuse(shard, "the minted room id is not a valid header value");
+        };
+        req.headers_mut().insert(PREASSIGNED_ROOM_ID_HEADER, value);
+        tracing::debug!(%room_id, %shard, "forwarding /createRoom to the shard's owner");
+        match self.forward(forwarder, shard, req).await {
+            Ok(response) => response,
+            Err(reason) => self.refuse(shard, &reason),
+        }
+    }
+
+    /// Reads the `room_id` out of a successful `/createRoom` response and warns if it is not the
+    /// pre-assigned one, or hashes to a shard this replica does not own: either means the handler
+    /// minted its own id (`hs-room` not yet honouring [`PreassignedRoomId`], or a room version
+    /// whose id is derived from the create event) and the room's first actor may have been built
+    /// on a non-owner. The response is passed on unchanged either way; this is a diagnostic, and
+    /// the room is usable (every later request is routed to its true owner).
+    async fn check_created_room(&self, response: Response, preassigned: &str) -> Response {
+        if response.status() != StatusCode::OK {
+            return response;
+        }
+        let (parts, body) = response.into_parts();
+        let bytes = match to_bytes(body, MAX_PROXIED_BODY_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(%error, "could not read the /createRoom response body");
+                return Response::from_parts(parts, Body::empty());
+            }
+        };
+        let created = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v.get("room_id")?.as_str().map(str::to_owned));
+        match created {
+            Some(id) if id == preassigned => {
+                tracing::debug!(room_id = %id, "created a room under its pre-assigned id");
+            }
+            Some(id) => {
+                let shard = self.layout.room_shard(&id);
+                let mine = self.ownership.is_mine(shard);
+                tracing::warn!(
+                    room_id = %id,
+                    %preassigned,
+                    %shard,
+                    owned_here = mine,
+                    "the /createRoom handler minted its own room id instead of the pre-assigned \
+                     one (see docs/rfcs/0019-create-room-shard-gate.md); the room's first actor \
+                     was built on this replica, which owns its shard: {mine}"
+                );
+            }
+            None => {}
+        }
+        Response::from_parts(parts, Body::from(bytes))
     }
 
     fn refuse(&self, shard: ShardId, reason: &str) -> Response {
@@ -635,10 +944,14 @@ impl ShardHandler for ProxyShardHandler {
         for (name, value) in &proxied.headers {
             builder = builder.header(name.as_str(), value.as_str());
         }
-        let request = match builder.body(Body::from(body)) {
+        let mut request = match builder.body(Body::from(body)) {
             Ok(r) => r,
             Err(e) => return bad_request(format!("bad proxied request: {e}")),
         };
+        // Marks the request as having arrived over the mesh, which is what lets the gate on this
+        // side honour a pre-assigned `/createRoom` id (see `RoomShardGate::run_create_room`).
+        // Extensions cannot be set from a client socket, so this is not spoofable.
+        request.extensions_mut().insert(ViaMesh);
 
         let response = match self.app.clone().oneshot(request).await {
             Ok(r) => r,
@@ -704,6 +1017,31 @@ mod tests {
     }
 
     #[test]
+    fn extracts_room_id_from_join_and_knock_by_id_but_not_by_alias() {
+        // `POST /join/{roomIdOrAlias}` has no `rooms` segment; on a non-owner it used to reach
+        // the handler and be refused by the write fence instead of forwarded (found by track 05).
+        assert_eq!(
+            extract_room_id("/_matrix/client/v3/join/!abc%3Aexample.org"),
+            Some("!abc:example.org".to_owned())
+        );
+        assert_eq!(
+            extract_room_id("/_matrix/client/v3/knock/!abc:example.org"),
+            Some("!abc:example.org".to_owned())
+        );
+        // An alias resolves to a room id only inside the handler: not gated here.
+        assert_eq!(
+            extract_room_id("/_matrix/client/v3/join/%23alias%3Aexample.org"),
+            None
+        );
+        assert_eq!(extract_room_id("/_matrix/client/v3/join/"), None);
+        // `/rooms/{roomId}/join` was already covered by the `rooms` segment.
+        assert_eq!(
+            extract_room_id("/_matrix/client/v3/rooms/!abc%3Aexample.org/join"),
+            Some("!abc:example.org".to_owned())
+        );
+    }
+
+    #[test]
     fn does_not_match_unrelated_paths() {
         assert_eq!(extract_room_id("/_matrix/client/v3/createRoom"), None);
         assert_eq!(extract_room_id("/_matrix/client/v3/sync"), None);
@@ -730,7 +1068,9 @@ mod tests {
             origin: ReplicaId::new("solo:1"),
             origin_generation: Generation::fresh(None),
             default_deadline: Duration::from_secs(10),
+            server_name: None,
             mesh: None,
+            peer_handler: std::sync::OnceLock::new(),
         };
         let gate = RoomShardGate::new(&handles);
         assert!(
@@ -738,5 +1078,428 @@ mod tests {
                 .is_mine(handles.layout.room_shard("!any:room.example.org"))
         );
         assert!(gate.forwarder.is_none());
+    }
+
+    fn config_with_cluster(cluster_yaml: &str) -> hs_config::Config {
+        hs_config::Config::from_yaml(&format!(
+            "server:\n  server_name: example.org\n\
+             listeners:\n  listeners:\n    - port: 8008\n      bind_addresses: [\"10.0.0.7\"]\n      resources: [client]\n\
+             cluster:\n  single_node: false\n{cluster_yaml}"
+        ))
+        .expect("test config parses")
+    }
+
+    #[test]
+    fn advertise_addr_prefers_the_configured_address_over_the_bind_address() {
+        let bare_host = config_with_cluster(
+            "  mesh:\n    port: 8449\n    advertise_address: hs-0.hs-headless.matrix.svc.cluster.local\n",
+        );
+        assert_eq!(
+            advertise_addr(&bare_host),
+            "hs-0.hs-headless.matrix.svc.cluster.local:8449",
+            "a bare host gets the mesh port appended"
+        );
+
+        let with_port =
+            config_with_cluster("  mesh:\n    port: 8449\n    advertise_address: 10.1.2.3:9000\n");
+        assert_eq!(advertise_addr(&with_port), "10.1.2.3:9000");
+
+        let bracketed_v6 =
+            config_with_cluster("  mesh:\n    port: 8449\n    advertise_address: \"[fd00::1]\"\n");
+        assert_eq!(advertise_addr(&bracketed_v6), "[fd00::1]:8449");
+
+        let unset = config_with_cluster("  mesh:\n    port: 8449\n");
+        assert_eq!(
+            advertise_addr(&unset),
+            "10.0.0.7:8449",
+            "unset falls back to the first listener's bind address"
+        );
+
+        let wildcard = {
+            let mut cfg = unset.clone();
+            cfg.listeners.listeners[0].bind_addresses = vec!["0.0.0.0".to_owned()];
+            cfg
+        };
+        assert_eq!(advertise_addr(&wildcard), "127.0.0.1:8449");
+    }
+
+    #[test]
+    fn a_live_row_under_this_identity_refuses_startup_but_a_stale_one_does_not() {
+        use hs_cluster::types::{ReplicaRecord, ReplicaState};
+        let backend = hs_kv::memory::MemoryBackend::new();
+        let store = hs_cluster::store::ClusterStore::open(backend).unwrap();
+        let me = ReplicaId::new("hs-0.hs-headless.matrix.svc.cluster.local:8449");
+        let lease = Duration::from_secs(10);
+        let now = 1_000_000_u64;
+
+        // Empty registry: fine.
+        refuse_live_duplicate(&store, &me, lease, now).expect("no rows");
+
+        let row = |heartbeat_unix_ms: u64| ReplicaRecord {
+            id: me.clone(),
+            generation: Generation(7),
+            mesh_addr: me.as_str().to_owned(),
+            zone: None,
+            version: "test".into(),
+            state: ReplicaState::Active,
+            heartbeat_seq: 1,
+            heartbeat_unix_ms,
+        };
+        // A row heartbeated a moment ago under the same identity: another process is live.
+        store.heartbeat(&row(now - 500)).unwrap();
+        let err = refuse_live_duplicate(&store, &me, lease, now).expect_err("live duplicate");
+        assert!(
+            err.to_string()
+                .contains("HS__CLUSTER__MESH__ADVERTISE_ADDRESS"),
+            "{err}"
+        );
+        // The same row once it is older than the lease: a restart of this replica, allowed.
+        refuse_live_duplicate(&store, &me, lease, now + 20_000).expect("stale row");
+        // A live row under a different identity is somebody else, allowed.
+        let other = ReplicaId::new("hs-1.hs-headless.matrix.svc.cluster.local:8449");
+        refuse_live_duplicate(&store, &other, lease, now).expect("other identity");
+    }
+
+    #[test]
+    fn split_host_port_tells_a_port_from_an_ipv6_colon() {
+        assert_eq!(split_host_port("host:8449"), Some(("host", 8449)));
+        assert_eq!(split_host_port("[fd00::1]:8449"), Some(("[fd00::1]", 8449)));
+        assert_eq!(split_host_port("fd00::1"), None);
+        assert_eq!(split_host_port("host"), None);
+        assert_eq!(split_host_port("host:notaport"), None);
+    }
+
+    #[test]
+    fn to_hs_cluster_config_carries_the_tls_paths_and_the_identity() {
+        let cfg = config_with_cluster(
+            "  mesh:\n    port: 8449\n    advertise_address: hs-1.mesh.test\n    tls:\n\
+             \x20     certificate_path: /m/tls.crt\n      private_key_path: /m/tls.key\n\
+             \x20     ca_certificate_path: /m/ca.crt\n      peer_san_suffix: .mesh.test\n",
+        );
+        let converted = to_hs_cluster_config(&cfg, ShardLayout::default());
+        assert_eq!(converted.me.as_str(), "hs-1.mesh.test:8449");
+        assert_eq!(converted.mesh_advertise_addr, "hs-1.mesh.test:8449");
+        assert_eq!(converted.mesh.listen_addr, "0.0.0.0:8449");
+        match converted.mesh.auth {
+            AuthMode::MutualTls {
+                ca_file,
+                cert_file,
+                key_file,
+                peer_san_suffix,
+            } => {
+                assert_eq!(ca_file, std::path::PathBuf::from("/m/ca.crt"));
+                assert_eq!(cert_file, std::path::PathBuf::from("/m/tls.crt"));
+                assert_eq!(key_file, std::path::PathBuf::from("/m/tls.key"));
+                assert_eq!(peer_san_suffix.as_deref(), Some(".mesh.test"));
+            }
+            AuthMode::SharedSecret { .. } => panic!("tls in the config must select mutual TLS"),
+        }
+
+        let plain = config_with_cluster("  mesh:\n    shared_secret: s3\n");
+        match to_hs_cluster_config(&plain, ShardLayout::default())
+            .mesh
+            .auth
+        {
+            AuthMode::SharedSecret { secret } => assert_eq!(secret, "s3"),
+            AuthMode::MutualTls { .. } => panic!("no tls in the config must select the secret"),
+        }
+    }
+
+    #[test]
+    fn is_create_room_matches_only_the_create_route() {
+        assert!(is_create_room(
+            &http::Method::POST,
+            "/_matrix/client/v3/createRoom"
+        ));
+        assert!(is_create_room(
+            &http::Method::POST,
+            "/_matrix/client/r0/createRoom"
+        ));
+        assert!(!is_create_room(
+            &http::Method::GET,
+            "/_matrix/client/v3/createRoom"
+        ));
+        assert!(!is_create_room(
+            &http::Method::POST,
+            "/_matrix/client/v3/rooms/!a:b/send/m.room.message/1"
+        ));
+    }
+
+    // ---- the /createRoom gate, with scripted ownership ----
+
+    /// An ownership whose answers a test scripts: every shard is mine, or none is and `owner`
+    /// has them all.
+    struct Scripted {
+        me: ReplicaId,
+        mine: bool,
+        owner: Option<ReplicaId>,
+    }
+
+    impl Ownership for Scripted {
+        fn me(&self) -> &ReplicaId {
+            &self.me
+        }
+        fn owner_of(&self, _shard: ShardId) -> Option<ReplicaId> {
+            if self.mine {
+                Some(self.me.clone())
+            } else {
+                self.owner.clone()
+            }
+        }
+        fn is_mine(&self, _shard: ShardId) -> bool {
+            self.mine
+        }
+        fn fence(&self, shard: ShardId) -> Option<Fence> {
+            self.mine.then(|| Fence::inert(shard))
+        }
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<hs_cluster::OwnershipEvent> {
+            tokio::sync::broadcast::channel(1).1
+        }
+        fn shard_map(&self) -> watch::Receiver<Arc<hs_cluster::ShardMap>> {
+            watch::channel(Arc::new(hs_cluster::ShardMap::default())).1
+        }
+    }
+
+    fn scripted(me: &str, mine: bool, owner: Option<&str>) -> Arc<Scripted> {
+        Arc::new(Scripted {
+            me: ReplicaId::new(me),
+            mine,
+            owner: owner.map(ReplicaId::new),
+        })
+    }
+
+    const TEST_SECRET: &str = "gate-test-secret";
+
+    fn gate(ownership: Arc<dyn Ownership>, clustered: bool) -> Arc<RoomShardGate> {
+        let forwarder = clustered.then(|| {
+            Arc::new(
+                Forwarder::new(
+                    AuthMode::SharedSecret {
+                        secret: TEST_SECRET.into(),
+                    },
+                    None,
+                    3,
+                    2,
+                    Duration::from_millis(5),
+                    ownership.clone(),
+                    Arc::new(hs_cluster::metrics::ClusterMetrics::new()),
+                )
+                .expect("forwarder"),
+            )
+        });
+        Arc::new(RoomShardGate {
+            ownership: ownership.clone(),
+            layout: ShardLayout::default(),
+            forwarder,
+            origin: ownership.me().clone(),
+            origin_generation: Generation::fresh(None),
+            default_deadline: Duration::from_secs(5),
+            server_name: clustered.then(|| {
+                ruma::ServerName::parse("example.org")
+                    .expect("valid")
+                    .to_owned()
+            }),
+        })
+    }
+
+    /// What one replica's stand-in `/createRoom` handler saw, per call.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+    struct Seen {
+        room_id: String,
+        preassigned: bool,
+        via_mesh: bool,
+        header_present: bool,
+    }
+
+    /// A router whose `/createRoom` records what reached it and answers the way `hs-room` would
+    /// once it honours [`PreassignedRoomId`]: the pre-assigned id if there is one, its own
+    /// otherwise.
+    fn create_room_router(seen: Arc<std::sync::Mutex<Vec<Seen>>>) -> axum::Router {
+        axum::Router::new().route(
+            "/_matrix/client/v3/createRoom",
+            axum::routing::post(move |req: Request| {
+                let seen = seen.clone();
+                async move {
+                    let pre = req.extensions().get::<PreassignedRoomId>().cloned();
+                    let record = Seen {
+                        room_id: pre
+                            .as_ref()
+                            .map(|p| p.0.clone())
+                            .unwrap_or_else(|| "!minted-by-handler:example.org".to_owned()),
+                        preassigned: pre.is_some(),
+                        via_mesh: req.extensions().get::<ViaMesh>().is_some(),
+                        header_present: req.headers().contains_key(PREASSIGNED_ROOM_ID_HEADER),
+                    };
+                    seen.lock().unwrap().push(record.clone());
+                    axum::Json(serde_json::json!({ "room_id": record.room_id }))
+                }
+            }),
+        )
+    }
+
+    fn create_room_request(client_header: Option<&str>) -> Request {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/_matrix/client/v3/createRoom")
+            .header("content-type", "application/json");
+        if let Some(value) = client_header {
+            builder = builder.header(PREASSIGNED_ROOM_ID_HEADER, value);
+        }
+        builder
+            .body(Body::from(r#"{"preset":"public_chat"}"#))
+            .unwrap()
+    }
+
+    async fn room_id_of(response: Response) -> (StatusCode, String) {
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": String::from_utf8_lossy(&bytes) }));
+        (
+            status,
+            json.get("room_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned(),
+        )
+    }
+
+    #[tokio::test]
+    async fn on_the_owner_create_room_runs_locally_under_a_preassigned_id() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = gate(scripted("a:1", true, None), true).layer(create_room_router(seen.clone()));
+
+        // A client trying to pick its own room id through the mesh-only header is ignored.
+        let response = app
+            .oneshot(create_room_request(Some("!chosen-by-client:example.org")))
+            .await
+            .unwrap();
+        let (status, room_id) = room_id_of(response).await;
+        assert_eq!(status, StatusCode::OK);
+        let calls = seen.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].preassigned,
+            "the gate pre-assigned an id: {calls:?}"
+        );
+        assert!(!calls[0].header_present, "the client's header was stripped");
+        assert!(!calls[0].via_mesh);
+        assert_eq!(room_id, calls[0].room_id);
+        assert_ne!(room_id, "!chosen-by-client:example.org");
+        assert!(
+            room_id.starts_with('!') && room_id.ends_with(":example.org"),
+            "{room_id}"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_single_node_mode_create_room_passes_through_untouched() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app =
+            gate(scripted("solo:1", true, None), false).layer(create_room_router(seen.clone()));
+        let response = app
+            .oneshot(create_room_request(Some("!chosen-by-client:example.org")))
+            .await
+            .unwrap();
+        let (status, room_id) = room_id_of(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(room_id, "!minted-by-handler:example.org");
+        let calls = seen.lock().unwrap().clone();
+        assert!(!calls[0].preassigned);
+        assert!(!calls[0].header_present, "the header is stripped even here");
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_create_room_for_a_shard_not_owned_here_is_refused() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app =
+            gate(scripted("b:1", false, Some("c:1")), true).layer(create_room_router(seen.clone()));
+        let mut req = create_room_request(Some("!forwarded:example.org"));
+        req.extensions_mut().insert(ViaMesh);
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("M_HS_NOT_SHARD_OWNER"),
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(seen.lock().unwrap().is_empty(), "the handler must not run");
+    }
+
+    /// A port nobody is listening on right now; `MeshServer` binds only inside `serve`.
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    #[tokio::test]
+    async fn on_a_non_owner_create_room_is_forwarded_to_the_owner_which_creates_it() {
+        // Replica B owns every shard and runs a mesh listener whose handler replays forwards
+        // against B's own gated router, exactly as `spawn_mesh` wires it in production.
+        let b_addr = format!("127.0.0.1:{}", free_port());
+        let seen_b = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ownership_b: Arc<dyn Ownership> = scripted(&b_addr, true, None);
+        let app_b = gate(ownership_b.clone(), true).layer(create_room_router(seen_b.clone()));
+        let deps = Arc::new(MeshDeps {
+            authenticator: Arc::new(SharedSecretAuthenticator::new(TEST_SECRET)),
+            ownership: ownership_b,
+            handler: Arc::new(ProxyShardHandler { app: app_b }),
+            idempotency: Arc::new(IdempotencyCache::new(Duration::from_secs(5), 16)),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(8)),
+            nudge: None,
+            peers: None,
+        });
+        let server = MeshServer::new(b_addr.clone(), None).unwrap();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            server.serve(deps, shutdown_rx).await.unwrap();
+        });
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(&b_addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Replica A owns nothing and believes B owns everything.
+        let seen_a = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app_a = gate(scripted("127.0.0.1:1", false, Some(&b_addr)), true)
+            .layer(create_room_router(seen_a.clone()));
+
+        let response = app_a
+            .oneshot(create_room_request(Some("!chosen-by-client:example.org")))
+            .await
+            .unwrap();
+        let (status, room_id) = room_id_of(response).await;
+        assert_eq!(status, StatusCode::OK, "{room_id}");
+
+        assert!(
+            seen_a.lock().unwrap().is_empty(),
+            "the non-owner must never run the handler"
+        );
+        let calls_b = seen_b.lock().unwrap().clone();
+        assert_eq!(calls_b.len(), 1, "{calls_b:?}");
+        assert!(
+            calls_b[0].via_mesh,
+            "B saw the request arrive over the mesh"
+        );
+        assert!(
+            calls_b[0].preassigned,
+            "B's gate turned the header into the extension"
+        );
+        assert!(
+            !calls_b[0].header_present,
+            "the header does not reach the handler"
+        );
+        assert_eq!(
+            room_id, calls_b[0].room_id,
+            "the client got the id B created under"
+        );
+        assert_ne!(room_id, "!chosen-by-client:example.org");
+        assert!(room_id.ends_with(":example.org"), "{room_id}");
     }
 }

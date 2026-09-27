@@ -1,0 +1,174 @@
+# Two replicas in cluster mode on a real cluster: the experiment docs/next-steps.md item 1 asks
+# for, and the first time two *pods* (not two processes on one host) will have talked over the
+# mesh. Written 2026-09-27 by track 03 without a cluster to run it on; the two-process run on
+# one PostgreSQL that proved the same binary and configuration is in docs/status/03-cluster.md.
+#
+#   helm upgrade --install hs deploy/helm/hs -n matrix -f deploy/helm/hs/values-two-replica-experiment.yaml
+#
+# Before that, four Secrets in the namespace, in this order:
+#
+# 1. The database. CloudNativePG (the verification cluster runs `cnpg-system`) makes the
+#    `<clusterName>-app` Secret itself when its Cluster comes up:
+#
+#      kubectl -n matrix apply -f - <<'EOF'
+#      apiVersion: postgresql.cnpg.io/v1
+#      kind: Cluster
+#      metadata: { name: hs-db }
+#      spec:
+#        instances: 1
+#        storage: { size: 10Gi }
+#        bootstrap: { initdb: { database: hs, owner: hs } }
+#      EOF
+#
+# 2. The signing key, shared by both replicas (they share no volume; two keys would mean two
+#    servers signing as one name):
+#
+#      hs generate-signing-key -o signing.key
+#      kubectl -n matrix create secret generic hs-signing-key --from-file=signing.key
+#
+# 3. The mesh's private CA and one wildcard certificate for every pod's stable name under the
+#    headless Service. `hs` is the release name below, `matrix` the namespace, so the pods are
+#    hs-0.hs-headless.matrix.svc.cluster.local and hs-1...; the wildcard covers both, and any
+#    further replica. Three openssl commands (or a cert-manager Certificate with the same
+#    dnsNames, whose Secret has the same three keys):
+#
+#      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
+#        -subj /CN=hs-mesh-ca -keyout mesh-ca.key -out mesh-ca.crt
+#      openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+#        -subj '/CN=*.hs-headless.matrix.svc.cluster.local' -keyout mesh.key -out mesh.csr \
+#        -addext 'subjectAltName=DNS:*.hs-headless.matrix.svc.cluster.local'
+#      openssl x509 -req -in mesh.csr -CA mesh-ca.crt -CAkey mesh-ca.key -CAcreateserial \
+#        -days 825 -copy_extensions copy -out mesh.crt
+#      kubectl -n matrix create secret generic hs-mesh-tls \
+#        --type=kubernetes.io/tls --from-file=tls.crt=mesh.crt --from-file=tls.key=mesh.key \
+#        --from-file=ca.crt=mesh-ca.crt
+#
+#    A pod verifies its peer's certificate against the name it dialled, so the SAN must be the
+#    wildcard for exactly this release's headless Service (release name and namespace both
+#    appear in it). Change either below and reissue the certificate.
+#
+# 4. The registration shared secret, so `hs register` can make the test users:
+#
+#      kubectl -n matrix create secret generic hs-registration \
+#        --from-literal=registration-shared-secret="$(openssl rand -hex 32)"
+#
+# What to look for once both pods are Ready: `kubectl logs hs-0 | grep -i mesh` says
+# "mesh authentication is mutual TLS" and names hs-0's advertised address; the replica registry
+# in the database (`select * from kv_cluster_replicas`, or the admin interface's overview) lists
+# both pods by their DNS names; a room created through one pod and written through the other
+# reads the same on both. Then Element through the Service, per docs/next-steps.md.
+
+## Two identical replicas, PostgreSQL-backed, forwarding to each other over the mesh.
+mode: cluster
+replicaCount: 2
+
+## The Matrix server name. Both replicas sign as this, with the one key in `secrets.signingKey`.
+serverName: cluster.example.org
+## Where clients reach the Service (through the Ingress below, or a port-forward for the
+## experiment). Also what the setup link in the logs is built from.
+publicBaseUrl: https://cluster.example.org
+
+image:
+  ## The image CD publishes for main. A tag that contains this branch's `hs-cli` is required:
+  ## the pod's advertised mesh address and the mesh's mutual TLS are read from the config
+  ## fields added on 2026-09-27; an older image ignores them and advertises 127.0.0.1.
+  tag: ""
+
+## One shared PostgreSQL, from the CloudNativePG Cluster made in step 1; the chart reads host,
+## port, database, user and password from the `hs-db-app` Secret CloudNativePG generates.
+## Every replica writes to this primary; it is the ceiling docs/scaling.md describes.
+storage:
+  backend: postgres
+cloudNativePG:
+  enabled: true
+  clusterName: hs-db
+
+## Media must be somewhere both pods can see: an S3-compatible bucket, or a ReadWriteMany
+## claim via `media.storage.backend: local` + `local.existingClaim`. The chart refuses `local`
+## with no claim in cluster mode, because an upload to one pod would be a 404 on the other.
+media:
+  storage:
+    backend: s3
+    s3:
+      bucket: hs-media-experiment
+      region: ""
+      ## The bucket's endpoint for MinIO/Ceph RGW/R2; empty for AWS.
+      endpoint: ""
+      accessKeyId: ""
+      ## Secret holding `secret-access-key`.
+      existingSecret: hs-media-s3
+
+secrets:
+  ## Step 2. Required in cluster mode.
+  signingKey:
+    existingSecret: hs-signing-key
+  ## Step 4. Lets `hs register -k <secret>` create the users the experiment sends as.
+  registrationSharedSecret:
+    existingSecret: hs-registration
+
+cluster:
+  ## Shard counts are fixed once the first replica records them; the defaults are right for two
+  ## pods and for sixteen. Heartbeat/lease as the defaults: failover in about ten seconds.
+  roomShards: 256
+  userShards: 256
+  heartbeatInterval: 2s
+  leaseTtl: 10s
+  ## Change if the cluster's DNS domain is not cluster.local (`kubectl exec <pod> -- cat
+  ## /etc/resolv.conf` shows it); the advertised names and the SAN suffix are built from it.
+  clusterDomain: cluster.local
+  mesh:
+    port: 8449
+    ## Step 3. Mutual TLS between the two pods, verified against the private CA in the Secret.
+    tls:
+      existingSecret: hs-mesh-tls
+  ## The pod hands its shards to the other before its listeners stop; 40s leaves a margin over
+  ## the server's 20s drain deadline for a `kubectl rollout restart` under load.
+  terminationGracePeriodSeconds: 40
+
+## Two pods on two nodes if the cluster has them; soft, so a one-node cluster still schedules.
+affinity:
+  podAntiAffinity:
+    enabled: true
+    style: soft
+
+## Keep one pod serving through a rollout or a node drain.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+## Only this release's pods may reach the mesh port; clients and federation come in as usual.
+networkPolicy:
+  enabled: true
+
+## Clients reach whichever pod the Service picks. Until /sync is cluster-aware (track 05, in
+## flight on 2026-09-27) a client should stay on one pod for its session; an Ingress with
+## session affinity (annotations below, for ingress-nginx) makes the experiment's Element
+## sessions sticky. Room writes are correct from either pod regardless.
+ingress:
+  enabled: true
+  className: nginx
+  clientHost: cluster.example.org
+  federationHost: cluster.example.org
+  tlsEnabled: true
+  tlsSecret: hs-ingress-tls
+  annotations:
+    nginx.ingress.kubernetes.io/affinity: cookie
+    nginx.ingress.kubernetes.io/session-cookie-name: hs-replica
+    nginx.ingress.kubernetes.io/session-cookie-max-age: "86400"
+
+## The operator and its CRD are not part of this experiment.
+bridges:
+  enabled: false
+
+telemetry:
+  logging:
+    ## Human-readable, for tailing both pods side by side.
+    format: text
+    level: info
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    memory: 1Gi

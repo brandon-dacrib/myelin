@@ -156,6 +156,9 @@ pub struct BridgeStore<B: KvBackend> {
     instances: TypedKeyspace<B::Keyspace, (String, String)>,
     /// `room_id -> bot localpart`: which of the manager's bots is in which room.
     rooms: TypedKeyspace<B::Keyspace, (String,)>,
+    /// `(room_id, user_id)`: who has already been told, in which room, that a bridge is not
+    /// theirs to have, so that it is said once.
+    refusals: TypedKeyspace<B::Keyspace, (String, String)>,
     meta: TypedKeyspace<B::Keyspace, (String,)>,
 }
 
@@ -181,6 +184,7 @@ impl<B: KvBackend> BridgeStore<B> {
             offerings: TypedKeyspace::new(backend.keyspace("hs_bridges.offerings")?),
             instances: TypedKeyspace::new(backend.keyspace("hs_bridges.instances")?),
             rooms: TypedKeyspace::new(backend.keyspace("hs_bridges.rooms")?),
+            refusals: TypedKeyspace::new(backend.keyspace("hs_bridges.refusals")?),
             meta: TypedKeyspace::new(backend.keyspace("hs_bridges.meta")?),
             backend,
         })
@@ -338,6 +342,22 @@ impl<B: KvBackend> BridgeStore<B> {
             .rooms
             .get(&snap, &(room_id.to_owned(),))?
             .map(|b| String::from_utf8_lossy(&b).into_owned()))
+    }
+
+    /// Records that `user_id` was refused in `room_id`; returns whether this is the first time.
+    ///
+    /// # Errors
+    /// On a store failure.
+    pub fn record_refusal(&self, room_id: &str, user_id: &str) -> Result<bool, StoreError> {
+        let key = (room_id.to_owned(), user_id.to_owned());
+        let first = transact(&self.backend, TransactConfig::default(), |txn| {
+            if self.refusals.get(txn, &key).map_err(kv)?.is_some() {
+                return Ok(false);
+            }
+            self.refusals.put(txn, &key, b"1").map_err(kv)?;
+            Ok(true)
+        })?;
+        Ok(first)
     }
 
     /// The manager's tokens, minted by `mint` the first time and kept.

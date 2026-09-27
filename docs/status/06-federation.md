@@ -1,5 +1,192 @@
 # 06 Federation: status
 
+## Ninth session (2026-09-27): the outbound queue survives a restart, and the sender is shard-gated
+
+Scope, per this session's brief: `docs/next-steps.md` item 4 ("The outbound queue is in
+memory"), then its second half (the sender was not shard-gated). Branch
+`worktree-agent-a4a1568719279c325`, commits `238c5fe` (the durable queue), `929f453` (the
+real-binary restart test) and `60be866` (the shard gate). Ownership this session:
+`crates/hs-federation/**`, the sender's wiring in `crates/hs-cli` (`federation.rs`'s
+`build_mount`, `federation_sender.rs`, the minimum in `serve.rs`, `Cargo.toml` dev-dependencies,
+tests), this file. Nothing else was touched.
+
+### Verified by running
+
+```
+cargo fmt --all --check                                                     # clean
+cargo clippy -p hs-federation -p hs-cli --all-targets -- -D warnings        # clean
+cargo test -p hs-federation                                                 # 152/152 (was 136)
+cargo test -p hs-cli                                                        # 124 unit, e2e 25/25,
+   # federation_reads 9/9, federation_restart 1/1 (new), federation_sender 3/3 (was 2),
+   # federation_two_servers 2/2, federation_writes 8/8
+```
+
+- **`crates/hs-cli/tests/federation_restart.rs`,
+  `an_event_queued_for_a_server_that_is_down_arrives_after_a_restart_of_the_sender`** (ran five
+  times, 4-10s each): two real `hs serve` processes, A and B, federating over TLS. The binary
+  does not terminate TLS and outbound federation is HTTPS only, so the test terminates it: a
+  private CA and a leaf certificate for `127.0.0.1` from `rcgen`, and a TLS-terminating proxy in
+  the test process in front of each server's plaintext listener; each server is named
+  `127.0.0.1:{its proxy's port}` and trusts the CA through `federation.custom_ca_certificates`,
+  as an operator with a private CA would. Bob on B joins alice's room on A through the client
+  API and a message crosses. Then B's proxy is closed (B's port closes; A gets `connection
+  refused`), alice sends "said while B was down", and A's admin API
+  (`GET /api/v1/federation/destinations`) lists B with `failing_since` set and
+  `pending_pdu_count` 1. A is stopped with SIGTERM (its log says the queued PDU is "kept for the
+  next start") and started again over the same data directory; its log says "resuming an
+  outbound federation queue" naming B, and the admin row shows the same `failing_since` and the
+  one pending PDU -- read by a process that never queued them. B's port opens; the message
+  reaches bob's `/sync` on B, exactly once; the row shows nothing pending, not failing, a new
+  `last_successful_at`.
+- **`crates/hs-federation/src/sender.rs`**:
+  `what_was_queued_is_sent_by_the_next_sender_over_the_same_store_in_order` (a sender over a
+  `KvOutboundStore` on a `MemoryBackend` fails to reach a closed port, records the failure, is
+  shut down with three PDUs queued; a second sender over the same backend `resume()`s three,
+  the peer comes up on that port, one transaction with the three in order arrives, the retry
+  state is clean, the store is empty),
+  `a_persisted_backoff_is_waited_out_after_a_restart_and_a_reset_ends_it_early` (a state left
+  as "not before an hour from now" holds the resumed worker back; `reset_destination` releases
+  it within the poll interval; `last_error` is kept as history),
+  `a_backlog_the_sender_was_not_told_about_goes_out_before_what_is_queued_now`,
+  `a_destination_another_replica_sends_for_is_stored_but_not_sent_from_here`,
+  `losing_a_destination_stops_its_worker_and_leaves_its_queue_in_the_store` (mid-retry against
+  a 500ing peer),
+  `a_row_written_behind_the_workers_back_is_found_by_the_rescan`; the nine eighth-session
+  tests unchanged in what they assert.
+- **`crates/hs-federation/src/outbound_store.rs`**: the same four tests against both stores
+  (order, ack through a sequence number, per-destination isolation, retry state recorded,
+  reset and listed) plus `the_kv_store_keeps_its_queue_and_sequence_across_a_reopen`.
+- **`crates/hs-federation/src/admin_source.rs`**,
+  `the_senders_persisted_retry_state_is_merged_into_the_row_and_reset_with_it`.
+- **`crates/hs-cli/tests/federation_sender.rs`**,
+  `only_the_replica_that_owns_a_destinations_federation_shard_sends_to_it`: the real feeder over
+  a scripted `Ownership` owning nothing -- alice's message to bob's server is queued and not
+  sent, nothing pending here; acquiring the destination's federation shard sends it; releasing
+  it stops the worker, and a further message is queued, not sent.
+
+### Written, not verified by running
+
+- Cluster mode with a real multi-replica deployment over PostgreSQL: no cluster here. What is
+  proven is the gate's behaviour against scripted ownership and the rescan against an in-memory
+  store; that the same rows are seen by two processes through PostgreSQL is `hs-kv`'s contract,
+  not re-tested here. The `Lagged` branch of `follow_ownership` (stop, then resume) is written
+  and not exercised.
+- `KvOutboundStore` against `FjallBackend` is exercised only through the real binary (the
+  restart test); its unit tests use `MemoryBackend`.
+
+### What was built
+
+1. **`crate::outbound_store`** (new). `OutboundStore`: `enqueue(destinations, pdu) -> seq`
+   (one transaction, one sequence number for every destination), `peek(destination, limit)`
+   (oldest first), `ack(destination, through_seq) -> removed`, `queued()` (every destination
+   with a queue, at start), `queue_len`, `state`/`states`, `record_failure(destination, error,
+   next_attempt_ms)`, `record_success`, `reset`, `durable()`. `KvOutboundStore<B>` over three
+   keyspaces: `hs_federation.outbound_queue` `(destination, seq) -> PDU JSON`,
+   `hs_federation.outbound_destinations` `(destination,) -> OutboundDestinationState` JSON
+   (`failures`, `next_attempt_ms`, `last_error` (truncated to 512 bytes), `failing_since_ms`,
+   `last_attempt_ms`, `last_success_ms`), and `hs_federation.outbound_meta` whose `seq` key is
+   advanced with `atomic_add` inside the enqueue transaction. `InMemoryOutboundStore` for tests
+   and for `FederationSender::new`, exactly as volatile as the sender was before. A row that no
+   longer decodes is logged and skipped by `peek`, and removed by the next `ack` past it.
+2. **`crate::sender`**: the store is the source of truth, the channels the fast path. Every
+   PDU is written before any worker sees it and deleted only when its destination accepted it
+   (or this server's policy refused it). A worker first drains what the store holds for its
+   destination, then follows its channel; a channel copy of a row it already sent is recognised
+   by its sequence number and skipped. `FederationSender::with_store`, `resume()` (workers back
+   for every queued destination the gate allows; idempotent), `is_durable`,
+   `destination_states`/`destination_state`, `reset_destination`, `set_gate`,
+   `stop_workers_not_sent_here`. `SenderConfig` gained `reset_poll_interval` (the slice a
+   waiting worker sleeps before re-reading the store for a reset; `BACKOFF_POLL_INTERVAL` = 30s
+   by default) and `store_rescan_interval` (`None` by default). The persisted `failures` and
+   `next_attempt_ms` are honoured when a worker starts (the doubling carries on from where it
+   was, what is left of the wait is waited out). `ClientError::Backoff` (the client's own
+   connection-level record) is still slept out in slices and not counted as a failure of the
+   transaction. `shutdown()` says whether what is left is kept or lost, by `durable()`.
+3. **`crate::admin_source`**: one row per destination from three sources -- the client's
+   connection-level records, the sender's persisted retry states, the sender's live queues.
+   `failing_since` is the earlier of the two records', `retry_last_at` and `last_successful_at`
+   the later, `retry_interval_ms` that of whichever wait ends later. `reset` clears both records
+   (and answers `Unavailable` if the sender's store refuses).
+4. **`hs-cli`**: `build_mount` opens `KvOutboundStore` on the same backend as everything else
+   and builds the sender over it (`store_rescan_interval` 10s when `cluster.single_node` is
+   false). `OutboundFederation::start(rooms, sender, own_server_name, ownership, layout)` sets
+   a `ShardGate` (ownership of `ShardLayout::federation_shard(destination)`), `resume()`s,
+   follows the room stream as before and ownership events through `follow_ownership`
+   (acquired federation shard: resume; released or lost: stop the workers no longer sent for
+   here; lagged: both). `serve.rs` starts it after `crate::cluster::start`, still before any
+   listener is bound.
+5. **Tests**: above. `hs-cli` gained four dev-dependencies for the restart test (`rcgen`,
+   `rustls`, `tokio-rustls`, `rustls-pki-types`), all already in `[workspace.dependencies]`;
+   `Cargo.lock` updated accordingly.
+
+### Decisions made
+
+1. **Two records per destination, merged for the operator.** The client's
+   `hs_federation.destinations` (connection-level, every outbound call, already persisted) and
+   the sender's `hs_federation.outbound_destinations` (the head transaction's retrying) stay
+   separate: a `/send` answered non-2xx must not put the destination's key fetches and backfill
+   into backoff, and the client already records connection failures for both. The admin row
+   merges them (above).
+2. **`last_error` is persisted but not shown.** `hs_admin::model::AdminDestination` has no
+   field for it and `hs-admin` is track 10's. See "Interfaces needed".
+3. **A transaction re-sent after a restart carries a new `txnId`** (`{start_ms}-{n}`). The
+   receiver may see PDUs it already applied; an event it holds is not applied again, so this is
+   harmless, and the alternative (persisting in-flight transaction IDs) buys nothing.
+4. **What survives is what was queued; there is still no catch-up from the room.** A local
+   event the feeder never handed over (a crash between persistence and queueing, or the update
+   stream lagging) is not sent. Synapse's `destination_rooms` (last stream position sent per
+   destination) is the next step, not this one; said in `crate::sender`'s module docs.
+5. **In a cluster a non-owner writes and does not send.** The owner finds the rows on
+   `resume()` (start, shard acquisition), when it enqueues something itself for that
+   destination (the worker drains the store first), or through the idle rescan every 10s. The
+   pending counts an operator sees are per replica: each reports what its own workers hold.
+6. **Store calls are synchronous KV transactions from the async worker**, the same shape as
+   `crate::destination_store` and the appservice pump's cursor. `enqueue_pdu` holds the queue
+   map's mutex across its store write so a PDU is counted pending exactly once (as backlog at
+   worker start or as this enqueue).
+7. **One sequence counter for the whole store**, so a PDU queued for several destinations has
+   one number everywhere and a destination's key order is its send order.
+
+### Interfaces provided
+
+- `hs_federation::outbound_store::{OutboundStore, KvOutboundStore, InMemoryOutboundStore,
+  OutboundDestinationState, QueuedPdu, OutboundStoreError}`.
+- `hs_federation::sender::{FederationSender::{with_store, resume, is_durable, set_gate,
+  stop_workers_not_sent_here, destination_states, destination_state, reset_destination},
+  SendGate, SendsEverywhere, SenderConfig::{for_client, reset_poll_interval,
+  store_rescan_interval}}`. `SenderConfig` has two new public fields: a struct literal without
+  `..Default::default()` no longer compiles (one in `crates/hs-cli/tests/federation_sender.rs`
+  was updated).
+- `hs_cli::federation_sender::{ShardGate, follow_ownership}`; **`OutboundFederation::start`
+  takes two more arguments** (`Arc<dyn Ownership>`, `ShardLayout`).
+
+### Interfaces needed
+
+- **Track 10 (`hs-admin`)**: `AdminDestination` could carry `last_error: Option<String>` (the
+  sender persists it; the Federation page would show why a destination is failing) and the
+  OpenAPI schema with it. No RFC written: it is one optional field; this note is the ask.
+- **Track 03 (`hs-cluster`)**: nothing new; `Ownership::{is_mine, subscribe}` and
+  `ShardLayout::federation_shard` are used as they are.
+
+### Environment hazards found (for the integration lead)
+
+- **The shared `target/` cross-contaminates workspace members between worktrees.** Cargo's
+  artifact hash for a path crate does not include the worktree path, so when the cluster
+  track's worktree added a `peers` field to `hs_cluster::mesh::MeshDeps` and built, my
+  `hs-cli` (whose `hs-cluster` sources have no such field) was compiled against their `rlib` and
+  failed at `crates/hs-cli/src/cluster.rs:240`. Worked around with
+  `touch crates/hs-cluster/src/lib.rs` (a rebuild from my sources); that worktree will meet the
+  mirror image on its next build. Any two worktrees whose copies of one crate differ will
+  ping-pong like this until they are merged.
+- **Disk**: `target/` reached 29G on a disk with about 38G usable and a build died with
+  `ENOSPC`; space came back before I removed anything (I deleted nothing), and my builds
+  afterwards ran with `CARGO_INCREMENTAL=0` to keep the footprint down.
+
+### Shared dependencies added
+
+None to `[workspace.dependencies]`. `crates/hs-cli` dev-dependencies: `rcgen`, `rustls`,
+`tokio-rustls`, `rustls-pki-types` (workspace entries, already resolved in `Cargo.lock`).
+
 > **Integration note, 2026-09-26, last (integration lead): what a server is served.**
 > `/backfill` and `/get_missing_events` applied only the room-level gate (a member of the
 > requesting server now, or `world_readable`) and served everything whole, so a server whose

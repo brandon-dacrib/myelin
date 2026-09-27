@@ -28,7 +28,12 @@ spec:
 ---
 # Headless service backing the StatefulSet's stable network identity
 # (pod-0.<fullname>-headless.<namespace>.svc.cluster.local, ...), used by `spec.serviceName`
-# above, not intended for client traffic.
+# above, not intended for client traffic. In cluster mode it is also where the replicas' mesh
+# lives: each pod advertises its own name under this Service to its peers, and forwards are
+# dialled by that name (see values.yaml, `cluster`). `publishNotReadyAddresses` matters for
+# that: a pod's name must resolve before it is ready, because readiness in cluster mode waits
+# for its first successful heartbeat, and its peers may forward to it the moment it appears in
+# the replica registry.
 apiVersion: v1
 kind: Service
 metadata:
@@ -45,3 +50,9 @@ spec:
       port: {{ .Values.service.clientPort }}
       targetPort: client
       protocol: TCP
+    {{- if eq .Values.mode "cluster" }}
+    - name: mesh
+      port: {{ .Values.cluster.mesh.port }}
+      targetPort: mesh
+      protocol: TCP
+    {{- end }}

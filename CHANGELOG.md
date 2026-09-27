@@ -163,8 +163,15 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Bridges
 
-- **Bridges are offerings, one per person, and the server deploys them -- built, not yet
-  run.** RFC 0017 (`docs/rfcs/0017-the-server-deploys-its-own-bridges.md`), 2026-09-26. An
+- **Bridges are offerings, one per person, and the server deploys them.** RFC 0017
+  (`docs/rfcs/0017-the-server-deploys-its-own-bridges.md`), built 2026-09-26 and run
+  end to end against the real binary on 2026-09-27: an offering made through the admin API,
+  a person's instance walking from requested to ready, its files rendered with its own
+  tokens, the bot opening a direct chat with the sign-in steps, `@whatsappbot` answering a
+  real invitation and `@bridges` taking commands, and a real heisenbridge started from the
+  rendered registration reaching ready; the interface's offerings flow passes as a browser
+  test against the real server. What has not run is the in-cluster runtime, which needs a
+  Kubernetes API server. The paragraph below describes the design. An
   administrator offers a bridge type (WhatsApp, with an image tag, who may use it, and whether
   it runs in this cluster or somewhere else); each person gets their own instance, with its own
   registration, ghosts, process and volume, by messaging the bridge's familiar address
@@ -176,11 +183,8 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   instance's bot open a direct chat with its owner and send the sign-in steps. Ten new admin
   operations; the interface's Bridges section is offerings first, with everybody's instance,
   failed first, on the offering's page; the chart installs the operator and its RBAC by default.
-  What is verified: the operator's builders (unit tests), the chart renders, the interface
-  against mocks, and that the server starts with all of it wired in. What is not: none of it has
-  run against a Kubernetes API server or a real cluster, no instance has been created against
-  the real binary, and nobody has messaged a front door. The register-a-bridge wizard below
-  still exists, under Registrations, for a bridge somebody runs themselves.
+  The register-a-bridge wizard below still exists, under Registrations, for a bridge somebody
+  runs themselves.
 - **Adding a bridge is a wizard, and it ends in a running bridge.** The interface's catalogue
   says what each of fourteen bridges is, what it needs and how to sign in to it (from the
   bridges' own documentation); choosing one renders the bridge's `config.yaml` and its
@@ -274,6 +278,18 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Federation
 
+- **An event queued for a server that is down survives a restart, and arrives.** The outbound
+  queue and every destination's retry state (failing since, next attempt, last error) are in
+  the database: a PDU is written before any worker sees it and removed only when the
+  destination accepted it, and the sender resumes every queued destination at start.
+  Verified 2026-09-27 with two real binaries over TLS: the receiving server's port closed, a
+  message sent, the sending server killed and restarted over its data directory, the admin
+  API still showing the destination failing since the same moment with one pending event,
+  the port opened, and the message arriving in the recipient's `/sync` exactly once. In
+  cluster mode only the replica that owns a destination's shard sends to it; the others queue
+  and do not send (scripted ownership in a test; not yet watched on a cluster). What was
+  never queued, because the destination was already known to be failing, is still not
+  caught up from the room afterwards.
 - Inbound transactions (`PUT /send/{txnId}`): content hashes and signatures verified against the
   *sender's* server, the spec's 50 PDU / 100 EDU limits enforced, processed in order, idempotent by
   transaction id.
@@ -389,6 +405,26 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Operations
 
+- **Replicas know their own address, speak mutual TLS to each other, and a room is created
+  by the replica that owns it.** A replica advertises the address it is configured with (the
+  chart gives each pod its stable DNS name under the headless Service, so one wildcard
+  certificate covers them all); the mesh between replicas is mutual TLS with a CA the
+  operator provides, and a replica presenting a certificate from any other CA is refused on
+  every call. Creating a room, joining or knocking by room id is routed to the shard's owner
+  first, so a room's first actor is never built on a replica that does not own it. Verified
+  2026-09-27 as three processes on one PostgreSQL with a private CA: rooms created through
+  one replica and forwarded to their owner, concurrent sends through two replicas, identical
+  history on both, and the third replica's foreign certificate refused. Not yet run as pods;
+  the chart's cluster templates have not been rendered on this side, and
+  `values-two-replica-experiment.yaml` is the values file for that run.
+- **A second replica is capacity, not only availability: `/sync` works from any replica.**
+  A room's owner wakes every other replica over the mesh after each update, the replica
+  holding the client's long-poll answers it, and a sync waits (within half a second) for
+  everything its peers had published before it arrived, so a write through one replica is in
+  the very next sync on another. Verified 2026-09-27 as two processes on one PostgreSQL: every
+  cross-replica long-poll woken with the event, 160 of 160 writes seen in the next sync on the
+  other replica, about 150 ms from write to woken sync. Not yet run as two pods; typing,
+  receipts and presence still stay on the replica that received them.
 - **Runs on PostgreSQL.** Boots, registers, serves, and survives a restart with its data intact.
   The embedded single-node backend remains the default.
 - **Two replicas no longer fork a room's history.** A shard gate forwards or refuses requests for

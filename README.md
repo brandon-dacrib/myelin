@@ -34,6 +34,14 @@ connects, and gives the sign-in steps for that network with the bot's real name.
 mautrix-whatsapp was added exactly that way and connected in seconds
 (`docs/bridges/mautrix.md`).
 
+**And a bridge can be offered to everyone.** An administrator switches WhatsApp on for the
+server; a person gets their own bridge by messaging `@whatsappbot`, which sets it up and
+invites them to it with the sign-in steps; the administrator sees everybody's bridge on one
+page. Each instance has its own registration, ghosts and process, so one person's trouble
+touches nobody else. Verified against the real server, with a real heisenbridge started from
+the files the server rendered (`docs/rfcs/0017-the-server-deploys-its-own-bridges.md`). The
+server deploying each instance as a pod is built and waits for its first run on a cluster.
+
 **Two encrypted clients exchange a message this server cannot read.** `matrix-rust-sdk` with
 encryption enabled: keys upload, cross-signing bootstraps, one-time keys are claimed atomically,
 Megolm establishes, the recipient decrypts. `cargo test -p hs-loadgen --test real_client_encrypted`.
@@ -142,8 +150,8 @@ broken up, because the parts are nowhere near each other. This table is kept cur
 | Configuration and first run | ~90% | database-backed, edited in the UI, one command from nothing to a server |
 | Admin API | ~40% | 58 of 145 operations have a real handler; the rest answer an honest 501 |
 | Management web interface | ~75% | users, rooms, bridges (catalogue, wizard, runbook, sign-in guides), federation, configuration and the audit log are real against the real server |
-| Bridges | ~75% | heisenbridge works end to end; mautrix-whatsapp, added through the wizard, connects and starts encrypted; no mautrix bridge has carried a message yet; offering a bridge to everyone, each person getting their own instance the server deploys, is built and has not been run |
-| Operations (HA, scale-out) | ~50% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; the chart is published from `main` and installs from the registry in one sentence; a standing demo behind an Ingress with a real certificate, scraped by Prometheus, its setup page opened in a browser; a locked-out administrator gets back in with one command run where the key is; readiness is withdrawn the moment a shutdown begins; the cluster path has not carried real traffic; the operator reconciles a `Bridge` into a pod, a Service and a volume in unit tests only, and does not deploy the server itself |
+| Bridges | ~75% | heisenbridge works end to end; mautrix-whatsapp, added through the wizard, connects and starts encrypted; no mautrix bridge has carried a message yet; offering a bridge to everyone, each person getting their own instance by messaging its bot, runs end to end against the real server, with a real heisenbridge started from the rendered files; the server deploying the instance itself has not run against Kubernetes |
+| Operations (HA, scale-out) | ~50% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; the chart is published from `main` and installs from the registry in one sentence; a standing demo behind an Ingress with a real certificate, scraped by Prometheus, its setup page opened in a browser; a locked-out administrator gets back in with one command run where the key is; readiness is withdrawn the moment a shutdown begins; two replicas on one PostgreSQL serve a client's `/sync` from either, woken over the mesh, with the outbound federation queue durable and shard-gated; the cluster path has not carried real traffic on a cluster; the operator reconciles a `Bridge` into a pod, a Service and a volume in unit tests only, and does not deploy the server itself |
 | **Federation** | **~30%** | 75/250 assertions, 14/88 tests; a user joins a room hosted elsewhere through the client API, messages flow both ways between two instances of this server, and the room's history from before the join is fetched as the client scrolls back; no EDUs, in-memory outbound queue, not yet tried against Synapse |
 
 Federation is the honest answer to "when could I use this": a user here cannot really talk to

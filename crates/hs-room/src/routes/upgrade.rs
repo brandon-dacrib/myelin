@@ -309,6 +309,7 @@ mod tests {
         let created = post_create_room::<MemoryBackend>(
             State(state.clone()),
             requester(alice),
+            None,
             PermissiveJson(json!({"preset": "public_chat", "topic": "before the upgrade"})),
         )
         .await
@@ -394,6 +395,7 @@ mod tests {
         let created = post_create_room::<MemoryBackend>(
             State(state.clone()),
             requester(alice),
+            None,
             PermissiveJson(json!({"preset": "public_chat"})),
         )
         .await

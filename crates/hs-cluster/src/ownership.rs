@@ -58,6 +58,16 @@ impl ShardMap {
             .collect::<std::collections::HashSet<_>>()
             .len()
     }
+
+    /// Every distinct replica this map believes owns at least one shard: the live membership of
+    /// the cluster as far as ownership can tell. What a room owner fans a `/sync` wake out to,
+    /// and who a replica asks for their stream positions before it reads (`hs-user`'s session
+    /// cluster). A replica that is up but owns nothing yet is not listed; it also cannot have
+    /// written anything a `/sync` could be waiting for.
+    #[must_use]
+    pub fn replicas(&self) -> std::collections::BTreeSet<ReplicaId> {
+        self.owners.values().cloned().collect()
+    }
 }
 
 /// Ownership convergence events, emitted on [`Ownership::subscribe`].

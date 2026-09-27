@@ -1,6 +1,8 @@
 # 0017. The server deploys its own bridges, one per person
 
-Status: accepted 2026-09-26; built and wired into `hs serve` the same day; **not yet run against a
+Status: accepted 2026-09-26; built and wired into `hs serve` the same day; run end to end against
+the real binary on 2026-09-27 (an offering, an instance from `requested` to `ready`, the front
+door and the manager bot from a real client, heisenbridge for real); **not yet run against a
 cluster** (section 8). Owner: track 12 (platform), `crates/hs-operator`,
 and track 11 (appservices), `crates/hs-bridges`. Consuming tracks: 15 (admin API,
 `crates/hs-admin`), 16 (management web interface, `web/`).
@@ -233,20 +235,34 @@ elsewhere); moving an instance between users; shared portal rooms between instan
 
 ## 8. Where it stands (2026-09-27)
 
-Everything sections 4 and 5 describe exists on `main` (`1c38b5e` to `52649d2`, 2026-09-26):
+Everything sections 4 and 5 describe exists on `main` (`1c38b5e` to `52649d2`, 2026-09-26) and,
+apart from the cluster runtime, has now been run:
 
 | Piece | Where | Verified by |
 |---|---|---|
-| The manager, store, state machine, front doors, manager bot, Matrix client, runtime seam | `crates/hs-bridges` | 3 unit tests; starts inside `hs serve` |
-| The ten admin operations, `BridgeType.mode` and `deployable`, instance rendering | `crates/hs-admin` | router tests over the in-memory source |
+| The manager, store, state machine, front doors, manager bot, Matrix client, runtime seam | `crates/hs-bridges` | 9 unit tests (6 drive the manager over the in-memory store and directory); **three tests through the real binary** (`crates/hs-cli/tests/bridge_offerings.rs`): an offering made over the admin API, an instance walked `requested → registered → starting → ready` with an axum stand-in answering the ping, the owner invited to a direct chat with the sign-in steps, `m.direct` set through double puppeting, the instance's registration delivered its room, the instance and the offering removed; `@whatsappbot` invited by a real client (the server delivers to itself over loopback), setting one up, saying where it stands, saying it is ready, refusing a user it is not open to once; `@bridges` answering `help`, `list`, `status`, `stop`, `stop confirm`, `start` |
+| The ten admin operations, `BridgeType.mode`, `deployable` and `not_deployable_reason`, `BridgeOffering.image_tag`, `BridgeInstance.last_ping_at`/`last_error`, instance rendering | `crates/hs-admin` | router tests over the in-memory source; the real-binary tests above through the router |
+| A `shared` offering: heisenbridge | `crates/hs-admin` (catalogue), `crates/hs-bridges` | its one instance (`_`) created by the offering's `PUT`; **heisenbridge 1.15.4 run from the rendered `registration.yaml` reached `ready`** (the same test, when `heisenbridge` is installed; a stand-in otherwise) |
 | The `Bridge` CRD, the reconciler, the status, `KubeBridgeClient`, `hs operator` | `crates/hs-operator`, `crates/hs-cli` | 52 unit tests, generated CRDs checked for drift |
 | The Kubernetes runtime from the chart's two variables | `crates/hs-cli/src/bridges.rs` | compiles; a half-set pair fails startup |
 | The operator Deployment, RBAC, CRD and the server's variables in the chart | `deploy/helm/hs` | `helm lint`, both mode renders, `bridges.enabled=false` renders none of it |
-| Offerings first in the interface, the Offer wizard, the offering page, files, registrations tab | `web/` | unit tests and Playwright against MSW mocks |
+| Offerings first in the interface, the Offer wizard, the offering page, files, registrations tab | `web/` | unit tests and Playwright against MSW mocks; **Playwright against the real binary** (`web/e2e-real/bridge-offerings.spec.ts`: offer WhatsApp elsewhere with the server's own reason quoted, the offering page, a refused non-local user, an instance row reaching Starting, its files with the server's bound address, remove, stop offering; `docs/design/screenshots/bridge-offerings-*-real.png`) |
+
+Found and fixed on the way (2026-09-27): an offering on a server with no `public_baseurl`
+rendered an empty homeserver address into the files (now the bound address); the manager only
+noticed a bridge through its own half-minute ping, though a mautrix bridge pings itself through
+the server on start and an administrator can press Ping (the registry's health is read first,
+and an instance run elsewhere is pinged every tick for its first two minutes); a front door
+repeated its refusal on every message (once per room now); the bots' `m.direct` write replaced
+the account data event (merged now, and set for the owner through double puppeting); the
+catalogue said heisenbridge was per user (it is a bouncer many local users share, so it is
+`shared`, and a shared instance names no owner: the first local user to talk to it claims it);
+the two list operations were documented as `{data}` while the router answered pages
+(`{items, next_cursor, prev_cursor}`, like every other list: the document and the interface now
+say so).
 
 Not yet done, in the order it should happen: a `Bridge` applied by hand on a kind cluster and
-watched to `Ready`; an offering made against the real binary and an instance driven through
-the state machine by the manager; a front door messaged by a real client; the demo's shared
+watched to `Ready`, and a `cluster` offering driven through `deploying`; the demo's shared
 WhatsApp registration replaced by an offering (section 6); the scale measurement in section 6.
-Until the first of those, this RFC describes a design, not a capability, and `CHANGELOG.md`
+Until the first of those, the cluster runtime is a design, not a capability, and `CHANGELOG.md`
 says so.

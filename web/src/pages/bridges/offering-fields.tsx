@@ -141,7 +141,7 @@ export function RuntimeFields({
   clusterAvailable: boolean;
   unavailableBecause: "no-target" | "not-deployable" | "loading" | null;
   target: BridgeDeploymentTarget | undefined;
-  type: Pick<BridgeType, "name" | "id" | "image"> | undefined;
+  type: Pick<BridgeType, "name" | "id" | "image" | "not_deployable_reason"> | undefined;
   imageTag: string;
   onImageTag: (tag: string) => void;
 }) {

@@ -14,7 +14,7 @@ pub use auth::{
     AuthMode, Authenticator, MutualTlsAuthenticator, PeerIdentity, SharedSecretAuthenticator,
     TlsPeerInfo,
 };
-pub use envelope::{Envelope, IdempotencyKey, Reply, RequesterContext, ShardHandler};
+pub use envelope::{Envelope, IdempotencyKey, PeerHandler, Reply, RequesterContext, ShardHandler};
 pub use forwarder::Forwarder;
 pub use idempotency::IdempotencyCache;
 pub use server::{MeshDeps, MeshServer};

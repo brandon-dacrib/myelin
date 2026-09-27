@@ -75,6 +75,16 @@ data:
         path: {{ include "hs.mediaPath" . }}
         {{- end }}
     {{- end }}
+    {{- if eq .Values.mode "cluster" }}
+    # Tunables only. What must hold on every pod regardless of what the admin interface stores
+    # -- single_node: false, this pod's own mesh address, the mesh port and its authentication --
+    # is pinned through HS__CLUSTER__* environment variables in statefulset.yaml.
+    cluster:
+      room_shards: {{ .Values.cluster.roomShards }}
+      user_shards: {{ .Values.cluster.userShards }}
+      heartbeat_interval: {{ .Values.cluster.heartbeatInterval | quote }}
+      lease_ttl: {{ .Values.cluster.leaseTtl | quote }}
+    {{- end }}
     telemetry:
       metrics:
         enabled: {{ .Values.telemetry.metrics.enabled }}

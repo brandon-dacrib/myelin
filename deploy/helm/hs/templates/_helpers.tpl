@@ -147,6 +147,21 @@ otherwise on the dedicated claim's own mount.
 {{- if and (eq .Values.mode "cluster") (not .Values.secrets.signingKey.existingSecret) -}}
 {{- fail "secrets.signingKey.existingSecret is required in cluster mode: replicas share no volume and must sign with the same key. Generate one with `hs generate-signing-key -o signing.key` and `kubectl create secret generic <name> --from-file=signing.key`. (singleNode mode generates its key on the data volume and needs no Secret.)" -}}
 {{- end -}}
+{{- if and (eq .Values.mode "cluster") (eq .Values.storage.backend "embedded") -}}
+{{- fail "mode is cluster but storage.backend is embedded: replicas must share one database. Set storage.backend to postgres (with cloudNativePG.enabled or storage.postgres.host) or slatedb." -}}
+{{- end -}}
+{{- if and (eq .Values.mode "cluster") (not .Values.cluster.mesh.tls.existingSecret) (not .Values.cluster.mesh.sharedSecret.existingSecret) -}}
+{{- fail "mode is cluster but the mesh has no authentication: set cluster.mesh.tls.existingSecret (a kubernetes.io/tls Secret with tls.crt, tls.key and ca.crt for *.<release>-headless.<namespace>.svc.<clusterDomain>) or, on a trusted pod network only, cluster.mesh.sharedSecret.existingSecret. See values.yaml, `cluster.mesh`." -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The DNS domain of the headless Service, under which every pod has its stable name
+(<pod>.<this>). The mesh advertises `<pod>.<this>` and requires peers' certificates to carry a
+name under it.
+*/}}
+{{- define "hs.meshDomain" -}}
+{{- printf "%s-headless.%s.svc.%s" (include "hs.fullname" .) .Release.Namespace .Values.cluster.clusterDomain -}}
 {{- end -}}
 
 {{/*

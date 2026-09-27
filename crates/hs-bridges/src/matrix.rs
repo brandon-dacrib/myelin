@@ -231,15 +231,56 @@ impl MatrixClient {
             )
             .await?;
         let room_id = body["room_id"].as_str().unwrap_or_default().to_owned();
-        let _ = self
+        let _ = self.add_direct(token, user, invitee, &room_id).await;
+        Ok(room_id)
+    }
+
+    /// Adds `room_id` to `user`'s `m.direct` under `other`, keeping every other entry: a `PUT`
+    /// of account data replaces the whole event, and a person's direct chats are not this
+    /// bridge's to forget.
+    ///
+    /// # Errors
+    /// On failure to read or write it.
+    pub async fn add_direct(
+        &self,
+        token: &str,
+        user: &str,
+        other: &str,
+        room_id: &str,
+    ) -> Result<(), MatrixError> {
+        let path = ["user", user, "account_data", "m.direct"];
+        let mut direct = match self
             .call(
-                reqwest::Method::PUT,
-                self.url(&["user", user, "account_data", "m.direct"], Some(user)),
+                reqwest::Method::GET,
+                self.url(&path, Some(user)),
                 token,
-                Some(json!({ invitee: [room_id] })),
+                None,
                 "m.direct",
             )
-            .await;
-        Ok(room_id)
+            .await
+        {
+            Ok(Value::Object(map)) => map,
+            Ok(_) => serde_json::Map::new(),
+            Err(e) if e.status == 404 => serde_json::Map::new(),
+            Err(e) => return Err(e),
+        };
+        let rooms = direct.entry(other).or_insert_with(|| json!([]));
+        if !rooms.is_array() {
+            *rooms = json!([]);
+        }
+        if let Some(list) = rooms.as_array_mut()
+            && !list.iter().any(|r| r == room_id)
+        {
+            list.push(json!(room_id));
+        }
+        self.call(
+            reqwest::Method::PUT,
+            self.url(&path, Some(user)),
+            token,
+            Some(Value::Object(direct)),
+            "m.direct",
+        )
+        .await
+        .map(|_| ())
     }
 }

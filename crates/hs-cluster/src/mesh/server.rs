@@ -1,6 +1,7 @@
 //! The mesh HTTP/2 server: accepts `POST /mesh/v1/forward` and `POST /mesh/v1/released`,
 //! authenticates the peer, checks ownership and fencing, and dispatches to a [`ShardHandler`].
-//! `docs/rfcs/0001-cluster-ownership.md` sections 8, 9 and 11.
+//! `docs/rfcs/0001-cluster-ownership.md` sections 8, 9 and 11. `POST /mesh/v1/peer` is the one
+//! route that is not about a shard: a replica-to-replica message for a [`PeerHandler`].
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use tokio::sync::{Semaphore, watch};
 
 use crate::mesh::auth::{Authenticator, TlsPeerInfo};
 use crate::mesh::envelope::{
-    Envelope, IdempotencyKey, Reply, RequesterContext, ShardHandler, headers,
+    Envelope, IdempotencyKey, PeerHandler, Reply, RequesterContext, ShardHandler, headers,
 };
 use crate::mesh::idempotency::IdempotencyCache;
 use crate::mesh::tls;
@@ -41,6 +42,10 @@ pub struct MeshDeps {
     /// Notified when a `/mesh/v1/released` nudge arrives, so the local convergence loop
     /// re-evaluates immediately instead of waiting for its next tick.
     pub nudge: Option<Arc<tokio::sync::Notify>>,
+    /// Answers `POST /mesh/v1/peer`, the replica-to-replica messages that are not about a shard
+    /// (see [`PeerHandler`]). `None` answers them `501`, which
+    /// [`crate::mesh::Forwarder::send_to_peer`] reports as the peer being unreachable.
+    pub peers: Option<Arc<dyn PeerHandler>>,
 }
 
 /// The mesh's HTTP/2 listener.
@@ -159,6 +164,7 @@ async fn handle_request(
 
     match req.uri().path() {
         "/mesh/v1/forward" => handle_forward(req, &deps).await,
+        "/mesh/v1/peer" => handle_peer(req, &deps).await,
         "/mesh/v1/released" => {
             if let Some(n) = &deps.nudge {
                 n.notify_one();
@@ -260,6 +266,35 @@ async fn handle_forward(req: Request<Incoming>, deps: &Arc<MeshDeps>) -> Respons
     let reply = deps.handler.handle(env, fence).await;
     deps.idempotency.put(shard, key, reply.clone());
     reply_response(reply)
+}
+
+/// `POST /mesh/v1/peer`: the origin and route travel as headers like a forward's do, the body
+/// is the payload. Not gated on ownership (the message is for this replica, whatever it owns),
+/// not cached (a handler's semantics are idempotent by contract), and not counted against the
+/// forward semaphore, which bounds work done on behalf of *clients*; a peer message is cheap.
+async fn handle_peer(req: Request<Incoming>, deps: &Arc<MeshDeps>) -> Response<Full<Bytes>> {
+    let Some(handler) = deps.peers.clone() else {
+        return respond(StatusCode::NOT_IMPLEMENTED, Bytes::new());
+    };
+    let (parts, body) = req.into_parts();
+    let payload = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => return respond(StatusCode::BAD_REQUEST, format!("reading body: {e}")),
+    };
+    let header = |name: &str| -> Result<String, String> {
+        parts
+            .headers
+            .get(name)
+            .ok_or_else(|| format!("missing header {name}"))?
+            .to_str()
+            .map(str::to_owned)
+            .map_err(|e| format!("header {name} is not valid text: {e}"))
+    };
+    let (route, origin) = match (header(headers::ROUTE), header(headers::ORIGIN)) {
+        (Ok(route), Ok(origin)) => (route, ReplicaId::new(origin)),
+        (Err(msg), _) | (_, Err(msg)) => return respond(StatusCode::BAD_REQUEST, msg),
+    };
+    reply_response(handler.handle(origin, &route, payload).await)
 }
 
 fn misdirected(deps: &Arc<MeshDeps>, shard: ShardId) -> Response<Full<Bytes>> {

@@ -707,18 +707,11 @@ paths:
         - bridges:read
       responses:
         '200':
-          description: Offerings.
+          description: Offerings, as one page (there is no cursor to follow; an offering is one per catalogue type).
           content:
             application/json:
               schema:
-                type: object
-                required:
-                - data
-                properties:
-                  data:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/BridgeOffering'
+                $ref: '#/components/schemas/BridgeOfferingPage'
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '403':
@@ -839,18 +832,11 @@ paths:
       - $ref: '#/components/parameters/BridgeTypeId'
       responses:
         '200':
-          description: Instances.
+          description: Instances, as one page (`items` holds every instance of the offering; no cursor is issued).
           content:
             application/json:
               schema:
-                type: object
-                required:
-                - data
-                properties:
-                  data:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/BridgeInstance'
+                $ref: '#/components/schemas/BridgeInstancePage'
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '403':
@@ -7280,6 +7266,11 @@ components:
         deployable:
           type: boolean
           description: Whether this server can run the type from a rendered config alone.
+        not_deployable_reason:
+          type:
+          - string
+          - 'null'
+          description: Why it cannot, when `deployable` is false, in words for an administrator.
         sign_in:
           type: object
           description: The bridge's own documented login flow. `{bot}` in a step stands for the bridge bot's Matrix ID, which the interface substitutes.
@@ -7398,6 +7389,10 @@ components:
           - elsewhere
         image:
           type: string
+          description: The full image reference instances run.
+        image_tag:
+          type: string
+          description: The tag part of `image`, as `BridgeOfferingRequest.image_tag` takes it back.
         front_door:
           type:
           - string
@@ -7462,6 +7457,17 @@ components:
           - string
           - 'null'
           description: The registry's word for its ping health (`healthy`, `down`, ...).
+        last_ping_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When this server last pinged the instance's bridge.
+        last_error:
+          type:
+          - string
+          - 'null'
+          description: What went wrong, if the last ping failed.
         created_at:
           type: string
           format: date-time
@@ -8179,6 +8185,28 @@ components:
             type: array
             items:
               $ref: '#/components/schemas/BridgeType'
+    BridgeOfferingPage:
+      allOf:
+      - $ref: '#/components/schemas/PageEnvelope'
+      - type: object
+        required:
+        - items
+        properties:
+          items:
+            type: array
+            items:
+              $ref: '#/components/schemas/BridgeOffering'
+    BridgeInstancePage:
+      allOf:
+      - $ref: '#/components/schemas/PageEnvelope'
+      - type: object
+        required:
+        - items
+        properties:
+          items:
+            type: array
+            items:
+              $ref: '#/components/schemas/BridgeInstance'
     AppServiceBacklogEntryPage:
       allOf:
       - $ref: '#/components/schemas/PageEnvelope'

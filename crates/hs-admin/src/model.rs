@@ -512,6 +512,9 @@ pub struct BridgeType {
     /// Whether this server can run the type from a rendered config alone, with nothing written
     /// by hand.
     pub deployable: bool,
+    /// Why it cannot, when `deployable` is false, in words for an administrator.
+    #[serde(default)]
+    pub not_deployable_reason: Option<String>,
 }
 
 /// [`BridgeType::sign_in`]: the bridge's own documented login flow, one step per line. `{bot}`
@@ -624,7 +627,11 @@ pub struct BridgeOffering {
     pub enabled: bool,
     /// `cluster` or `elsewhere`.
     pub runtime: String,
+    /// The full image reference instances run (`dock.mau.dev/mautrix/whatsapp:v0.12.1`).
     pub image: String,
+    /// The tag part of `image`, as `BridgeOfferingRequest.image_tag` takes it back.
+    #[serde(default)]
+    pub image_tag: String,
     /// The Matrix ID users message to get an instance; `per_user` offerings only.
     pub front_door: Option<String>,
     pub access: BridgeOfferingAccess,
@@ -663,6 +670,11 @@ pub struct BridgeInstance {
     pub deployment: Option<BridgeDeployment>,
     /// The registry's word for its ping health.
     pub health: Option<String>,
+    /// When this server last pinged it, and what went wrong if the last ping failed.
+    #[serde(default)]
+    pub last_ping_at: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
     pub created_at: String,
     pub ready_at: Option<String>,
 }
