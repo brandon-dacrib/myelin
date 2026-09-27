@@ -422,6 +422,37 @@ are.
 
 ## What to do next, in order
 
+**The owner's rule as of 2026-09-27: complete before fast.** A fully demonstrable product comes
+before any performance gain; boot time, the slope and the rolling-update count are measured
+when convenient and optimized only once every feature an operator would show somebody is real
+end to end. "Demonstrable" means: install with one value, add a second replica and have it
+carry load, offer a bridge and get one by messaging its bot, administer everything from the
+web interface with no page reading from a 501, and talk to another homeserver. The queue below
+is ordered by that; each item says whether a cloud session can do it (no cluster, no Docker)
+or a laptop session must.
+
+**The completeness queue** (what the next agents get, in order; cloud-doable unless marked):
+
+1. RFC 0017 end to end against the real binary: an offering made through the admin API, an
+   instance walking the state machine with the `elsewhere` runtime to `starting`, the front
+   door answering a real invite and message, the files endpoint, and the interface's
+   `e2e-real` Playwright suite for offerings against the real binary (Chromium is available in
+   a cloud session; Docker is not, so a real bridge process is a laptop item unless
+   `pip install heisenbridge` works through the proxy).
+2. The admin API's empty areas, each with its interface page reading real data:
+   RegistrationTokens 0/5 (which also gives invite-by-link user creation), Media 0/9, Reports
+   0/4, ServerNotices 0/2 (also `TestServerNotices`), Tasks 0/3, Statistics 1/4, Cluster 1/6,
+   then the long tails of Users 14/41 and Rooms 6/23. `python3 tools/admin_api_coverage.py
+   --list` is the checklist.
+3. Federation completeness: invites, leaves and knocks over federation; EDUs (typing,
+   receipts, presence, device lists); restricted joins (ten Complement tests). Two in-process
+   servers verify each; Complement itself is a laptop item.
+4. Receipts and presence durable across a restart; `/search`.
+5. The operator's `Homeserver` reconciler (unit tests and `helm template` here; the cluster run
+   is a laptop item), and the `Bridge` reconciler's first cluster run (laptop).
+6. Then the cluster items below that need the cluster (laptop): two pods with real traffic,
+   the demo's offering, the rolling update.
+
 ### 1. The standout: make the operations story true on a cluster
 
 Decision 0008 puts this first. Each item is something an operator would do, in the order they
@@ -461,10 +492,11 @@ would do it; each ends in a transcript in `docs/status/12-platform-and-kubernete
   over the mesh (`PLAN.md` 5.4), is not built; until it is, N replicas are an availability
   feature for clients, not a capacity one. `docs/scaling.md` has the whole adds/does-not-add
   table and is the document to keep true as this lands.
-- **Measure the slope.** `hs-loadgen` against one replica, then two, then three, on the same
-  PostgreSQL: connected users and active rooms at a fixed sync p99. Every number in `PLAN.md`
-  section 13 is a target; this is the first fact.
-- **A rolling update that drops nothing.** With two replicas under a loadgen client,
+- **Measure the slope** (performance; after completeness, per the rule above). `hs-loadgen`
+  against one replica, then two, then three, on the same PostgreSQL: connected users and
+  active rooms at a fixed sync p99. Every number in `PLAN.md` section 13 is a target; this is
+  the first fact.
+- **A rolling update that drops nothing** (laptop; after completeness). With two replicas under a loadgen client,
   `kubectl rollout restart` and count failed requests; the target is zero. Readiness is
   withdrawn first now and the drain hands shards off, but nobody has measured it. A `preStop`
   sleep for endpoint propagation (Kubernetes 1.30+ has a native `sleep` action, which matters
@@ -484,9 +516,11 @@ would do it; each ends in a transcript in `docs/status/12-platform-and-kubernete
 - ~~The chart install as a CD gate.~~ **Done 2026-09-26** (see "And gated"): `helm install` on
   a kind cluster in the amd64 image leg, to Ready, the setup link read from the log and used,
   before anything is tagged. First run on GitHub's runners pending the push.
-- **The first-boot startup probe.** The first probe at four seconds is refused (the image's
-  cold boot is about five seconds, opening sixty keyspaces with a synchronous flush each); the
-  startup probe absorbs it, but the boot itself is worth measuring and halving.
+- **The first-boot startup probe** (performance; measured, not optimized, until the product is
+  complete). The first probe at four seconds is refused (the image's cold boot is about five
+  seconds, opening sixty keyspaces with a synchronous flush each); the startup probe absorbs
+  it. A 2026-09-27 agent was measuring where the time goes when the priority changed; its
+  numbers, if any, are at the top of `docs/status/01-storage-engine.md`.
 
 ### 2. Keep pulling on the measurement
 
