@@ -136,6 +136,7 @@ async fn spawn_mtls_server(material: TlsMaterial, peer_san_suffix: &str) -> Runn
         idempotency: Arc::new(IdempotencyCache::new(Duration::from_secs(5), 64)),
         in_flight: Arc::new(tokio::sync::Semaphore::new(16)),
         nudge: None,
+        peers: None,
     });
     let server = MeshServer::new(addr.clone(), Some(&material)).expect("server config");
     let (shutdown, shutdown_rx) = watch::channel(false);
