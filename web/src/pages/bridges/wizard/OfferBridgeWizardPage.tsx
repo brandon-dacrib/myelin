@@ -14,7 +14,7 @@ import { Button } from "@/components/ui/button/Button";
 import { ErrorState, ForbiddenState } from "@/components/ui/error-state/ErrorState";
 import { toast } from "@/components/ui/toast/toast-store";
 import { hasScope } from "@/lib/auth";
-import { accessIsValid, parseUserList, runtimeMeta } from "@/lib/bridge-offerings";
+import { accessIsValid, runtimeMeta } from "@/lib/bridge-offerings";
 import { AccessFields, OptionFields } from "../offering-fields";
 import { StepRail } from "./StepRail";
 import { KindStep } from "./steps/KindStep";
@@ -76,7 +76,7 @@ export function OfferBridgeWizardPage() {
 
   const canContinue =
     (step === "kind" && Boolean(state.type)) ||
-    (step === "access" && accessIsValid(state.allLocalUsers, state.usersText)) ||
+    (step === "access" && accessIsValid(state.allLocalUsers, state.users)) ||
     step === "runtime" ||
     step === "options";
 
@@ -163,7 +163,7 @@ export function OfferBridgeWizardPage() {
               <div className="mt-6">
                 <AccessFields
                   allLocalUsers={state.allLocalUsers}
-                  usersText={state.usersText}
+                  users={state.users}
                   serverName={server?.name}
                   onChange={patch}
                 />
@@ -206,9 +206,7 @@ export function OfferBridgeWizardPage() {
                 </ReviewGroup>
                 <ReviewGroup title="Access" onEdit={() => goTo("access")}>
                   <p className="text-sm text-text">
-                    {state.allLocalUsers
-                      ? "Everyone on this server"
-                      : parseUserList(state.usersText).join(", ")}
+                    {state.allLocalUsers ? "Everyone on this server" : state.users.join(", ")}
                   </p>
                 </ReviewGroup>
                 <ReviewGroup title="Runtime" onEdit={() => goTo("runtime")}>

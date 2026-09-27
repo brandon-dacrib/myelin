@@ -177,10 +177,9 @@ export function looksLikeUserId(value: string): boolean {
 }
 
 /** Whether an access choice can be sent as it is: everyone, or at least one well-formed ID. */
-export function accessIsValid(allLocalUsers: boolean, usersText: string): boolean {
+export function accessIsValid(allLocalUsers: boolean, users: readonly string[]): boolean {
   if (allLocalUsers) return true;
-  const ids = parseUserList(usersText);
-  return ids.length > 0 && ids.every(looksLikeUserId);
+  return users.length > 0 && users.every(looksLikeUserId);
 }
 
 /** The label an instance row goes by: its owner, or the offering itself for a shared one. */

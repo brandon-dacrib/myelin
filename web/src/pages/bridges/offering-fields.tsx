@@ -1,7 +1,8 @@
-import { useId, type ReactNode } from "react";
-import { Cloud, Laptop } from "lucide-react";
+import { useId, useState, type ReactNode } from "react";
+import { Cloud, Laptop, Plus, X } from "lucide-react";
 import type { BridgeDeploymentTarget, BridgeOfferingRuntime, BridgeType } from "@/api/bridges";
-import { Field, Input, Textarea } from "@/components/ui/input/Input";
+import { Button } from "@/components/ui/button/Button";
+import { Field, Input } from "@/components/ui/input/Input";
 import { Switch } from "@/components/ui/switch/Switch";
 import { looksLikeUserId, notDeployableReason, parseUserList } from "@/lib/bridge-offerings";
 import { cn } from "@/lib/cn";
@@ -61,17 +62,15 @@ export function ChoiceCard({
 /** Who may have an instance: everyone local, or the people listed. */
 export function AccessFields({
   allLocalUsers,
-  usersText,
+  users,
   onChange,
   serverName,
 }: {
   allLocalUsers: boolean;
-  usersText: string;
-  onChange: (patch: { allLocalUsers?: boolean; usersText?: string }) => void;
+  users: string[];
+  onChange: (patch: { allLocalUsers?: boolean; users?: string[] }) => void;
   serverName?: string;
 }) {
-  const invalid = parseUserList(usersText).filter((id) => !looksLikeUserId(id));
-  const empty = !allLocalUsers && parseUserList(usersText).length === 0;
   return (
     <div>
       <div
@@ -94,29 +93,114 @@ export function AccessFields({
       </div>
       {!allLocalUsers && (
         <div className="mt-4 max-w-lg">
+          <UserIdList
+            users={users}
+            onChange={(next) => onChange({ users: next })}
+            serverName={serverName}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * A list of Matrix IDs, one row each, rather than a box of text to get the separators right in.
+ * An ID is added with Enter or the Add button, or when focus leaves the box -- so one typed and
+ * never "added" is not silently dropped on save. Pasting several at once, separated by commas,
+ * spaces or new lines, adds them all. Something that is not a Matrix ID stays in the box with the
+ * reason under it.
+ */
+function UserIdList({
+  users,
+  onChange,
+  serverName,
+}: {
+  users: string[];
+  onChange: (users: string[]) => void;
+  serverName?: string;
+}) {
+  const [pending, setPending] = useState("");
+  const listLabelId = useId();
+  const typed = parseUserList(pending);
+  const invalid = typed.filter((id) => !looksLikeUserId(id));
+
+  function commit() {
+    if (typed.length === 0 || invalid.length > 0) return;
+    onChange([...new Set([...users, ...typed])]);
+    setPending("");
+  }
+
+  const error =
+    invalid.length > 0
+      ? `Not a Matrix ID: ${invalid.join(", ")}`
+      : users.length === 0 && typed.length === 0
+        ? "List at least one person, or let everyone have one."
+        : undefined;
+
+  return (
+    <div className="flex flex-col gap-3">
+      <p id={listLabelId} className="sr-only">
+        People listed
+      </p>
+      {users.length > 0 && (
+        <ul aria-labelledby={listLabelId} className="flex flex-col gap-1">
+          {users.map((id) => (
+            <li
+              key={id}
+              className="flex items-center justify-between gap-2 rounded-sm border border-border bg-surface px-3 py-1"
+            >
+              <span className="min-w-0 truncate font-identifier text-sm text-text">{id}</span>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                aria-label={`Remove ${id}`}
+                onClick={() => onChange(users.filter((u) => u !== id))}
+              >
+                <X size={16} aria-hidden="true" />
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="flex items-start gap-2">
+        <div className="min-w-0 flex-1">
           <Field
             label="People who can have one"
-            hint="Matrix IDs, one per line or separated by commas."
-            error={
-              invalid.length > 0
-                ? `Not a Matrix ID: ${invalid.join(", ")}`
-                : empty
-                  ? "List at least one person, or let everyone have one."
-                  : undefined
-            }
+            hint="A Matrix ID, then Enter. Paste several at once, separated by commas or spaces."
+            error={error}
           >
             {(f) => (
-              <Textarea
+              <Input
                 {...f}
-                value={usersText}
+                value={pending}
                 placeholder={`@alice:${serverName ?? "example.org"}`}
-                onChange={(e) => onChange({ usersText: e.target.value })}
+                onChange={(e) => setPending(e.target.value)}
+                onBlur={commit}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    // Inside a form, Enter would submit it; here it adds the person.
+                    e.preventDefault();
+                    commit();
+                  }
+                }}
                 className="font-identifier"
               />
             )}
           </Field>
         </div>
-      )}
+        <Button
+          type="button"
+          variant="secondary"
+          className="mt-6"
+          disabled={typed.length === 0 || invalid.length > 0}
+          leadingIcon={<Plus size={14} aria-hidden="true" />}
+          onClick={commit}
+        >
+          Add
+        </Button>
+      </div>
     </div>
   );
 }
