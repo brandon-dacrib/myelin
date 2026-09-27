@@ -56,6 +56,11 @@ spec:
       topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if eq .Values.mode "cluster" }}
+      ## The server hands its shards to its peers before its listeners stop (up to twenty
+      ## seconds, crates/hs-cli/src/serve.rs CLUSTER_DRAIN_DEADLINE); this must outlast that.
+      terminationGracePeriodSeconds: {{ .Values.cluster.terminationGracePeriodSeconds }}
+      {{- end }}
       containers:
         - name: hs
           image: {{ include "hs.image" . }}
@@ -79,6 +84,11 @@ spec:
             - name: metrics
               containerPort: {{ .Values.service.metricsPort }}
               protocol: TCP
+            {{- if eq .Values.mode "cluster" }}
+            - name: mesh
+              containerPort: {{ .Values.cluster.mesh.port }}
+              protocol: TCP
+            {{- end }}
           env:
             ## No RUST_LOG here: `telemetry.logging.level` in the ConfigMap sets the level, and
             ## the server's own directives for it hold the embedded storage engine to `warn`
@@ -149,6 +159,37 @@ spec:
             - name: HS_DATA_DIR
               value: {{ include "hs.dataDir" . | quote }}
             {{- end }}
+            {{- if eq .Values.mode "cluster" }}
+            ## Cluster mode, pinned through the environment so it holds on every pod whatever
+            ## the admin interface stores (a replica that fell back to single_node: true would
+            ## own every room itself and fork them). The pod's mesh address is its own stable
+            ## DNS name under the headless Service, composed from the Downward API: peers dial
+            ## it and verify this pod's certificate against it, which is why it is a name and
+            ## not status.podIP (see values.yaml, `cluster`).
+            - name: HS__CLUSTER__SINGLE_NODE
+              value: "false"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: HS__CLUSTER__MESH__ADVERTISE_ADDRESS
+              value: {{ printf "$(POD_NAME).%s" (include "hs.meshDomain" .) | quote }}
+            - name: HS__CLUSTER__MESH__PORT
+              value: {{ .Values.cluster.mesh.port | quote }}
+            {{- if .Values.cluster.mesh.tls.existingSecret }}
+            - name: HS__CLUSTER__MESH__TLS__CERTIFICATE_PATH
+              value: /etc/hs/secrets/mesh-tls/tls.crt
+            - name: HS__CLUSTER__MESH__TLS__PRIVATE_KEY_PATH
+              value: /etc/hs/secrets/mesh-tls/tls.key
+            - name: HS__CLUSTER__MESH__TLS__CA_CERTIFICATE_PATH
+              value: /etc/hs/secrets/mesh-tls/ca.crt
+            - name: HS__CLUSTER__MESH__TLS__PEER_SAN_SUFFIX
+              value: {{ printf ".%s" (include "hs.meshDomain" .) | quote }}
+            {{- else }}
+            - name: HS__CLUSTER__MESH__SHARED_SECRET_FILE
+              value: /etc/hs/secrets/mesh-shared-secret
+            {{- end }}
+            {{- end }}
             {{- if .Values.secrets.registrationSharedSecret.existingSecret }}
             - name: HS__AUTH__REGISTRATION_SHARED_SECRET_FILE
               value: /etc/hs/secrets/registration-shared-secret
@@ -190,6 +231,19 @@ spec:
               mountPath: /etc/hs/secrets/registration-shared-secret
               subPath: {{ .Values.secrets.registrationSharedSecret.key }}
               readOnly: true
+            {{- end }}
+            {{- if eq .Values.mode "cluster" }}
+            {{- if .Values.cluster.mesh.tls.existingSecret }}
+            ## Mounted whole: tls.crt, tls.key and ca.crt, the kubernetes.io/tls layout.
+            - name: secrets-mesh-tls
+              mountPath: /etc/hs/secrets/mesh-tls
+              readOnly: true
+            {{- else }}
+            - name: secrets-mesh-shared-secret
+              mountPath: /etc/hs/secrets/mesh-shared-secret
+              subPath: {{ .Values.cluster.mesh.sharedSecret.key }}
+              readOnly: true
+            {{- end }}
             {{- end }}
             {{- if .Values.secrets.sessionSecret.existingSecret }}
             - name: secrets-session-secret
@@ -262,6 +316,17 @@ spec:
         - name: secrets-registration-shared-secret
           secret:
             secretName: {{ .Values.secrets.registrationSharedSecret.existingSecret }}
+        {{- end }}
+        {{- if eq .Values.mode "cluster" }}
+        {{- if .Values.cluster.mesh.tls.existingSecret }}
+        - name: secrets-mesh-tls
+          secret:
+            secretName: {{ .Values.cluster.mesh.tls.existingSecret }}
+        {{- else }}
+        - name: secrets-mesh-shared-secret
+          secret:
+            secretName: {{ .Values.cluster.mesh.sharedSecret.existingSecret }}
+        {{- end }}
         {{- end }}
         {{- if .Values.secrets.sessionSecret.existingSecret }}
         - name: secrets-session-secret
