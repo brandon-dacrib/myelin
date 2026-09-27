@@ -195,7 +195,6 @@ pub async fn post_create_room<B: KvBackend + 'static>(
             .map(|axum::Extension(p)| ruma::RoomId::parse(p.as_str()).map(|r| r.to_owned()))
             .transpose()
             .map_err(|e| RoomError::Internal(format!("pre-assigned room id: {e}")))?,
-        ..Default::default()
     };
 
     let handle = state

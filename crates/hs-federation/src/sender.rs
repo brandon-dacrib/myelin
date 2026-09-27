@@ -1655,7 +1655,8 @@ mod tests {
         assert!(wait_for(Duration::from_secs(10), || peer.request_count() == 2).await);
         let second = &peer.requests()[1];
         assert_eq!(second.body["pdus"][0]["i"], 1);
-        assert!(store.queued().unwrap().is_empty());
+        // The peer has the request before the worker has read its answer and deleted the row.
+        assert!(wait_for(Duration::from_secs(10), || store.queued().unwrap().is_empty()).await);
         assert_eq!(
             sender.pending_pdus(),
             0,
