@@ -42,6 +42,7 @@ use hs_room::protocol::RoomUpdate;
 use ruma::{OwnedUserId, RoomId, UserId};
 use tokio::sync::{Mutex, Notify};
 
+use crate::cluster::{ClusterLink, RoomMirror, RoomWake, SessionCluster, WakeBatch};
 use crate::error::UserError;
 use crate::presence::PresenceRegistry;
 use crate::receipts::{ReceiptKind, ReceiptRegistry};
@@ -49,6 +50,15 @@ use crate::room_source::RoomSource;
 use crate::store::DynUserStore;
 use crate::token::SyncToken;
 use crate::typing::TypingRegistry;
+
+/// How long [`SessionHub::settle_before_read`] gives the peers to answer with their positions:
+/// one mesh round trip, not a wait for anything to happen. Well inside the whole read budget so
+/// a slow peer still leaves time for its wakes to land.
+const PEER_POSITIONS_DEADLINE: Duration = Duration::from_millis(250);
+/// How often the mirror's idle sweeper runs, and how long a snapshot may go unread before it
+/// is dropped. A dropped snapshot costs one reload on the next read; a kept one costs memory.
+const MIRROR_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+const MIRROR_MAX_IDLE: Duration = Duration::from_secs(600);
 
 fn membership_of(event: &Event) -> Option<String> {
     event
@@ -200,6 +210,14 @@ pub struct SessionHub<B: KvBackend, R: RoomSource<B>> {
     /// The `global_seq` of the last update [`SessionHub::consume_updates`] finished processing
     /// from the registry's global stream. See [`SessionHub::wait_for_consumed`].
     consumed: tokio::sync::watch::Sender<u64>,
+    /// Per peer (`replica#generation`), the highest consumed mark its wake batches have carried
+    /// here. See [`SessionHub::receive_wakes`] and [`SessionHub::settle_before_read`]. A
+    /// `std::sync::Mutex`: every critical section is a map lookup with no `.await` inside.
+    peer_consumed: std::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<u64>>>,
+    /// The cluster this hub is part of, if any -- see [`SessionHub::install_cluster`]. `None`
+    /// (single-node mode, and every test that does not install one) means every room is this
+    /// hub's to feed and read through the registry, exactly as before the link existed.
+    cluster: OnceLock<ClusterLink<B>>,
     /// Set once, by [`SessionHub::begin_shutdown`]: the server is stopping, and a `/sync` that is
     /// waiting for news should stop waiting.
     shutting_down: std::sync::atomic::AtomicBool,
@@ -245,6 +263,8 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             fan_out_threshold,
             wakers: Mutex::new(HashMap::new()),
             consumed: tokio::sync::watch::channel(0).0,
+            peer_consumed: std::sync::Mutex::new(HashMap::new()),
+            cluster: OnceLock::new(),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             typing: TypingRegistry::new(),
             presence: PresenceRegistry::new(),
@@ -321,6 +341,164 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         e2e.install_sync_token_resolver(Arc::new(DeviceListTokenResolver));
     }
 
+    /// Makes this hub one replica of a cluster (`crate::cluster`'s module docs): rooms this
+    /// replica does not own are read through `mirror` and fed by their owners, every update this
+    /// hub feeds is announced to the other replicas through `cluster`, and `/sync` waits for the
+    /// peers' positions before it reads. Same idempotent-install convention as
+    /// [`SessionHub::install_push_rules_store`]. Also spawns the mirror's idle sweeper.
+    ///
+    /// Not a constructor parameter because `hs-cli` starts the cluster after it has built this
+    /// hub; a hub with nothing installed is a single-node hub.
+    pub fn install_cluster(
+        self: &Arc<Self>,
+        cluster: Arc<dyn SessionCluster>,
+        mirror: Arc<RoomMirror<B>>,
+    ) where
+        R: 'static,
+    {
+        let sweeper = Arc::clone(&mirror);
+        if self.cluster.set(ClusterLink { cluster, mirror }).is_err() {
+            tracing::warn!("a session cluster was already installed on this hub; ignoring");
+            return;
+        }
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(MIRROR_SWEEP_INTERVAL);
+            loop {
+                interval.tick().await;
+                sweeper.evict_idle(MIRROR_MAX_IDLE).await;
+            }
+        });
+    }
+
+    /// Whether this hub is the one that feeds `room_id`: always, unless a cluster is installed
+    /// and says the room's shard belongs to another replica.
+    #[must_use]
+    pub fn owns_room(&self, room_id: &RoomId) -> bool {
+        self.cluster
+            .get()
+            .is_none_or(|link| link.cluster.owns_room(room_id))
+    }
+
+    /// The actor to read `room_id` through: the registry for a room this replica owns (or when
+    /// no cluster is installed), the mirror for any other. Every read this crate makes of a
+    /// room goes through here, so that a replica never serves a stale registry copy of a room
+    /// another replica is writing to.
+    ///
+    /// # Errors
+    /// Returns [`UserError`] if the room does not exist or could not be loaded.
+    pub async fn room(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<hs_room::actor::RoomActorHandle<B>, UserError> {
+        match self.cluster.get() {
+            Some(link) if !link.cluster.owns_room(room_id) => {
+                Ok(link.mirror.get_or_load(room_id).await?)
+            }
+            _ => Ok(self.rooms.get_or_load(room_id).await?),
+        }
+    }
+
+    /// Takes one peer's [`WakeBatch`]: wakes every user it names, then records the sender's
+    /// consumed mark for [`SessionHub::settle_before_read`]. In that order, so a `/sync` released
+    /// by the mark cannot run before the wake that goes with it. Called by the mesh's peer
+    /// handler in `hs-cli`; in tests, directly.
+    pub async fn receive_wakes(&self, batch: WakeBatch) {
+        tracing::debug!(
+            from = %batch.from,
+            consumed = batch.consumed,
+            rooms = batch.wakes.len(),
+            users = batch.wakes.iter().map(|w| w.users.len()).sum::<usize>(),
+            "received a wake batch from a peer"
+        );
+        for wake in &batch.wakes {
+            for user in &wake.users {
+                self.wake(user).await;
+            }
+        }
+        if batch.consumed > 0 {
+            self.advance_peer_consumed(&batch.from, batch.consumed);
+        }
+    }
+
+    fn advance_peer_consumed(&self, peer: &str, consumed: u64) {
+        let mut peers = self
+            .peer_consumed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sender = peers
+            .entry(peer.to_owned())
+            .or_insert_with(|| tokio::sync::watch::channel(0).0);
+        sender.send_if_modified(|current| {
+            if consumed > *current {
+                *current = consumed;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    /// The highest consumed mark `peer` has reported here, for tests and diagnostics.
+    #[must_use]
+    pub fn peer_consumed(&self, peer: &str) -> u64 {
+        self.peer_consumed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(peer)
+            .map_or(0, |s| *s.borrow())
+    }
+
+    async fn wait_for_peer_consumed(&self, peer: &str, seq: u64, at_most: Duration) {
+        let mut rx = {
+            let mut peers = self
+                .peer_consumed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            peers
+                .entry(peer.to_owned())
+                .or_insert_with(|| tokio::sync::watch::channel(0).0)
+                .subscribe()
+        };
+        if *rx.borrow() >= seq {
+            return;
+        }
+        let _ = tokio::time::timeout(at_most, rx.wait_for(|consumed| *consumed >= seq)).await;
+    }
+
+    /// What a `/sync` does before it reads anything: waits, up to `at_most` in all, for this hub
+    /// to have consumed everything its own registry had published when the request arrived
+    /// ([`SessionHub::wait_for_consumed`]) and, in a cluster, for every peer's wakes up to what
+    /// that peer reports having published ([`SessionCluster::peer_positions`]). The second is
+    /// what makes a write a client just made through another replica visible to its next read
+    /// here: the owner's hub sends the wake only after the feed entries are durable.
+    ///
+    /// Bounded, like the single-replica wait: a peer that has fallen seconds behind, or is not
+    /// answering, must not hold every `/sync` on this replica with it.
+    pub async fn settle_before_read(&self, at_most: Duration) {
+        let started = tokio::time::Instant::now();
+        let published = self.rooms.global_published_seq();
+        self.wait_for_consumed(published, at_most).await;
+        let Some(link) = self.cluster.get() else {
+            return;
+        };
+        let remaining = at_most.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return;
+        }
+        let positions = link
+            .cluster
+            .peer_positions(remaining.min(PEER_POSITIONS_DEADLINE))
+            .await;
+        for position in positions {
+            let remaining = at_most.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return;
+            }
+            self.wait_for_peer_consumed(&position.peer, position.published, remaining)
+                .await;
+        }
+    }
+
     /// Waits until this hub has processed every global-stream update numbered up to `seq`
     /// (`hs_room::protocol::RoomUpdate::global_seq`), or `at_most` has passed.
     ///
@@ -391,7 +569,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         &self,
         room_id: &RoomId,
     ) -> Result<Vec<OwnedUserId>, UserError> {
-        let handle = self.rooms.get_or_load(room_id).await?;
+        let handle = self.room(room_id).await?;
         Ok(handle
             .query(|actor| {
                 Ok::<_, hs_room::RoomError>(
@@ -624,9 +802,15 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             match updates.recv().await {
                 Ok(update) => {
                     let seq = update.global_seq;
-                    if let Err(e) = self.process_room_update(update).await {
-                        tracing::warn!(error = %e, "failed to process a room update into user feeds");
-                    }
+                    let room_id = update.room_id.clone();
+                    let room_pos = update.room_pos;
+                    let woken = match self.apply_room_update(update).await {
+                        Ok(woken) => woken,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to process a room update into user feeds");
+                            Vec::new()
+                        }
+                    };
                     // Processed or failed, it has been dealt with: nobody should wait for it.
                     if seq > 0 {
                         self.consumed.send_if_modified(|current| {
@@ -636,6 +820,16 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
                             } else {
                                 false
                             }
+                        });
+                    }
+                    // The other replicas hear of it after the feeds are written and the mark
+                    // moved, so that a peer released by this number reads what it stands for.
+                    if let Some(link) = self.cluster.get() {
+                        link.cluster.publish(RoomWake {
+                            room_id,
+                            room_pos,
+                            global_seq: seq,
+                            users: woken,
                         });
                     }
                 }
@@ -653,10 +847,25 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
                         "session hub fell behind the room stream; re-reading every resident room"
                     );
                     for handle in self.rooms.resident_handles().await {
-                        if let Some(head) = handle.query(|actor| actor.head_update()).await
-                            && let Err(e) = self.process_room_update(head).await
-                        {
-                            tracing::warn!(error = %e, "failed to re-read a room after falling behind");
+                        let Some(head) = handle.query(|actor| actor.head_update()).await else {
+                            continue;
+                        };
+                        let room_id = head.room_id.clone();
+                        let room_pos = head.room_pos;
+                        match self.apply_room_update(head).await {
+                            Ok(woken) => {
+                                if let Some(link) = self.cluster.get() {
+                                    link.cluster.publish(RoomWake {
+                                        room_id,
+                                        room_pos,
+                                        global_seq: 0,
+                                        users: woken,
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to re-read a room after falling behind");
+                            }
                         }
                     }
                 }
@@ -675,6 +884,17 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     /// Returns [`UserError`] if the room's member list could not be read, or if a store write
     /// failed.
     pub async fn process_room_update(&self, update: RoomUpdate) -> Result<(), UserError> {
+        self.apply_room_update(update).await.map(|_| ())
+    }
+
+    /// [`SessionHub::process_room_update`], returning the users it woke -- what the other
+    /// replicas are told (`crate::cluster::RoomWake::users`). Empty, and nothing written, for a
+    /// room this replica does not own: its owner feeds it, and two hubs writing the same
+    /// user's feed from two views of one room would race each other.
+    async fn apply_room_update(&self, update: RoomUpdate) -> Result<Vec<OwnedUserId>, UserError> {
+        if !self.owns_room(&update.room_id) {
+            return Ok(Vec::new());
+        }
         let handle = self.rooms.get_or_load(&update.room_id).await?;
         let (active_members, member_count, directory) = handle
             .query(|actor| {
@@ -756,7 +976,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             self.wake(user_id).await;
         }
 
-        Ok(())
+        Ok(targets.into_keys().collect())
     }
 
     /// A room's current member count, for callers (`crate::sync`'s hot-room fallback) that need
@@ -765,7 +985,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     /// # Errors
     /// Returns [`UserError`] if the room could not be loaded.
     pub async fn room_member_count(&self, room_id: &RoomId) -> Result<usize, UserError> {
-        let handle = self.rooms.get_or_load(room_id).await?;
+        let handle = self.room(room_id).await?;
         Ok(handle
             .query(|actor| actor.members().map(|m| m.len()))
             .await?)

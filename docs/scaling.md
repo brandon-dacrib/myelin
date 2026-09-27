@@ -1,6 +1,7 @@
 # What adding a replica gets you, and what it does not
 
-Written 2026-09-26. This is the plain answer to "if I set `replicas: 3`, what do I get?", and
+Written 2026-09-26, revised 2026-09-27 for cluster-aware `/sync`. This is the plain answer to
+"if I set `replicas: 3`, what do I get?", and
 it is deliberately split into what the design gives, what is built today, and what has been
 measured (nothing, yet). `PLAN.md` sections 5 and 7 are the design; `docs/status/03-cluster.md`
 is the record of what has actually run.
@@ -30,7 +31,7 @@ partition is the hash, and the routing is the mesh.
 | More of this | Why it scales with N |
 |---|---|
 | Rooms active at the same time | each room has one owner; N replicas hold N times the hot rooms in memory and run N times the event pipelines in parallel |
-| Clients connected at the same time | open `/sync` long-polls and per-user change trackers are memory and fan-out work, spread across owners |
+| Clients connected at the same time | a client's `/sync` is answered by whichever replica it reaches, from the shared store; the room's owner wakes that replica over the mesh when something happens, and a write made through one replica is in the client's next `/sync` on another (built and run as two processes on 2026-09-27, `docs/status/05-sync.md`). Long-polls, response building and the per-user feed work are spread across replicas |
 | Inbound federation | a `/send` transaction is split by room and dispatched to each room's owner |
 | Outbound federation and bridge delivery | per-destination and per-appservice queues are sharded across replicas (designed; see "today") |
 | Availability | a lost replica's rooms and users are re-owned by survivors within the lease timeout; the target is under five seconds to the first successful write on the new owner |
@@ -49,6 +50,8 @@ what spreads that work.
 | Cheaper fan-out to a huge room | an event in a room of ten thousand members costs ten thousand recipients' worth of push and sync work, on that room's owner, however many replicas there are |
 | Faster single requests | a request for a room another replica owns pays one mesh hop. Latency does not go down with N; it goes up by that hop when the client happens to hit a non-owner |
 | Federation bandwidth to one peer | one destination's queue lives on one shard |
+| Cheaper reads of a room from a replica that does not own it | such a replica reads the room through a snapshot it reloads from the store whenever the owner has written (`hs_user::cluster::RoomMirror`). Today that reload is the whole room, O(room size) per new event, in every room a replica has sessions in but does not own; the incremental catch-up is RFC 0018. Until then, a cluster's `/sync` costs more store reads per event than a single node's |
+| Typing, receipts and presence across replicas | they live in memory on the replica that took the request. A typing notice reaches the sessions on the room owner's replica (room requests are forwarded there) and nobody else's; presence set on one replica is seen from that replica |
 
 ## The same thing in Synapse's terms
 
@@ -68,12 +71,29 @@ clients. As of 2026-09-26:
   forwarded to the owner or refused with `503 M_HS_NOT_SHARD_OWNER`. Two `hs serve` processes
   on one PostgreSQL took forty concurrent sends to one room and did not fork its history
   (`docs/status/03-cluster.md`). Fencing inside the write transaction is installed too.
-- **`/sync` is not cluster-aware.** A client's `/sync` is served by whichever replica it
-  reaches, from that replica's own feeds, and the session hub watches only its own replica's
-  room stream (`hub.watch_all(rooms.subscribe_global())` in `crates/hs-cli/src/serve.rs`). So a
-  long-poll on replica B for a room replica A owns is not woken by A's events. The design's
-  user-session owner, woken by room owners over the mesh (`PLAN.md` section 5.4), is not built.
-  This is the reason the "clients connected" row above is design, not fact.
+- **`/sync` is cluster-aware, as two processes on one PostgreSQL** (2026-09-27,
+  `docs/status/05-sync.md`). A client's `/sync` is answered by whichever replica it reaches;
+  only a room's owner writes feeds, and after each update it sends every other live replica a
+  wake over the mesh (`POST /mesh/v1/peer`, `hs_cli::sync_cluster`), so a long-poll on
+  replica B for a room replica A owns returns as soon as A has fed the update (the mesh hop
+  measured under a millisecond; what remains is the owner's feed writes and the reader's
+  response build). Before reading, a `/sync` asks every peer what it has published and waits,
+  within the same 500 ms budget the single-replica read-your-writes wait has, to have received
+  that peer's wakes up to it: 160 of 160 sends through one replica were in the very next
+  `timeout=0` sync on the other. A replica reads a room it does not own through a snapshot
+  checked against the store's head on every access. What is *not* built: the user-session
+  *owner* of `PLAN.md` 5.4 (no `/sync` is forwarded; there is no per-user shard in use), the
+  incremental catch-up that would make a non-owner's reads cheap (RFC 0018), and any exchange
+  of typing, receipts or presence between replicas. Two pods have still not done this: the
+  run was two processes on one host over a plain (non-TLS) mesh. Release build, same host: a
+  cross-replica long-poll returns about 150 ms after the write is acknowledged, of which the
+  mesh is under a millisecond.
+- **Per-replica settings are seeded into the shared configuration store.** The bootstrap file
+  seeds the database once, and the database outranks the file afterwards, so two replicas
+  seeding one database leave the loser's `listeners` and `cluster.mesh.port` in force for both
+  on the next restart (seen: replica A restarted as B and failed to bind). Until the config
+  store excludes per-replica sections in cluster mode, `hs config unset /listeners/listeners`
+  and `unset /cluster/mesh/port` once after the first start make each replica's own file win.
 - **`/createRoom` is not shard-gated**: the room's first actor is built wherever the request
   lands, and every later request is routed to the true owner.
 - **Outbound federation and bridge delivery are not shard-gated on a real cluster**: the
@@ -92,9 +112,10 @@ In order, each a transcript in `docs/status/`:
 1. Two pods in `mode=cluster` on the verification cluster, which already runs CloudNativePG:
    the pod's IP advertised to the mesh, a room created on one and written through both, from
    Element.
-2. The user session owner: `/sync` routed to, or woken by, the right replica, so a client can
-   connect to any pod and see every room. Until then, clients must all reach the same replica,
-   which makes N replicas an availability feature and not a capacity one.
+2. ~~The user session owner: `/sync` routed to, or woken by, the right replica, so a client can
+   connect to any pod and see every room.~~ Done as "woken by", as two processes on one host
+   (2026-09-27); a client may reach any replica. Left: the same on two pods, and the cost of a
+   non-owner's room reads (RFC 0018) once the loadgen slope below says it matters.
 3. `hs-loadgen` against one replica, then two, then three, on the same PostgreSQL: connected
    users and active rooms at a fixed sync p99. The slope of that line is the number this
    document is really about, and it does not exist yet.

@@ -1109,6 +1109,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         None
     };
 
+    // For the room mirror `crate::sync_cluster::install` opens below; `identity` itself moves
+    // into `RoomState` here.
+    let mirror_identity = identity.clone();
     let room_state = RoomState {
         auth: auth_state.clone(),
         rooms: rooms.clone(),
@@ -1152,6 +1155,18 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // (`crate::appservice_delivery`'s module docs). Inert in single-node mode
     // (`config.cluster.single_node`, the default).
     let cluster_handles = crate::cluster::start(&config, backend.clone()).await?;
+    // `/sync` across replicas (`hs_user::cluster`): room owners wake this replica's long-polls
+    // over the mesh, this replica reads rooms it does not own through a store-checked mirror,
+    // and a `/sync` here waits for the peers' positions before it reads. Nothing in single-node
+    // mode. After the cluster has started (it needs the forwarder) and before `spawn_mesh`
+    // below (which serves the peer handler this installs).
+    crate::sync_cluster::install(
+        &user_state.hub,
+        &cluster_handles,
+        backend.clone(),
+        mirror_identity,
+    )
+    .map_err(|e| ServeError::Sessions(Box::new(e)))?;
     let appservice_delivery = crate::appservice_delivery::AppserviceDelivery::start(
         appservices.registry.clone(),
         appservices.ping_service.clone(),

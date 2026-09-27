@@ -1,5 +1,313 @@
 # 05 Sync: status
 
+Last updated: 2026-09-27 (session 7: `/sync` is cluster-aware -- the room owner wakes the
+replica holding the user's session over the mesh, with read-your-writes across replicas;
+verified as two `hs serve` processes on one PostgreSQL 16. Sessions 1-6 preserved unchanged
+further down, after the integration note.)
+
+## Session 7 (2026-09-27): `/sync` is cluster-aware
+
+**Task**: `docs/next-steps.md` item 1, the bullet that matters most to a client: the session hub
+watched only its own replica's room stream, so a long-poll on replica B for a room replica A owns
+was never woken by A's events, and a client's write through A was not necessarily in its next
+`/sync` on B. Scope: `crates/hs-user`, additive mesh methods in `crates/hs-cluster`, one new
+module and a few lines of wiring in `crates/hs-cli`, `docs/scaling.md`, RFC 0018. Track 03 is
+concurrently changing `serve.rs`'s advertise address, `/createRoom`'s gating and the mesh's TLS
+wiring; nothing here touches any of those.
+
+### The design, in five lines
+
+1. **A session lives wherever its `/sync` arrived.** No user shard is consulted and no `/sync`
+   is forwarded: every replica reads the same feeds, memberships and device cursors from the
+   shared store, so any replica can answer any user. `PLAN.md` 5.4's user-session *owner* is
+   not built; what is built is the part of it a client can tell apart -- the wake and the
+   read-your-writes -- without a second routing layer.
+2. **Only a room's owner writes feeds; it then rings every other replica's doorbell.** The
+   owner's hub processes the registry stream as before (feed entries, membership rows) and
+   hands each processed update to `SessionCluster::publish` as a `RoomWake` (room, position,
+   the owner's stream number, the users it woke). A per-peer pump coalesces wakes into one
+   `user.wake` batch per mesh round trip to *every live replica* (the shard map's distinct
+   owners); the receiving hub wakes those users' long-polls. Broadcast, not registration:
+   O(replicas) small messages per event and no per-room interest table to keep consistent
+   across failovers. A non-owner's hub writes nothing for rooms it does not own.
+3. **A non-owner reads a room through a mirror validated against the store, never through its
+   registry.** `SessionHub::room` sends owned rooms to the registry and every other room to
+   `RoomMirror`: a read-only `RoomActor::load` snapshot per room, reloaded whenever the store's
+   durable timeline head (`room_sn` lookup plus a reverse range of one on `room_timeline`) is
+   past the snapshot's. The store is the source of truth; the wake is only the doorbell, the
+   rule the appservice pump already follows.
+4. **Read-your-writes across replicas is `wait_for_consumed` with the peers' numbers.** Before
+   reading, `/sync` on B asks every live peer what it has published (`user.positions`, one small
+   mesh round trip per peer, concurrently, 250 ms cap) and waits, within the same 500 ms budget
+   the single-replica wait already had, until B has received each peer's wakes up to that
+   number (every batch carries the sender's consumed high-water mark, keyed by
+   `replica#generation` so a restarted peer starts over). A's wake is sent only after A's hub
+   wrote the feed entries, so when B has it the entries are durable and the mirror check in (3)
+   sees the new head.
+5. **What it does not do.** Typing, receipts and presence stay in memory per replica and are not
+   exchanged. To-device and device-list changes still rely on the long-poll's 500 ms re-check.
+   A mirror reload is a full `RoomActor::load`, O(room size) per new event in a room this
+   replica does not own but has sessions in (RFC 0018 asks `hs-room` for an incremental
+   catch-up). A single replica in `mode=cluster` pays nothing (no peers); single-node mode is
+   untouched (no cluster is installed on the hub, and every code path is the old one).
+
+One thing the task description overstated, found while proving the test fails without the wake:
+the long-poll already re-checks its durable feed every 500 ms (`E2E_POLL_INTERVAL`, there for
+to-device traffic), so with a shared store a cross-replica long-poll was never held for the full
+timeout -- it was held for up to half a second and then answered *from a stale registry copy of
+the room*. The wake takes the half second to the owner's feed latency; the mirror is what makes
+the answer right. The unit test's bar is therefore "faster than the re-check" (400 ms; in-process
+it is single-digit milliseconds), and the mutant without the wake fails at 507 ms.
+
+### Verified by running: two `hs serve` processes on one PostgreSQL 16
+
+Setup: PostgreSQL 16 from apt on `127.0.0.1:5432` (`service postgresql start`; role `hs`,
+database `hs05`), two configs differing only in the client port (18140/18141) and mesh port
+(18549/18550), `cluster.single_node: false`, `room_shards: 4`, `user_shards: 4`, shared secret
+mesh auth (plain TCP; TLS is track 03's), one signing-key directory shared by both, a debug
+build of `hs` from this branch, `RUST_LOG=info,hs_user::cluster=debug,hs_user::hub=debug,hs_cli::sync_cluster=debug`.
+The machine: 4 cores shared with three other agents' cargo builds throughout.
+
+```
+$ hs serve -c a.yaml &   # A: client 18140, mesh 18549
+$ hs serve -c b.yaml &   # B: client 18141, mesh 18550
+A ready: 200
+B ready: 200
+a.log: INFO hs_cli::sync_cluster: /sync is cluster-aware: room owners wake this replica's long-polls over the mesh replica=127.0.0.1:18549#1790482095157
+b.log: INFO hs_cli::sync_cluster: /sync is cluster-aware: room owners wake this replica's long-polls over the mesh replica=127.0.0.1:18550#1790482095160
+```
+
+`run.py` (in the session's scratch directory; it registers alice and bob on A, creates four
+rooms on A, bob joins each through the gated `/rooms/{id}/join`, then measures). All four rooms
+hashed to shards A owns (A's log has no mirror loads, B's has 92), so "poll on B, send on A" is
+the direction that crosses the mesh and "poll on A, send on B" is a send forwarded to the owner
+with a local wake:
+
+```
+== wake latency: alice long-polls on X (timeout 30 s), bob sends on Y ==
+  room poll on send on  ack->return  start->return  event in poll
+     0       B       A     324.0 ms       409.6 ms           True
+     0       A       B     273.7 ms       358.8 ms           True
+     1       B       A     366.6 ms       442.9 ms           True
+     1       A       B     258.6 ms       336.2 ms           True
+     2       B       A     368.1 ms       468.5 ms           True
+     2       A       B     254.4 ms       331.3 ms           True
+     3       B       A     390.0 ms       508.0 ms           True
+     3       A       B     261.2 ms       353.4 ms           True
+
+== read-your-writes: alice sends on X, immediately syncs on Y with timeout=0 ==
+room 0: send on A, sync on B: 20/20 seen, 0 missed, slowest sync 413.3 ms
+room 1: send on A, sync on B: 20/20 seen, 0 missed, slowest sync 361.2 ms
+room 2: send on A, sync on B: 20/20 seen, 0 missed, slowest sync 405.3 ms
+room 3: send on A, sync on B: 20/20 seen, 0 missed, slowest sync 623.1 ms
+room 0: send on B, sync on A: 20/20 seen, 0 missed, slowest sync 313.6 ms
+room 1: send on B, sync on A: 20/20 seen, 0 missed, slowest sync 618.4 ms
+room 2: send on B, sync on A: 20/20 seen, 0 missed, slowest sync 363.8 ms
+room 3: send on B, sync on A: 20/20 seen, 0 missed, slowest sync 336.2 ms
+```
+
+160 of 160 writes through one replica were in the very next `timeout=0` sync on the other, in
+both directions. The long-poll returned in 250-390 ms after the send was acknowledged, never
+the timeout -- but "tens of milliseconds" it is not, and the *local* direction is nearly as slow,
+so the time is not the mesh. `run2.py` puts wall-clock stamps next to the replica logs (same
+machine, same clock) for a fresh room, and first measures what a `/sync` costs when nothing is
+new:
+
+```
+baseline: alice's timeout=0 sync on B with nothing new: 75, 75, 75, 83, 75 ms
+baseline: alice's timeout=0 sync on A with nothing new: 92, 75, 78, 72, 82 ms
+
+round 0 poll on B, send on A: send started 04:12:18,703, acked 04:12:18,781 (79 ms), poll returned 04:12:19,088: ack->return 306 ms
+round 0 poll on A, send on B: send started 04:12:19,662, acked 04:12:19,748 (86 ms), poll returned 04:12:19,988: ack->return 240 ms
+round 1 poll on B, send on A: send started 04:12:20,649, acked 04:12:20,730 (81 ms), poll returned 04:12:21,037: ack->return 307 ms
+round 1 poll on A, send on B: send started 04:12:21,656, acked 04:12:21,737 (82 ms), poll returned 04:12:21,975: ack->return 238 ms
+round 2 poll on B, send on A: send started 04:12:22,714, acked 04:12:22,792 (78 ms), poll returned 04:12:23,095: ack->return 303 ms
+round 2 poll on A, send on B: send started 04:12:23,795, acked 04:12:23,883 (89 ms), poll returned 04:12:24,145: ack->return 262 ms
+
+a.log 04:12:18,886 DEBUG hs_cli::sync_cluster: sent a wake batch to a peer peer=127.0.0.1:18550 consumed=180 rooms=1
+b.log 04:12:18,886 DEBUG hs_user::hub: received a wake batch from a peer from=127.0.0.1:18549#... consumed=180 rooms=1 users=2
+b.log 04:12:18,932 DEBUG request{...}: hs_user::cluster: room mirror loaded a room this replica does not own room_id=!WKWFowBu5upLSA9KJz:cluster.local head=11
+```
+
+Round 0, cross-replica, read against the logs: the send was acknowledged at 18,781; A's hub fed
+the update and B had the wake at 18,886 (105 ms, which is A's feed writes over PostgreSQL in a
+debug build -- a long-poll *on A* waits for the same thing); the mesh hop is inside one
+millisecond (A logs "sent" after B's reply, B logs "received" before answering, same
+millisecond); B's mirror had reloaded the room at 18,932 (46 ms); the response was on the wire
+at 19,088 (156 ms to build, against 75 ms for a response with nothing in it). So of the 306 ms,
+under 1 ms is the mesh, about 60 ms is the cross-replica premium (the mirror reload, RFC 0018),
+and the rest is what this debug binary pays for any `/sync` with news over PostgreSQL. A
+release build is the honest way to get the absolute number; see the next paragraph for what it
+gave, or that it did not finish.
+
+The same two scripts against a **release** build (same host, same PostgreSQL, the other agents'
+builds still running):
+
+```
+baseline: alice's timeout=0 sync on B with nothing new: 38, 41, 41, 40, 42 ms
+baseline: alice's timeout=0 sync on A with nothing new: 44, 38, 44, 37, 37 ms
+
+round 0 poll on B, send on A: send started 04:25:03,599, acked 04:25:03,643 (44 ms), poll returned 04:25:03,794: ack->return 151 ms
+round 0 poll on A, send on B: send started 04:25:04,236, acked 04:25:04,277 (40 ms), poll returned 04:25:04,396: ack->return 119 ms
+round 1 poll on B, send on A: send started 04:25:04,876, acked 04:25:04,915 (39 ms), poll returned 04:25:05,052: ack->return 137 ms
+round 1 poll on A, send on B: send started 04:25:05,509, acked 04:25:05,552 (43 ms), poll returned 04:25:05,722: ack->return 171 ms
+round 2 poll on B, send on A: send started 04:25:06,257, acked 04:25:06,301 (44 ms), poll returned 04:25:06,477: ack->return 176 ms
+round 2 poll on A, send on B: send started 04:25:07,009, acked 04:25:07,067 (58 ms), poll returned 04:25:07,243: ack->return 176 ms
+
+a.log 04:25:03,697 sent a wake batch to a peer consumed=5 rooms=1
+b.log 04:25:03,696 received a wake batch from a peer consumed=5 rooms=1 users=2
+b.log 04:25:03,721 room mirror loaded a room this replica does not own head=9
+
+== wake latency (4 rooms, both directions): ack->return 168-201 ms, event in poll: 8/8 ==
+== read-your-writes: 160/160 seen, 0 missed; slowest sync 173-219 ms in 14 of 16 cells,
+   516.7 ms and 1418.3 ms in the other two (single outliers; the 500 ms bounded wait plus a
+   stalled response build on a box running three cargo builds, not explained further) ==
+```
+
+Round 0 cross-replica, release: acked at 03,643; B had the wake at 03,696 (53 ms: A's hub
+feeding the update over PostgreSQL); the mirror had reloaded at 03,721 (25 ms); the response
+was on the wire at 03,794 (73 ms to build, against 40 ms for an empty one). So a cross-replica
+long-poll returns about 150 ms after the write is acknowledged, of which the mesh is under a
+millisecond and the cross-replica premium (the mirror reload) about 25 ms; a same-replica
+long-poll is 120-170 ms on the same box. The wake is not the bottleneck; the feed write and the
+response build are, and both are single-node work.
+
+**Found on the way, for the config owner (track 03/hs-config): per-replica settings live in the
+shared store.** Settings are stored in the database and the bootstrap file only seeds it on the
+first run (`crates/hs-cli/src/bootstrap.rs`, `hs_config::layered`: database outranks file). Two
+replicas seeding one database race, and the loser's `listeners` and `cluster.mesh.port` then
+apply to *both* on the next restart: on my second start replica A came up as B (bound 18141 and
+mesh 18550, "Address already in use", exit 1). `HS__` overrides cannot fix the listener (they
+set scalars, not list entries). Workaround used:
+`hs config -c a.yaml unset /listeners/listeners` and `unset /cluster/mesh/port`, after which
+each replica's own file supplies them and the store does not re-seed. A cluster deployment
+needs either those sections excluded from seeding in `mode=cluster`, or documentation saying
+so; nothing in this branch changes it.
+
+Not verified by running: two *pods*; a peer that dies mid-run (the unit test covers a peer whose
+wakes never arrive: the sync is delayed by the bounded wait and still sees the write, from the
+store); more than two replicas; any room with more than a handful of events (the reload cost is
+reasoned about, not measured).
+
+### Automated tests
+
+- `crates/hs-user/src/cluster.rs`, `two_replica_tests`: two hubs, two registries, one shared
+  `MemoryBackend`, replica A owning every room and B none, a `FakeCluster` carrying A's wakes to
+  B in-process (with a configurable delay, and a mute switch). `a_long_poll_on_the_other_replica_is_woken_by_the_owners_write`
+  fails without the wake (mutant checked by hand: 507 ms, the re-check interval, against the
+  400 ms bar); `a_write_through_the_owner_is_in_the_very_next_sync_on_the_other_replica` sends
+  ten times through A and syncs `timeout=0` on B after each with wakes delayed 150 ms, which
+  without the peer wait would read the feeds before A's hub wrote them;
+  `a_peer_whose_wakes_never_arrive_delays_a_sync_only_by_the_bounded_wait`;
+  `a_hub_that_does_not_own_a_room_feeds_nobody_for_it`;
+  `the_mirror_reloads_a_room_only_when_the_store_is_ahead_of_its_snapshot`. Plus `WakeBatch`
+  coalescing and JSON round-trip.
+- `crates/hs-cluster/tests/mesh_peer.rs`: `POST /mesh/v1/peer` end to end over a loopback
+  socket with shared-secret auth: the handler sees the sender's identity, route and payload;
+  later messages reuse the pooled connection; a port nobody listens on is `PeerUnreachable`
+  promptly; a server without a peer handler is reported unreachable (its `501`), not answered;
+  the wrong secret is refused before the handler sees anything.
+- `crates/hs-cli/src/sync_cluster.rs`: the peer handler's `user.positions` answer, a
+  `user.wake` batch advancing the hub's per-peer mark, junk and unknown routes refused; a
+  single-node replica owns every room and has no peers.
+- Every pre-existing `hs-user` test still passes (123 lib, 6 scenario); `hs-cluster` and
+  `hs-cli` suites as recorded under "How to verify".
+
+### Files
+
+- `crates/hs-user/src/cluster.rs` (new): `RoomWake`, `WakeBatch`, `PeerPosition`,
+  `SessionCluster`, `RoomMirror`, the in-process `FakeCluster` for tests.
+- `crates/hs-user/src/hub.rs`: `install_cluster`, `owns_room`, `room` (the one way this crate
+  now reads a room), `receive_wakes`, `peer_consumed`, `settle_before_read`; the drain loop
+  publishes a wake after every update; `process_room_update` skips rooms this replica does not
+  own and reports whom it woke.
+- `crates/hs-user/src/sync/mod.rs`: `build` calls `settle_before_read`; the three room reads
+  go through `hub.room`.
+- `crates/hs-cluster/src/mesh/envelope.rs`: `PeerHandler`. `mesh/server.rs`: `MeshDeps.peers`,
+  `POST /mesh/v1/peer`. `mesh/forwarder.rs`: `Forwarder::send_to_peer`. `error.rs`:
+  `ForwardError::PeerUnreachable`. `ownership.rs`: `ShardMap::replicas`.
+- `crates/hs-cli/src/sync_cluster.rs` (new): `MeshSessionCluster`, `SessionPeerHandler`,
+  `install`. `cluster.rs`: `ClusterHandles::{origin, origin_generation, install_peer_handler}`
+  and the `peers` field of `MeshDeps` in `spawn_mesh`. `serve.rs`: one `install` call after the
+  cluster starts and one `identity.clone()` for the mirror. `lib.rs`: the module.
+- `docs/scaling.md`: the "clients connected" row is fact; two new "does not add" rows; the
+  honest-status bullet and the list of what would turn design into fact.
+- `docs/rfcs/0018-room-actor-catch-up.md`: the incremental catch-up `hs-room` needs.
+
+### How to verify
+
+```
+cargo fmt --all --check
+cargo clippy -p hs-user -p hs-cluster -p hs-cli --all-targets -- -D warnings
+cargo test -p hs-user -p hs-cluster
+cargo test -p hs-cli
+```
+
+For the two-process run: `service postgresql start`, a role and database
+(`psql -h 127.0.0.1 -U postgres -c "CREATE USER hs PASSWORD 'hs'" -c "CREATE DATABASE hs05 OWNER hs"`
+works with the apt package's `trust` rule for `127.0.0.1`), the two configs above, one signing
+key directory, `hs serve -c a.yaml & hs serve -c b.yaml &`, then `run.py` and `run2.py`
+(kept in the session scratch directory, not the repository; both are twenty lines of
+`requests` calls and are reproduced in spirit by `crates/hs-user/src/cluster.rs`'s
+`two_replica_tests`).
+
+### Decisions made
+
+- **Broadcast, not registration.** A room owner sends its wake to every live replica rather than
+  keeping a table of which replicas hold sessions for which rooms. O(replicas) tiny messages per
+  event, coalesced per peer; no state to lose on failover. Revisit if replica counts get large.
+- **Ask the peers, not the client.** Read-your-writes across replicas costs one mesh round trip
+  per peer per `/sync` (`user.positions`, concurrently, sub-millisecond on a host). The
+  alternative -- carrying the owner's position back through the forwarded write's reply -- only
+  covers a write that went through the same replica the sync then hits, which a load balancer
+  does not promise. Piggybacking can be added as an optimisation if the loadgen slope says the
+  round trip matters.
+- **The store is the truth, the wake is the doorbell.** A non-owner's mirror is checked against
+  the durable head on every access (two point reads), so a lost or late wake can delay a
+  response but never make it wrong. This is what made the "peer whose wakes never arrive" case
+  a bounded-latency case rather than a correctness case.
+- **Only the owner feeds.** `process_room_update` writes nothing for a room this replica does
+  not own, so two hubs never race on one user's feed from two views of a room.
+- **Keyed by `replica#generation`.** A restarted peer's numbering starts over; its old mark must
+  not satisfy a new wait.
+- **`hs-user` does not depend on `hs-cluster`.** The `SessionCluster` trait is this crate's own;
+  `hs-cli` implements it over the mesh. Tests stand two hubs up without a mesh.
+- **A shared `target/` across worktrees clobbers same-named artifacts.** Cargo's metadata hash
+  does not include a workspace member's path, so my worktree's `libhs_cluster-<hash>.rmeta` and
+  the main checkout's are the same file; a build in one tree refreshes the fingerprint the other
+  trusts. Symptom: `hs-cli` failed to see `PeerHandler` that `hs-cluster` had just compiled.
+  Workaround used here: `touch` the crates' sources before every build, and `CARGO_INCREMENTAL=0`
+  so a rebuild does not need a new 900 MB incremental session directory on a disk that was full
+  (nothing under `target/` was deleted). The integration lead should know this when merging
+  concurrent branches that touch one crate.
+
+### Interfaces provided
+
+- `hs_user::cluster::{SessionCluster, RoomWake, WakeBatch, PeerPosition, RoomMirror}`;
+  `SessionHub::{install_cluster, owns_room, room, receive_wakes, settle_before_read, peer_consumed}`.
+- `hs_cluster::mesh::{PeerHandler, Forwarder::send_to_peer}`, `MeshDeps::peers`,
+  `POST /mesh/v1/peer`, `ShardMap::replicas`, `ForwardError::PeerUnreachable`.
+- `hs_cli::sync_cluster::{install, MeshSessionCluster, SessionPeerHandler, WAKE_ROUTE, POSITIONS_ROUTE}`;
+  `ClusterHandles::{origin, origin_generation, install_peer_handler}`.
+
+### Interfaces needed
+
+- From track 04: `RoomActor::catch_up` (RFC 0018), so a non-owner's mirror stops reloading
+  whole rooms.
+- From track 03 / the config owner: per-replica settings (`listeners`, `cluster.mesh.port`, the
+  advertise address) must not be seeded into the shared config store, or a restarted replica
+  takes on another's identity (details above under "Found on the way").
+- From track 03: `/join/{roomIdOrAlias}` (and `/createRoom`, already on its list) shard-gated.
+  Found while running: bob's `POST /join/{roomId}` on A for a room B owns was refused `503` by
+  A's fence -- the fence doing its job -- because that path has no `/rooms/` segment for the
+  gate to see. `POST /rooms/{roomId}/join` is gated and forwarded, and is what the scripts use.
+
+### Shared dependencies added
+
+None. `hs-user` gained no dependency; `hs-cli` uses `tokio::task::JoinSet` rather than adding
+`futures`.
+
+
 > **Integration note, 2026-09-19 (integration lead):** this file reports the encrypted loadgen
 > scenario failing at step 11 with an "ATOMICITY VIOLATION" in `/keys/claim`, attributed to track
 > 01's concurrent `hs-kv` work. **That diagnosis was wrong and there is no regression.** The
