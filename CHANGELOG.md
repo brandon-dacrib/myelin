@@ -401,6 +401,18 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Operations
 
+- **Replicas know their own address, speak mutual TLS to each other, and a room is created
+  by the replica that owns it.** A replica advertises the address it is configured with (the
+  chart gives each pod its stable DNS name under the headless Service, so one wildcard
+  certificate covers them all); the mesh between replicas is mutual TLS with a CA the
+  operator provides, and a replica presenting a certificate from any other CA is refused on
+  every call. Creating a room, joining or knocking by room id is routed to the shard's owner
+  first, so a room's first actor is never built on a replica that does not own it. Verified
+  2026-09-27 as three processes on one PostgreSQL with a private CA: rooms created through
+  one replica and forwarded to their owner, concurrent sends through two replicas, identical
+  history on both, and the third replica's foreign certificate refused. Not yet run as pods;
+  the chart's cluster templates have not been rendered on this side, and
+  `values-two-replica-experiment.yaml` is the values file for that run.
 - **A second replica is capacity, not only availability: `/sync` works from any replica.**
   A room's owner wakes every other replica over the mesh after each update, the replica
   holding the client's long-poll answers it, and a sync waits (within half a second) for

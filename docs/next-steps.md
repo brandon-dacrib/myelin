@@ -481,12 +481,28 @@ would do it; each ends in a transcript in `docs/status/12-platform-and-kubernete
   signing-key Secret, two replicas: Element signed in through the Service, a bridge registered,
   a room created and used from both replicas. The two-process experiment on one PostgreSQL
   (`docs/status/03-cluster.md`) proved the ownership gate; nothing has proved the mesh between
-  two *pods*. Known blockers, in order: `crate::cluster::advertise_host` falls back to the first
-  listener's bind address or `127.0.0.1`, so a pod must be told its own IP (the Downward API
-  `status.podIP` into a config field that does not exist yet); the mesh's mutual TLS is built
-  in `hs-cluster` and not wired from `hs-cli`; `/createRoom` is not shard-gated; the outbound
-  federation sender and the appservice pump are shard-gated in a unit test with scripted
-  ownership only. ~~And the one that matters most to a client: `/sync` is not cluster-aware.~~
+  two *pods*. ~~Known blockers, in order: `advertise_host` falls back to the bind address; the
+  mesh's mutual TLS is not wired from `hs-cli`; `/createRoom` is not shard-gated.~~ **All three
+  done 2026-09-27** (track 03, `docs/status/03-cluster.md`): `cluster.mesh.advertise_address`
+  (`HS__CLUSTER__MESH__ADVERTISE_ADDRESS`) names the address a replica advertises, and the
+  chart sets it per pod from the Downward API to the pod's stable DNS name under the headless
+  Service, so one wildcard certificate covers every pod; `cluster.mesh.tls` is certificate,
+  key, CA and an optional peer SAN suffix, mounted from a `kubernetes.io/tls` Secret; the
+  mesh runs mutual TLS and a replica whose certificate chains to another CA is refused on
+  every forward. `/createRoom`, `/join/{roomId}` and `/knock/{roomId}` are gated: the gate
+  pre-assigns the room id, forwards to the shard's owner over the mesh, and `hs-room`'s
+  handler builds the room under that id (RFC 0019; the `hs-room` line landed with the merge
+  and the two-process transcript predates it, so the gate's "minted its own room id" warning
+  in that transcript is expected to be gone on the next run). A clustered replica refuses to
+  start if the registry already holds a live row under its identity, which is the symptom of
+  inheriting another replica's address from the seeded database. Verified as three `hs
+  serve` processes on one PostgreSQL 16 with a private CA, real advertised names, forwarded
+  `/createRoom`, concurrent sends through both and identical `/messages` on both. Not done:
+  the chart's cluster templates were written without `helm` here and have not been rendered;
+  `deploy/helm/hs/values-two-replica-experiment.yaml` is the values file for the two-pod run
+  (laptop), with the exact commands for its four Secrets. The outbound federation sender and
+  the appservice pump are shard-gated in a unit test with scripted ownership only.
+  ~~And the one that matters most to a client: `/sync` is not cluster-aware.~~
   **Done 2026-09-27** (track 05, `docs/status/05-sync.md` session 7): a `/sync` may reach any
   replica. Only a room's owner feeds users; after each update it sends every other live
   replica a wake batch over a new mesh route (`POST /mesh/v1/peer`, `hs_user::cluster`,
@@ -829,7 +845,6 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | CI does not run the Playwright suite | `.github` | two of its tests failed for an unknown length of time before anybody noticed (fixed 2026-09-21) |
 | Receipts and presence in memory | `hs-user` | a restart forgets read state |
 | Postgres `tls`/`pool_size`/schema | `hs-kv`, `hs-cli` | encrypt in front of the database for now |
-| `/createRoom` not shard-gated | `hs-cli` | first actor may be built on a non-owner |
 | `e2e/configuration.spec.ts` failed once in 112 runs | `web` | unreproduced, and the machine was running Complement at the time; if it recurs, the error is the first thing to capture |
 | A bridge's per-user sign-in state is invisible to the admin API | `hs-admin`, bridges | the Sign in tab says how to sign in, not who has; the bridges keep that state themselves |
 | Overview counts media, failing destinations and reports as unknown | `hs-cli` | three dashes where numbers should be; the sources exist in `hs-media`, `hs-federation` and nowhere respectively |
@@ -839,9 +854,10 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | The release binaries job's web build has never run | `.github` | it only runs on a `v*` tag; the image path is verified, this one is not |
 | The `main` chart needs `--devel`, and a first tag hides it until Chart.yaml's version moves on | `.github`, `deploy/helm` | pre-releases sort below the release they precede; bump `version` in Chart.yaml right after tagging |
 | An install from a chart before 2026-09-26's label fix cannot be upgraded in place | `deploy/helm` | one `kubectl delete statefulset --cascade=orphan` before the next `helm upgrade`; only the demo existed |
-| A pod does not know its own mesh address | `hs-cli`, `hs-cluster` | `advertise_host` falls back to the bind address or `127.0.0.1`; cluster mode between two pods has not been tried |
+| Cluster mode between two pods has not been tried | `deploy/helm`, laptop | `deploy/helm/hs/values-two-replica-experiment.yaml` is the values file; the chart's cluster templates were written without `helm` available and have not been rendered |
+| A room alias in `/join/{alias}` is not shard-gated | `hs-cli` | the alias resolves inside the handler; ids in `/join/{roomId}`, `/knock/{roomId}` and `/rooms/{roomId}/...` are gated |
+| A v12 room's id cannot be pre-assigned | `hs-room` | the id derives from the create event's hash; RFC 0019 describes the retry the handler should do and it is not implemented |
 | Per-replica settings are seeded into the shared database | `hs-config`, `hs-cli` | the second replica to seed loses; `listeners` and `cluster.mesh.port` then apply to both on restart; `hs config unset /listeners/listeners` and `/cluster/mesh/port` is the workaround; cluster mode needs per-replica sections excluded from seeding |
-| `POST /join/{roomId}` on a non-owner replica is 503 | `hs-cli` | the fence gates on a `/rooms/` path segment; `/rooms/{roomId}/join` forwards correctly, `/join/{roomId}` does not |
 | A non-owner replica reloads a whole room per event to answer `/sync` | `hs-user`, `hs-room` | correct, and 25 ms for a small room; RFC 0018 asks `hs-room` for an incremental catch-up |
 | Typing, receipts and presence do not cross replicas | `hs-user` | each replica's memory; a user on replica B does not see typing from a user on A |
 | The operator has never run against an API server | `hs-operator` | the `Bridge` reconciler (claim, Deployment, Service, status) is unit-tested only; `Homeserver` reconciles to a status only; the chart is the only way to deploy the server |
