@@ -37,6 +37,9 @@ Last updated: 2026-09-27 (the bridge manager, below); before that 2026-09-25.
   offerings can only run `elsewhere`.
 - In `hs serve`: the manager ticks only on the replica that owns the global shard, is
   aborted at shutdown before the drain, and its router is merged into the client listener's.
+  Its registration (and the `@bridges` namespace) is made at every start; its bot accounts are
+  made with the first offering, not before -- CI caught the `bridges` account showing up in the
+  overview's user count on a server that offered nothing (2026-09-27).
 
 Verified: `cargo test -p hs-bridges` is **3 tests** (the manifest is a Secret and a `Bridge`;
 an instance row is inserted once and updated in place; backticks become code and HTML is

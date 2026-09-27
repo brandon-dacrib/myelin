@@ -237,7 +237,14 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                 })
                 .await?;
         }
-        if let Some(client) = self.client.get() {
+        // The bots are accounts, and an account an operator did not make has no business on a
+        // server that offers nothing: the Users page, and the overview's count, would show a
+        // `bridges` account from the first boot. They are created with the first offering
+        // (`put` re-syncs), and the namespace above is reserved from the start regardless.
+        let offered = !self.store.offerings().map_err(store_err)?.is_empty();
+        if let Some(client) = self.client.get()
+            && offered
+        {
             let names = std::iter::once((MANAGER_BOT, "Bridges".to_owned())).chain(
                 doors.iter().map(|(t, l)| {
                     (
