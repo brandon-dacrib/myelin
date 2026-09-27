@@ -426,14 +426,16 @@ jobs:
 
       - name: Lint and template before publishing anything
         # A server name is the one value the chart requires, so it is supplied to make rendering
-        # possible. Cluster mode is rendered too, with the signing-key Secret it insists on.
+        # possible. Cluster mode is rendered too, with the signing-key Secret and the mesh
+        # authentication it insists on.
         run: |
           set -euo pipefail
           helm lint deploy/helm/hs --set serverName=example.org
           helm template myelin deploy/helm/hs --set serverName=example.org > /dev/null
           helm template myelin deploy/helm/hs --set serverName=example.org --set mode=cluster \
             --set storage.backend=postgres --set storage.postgres.host=db --set media.storage.backend=s3 \
-            --set media.storage.s3.bucket=media --set secrets.signingKey.existingSecret=example > /dev/null
+            --set media.storage.s3.bucket=media --set secrets.signingKey.existingSecret=example \
+            --set cluster.mesh.tls.existingSecret=example-mesh > /dev/null
           # Bridges off renders no operator, no RBAC and no bridge environment on the server.
           if helm template myelin deploy/helm/hs --set serverName=example.org --set bridges.enabled=false \
               | grep -E 'bridges-operator|MYELIN_BRIDGES|hs\.matrix\.org'; then
