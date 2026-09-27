@@ -741,18 +741,17 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
         if let (Some(door_room), Some(door)) = (
             &row.front_door_room,
             bridge_types::front_door_localpart(&row.bridge_type),
-        ) {
-            if let Ok(tokens) = self.tokens() {
-                let text = format!(
-                    "Your {name} bridge is ready. I've invited you to a chat with {bot}: accept it and follow the steps there to sign in."
-                );
-                let html = format!(
-                    "Your {name} bridge is ready. I've invited you to a chat with <a href=\"https://matrix.to/#/{bot}\">{bot}</a>: accept it and follow the steps there to sign in."
-                );
-                let _ = client
-                    .notice(&tokens.as_token, &self.mxid(door), door_room, &text, &html)
-                    .await;
-            }
+        ) && let Ok(tokens) = self.tokens()
+        {
+            let text = format!(
+                "Your {name} bridge is ready. I've invited you to a chat with {bot}: accept it and follow the steps there to sign in."
+            );
+            let html = format!(
+                "Your {name} bridge is ready. I've invited you to a chat with <a href=\"https://matrix.to/#/{bot}\">{bot}</a>: accept it and follow the steps there to sign in."
+            );
+            let _ = client
+                .notice(&tokens.as_token, &self.mxid(door), door_room, &text, &html)
+                .await;
         }
         Ok(())
     }
