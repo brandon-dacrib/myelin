@@ -2805,6 +2805,7 @@ paths:
           type: string
           enum:
           - event
+          - room
           - user
       - name: status
         in: query
@@ -4122,12 +4123,26 @@ paths:
       security:
       - OAuth2:
         - admin:read
+      description: 'Counters (users.registered, media.uploaded, media.uploaded_bytes, reports.received) count what happened in each step, from the records'' own timestamps, with 0 for a quiet step. Gauges (the StatisticsOverview field names) are the Overview''s numbers sampled periodically by the server; a step with no sample has no point. from defaults to seven days before until, until to now; step (15m, 1h, 1d...) defaults to about a hundred points or fewer. At most 1000 points.'
       parameters:
       - name: metric
         in: query
         required: true
         schema:
           type: string
+          enum:
+          - users.registered
+          - media.uploaded
+          - media.uploaded_bytes
+          - reports.received
+          - users_count
+          - rooms_count
+          - daily_active_users
+          - monthly_active_users
+          - media_count
+          - media_bytes
+          - pending_reports_count
+          - federation_destinations_failing_count
       - name: from
         in: query
         schema:
@@ -4211,8 +4226,15 @@ paths:
         in: query
         schema:
           type: string
+          enum:
+          - scheduled
+          - running
+          - succeeded
+          - failed
+          - cancelled
       - name: action
         in: query
+        description: An action (media.purge_remote_cache), or a prefix ending in a dot (media.).
         schema:
           type: string
       responses:
@@ -6982,13 +7004,22 @@ components:
           format: date-time
     Report:
       type: object
+      description: A report filed through the client-server API (POST /rooms/{roomId}/report/{eventId}, POST /rooms/{roomId}/report, POST /users/{userId}/report). Resolving with no_action dismisses it; any other resolution resolves it. Either closes it for good.
+      required:
+      - id
+      - kind
+      - status
+      - reporter_id
+      - received_at
       properties:
         id:
           type: string
         kind:
           type: string
+          description: event (one event in a room), room (a whole room) or user.
           enum:
           - event
+          - room
           - user
         status:
           type: string
@@ -7038,6 +7069,34 @@ components:
           type:
           - string
           - 'null'
+        resolved_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        resolved_by:
+          type:
+          - string
+          - 'null'
+          description: The user id of whoever closed it.
+        event:
+          type:
+          - object
+          - 'null'
+          description: The reported event as this server now holds it (type, sender, origin_server_ts, content; redacted content shows redacted). Only on GET /reports/{id}, and only for an event report whose event this server has.
+          properties:
+            event_id:
+              type: string
+            type:
+              type: string
+            sender:
+              type: string
+            origin_server_ts:
+              type: integer
+            content:
+              type: object
+            redacted:
+              type: boolean
     ReportResolve:
       type: object
       required:

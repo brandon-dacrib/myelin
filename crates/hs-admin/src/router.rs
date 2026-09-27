@@ -93,6 +93,15 @@ pub struct AdminState {
     /// What the `bridge_deployments.*`, `bridge_offerings.*` and `bridge_instances.*` operations
     /// read and write (RFC 0017). `None` until wired with [`AdminState::with_bridge_offerings`].
     pub bridge_offerings: Option<Arc<dyn crate::bridge_offerings::BridgeOfferingSource>>,
+    /// What the `reports.*` operations read and close: the reports users filed through the
+    /// client-server API. `None` until wired with [`AdminState::with_reports`].
+    pub reports: Option<Arc<dyn crate::reports::ReportSource>>,
+    /// The registry long-running work reports into, which the `tasks.*` operations read and
+    /// cancel. `None` until wired with [`AdminState::with_tasks`].
+    pub tasks: Option<Arc<crate::tasks::TaskRegistry>>,
+    /// What `statistics.users_media` and `statistics.timeseries` read. `None` until wired with
+    /// [`AdminState::with_statistics`].
+    pub statistics: Option<Arc<dyn crate::statistics::StatisticsSource>>,
     /// The `Idempotency-Key` cache every mutating handler that declares it consults (see
     /// [`crate::idempotency`]). Always present (never `None`): a client is never told its
     /// idempotency key was ignored.
@@ -121,6 +130,9 @@ impl AdminState {
             appservices: None,
             federation: None,
             bridge_offerings: None,
+            reports: None,
+            tasks: None,
+            statistics: None,
             idempotency: Arc::new(IdempotencyStore::new()),
         }
     }
@@ -196,6 +208,33 @@ impl AdminState {
     #[must_use]
     pub fn with_recovery(mut self, recovery: Arc<dyn RecoverySource>) -> Self {
         self.recovery = Some(recovery);
+        self
+    }
+
+    /// Wires the reports users have filed, making the `reports.*` operations real.
+    #[must_use]
+    pub fn with_reports(mut self, reports: Arc<dyn crate::reports::ReportSource>) -> Self {
+        self.reports = Some(reports);
+        self
+    }
+
+    /// Wires the task registry, making the `tasks.*` operations real; its `task.changed`
+    /// events go out on this state's event bus.
+    #[must_use]
+    pub fn with_tasks(mut self, tasks: Arc<crate::tasks::TaskRegistry>) -> Self {
+        tasks.attach_events(self.events.clone());
+        self.tasks = Some(tasks);
+        self
+    }
+
+    /// Wires the statistics source, making `statistics.users_media` and
+    /// `statistics.timeseries` real (`statistics.rooms` reads the room directory).
+    #[must_use]
+    pub fn with_statistics(
+        mut self,
+        statistics: Arc<dyn crate::statistics::StatisticsSource>,
+    ) -> Self {
+        self.statistics = Some(statistics);
         self
     }
 
@@ -309,6 +348,16 @@ const REAL_HANDLERS: &[&str] = &[
     "audit_log.get",
     "audit_log.export",
     "events.stream",
+    "reports.list",
+    "reports.get",
+    "reports.delete",
+    "reports.resolve",
+    "tasks.list",
+    "tasks.get",
+    "tasks.cancel",
+    "statistics.rooms",
+    "statistics.users_media",
+    "statistics.timeseries",
 ];
 
 /// The `503 unavailable` problem a handler answers when its backing [`crate::sources`] trait
@@ -3171,6 +3220,14 @@ async fn appservice_action(
                             task.started_at = Some(task.created_at.clone());
                             task.finished_at = Some(task.created_at.clone());
                             task.result = Some(json!({ "replayed": replayed }));
+                            // Kept, so `GET /tasks/{id}` answers for the task this response
+                            // names. A registry that cannot store it does not undo the replay,
+                            // which has already happened.
+                            if let Some(tasks) = &state.tasks
+                                && let Err(error) = tasks.record_finished(task.clone()).await
+                            {
+                                tracing::warn!(%error, "could not record an appservice replay task");
+                            }
                             (
                                 202,
                                 serde_json::to_value(task).unwrap_or_default(),
@@ -4588,6 +4645,31 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         "audit_log.get" => builder.add(method, &full_path, audit_log_get, meta),
         "audit_log.export" => builder.add(method, &full_path, audit_log_export, meta),
         "events.stream" => builder.add(method, &full_path, events_stream, meta),
+        "reports.list" => builder.add(method, &full_path, crate::reports::reports_list, meta),
+        "reports.get" => builder.add(method, &full_path, crate::reports::reports_get, meta),
+        "reports.delete" => builder.add(method, &full_path, crate::reports::reports_delete, meta),
+        "reports.resolve" => builder.add(method, &full_path, crate::reports::reports_resolve, meta),
+        "tasks.list" => builder.add(method, &full_path, crate::tasks::tasks_list, meta),
+        "tasks.get" => builder.add(method, &full_path, crate::tasks::tasks_get, meta),
+        "tasks.cancel" => builder.add(method, &full_path, crate::tasks::tasks_cancel, meta),
+        "statistics.rooms" => builder.add(
+            method,
+            &full_path,
+            crate::statistics::statistics_rooms,
+            meta,
+        ),
+        "statistics.users_media" => builder.add(
+            method,
+            &full_path,
+            crate::statistics::statistics_users_media,
+            meta,
+        ),
+        "statistics.timeseries" => builder.add(
+            method,
+            &full_path,
+            crate::statistics::statistics_timeseries,
+            meta,
+        ),
         other => unreachable!(
             "{other} is listed in REAL_HANDLERS but register_real_operation doesn't know it"
         ),
