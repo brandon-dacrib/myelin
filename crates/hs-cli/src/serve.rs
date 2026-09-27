@@ -615,6 +615,7 @@ fn admin_state<B: KvBackend + 'static>(
     // The Bridges section: until this, all thirteen of its operations answered 503, and the
     // section worked against the mock server only.
     .with_appservices(sources.appservices)
+    .with_bridge_offerings(sources.bridge_offerings)
     // The Federation page and the Overview's last 501 panel.
     .with_federation(sources.federation)
     .with_server_info(hs_admin::model::ServerInfo {
@@ -643,6 +644,7 @@ fn admin_state<B: KvBackend + 'static>(
 /// the listeners are bound, and the overview is given the cluster's ownership view once the
 /// cluster has started.
 struct AdminSources {
+    bridge_offerings: Arc<dyn hs_admin::bridge_offerings::BridgeOfferingSource>,
     config: Option<Arc<dyn hs_admin::sources::ConfigSource>>,
     setup: Arc<hs_auth::setup::FirstRunSetup>,
     recovery: Arc<hs_auth::recovery::AdministratorRecovery>,
@@ -809,6 +811,7 @@ pub struct ServeHandle {
     /// it is on the handle so that is one decision made in one place, and so a test can follow
     /// the same link an operator would.
     pub setup_link: Option<String>,
+    bridge_manager: tokio::task::JoinHandle<()>,
     shutdown_tx: watch::Sender<bool>,
     join: tokio::task::JoinHandle<()>,
     /// Ends every `/sync` long-poll in flight (`hs_user::hub::SessionHub::begin_shutdown`), so
@@ -869,6 +872,7 @@ impl ServeHandle {
         // First, before the drain: a readiness probe that still passes during the drain keeps
         // the Service sending new requests here.
         self.withdraw_readiness();
+        self.bridge_manager.abort();
         let report = self.cluster.drain(CLUSTER_DRAIN_DEADLINE).await;
         if report.handed_off > 0 || report.released_unclaimed > 0 {
             tracing::info!(
@@ -1164,6 +1168,18 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     .await
     .map_err(|e| ServeError::Sessions(Box::new(e)))?;
 
+    let bridge_runtime = crate::bridges::runtime()
+        .await
+        .map_err(|e| ServeError::Sessions(std::io::Error::other(e).into()))?;
+    let bridge_manager = hs_bridges::manager::BridgeManager::new(
+        backend.clone(),
+        appservice_delivery.admin_directory(),
+        bridge_runtime,
+        server_name.as_str(),
+        config.server.public_baseurl.as_deref().unwrap_or(""),
+    )
+    .map_err(|e| ServeError::Sessions(Box::new(e)))?;
+
     let setup = Arc::new(hs_auth::setup::FirstRunSetup::from_auth_state(&auth_state));
     let recovery = Arc::new(hs_auth::recovery::AdministratorRecovery::new(
         &auth_state,
@@ -1195,6 +1211,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             server_name.as_str(),
             enabled_components,
             AdminSources {
+                bridge_offerings: bridge_manager.clone(),
                 config: options.config_source.clone(),
                 setup: setup.clone(),
                 recovery: recovery.clone(),
@@ -1247,6 +1264,8 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         well_known,
         &cluster_handles,
     );
+
+    let app = app.merge(hs_bridges::front_door::router(bridge_manager.clone()));
 
     // The mesh listener replays a forwarded request against this exact router (see
     // `crate::cluster::ClusterHandles::spawn_mesh`'s doc comment): a `None` in single-node mode,
@@ -1318,6 +1337,18 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     }
 
     let join = tokio::spawn(async move { while tasks.join_next().await.is_some() {} });
+    let mut loopback = addrs[0];
+    if loopback.ip().is_unspecified() {
+        loopback.set_ip(if loopback.is_ipv4() {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        });
+    }
+    let ownership = cluster.ownership().clone();
+    let bridge_manager = bridge_manager.start(&format!("http://{loopback}"), move || {
+        ownership.is_mine(hs_cluster::ShardId::GLOBAL)
+    });
 
     // Asked last, once the listeners are bound, because the link needs a port that is real. A
     // server that cannot work out whether to offer setup still serves: everything else about it
@@ -1335,6 +1366,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     };
 
     Ok(ServeHandle {
+        bridge_manager,
         addrs,
         setup_link,
         shutdown_tx,

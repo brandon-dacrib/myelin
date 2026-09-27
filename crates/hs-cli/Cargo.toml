@@ -32,6 +32,7 @@ hs-e2e = { path = "../hs-e2e" }
 hs-push = { path = "../hs-push" }
 hs-media = { path = "../hs-media" }
 hs-appservice = { path = "../hs-appservice" }
+hs-bridges = { path = "../hs-bridges" }
 hs-admin = { path = "../hs-admin" }
 hs-model = { path = "../hs-model" }
 # `hs operator`: the Bridge controller (docs/rfcs/0017).

@@ -13,6 +13,7 @@ pub mod audit;
 pub mod auth_manifest;
 pub mod backfill;
 pub mod bootstrap;
+pub mod bridges;
 pub mod capabilities;
 pub mod cli;
 pub mod cluster;

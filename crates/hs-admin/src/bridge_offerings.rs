@@ -10,7 +10,7 @@ use async_trait::async_trait;
 
 use crate::model::{
     BridgeDeploymentTarget, BridgeInstance, BridgeInstanceFiles, BridgeOffering,
-    BridgeOfferingAccess, BridgeOfferingOptions, BridgeOfferingRequest,
+    BridgeOfferingRequest,
 };
 use crate::sources::SourceError;
 

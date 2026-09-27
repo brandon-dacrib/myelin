@@ -124,22 +124,37 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
         }))
     }
 
-    /// Tells the manager where this server's client listener is, now that it is bound, and
-    /// starts it: registers its own appservice there, then runs the state machine until the
-    /// process ends.
-    pub fn start(self: &Arc<Self>, loopback: &str) {
+    /// Starts the manager against the bound client listener. Reconciliation runs only while
+    /// `is_owner` says this replica owns the global shard. Abort the returned task on shutdown.
+    pub fn start(
+        self: &Arc<Self>,
+        loopback: &str,
+        is_owner: impl Fn() -> bool + Send + 'static,
+    ) -> tokio::task::JoinHandle<()> {
         let _ = self.loopback.set(loopback.trim_end_matches('/').to_owned());
         let _ = self.client.set(MatrixClient::new(loopback));
         let manager = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = manager.sync_registration().await {
-                tracing::warn!(error = %e, "the bridge manager could not register its front doors");
-            }
+            let mut registered = false;
             loop {
-                manager.tick().await;
+                if is_owner() {
+                    if !registered {
+                        match manager.sync_registration().await {
+                            Ok(()) => registered = true,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "the bridge manager could not register its front doors")
+                            }
+                        }
+                    }
+                    if registered {
+                        manager.tick().await;
+                    }
+                } else {
+                    registered = false;
+                }
                 let _ = tokio::time::timeout(TICK, manager.wake.notified()).await;
             }
-        });
+        })
     }
 
     /// The manager's own tokens.
