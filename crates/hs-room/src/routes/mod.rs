@@ -13,6 +13,7 @@ pub mod query;
 pub mod redact;
 pub mod relations;
 pub mod render;
+pub mod report;
 pub mod send_state;
 pub mod threads;
 pub mod upgrade;
@@ -88,6 +89,22 @@ pub fn router<B: KvBackend + 'static>() -> (axum::Router<RoomState<B>>, RouteMan
             "/rooms/{roomId}/event/{eventId}",
             query::get_event::<B>,
             matrix_client("getOneRoomEvent"),
+        )
+        // Reporting (`report`): kept for the admin API's Reports inbox.
+        .post(
+            "/rooms/{roomId}/report/{eventId}",
+            report::post_report_event::<B>,
+            matrix_client("reportEvent"),
+        )
+        .post(
+            "/rooms/{roomId}/report",
+            report::post_report_room::<B>,
+            matrix_client("reportRoom"),
+        )
+        .post(
+            "/users/{userId}/report",
+            report::post_report_user::<B>,
+            matrix_client("reportUser"),
         )
         .get(
             "/rooms/{roomId}/context/{eventId}",

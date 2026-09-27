@@ -32,6 +32,23 @@ use crate::model::{AuditChange, Page, ResourceRef, Scope};
 use crate::router::AdminState;
 use crate::sources::SourceError;
 
+/// A new report id: a ULID that sorts after every id this process has handed out before, so
+/// "newest first" is key order even for two reports filed in the same millisecond (plain
+/// [`crate::model::new_id`] ULIDs are random within a millisecond).
+#[must_use]
+pub fn new_report_id() -> String {
+    static GENERATOR: std::sync::Mutex<Option<ulid::Generator>> = std::sync::Mutex::new(None);
+    let mut generator = GENERATOR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    generator
+        .get_or_insert_with(ulid::Generator::new)
+        .generate()
+        // Only fails when 2^80 ids were made in one millisecond; a fresh random one is fine then.
+        .unwrap_or_else(|_| ulid::Ulid::new())
+        .to_string()
+}
+
 /// What a report is about. `room` is a report about a whole room rather than one event in it
 /// (`POST /rooms/{roomId}/report`, client-server API v1.13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

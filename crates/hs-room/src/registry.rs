@@ -124,6 +124,8 @@ pub struct RoomRegistry<B: KvBackend> {
     /// loads runs with no cluster-fencing check at all -- `RoomActor::persist` behaves exactly as
     /// it did before this hook existed.
     fencing: OnceLock<Arc<crate::fencing::RoomFencing<B>>>,
+    /// Reports users have filed about events, rooms and other users (`crate::reports`).
+    reports: crate::reports::ReportStore<B>,
 }
 
 impl<B: KvBackend + 'static> RoomRegistry<B> {
@@ -133,6 +135,7 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     /// Returns [`hs_kv::KvError`] if opening the shared keyspaces fails.
     pub fn open(backend: B, identity: HomeserverIdentity) -> Result<Self, hs_kv::KvError> {
         let tables = Tables::open(&backend)?;
+        let reports = crate::reports::ReportStore::open(backend.clone())?;
         // Sized to absorb a burst from many rooms at once without stalling any room actor: a
         // `broadcast` send never blocks, it drops the oldest item and reports `Lagged` to the
         // slow receiver, which the consumer must handle (`hs_user::hub`'s watcher does).
@@ -154,7 +157,15 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             global_token_resolver: OnceLock::new(),
             backfill: OnceLock::new(),
             fencing: OnceLock::new(),
+            reports,
         })
+    }
+
+    /// The reports users have filed (`crate::routes::report` writes them, the admin API reads
+    /// them through [`crate::reports::RoomReports`]).
+    #[must_use]
+    pub fn reports(&self) -> &crate::reports::ReportStore<B> {
+        &self.reports
     }
 
     /// Installs the [`GlobalTokenResolver`] this registry's `GET /messages` handler consults for
