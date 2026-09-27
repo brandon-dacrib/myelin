@@ -236,6 +236,49 @@ server:
     }
 
     #[test]
+    fn env_override_sets_the_mesh_advertise_address_and_tls_paths() {
+        // What the chart does per pod: the pod's own DNS name from the Downward API, and the
+        // mounted mesh certificate's paths, all through the environment. `cluster.mesh.tls` is
+        // entirely absent from MINIMAL, so this also checks that an override can bring a whole
+        // optional sub-object into being as long as it names every required field.
+        let cfg = Config::from_yaml_with_env(
+            MINIMAL,
+            [
+                ("HS__CLUSTER__SINGLE_NODE".to_string(), "false".to_string()),
+                (
+                    "HS__CLUSTER__MESH__ADVERTISE_ADDRESS".to_string(),
+                    "hs-0.hs-headless.matrix.svc.cluster.local".to_string(),
+                ),
+                (
+                    "HS__CLUSTER__MESH__TLS__CERTIFICATE_PATH".to_string(),
+                    "/etc/hs/secrets/mesh-tls/tls.crt".to_string(),
+                ),
+                (
+                    "HS__CLUSTER__MESH__TLS__PRIVATE_KEY_PATH".to_string(),
+                    "/etc/hs/secrets/mesh-tls/tls.key".to_string(),
+                ),
+                (
+                    "HS__CLUSTER__MESH__TLS__CA_CERTIFICATE_PATH".to_string(),
+                    "/etc/hs/secrets/mesh-tls/ca.crt".to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+        assert!(!cfg.cluster.single_node);
+        assert_eq!(
+            cfg.cluster.mesh.advertise_address.as_deref(),
+            Some("hs-0.hs-headless.matrix.svc.cluster.local")
+        );
+        let tls = cfg.cluster.mesh.tls.as_ref().expect("tls from env");
+        assert_eq!(
+            tls.ca_certificate_path,
+            std::path::PathBuf::from("/etc/hs/secrets/mesh-tls/ca.crt")
+        );
+        assert_eq!(tls.peer_san_suffix, None);
+        assert_eq!(cfg.cluster.mesh.port, 8449, "sibling defaults still apply");
+    }
+
+    #[test]
     fn env_override_sets_a_field_nested_under_an_absent_section() {
         // `federation` is entirely absent from MINIMAL, and every
         // `FederationConfig` field has its own `serde(default = ...)`, so
