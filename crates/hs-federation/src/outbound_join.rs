@@ -693,6 +693,7 @@ mod tests {
             ancestor_fetcher: None,
             backfill_limits: crate::backfill::BackfillLimits::default(),
             sender: None,
+            edu_sink: None,
         };
         let ctx = Arc::new(XMatrixContext {
             own_server_name: server_name.clone(),

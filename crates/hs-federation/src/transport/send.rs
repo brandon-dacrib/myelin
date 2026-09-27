@@ -50,6 +50,7 @@ async fn send(
         state.transactions.as_ref(),
         state.ancestor_fetcher.as_deref(),
         &state.backfill_limits,
+        state.edu_sink.as_deref(),
     )
     .await
     {
@@ -120,6 +121,7 @@ mod tests {
             ancestor_fetcher: None,
             backfill_limits: crate::backfill::BackfillLimits::default(),
             sender: None,
+            edu_sink: None,
         }
     }
 

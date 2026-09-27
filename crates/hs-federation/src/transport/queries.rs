@@ -24,6 +24,22 @@ pub trait FederationQuerySource: Send + Sync {
     /// Resolves an OpenID access token (from `/openid/userinfo`) to the local Matrix user ID it
     /// belongs to.
     async fn openid_userinfo(&self, access_token: &str) -> Option<String>;
+
+    /// Answers `POST /user/keys/query` for `origin`: `device_keys` is the request's field of the
+    /// same name (`{user_id: [device_id, ...]}`, an empty list meaning every device). The
+    /// response carries `device_keys`, `master_keys` and `self_signing_keys` for this server's
+    /// own users only. `None` (the default) means this source cannot answer, which the route
+    /// reports as `M_UNRECOGNIZED`.
+    async fn keys_query(&self, _origin: &str, _device_keys: &Value) -> Option<Value> {
+        None
+    }
+
+    /// Answers `POST /user/keys/claim` for `origin`: `one_time_keys` is the request's field of
+    /// the same name (`{user_id: {device_id: algorithm}}`), each claimed atomically. `None` (the
+    /// default) means this source cannot answer.
+    async fn keys_claim(&self, _origin: &str, _one_time_keys: &Value) -> Option<Value> {
+        None
+    }
 }
 
 /// An in-memory [`FederationQuerySource`] for this crate's own handler tests.

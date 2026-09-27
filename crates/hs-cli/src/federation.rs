@@ -1028,6 +1028,7 @@ pub fn build_mount<B: KvBackend + 'static>(
         ancestor_fetcher: Some(client.clone() as Arc<dyn hs_federation::backfill::AncestorFetcher>),
         backfill_limits: hs_federation::backfill::BackfillLimits::default(),
         sender: Some(sender.clone() as Arc<dyn hs_federation::sender::OutboundPduSink>),
+        edu_sink: None,
     };
 
     let x_matrix = Arc::new(hs_federation::xmatrix::XMatrixContext {
@@ -1192,6 +1193,7 @@ pub fn manifest_only_mount() -> (
         ancestor_fetcher: None,
         backfill_limits: hs_federation::backfill::BackfillLimits::default(),
         sender: None,
+        edu_sink: None,
     };
     let key_cache: Arc<hs_federation::keys::DynRemoteKeyCache> =
         Arc::new(hs_federation::keys::RemoteKeyCache::new(

@@ -16,6 +16,7 @@
 //! "not implemented" error — nothing else.
 
 mod join;
+mod keys;
 mod queries;
 mod read_routes;
 mod seams;
@@ -60,6 +61,9 @@ pub struct FederationState {
     /// nothing is forwarded (the manifest-only mount, and every handler test that does not care).
     /// See `crate::sender`.
     pub sender: Option<Arc<dyn crate::sender::OutboundPduSink>>,
+    /// Where `/send`'s EDUs go once validated (`crate::edu::InboundEduSink`). `None` drops them,
+    /// which is what every handler test that does not care about EDUs wants.
+    pub edu_sink: Option<Arc<dyn crate::edu::InboundEduSink>>,
 }
 
 fn matrix_federation(operation_id: &str) -> RouteMeta {
@@ -87,6 +91,7 @@ pub fn router(
     let builder = seams::add_routes(builder);
     let builder = send::add_routes(builder);
     let builder = join::add_routes(builder);
+    let builder = keys::add_routes(builder);
     let (merged, manifest) = builder.build();
 
     (apply_x_matrix_layer(merged, state, x_matrix_ctx), manifest)
@@ -170,6 +175,7 @@ mod tests {
             ancestor_fetcher: None,
             backfill_limits: crate::backfill::BackfillLimits::default(),
             sender: None,
+            edu_sink: None,
         }
     }
 

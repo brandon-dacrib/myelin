@@ -61,11 +61,20 @@
 //! per destination, so a whole outage is caught up from the room's own history) is the
 //! behavioural reference for closing that, and is the next step, not this one.
 //!
-//! **Only PDUs.** EDUs -- typing, presence, receipts, device-list updates, to-device messages,
-//! signing-key updates -- are not sent. There is no `enqueue_edu`: adding one would have cost a
-//! second queue with different batching and coalescing rules (typing notices supersede each
-//! other; to-device messages must not be dropped), and an entry point that silently discarded
-//! its argument would be worse than none.
+//! # EDUs
+//!
+//! [`FederationSender::enqueue_edu`] queues an EDU (typing, receipts, presence, device-list
+//! updates) for each destination alongside its PDUs: every transaction carries up to
+//! [`MAX_EDUS_PER_TRANSACTION`] of them (the spec's limit, and Synapse's), with whatever PDUs are
+//! waiting, and a destination with only EDUs waiting gets a transaction of only EDUs. Unlike PDUs
+//! they are **in memory only** -- an EDU describes a moment, and one delivered after a restart
+//! would mostly describe a moment that has passed -- and each destination keeps at most
+//! [`MAX_QUEUED_EDUS_PER_DESTINATION`], dropping the oldest, so a destination that is down for a
+//! day does not hold a day of typing notices. An EDU queued with a coalescing key replaces the
+//! unsent one with the same key (a typing or presence update supersedes the previous one). An
+//! EDU for a destination another replica sends for is dropped, not stored: the replica that owns
+//! it has its own users' EDUs to send, and this one's are not worth a shared table.
+//! To-device messages, which must not be dropped, are not sent this way.
 //!
 //! **Only `/send`.** Invites (`PUT /invite`), leaves and knocks against a remote resident
 //! (`make_leave`/`send_leave`, `make_knock`/`send_knock`) are separate handshakes, not
@@ -96,7 +105,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::client::{ClientError, FederationClient};
-use crate::inbound::MAX_PDUS_PER_TRANSACTION;
+use crate::inbound::{MAX_EDUS_PER_TRANSACTION, MAX_PDUS_PER_TRANSACTION};
 use crate::outbound_store::{
     InMemoryOutboundStore, OutboundDestinationState, OutboundStore, OutboundStoreError,
 };
@@ -111,6 +120,10 @@ pub trait OutboundPduSink: Send + Sync {
     /// that owns its queue, and logged there.
     fn enqueue_pdu(&self, destinations: Vec<String>, pdu: Value);
 }
+
+/// The most EDUs a destination's queue holds; past it the oldest is dropped. See the module
+/// docs' "EDUs".
+pub const MAX_QUEUED_EDUS_PER_DESTINATION: usize = 5_000;
 
 /// How a destination's worker waits between failed attempts at one transaction. See the module
 /// docs for which failures this applies to and which are governed by the destination store
@@ -207,14 +220,60 @@ struct Shared {
 struct DestinationQueue {
     tx: mpsc::UnboundedSender<Queued>,
     pending: Arc<AtomicUsize>,
+    edus: Arc<EduQueue>,
     worker: tokio::task::AbortHandle,
 }
 
-/// A PDU on its way through a destination's channel, with the sequence number the store gave
-/// it (what lets the worker tell a copy of something it already sent from the store).
-struct Queued {
-    seq: u64,
-    pdu: Arc<Value>,
+/// What a destination's channel carries.
+enum Queued {
+    /// A PDU, with the sequence number the store gave it (what lets the worker tell a copy of
+    /// something it already sent from the store).
+    Pdu { seq: u64, pdu: Arc<Value> },
+    /// "There are EDUs in the queue": the doorbell for an idle worker. The EDUs themselves are
+    /// in [`EduQueue`], where a newer one can replace an older one before either is sent.
+    Edus,
+}
+
+/// One destination's unsent EDUs, oldest first, each with its coalescing key.
+#[derive(Default)]
+struct EduQueue {
+    queue: Mutex<std::collections::VecDeque<(Option<String>, Arc<Value>)>>,
+}
+
+impl EduQueue {
+    /// Adds `edu`, replacing an unsent one with the same key, and dropping the oldest past
+    /// [`MAX_QUEUED_EDUS_PER_DESTINATION`]. Returns how many were dropped that way (0 or 1).
+    fn push(&self, key: Option<String>, edu: Arc<Value>) -> usize {
+        let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(key) = &key
+            && let Some(position) = queue
+                .iter()
+                .position(|(existing, _)| existing.as_ref() == Some(key))
+        {
+            queue.remove(position);
+        }
+        queue.push_back((key, edu));
+        let mut dropped = 0;
+        while queue.len() > MAX_QUEUED_EDUS_PER_DESTINATION {
+            queue.pop_front();
+            dropped += 1;
+        }
+        dropped
+    }
+
+    /// Takes up to [`MAX_EDUS_PER_TRANSACTION`] of the oldest.
+    fn take(&self) -> Vec<Arc<Value>> {
+        let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        let n = queue.len().min(MAX_EDUS_PER_TRANSACTION);
+        queue.drain(..n).map(|(_, edu)| edu).collect()
+    }
+
+    fn len(&self) -> usize {
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
 }
 
 /// What a failed attempt asks the worker to do before the next one.
@@ -449,7 +508,7 @@ impl FederationSender {
             };
             queue.pending.fetch_add(1, Ordering::AcqRel);
             self.shared.pending_total.fetch_add(1, Ordering::AcqRel);
-            let queued = Queued {
+            let queued = Queued::Pdu {
                 seq,
                 pdu: pdu.clone(),
             };
@@ -465,6 +524,90 @@ impl FederationSender {
                 );
             }
         }
+    }
+
+    /// Queues an EDU (`{"edu_type": edu_type, "content": content}`) for each server in
+    /// `destinations` (deduplicated; this server's own name is always skipped), to go out with
+    /// the next transaction to each. With a `coalesce_key`, it replaces an unsent EDU with the same
+    /// key for the same destination. In memory only; see the module docs' "EDUs" for what is kept,
+    /// what is dropped, and why. Like [`FederationSender::enqueue_pdu`] it must be called from
+    /// within a Tokio runtime and is a no-op after [`FederationSender::shutdown`].
+    pub fn enqueue_edu(
+        &self,
+        destinations: impl IntoIterator<Item = String>,
+        edu_type: &str,
+        content: Value,
+        coalesce_key: Option<String>,
+    ) {
+        if self.shared.shut_down.load(Ordering::Acquire) {
+            tracing::debug!(
+                edu_type,
+                "outbound federation sender is shut down; dropping an EDU"
+            );
+            return;
+        }
+        let edu = Arc::new(serde_json::json!({"edu_type": edu_type, "content": content}));
+        let mut seen = HashSet::new();
+        let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+        for destination in destinations {
+            if destination.is_empty()
+                || destination == self.shared.own_server_name
+                || !seen.insert(destination.clone())
+            {
+                continue;
+            }
+            if !queues.contains_key(&destination) {
+                if !self.shared.sends_here(&destination) {
+                    tracing::debug!(
+                        destination,
+                        edu_type,
+                        "dropping an EDU for a destination another replica sends for"
+                    );
+                    continue;
+                }
+                let backlog = match self.shared.store.queue_len(&destination) {
+                    Ok(count) => count,
+                    Err(error) => {
+                        tracing::error!(destination, %error, "cannot read the outbound queue");
+                        0
+                    }
+                };
+                match spawn_worker(&self.shared, &destination, backlog) {
+                    Some(queue) => {
+                        queues.insert(destination.clone(), queue);
+                    }
+                    None => continue,
+                }
+            }
+            let Some(queue) = queues.get(&destination) else {
+                continue;
+            };
+            let dropped = queue.edus.push(coalesce_key.clone(), edu.clone());
+            if dropped > 0 {
+                tracing::warn!(
+                    destination,
+                    dropped,
+                    "a destination's EDU queue is full; dropped the oldest"
+                );
+            }
+            if queue.tx.send(Queued::Edus).is_err() {
+                tracing::debug!(
+                    destination,
+                    "outbound federation worker is gone; EDU not sent"
+                );
+            }
+        }
+    }
+
+    /// EDUs queued for `destination` and not yet in a transaction it accepted. Zero for a
+    /// destination nothing has been queued for.
+    #[must_use]
+    pub fn pending_edus_for(&self, destination: &str) -> usize {
+        self.queues
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(destination)
+            .map_or(0, |queue| queue.edus.len())
     }
 
     /// PDUs queued and not yet accepted by (or dropped for) their destination, summed over every
@@ -599,18 +742,21 @@ fn spawn_worker(
     };
     let (tx, rx) = mpsc::unbounded_channel();
     let pending = Arc::new(AtomicUsize::new(backlog));
+    let edus = Arc::new(EduQueue::default());
     shared.pending_total.fetch_add(backlog, Ordering::AcqRel);
     let worker = runtime
         .spawn(run_worker(
             shared.clone(),
             destination.to_owned(),
             pending.clone(),
+            edus.clone(),
             rx,
         ))
         .abort_handle();
     Some(DestinationQueue {
         tx,
         pending,
+        edus,
         worker,
     })
 }
@@ -624,6 +770,7 @@ async fn run_worker(
     shared: Arc<Shared>,
     destination: String,
     pending: Arc<AtomicUsize>,
+    edus: Arc<EduQueue>,
     mut rx: mpsc::UnboundedReceiver<Queued>,
 ) {
     // Everything with a sequence number up to here has left the store; a channel copy of it is
@@ -648,7 +795,7 @@ async fn run_worker(
             };
             let through = last.seq;
             let pdus: Vec<Arc<Value>> = batch.into_iter().map(|row| Arc::new(row.pdu)).collect();
-            if let Delivery::ShutDown = shared.send_batch(&destination, &pdus).await {
+            if let Delivery::ShutDown = shared.send_batch(&destination, &pdus, &edus.take()).await {
                 return;
             }
             shared.settle(&destination, through, pdus.len(), &pending);
@@ -656,6 +803,15 @@ async fn run_worker(
         }
         // Then the channel, until it closes or has been quiet for a rescan interval.
         loop {
+            // EDUs left over from a full transaction, or queued while one was being sent (their
+            // doorbells may already have been consumed), go out before waiting for anything.
+            if edus.len() > 0 {
+                if let Delivery::ShutDown = shared.send_batch(&destination, &[], &edus.take()).await
+                {
+                    return;
+                }
+                continue;
+            }
             let first = match shared.config.store_rescan_interval {
                 None => rx.recv().await,
                 Some(interval) => match tokio::time::timeout(interval, rx.recv()).await {
@@ -666,24 +822,34 @@ async fn run_worker(
             let Some(first) = first else {
                 return;
             };
-            if first.seq <= acked_through {
+            // PDUs from the channel, up to a transaction's worth, skipping any already sent
+            // from the store; EDU doorbells need nothing here (the queue is read below).
+            let mut batch: Vec<(u64, Arc<Value>)> = Vec::new();
+            let mut next = Some(first);
+            while let Some(queued) = next.take() {
+                if let Queued::Pdu { seq, pdu } = queued
+                    && seq > acked_through
+                {
+                    batch.push((seq, pdu));
+                }
+                if batch.len() >= MAX_PDUS_PER_TRANSACTION {
+                    break;
+                }
+                next = rx.try_recv().ok();
+            }
+            let edu_batch = edus.take();
+            if batch.is_empty() && edu_batch.is_empty() {
                 continue;
             }
-            let mut batch = vec![first];
-            while batch.len() < MAX_PDUS_PER_TRANSACTION {
-                match rx.try_recv() {
-                    Ok(queued) if queued.seq <= acked_through => {}
-                    Ok(queued) => batch.push(queued),
-                    Err(_) => break,
-                }
-            }
-            let through = batch.last().map_or(acked_through, |queued| queued.seq);
-            let pdus: Vec<Arc<Value>> = batch.into_iter().map(|queued| queued.pdu).collect();
-            if let Delivery::ShutDown = shared.send_batch(&destination, &pdus).await {
+            let through = batch.last().map_or(acked_through, |(seq, _)| *seq);
+            let pdus: Vec<Arc<Value>> = batch.into_iter().map(|(_, pdu)| pdu).collect();
+            if let Delivery::ShutDown = shared.send_batch(&destination, &pdus, &edu_batch).await {
                 return;
             }
-            shared.settle(&destination, through, pdus.len(), &pending);
-            acked_through = through;
+            if !pdus.is_empty() {
+                shared.settle(&destination, through, pdus.len(), &pending);
+                acked_through = through;
+            }
         }
     }
 }
@@ -712,9 +878,14 @@ impl Shared {
     }
 
     /// One transaction, as a new transaction ID, until it is delivered or dropped.
-    async fn send_batch(&self, destination: &str, pdus: &[Arc<Value>]) -> Delivery {
+    async fn send_batch(
+        &self,
+        destination: &str,
+        pdus: &[Arc<Value>],
+        edus: &[Arc<Value>],
+    ) -> Delivery {
         let txn_id = self.next_txn_id();
-        self.deliver(destination, &txn_id, pdus).await
+        self.deliver(destination, &txn_id, pdus, edus).await
     }
 
     /// Takes a delivered (or dropped) batch out of the store and the pending counts.
@@ -791,13 +962,19 @@ impl Shared {
 
     /// Sends one transaction until the destination accepts it, this server's own policy refuses
     /// it, or the sender is shut down. See the module docs for the retry rules.
-    async fn deliver(&self, destination: &str, txn_id: &str, pdus: &[Arc<Value>]) -> Delivery {
+    async fn deliver(
+        &self,
+        destination: &str,
+        txn_id: &str,
+        pdus: &[Arc<Value>],
+        edus: &[Arc<Value>],
+    ) -> Delivery {
         let path = format!("/_matrix/federation/v1/send/{txn_id}");
         let body = serde_json::json!({
             "origin": self.own_server_name,
             "origin_server_ts": now_ms(),
             "pdus": pdus.iter().map(|pdu| (**pdu).clone()).collect::<Vec<Value>>(),
-            "edus": [],
+            "edus": edus.iter().map(|edu| (**edu).clone()).collect::<Vec<Value>>(),
         });
         // Where a previous run left this destination: its run of failures carries on from
         // there, and what is left of its wait is waited out first.
@@ -832,6 +1009,7 @@ impl Shared {
                         destination,
                         txn_id,
                         pdus = pdus.len(),
+                        edus = edus.len(),
                         "federation transaction accepted"
                     );
                     if let Err(error) = self.store.record_success(destination) {
@@ -1668,5 +1846,127 @@ mod tests {
             0,
             "never counted here, never negative"
         );
+    }
+
+    // ---- EDUs ----
+
+    fn typing(i: usize) -> Value {
+        serde_json::json!({"room_id": "!r:example.org", "user_id": format!("@u{i}:example.org"), "typing": true})
+    }
+
+    /// An EDU goes out in the same transaction as the PDUs waiting with it, in the spec's
+    /// `{edu_type, content}` shape; one queued on its own gets a transaction of its own.
+    #[tokio::test]
+    async fn an_edu_rides_with_waiting_pdus_and_goes_alone_when_nothing_waits() {
+        let peer = FakeFederationPeer::new("peer.example.org");
+        let (destination, _auth) = spawn_peer(&peer).await;
+        let sender = FederationSender::with_config(client(), US, fast());
+
+        // Nothing has yielded to the worker between these two, so it finds both.
+        sender.enqueue_pdu([destination.clone()], pdu(0));
+        sender.enqueue_edu([destination.clone()], "m.typing", typing(0), None);
+        assert_eq!(sender.pending_edus_for(&destination), 1);
+        assert!(wait_for(Duration::from_secs(10), || peer.request_count() >= 1).await);
+        assert!(
+            wait_for(Duration::from_secs(10), || sender
+                .pending_edus_for(&destination)
+                == 0)
+            .await
+        );
+
+        sender.enqueue_edu(
+            [destination.clone(), US.to_owned()],
+            "m.presence",
+            serde_json::json!({"push": []}),
+            None,
+        );
+        assert!(wait_for(Duration::from_secs(10), || peer.request_count() >= 2).await);
+
+        let requests = peer.requests();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert_eq!(requests[0].body["pdus"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            requests[0].body["edus"],
+            serde_json::json!([{"edu_type": "m.typing", "content": typing(0)}])
+        );
+        assert_eq!(requests[1].body["pdus"], serde_json::json!([]));
+        assert_eq!(
+            requests[1].body["edus"],
+            serde_json::json!([{"edu_type": "m.presence", "content": {"push": []}}])
+        );
+        assert_ne!(
+            requests[0].path, requests[1].path,
+            "each is its own transaction"
+        );
+    }
+
+    /// At most a hundred EDUs to a transaction, in the order queued; a newer EDU with the same
+    /// coalescing key replaces the unsent one rather than following it.
+    #[tokio::test]
+    async fn edus_are_capped_per_transaction_and_a_newer_one_replaces_its_unsent_key() {
+        let peer = FakeFederationPeer::new("peer.example.org");
+        let (destination, _auth) = spawn_peer(&peer).await;
+        let sender = FederationSender::with_config(client(), US, fast());
+
+        sender.enqueue_edu(
+            [destination.clone()],
+            "m.typing",
+            serde_json::json!({"stale": true}),
+            Some("typing alice".to_owned()),
+        );
+        for i in 0..149 {
+            sender.enqueue_edu(
+                [destination.clone()],
+                "m.typing",
+                typing(i),
+                Some(format!("k{i}")),
+            );
+        }
+        sender.enqueue_edu(
+            [destination.clone()],
+            "m.typing",
+            serde_json::json!({"stale": false}),
+            Some("typing alice".to_owned()),
+        );
+        assert_eq!(sender.pending_edus_for(&destination), 150);
+        assert!(wait_for(Duration::from_secs(10), || peer.request_count() >= 2).await);
+        assert!(
+            wait_for(Duration::from_secs(10), || sender
+                .pending_edus_for(&destination)
+                == 0)
+            .await
+        );
+
+        let requests = peer.requests();
+        let sizes: Vec<usize> = requests
+            .iter()
+            .map(|r| r.body["edus"].as_array().unwrap().len())
+            .collect();
+        assert_eq!(sizes, vec![100, 50]);
+        let contents: Vec<Value> = requests
+            .iter()
+            .flat_map(|r| r.body["edus"].as_array().unwrap().clone())
+            .map(|edu| edu["content"].clone())
+            .collect();
+        assert_eq!(contents[0], typing(0), "order is kept");
+        assert_eq!(contents[149], serde_json::json!({"stale": false}));
+        assert!(!contents.contains(&serde_json::json!({"stale": true})));
+    }
+
+    /// An EDU for a destination another replica sends for is not sent from here, and -- unlike
+    /// a PDU -- not stored for that replica either.
+    #[tokio::test]
+    async fn an_edu_for_a_destination_another_replica_sends_for_is_dropped() {
+        let peer = FakeFederationPeer::new("peer.example.org");
+        let (destination, _auth) = spawn_peer(&peer).await;
+        let store: Arc<dyn OutboundStore> = Arc::new(InMemoryOutboundStore::new());
+        let sender = FederationSender::with_store(client(), US, fast(), store.clone());
+        sender.set_gate(Arc::new(Only(Mutex::new(HashSet::new()))));
+
+        sender.enqueue_edu([destination.clone()], "m.typing", typing(0), None);
+        assert_eq!(sender.pending_edus_for(&destination), 0);
+        assert!(store.queued().unwrap().is_empty());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(peer.requests().is_empty());
     }
 }

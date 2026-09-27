@@ -7,9 +7,8 @@
 //! dangerous than an honest "not implemented", because a peer (or a future contributor) could
 //! mistake it for working.
 //!
-//! `user/keys/claim` and `user/keys/query` are explicitly joint-owned with track 08 (E2EE, not
-//! yet started); they are mounted here as seams like everything else in this module until that
-//! track defines the real contract. The media endpoints and the two `_synapse/client/*` compat
+//! `user/keys/claim` and `user/keys/query` are real now (`crate::transport::keys`). The media
+//! endpoints and the two `_synapse/client/*` compat
 //! entries from `docs/synapse-inventory.md` are deliberately **not** mounted here at all (media is
 //! track 09's; the `_synapse/client/*` pair is client-prefixed compat surface, not
 //! server-to-server).
@@ -82,18 +81,6 @@ pub(super) fn add_routes(builder: Builder<FederationState>) -> Builder<Federatio
         Method::PUT,
         "/3pid/onbind",
         "federationThreepidOnbind"
-    );
-    builder = seam!(
-        builder,
-        Method::POST,
-        "/user/keys/claim",
-        "federationUserKeysClaim"
-    );
-    builder = seam!(
-        builder,
-        Method::POST,
-        "/user/keys/query",
-        "federationUserKeysQuery"
     );
     builder = seam!(
         builder,
@@ -178,6 +165,7 @@ mod tests {
             ancestor_fetcher: None,
             backfill_limits: crate::backfill::BackfillLimits::default(),
             sender: None,
+            edu_sink: None,
         }
     }
 
