@@ -110,6 +110,7 @@ impl Harness {
             SenderConfig {
                 initial_backoff: Duration::from_millis(100),
                 max_backoff: Duration::from_secs(1),
+                ..SenderConfig::default()
             },
         ));
         Self {

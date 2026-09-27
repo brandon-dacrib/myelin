@@ -58,9 +58,11 @@ pub struct OutboundFederation {
 }
 
 impl OutboundFederation {
-    /// Subscribes to `rooms`' update stream and starts following it. Subscribe-then-return, so a
-    /// caller that starts this before binding any listener is guaranteed to see every event a
-    /// client sends afterwards; updates published before this call are not replayed.
+    /// Subscribes to `rooms`' update stream and starts following it, and resumes whatever the
+    /// sender's store still holds from a previous run (`FederationSender::resume`: every
+    /// destination with a queue gets its worker back, oldest PDU first). Subscribe-then-return,
+    /// so a caller that starts this before binding any listener is guaranteed to see every
+    /// event a client sends afterwards; updates published before this call are not replayed.
     #[must_use]
     pub fn start<B: KvBackend + 'static>(
         rooms: Arc<RoomRegistry<B>>,
@@ -68,6 +70,18 @@ impl OutboundFederation {
         own_server_name: OwnedServerName,
     ) -> Self {
         let updates = rooms.subscribe_global();
+        match sender.resume() {
+            Ok(0) => {}
+            Ok(pdus) => tracing::info!(
+                pdus,
+                "resumed outbound federation queues left by a previous run"
+            ),
+            Err(error) => tracing::error!(
+                %error,
+                "could not read the outbound federation queues left by a previous run; what \
+                 they hold will go out only once something new is queued for the same server"
+            ),
+        }
         let task =
             tokio::spawn(follow(rooms, sender.clone(), own_server_name, updates)).abort_handle();
         Self { task, sender }
@@ -79,8 +93,8 @@ impl OutboundFederation {
         &self.sender
     }
 
-    /// Stops following rooms and shuts the sender down. Whatever is still queued is lost, and
-    /// the sender logs how much.
+    /// Stops following rooms and shuts the sender down. Whatever is still queued stays in the
+    /// sender's store for the next start, and the sender logs how much.
     pub fn stop(&self) {
         self.task.abort();
         self.sender.shutdown();

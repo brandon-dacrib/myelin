@@ -17,6 +17,7 @@ pub mod inbound;
 pub mod join;
 pub mod keys;
 pub mod outbound_join;
+pub mod outbound_store;
 pub mod room_source;
 pub mod sender;
 pub mod transport;

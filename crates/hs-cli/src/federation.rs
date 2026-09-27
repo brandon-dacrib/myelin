@@ -914,8 +914,10 @@ pub struct FederationMount {
     pub client: Arc<hs_federation::client::FederationClient>,
     /// The outbound sender: where this server's own events are queued for the servers of a
     /// room's remote members (`crate::federation_sender` feeds it), and where `send_join` hands
-    /// a join it accepted so the room's other servers hear of it. In memory only; see
-    /// `hs_federation::sender`'s module docs for what a restart loses.
+    /// a join it accepted so the room's other servers hear of it. Its queues are on the same
+    /// backend as everything else (`hs_federation::outbound_store::KvOutboundStore`), so a
+    /// restart resumes them; see `hs_federation::sender`'s module docs for what is still not
+    /// caught up.
     pub sender: Arc<hs_federation::sender::FederationSender>,
     /// The per-destination backoff records the client keeps, for the admin API's Federation
     /// page (`hs_federation::admin_source`).
@@ -936,7 +938,8 @@ const KEY_VALIDITY_SECS: u64 = 24 * 60 * 60;
 /// happens.
 ///
 /// # Errors
-/// Returns the backend's error if the destination-backoff keyspace cannot be opened.
+/// Returns the backend's error if the destination-backoff or outbound-queue keyspaces cannot be
+/// opened.
 // Eight parameters: the stores this mount reads, plus the one test seam (`scheme`). A struct
 // of them would be built at exactly one call site and read at exactly one, which is the same
 // list twice.
@@ -957,7 +960,13 @@ pub fn build_mount<B: KvBackend + 'static>(
     ]));
 
     let destinations: Arc<dyn hs_federation::destination_store::DestinationStore> = Arc::new(
-        hs_federation::destination_store::KvDestinationStore::open(backend)?,
+        hs_federation::destination_store::KvDestinationStore::open(backend.clone())?,
+    );
+    // The sender's queues, on the same backend as the events they carry: what is queued for a
+    // destination that is down survives a restart of this process, and
+    // `crate::federation_sender::OutboundFederation::start` resumes it.
+    let outbound_store: Arc<dyn hs_federation::outbound_store::OutboundStore> = Arc::new(
+        hs_federation::outbound_store::KvOutboundStore::open(backend)?,
     );
     let well_known = Arc::new(hs_federation::discovery::CachingWellKnownFetcher::new(
         hs_federation::discovery::HttpWellKnownFetcher::new(),
@@ -982,9 +991,11 @@ pub fn build_mount<B: KvBackend + 'static>(
     // The same client again: a transaction to a destination that is backing off waits for the
     // same `retry_at` every other outbound call to it does, and an administrator's reset of that
     // destination releases both.
-    let sender = Arc::new(hs_federation::sender::FederationSender::new(
+    let sender = Arc::new(hs_federation::sender::FederationSender::with_store(
         client.clone(),
         server_name.clone(),
+        hs_federation::sender::SenderConfig::for_client(&client),
+        outbound_store,
     ));
 
     let state = hs_federation::transport::FederationState {
