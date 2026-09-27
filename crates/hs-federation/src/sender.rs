@@ -1387,7 +1387,9 @@ mod tests {
         let peer = FakeFederationPeer::new("peer.example.org");
         let (destination, _auth) = spawn_peer(&peer).await;
         let store: Arc<dyn OutboundStore> = Arc::new(InMemoryOutboundStore::new());
-        store.enqueue(&[destination.clone()], &pdu(0)).unwrap();
+        store
+            .enqueue(std::slice::from_ref(&destination), &pdu(0))
+            .unwrap();
         store
             .record_failure(&destination, "connection refused", now_ms() + 3_600_000)
             .unwrap();
@@ -1421,8 +1423,12 @@ mod tests {
         let peer = FakeFederationPeer::new("peer.example.org");
         let (destination, _auth) = spawn_peer(&peer).await;
         let store: Arc<dyn OutboundStore> = Arc::new(InMemoryOutboundStore::new());
-        store.enqueue(&[destination.clone()], &pdu(0)).unwrap();
-        store.enqueue(&[destination.clone()], &pdu(1)).unwrap();
+        store
+            .enqueue(std::slice::from_ref(&destination), &pdu(0))
+            .unwrap();
+        store
+            .enqueue(std::slice::from_ref(&destination), &pdu(1))
+            .unwrap();
 
         let sender = FederationSender::with_store(client(), US, fast(), store.clone());
         sender.enqueue_pdu([destination.clone()], pdu(2));

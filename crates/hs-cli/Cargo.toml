@@ -66,3 +66,12 @@ tempfile = { workspace = true }
 # The fake federation peer `tests/federation_sender.rs` sends real transactions to; the same
 # double `hs-federation`'s own client and sender tests use.
 hs-testkit = { path = "../hs-testkit" }
+# `tests/federation_restart.rs`: two real `hs serve` processes federate over TLS, which the
+# binary does not terminate itself, so the test terminates it -- `rcgen` mints a private CA and a
+# leaf certificate for 127.0.0.1, `rustls`/`tokio-rustls`/`rustls-pki-types` run a
+# TLS-terminating proxy in front of each process's plaintext listener. All four are already
+# `[workspace.dependencies]` entries used elsewhere in the workspace.
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }

@@ -647,7 +647,7 @@ mod tests {
             let a = "a.example".to_owned();
             let b = "b.example".to_owned();
             let s1 = store.enqueue(&[a.clone(), b.clone()], &pdu(1)).unwrap();
-            let s2 = store.enqueue(&[a.clone()], &pdu(2)).unwrap();
+            let s2 = store.enqueue(std::slice::from_ref(&a), &pdu(2)).unwrap();
             let s3 = store.enqueue(&[a.clone(), b.clone()], &pdu(3)).unwrap();
             assert!(s1 < s2 && s2 < s3, "{name}: {s1} {s2} {s3}");
 
