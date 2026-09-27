@@ -29,7 +29,7 @@
 //! every room as it is created or loaded -- see `docs/status/05-sync.md` for the exact,
 //! near-mechanical addition this implies for `crates/hs-cli/src/serve.rs`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -43,6 +43,7 @@ use ruma::{OwnedUserId, RoomId, UserId};
 use tokio::sync::{Mutex, Notify};
 
 use crate::cluster::{ClusterLink, RoomMirror, RoomWake, SessionCluster, WakeBatch};
+use crate::edu::{EduOutbox, InboundEdu};
 use crate::error::UserError;
 use crate::presence::PresenceRegistry;
 use crate::receipts::{ReceiptKind, ReceiptRegistry};
@@ -225,10 +226,14 @@ pub struct SessionHub<B: KvBackend, R: RoomSource<B>> {
     /// rather than in `store`: ephemeral, never persisted, and this hub is already the one place
     /// that both knows how to reach a room's member list and owns the wakers a change needs to
     /// touch.
-    typing: TypingRegistry,
-    /// In-memory `m.presence` state. See [`crate::presence`]'s module docs.
+    typing: Arc<TypingRegistry>,
+    /// Where this server's own users' typing, receipts and presence go to reach other servers,
+    /// once `hs-cli` installs it ([`SessionHub::install_edu_outbox`]). `None`: nothing leaves
+    /// this server, which is what federation being off means.
+    edu_outbox: OnceLock<Arc<dyn EduOutbox>>,
+    /// `m.presence` state, written through to `store`. See [`crate::presence`]'s module docs.
     presence: PresenceRegistry,
-    /// In-memory `m.receipt` state. See [`crate::receipts`]'s module docs.
+    /// `m.receipt` state, written through to `store`. See [`crate::receipts`]'s module docs.
     receipts: ReceiptRegistry,
     /// `hs-push`'s cached ruleset store, if installed (see
     /// [`SessionHub::install_push_rules_store`]). `None` until installed -- `/sync` then omits
@@ -257,6 +262,8 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         rooms.install_global_token_resolver(Arc::new(FeedTokenResolver {
             store: store.clone(),
         }));
+        let presence = PresenceRegistry::with_store(store.clone());
+        let receipts = ReceiptRegistry::with_store(store.clone());
         Self {
             store,
             rooms,
@@ -266,9 +273,10 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             peer_consumed: std::sync::Mutex::new(HashMap::new()),
             cluster: OnceLock::new(),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
-            typing: TypingRegistry::new(),
-            presence: PresenceRegistry::new(),
-            receipts: ReceiptRegistry::new(),
+            typing: Arc::new(TypingRegistry::new()),
+            edu_outbox: OnceLock::new(),
+            presence,
+            receipts,
             push_rules: OnceLock::new(),
             counts: OnceLock::new(),
             _marker: std::marker::PhantomData,
@@ -325,6 +333,16 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     #[must_use]
     pub fn counts_store(&self) -> Option<&Arc<dyn CountsStore>> {
         self.counts.get()
+    }
+
+    /// Installs where this server's own users' typing, receipts and presence are handed to reach
+    /// other servers (`crate::edu`'s module docs). Same idempotent-install convention as
+    /// [`SessionHub::install_push_rules_store`]. `hs-cli` installs one over the federation
+    /// sender when federation is on.
+    pub fn install_edu_outbox(&self, outbox: Arc<dyn EduOutbox>) {
+        if self.edu_outbox.set(outbox).is_err() {
+            tracing::warn!("an EDU outbox was already installed on this hub; ignoring");
+        }
     }
 
     /// Installs this crate's [`DeviceListTokenResolver`] on `e2e`'s `GET /keys/changes` hook, so
@@ -599,8 +617,40 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         timeout: Duration,
     ) -> Result<(), UserError> {
         self.typing.set(room_id, user_id, typing, timeout).await;
-        for member in self.joined_member_ids(room_id).await? {
-            self.wake(&member).await;
+        let members = self.joined_member_ids(room_id).await?;
+        for member in &members {
+            self.wake(member).await;
+        }
+        if let Some(outbox) = self.edu_outbox.get() {
+            let destinations = crate::edu::servers_of(&members);
+            let key = format!("typing {room_id} {user_id}");
+            outbox.send_edu(
+                destinations.clone(),
+                "m.typing",
+                crate::edu::typing_content(room_id, user_id, typing),
+                Some(key.clone()),
+            );
+            if typing {
+                // The other servers are told when the typing lapses, as they are when it is
+                // stopped: nothing else would tell them before their own backstop
+                // (`crate::edu::REMOTE_TYPING_TIMEOUT`).
+                let registry = Arc::clone(&self.typing);
+                let outbox = Arc::clone(outbox);
+                let (room_id, user_id) = (room_id.to_owned(), user_id.to_owned());
+                let lapse = timeout.min(crate::typing::MAX_TYPING_TIMEOUT);
+                tokio::spawn(async move {
+                    tokio::time::sleep(lapse + Duration::from_millis(50)).await;
+                    let (still, _) = registry.current(&room_id).await;
+                    if !still.contains(&user_id) {
+                        outbox.send_edu(
+                            destinations,
+                            "m.typing",
+                            crate::edu::typing_content(&room_id, &user_id, false),
+                            Some(key),
+                        );
+                    }
+                });
+            }
         }
         Ok(())
     }
@@ -624,9 +674,11 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         status_msg: Option<String>,
     ) -> Result<(), UserError> {
         self.presence.set(user_id, presence, status_msg).await;
-        for other in self.users_sharing_room_with(user_id).await? {
-            self.wake(&other).await;
+        let audience = self.users_sharing_room_with(user_id).await?;
+        for other in &audience {
+            self.wake(other).await;
         }
+        self.send_presence(user_id, &audience).await;
         // A user always sees their own just-set presence on their own next sync too (Synapse
         // behavior: a client's own `set_presence` call is reflected back to it), so wake the
         // setter's own long poll as well, not only everyone else's.
@@ -647,10 +699,29 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         if !self.presence.touch(user_id, presence).await {
             return Ok(());
         }
-        for other in self.users_sharing_room_with(user_id).await? {
-            self.wake(&other).await;
+        let audience = self.users_sharing_room_with(user_id).await?;
+        for other in &audience {
+            self.wake(other).await;
         }
+        self.send_presence(user_id, &audience).await;
         Ok(())
+    }
+
+    /// Hands `user_id`'s current presence to the outbox for the servers of `audience` (the
+    /// people they share a room with), if an outbox is installed.
+    async fn send_presence(&self, user_id: &UserId, audience: &BTreeSet<OwnedUserId>) {
+        let Some(outbox) = self.edu_outbox.get() else {
+            return;
+        };
+        let Some(record) = self.presence.get(user_id).await else {
+            return;
+        };
+        outbox.send_edu(
+            crate::edu::servers_of(audience),
+            "m.presence",
+            crate::edu::presence_content(user_id, &record),
+            Some(format!("presence {user_id}")),
+        );
     }
 
     /// `user_id`'s current presence record, if this process has ever recorded one.
@@ -677,12 +748,129 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         ts: u64,
     ) -> Result<(), UserError> {
         self.receipts
-            .set(room_id, user_id, kind, event_id, ts)
+            .set(room_id, user_id, kind, event_id.clone(), ts)
             .await;
-        for member in self.joined_member_ids(room_id).await? {
-            self.wake(&member).await;
+        let members = self.joined_member_ids(room_id).await?;
+        for member in &members {
+            self.wake(member).await;
+        }
+        // A private receipt is its sender's alone; only a public one goes to other servers.
+        if let (ReceiptKind::Read, Some(outbox)) = (kind, self.edu_outbox.get()) {
+            outbox.send_edu(
+                crate::edu::servers_of(&members),
+                "m.receipt",
+                crate::edu::receipt_content(room_id, user_id, &event_id, ts),
+                Some(format!("receipt {room_id} {user_id}")),
+            );
         }
         Ok(())
+    }
+
+    /// Applies a typing, receipt or presence EDU another server sent (`origin`), and wakes the
+    /// local users it concerns. Returns how many updates were applied; what was dropped (a user
+    /// of another server, a user not joined to the room here, a room this server does not have)
+    /// is logged at `debug`. Nothing applied here is sent on to any other server: each server
+    /// distributes its own users' EDUs. See `crate::edu`'s module docs.
+    pub async fn receive_edu(
+        &self,
+        origin: &str,
+        edu_type: &str,
+        content: &serde_json::Value,
+    ) -> usize {
+        let mut applied = 0;
+        for update in InboundEdu::parse(origin, edu_type, content) {
+            match update {
+                InboundEdu::Typing {
+                    room_id,
+                    user_id,
+                    typing,
+                } => {
+                    let Some(members) = self.members_if_joined(&room_id, &user_id).await else {
+                        continue;
+                    };
+                    self.typing
+                        .set(
+                            &room_id,
+                            &user_id,
+                            typing,
+                            crate::edu::REMOTE_TYPING_TIMEOUT,
+                        )
+                        .await;
+                    for member in &members {
+                        self.wake(member).await;
+                    }
+                    applied += 1;
+                }
+                InboundEdu::Receipt {
+                    room_id,
+                    user_id,
+                    event_id,
+                    ts,
+                } => {
+                    let Some(members) = self.members_if_joined(&room_id, &user_id).await else {
+                        continue;
+                    };
+                    self.receipts
+                        .set(&room_id, &user_id, ReceiptKind::Read, event_id, ts)
+                        .await;
+                    for member in &members {
+                        self.wake(member).await;
+                    }
+                    applied += 1;
+                }
+                InboundEdu::Presence {
+                    user_id,
+                    presence,
+                    status_msg,
+                    last_active_ago,
+                    currently_active,
+                } => {
+                    self.presence
+                        .set_remote(
+                            &user_id,
+                            presence,
+                            status_msg,
+                            last_active_ago,
+                            currently_active,
+                        )
+                        .await;
+                    match self.users_sharing_room_with(&user_id).await {
+                        Ok(audience) => {
+                            for other in &audience {
+                                self.wake(other).await;
+                            }
+                        }
+                        Err(error) => tracing::debug!(
+                            %user_id,
+                            %error,
+                            "could not work out who shares a room with a remote user"
+                        ),
+                    }
+                    applied += 1;
+                }
+            }
+        }
+        applied
+    }
+
+    /// `room_id`'s joined members, if `user_id` is one of them; `None` (logged at `debug`) if
+    /// they are not or the room cannot be read here.
+    async fn members_if_joined(
+        &self,
+        room_id: &RoomId,
+        user_id: &UserId,
+    ) -> Option<Vec<OwnedUserId>> {
+        match self.joined_member_ids(room_id).await {
+            Ok(members) if members.iter().any(|m| m == user_id) => Some(members),
+            Ok(_) => {
+                tracing::debug!(%room_id, %user_id, "dropping an EDU for a user not joined here");
+                None
+            }
+            Err(error) => {
+                tracing::debug!(%room_id, %error, "dropping an EDU for a room not readable here");
+                None
+            }
+        }
     }
 
     /// `room_id`'s current receipt cursor. See [`crate::receipts`].

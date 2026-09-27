@@ -16,6 +16,8 @@
 //! | `hs_user.account_data_room` | `(user_id, room_id, event_type)` | room-scoped account data (`m.tag` and friends) |
 //! | `hs_user.account_data_counter` | `user_id` (raw `atomic_add` key, not a [`hs_tables::keyspace::TypedKeyspace`]) | the shared global/room account-data change counter |
 //! | `hs_user.filters` | `(user_id, filter_id)` | uploaded named filters (`POST /user/{userId}/filter`) |
+//! | `hs_user.receipts` | `(room_id, user_id, kind)` | the latest read receipt of each kind per user per room |
+//! | `hs_user.presence` | `user_id` | each user's latest presence |
 //!
 //! # The coalescing invariant, precisely
 //!
@@ -57,7 +59,8 @@ use ruma::{DeviceId, RoomId, UserId};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AccountDataRecord, FeedEntry, MembershipRecord, PublicRoomEntry, StoreError, UserStore,
+    AccountDataRecord, FeedEntry, MembershipRecord, PublicRoomEntry, StoreError, StoredPresence,
+    StoredReceipt, UserStore,
 };
 
 fn to_kv<E: std::error::Error + Send + Sync + 'static>(e: E) -> hs_kv::KvError {
@@ -104,6 +107,8 @@ pub struct TablesUserStore<B: KvBackend> {
     account_data_counter: B::Keyspace,
     filters: TypedKeyspace<B::Keyspace, (String, String)>,
     public_rooms: TypedKeyspace<B::Keyspace, (String,)>,
+    receipts: TypedKeyspace<B::Keyspace, (String, String, String)>,
+    presence: TypedKeyspace<B::Keyspace, (String,)>,
 }
 
 impl<B: KvBackend> TablesUserStore<B> {
@@ -125,6 +130,8 @@ impl<B: KvBackend> TablesUserStore<B> {
             account_data_counter: open("hs_user.account_data_counter")?,
             filters: TypedKeyspace::new(open("hs_user.filters")?),
             public_rooms: TypedKeyspace::new(open("hs_user.public_rooms")?),
+            receipts: TypedKeyspace::new(open("hs_user.receipts")?),
+            presence: TypedKeyspace::new(open("hs_user.presence")?),
             backend,
         })
     }
@@ -562,6 +569,60 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
             out.push(json_decode(&value)?);
         }
         Ok(out)
+    }
+
+    async fn put_receipt(
+        &self,
+        room_id: &RoomId,
+        receipt: &StoredReceipt,
+    ) -> Result<(), StoreError> {
+        let key = (
+            room_id.to_string(),
+            receipt.user_id.clone(),
+            receipt.kind.clone(),
+        );
+        let value = json_encode(receipt)?;
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            self.receipts.put(txn, &key, &value).map_err(to_kv)
+        })
+        .map_err(StoreError::Kv)
+    }
+
+    async fn list_room_receipts(&self, room_id: &RoomId) -> Result<Vec<StoredReceipt>, StoreError> {
+        let snap = self.backend.snapshot();
+        let spec =
+            TypedKeyspace::<B::Keyspace, (String, String, String)>::prefix(&(room_id.to_string(),));
+        let mut out = Vec::new();
+        for item in self.receipts.range(&snap, spec) {
+            let (_, value) = item.map_err(StoreError::Table)?;
+            out.push(json_decode(&value)?);
+        }
+        Ok(out)
+    }
+
+    async fn put_presence(
+        &self,
+        user_id: &UserId,
+        presence: &StoredPresence,
+    ) -> Result<(), StoreError> {
+        let key = (user_id.to_string(),);
+        let value = json_encode(presence)?;
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            self.presence.put(txn, &key, &value).map_err(to_kv)
+        })
+        .map_err(StoreError::Kv)
+    }
+
+    async fn get_presence(&self, user_id: &UserId) -> Result<Option<StoredPresence>, StoreError> {
+        let snap = self.backend.snapshot();
+        match self
+            .presence
+            .get(&snap, &(user_id.to_string(),))
+            .map_err(StoreError::Table)?
+        {
+            Some(bytes) => Ok(Some(json_decode(&bytes)?)),
+            None => Ok(None),
+        }
     }
 }
 

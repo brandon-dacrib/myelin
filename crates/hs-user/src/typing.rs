@@ -31,7 +31,6 @@
 //! `crate::sync::has_new_data`, which calls `current` for every joined room on each recheck).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId};
@@ -60,7 +59,7 @@ struct RoomTyping {
 /// last synced" collapse into the same, correct, "do not include an ephemeral event" answer.
 pub struct TypingRegistry {
     rooms: Mutex<HashMap<OwnedRoomId, RoomTyping>>,
-    counter: AtomicU64,
+    counter: crate::stamp::Stamps,
 }
 
 impl TypingRegistry {
@@ -69,12 +68,12 @@ impl TypingRegistry {
     pub fn new() -> Self {
         Self {
             rooms: Mutex::new(HashMap::new()),
-            counter: AtomicU64::new(0),
+            counter: crate::stamp::Stamps::new(),
         }
     }
 
     fn next_seq(&self) -> u64 {
-        self.counter.fetch_add(1, Ordering::SeqCst) + 1
+        self.counter.next()
     }
 
     /// Records `user_id`'s typing state in `room_id`: `typing: true` (re)inserts them with a
