@@ -382,7 +382,7 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 | Management web interface | ~75% | users (with devices, sign-out and password reset), rooms (with members), bridges (the catalogue, the wizard with the bridge's own config, the runbook, sign-in guides), federation destinations, configuration and the audit log are real against the real server; the media and reports pages still read from operations that answer 501; arrays-of-objects are a JSON textarea |
 | **Federation** | **~30%** | 75/250 assertions, 14/88 top-level (run 7); a user here joins a room hosted elsewhere through the client API, messages flow both ways between two real servers, and the room's history from before the join is fetched as the client scrolls back; the outbound queue survives a restart and is shard-gated; no EDUs, no invites/leaves/knocks over federation |
 | Bridges | ~75% | heisenbridge works end to end both directions (`docs/bridges/heisenbridge.md`); mautrix-whatsapp, added through the wizard, connects and starts in appservice-mode encryption (`docs/bridges/mautrix.md`); all 26 bridge operations are real; no mautrix bridge has carried a message yet, because signing in needs a phone. Not counted: offerings and per-user instances (RFC 0017) are built end to end and have never been run, so they add nothing to the number until they have |
-| Operations (HA, scale-out) | ~50% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; the chart is published from `main` and installs from the registry in one sentence; a standing demo behind a Traefik Ingress with a Let's Encrypt certificate, scraped by Prometheus, its setup page opened in a browser at the public hostname; a locked-out administrator gets back in with `hs recover` run where the key is; readiness withdrawn the moment a shutdown begins; two replicas shared a room on one PostgreSQL in an experiment; the cluster path has never carried real traffic on a cluster; the operator reconciles a `Bridge` into a pod, a Service and a volume in unit tests and has never been run against an API server, and `Homeserver` is still status-only |
+| Operations (HA, scale-out) | ~50% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; the chart is published from `main` and installs from the registry in one sentence; a standing demo behind a Traefik Ingress with a Let's Encrypt certificate, scraped by Prometheus, its setup page opened in a browser at the public hostname; a locked-out administrator gets back in with `hs recover` run where the key is; readiness withdrawn the moment a shutdown begins; two replicas share a room on one PostgreSQL and a client's `/sync` works from either, woken over the mesh, with read-your-writes across them; the outbound federation sender is shard-gated; the cluster path has never carried real traffic on a cluster; the operator reconciles a `Bridge` into a pod, a Service and a volume in unit tests and has never been run against an API server, and `Homeserver` is still status-only |
 
 Federation is still the honest answer to "when could I use this". Everything else is far enough
 along that the gaps are specific and listed. As of 2026-09-25 a user here can join a room on
@@ -486,12 +486,29 @@ would do it; each ends in a transcript in `docs/status/12-platform-and-kubernete
   `status.podIP` into a config field that does not exist yet); the mesh's mutual TLS is built
   in `hs-cluster` and not wired from `hs-cli`; `/createRoom` is not shard-gated; the outbound
   federation sender and the appservice pump are shard-gated in a unit test with scripted
-  ownership only. And the one that matters most to a client: **`/sync` is not cluster-aware**.
-  The session hub watches only its own replica's room stream, so a long-poll on replica B for
-  a room replica A owns is never woken. The design's user-session owner, woken by room owners
-  over the mesh (`PLAN.md` 5.4), is not built; until it is, N replicas are an availability
-  feature for clients, not a capacity one. `docs/scaling.md` has the whole adds/does-not-add
-  table and is the document to keep true as this lands.
+  ownership only. ~~And the one that matters most to a client: `/sync` is not cluster-aware.~~
+  **Done 2026-09-27** (track 05, `docs/status/05-sync.md` session 7): a `/sync` may reach any
+  replica. Only a room's owner feeds users; after each update it sends every other live
+  replica a wake batch over a new mesh route (`POST /mesh/v1/peer`, `hs_user::cluster`,
+  `hs_cli::sync_cluster`), and the receiving hub wakes those users' long-polls. Before
+  reading, a `/sync` asks every peer what it has published and waits, within the existing
+  500 ms read-your-writes budget, until it has that peer's wakes up to that number. A replica
+  reads a room it does not own through a store-checked mirror, reloaded when the store's
+  timeline head moves, so a lost wake can delay an answer but never make it stale. Verified
+  as two `hs serve` processes on one PostgreSQL 16: 8 of 8 cross-replica long-polls woken
+  with the event; 160 of 160 writes through one replica seen in the very next `timeout=0`
+  sync on the other, both directions; a cross-replica long-poll returns about 150 ms after
+  the write is acknowledged in a release build. Not verified: two pods, more than two
+  replicas, a peer dying mid-run (unit-tested only), large rooms. The mirror reloads the whole
+  room per event; RFC 0018 (`RoomActor::catch_up`) is the incremental version, asked of
+  track 04. Typing, receipts and presence are still per-replica memory. `docs/scaling.md` is
+  updated and remains the document to keep true. **Found on the way, for track 03 and 13:**
+  settings are seeded into the shared database once and the database outranks the file, so
+  two replicas seeding one database leave the loser's `listeners` and `cluster.mesh.port` in
+  force for both on the next restart (replica A restarted as B and failed to bind), and an
+  `HS__` override cannot fix a list entry; cluster mode needs per-replica sections excluded
+  from seeding. Also `POST /join/{roomId}` on a non-owner replica is refused 503 by the fence
+  (no `/rooms/` segment to gate on) while `POST /rooms/{roomId}/join` forwards correctly.
 - **Measure the slope** (performance; after completeness, per the rule above). `hs-loadgen`
   against one replica, then two, then three, on the same PostgreSQL: connected users and
   active rooms at a fixed sync p99. Every number in `PLAN.md` section 13 is a target; this is
@@ -823,6 +840,10 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | The `main` chart needs `--devel`, and a first tag hides it until Chart.yaml's version moves on | `.github`, `deploy/helm` | pre-releases sort below the release they precede; bump `version` in Chart.yaml right after tagging |
 | An install from a chart before 2026-09-26's label fix cannot be upgraded in place | `deploy/helm` | one `kubectl delete statefulset --cascade=orphan` before the next `helm upgrade`; only the demo existed |
 | A pod does not know its own mesh address | `hs-cli`, `hs-cluster` | `advertise_host` falls back to the bind address or `127.0.0.1`; cluster mode between two pods has not been tried |
+| Per-replica settings are seeded into the shared database | `hs-config`, `hs-cli` | the second replica to seed loses; `listeners` and `cluster.mesh.port` then apply to both on restart; `hs config unset /listeners/listeners` and `/cluster/mesh/port` is the workaround; cluster mode needs per-replica sections excluded from seeding |
+| `POST /join/{roomId}` on a non-owner replica is 503 | `hs-cli` | the fence gates on a `/rooms/` path segment; `/rooms/{roomId}/join` forwards correctly, `/join/{roomId}` does not |
+| A non-owner replica reloads a whole room per event to answer `/sync` | `hs-user`, `hs-room` | correct, and 25 ms for a small room; RFC 0018 asks `hs-room` for an incremental catch-up |
+| Typing, receipts and presence do not cross replicas | `hs-user` | each replica's memory; a user on replica B does not see typing from a user on A |
 | The operator has never run against an API server | `hs-operator` | the `Bridge` reconciler (claim, Deployment, Service, status) is unit-tested only; `Homeserver` reconciles to a status only; the chart is the only way to deploy the server |
 | RFC 0017 has never been exercised end to end | `hs-bridges`, `hs-cli` | no offering has been made against the real binary, no instance created, no front door messaged; the manager's state machine, front door and Matrix client have no tests of their own |
 | The demo still runs a shared WhatsApp registration | demo | RFC 0017 section 6 says an offering replaces it; not done |

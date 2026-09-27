@@ -401,6 +401,14 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Operations
 
+- **A second replica is capacity, not only availability: `/sync` works from any replica.**
+  A room's owner wakes every other replica over the mesh after each update, the replica
+  holding the client's long-poll answers it, and a sync waits (within half a second) for
+  everything its peers had published before it arrived, so a write through one replica is in
+  the very next sync on another. Verified 2026-09-27 as two processes on one PostgreSQL: every
+  cross-replica long-poll woken with the event, 160 of 160 writes seen in the next sync on the
+  other replica, about 150 ms from write to woken sync. Not yet run as two pods; typing,
+  receipts and presence still stay on the replica that received them.
 - **Runs on PostgreSQL.** Boots, registers, serves, and survives a restart with its data intact.
   The embedded single-node backend remains the default.
 - **Two replicas no longer fork a room's history.** A shard gate forwards or refuses requests for
