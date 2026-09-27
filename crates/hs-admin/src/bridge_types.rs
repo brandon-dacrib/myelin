@@ -343,12 +343,13 @@ const CATALOGUE: &[Entry] = &[
     },
 ];
 
-/// `per_user` for a bridge of one person's account (every mautrix bridge; heisenbridge, which is
-/// one person's IRC bouncer), `shared` for one that bridges a network or a server for everyone.
+/// `per_user` for a bridge of one person's account (every mautrix bridge), `shared` for one
+/// that bridges a network or a server for everyone: heisenbridge is a bouncer any local user
+/// the owner allows can drive, so one process serves the server (RFC 0017 section 2).
 fn mode(entry: &Entry) -> &'static str {
     match entry.runtime {
-        Runtime::Mautrix | Runtime::Heisenbridge => "per_user",
-        Runtime::AppserviceIrc | Runtime::Hookshot => "shared",
+        Runtime::Mautrix => "per_user",
+        Runtime::Heisenbridge | Runtime::AppserviceIrc | Runtime::Hookshot => "shared",
     }
 }
 
@@ -356,11 +357,28 @@ fn mode(entry: &Entry) -> &'static str {
 /// hookshot, whose configs name networks and services only an operator knows; not Telegram,
 /// whose config needs the operator's own API ID and hash.
 fn deployable(entry: &Entry) -> bool {
-    matches!(entry.runtime, Runtime::Mautrix | Runtime::Heisenbridge)
-        && !entry
+    not_deployable_reason(entry).is_none()
+}
+
+/// Why this server cannot deploy the type itself, in the words the interface shows; `None`
+/// when it can.
+fn not_deployable_reason(entry: &Entry) -> Option<String> {
+    match entry.runtime {
+        Runtime::AppserviceIrc | Runtime::Hookshot => Some(format!(
+            "{}'s config names the networks or services it connects, which only an administrator can write, so it runs elsewhere.",
+            entry.name
+        )),
+        Runtime::Mautrix | Runtime::Heisenbridge => entry
             .needs
             .iter()
-            .any(|(key, _, required)| *required && *key == "api_id")
+            .find(|(key, _, required)| *required && *key == "api_id")
+            .map(|(_, description, _)| {
+                format!(
+                    "{} needs settings only an administrator can provide ({description}), so it runs elsewhere.",
+                    entry.name
+                )
+            }),
+    }
 }
 
 fn entry(id: &str) -> Option<&'static Entry> {
@@ -410,6 +428,7 @@ fn bridge_type(entry: &Entry, server_name: &str) -> BridgeType {
         renders_config: entry.runtime == Runtime::Mautrix,
         mode: mode(entry).to_owned(),
         deployable: deployable(entry),
+        not_deployable_reason: not_deployable_reason(entry),
         sign_in: BridgeTypeSignIn {
             steps: entry
                 .sign_in
@@ -1017,11 +1036,14 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
                 "0.0.0.0".into(),
                 "-p".into(),
                 entry.port.to_string(),
-                "-o".into(),
-                spec.owner
-                    .map_or_else(|| format!("@OWNER:{}", spec.server_name), str::to_owned),
-                spec.homeserver_address.to_owned(),
             ];
+            // A shared instance names no owner: heisenbridge gives the bridge to the first local
+            // user who talks to it, and that person allows the others.
+            if let Some(owner) = spec.owner {
+                args.push("-o".into());
+                args.push(owner.to_owned());
+            }
+            args.push(spec.homeserver_address.to_owned());
             None
         }
         Runtime::AppserviceIrc | Runtime::Hookshot => None,
@@ -1436,9 +1458,9 @@ mod tests {
 
         let heisen = render_instance(&InstanceSpec {
             type_id: "heisenbridge",
-            owner: Some("@bob:x.org"),
+            owner: None,
             server_name: "x.org",
-            appservice_id: "heisenbridge-bob",
+            appservice_id: "heisenbridge",
             url: "http://b:9898",
             homeserver_address: "http://hs:8008",
             image_tag: "",
@@ -1460,8 +1482,14 @@ mod tests {
         .unwrap();
         assert!(heisen.config_yaml.is_none());
         assert_eq!(heisen.args.last().unwrap(), "http://hs:8008");
-        assert!(heisen.args.contains(&"@bob:x.org".to_owned()));
-        assert_eq!(heisen.bot_localpart, "heisenbridge_bob");
+        // Shared: nobody is named as the owner; the first local user to talk to it claims it.
+        assert!(!heisen.args.contains(&"-o".to_owned()), "{:?}", heisen.args);
+        assert_eq!(heisen.bot_localpart, "heisenbridge");
+        assert_eq!(heisen.ghost_prefix, "irc_");
+        assert_eq!(
+            heisen.registration[BRIDGE_INSTANCE_KEY],
+            crate::bridge_offerings::SHARED_INSTANCE
+        );
         assert_eq!(heisen.image_tag, "latest");
     }
 
@@ -1479,6 +1507,23 @@ mod tests {
             (hookshot.mode.as_str(), hookshot.deployable),
             ("shared", false)
         );
-        assert_eq!(get("heisenbridge", "x.org").unwrap().mode, "per_user");
+        let heisenbridge = get("heisenbridge", "x.org").unwrap();
+        assert_eq!(
+            (heisenbridge.mode.as_str(), heisenbridge.deployable),
+            ("shared", true)
+        );
+        assert!(whatsapp.not_deployable_reason.is_none());
+        assert!(
+            telegram
+                .not_deployable_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("API ID"),
+            "{:?}",
+            telegram.not_deployable_reason
+        );
+        for t in list("x.org") {
+            assert_eq!(t.deployable, t.not_deployable_reason.is_none(), "{}", t.id);
+        }
     }
 }
