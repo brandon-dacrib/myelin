@@ -442,6 +442,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             .map_err(|e| e.to_string())?
         else {
             // Its offering is gone: it goes too.
+            tracing::info!(bridge_type = %row.bridge_type, owner = %row.owner, "its offering is gone: removing the instance");
             if row.state != InstanceState::Removing {
                 self.set_state(row, InstanceState::Removing, None);
             }
@@ -555,6 +556,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                             r.ready_at_ms = Some(now);
                             true
                         });
+                    tracing::info!(bridge_type = %row.bridge_type, owner = %row.owner, "bridge instance answered this server: ready");
                     self.wake();
                 } else if !elsewhere && now.saturating_sub(row.state_since_ms) > START_TIMEOUT_MS {
                     self.set_state(
@@ -585,7 +587,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
     fn set_state(&self, row: &InstanceRow, state: InstanceState, reason: Option<String>) {
         let from = row.state;
         let now = now_ms();
-        let _ = self
+        let moved = self
             .store
             .update_instance(&row.bridge_type, &row.owner, |r| {
                 if r.state != from {
@@ -595,6 +597,16 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                 r.reason = reason.clone();
                 true
             });
+        if matches!(moved, Ok(Some(_))) {
+            tracing::info!(
+                bridge_type = %row.bridge_type,
+                owner = %row.owner,
+                from = from.as_str(),
+                to = state.as_str(),
+                reason = reason.as_deref().unwrap_or_default(),
+                "bridge instance moved"
+            );
+        }
     }
 
     fn set_reason(&self, row: &InstanceRow, reason: Option<String>) {
@@ -806,6 +818,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
     }
 
     async fn remove(&self, row: &InstanceRow) -> Result<(), String> {
+        tracing::info!(bridge_type = %row.bridge_type, owner = %row.owner, appservice_id = row.appservice_id.as_deref().unwrap_or_default(), "removing bridge instance");
         if let (Some(runtime), Some(name)) = (&self.runtime, &row.deploy_name) {
             runtime.delete(name).await?;
         }
@@ -902,6 +915,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
 
     /// Stops and removes `owner`'s instance of `bridge_type` now.
     pub(crate) async fn stop(&self, bridge_type: &str, owner: &str) -> Result<bool, String> {
+        tracing::info!(bridge_type, owner, "asked to stop a bridge instance");
         let Some(row) = self
             .store
             .instance(bridge_type, owner)
@@ -1162,6 +1176,11 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
     }
 
     async fn delete_instance(&self, bridge_type: &str, user_id: &str) -> Result<(), SourceError> {
+        tracing::debug!(
+            bridge_type,
+            user_id,
+            "an administrator removes a bridge instance"
+        );
         match self.stop(bridge_type, user_id).await {
             Ok(true) => Ok(()),
             Ok(false) => Err(SourceError::NotFound),

@@ -132,6 +132,12 @@ async fn handle<B: KvBackend + 'static>(
     let kind = event["type"].as_str().unwrap_or_default();
     let sender = event["sender"].as_str().unwrap_or_default();
     let room_id = event["room_id"].as_str().unwrap_or_default();
+    tracing::debug!(
+        kind,
+        sender,
+        room_id,
+        "the bridge manager was sent an event"
+    );
     let sender_localpart = sender
         .trim_start_matches('@')
         .split(':')
@@ -371,6 +377,7 @@ async fn command<B: KvBackend + 'static>(
     room_id: &str,
     body: &str,
 ) {
+    tracing::debug!(user, room_id, body, "the manager bot was told");
     let mut words = body.split_whitespace();
     let verb = words.next().unwrap_or_default().to_lowercase();
     let rest: Vec<&str> = words.collect();
