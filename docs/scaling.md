@@ -85,7 +85,15 @@ clients. As of 2026-09-26:
   *owner* of `PLAN.md` 5.4 (no `/sync` is forwarded; there is no per-user shard in use), the
   incremental catch-up that would make a non-owner's reads cheap (RFC 0018), and any exchange
   of typing, receipts or presence between replicas. Two pods have still not done this: the
-  run was two processes on one host over a plain (non-TLS) mesh.
+  run was two processes on one host over a plain (non-TLS) mesh. Release build, same host: a
+  cross-replica long-poll returns about 150 ms after the write is acknowledged, of which the
+  mesh is under a millisecond.
+- **Per-replica settings are seeded into the shared configuration store.** The bootstrap file
+  seeds the database once, and the database outranks the file afterwards, so two replicas
+  seeding one database leave the loser's `listeners` and `cluster.mesh.port` in force for both
+  on the next restart (seen: replica A restarted as B and failed to bind). Until the config
+  store excludes per-replica sections in cluster mode, `hs config unset /listeners/listeners`
+  and `unset /cluster/mesh/port` once after the first start make each replica's own file win.
 - **`/createRoom` is not shard-gated**: the room's first actor is built wherever the request
   lands, and every later request is routed to the true owner.
 - **Outbound federation and bridge delivery are not shard-gated on a real cluster**: the

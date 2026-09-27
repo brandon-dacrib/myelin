@@ -140,7 +140,49 @@ and the rest is what this debug binary pays for any `/sync` with news over Postg
 release build is the honest way to get the absolute number; see the next paragraph for what it
 gave, or that it did not finish.
 
-RELEASE_NUMBERS_PLACEHOLDER
+The same two scripts against a **release** build (same host, same PostgreSQL, the other agents'
+builds still running):
+
+```
+baseline: alice's timeout=0 sync on B with nothing new: 38, 41, 41, 40, 42 ms
+baseline: alice's timeout=0 sync on A with nothing new: 44, 38, 44, 37, 37 ms
+
+round 0 poll on B, send on A: send started 04:25:03,599, acked 04:25:03,643 (44 ms), poll returned 04:25:03,794: ack->return 151 ms
+round 0 poll on A, send on B: send started 04:25:04,236, acked 04:25:04,277 (40 ms), poll returned 04:25:04,396: ack->return 119 ms
+round 1 poll on B, send on A: send started 04:25:04,876, acked 04:25:04,915 (39 ms), poll returned 04:25:05,052: ack->return 137 ms
+round 1 poll on A, send on B: send started 04:25:05,509, acked 04:25:05,552 (43 ms), poll returned 04:25:05,722: ack->return 171 ms
+round 2 poll on B, send on A: send started 04:25:06,257, acked 04:25:06,301 (44 ms), poll returned 04:25:06,477: ack->return 176 ms
+round 2 poll on A, send on B: send started 04:25:07,009, acked 04:25:07,067 (58 ms), poll returned 04:25:07,243: ack->return 176 ms
+
+a.log 04:25:03,697 sent a wake batch to a peer consumed=5 rooms=1
+b.log 04:25:03,696 received a wake batch from a peer consumed=5 rooms=1 users=2
+b.log 04:25:03,721 room mirror loaded a room this replica does not own head=9
+
+== wake latency (4 rooms, both directions): ack->return 168-201 ms, event in poll: 8/8 ==
+== read-your-writes: 160/160 seen, 0 missed; slowest sync 173-219 ms in 14 of 16 cells,
+   516.7 ms and 1418.3 ms in the other two (single outliers; the 500 ms bounded wait plus a
+   stalled response build on a box running three cargo builds, not explained further) ==
+```
+
+Round 0 cross-replica, release: acked at 03,643; B had the wake at 03,696 (53 ms: A's hub
+feeding the update over PostgreSQL); the mirror had reloaded at 03,721 (25 ms); the response
+was on the wire at 03,794 (73 ms to build, against 40 ms for an empty one). So a cross-replica
+long-poll returns about 150 ms after the write is acknowledged, of which the mesh is under a
+millisecond and the cross-replica premium (the mirror reload) about 25 ms; a same-replica
+long-poll is 120-170 ms on the same box. The wake is not the bottleneck; the feed write and the
+response build are, and both are single-node work.
+
+**Found on the way, for the config owner (track 03/hs-config): per-replica settings live in the
+shared store.** Settings are stored in the database and the bootstrap file only seeds it on the
+first run (`crates/hs-cli/src/bootstrap.rs`, `hs_config::layered`: database outranks file). Two
+replicas seeding one database race, and the loser's `listeners` and `cluster.mesh.port` then
+apply to *both* on the next restart: on my second start replica A came up as B (bound 18141 and
+mesh 18550, "Address already in use", exit 1). `HS__` overrides cannot fix the listener (they
+set scalars, not list entries). Workaround used:
+`hs config -c a.yaml unset /listeners/listeners` and `unset /cluster/mesh/port`, after which
+each replica's own file supplies them and the store does not re-seed. A cluster deployment
+needs either those sections excluded from seeding in `mode=cluster`, or documentation saying
+so; nothing in this branch changes it.
 
 Not verified by running: two *pods*; a peer that dies mid-run (the unit test covers a peer whose
 wakes never arrive: the sync is delayed by the bounded wait and still sees the write, from the
@@ -252,6 +294,9 @@ key directory, `hs serve -c a.yaml & hs serve -c b.yaml &`, then `run.py` and `r
 
 - From track 04: `RoomActor::catch_up` (RFC 0018), so a non-owner's mirror stops reloading
   whole rooms.
+- From track 03 / the config owner: per-replica settings (`listeners`, `cluster.mesh.port`, the
+  advertise address) must not be seeded into the shared config store, or a restarted replica
+  takes on another's identity (details above under "Found on the way").
 - From track 03: `/join/{roomIdOrAlias}` (and `/createRoom`, already on its list) shard-gated.
   Found while running: bob's `POST /join/{roomId}` on A for a room B owns was refused `503` by
   A's fence -- the fence doing its job -- because that path has no `/rooms/` segment for the
