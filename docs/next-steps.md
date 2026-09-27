@@ -397,35 +397,28 @@ carried a message through an encrypted room. Each of those has historically foun
 
 ## In flight right now (2026-09-27)
 
-On 2026-09-26 five agents were started in parallel, each in its own git worktree under
-`.claude/worktrees/` (excluded from git locally, not ignored in the repository) on a branch
-named after the worktree, committing there and never pushing; the lead merges each branch into
-`main`, runs the checks and pushes. One of the five is merged. The other four, and the two
-worktrees of the operator and offerings session, exist **only on the owner's machine**: as of
-the 2026-09-27 session the remote has `main` and nothing else, so a cloud session cannot see
-them until they are pushed
-(`git push -u origin 'refs/heads/worktree-agent-*:refs/heads/worktree-agent-*'`, after
-committing anything still uncommitted in each worktree). Then, for each: `git log
-main..<branch>`, the worktree's own `docs/status/NN-*.md` for the agent's account of what was
-verified, `git merge --no-ff <branch>`, `cargo fmt --all --check`, clippy and the touched
-crates' tests, and then this file, `README.md`'s table and `CHANGELOG.md`, which the agents
-were told not to touch.
+Nothing is in flight on a branch. On 2026-09-26 five agents were started in parallel in git
+worktrees on the owner's machine, committing to `worktree-agent-*` branches that were never
+pushed. One was merged (`50fa29f`, the chart install as a CD gate). The other four -- the
+cold-boot measurement (track 01), the pod's own mesh address with mTLS wired and `/createRoom`
+shard-gated (03), cluster-aware `/sync` (05), and the durable outbound federation queue (06)
+-- **were deleted with the worktrees before they were pushed, and that work is lost.** Their
+tasks are back in the list below as if never started; nothing from them reached `main`.
 
-| Branch | Track | Task | State |
-|---|---|---|---|
-| `worktree-agent-a24fa2b7f44661e43` | 12 platform | the chart install as a CD gate | **merged** (`50fa29f`); see "And gated" |
-| `worktree-agent-a909b00192bc83196` | 01 storage | measure the five-second cold boot and halve it; before/after in `docs/status/01-storage-engine.md`; it will say what the startup probe can become | not pushed |
-| `worktree-agent-a368732bc30d06e73` | 03 cluster | a pod knows its own mesh address (config field + Downward API in the chart), mesh mTLS wired from `hs-cli` and the chart, `/createRoom` shard-gated; verified as two processes on one PostgreSQL; a values file for the two-pod cluster experiment | not pushed |
-| `worktree-agent-a2d1e568234dc9ca4` | 05 sync | `/sync` cluster-aware: the room owner wakes the replica holding the user's session over the mesh, read-your-writes across replicas; two-process transcript in `docs/status/05-sync.md`, `docs/scaling.md` kept true | not pushed |
-| `worktree-agent-a64e3554e25e92d1a` | 06 federation | the outbound federation queue and per-destination backoff survive a restart; verified by restarting the real binary | not pushed |
-| `worktree-agent-a093b1e401ca6cda1`, `worktree-agent-aa9588e34dffe839c` | 11/12/15/16 | the operator and offerings session (RFC 0017); its work reached `main` as `1c38b5e` to `52649d2` | not pushed; probably nothing beyond `main`, to be checked with `git log main..<branch>` |
+The lesson is cheap to keep: an agent's branch is pushed the moment it has a commit worth
+keeping (`git push -u origin <branch>`), not when the lead gets to it. `.claude/worktrees/` is
+excluded from git locally; a branch that exists only there is one `rm -rf` from gone.
 
-The four unmerged branches were written against `main` at `7647578` or so and `main` has
-moved by RFC 0017 (a new crate, `hs serve` wiring, the chart's operator templates); expect
-conflicts in `crates/hs-cli/src/serve.rs` and `deploy/helm/hs/` from the cluster branch in
-particular. When the cluster and sync branches are in and CD has published an image with them,
-the two-pod experiment on the real cluster is the next thing (item 1 below), with the values
-file the cluster agent leaves behind.
+**Where sessions run now.** The owner works from cloud sessions (Claude Code on the web) as
+well as the laptop. A cloud session has the repository, a Rust toolchain that builds the
+workspace, Node, four cores, outbound HTTPS through a proxy, and root with `apt-get` (a
+PostgreSQL 16 server installs in a minute, so two processes on one database is doable); it
+has **no Docker daemon, no kind, no `kubectl` context for the verification cluster and no
+access to the demo**. So from a cloud session: everything that is a test against the real
+binary, two processes on one PostgreSQL, two in-process servers, or a chart render is doable;
+everything that says "on the cluster", "in a browser against the real binary", Complement, or
+a real bridge is not, and is left for a session on the laptop. Items below say which they
+are.
 
 ## What to do next, in order
 
