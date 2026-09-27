@@ -1,6 +1,7 @@
 # 0017. The server deploys its own bridges, one per person
 
-Status: accepted 2026-09-26, being implemented. Owner: track 12 (platform), `crates/hs-operator`,
+Status: accepted 2026-09-26; built and wired into `hs serve` the same day; **not yet run against a
+cluster** (section 8). Owner: track 12 (platform), `crates/hs-operator`,
 and track 11 (appservices), `crates/hs-bridges`. Consuming tracks: 15 (admin API,
 `crates/hs-admin`), 16 (management web interface, `web/`).
 
@@ -202,7 +203,9 @@ elsewhere.
 | `DELETE /bridge-offerings/{type}/instances/{user_id}` | `bridge_instances.delete` | Stop it and remove its registration, pod and volume. |
 | `POST /bridge-offerings/{type}/instances/{user_id}/files` | `bridge_instances.files` | `config_yaml`, `registration_yaml`, `compose_yaml`, `manifest_yaml` (Secret + `Bridge`) with the instance's tokens, to run it elsewhere. Creates nothing. |
 
-Reads need `admin:read`; everything else `admin:write` (the files carry tokens). Every write is
+Reads need `bridges:read`; everything else `bridges:write` (the files carry tokens). (This said
+`admin:read`/`admin:write` when accepted; the OpenAPI document, which is what the router enforces
+and the interface follows, uses the bridge scopes, and the text was corrected to it on 2026-09-27.) Every write is
 audited and published on the event stream. `BridgeType` gains `mode` (`per_user` or `shared`) and
 `deployable`. The `appservices.*` operations are unchanged and list every instance's registration
 (each tagged `io.myelin.bridge_instance`), so the registry stays the one place delivery, health and
@@ -227,3 +230,23 @@ backlog are looked at.
 Reserving the ghost prefixes against local registration before an instance exists; per-user
 quotas beyond "may use it"; a Docker runtime for single-node installs (instances there run
 elsewhere); moving an instance between users; shared portal rooms between instances.
+
+## 8. Where it stands (2026-09-27)
+
+Everything sections 4 and 5 describe exists on `main` (`1c38b5e` to `52649d2`, 2026-09-26):
+
+| Piece | Where | Verified by |
+|---|---|---|
+| The manager, store, state machine, front doors, manager bot, Matrix client, runtime seam | `crates/hs-bridges` | 3 unit tests; starts inside `hs serve` |
+| The ten admin operations, `BridgeType.mode` and `deployable`, instance rendering | `crates/hs-admin` | router tests over the in-memory source |
+| The `Bridge` CRD, the reconciler, the status, `KubeBridgeClient`, `hs operator` | `crates/hs-operator`, `crates/hs-cli` | 52 unit tests, generated CRDs checked for drift |
+| The Kubernetes runtime from the chart's two variables | `crates/hs-cli/src/bridges.rs` | compiles; a half-set pair fails startup |
+| The operator Deployment, RBAC, CRD and the server's variables in the chart | `deploy/helm/hs` | `helm lint`, both mode renders, `bridges.enabled=false` renders none of it |
+| Offerings first in the interface, the Offer wizard, the offering page, files, registrations tab | `web/` | unit tests and Playwright against MSW mocks |
+
+Not yet done, in the order it should happen: a `Bridge` applied by hand on a kind cluster and
+watched to `Ready`; an offering made against the real binary and an instance driven through
+the state machine by the manager; a front door messaged by a real client; the demo's shared
+WhatsApp registration replaced by an offering (section 6); the scale measurement in section 6.
+Until the first of those, this RFC describes a design, not a capability, and `CHANGELOG.md`
+says so.

@@ -237,7 +237,14 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                 })
                 .await?;
         }
-        if let Some(client) = self.client.get() {
+        // The bots are accounts, and an account an operator did not make has no business on a
+        // server that offers nothing: the Users page, and the overview's count, would show a
+        // `bridges` account from the first boot. They are created with the first offering
+        // (`put` re-syncs), and the namespace above is reserved from the start regardless.
+        let offered = !self.store.offerings().map_err(store_err)?.is_empty();
+        if let Some(client) = self.client.get()
+            && offered
+        {
             let names = std::iter::once((MANAGER_BOT, "Bridges".to_owned())).chain(
                 doors.iter().map(|(t, l)| {
                     (
@@ -741,18 +748,17 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
         if let (Some(door_room), Some(door)) = (
             &row.front_door_room,
             bridge_types::front_door_localpart(&row.bridge_type),
-        ) {
-            if let Ok(tokens) = self.tokens() {
-                let text = format!(
-                    "Your {name} bridge is ready. I've invited you to a chat with {bot}: accept it and follow the steps there to sign in."
-                );
-                let html = format!(
-                    "Your {name} bridge is ready. I've invited you to a chat with <a href=\"https://matrix.to/#/{bot}\">{bot}</a>: accept it and follow the steps there to sign in."
-                );
-                let _ = client
-                    .notice(&tokens.as_token, &self.mxid(door), door_room, &text, &html)
-                    .await;
-            }
+        ) && let Ok(tokens) = self.tokens()
+        {
+            let text = format!(
+                "Your {name} bridge is ready. I've invited you to a chat with {bot}: accept it and follow the steps there to sign in."
+            );
+            let html = format!(
+                "Your {name} bridge is ready. I've invited you to a chat with <a href=\"https://matrix.to/#/{bot}\">{bot}</a>: accept it and follow the steps there to sign in."
+            );
+            let _ = client
+                .notice(&tokens.as_token, &self.mxid(door), door_room, &text, &html)
+                .await;
         }
         Ok(())
     }

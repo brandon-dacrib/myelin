@@ -1,6 +1,56 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-09-25.
+Last updated: 2026-09-27 (the bridge manager, below); before that 2026-09-25.
+
+**The bridge manager exists, and nothing has run it** (RFC 0017 section 4.1 to 4.3,
+`crates/hs-bridges`, built 2026-09-26 by the operator and offerings session, wired into
+`hs serve` in `52649d2`). It is the admin API's data source for `bridge_offerings.*` and
+`bridge_instances.*` and the state machine behind them:
+
+- `store.rs`: offerings, instances and the manager's own row (its appservice tokens and its
+  bots' rooms) in `hs-kv`; an instance's state is persisted at every step, so a restart or
+  another replica continues rather than restarts.
+- `manager.rs`: `BridgeManager` implements `hs_admin::bridge_offerings::BridgeOfferingSource`.
+  `put` on an offering registers its front door (the manager's own registration is re-synced
+  with every enabled offering's bot in its exclusive namespace) and, for a `shared` type,
+  creates its one instance. An instance walks `requested → registered` (appservice id
+  allocated, `config.yaml` and registration rendered by `hs_admin::bridge_types` with the
+  instance's own tokens, registered through the appservice directory, tagged
+  `io.myelin.bridge_instance`) `→ deploying` (the runtime is asked to run it) `→ starting`
+  (the deployment is Ready) `→ ready` (the registry's ping succeeded), or `failed` with the
+  reason; fifteen minutes for `deploying`, ten for `starting`; `removing` deletes the
+  deployment, the registration and the row. At `ready` the instance's bot creates a direct
+  chat with its owner, sends the catalogue's sign-in steps, and the front door says so where
+  the person asked. A tick every three seconds, or when woken by a write.
+- `front_door.rs`: the manager's appservice API on the client listener under
+  `/_myelin/bridges/_matrix/app/v1/{transactions,ping,users}`, authenticated by its own
+  `hs_token`; what `@whatsappbot` answers on an invite or a message (sets one up, says where
+  theirs is, says an administrator has been told for an `elsewhere` offering, refuses politely
+  once) and what `@bridges` answers (`help`, `list`, `start`, `stop ... confirm`, `status`).
+- `matrix.rs`: the client API over loopback, as the bots and as an instance's bot.
+- `runtime.rs`: the `Runtime` trait (`target`, `apply`, `status`, `delete`, `service_url`) and
+  `manifest_yaml`, the Secret plus `Bridge` for running an instance on another cluster. The
+  Kubernetes implementation is `crates/hs-cli/src/bridges.rs` over
+  `hs_operator::deploy::KubeBridgeClient`, built only when the chart's
+  `MYELIN_BRIDGES_NAMESPACE` and `MYELIN_BRIDGES_HOMESERVER_URL` are both set; one without the
+  other fails startup. Without them `bridge_deployments.target` says `available: false` and
+  offerings can only run `elsewhere`.
+- In `hs serve`: the manager ticks only on the replica that owns the global shard, is
+  aborted at shutdown before the drain, and its router is merged into the client listener's.
+  Its registration (and the `@bridges` namespace) is made at every start; its bot accounts are
+  made with the first offering, not before -- CI caught the `bridges` account showing up in the
+  overview's user count on a server that offered nothing (2026-09-27).
+
+Verified: `cargo test -p hs-bridges` is **3 tests** (the manifest is a Secret and a `Bridge`;
+an instance row is inserted once and updated in place; backticks become code and HTML is
+escaped), `cargo test -p hs-admin` 175 with the ten operations' handlers over the in-memory
+source, and the server starts with it all wired in. **Not verified, and the whole point of
+the crate:** the state machine has never taken an instance from `requested` to `ready`, the
+front door has never received a transaction from the real server, no `Bridge` has been applied
+to an API server, and the RFC's scale note (section 6: hundreds of registrations, event routing
+not scanning every namespace linearly) has not been measured. The next thing is heisenbridge as
+a `shared` offering against the real binary on a kind cluster, then WhatsApp per user on the
+demo, replacing 2026-09-25's shared registration (`docs/next-steps.md` item 1).
 
 **A mautrix bridge works, added through the interface.** mautrix-whatsapp, against the real
 binary, from the registration and `config.yaml` the interface's wizard rendered, with nothing
