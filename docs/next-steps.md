@@ -453,6 +453,13 @@ web interface with no page reading from a 501, and talk to another homeserver. T
 is ordered by that; each item says whether a cloud session can do it (no cluster, no Docker)
 or a laptop session must.
 
+**And a second rule, also 2026-09-27 (decision 0010): the admin API and the web interface are
+how this server is administered.** No operator edits a configuration file or a YAML file to
+change what it does, and no page in the interface edits YAML, JSON or any file format as text.
+Only bootstrap (reaching the database, serving the setup page) stays in the file, the
+environment or the Helm values. Showing a generated file to copy is fine; asking someone to
+edit one is not. New settings and operations arrive with their interface control.
+
 **The completeness queue** (what the next agents get, in order; cloud-doable unless marked):
 
 1. ~~RFC 0017 end to end against the real binary.~~ **Done 2026-09-27** (see "And then it
@@ -463,7 +470,9 @@ or a laptop session must.
    RegistrationTokens 0/5 (which also gives invite-by-link user creation), Media 0/9, Reports
    0/4, ServerNotices 0/2 (also `TestServerNotices`), Tasks 0/3, Statistics 1/4, Cluster 1/6,
    then the long tails of Users 14/41 and Rooms 6/23. `python3 tools/admin_api_coverage.py
-   --list` is the checklist.
+   --list` is the checklist. Alongside it, decision 0010: the Configuration page's JSON
+   textarea (`JsonControl`, for arrays of objects and maps) becomes structured editors, and
+   `appservices.registration_files` becomes an importer-only migration path.
 3. Federation completeness: invites, leaves and knocks over federation; EDUs (typing,
    receipts, presence, device lists); restricted joins (ten Complement tests). Two in-process
    servers verify each; Complement itself is a laptop item.
