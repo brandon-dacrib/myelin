@@ -2,7 +2,27 @@
 
 Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-admin`, `hs-modules`, `hs-identity`, `hs-http` (shared with 07 and 14).
 
-Last updated: 2026-09-26 (three public recovery operations, below); before that 2026-09-25 (additive schema change for the bridges wizard); the session log that follows is from 2026-09-19 (session 6).
+Last updated: 2026-09-27 (the bridge offering operations, below); before that 2026-09-26 (three public recovery operations); 2026-09-25 (additive schema change for the bridges wizard); the session log that follows is from 2026-09-19 (session 6).
+
+> **2026-09-26, additive, served for real (RFC 0017).** Ten operations under the `Bridges` tag:
+> `bridge_deployments.target` (`GET /bridge-deployment-target`), `bridge_offerings.list/get/
+> put/delete` (`/bridge-offerings`, `/bridge-offerings/{type}`, `DELETE ... ?remove_instances=`
+> answering `409` while instances remain) and `bridge_instances.list/get/put/delete/files`
+> (`/bridge-offerings/{type}/instances[/{user_id}[/files]]`, `_` for a shared type's one
+> instance). Reads need `bridges:read`, writes `bridges:write` (the RFC's section 5 says
+> `admin:read`/`admin:write`; the document is what the router enforces, and the RFC should be
+> corrected to it). Schemas `BridgeDeploymentTarget`, `BridgeOffering`, `BridgeOfferingRequest`,
+> `BridgeOfferingAccess`, `BridgeOfferingOptions`, `BridgeInstance`, `BridgeDeployment`,
+> `BridgeInstanceFiles`; `BridgeType` gained `mode` (`per_user` or `shared`) and `deployable`.
+> In this crate: `bridge_offerings::BridgeOfferingSource` with `InMemoryBridgeOfferings` for
+> tests and the mock, `AdminState::with_bridge_offerings`, the handlers (each write audited and
+> published), and `bridge_types` renders an instance (`InstanceSpec`, `InstanceRender`, the
+> `io.myelin.bridge_instance` registration tag) as well as a registration. The real source is
+> `hs_bridges::manager::BridgeManager`, wired in `hs serve` (track 11's status has what it does
+> and does not do); `tools/admin_api_coverage.py` counts **71 of 158** operations with a real
+> handler (Bridges 26 of 26). Track 16's contract notes from its side (unpaginated `{data}`
+> lists, `image` out but `image_tag` in, no reason on `deployable: false`, no structured count
+> on the 409) are in `docs/status/16-management-web-interface.md` and are not addressed yet.
 
 > **2026-09-26, additive.** Three operations under a new `Recovery` tag, all public (`security:
 > []`, rate-limited, `no-store`), the siblings of `setup.*`: `recovery.links.create` (`POST

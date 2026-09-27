@@ -163,6 +163,24 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Bridges
 
+- **Bridges are offerings, one per person, and the server deploys them -- built, not yet
+  run.** RFC 0017 (`docs/rfcs/0017-the-server-deploys-its-own-bridges.md`), 2026-09-26. An
+  administrator offers a bridge type (WhatsApp, with an image tag, who may use it, and whether
+  it runs in this cluster or somewhere else); each person gets their own instance, with its own
+  registration, ghosts, process and volume, by messaging the bridge's familiar address
+  (`@whatsappbot:server`) or the manager bot (`@bridges:server`), or an administrator makes one
+  for them. The manager inside the server (`crates/hs-bridges`) renders the instance's files with
+  its own tokens, registers it, asks the operator to run it (a `Bridge` resource, which
+  `hs operator` turns into a claim, a one-replica Deployment and a Service, and reports back),
+  waits for the pod to be Ready and for the bridge to answer the server's ping, then has the
+  instance's bot open a direct chat with its owner and send the sign-in steps. Ten new admin
+  operations; the interface's Bridges section is offerings first, with everybody's instance,
+  failed first, on the offering's page; the chart installs the operator and its RBAC by default.
+  What is verified: the operator's builders (unit tests), the chart renders, the interface
+  against mocks, and that the server starts with all of it wired in. What is not: none of it has
+  run against a Kubernetes API server or a real cluster, no instance has been created against
+  the real binary, and nobody has messaged a front door. The register-a-bridge wizard below
+  still exists, under Registrations, for a bridge somebody runs themselves.
 - **Adding a bridge is a wizard, and it ends in a running bridge.** The interface's catalogue
   says what each of fourteen bridges is, what it needs and how to sign in to it (from the
   bridges' own documentation); choosing one renders the bridge's `config.yaml` and its
@@ -377,7 +395,7 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   rooms this replica does not own, with a fencing check inside the transaction that commits a
   write. Before this, concurrent sends through two replicas silently produced two divergent
   histories with no error to any client.
-- Admin API: 34 of 145 operations genuinely served (`tools/admin_api_coverage.py`) — users, rooms, moderation actions, a durable
+- Admin API: 71 of 158 operations genuinely served (`tools/admin_api_coverage.py`, 2026-09-27) — users, rooms, moderation actions, bridges and offerings, configuration, recovery, a durable
   audit log, and an SSE event stream. Every mutation writes exactly one audit entry and publishes
   exactly one event. The rest answer `501`, or `503` naming the capability when a seam exists but
   nothing implements it.

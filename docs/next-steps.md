@@ -1,6 +1,6 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-09-26. `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-09-27. `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
@@ -236,6 +236,45 @@ the boot from first log line to `listening` was 4 to 7 s for today's build again
 2026-09-21 image, which the storage track is now measuring. What has not run is the workflow on
 GitHub's runners; the push that carries it is the test.
 
+**Bridges are offerings, one per person, and the server deploys them -- built, wired in, and
+never run on a cluster** (RFC 0017, 2026-09-26, late). The owner's decisions that day: the
+server deploys bridges itself, one instance per user (Beeper's model), and a person gets theirs
+by messaging the bridge's familiar address. All four halves exist on `main` now. The
+**manager** (`crates/hs-bridges`, 2,400 lines) owns offerings and instances in `hs-kv`, renders
+an instance's `config.yaml` and registration with its own tokens, registers it through the
+appservice registry, asks a runtime to run it, and walks each instance through a persisted
+state machine (`requested → registered → deploying → starting → ready`, or `failed`; fifteen
+minutes for a deployment to become Ready, ten for a ready pod to answer the server's ping);
+at `ready` the instance's bot opens a direct chat with its owner and sends the catalogue's
+sign-in steps. The manager is itself an appservice (`myelin-bridges`), served on the client
+listener under `/_myelin/bridges`, whose namespace is every enabled offering's front door plus
+`@bridges`: invite `@whatsappbot`, it joins, says it is setting up your bridge, and tells you
+when it is ready. The **admin API** has all ten operations RFC 0017 section 5 lists,
+`bridge_deployments.target` through `bridge_instances.files` (Bridges are 26 of 26 now, and
+the whole API is 71 of 158). The **operator** (`crates/hs-operator`, `hs operator`) reconciles
+a `Bridge` into a claim, a one-replica `Recreate` Deployment whose init container copies the
+files Secret into `/data` only where a file is missing (a mautrix bridge rewrites its config
+and mints its pickle key on first start), and a Service, and writes Ready or Degraded back
+with the reason; the chart installs it, the CRD and the RBAC by default (`bridges.enabled`)
+and tells the server where it may deploy through two environment variables. The **interface**
+is offerings first: `/bridges` lists what is offered, "Offer a bridge" is the wizard, an
+offering's page shows everybody's instance, failed first, with Retry, Files, Remove and Add
+for a user; the old register-a-bridge wizard lives on under Registrations. The last commit
+of the day wired it into `hs serve`: the manager runs only on the replica that owns the
+global shard, is aborted at shutdown before the drain, and a half-set pair of the two
+deployment variables is a startup error rather than a silent fall-back to "run it elsewhere".
+
+What is verified is narrow, and this paragraph is not a claim that any of it works. The
+operator has 28 unit tests over pure builders and the file-copy script, and its two chart
+renders and CRD copies are checked; the interface's 25 test files and 26 Playwright flows run
+against MSW mocks; the manager has **three** unit tests (the manifest, the store's upsert, the
+message formatting) and its state machine, front door and Matrix client have none. Nothing
+has run against a real API server or a real cluster; no instance has been created against
+the real binary; nobody has messaged a front door; the demo at `myelin.dacrib.net` still has
+2026-09-25's shared WhatsApp registration, which section 6 of the RFC says an offering
+replaces. The order to close that is in item 1 below: a kind run of the operator with a
+hand-written `Bridge`, then the manager driving it, then the demo.
+
 **The admin interface ships.** Until 2026-09-21 it did not: every binary and every published image served a placeholder at `/admin/` saying the interface had not been built in, because nothing embedded `web/dist`. `crates/hs-admin/build.rs` now stages the built interface (or the placeholder, for a Rust-only checkout, and says so at startup); release builds set `HS_ADMIN_WEB_DIST` and *fail* without a built interface; CD refuses to publish an image whose `/admin/` is not the interface. Verified on the published artifact: `ghcr.io/brandon-dacrib/myelin:main`, pulled from the registry on 2026-09-21 and run with the README's exact command, serves the interface at `/admin/`, answers `needs_setup: true`, and logs the setup link. What has still never run is the `v*` binaries job's new Node step, which only a tag exercises.
 
 **Complement, `csapi`: 317 of 384 assertions pass** (78 of 106 top-level), measured 2026-09-26 at
@@ -339,11 +378,11 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 | Client-server API | ~75% | 317/384 csapi assertions, 78/106 top-level (run 11); two real Element sessions sign in, create an encrypted room, invite, accept, and read each other's encrypted messages. The number understates the day: four of the fixes behind it were `/sync` silently losing events, which no percentage shows |
 | Storage, rooms, state resolution | ~85% | the engine underneath; 1600+ tests, two backends through one conformance suite, state bake-off done |
 | Configuration and first run | ~90% | database-backed, editable in the UI, one command from nothing to a working server |
-| Admin API | ~40% | 58 of 145 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Config 6/6, Server 5/5, AuditLog 3/3, Setup 2/2, Bridges 16/16, Users 14/41, Rooms 6/23, Federation 3/7, Statistics 1/4, Cluster 1/6, and Media 0/9, RegistrationTokens 0/5 |
+| Admin API | ~45% | 71 of 158 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Bridges 26/26, Config 6/6, Server 5/5, AuditLog 3/3, Recovery 3/3, Setup 2/2, Events 1/1, Users 14/41, Rooms 6/23, Federation 3/7, Statistics 1/4, Cluster 1/6, and Media 0/9, Migration 0/8, RegistrationTokens 0/5, Reports 0/4, Tasks 0/3, ServerNotices 0/2 |
 | Management web interface | ~75% | users (with devices, sign-out and password reset), rooms (with members), bridges (the catalogue, the wizard with the bridge's own config, the runbook, sign-in guides), federation destinations, configuration and the audit log are real against the real server; the media and reports pages still read from operations that answer 501; arrays-of-objects are a JSON textarea |
 | **Federation** | **~30%** | 75/250 assertions, 14/88 top-level (run 7); a user here joins a room hosted elsewhere through the client API, messages flow both ways between two real servers, and the room's history from before the join is fetched as the client scrolls back; in-memory outbound queue, no EDUs, no invites/leaves/knocks over federation |
-| Bridges | ~75% | heisenbridge works end to end both directions (`docs/bridges/heisenbridge.md`); mautrix-whatsapp, added through the wizard, connects and starts in appservice-mode encryption (`docs/bridges/mautrix.md`); all 16 bridge operations are real; no mautrix bridge has carried a message yet, because signing in needs a phone |
-| Operations (HA, scale-out) | ~50% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; the chart is published from `main` and installs from the registry in one sentence; a standing demo behind a Traefik Ingress with a Let's Encrypt certificate, scraped by Prometheus, its setup page opened in a browser at the public hostname; a locked-out administrator gets back in with `hs recover` run where the key is; readiness withdrawn the moment a shutdown begins; two replicas shared a room on one PostgreSQL in an experiment; the cluster path has never carried real traffic on a cluster and the operator creates nothing yet |
+| Bridges | ~75% | heisenbridge works end to end both directions (`docs/bridges/heisenbridge.md`); mautrix-whatsapp, added through the wizard, connects and starts in appservice-mode encryption (`docs/bridges/mautrix.md`); all 26 bridge operations are real; no mautrix bridge has carried a message yet, because signing in needs a phone. Not counted: offerings and per-user instances (RFC 0017) are built end to end and have never been run, so they add nothing to the number until they have |
+| Operations (HA, scale-out) | ~50% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; the chart is published from `main` and installs from the registry in one sentence; a standing demo behind a Traefik Ingress with a Let's Encrypt certificate, scraped by Prometheus, its setup page opened in a browser at the public hostname; a locked-out administrator gets back in with `hs recover` run where the key is; readiness withdrawn the moment a shutdown begins; two replicas shared a room on one PostgreSQL in an experiment; the cluster path has never carried real traffic on a cluster; the operator reconciles a `Bridge` into a pod, a Service and a volume in unit tests and has never been run against an API server, and `Homeserver` is still status-only |
 
 Federation is still the honest answer to "when could I use this". Everything else is far enough
 along that the gaps are specific and listed. As of 2026-09-25 a user here can join a room on
@@ -356,30 +395,37 @@ What is *not* in those percentages, and should temper them: no security review, 
 beyond a loadgen harness, `cargo fuzz` never run, Sytest never run, and no bridge has yet
 carried a message through an encrypted room. Each of those has historically found things.
 
-## In flight right now (2026-09-26, evening)
+## In flight right now (2026-09-27)
 
-Five agents were started in parallel, each in its own git worktree under `.claude/worktrees/`
-(excluded from git locally, not ignored in the repository) on a branch named after the
-worktree, committing there and never pushing; the lead merges each branch into `main`, runs
-the checks and pushes. If a session ends before that, the work is still on these branches
-(`git branch --list 'worktree-agent-*'`, `git log main..<branch>`), and the worktree's own
-`docs/status/NN-*.md` has the agent's account of what was verified. Merge with
-`git merge --no-ff <branch>`, then `cargo fmt --all --check`, clippy and the touched crates'
-tests, then update this file, `README.md`'s table and `CHANGELOG.md`, which the agents were told
-not to touch. All five share the main checkout's `target/` through a symlink.
+On 2026-09-26 five agents were started in parallel, each in its own git worktree under
+`.claude/worktrees/` (excluded from git locally, not ignored in the repository) on a branch
+named after the worktree, committing there and never pushing; the lead merges each branch into
+`main`, runs the checks and pushes. One of the five is merged. The other four, and the two
+worktrees of the operator and offerings session, exist **only on the owner's machine**: as of
+the 2026-09-27 session the remote has `main` and nothing else, so a cloud session cannot see
+them until they are pushed
+(`git push -u origin 'refs/heads/worktree-agent-*:refs/heads/worktree-agent-*'`, after
+committing anything still uncommitted in each worktree). Then, for each: `git log
+main..<branch>`, the worktree's own `docs/status/NN-*.md` for the agent's account of what was
+verified, `git merge --no-ff <branch>`, `cargo fmt --all --check`, clippy and the touched
+crates' tests, and then this file, `README.md`'s table and `CHANGELOG.md`, which the agents
+were told not to touch.
 
-| Branch | Track | Task |
-|---|---|---|
-| `worktree-agent-a24fa2b7f44661e43` | 12 platform | the chart install as a CD gate: a `kind` install in `cd.yml` before anything is tagged, as a script under `deploy/helm/hs/ci/` |
-| `worktree-agent-a909b00192bc83196` | 01 storage | measure the five-second cold boot and halve it; before/after in `docs/status/01-storage-engine.md`; it will say what the startup probe can become |
-| `worktree-agent-a368732bc30d06e73` | 03 cluster | a pod knows its own mesh address (config field + Downward API in the chart), mesh mTLS wired from `hs-cli` and the chart, `/createRoom` shard-gated; verified as two processes on one PostgreSQL; a values file for the two-pod cluster experiment |
-| `worktree-agent-a2d1e568234dc9ca4` | 05 sync | `/sync` cluster-aware: the room owner wakes the replica holding the user's session over the mesh, read-your-writes across replicas; two-process transcript in `docs/status/05-sync.md`, `docs/scaling.md` kept true |
-| `worktree-agent-a64e3554e25e92d1a` | 06 federation | the outbound federation queue and per-destination backoff survive a restart; verified by restarting the real binary |
+| Branch | Track | Task | State |
+|---|---|---|---|
+| `worktree-agent-a24fa2b7f44661e43` | 12 platform | the chart install as a CD gate | **merged** (`50fa29f`); see "And gated" |
+| `worktree-agent-a909b00192bc83196` | 01 storage | measure the five-second cold boot and halve it; before/after in `docs/status/01-storage-engine.md`; it will say what the startup probe can become | not pushed |
+| `worktree-agent-a368732bc30d06e73` | 03 cluster | a pod knows its own mesh address (config field + Downward API in the chart), mesh mTLS wired from `hs-cli` and the chart, `/createRoom` shard-gated; verified as two processes on one PostgreSQL; a values file for the two-pod cluster experiment | not pushed |
+| `worktree-agent-a2d1e568234dc9ca4` | 05 sync | `/sync` cluster-aware: the room owner wakes the replica holding the user's session over the mesh, read-your-writes across replicas; two-process transcript in `docs/status/05-sync.md`, `docs/scaling.md` kept true | not pushed |
+| `worktree-agent-a64e3554e25e92d1a` | 06 federation | the outbound federation queue and per-destination backoff survive a restart; verified by restarting the real binary | not pushed |
+| `worktree-agent-a093b1e401ca6cda1`, `worktree-agent-aa9588e34dffe839c` | 11/12/15/16 | the operator and offerings session (RFC 0017); its work reached `main` as `1c38b5e` to `52649d2` | not pushed; probably nothing beyond `main`, to be checked with `git log main..<branch>` |
 
-The two other worktrees at `f1ebdbc` belong to the session building the operator (RFC 0017,
-bridge offerings) and are not the lead's to merge. When the cluster and sync branches are in
-and CD has published an image with them, the two-pod experiment on the real cluster is the next
-thing (item 1 below), with the values file the cluster agent leaves behind.
+The four unmerged branches were written against `main` at `7647578` or so and `main` has
+moved by RFC 0017 (a new crate, `hs serve` wiring, the chart's operator templates); expect
+conflicts in `crates/hs-cli/src/serve.rs` and `deploy/helm/hs/` from the cluster branch in
+particular. When the cluster and sync branches are in and CD has published an image with them,
+the two-pod experiment on the real cluster is the next thing (item 1 below), with the values
+file the cluster agent leaves behind.
 
 ## What to do next, in order
 
@@ -430,10 +476,18 @@ would do it; each ends in a transcript in `docs/status/12-platform-and-kubernete
   withdrawn first now and the drain hands shards off, but nobody has measured it. A `preStop`
   sleep for endpoint propagation (Kubernetes 1.30+ has a native `sleep` action, which matters
   because the image has no shell) may be needed; find out.
-- **The operator creates something.** `reconcile_homeserver` computes a status and creates no
-  `StatefulSet`, `Service` or `ConfigMap`. Phase 1 is exactly what the chart renders, owned by
-  a `Homeserver` resource, with status from `/health/ready` and the shard map. `Bridge` after
-  that: the wizard already renders the resource it would reconcile.
+- **The operator creates something -- `Bridge` half built, `Homeserver` not started.** Since
+  2026-09-26 the operator reconciles a `Bridge` into a claim, a Deployment and a Service (see
+  "Bridges are offerings" in the state of things), in unit tests and `helm template` only.
+  The next step, in order: `kind create cluster`, `helm install` the chart (the operator
+  comes with it), `kubectl apply` a hand-written `Bridge` for heisenbridge (no external
+  account needed) and watch it reach `Ready` with the transcript in
+  `docs/status/12-platform-and-kubernetes.md`; then offer heisenbridge from the interface and
+  let `hs-bridges` drive the same thing, front door included; then WhatsApp on the demo,
+  replacing the shared registration. `reconcile_homeserver` still computes a status and
+  creates no `StatefulSet`, `Service` or `ConfigMap`; phase 1 there is exactly what the chart
+  renders, owned by a `Homeserver` resource, with status from `/health/ready` and the shard
+  map.
 - ~~The chart install as a CD gate.~~ **Done 2026-09-26** (see "And gated"): `helm install` on
   a kind cluster in the amd64 image leg, to Ready, the setup link read from the log and used,
   before anything is tagged. First run on GitHub's runners pending the push.
@@ -731,7 +785,10 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | The `main` chart needs `--devel`, and a first tag hides it until Chart.yaml's version moves on | `.github`, `deploy/helm` | pre-releases sort below the release they precede; bump `version` in Chart.yaml right after tagging |
 | An install from a chart before 2026-09-26's label fix cannot be upgraded in place | `deploy/helm` | one `kubectl delete statefulset --cascade=orphan` before the next `helm upgrade`; only the demo existed |
 | A pod does not know its own mesh address | `hs-cli`, `hs-cluster` | `advertise_host` falls back to the bind address or `127.0.0.1`; cluster mode between two pods has not been tried |
-| The operator creates no workloads | `hs-operator` | `Homeserver` reconciles to a status only; the chart is the only way to deploy |
+| The operator has never run against an API server | `hs-operator` | the `Bridge` reconciler (claim, Deployment, Service, status) is unit-tested only; `Homeserver` reconciles to a status only; the chart is the only way to deploy the server |
+| RFC 0017 has never been exercised end to end | `hs-bridges`, `hs-cli` | no offering has been made against the real binary, no instance created, no front door messaged; the manager's state machine, front door and Matrix client have no tests of their own |
+| The demo still runs a shared WhatsApp registration | demo | RFC 0017 section 6 says an offering replaces it; not done |
+| The bridge manager runs on one replica only | `hs-cli` | gated to the owner of the global shard, so a handoff pauses provisioning for a tick; never watched on a cluster |
 | A cold boot in the image takes about five seconds | `hs-cli`, `hs-kv` | the first startup probe is refused every time; harmless, unmeasured |
 | User-directory scope is computed by walking rooms on every search | `hs-user` | fine today; the first thing to index if a public room gets very large |
 | `TestThreadsEndpoint` flapped between runs | `hs-room` | ordering tie on a millisecond timestamp; fixed 2026-09-21, not yet graded -- if any test still moves between identical runs, that is a bug to find, not noise |
@@ -756,4 +813,4 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
   interface was embedded; it would have passed for the placeholder too, and the binary had the
   placeholder. Look at the decision itself (the build script's output, the log line, the byte on
   the wire), not at a test that is satisfied either way.
-- **Registered is not working, and a real handler is not working either.** 34 of 145 admin operations have a real handler (`tools/admin_api_coverage.py` counts them; the figure used to be quoted by hand and was different in every document). The rest answer 501. But `users.create` had a real handler for days while the only real user directory answered it 503 — so "has a handler" is a ceiling, and the floor is an end-to-end test through `hs serve`.
+- **Registered is not working, and a real handler is not working either.** 71 of 158 admin operations have a real handler (`tools/admin_api_coverage.py` counts them; the figure used to be quoted by hand and was different in every document). The rest answer 501. But `users.create` had a real handler for days while the only real user directory answered it 503 — so "has a handler" is a ceiling, and the floor is an end-to-end test through `hs serve`.
