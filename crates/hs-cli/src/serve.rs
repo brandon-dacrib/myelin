@@ -1060,7 +1060,8 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // The admin API's view of federation. With federation off there are no destinations, and
     // an empty list is the honest answer -- not a 503, which would read as "could not check".
     let federation_source: Arc<dyn hs_admin::sources::FederationSource>;
-    let outbound_federation: Option<crate::federation_sender::OutboundFederation>;
+    // The sender, to be fed once the cluster is up (its feeder is gated on shard ownership).
+    let federation_sender: Option<Arc<hs_federation::sender::FederationSender>>;
     // How `POST /join` reaches a room hosted elsewhere (`crate::remote_join`): over the
     // federation mount's own client, so only when federation is on.
     let remote_join: Option<Arc<dyn hs_room::remote_join::RemoteJoin>>;
@@ -1079,14 +1080,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             hs_federation::admin_source::DestinationStoreSource::new(mount.destinations.clone())
                 .with_sender(mount.sender.clone()),
         );
-        // This server's own events reach remote servers from here. Subscribes to the room
-        // stream inside, so it is started before any listener is bound: an event sent before the
-        // subscription existed would never be sent anywhere (`crate::federation_sender`).
-        outbound_federation = Some(crate::federation_sender::OutboundFederation::start(
-            rooms.clone(),
-            mount.sender.clone(),
-            server_name.clone(),
-        ));
+        federation_sender = Some(mount.sender.clone());
         remote_join = Some(Arc::new(crate::remote_join::FederationRemoteJoin::new(
             mount.client.clone(),
             mount.x_matrix.key_cache.clone(),
@@ -1110,7 +1104,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     } else {
         tracing::info!("federation is disabled; not mounting the federation transport server");
         federation_source = Arc::new(hs_admin::sources::InMemoryFederationSource::new());
-        outbound_federation = None;
+        federation_sender = None;
         remote_join = None;
         None
     };
@@ -1167,6 +1161,19 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     )
     .await
     .map_err(|e| ServeError::Sessions(Box::new(e)))?;
+    // This server's own events reach remote servers from here, from the replica that owns each
+    // destination's federation shard. Subscribes to the room stream inside, so it is started
+    // before any listener is bound: an event sent before the subscription existed would never
+    // be sent anywhere (`crate::federation_sender`).
+    let outbound_federation = federation_sender.map(|sender| {
+        crate::federation_sender::OutboundFederation::start(
+            rooms.clone(),
+            sender,
+            server_name.clone(),
+            cluster_handles.cluster.ownership().clone(),
+            cluster_handles.layout,
+        )
+    });
 
     let bridge_runtime = crate::bridges::runtime()
         .await

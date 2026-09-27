@@ -187,6 +187,8 @@ async fn a_local_message_reaches_the_server_of_a_remote_member_and_nothing_earli
         h.rooms.clone(),
         h.sender.clone(),
         h.identity.server_name.clone(),
+        hs_cluster::ownership::SingleNode::new(hs_cluster::types::ReplicaId::new("only")),
+        hs_cluster::types::ShardLayout::default(),
     );
     let alice = Harness::alice();
     let bob = h.bob();
@@ -353,4 +355,148 @@ async fn a_kick_reaches_the_kicked_users_server_and_later_events_do_not() {
     assert_eq!(pdus[1]["state_key"], bob.as_str());
     assert_eq!(pdus[1]["content"]["membership"], "leave");
     assert_eq!(pdus[1]["sender"], alice.as_str());
+}
+
+/// An ownership whose answers a test scripts: which shards are mine, changed at will, with the
+/// event a real acquisition or release would publish (the same double
+/// `hs_cli::appservice_delivery`'s tests use).
+struct Scripted {
+    me: hs_cluster::types::ReplicaId,
+    mine: std::sync::Mutex<std::collections::HashSet<hs_cluster::types::ShardId>>,
+    events: tokio::sync::broadcast::Sender<hs_cluster::ownership::OwnershipEvent>,
+}
+
+impl Scripted {
+    fn owning_nothing() -> Arc<Self> {
+        Arc::new(Self {
+            me: hs_cluster::types::ReplicaId::new("replica-b"),
+            mine: std::sync::Mutex::new(std::collections::HashSet::new()),
+            events: tokio::sync::broadcast::channel(16).0,
+        })
+    }
+
+    fn acquire(&self, shard: hs_cluster::types::ShardId) {
+        self.mine.lock().unwrap().insert(shard);
+        let _ = self
+            .events
+            .send(hs_cluster::ownership::OwnershipEvent::Acquired(
+                hs_cluster::fence::Fence::inert(shard),
+            ));
+    }
+
+    fn release(&self, shard: hs_cluster::types::ShardId) {
+        self.mine.lock().unwrap().remove(&shard);
+        let _ = self
+            .events
+            .send(hs_cluster::ownership::OwnershipEvent::Released(shard));
+    }
+}
+
+impl hs_cluster::ownership::Ownership for Scripted {
+    fn me(&self) -> &hs_cluster::types::ReplicaId {
+        &self.me
+    }
+    fn owner_of(&self, shard: hs_cluster::types::ShardId) -> Option<hs_cluster::types::ReplicaId> {
+        self.is_mine(shard).then(|| self.me.clone())
+    }
+    fn is_mine(&self, shard: hs_cluster::types::ShardId) -> bool {
+        self.mine.lock().unwrap().contains(&shard)
+    }
+    fn fence(&self, shard: hs_cluster::types::ShardId) -> Option<hs_cluster::fence::Fence> {
+        self.is_mine(shard)
+            .then(|| hs_cluster::fence::Fence::inert(shard))
+    }
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<hs_cluster::ownership::OwnershipEvent> {
+        self.events.subscribe()
+    }
+    fn shard_map(&self) -> tokio::sync::watch::Receiver<Arc<hs_cluster::ownership::ShardMap>> {
+        tokio::sync::watch::channel(Arc::new(hs_cluster::ownership::ShardMap::default())).1
+    }
+}
+
+/// In a cluster, the replica that owns a destination's federation shard is the one that sends
+/// to it: a replica that does not own it queues the event (into the store every replica
+/// shares) and sends nothing; acquiring the shard sends what is queued; releasing it stops the
+/// worker and leaves the rest queued for whoever owns it next.
+#[tokio::test]
+async fn only_the_replica_that_owns_a_destinations_federation_shard_sends_to_it() {
+    let h = Harness::new().await;
+    let ownership = Scripted::owning_nothing();
+    let layout = hs_cluster::types::ShardLayout::default();
+    let shard = layout.federation_shard(&h.remote);
+    let outbound = OutboundFederation::start(
+        h.rooms.clone(),
+        h.sender.clone(),
+        h.identity.server_name.clone(),
+        ownership.clone(),
+        layout,
+    );
+    let alice = Harness::alice();
+    let bob = h.bob();
+    let room = h.public_room().await;
+    room.membership(
+        bob.clone(),
+        Action::Join,
+        bob.clone(),
+        serde_json::json!({}),
+        3_000,
+    )
+    .await
+    .expect("bob joins");
+    room.send_event(
+        alice.clone(),
+        "m.room.message".to_owned(),
+        None,
+        serde_json::json!({ "msgtype": "m.text", "body": "queued elsewhere" }),
+        None,
+        4_000,
+    )
+    .await
+    .expect("message to bob");
+
+    // Not this replica's to send: queued, not sent, not pending here.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.peer.request_count(), 0, "{:?}", h.peer.requests());
+    assert_eq!(h.sender.pending_pdus(), 0);
+    assert!(h.sender.pending_by_destination().is_empty());
+
+    // Now it is.
+    ownership.acquire(shard);
+    let requests = h.settled_transactions(1).await;
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(
+        pdus_of(&requests[0])[0]["content"]["body"],
+        "queued elsewhere"
+    );
+
+    // And then it is not, again: the worker goes, with nothing lost.
+    ownership.release(shard);
+    assert!(
+        wait_for(Duration::from_secs(5), || h
+            .sender
+            .pending_by_destination()
+            .is_empty())
+        .await,
+        "the worker should have been stopped: {:?}",
+        h.sender.pending_by_destination()
+    );
+    room.send_event(
+        alice.clone(),
+        "m.room.message".to_owned(),
+        None,
+        serde_json::json!({ "msgtype": "m.text", "body": "after the release" }),
+        None,
+        5_000,
+    )
+    .await
+    .expect("second message");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        h.peer.request_count(),
+        1,
+        "sent after the shard was given up"
+    );
+    assert_eq!(h.sender.pending_pdus(), 0);
+
+    outbound.stop();
 }

@@ -991,10 +991,18 @@ pub fn build_mount<B: KvBackend + 'static>(
     // The same client again: a transaction to a destination that is backing off waits for the
     // same `retry_at` every other outbound call to it does, and an administrator's reset of that
     // destination releases both.
+    // In a cluster the store is shared and another replica may write rows for a destination
+    // this one sends for, so an idle worker looks again every so often; alone, the store only
+    // ever holds what this process's own channels already carried.
+    let store_rescan_interval =
+        (!config.cluster.single_node).then(|| std::time::Duration::from_secs(10));
     let sender = Arc::new(hs_federation::sender::FederationSender::with_store(
         client.clone(),
         server_name.clone(),
-        hs_federation::sender::SenderConfig::for_client(&client),
+        hs_federation::sender::SenderConfig {
+            store_rescan_interval,
+            ..hs_federation::sender::SenderConfig::for_client(&client)
+        },
         outbound_store,
     ));
 

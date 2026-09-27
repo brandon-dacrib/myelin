@@ -32,14 +32,22 @@
 //!
 //! # In a cluster
 //!
-//! Not shard-gated. A room's actor is resident on the replica that owns its shard and publishes
-//! only there, so each local event is handed to exactly one replica's sender; but nothing here
-//! consults `hs-cluster`, and a persisted, sharded sender will need to own that decision.
+//! A room's actor is resident on the replica that owns its shard and publishes only there, so
+//! each local event is handed to exactly one replica's sender, which writes it to the shared
+//! store for every destination. Which replica *sends* for a destination is a separate question,
+//! answered by [`ShardGate`]: the one that owns `ShardLayout::federation_shard(destination)`
+//! (RFC 0001's federation shards). [`follow_ownership`] keeps the sender in line with that as
+//! shards come and go: acquiring a federation shard resumes the queues now sent for here,
+//! releasing or losing one stops the workers that no longer are, leaving their queues in the
+//! store for the new owner. In single-node mode every shard is always mine and none of this is
+//! visible.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use hs_federation::sender::FederationSender;
+use hs_cluster::ownership::{Ownership, OwnershipEvent};
+use hs_cluster::types::{ShardKind, ShardLayout};
+use hs_federation::sender::{FederationSender, SendGate};
 use hs_kv::KvBackend;
 use hs_model::Event;
 use hs_room::RoomError;
@@ -50,41 +58,65 @@ use ruma::{OwnedServerName, ServerName};
 use serde_json::Value;
 use tokio::sync::broadcast::error::RecvError;
 
+/// The sender's gate in `hs serve`: a destination is sent for by the replica that owns its
+/// federation shard. See the module docs.
+pub struct ShardGate {
+    ownership: Arc<dyn Ownership>,
+    layout: ShardLayout,
+}
+
+impl ShardGate {
+    /// A gate over `ownership`, computing shards with `layout`.
+    #[must_use]
+    pub fn new(ownership: Arc<dyn Ownership>, layout: ShardLayout) -> Self {
+        Self { ownership, layout }
+    }
+}
+
+impl SendGate for ShardGate {
+    fn sends_here(&self, destination: &str) -> bool {
+        self.ownership
+            .is_mine(self.layout.federation_shard(destination))
+    }
+}
+
 /// The running feeder: stopped by [`OutboundFederation::stop`], which `hs serve`'s shutdown
 /// calls.
 pub struct OutboundFederation {
     task: tokio::task::AbortHandle,
+    ownership_task: tokio::task::AbortHandle,
     sender: Arc<FederationSender>,
 }
 
 impl OutboundFederation {
-    /// Subscribes to `rooms`' update stream and starts following it, and resumes whatever the
+    /// Subscribes to `rooms`' update stream and starts following it; gates the sender on
+    /// `ownership` (see the module docs) and follows that too; and resumes whatever the
     /// sender's store still holds from a previous run (`FederationSender::resume`: every
-    /// destination with a queue gets its worker back, oldest PDU first). Subscribe-then-return,
-    /// so a caller that starts this before binding any listener is guaranteed to see every
-    /// event a client sends afterwards; updates published before this call are not replayed.
+    /// destination with a queue that this replica sends for gets its worker back, oldest PDU
+    /// first). Subscribe-then-return, so a caller that starts this before binding any listener
+    /// is guaranteed to see every event a client sends afterwards; updates published before
+    /// this call are not replayed.
     #[must_use]
     pub fn start<B: KvBackend + 'static>(
         rooms: Arc<RoomRegistry<B>>,
         sender: Arc<FederationSender>,
         own_server_name: OwnedServerName,
+        ownership: Arc<dyn Ownership>,
+        layout: ShardLayout,
     ) -> Self {
         let updates = rooms.subscribe_global();
-        match sender.resume() {
-            Ok(0) => {}
-            Ok(pdus) => tracing::info!(
-                pdus,
-                "resumed outbound federation queues left by a previous run"
-            ),
-            Err(error) => tracing::error!(
-                %error,
-                "could not read the outbound federation queues left by a previous run; what \
-                 they hold will go out only once something new is queued for the same server"
-            ),
-        }
+        let ownership_events = ownership.subscribe();
+        sender.set_gate(Arc::new(ShardGate::new(ownership, layout)));
+        resume_logged(&sender);
         let task =
             tokio::spawn(follow(rooms, sender.clone(), own_server_name, updates)).abort_handle();
-        Self { task, sender }
+        let ownership_task =
+            tokio::spawn(follow_ownership(sender.clone(), ownership_events)).abort_handle();
+        Self {
+            task,
+            ownership_task,
+            sender,
+        }
     }
 
     /// The sender this feeds.
@@ -93,11 +125,58 @@ impl OutboundFederation {
         &self.sender
     }
 
-    /// Stops following rooms and shuts the sender down. Whatever is still queued stays in the
-    /// sender's store for the next start, and the sender logs how much.
+    /// Stops following rooms and ownership and shuts the sender down. Whatever is still queued
+    /// stays in the sender's store for the next start, and the sender logs how much.
     pub fn stop(&self) {
         self.task.abort();
+        self.ownership_task.abort();
         self.sender.shutdown();
+    }
+}
+
+fn resume_logged(sender: &FederationSender) {
+    match sender.resume() {
+        Ok(0) => {}
+        Ok(pdus) => tracing::info!(
+            pdus,
+            "resumed outbound federation queues left by a previous run"
+        ),
+        Err(error) => tracing::error!(
+            %error,
+            "could not read the outbound federation queues left by a previous run; what they \
+             hold will go out only once something new is queued for the same server"
+        ),
+    }
+}
+
+/// Keeps `sender`'s workers in line with shard ownership (see the module docs): a federation
+/// shard acquired resumes the queues now sent for here, one released or lost stops the workers
+/// that no longer are. A lagged event stream is answered by doing both, since the answer to
+/// "what changed" is then whatever the gate says now. Returns when the stream closes.
+pub async fn follow_ownership(
+    sender: Arc<FederationSender>,
+    mut events: tokio::sync::broadcast::Receiver<OwnershipEvent>,
+) {
+    loop {
+        match events.recv().await {
+            Ok(OwnershipEvent::Acquired(fence)) if fence.shard.kind == ShardKind::Federation => {
+                tracing::info!(shard = ?fence.shard, "federation shard acquired");
+                resume_logged(&sender);
+            }
+            Ok(OwnershipEvent::Released(shard) | OwnershipEvent::Lost { shard, .. })
+                if shard.kind == ShardKind::Federation =>
+            {
+                tracing::info!(?shard, "federation shard given up");
+                sender.stop_workers_not_sent_here();
+            }
+            Ok(_) => {}
+            Err(RecvError::Lagged(missed)) => {
+                tracing::warn!(missed, "ownership events missed; re-reading what is mine");
+                sender.stop_workers_not_sent_here();
+                resume_logged(&sender);
+            }
+            Err(RecvError::Closed) => return,
+        }
     }
 }
 
