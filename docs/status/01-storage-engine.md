@@ -1,5 +1,121 @@
 # 01 Storage engine: status
 
+## The cold boot measured: it is keyspace creation, and only the first boot pays it (2026-09-27)
+
+`docs/next-steps.md` items 1 ("The first-boot startup probe") and 3 ("A first boot takes
+about five seconds"). This session was cut short by a priority change (completeness over
+performance) after the measurement and before the fix, so this section is a measurement and
+a proposed change, not a delivered speed-up. Nothing in `hs-kv` or `hs-cli` was changed.
+
+### What was measured, by running
+
+Method: `hs serve -c homeserver.yaml` (embedded backend, one listener on an ephemeral
+127.0.0.1 port, `server_name: example.org`, `RUST_LOG` unset) launched by a script that
+records the launch wall clock, reads the server's own log lines (Synapse-text format, the
+native default; millisecond timestamps) and stops the server at `listening`. Each run boots
+once over an **empty** data directory ("cold": the very first boot of a server) and then
+again over the **same** directory ("warm": every boot after the first). The binary was the
+**debug** build (`target/debug/hs`, built from `main` at `3ee2ea8`); the release build was
+started but had not finished under contention when the session was wrapped up, so **no
+release number exists yet**. Three other agents were building on four cores at the time, so
+every number is an upper bound on the code.
+
+Three cold boots and two warm boots, launch to `listening`:
+
+| boot | launch to first log line | first line to appservice pump line | pump to `.well-known` line | to `listening` | **total** |
+|---|---|---|---|---|---|
+| cold 1 | 0.27 s | 4.10 s | 0.60 s | 0.03 s | **5.00 s** |
+| cold 2 | 0.14 s | 4.60 s | 0.55 s | 0.04 s | **5.33 s** |
+| cold 3 | 0.13 s | 4.55 s | 0.71 s | 0.05 s | **5.43 s** |
+| warm 1 | 0.34 s | (no pump line) 0.03 s | | 0.04 s | **0.41 s** |
+| warm 2 | 0.34 s | 0.04 s | | 0.06 s | **0.44 s** |
+
+So the five seconds the kind install saw (`docs/status/12-platform-and-kubernetes.md`,
+"What the kind install says about boot time and probes") is real, it reproduces outside a
+container, and **a second boot over the same data directory is 0.4 s**. The whole cost is in
+the first boot, between "configuration resolved" and the appservice pump's line, which is
+where every store opens its keyspaces (`TablesAuthStore::open`, `RoomRegistry::open`,
+`build_session_mounts`, the appservice registry, ... in `spawn_serve_with_backend`,
+`crates/hs-cli/src/serve.rs`). The data directory ends the cold boot with **77 keyspaces**
+(`data/keyspaces/1..77`, plus Fjall's own meta keyspace `0`; the count in `next-steps.md` says
+"sixty", it is 77 today), 1.7 MB on disk. Opening the Fjall database itself, seeding the configuration store, generating the
+signing key and resolving the configuration all happen before the first log line and cost
+0.13 to 0.34 s together.
+
+The 0.55 to 0.7 s between the pump line and `.well-known` was not attributed; it is the next
+largest piece and is not storage (nothing opens a keyspace there).
+
+### The mechanism, read from Fjall 3.1.10's source (not instrumented)
+
+`FjallBackend::keyspace` (`crates/hs-kv/src/fjall_backend.rs`) calls
+`fjall::Database::keyspace(name, opts)`. For a name that does not exist yet, Fjall
+(`fjall-3.1.10/src/db.rs`, `keyspace/mod.rs`, `meta_keyspace.rs`) does, under the database's
+keyspaces **write lock**, so strictly one at a time:
+
+1. `Keyspace::create_new`: `create_dir_all` of `keyspaces/<id>`, then `lsm_tree::Config::open`
+   on it, which writes the tree's version marker and manifest and fsyncs the files and the
+   directories.
+2. `MetaKeyspace::create_keyspace`: the keyspace's configuration and name are written into
+   the meta keyspace (keyspace 0) **through the ingestion API**, i.e. as a freshly written
+   SST table (file write, fsync, directory fsync, then a manifest commit with its own fsync),
+   not through the journal.
+3. `MetaKeyspace::maintenance`: a Leveled compaction of the meta keyspace with an L0
+   threshold of **2**, so every second creation also rewrites the meta tables into a new SST
+   and commits a new manifest version, with the same fsyncs again.
+
+The evidence that this is what ran: after the cold boot the meta keyspace's manifest is at
+`data/keyspaces/0/v116`, i.e. 116 version commits for 77 user keyspaces (one ingestion
+commit each plus a compaction commit for most), and its `tables/` holds a single compacted
+table. At roughly 58 ms per keyspace (4.5 s / 77) on this machine's disk, with something like
+six to ten fsyncs per keyspace, that is the boot. It is not the journal (`Journal::recover`
+persists the active journal once, `SyncAll`, on a warm open) and not the trees' data (they are
+empty).
+
+This was reasoned from the source and the on-disk result, not instrumented: no span was added
+around each call, so the split between steps 1, 2 and 3 above is not measured.
+
+### Proposed change (not implemented; nothing below has run)
+
+Fjall does not offer a batched or deferred keyspace creation, and the meta ingestion plus
+compaction per keyspace is inside its write lock, so the options are:
+
+- **Create the keyspaces on a first boot in parallel from `hs-kv`**: not possible, the lock
+  serializes them; ruled out.
+- **Open keyspaces lazily**: `FjallBackend::keyspace` returns a handle whose Fjall keyspace is
+  created on first read or write rather than at open. It only moves the 4.5 s from the boot to
+  the first request of each store (and makes the first `/register` pay it), so on its own it
+  makes the startup probe pass and the first request slow. Not recommended alone.
+- **Fewer keyspaces** is the honest fix for a per-keyspace cost: 78 keyspaces for a server
+  with no rooms is the per-crate "one table, one keyspace" convention (`hs_auth.users`,
+  `hs_room.*`, `hs_e2e.*`, `hs_push.*`, ...) and most of them are tiny. Sharing one Fjall
+  keyspace between several `hs-kv` tables behind a name prefix would be a change in every
+  consuming crate's key layout and in `hs-tables`; it also loses per-keyspace compaction and
+  KV-separation settings. Large, and not this session.
+- **Raise Fjall's meta compaction threshold or ask upstream for a "create many keyspaces"
+  API**: `MetaKeyspace::maintenance` is private and its L0 threshold of 2 is hard-coded; an
+  upstream change (or a fork) is the only way to drop step 3, which is probably a third of the
+  cost.
+- **Pre-create the keyspaces on a first boot with the logging already up and a progress line**
+  does not shorten anything but would make the five seconds visible in the log, which is the
+  minimum for an operator reading a refused probe.
+
+The recommendation for track 12's chart (not edited here; `deploy/helm/hs/templates/statefulset.yaml`):
+**do not shorten the startup probe yet.** With the boot as measured, `initialDelaySeconds`
+must cover a 5 to 7 s first boot (5.4 s here without container overhead, 7.1 s on kind under
+load); every later boot of the same pod is 0.4 s plus container start, so once the first boot
+of a PersistentVolume is behind it a `periodSeconds: 2`, `failureThreshold: 10` startup probe
+would be right, but the very first boot on a fresh volume is what the probe exists for. Halving
+the cold boot needs one of the changes above to be done and measured first.
+
+### Not done
+
+- No release-build measurement (the build did not finish in time under contention).
+- No optimization: nothing changed in `crates/hs-kv` or `crates/hs-cli`; no test added.
+- The 0.6 s between the pump line and `.well-known` is unattributed.
+- The measuring script lives in the session's scratchpad only; it is forty lines of Python
+  that parses the text log's timestamps and is easy to recreate from the method above.
+
+
 > **Integration note, 2026-09-19 (integration lead): the Postgres backend cannot serve yet, and
 > the conformance suite could not have told us.** Wiring it into `hs serve` and booting against a
 > real PostgreSQL 17 panics immediately: `Cannot start a runtime from within a runtime`
