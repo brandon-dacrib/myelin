@@ -74,14 +74,25 @@ clients. As of 2026-09-26:
   long-poll on replica B for a room replica A owns is not woken by A's events. The design's
   user-session owner, woken by room owners over the mesh (`PLAN.md` section 5.4), is not built.
   This is the reason the "clients connected" row above is design, not fact.
-- **`/createRoom` is not shard-gated**: the room's first actor is built wherever the request
-  lands, and every later request is routed to the true owner.
+- **`/createRoom` is shard-gated in `hs-cli`, and `hs-room` does not yet honour it** (RFC 0018,
+  2026-09-27): the gate mints the new room's id, hashes it and forwards the request to the
+  shard's owner over the mesh, but `hs-room`'s handler still mints its own id, so the room's
+  first actor is built on the replica the gate chose under an id that hashes to that replica's
+  shard only by chance. One line in `hs-room` closes that; every later request is routed to
+  the true owner either way.
 - **Outbound federation and bridge delivery are not shard-gated on a real cluster**: the
   outbound sender is in memory and would run on every replica; the appservice pump moves with
   its shard in a unit test with scripted ownership only.
-- **Two pods have never talked**: the experiment was two processes on one host. A pod does not
-  yet know its own mesh address (`advertise_host` falls back to the bind address or
-  `127.0.0.1`), and the mesh's mutual TLS is built in `hs-cluster` and not wired from `hs-cli`.
+- **Two pods have never talked**, but the pieces are in place (2026-09-27): a replica advertises
+  `cluster.mesh.advertise_address` to its peers, which the chart sets per pod to its stable DNS
+  name under the headless Service; the mesh runs mutual TLS from `cluster.mesh.tls` (a private
+  CA, mounted from a `kubernetes.io/tls` Secret); a third process with a certificate from
+  another CA is refused. Verified as three processes on one host and one PostgreSQL
+  (`docs/status/03-cluster.md`); `deploy/helm/hs/values-two-replica-experiment.yaml` is the
+  values file for the same thing on a real cluster, not yet run. One same-host caveat found on
+  the way: the configuration's database layer outranks the file (RFC 0016), so two processes
+  from one database cannot differ in `listeners`; every pod in Kubernetes has the same
+  listeners, so the chart is unaffected.
 - **Nothing is measured.** Every number in `PLAN.md` section 13 is a target. No loadgen run
   has compared one replica to two.
 

@@ -239,6 +239,16 @@ pub async fn start<B: KvBackend + 'static>(
         mesh_listen = %listen_addr,
         "starting the cluster ownership manager"
     );
+    {
+        let store = hs_cluster::store::ClusterStore::open(backend.clone())?;
+        let lease_ttl = cluster_config.lease_ttl;
+        let me = me.clone();
+        tokio::task::spawn_blocking(move || {
+            refuse_live_duplicate(&store, &me, lease_ttl, unix_now_ms())
+        })
+        .await
+        .map_err(|e| ClusterSetupError::Invalid(format!("checking the replica registry: {e}")))??;
+    }
     let (cluster, manager) = Cluster::start(cluster_config, backend).await?;
     let ownership = cluster.ownership().clone();
     let metrics = manager.metrics();
@@ -395,6 +405,54 @@ fn advertise_addr(config: &hs_config::Config) -> String {
     format!("{host}:{port}")
 }
 
+/// Refuses to start when the replica registry already holds a *live* row under this replica's
+/// identity: another process is advertising the same mesh address right now. Two replicas with
+/// one identity would take turns overwriting each other's registry row and each other's shard
+/// ownership, a split-brain by configuration. The usual cause is the configuration store: a
+/// per-replica `cluster.mesh.advertise_address` written into the shared database by the first
+/// replica to start is what every later replica reads unless it sets its own through the
+/// environment (`HS__CLUSTER__MESH__ADVERTISE_ADDRESS`, which outranks the database; the chart
+/// does this per pod). A *stale* row under this identity (a restart of the same pod, whose old
+/// row is past `lease_ttl`) is fine and is taken over by the normal generation rule.
+///
+/// # Errors
+/// [`ClusterSetupError::Invalid`] naming the live row and the environment variable to set.
+fn refuse_live_duplicate<B: KvBackend>(
+    store: &hs_cluster::store::ClusterStore<B>,
+    me: &ReplicaId,
+    lease_ttl: Duration,
+    now_unix_ms: u64,
+) -> Result<(), ClusterSetupError> {
+    let lease_ms = u64::try_from(lease_ttl.as_millis()).unwrap_or(u64::MAX);
+    let live_duplicate = store
+        .list_replicas()?
+        .into_iter()
+        .find(|row| &row.id == me && now_unix_ms.saturating_sub(row.heartbeat_unix_ms) < lease_ms);
+    match live_duplicate {
+        Some(row) => Err(ClusterSetupError::Invalid(format!(
+            "another replica is already live under this identity ({me}, last heartbeat {} ms \
+             ago, generation {}): every replica needs its own cluster.mesh.advertise_address. \
+             A value in the shared configuration database is read by every replica; set it per \
+             replica through the environment (HS__CLUSTER__MESH__ADVERTISE_ADDRESS), which \
+             outranks the database, or unset it there (hs config unset \
+             /cluster/mesh/advertise_address)",
+            now_unix_ms.saturating_sub(row.heartbeat_unix_ms),
+            row.generation.0
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn unix_now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
 /// Splits `host:port` into its parts, or `None` if `addr` carries no port: a bare host name, a
 /// bare IPv4 address, or an unbracketed IPv6 address (whose colons are not a port separator).
 fn split_host_port(addr: &str) -> Option<(&str, u16)> {
@@ -499,19 +557,29 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
 }
 
 /// Extracts and percent-decodes the room id from a Matrix client-server path of the shape
-/// `.../rooms/{roomId}/...`. Returns `None` for any path with no `rooms` segment at all — every
-/// route this module does not need to gate (`/sync`, `/login`, `/media/...`, ...). `/createRoom`
-/// has no room id in its path either and is gated separately, by [`is_create_room`] and
+/// `.../rooms/{roomId}/...`, or `.../join/{roomId}` and `.../knock/{roomId}` when what follows
+/// is a room id (`!...`) rather than an alias. Returns `None` for any other path — every route
+/// this module does not need to gate (`/sync`, `/login`, `/media/...`, ...) and the alias forms
+/// of `/join` and `/knock`, whose room id is only known once the handler has resolved the alias
+/// (see `docs/status/03-cluster.md`, 2026-09-27, for that gap). `/createRoom` has no room id in
+/// its path either and is gated separately, by [`is_create_room`] and
 /// [`RoomShardGate::run_create_room`].
 fn extract_room_id(path: &str) -> Option<String> {
     let mut segments = path.split('/');
     while let Some(segment) = segments.next() {
-        if segment == "rooms" {
-            let raw = segments.next()?;
-            if raw.is_empty() {
-                return None;
+        match segment {
+            "rooms" => {
+                let raw = segments.next()?;
+                if raw.is_empty() {
+                    return None;
+                }
+                return Some(percent_decode(raw));
             }
-            return Some(percent_decode(raw));
+            "join" | "knock" => {
+                let decoded = percent_decode(segments.next()?);
+                return decoded.starts_with('!').then_some(decoded);
+            }
+            _ => {}
         }
     }
     None
@@ -920,6 +988,31 @@ mod tests {
     }
 
     #[test]
+    fn extracts_room_id_from_join_and_knock_by_id_but_not_by_alias() {
+        // `POST /join/{roomIdOrAlias}` has no `rooms` segment; on a non-owner it used to reach
+        // the handler and be refused by the write fence instead of forwarded (found by track 05).
+        assert_eq!(
+            extract_room_id("/_matrix/client/v3/join/!abc%3Aexample.org"),
+            Some("!abc:example.org".to_owned())
+        );
+        assert_eq!(
+            extract_room_id("/_matrix/client/v3/knock/!abc:example.org"),
+            Some("!abc:example.org".to_owned())
+        );
+        // An alias resolves to a room id only inside the handler: not gated here.
+        assert_eq!(
+            extract_room_id("/_matrix/client/v3/join/%23alias%3Aexample.org"),
+            None
+        );
+        assert_eq!(extract_room_id("/_matrix/client/v3/join/"), None);
+        // `/rooms/{roomId}/join` was already covered by the `rooms` segment.
+        assert_eq!(
+            extract_room_id("/_matrix/client/v3/rooms/!abc%3Aexample.org/join"),
+            Some("!abc:example.org".to_owned())
+        );
+    }
+
+    #[test]
     fn does_not_match_unrelated_paths() {
         assert_eq!(extract_room_id("/_matrix/client/v3/createRoom"), None);
         assert_eq!(extract_room_id("/_matrix/client/v3/sync"), None);
@@ -998,6 +1091,43 @@ mod tests {
             cfg
         };
         assert_eq!(advertise_addr(&wildcard), "127.0.0.1:8449");
+    }
+
+    #[test]
+    fn a_live_row_under_this_identity_refuses_startup_but_a_stale_one_does_not() {
+        use hs_cluster::types::{ReplicaRecord, ReplicaState};
+        let backend = hs_kv::memory::MemoryBackend::new();
+        let store = hs_cluster::store::ClusterStore::open(backend).unwrap();
+        let me = ReplicaId::new("hs-0.hs-headless.matrix.svc.cluster.local:8449");
+        let lease = Duration::from_secs(10);
+        let now = 1_000_000_u64;
+
+        // Empty registry: fine.
+        refuse_live_duplicate(&store, &me, lease, now).expect("no rows");
+
+        let row = |heartbeat_unix_ms: u64| ReplicaRecord {
+            id: me.clone(),
+            generation: Generation(7),
+            mesh_addr: me.as_str().to_owned(),
+            zone: None,
+            version: "test".into(),
+            state: ReplicaState::Active,
+            heartbeat_seq: 1,
+            heartbeat_unix_ms,
+        };
+        // A row heartbeated a moment ago under the same identity: another process is live.
+        store.heartbeat(&row(now - 500)).unwrap();
+        let err = refuse_live_duplicate(&store, &me, lease, now).expect_err("live duplicate");
+        assert!(
+            err.to_string()
+                .contains("HS__CLUSTER__MESH__ADVERTISE_ADDRESS"),
+            "{err}"
+        );
+        // The same row once it is older than the lease: a restart of this replica, allowed.
+        refuse_live_duplicate(&store, &me, lease, now + 20_000).expect("stale row");
+        // A live row under a different identity is somebody else, allowed.
+        let other = ReplicaId::new("hs-1.hs-headless.matrix.svc.cluster.local:8449");
+        refuse_live_duplicate(&store, &other, lease, now).expect("other identity");
     }
 
     #[test]
