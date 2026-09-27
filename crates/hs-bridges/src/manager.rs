@@ -124,6 +124,15 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
         }))
     }
 
+    /// Tells the manager where this server's own client API is (`http://127.0.0.1:8008`): what
+    /// its bots speak to, what its registration's `url` is rooted at, and what a bridge run
+    /// elsewhere is told to reach when the server has no public base URL. [`Self::start`] does
+    /// this; it is separate so that a test can drive [`Self::tick`] by hand.
+    pub fn attach(&self, loopback: &str) {
+        let _ = self.loopback.set(loopback.trim_end_matches('/').to_owned());
+        let _ = self.client.set(MatrixClient::new(loopback));
+    }
+
     /// Starts the manager against the bound client listener. Reconciliation runs only while
     /// `is_owner` says this replica owns the global shard. Abort the returned task on shutdown.
     pub fn start(
@@ -131,8 +140,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
         loopback: &str,
         is_owner: impl Fn() -> bool + Send + 'static,
     ) -> tokio::task::JoinHandle<()> {
-        let _ = self.loopback.set(loopback.trim_end_matches('/').to_owned());
-        let _ = self.client.set(MatrixClient::new(loopback));
+        self.attach(loopback);
         let manager = self.clone();
         tokio::spawn(async move {
             let mut registered = false;
@@ -297,6 +305,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             enabled: row.enabled,
             runtime: row.runtime.clone(),
             image: format!("{repository}:{}", row.image_tag),
+            image_tag: row.image_tag.clone(),
             front_door: (kind.mode == "per_user")
                 .then(|| bridge_types::front_door_localpart(&row.bridge_type).map(|l| self.mxid(l)))
                 .flatten(),
@@ -315,7 +324,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             _ => None,
         };
         let health = match &row.appservice_id {
-            Some(id) => self.directory.health(id).await.ok().map(|h| h.status),
+            Some(id) => self.directory.health(id).await.ok(),
             None => None,
         };
         let bot = row.appservice_id.as_ref().and_then(|_| {
@@ -330,7 +339,9 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             appservice_id: row.appservice_id.clone(),
             bot,
             deployment,
-            health,
+            health: health.as_ref().map(|h| h.status.clone()),
+            last_ping_at: health.as_ref().and_then(|h| h.last_ping_at.clone()),
+            last_error: health.and_then(|h| h.last_error),
             created_at: rfc3339(row.created_at_ms),
             ready_at: row.ready_at_ms.map(rfc3339),
         }
@@ -338,14 +349,22 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
 
     // ---- rendering --------------------------------------------------------------------------
 
-    /// How a bridge of `offering` reaches this server.
+    /// How a bridge of `offering` reaches this server: the cluster's internal address for an
+    /// instance it deploys, otherwise the public base URL, or, on a server that has none, the
+    /// address this server bound (a bridge on the same machine reaches that; one anywhere else
+    /// needs `server.public_baseurl` set, and the address in its files says so plainly rather
+    /// than being empty).
     fn homeserver_address(&self, offering: &OfferingRow) -> String {
+        let outside = || {
+            if self.public_base_url.is_empty() {
+                self.loopback.get().cloned().unwrap_or_default()
+            } else {
+                self.public_base_url.clone()
+            }
+        };
         match (&self.runtime, offering.runtime.as_str()) {
-            (Some(runtime), "cluster") => runtime
-                .target()
-                .homeserver_url
-                .unwrap_or_else(|| self.public_base_url.clone()),
-            _ => self.public_base_url.clone(),
+            (Some(runtime), "cluster") => runtime.target().homeserver_url.unwrap_or_else(outside),
+            _ => outside(),
         }
     }
 
@@ -423,6 +442,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             .map_err(|e| e.to_string())?
         else {
             // Its offering is gone: it goes too.
+            tracing::info!(bridge_type = %row.bridge_type, owner = %row.owner, "its offering is gone: removing the instance");
             if row.state != InstanceState::Removing {
                 self.set_state(row, InstanceState::Removing, None);
             }
@@ -502,13 +522,28 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                     .clone()
                     .ok_or("the instance has no registration")?;
                 let elsewhere = offering.runtime != "cluster";
-                // An instance run by hand may take days; ask it every half minute, not every tick.
-                if elsewhere
-                    && now.saturating_sub(row.state_since_ms) % 30_000 > TICK.as_millis() as u64
-                {
+                // The bridge may have announced itself already: a mautrix bridge pings itself
+                // through this server as it starts (MSC2659), and an administrator running one
+                // elsewhere can press Ping. The registry's `healthy` is the same evidence this
+                // server's own ping would give, and it is there a tick earlier.
+                let known = self
+                    .directory
+                    .health(&id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                // An instance run by hand may take days: ask it every tick for the first two
+                // minutes, when someone is most likely starting it, then every half minute.
+                let since = now.saturating_sub(row.state_since_ms);
+                let due = !elsewhere
+                    || since < 120_000
+                    || since % 30_000 <= u64::try_from(TICK.as_millis()).unwrap_or(u64::MAX);
+                let health = if known.status == "healthy" {
+                    known
+                } else if due {
+                    self.directory.ping(&id).await.map_err(|e| e.to_string())?
+                } else {
                     return Ok(());
-                }
-                let health = self.directory.ping(&id).await.map_err(|e| e.to_string())?;
+                };
                 if health.status == "healthy" {
                     let _ = self
                         .store
@@ -521,6 +556,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                             r.ready_at_ms = Some(now);
                             true
                         });
+                    tracing::info!(bridge_type = %row.bridge_type, owner = %row.owner, "bridge instance answered this server: ready");
                     self.wake();
                 } else if !elsewhere && now.saturating_sub(row.state_since_ms) > START_TIMEOUT_MS {
                     self.set_state(
@@ -551,7 +587,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
     fn set_state(&self, row: &InstanceRow, state: InstanceState, reason: Option<String>) {
         let from = row.state;
         let now = now_ms();
-        let _ = self
+        let moved = self
             .store
             .update_instance(&row.bridge_type, &row.owner, |r| {
                 if r.state != from {
@@ -561,6 +597,16 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                 r.reason = reason.clone();
                 true
             });
+        if matches!(moved, Ok(Some(_))) {
+            tracing::info!(
+                bridge_type = %row.bridge_type,
+                owner = %row.owner,
+                from = from.as_str(),
+                to = state.as_str(),
+                reason = reason.as_deref().unwrap_or_default(),
+                "bridge instance moved"
+            );
+        }
     }
 
     fn set_reason(&self, row: &InstanceRow, reason: Option<String>) {
@@ -702,11 +748,20 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             .ensure_user(&token, &bot_localpart)
             .await
             .map_err(|e| e.to_string())?;
+        let kind = bridge_types::get(&row.bridge_type, &self.server_name);
         let encrypted = offering.options.encryption.unwrap_or(true);
         let room = client
             .create_dm(&token, &bot, owner, encrypted)
             .await
             .map_err(|e| e.to_string())?;
+        // With double puppeting the instance may act as its owner, and only then can it mark
+        // the chat as direct on the owner's side too, the way a mautrix bridge does itself.
+        if kind.as_ref().is_some_and(|k| k.supports_double_puppeting)
+            && offering.options.double_puppeting.unwrap_or(true)
+            && let Err(e) = client.add_direct(&token, owner, &bot, &room).await
+        {
+            tracing::debug!(error = %e, owner, "could not mark the chat direct for its owner");
+        }
         let recorded = self
             .store
             .update_instance(&row.bridge_type, &row.owner, |r| {
@@ -721,7 +776,6 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             return Ok(()); // another replica got there first
         }
         let name = bridge_types::display_name(&row.bridge_type).unwrap_or(&row.bridge_type);
-        let kind = bridge_types::get(&row.bridge_type, &self.server_name);
         let steps: Vec<String> = kind
             .map(|k| {
                 k.sign_in
@@ -764,6 +818,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
     }
 
     async fn remove(&self, row: &InstanceRow) -> Result<(), String> {
+        tracing::info!(bridge_type = %row.bridge_type, owner = %row.owner, appservice_id = row.appservice_id.as_deref().unwrap_or_default(), "removing bridge instance");
         if let (Some(runtime), Some(name)) = (&self.runtime, &row.deploy_name) {
             runtime.delete(name).await?;
         }
@@ -860,6 +915,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
 
     /// Stops and removes `owner`'s instance of `bridge_type` now.
     pub(crate) async fn stop(&self, bridge_type: &str, owner: &str) -> Result<bool, String> {
+        tracing::info!(bridge_type, owner, "asked to stop a bridge instance");
         let Some(row) = self
             .store
             .instance(bridge_type, owner)
@@ -1120,6 +1176,11 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
     }
 
     async fn delete_instance(&self, bridge_type: &str, user_id: &str) -> Result<(), SourceError> {
+        tracing::debug!(
+            bridge_type,
+            user_id,
+            "an administrator removes a bridge instance"
+        );
         match self.stop(bridge_type, user_id).await {
             Ok(true) => Ok(()),
             Ok(false) => Err(SourceError::NotFound),

@@ -132,6 +132,12 @@ async fn handle<B: KvBackend + 'static>(
     let kind = event["type"].as_str().unwrap_or_default();
     let sender = event["sender"].as_str().unwrap_or_default();
     let room_id = event["room_id"].as_str().unwrap_or_default();
+    tracing::debug!(
+        kind,
+        sender,
+        room_id,
+        "the bridge manager was sent an event"
+    );
     let sender_localpart = sender
         .trim_start_matches('@')
         .split(':')
@@ -251,6 +257,15 @@ async fn front_door<B: KvBackend + 'static>(
     room_id: &str,
 ) {
     let door = bridge_types::front_door_localpart(bridge_type).unwrap_or(MANAGER_BOT);
+    // Someone the offering is not open to is told so once, politely, and then left alone: a bot
+    // that answers every message with the same refusal is a bot people mute.
+    if let Ok(Some(offering)) = manager.offering_row(bridge_type)
+        && offering.enabled
+        && !manager.allowed(&offering, user)
+        && !manager.store.record_refusal(room_id, user).unwrap_or(true)
+    {
+        return;
+    }
     let text = match request(manager, bridge_type, user, Some(room_id)).await {
         Ok(text) | Err(text) => text,
     };
@@ -362,6 +377,7 @@ async fn command<B: KvBackend + 'static>(
     room_id: &str,
     body: &str,
 ) {
+    tracing::debug!(user, room_id, body, "the manager bot was told");
     let mut words = body.split_whitespace();
     let verb = words.next().unwrap_or_default().to_lowercase();
     let rest: Vec<&str> = words.collect();

@@ -447,7 +447,9 @@ export const handlers = [
   // ---- Bridge offerings and instances (RFC 0017) ----
   http.get(`${API}/bridge-deployment-target`, () => HttpResponse.json(deploymentTarget.current)),
 
-  http.get(`${API}/bridge-offerings`, () => HttpResponse.json({ data: listOfferings() })),
+  http.get(`${API}/bridge-offerings`, () =>
+    HttpResponse.json({ items: listOfferings(), next_cursor: null, prev_cursor: null }),
+  ),
 
   http.get(`${API}/bridge-offerings/:type`, ({ params }) => {
     const offering = findOffering(String(params.type));
@@ -491,7 +493,7 @@ export const handlers = [
   http.get(`${API}/bridge-offerings/:type/instances`, ({ params }) => {
     const type = String(params.type);
     if (!findOffering(type)) return problem(404, "not-found", "Bridge offering not found");
-    return HttpResponse.json({ data: instancesOf(type) });
+    return HttpResponse.json({ items: instancesOf(type), next_cursor: null, prev_cursor: null });
   }),
 
   http.get(`${API}/bridge-offerings/:type/instances/:user_id`, ({ params }) => {

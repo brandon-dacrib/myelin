@@ -148,6 +148,17 @@ impl BridgeOfferingSource for InMemoryBridgeOfferings {
                 .or(current.as_ref().map(|c| c.enabled))
                 .unwrap_or(true),
             runtime,
+            image_tag: request
+                .image_tag
+                .clone()
+                .filter(|t| !t.trim().is_empty())
+                .or(current.as_ref().map(|c| c.image_tag.clone()))
+                .unwrap_or_else(|| {
+                    kind.image
+                        .rsplit_once(':')
+                        .map_or("latest", |(_, t)| t)
+                        .to_owned()
+                }),
             image: kind.image.clone(),
             front_door: (kind.mode == "per_user").then(|| {
                 kind.default_namespaces["users"][1]["regex"]
