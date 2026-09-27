@@ -1,3 +1,390 @@
+## 2026-09-27: a pod knows its own mesh address, the mesh is mutual TLS, `/createRoom` is gated
+
+Branch `worktree-agent-a2bffe0b517f748bc`. Three of the four "known blockers" `docs/next-steps.md`
+item 1 lists for cluster mode on a real cluster, in the order it lists them, plus the values
+file for the two-pod experiment. What was **verified by running** is under "Verified"; what was
+only **written** is under "Written, not run". `hs-room` was not edited (track 04's crate); the
+one line it needs is in RFC 0018.
+
+### Verified by running
+
+**Two `hs serve` processes on one PostgreSQL 16 (apt, `127.0.0.1:5432`, database `hs03`), both
+advertising real names, the mesh over mutual TLS from a private CA, a room created through A and
+used from B, and a third process with a certificate from another CA refused.** The certificates
+are the three `openssl` commands the experiment values file gives (a private CA, one wildcard
+leaf `*.mesh03.local` shared by A and B, the way the chart shares one wildcard across pods), the
+names `hs-a.mesh03.local`/`hs-b.mesh03.local`/`hs-c.mesh03.local` resolve to `127.0.0.1` through
+`/etc/hosts` (what the headless Service does for pods), and each config's `cluster` section is
+what the chart renders, with the per-pod values inline instead of from the environment:
+
+```yaml
+cluster:
+  single_node: false
+  room_shards: 4
+  user_shards: 4
+  heartbeat_interval: 500ms
+  lease_ttl: 2s
+  mesh:
+    port: 18649                           # 18650 on B, 18651 on C
+    advertise_address: hs-a.mesh03.local  # hs-b.mesh03.local on B, hs-c.mesh03.local on C
+    tls:
+      certificate_path: tls/mesh.crt      # C: tls/other.crt, issued by a different CA
+      private_key_path: tls/mesh.key
+      ca_certificate_path: tls/mesh-ca.crt
+      peer_san_suffix: .mesh03.local
+```
+
+Transcript (the script is `run.sh` in the session's scratch directory, run against the binary
+built from this branch's final commit; everything below is its output, trimmed only of
+timestamps, scratch paths and Python tracebacks from a `KeyError` on a refused create's JSON).
+The `03` in the names, ports and database is because another agent was running its own
+two-process experiment on this host at the same time, in the same scratch directory and the
+`hs` database the task named; the first attempt here collided with it (their config seeded the
+database this run read, and a `pkill` of theirs terminated A and B mid-run) before everything
+was moved under its own names:
+
+```
+$ fresh database
+
+$ hs serve -c a.yaml  (client 18340, mesh hs-a.mesh03.local:18649, mTLS)
+A /health/ready -> 200 (after ~1s)
+
+$ A seeded the database with its config; drop the seeded listeners section so B can bind its own port
+
+$   (the database layer outranks the file, RFC 0016, and HS__ cannot set a list; in Kubernetes every pod has the same listeners)
+DELETE 1
+
+$ hs serve -c b.yaml  (client 18341, mesh hs-b.mesh03.local:18650, mTLS, same CA)
+B /health/ready -> 200 (after ~1s)
+
+$ grep -h 'mesh authentication\|advertis\|starting the cluster' a.log b.log
+hs_cli::cluster: mesh authentication is mutual TLS ca=tls/mesh-ca.crt certificate=tls/mesh.crt peer_san_suffix=Some(".mesh03.local")
+hs_cli::cluster: starting the cluster ownership manager replica=hs-a.mesh03.local:18649 mesh_listen=0.0.0.0:18649
+hs_cli::serve: no .well-known documents are published (set server.well_known_server to delegate federation, server.public_baseurl to advertise a client base URL)
+hs_cli::cluster: mesh authentication is mutual TLS ca=tls/mesh-ca.crt certificate=tls/mesh.crt peer_san_suffix=Some(".mesh03.local")
+hs_cli::cluster: starting the cluster ownership manager replica=hs-b.mesh03.local:18650 mesh_listen=0.0.0.0:18650
+hs_cli::serve: no .well-known documents are published (set server.well_known_server to delegate federation, server.public_baseurl to advertise a client base URL)
+
+$ replica registry in PostgreSQL (who is alive, at what address)
+replica/hs-b.mesh03.local:18650|{"id":"hs-b.mesh03.local:18650","generation":1790483782363,"mesh_addr":"hs-b.mesh03.local:18650","zone":null,"version":"0.0.1","state":"active","heartbeat_seq":1790483785365,"heartbeat_unix_ms":1790483785365}
+replica/hs-a.mesh03.local:18649|{"id":"hs-a.mesh03.local:18649","generation":1790483781916,"mesh_addr":"hs-a.mesh03.local:18649","zone":null,"version":"0.0.1","state":"active","heartbeat_seq":1790483785418,"heartbeat_unix_ms":1790483785418}
+
+$ hs register -u alice ... -v http://127.0.0.1:18340
+@alice:cluster.example.org
+access_token: syt_YWxpY2U_NsqXjdLPYubSyRLodzWV_0JZuw4
+device_id: xtUUAHSQw6
+
+$ login on B
+access_token: syt_YWxpY2U_...
+
+$ POST /createRoom through A (5 rooms: each lands on whichever replica owns its shard)
+{"room_id":"!DgkECiicXB7yP0KtsK:cluster.example.org"}
+{"room_id":"!rrxIXsxgLWaYhz4VEh:cluster.example.org"}
+{"room_id":"!FY8YTwQgKxSwII3TDQ:cluster.example.org"}
+{"room_id":"!eWH6Q4LWcna3GD08R7:cluster.example.org"}
+{"room_id":"!LdGRVYJP6J7EYtuPTo:cluster.example.org"}
+
+$ what the gate logged on A for those creates (forwarded to B, or created here)
+hs_cli::cluster: the /createRoom handler minted its own room id instead of the pre-assigned one (see docs/rfcs/0018-create-room-shard-gate.md); the room's first actor was built on this replica, which 
+hs_cli::cluster: the /createRoom handler minted its own room id instead of the pre-assigned one (see docs/rfcs/0018-create-room-shard-gate.md); the room's first actor was built on this replica, which 
+hs_cli::cluster: the /createRoom handler minted its own room id instead of the pre-assigned one (see docs/rfcs/0018-create-room-shard-gate.md); the room's first actor was built on this replica, which 
+hs_cli::cluster: forwarding /createRoom to the shard's owner room_id=!5DOqIo2Nv2xRVc5y0r:cluster.example.org shard=room/2
+hs_cli::cluster: forwarding /createRoom to the shard's owner room_id=!wybt2tlfli30IFMsvJ:cluster.example.org shard=room/2
+hs_cli::cluster: the /createRoom handler minted its own room id instead of the pre-assigned one (see docs/rfcs/0018-create-room-shard-gate.md); the room's first actor was built on this replica, which 
+hs_cli::cluster: the /createRoom handler minted its own room id instead of the pre-assigned one (see docs/rfcs/0018-create-room-shard-gate.md); the room's first actor was built on this replica, which 
+
+$ room shard rows: who owns which of the 4 room shards
+shard/room/0000000000|{"epoch":1,"owner":["hs-a.mesh03.local:18649",1790483781916]}
+shard/room/0000000001|{"epoch":1,"owner":["hs-a.mesh03.local:18649",1790483781916]}
+shard/room/0000000003|{"epoch":1,"owner":["hs-a.mesh03.local:18649",1790483781916]}
+shard/room/0000000002|{"epoch":2,"owner":["hs-b.mesh03.local:18650",1790483782363]}
+
+$ PUT /send through B, then through A, same room (5 each, concurrently)
+A#4 -> 200
+A#3 -> 200
+A#5 -> 200
+A#1 -> 200
+B#2 -> 200
+A#2 -> 200
+
+$ GET /messages on A and on B (message bodies only)
+B#1 -> 200
+B#4 -> 200
+B#3 -> 200
+B#5 -> 200
+A: 10 ['from A #1', 'from A #2', 'from A #3', 'from A #4', 'from A #5', 'from B #1', 'from B #2', 'from B #3', 'from B #4', 'from B #5']
+B: 10 ['from A #1', 'from A #2', 'from A #3', 'from A #4', 'from A #5', 'from B #1', 'from B #2', 'from B #3', 'from B #4', 'from B #5']
+
+$ mesh log lines on A and B so far (a forward that failed would log 'mesh forward attempt failed')
+
+$ hs serve -c c.yaml  (client 18342, mesh hs-c.mesh03.local:18651, certificate from ANOTHER CA)
+C /health/ready -> 200 (after ~1s)
+
+$ C joined the registry (it shares the database; membership is a database row, not certificate-gated) and took shards:
+replica/hs-a.mesh03.local:18649|{"id":"hs-a.mesh03.local:18649","generation":1790483781916,"mesh_addr":"hs-a.mesh03.local:18649","zone":null,"version":"0.0.1","state":"active","heartbeat_seq":1790483795263,"heartbeat_unix_ms":1790483795263}
+replica/hs-c.mesh03.local:18651|{"id":"hs-c.mesh03.local:18651","generation":1790483792316,"mesh_addr":"hs-c.mesh03.local:18651","zone":null,"version":"0.0.1","state":"active","heartbeat_seq":1790483795317,"heartbeat_unix_ms":1790483795317}
+replica/hs-b.mesh03.local:18650|{"id":"hs-b.mesh03.local:18650","generation":1790483782363,"mesh_addr":"hs-b.mesh03.local:18650","zone":null,"version":"0.0.1","state":"active","heartbeat_seq":1790483795706,"heartbeat_unix_ms":1790483795706}
+shard/room/0000000000|{"epoch":1,"owner":["hs-a.mesh03.local:18649",1790483781916]}
+shard/room/0000000001|{"epoch":1,"owner":["hs-a.mesh03.local:18649",1790483781916]}
+shard/room/0000000003|{"epoch":1,"owner":["hs-a.mesh03.local:18649",1790483781916]}
+shard/room/0000000002|{"epoch":3,"owner":["hs-c.mesh03.local:18651",1790483792316]}
+
+$ creates through A until two land on a shard C owns: those are refused (503 M_HS_NOT_SHARD_OWNER), the rest succeed
+{"errcode":"M_HS_NOT_SHARD_OWNER","error":"this replica does not own room/2 (believed owner: hs-c.mesh03.local:18651) and could not forward the request to it: forwarding to the shard owner: forward to shard room/2 exhausted 4 attempts"} -> 503
+{"errcode":"M_HS_NOT_SHARD_OWNER","error":"this replica does not own room/2 (believed owner: hs-c.mesh03.local:18651) and could not forward the request to it: forwarding to the shard owner: forward to shard room/2 exhausted 4 attempts"} -> 503
+created: 10   refused: 2
+
+$ what A logged about forwarding to C (the TLS handshake failures behind those refusals)
+
+$ and from C's side: a send through C to each of the five rooms created earlier. C owns room/2 now (a valid
+
+$   registry member takes shards), so a room on room/2 is served by C locally; a room A or B owns is refused, C cannot reach them
+{"errcode":"M_HS_NOT_SHARD_OWNER","error":"this replica does not own room/1 (believed owner: hs-a.mesh03.local:18649) and could not forward the request to it: forwarding to the shard owner: forward to shard room/1 exhausted 4 attempts"} -> 503
+{"errcode":"M_HS_NOT_SHARD_OWNER","error":"this replica does not own room/1 (believed owner: hs-a.mesh03.local:18649) and could not forward the request to it: forwarding to the shard owner: forward to shard room/1 exhausted 4 attempts"} -> 503
+{"errcode":"M_HS_NOT_SHARD_OWNER","error":"this replica does not own room/0 (believed owner: hs-a.mesh03.local:18649) and could not forward the request to it: forwarding to the shard owner: forward to shard room/0 exhausted 4 attempts"} -> 503
+{"event_id":"$NFjWgi7ROnqbCOTrekH5XrDAAN3JE0RMAWLYGAKd3kw"} -> 200
+{"errcode":"M_HS_NOT_SHARD_OWNER","error":"this replica does not own room/0 (believed owner: hs-a.mesh03.local:18649) and could not forward the request to it: forwarding to the shard owner: forward to shard room/0 exhausted 4 attempts"} -> 503
+
+$ kill -TERM C, then A and B
+hs_cli::serve: cluster drain complete handed_off=0 released_unclaimed=62 elapsed=18.095233624s
+hs_cli::serve: cluster drain complete handed_off=0 released_unclaimed=74 elapsed=18.129770466s
+hs_cli::serve: cluster drain complete handed_off=48 released_unclaimed=0 elapsed=628.015575ms
+```
+
+The log lines the script's own `grep` ran too early for (the log writer is asynchronous), read from `a.log` and `c.log` after the run:
+
+```
+# a.log: A forwarding to C, and refusing to the client when the handshake fails
+DEBUG hs_cluster::mesh::forwarder: mesh forward attempt failed shard=room/2 attempt=1 error=mesh transport error: TLS handshake: invalid peer certificate: UnknownIssuer
+DEBUG hs_cluster::mesh::forwarder: mesh forward attempt failed shard=room/2 attempt=2 error=mesh transport error: TLS handshake: invalid peer certificate: UnknownIssuer
+DEBUG hs_cluster::mesh::forwarder: mesh forward attempt failed shard=room/2 attempt=3 error=mesh transport error: TLS handshake: invalid peer certificate: UnknownIssuer
+DEBUG hs_cluster::mesh::forwarder: mesh forward attempt failed shard=room/2 attempt=4 error=mesh transport error: TLS handshake: invalid peer certificate: UnknownIssuer
+# c.log: C forwarding to A or B
+DEBUG hs_cluster::mesh::forwarder: mesh forward attempt failed shard=room/1 attempt=1 error=mesh transport error: TLS handshake: invalid peer certificate: UnknownIssuer
+DEBUG hs_cluster::mesh::forwarder: mesh forward attempt failed shard=room/1 attempt=2 error=mesh transport error: TLS handshake: invalid peer certificate: UnknownIssuer
+DEBUG hs_cluster::mesh::forwarder: mesh forward attempt failed shard=room/1 attempt=3 error=mesh transport error: TLS handshake: invalid peer certificate: UnknownIssuer
+DEBUG hs_cluster::mesh::forwarder: mesh forward attempt failed shard=room/1 attempt=4 error=mesh transport error: TLS handshake: invalid peer certificate: UnknownIssuer
+```
+
+What the transcript shows, in the order the task asked:
+
+1. **Both advertise real addresses.** The replica registry rows carry `hs-a.mesh03.local:18649`
+   and `hs-b.mesh03.local:18650`, from `cluster.mesh.advertise_address`, not a bind address; with the
+   field unset the server now logs a warning naming `HS__CLUSTER__MESH__ADVERTISE_ADDRESS`.
+2. **The mesh is mTLS.** Each log says `mesh authentication is mutual TLS` with the CA path; the
+   forwards between A and B that made the room and message flow below complete over it. C, with
+   a certificate from another CA (and a perfectly good name under `.mesh03.local`), joins the
+   registry (it shares the database, and membership is a database row) and takes its share of
+   shards, but every forward to it from A fails at the TLS handshake and is refused to the client
+   as `503 M_HS_NOT_SHARD_OWNER`, and C's own forwards to A and B fail the same way. That is the
+   intended failure: a replica outside the CA gets no request and can serve none. (Membership
+   itself is not certificate-gated -- anyone with the database can insert a row -- which is the
+   trust model RFC 0001 section 11 describes: the database is the cluster's root of trust, the
+   mesh certificate is what keeps the pod network out.)
+3. **A room created through A is used from B.** `/createRoom` through A; concurrent sends through
+   B and A; `/messages` identical on both. Same as the 2026-09-19 run, now over mTLS and with the
+   gate below in front of `/createRoom`.
+4. **`/createRoom` is gated, as far as `hs-cli` can take it.** The gate mints the id, forwards to
+   the owner when the shard is not local, and the owner's gate re-checks ownership. What the
+   transcript also shows, honestly: `hs-room`'s handler does not yet read the
+   `PreassignedRoomId` extension, so it mints its own id, and the gate logs the warning it was
+   written to log for exactly this (`the /createRoom handler minted its own room id instead of
+   the pre-assigned one`, with `owned_here` true or false). Until the one-line change in RFC 0018
+   lands in `hs-room`, the room is created on the replica the gate chose under an id that hashes
+   to that replica's shard only by chance. Every later request is routed to the true owner and
+   the write fence protects the leftover actor, as before.
+
+**Tests, all run green on this branch** (after forcing a rebuild -- see the target-directory
+finding under "Decisions made"):
+
+```sh
+cargo fmt --all --check
+cargo clippy -p hs-cluster -p hs-config -p hs-cli --all-targets -- -D warnings
+cargo test -p hs-cluster          # 42 lib + 5 chaos + 2 mesh-pool + 4 mesh-mtls (new)
+cargo test -p hs-config           # 107 lib, 5 new (advertise_address, MeshTlsConfig, env override)
+cargo test -p hs-cli --lib cluster::   # 14: advertise_addr, split_host_port, to_hs_cluster_config
+                                       # (TLS), is_create_room, /join and /knock extraction, the
+                                       # live-duplicate identity check, and the four /createRoom
+                                       # gate tests with scripted ownership, one of them a real
+                                       # forward over a MeshServer to the owner
+cargo test -p hs-cli              # 134 lib + e2e 25 + federation_reads 9 + federation_sender 2
+                                  # + federation_two_servers 2 + federation_writes 8, all green
+```
+
+`crates/hs-cluster/tests/mesh_mtls.rs` is the test the task asked for at the mesh level: a
+`MeshServer` presenting a certificate from a private CA (minted with `rcgen`, no fixtures), a
+`Forwarder` from the same CA completes a forward and the handler runs once; a `Forwarder` from
+another CA is refused at the handshake and the handler never runs (and the reverse: a legitimate
+forwarder refuses a server outside the CA); the same CA but a name outside `peer_san_suffix` is
+refused after the handshake with `401`; a plaintext shared-secret client gets nothing from a TLS
+listener.
+
+### Per-replica settings and the configuration database (the lead's finding 1)
+
+The configuration is layered file < database < environment (RFC 0016), and the first replica to
+start seeds the database from its file. So a per-replica value written in a *file* -- the
+listener port, `cluster.mesh.port`, and now `cluster.mesh.advertise_address` -- is read from the
+database by every replica that starts after the first. The transcript above hit exactly this: B's
+file said port 18341 and B bound A's 18340 (the run script deletes the seeded `listeners` row
+before starting B; `hs config -c a.yaml unset /listeners/listeners`, which track 05 used, is the
+supported spelling of the same thing).
+
+**How a per-replica setting is meant to be set in cluster mode: through the environment, which
+outranks the database.** That is what the chart does for every pod --
+`HS__CLUSTER__MESH__ADVERTISE_ADDRESS` from the Downward API, `HS__CLUSTER__MESH__PORT`,
+`HS__CLUSTER__SINGLE_NODE`, the TLS paths -- and what the run script does for A, B and C. The
+file values in the transcript's configs are documentation; the environment is what each process
+ran with. In Kubernetes every pod has the same listeners, so the list field the environment
+cannot set never needs to differ; on one host it does, and `hs config unset` is the tool.
+
+Two guards against getting this wrong were added in `hs-cli`:
+
+- A clustered replica whose `advertise_address` is unset logs a warning naming the variable
+  (the fallback to a bind address is what made "a pod does not know its own mesh address" a
+  known gap).
+- **A clustered replica refuses to start if the replica registry already holds a live row under
+  its own identity** (`crate::cluster::refuse_live_duplicate`): that is what a second replica
+  that inherited the first one's `advertise_address` from the database would look like, and two
+  replicas under one identity would overwrite each other's registry row and shard ownership.
+  The error names the variable to set and the `hs config unset` alternative. A stale row (a
+  restart of the same pod) is allowed, as before. Unit-tested against a `MemoryBackend`
+  registry (live row refused, stale row and other identities allowed).
+
+`hs config unset /cluster/mesh/advertise_address` is not needed when the environment sets it
+(the environment wins), but `hs-config`'s store could reasonably exclude `listeners` and
+`cluster.mesh` from seeding altogether, the way it excludes `storage`; that is track 13's call
+and is recorded under "What is next".
+
+### `/join/{roomId}` (the lead's finding 2)
+
+`POST /join/{roomIdOrAlias}` and `POST /knock/{roomIdOrAlias}` have no `/rooms/` segment, so
+the gate let them through to the handler on a non-owner, where the write fence refused them
+with `503` instead of the gate forwarding them. `extract_room_id` now reads the id from those
+two paths as well when it is a room id (`!...`); it is the same gate, so the request is
+forwarded to the owner exactly as `/rooms/{roomId}/join` already was. An alias (`#...`) is
+still not gated: it resolves to a room id only inside the handler, and on a non-owner the
+fence still refuses it. Gating aliases needs the gate to resolve them (a `RoomRegistry::
+resolve_alias` call before the handler), which is a small follow-up, noted under "What is next".
+
+### Written, not run
+
+- **The chart in cluster mode** (`deploy/helm/hs/`): `helm` is not installed here and could not
+  be fetched through the proxy (`get.helm.sh` answers 403, the GitHub release has no tarball), so
+  the templates were **not rendered**. What changed, to be checked with `helm lint` and
+  `helm template --set mode=cluster ...` before the two-pod run:
+  - `values.yaml`: a `cluster:` block (`roomShards`, `userShards`, `heartbeatInterval`,
+    `leaseTtl`, `clusterDomain`, `mesh.port`, `mesh.tls.existingSecret`,
+    `mesh.sharedSecret.{existingSecret,key}`, `terminationGracePeriodSeconds`), with the
+    reasoning for a DNS name over `status.podIP` in its comments.
+  - `templates/statefulset.yaml`: in cluster mode, `HS__CLUSTER__SINGLE_NODE=false`,
+    `HS__CLUSTER__MESH__ADVERTISE_ADDRESS=$(POD_NAME).<release>-headless.<ns>.svc.<domain>` from
+    the Downward API, `HS__CLUSTER__MESH__PORT`, the three `HS__CLUSTER__MESH__TLS__*_PATH`
+    variables plus `PEER_SAN_SUFFIX` (or `SHARED_SECRET_FILE`), a `mesh` container port, the
+    `kubernetes.io/tls` Secret mounted whole at `/etc/hs/secrets/mesh-tls`, and
+    `terminationGracePeriodSeconds`.
+  - `templates/configmap.yaml`: the tunables (`room_shards`, `user_shards`,
+    `heartbeat_interval`, `lease_ttl`) in the file layer.
+  - `templates/service.yaml`: the mesh port on the headless Service.
+  - `templates/networkpolicy.yaml`: the mesh port admitted from this release's pods only.
+  - `templates/_helpers.tpl`: `hs.meshDomain`; validation that cluster mode has a shared
+    database (not `embedded`) and one of the two mesh authentications.
+  - `templates/NOTES.txt`: a cluster-mode paragraph.
+  - **`values-two-replica-experiment.yaml`**: two replicas, CloudNativePG `hs-db`, S3 media, the
+    four Secrets to make first (with the exact `kubectl`/`openssl` commands), mTLS, a sticky
+    Ingress for the Element session until `/sync` is cluster-aware.
+- `docs/config.md` was regenerated (`cargo run -p hs-config --bin gen_config_docs`) and did not
+  change: the generator lists `cluster.mesh` as an opaque `object`. The admin interface builds
+  its form from the JSON schema itself, where the new fields carry their descriptions.
+
+### Config fields added (`crates/hs-config/src/cluster.rs`)
+
+| Field | Env | Meaning |
+|---|---|---|
+| `cluster.mesh.advertise_address` | `HS__CLUSTER__MESH__ADVERTISE_ADDRESS` | host or `host:port` peers dial; bare host gets `mesh.port`; unset falls back to the bind address with a warning; ignored in single-node mode |
+| `cluster.mesh.tls.certificate_path` | `HS__CLUSTER__MESH__TLS__CERTIFICATE_PATH` | this replica's PEM chain |
+| `cluster.mesh.tls.private_key_path` | `HS__CLUSTER__MESH__TLS__PRIVATE_KEY_PATH` | its key |
+| `cluster.mesh.tls.ca_certificate_path` | `HS__CLUSTER__MESH__TLS__CA_CERTIFICATE_PATH` | the private CA peers must chain to (new: `mesh.tls` was `listeners::TlsConfig`, which has no CA) |
+| `cluster.mesh.tls.peer_san_suffix` | `HS__CLUSTER__MESH__TLS__PEER_SAN_SUFFIX` | optional; a peer's DNS SAN must end with it |
+
+`cluster.mesh.tls` changed type from `Option<listeners::TlsConfig>` to `Option<MeshTlsConfig>`;
+nothing outside `hs-cli`'s `cluster.rs` read it.
+
+### `serve.rs`, for the merge with track 05
+
+`crates/hs-cli/src/serve.rs` is **not modified** on this branch. Everything is in
+`crates/hs-cli/src/cluster.rs` (`start`, `ClusterHandles`, `spawn_mesh`, `advertise_addr`,
+`to_hs_cluster_config`, `refuse_live_duplicate`, `RoomShardGate::run_create_room`,
+`ProxyShardHandler`) behind the same three entry points `serve.rs` already calls
+(`crate::cluster::start`, `RoomShardGate::new(..).layer(..)`, `ClusterHandles::spawn_mesh`), so
+track 05's `crate::sync_cluster::install(...)` and track 06's federation feeder after
+`cluster::start` do not collide with anything here. What to watch in the merge, all in
+`cluster.rs`: track 05 adds `MeshDeps.peers`, `POST /mesh/v1/peer` and
+`ClusterHandles::install_peer_handler`; `spawn_mesh` here constructs `MeshDeps` (it needs the
+`peers` field) and now builds its authenticator and TLS material from `MeshStartConfig::auth`
+(an enum, replacing the old `secret: String` field), and `ProxyShardHandler::handle` now inserts
+the `ViaMesh` extension before replaying a request. `ClusterHandles` gained a `server_name`
+field (both constructors set it).
+
+### Decisions made
+
+- **The pod's advertised address is its stable DNS name, not `status.podIP`.** The mesh forwarder
+  dials `host:port` and `rustls` verifies the peer's certificate against that host; a name lets
+  one wildcard certificate (`*.<release>-headless.<ns>.svc.<domain>`) cover every pod for the
+  life of the StatefulSet, while pod IPs are unknowable before the pod exists and change on
+  every reschedule, so a certificate valid for them could only be issued per pod, at runtime,
+  by something like cert-manager's CSI driver. The headless Service has
+  `publishNotReadyAddresses: true`, so the name resolves before readiness, which the mesh needs.
+  `peer_san_suffix` is set to the headless domain so a certificate the same CA issued for
+  anything else is refused too.
+- **The mesh TLS material is three paths, not a `*_file` secret pair**, because a certificate,
+  key and CA already are files (a mounted `kubernetes.io/tls` Secret), the same convention as
+  `listeners[].tls`. Loaded twice in `start` (once for the forwarder's client config, once kept
+  for the listener) because `TlsMaterial` holds a private key and is deliberately not `Clone`.
+- **`advertise_address` unset in cluster mode is a warning, not an error**, so the same-host
+  two-process setup (and the 2026-09-19 configs) keep working; the warning names the env var.
+- **`/createRoom` is gated by pre-assigning the id in the gate** (RFC 0018), with the id carried
+  to the owner in a mesh-only header that the gate strips from every client request and honours
+  only on a request marked `ViaMesh` by the owner's own mesh handler. The seam's types live in
+  `hs-cluster` so `hs-room` can read the extension without depending on `hs-cli`. The alternative
+  -- `hs-cli` calling `RoomRegistry::create_room` itself with a chosen id -- would have meant
+  duplicating `hs-room`'s request parsing, presets and profile filling in the binary crate.
+  Hash-derived ids (room version 12) cannot be pre-assigned; the RFC says what `hs-room` should
+  do for those (retry until the derived id is local).
+- **The gate post-checks the created id and warns** when the handler did not use the
+  pre-assigned one, rather than refusing, so `/createRoom` keeps working while `hs-room` catches
+  up and the transcript shows the gap instead of hiding it.
+- **The shared `target/` directory cross-links worktrees.** Cargo hashes a workspace member's
+  metadata relative to the workspace root, so `crates/hs-cluster` in every agent's worktree
+  produces the *same* artifact name in the shared `target/`, and "fresh" is decided by mtimes
+  against whichever worktree built last. This session's `hs-cli` first failed to compile against
+  track 05's `hs-cluster` (which has a `peers` field on `MeshDeps`), and `hs-room` was later
+  linked against it too. Every build in this session was run after `find crates -name '*.rs'
+  -exec touch {} +` so all workspace crates rebuild from this worktree inside one cargo
+  invocation (cargo's build lock keeps one invocation consistent). Other agents' builds are
+  poisoned the same way in the other direction. `CARGO_TARGET_DIR` per worktree would fix it, but
+  the disk was nearly full (a full rebuild hit `ENOSPC` once; the shared target's 15 GB
+  `incremental/` cache was deleted to recover, and this session's builds ran with
+  `CARGO_INCREMENTAL=0`), so it was not done; the lead should know before trusting any agent's
+  "tests pass" from a shared target.
+- **PostgreSQL access:** `su`/`sudo` to the `postgres` OS user is refused in this sandbox, so
+  `pg_hba.conf`'s `127.0.0.1/32` line was switched from `scram-sha-256` to `trust` (a local,
+  throwaway server) to create the `hs` role and, after the collision above, the `hs03` database.
+
+### What is next
+
+- `hs-room`: the one-line change in RFC 0018, then re-run `run.sh`: the `minted its own room id`
+  warnings disappear and every room's first actor is built on its owner.
+- `helm lint` / `helm template` in both modes, then the two-pod run with
+  `values-two-replica-experiment.yaml` (the lead, from a laptop).
+- `hs_config::ClusterConfig` still has no federation/appservice shard counts, zone, or handoff
+  deadline (unchanged from 2026-09-19).
+- Track 13: consider excluding `listeners` and `cluster.mesh` from configuration-store seeding
+  (as `storage` is), so two replicas from one database can differ by file without
+  `hs config unset`.
+- Gate `/join/{alias}` and `/knock/{alias}` by resolving the alias in the gate.
+
+---
+
 # 03 Cluster: status
 
 ## Fix landed, 2026-09-19 (this session): the split-brain is closed
