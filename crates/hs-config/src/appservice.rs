@@ -1,8 +1,13 @@
-//! Appservice (bridge) registry bootstrap. Corresponds to Synapse's
-//! `app_service_config_files`. Hot-reloadable (see [`crate::reload`]): the
-//! registry itself supports hot registration through the admin API
-//! (`PLAN.md` D7); this section only lists the static registration files
-//! read at startup and re-scanned on reload.
+//! Appservice (bridge) delivery settings, and the one-time import of registration files.
+//!
+//! A bridge is registered, changed and removed through the admin API (`appservices.*`) and the
+//! web interface's Bridges section (decision 0010); the registry that holds it is in the
+//! database. `registration_files` corresponds to Synapse's `app_service_config_files`, and is a
+//! migration path only: each listed file is imported into the registry once, on the first start
+//! that sees it, and recorded as imported ([`crate::store::ImportRecord`]). A file still listed
+//! after that is not read again, so a bridge edited or removed in the interface stays that way
+//! across restarts. It is a bootstrap setting ([`crate::bootstrap`]): it names files on this
+//! process's filesystem, and is never stored in the database.
 
 use std::path::PathBuf;
 
@@ -19,16 +24,19 @@ fn default_tracking_failure_threshold() -> u32 {
     50
 }
 
-/// Appservice registry bootstrap settings.
+/// Appservice delivery settings, and registration files to import once.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppservicesConfig {
     /// Master switch for appservice transaction delivery.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Static registration YAML files loaded at startup (and on reload).
-    /// Corresponds to Synapse's `app_service_config_files`. Appservices
-    /// registered later through the admin API do not need an entry here.
+    /// Registration YAML files to import into the appservice registry, once each. Corresponds to
+    /// Synapse's `app_service_config_files`, and exists for migrating from it: the first start
+    /// that sees a file imports it (unless the registry already has an appservice with that id)
+    /// and records the import; every later start skips it, even if the file has changed. From
+    /// then on the bridge is managed in the Bridges section of the interface. Bootstrap only: set
+    /// in the bootstrap file or the environment, never stored in the database.
     #[serde(default)]
     pub registration_files: Vec<PathBuf>,
     /// Consecutive delivery failures to one appservice before it is marked

@@ -3358,13 +3358,16 @@ fn config_schema_document(sections: &[ConfigSection]) -> ConfigSchema {
             source: section.source.clone(),
         });
         for (pointer, origin) in &section.origins {
+            let bootstrap =
+                section.bootstrap || hs_config::bootstrap::is_bootstrap_pointer(pointer);
             settings.push(ConfigSettingInfo {
                 pointer: pointer.clone(),
                 section: section.name.clone(),
                 origin: origin.clone(),
                 secret: secrets.is_secret(pointer),
                 reloadable: section.reloadable,
-                editable: !section.bootstrap && origin != "environment",
+                editable: !bootstrap && origin != "environment",
+                bootstrap,
             });
         }
     }
@@ -3468,10 +3471,22 @@ async fn config_update(
             if current.bootstrap {
                 return Problem::conflict()
                     .with_detail(format!(
-                        "{section:?} is read before this server's database is open, so it cannot \
-                         be stored in it — set it on the command line, in an HS__ environment \
-                         variable, or in the bootstrap file"
+                        "{section:?} is a bootstrap section: it is read before this server's \
+                         database is open, or belongs to one process rather than to the whole \
+                         server, so it cannot be stored in the database — set it on the command \
+                         line, in an HS__ environment variable, or in the bootstrap file"
                     ))
+                    .with_instance(instance)
+                    .into_response();
+            }
+            // A bootstrap setting inside an administered section (`cluster.mesh.port`,
+            // `server.server_name`): stored, it would be ignored by every replica (decision 0010).
+            let bootstrap = hs_config::layered::Layers::bootstrap_in_patch(&section, &patch);
+            if !bootstrap.is_empty() {
+                return Problem::conflict()
+                    .with_detail(
+                        hs_config::store::StoreError::bootstrap(&section, bootstrap).to_string(),
+                    )
                     .with_instance(instance)
                     .into_response();
             }
@@ -6607,15 +6622,15 @@ mod tests {
     #[tokio::test]
     async fn config_update_rejecting_an_invalid_result_writes_nothing() {
         let (router, _manifest) = build_router(config_state());
-        let response = patch_section(&router, "server", r#"{"server_name":""}"#).await;
+        let response = patch_section(&router, "server", r#"{"public_baseurl":"ftp://nope"}"#).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let problem: serde_json::Value =
             serde_json::from_slice(&body_bytes(response).await).unwrap();
         assert_eq!(problem["type"], "urn:hs:problem:validation-failed");
-        assert_eq!(problem["errors"][0]["pointer"], "/server/server_name");
+        assert_eq!(problem["errors"][0]["pointer"], "/server/public_baseurl");
 
         let section = get_section(&router, "server").await;
-        assert_eq!(section.values["server_name"], json!("example.org"));
+        assert_eq!(section.values["public_baseurl"], json!(null));
         assert_eq!(section.revision, 1, "nothing was written");
         assert!(
             audit_entries_for_action(&router, "config.update")
@@ -6725,10 +6740,11 @@ mod tests {
 
         let state = test_state().with_config(Arc::new(
             InMemoryConfigSource::new()
-                .with_database(json!({
-                    "server": {"server_name": "example.org"},
-                    "auth": {"session_secret": "s3kr1t"},
-                }))
+                .with_file(
+                    "/etc/myelin/homeserver.yaml",
+                    json!({"server": {"server_name": "example.org"}}),
+                )
+                .with_database(json!({"auth": {"session_secret": "s3kr1t"}}))
                 .with_environment(json!({"federation": {"client_timeout": "30s"}})),
         ));
         let (router, _manifest) = build_router(state);
@@ -6778,7 +6794,59 @@ mod tests {
 
         let bootstrap = setting("/storage/data_dir");
         assert!(!bootstrap.editable);
+        assert!(bootstrap.bootstrap);
         assert_eq!(bootstrap.origin, "default");
+
+        // Decision 0010: bootstrap settings inside administered sections are marked one by one,
+        // and their administered neighbours stay editable.
+        for pointer in [
+            "/server/server_name",
+            "/server/signing_key_path",
+            "/cluster/single_node",
+            "/cluster/mesh/port",
+            "/appservices/registration_files",
+            "/listeners/listeners",
+        ] {
+            let found = setting(pointer);
+            assert!(found.bootstrap, "{pointer} is bootstrap");
+            assert!(!found.editable, "{pointer} must not be offered for editing");
+        }
+        for pointer in ["/server/public_baseurl", "/cluster/lease_ttl"] {
+            let found = setting(pointer);
+            assert!(!found.bootstrap, "{pointer} is administered");
+            assert!(found.editable, "{pointer} is editable");
+        }
+        assert!(
+            body.sections
+                .iter()
+                .any(|s| s.name == "listeners" && s.bootstrap),
+            "listeners are per process: the whole section is bootstrap"
+        );
+    }
+
+    /// A bootstrap setting inside an administered section is refused by `config.update` with a
+    /// conflict naming it, and nothing is written: stored, it would be ignored by every replica.
+    #[tokio::test]
+    async fn config_update_refuses_a_bootstrap_setting() {
+        let (router, _manifest) = build_router(config_state());
+        for (section, patch) in [
+            ("server", r#"{"server_name":"other.example"}"#),
+            ("cluster", r#"{"mesh":{"port":9000}}"#),
+            ("listeners", r#"{"listeners":[]}"#),
+        ] {
+            let response = patch_section(&router, section, patch).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{section} {patch}");
+            let problem: serde_json::Value =
+                serde_json::from_slice(&body_bytes(response).await).unwrap();
+            assert!(
+                problem["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("HS__"),
+                "the refusal says where to set it instead: {problem}"
+            );
+        }
+        assert_eq!(get_section(&router, "server").await.revision, 1);
     }
 
     #[tokio::test]
@@ -6816,7 +6884,9 @@ mod tests {
                     .uri("/api/v1/config/validate")
                     .header("authorization", "Bearer admin-token")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"server":{"server_name":"new.example"}}"#))
+                    .body(Body::from(
+                        r#"{"server":{"public_baseurl":"https://matrix.example.org"}}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -6828,7 +6898,7 @@ mod tests {
         assert_eq!(
             report.requires_restart,
             vec!["server".to_string()],
-            "server_name is burned into every event this process has already produced"
+            "the server section is read once at startup"
         );
     }
 

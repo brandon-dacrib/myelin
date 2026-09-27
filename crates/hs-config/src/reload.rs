@@ -10,8 +10,8 @@
 //! - `telemetry` — log level, trace sampling and metrics toggles are read
 //!   by the logging/tracing layer on each event.
 //! - `appservices` — the registry is explicitly designed for hot
-//!   registration (`PLAN.md` D7); this section only lists static
-//!   registration files, re-scanned on SIGHUP or an admin-API reload call.
+//!   registration (`PLAN.md` D7) through the admin API; this section holds
+//!   delivery tuning and the registration files imported once at startup.
 //!
 //! # Restart required
 //!

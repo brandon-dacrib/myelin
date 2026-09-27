@@ -27,6 +27,7 @@
 
 pub mod appservice;
 pub mod auth;
+pub mod bootstrap;
 pub mod cluster;
 pub mod document;
 pub mod duration;
