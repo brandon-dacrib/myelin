@@ -163,8 +163,15 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Bridges
 
-- **Bridges are offerings, one per person, and the server deploys them -- built, not yet
-  run.** RFC 0017 (`docs/rfcs/0017-the-server-deploys-its-own-bridges.md`), 2026-09-26. An
+- **Bridges are offerings, one per person, and the server deploys them.** RFC 0017
+  (`docs/rfcs/0017-the-server-deploys-its-own-bridges.md`), built 2026-09-26 and run
+  end to end against the real binary on 2026-09-27: an offering made through the admin API,
+  a person's instance walking from requested to ready, its files rendered with its own
+  tokens, the bot opening a direct chat with the sign-in steps, `@whatsappbot` answering a
+  real invitation and `@bridges` taking commands, and a real heisenbridge started from the
+  rendered registration reaching ready; the interface's offerings flow passes as a browser
+  test against the real server. What has not run is the in-cluster runtime, which needs a
+  Kubernetes API server. The paragraph below describes the design. An
   administrator offers a bridge type (WhatsApp, with an image tag, who may use it, and whether
   it runs in this cluster or somewhere else); each person gets their own instance, with its own
   registration, ghosts, process and volume, by messaging the bridge's familiar address
@@ -176,11 +183,8 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   instance's bot open a direct chat with its owner and send the sign-in steps. Ten new admin
   operations; the interface's Bridges section is offerings first, with everybody's instance,
   failed first, on the offering's page; the chart installs the operator and its RBAC by default.
-  What is verified: the operator's builders (unit tests), the chart renders, the interface
-  against mocks, and that the server starts with all of it wired in. What is not: none of it has
-  run against a Kubernetes API server or a real cluster, no instance has been created against
-  the real binary, and nobody has messaged a front door. The register-a-bridge wizard below
-  still exists, under Registrations, for a bridge somebody runs themselves.
+  The register-a-bridge wizard below still exists, under Registrations, for a bridge somebody
+  runs themselves.
 - **Adding a bridge is a wizard, and it ends in a running bridge.** The interface's catalogue
   says what each of fourteen bridges is, what it needs and how to sign in to it (from the
   bridges' own documentation); choosing one renders the bridge's `config.yaml` and its
