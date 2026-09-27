@@ -119,6 +119,10 @@ export interface JsonSchemaNode {
   writeOnly?: boolean;
   /** Extension: track 13 marks secret-valued fields so they render hidden even before a value arrives. */
   "x-secret"?: boolean;
+  /** Extension: `hs_config::Duration`'s schema (`crates/hs-config/src/duration.rs`). */
+  "x-duration"?: boolean;
+  /** Extension: `hs_config::ByteSize`'s schema (`crates/hs-config/src/size.rs`). */
+  "x-bytesize"?: boolean;
   /** Extension: a per-setting origin carried on the node instead of the `origins` map. */
   "x-origin"?: ConfigOrigin;
 }

@@ -49,6 +49,17 @@ if (!("ResizeObserver" in globalThis)) {
   };
 }
 
+/**
+ * Radix's Select opens on a pointer event and scrolls its chosen item into view, and jsdom has
+ * neither pointer capture nor `scrollIntoView`. Without these a test can render a select but not
+ * choose from it; with them it drives one exactly as a keyboard or pointer user would.
+ */
+if (!Element.prototype.scrollIntoView) Element.prototype.scrollIntoView = () => undefined;
+if (!Element.prototype.hasPointerCapture) Element.prototype.hasPointerCapture = () => false;
+if (!Element.prototype.releasePointerCapture) {
+  Element.prototype.releasePointerCapture = () => undefined;
+}
+
 server.listen({ onUnhandledRequest: "error" });
 
 afterEach(() => {

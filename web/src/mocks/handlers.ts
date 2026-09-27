@@ -33,6 +33,7 @@ import {
   patchPointers,
   recordConfigChange,
   sectionSource,
+  stripEchoedSecrets,
   validateDocument,
   validateSection,
 } from "./data/config";
@@ -957,7 +958,7 @@ export const handlers = [
       });
     }
 
-    const patch = (await request.json()) as JsonValue;
+    const patch = stripEchoedSecrets((await request.json()) as JsonValue);
 
     const pinned = environmentPinned(name);
     const touched = patchPointers(patch);
@@ -966,14 +967,20 @@ export const handlers = [
       return problem(400, "validation-failed", "Validation failed", {
         detail: "Pinned by this deployment's environment; change it where the environment is set.",
         errors: pinnedTouched.map((pointer) => ({
-          pointer,
+          pointer: `/${name}${pointer}`,
           detail: `set by an HS__ environment variable, which takes precedence over the database — change it in the deployment, not here`,
         })),
       });
     }
 
     const candidate = mergePatch(configValues[name], patch) as Record<string, JsonValue>;
-    const errors = validateSection(name, candidate);
+    // Whole-configuration pointers, section first, as the real server sends them
+    // (`config_validation_errors` in crates/hs-admin/src/sources.rs). Section-relative ones
+    // would be ambiguous for `listeners.listeners`, whose section and setting share a name.
+    const errors = validateSection(name, candidate).map((e) => ({
+      ...e,
+      pointer: `/${name}${e.pointer}`,
+    }));
     if (errors.length > 0) {
       return problem(400, "validation-failed", "Validation failed", {
         detail: `${errors.length} setting${errors.length === 1 ? "" : "s"} could not be accepted.`,

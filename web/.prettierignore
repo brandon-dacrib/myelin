@@ -12,3 +12,7 @@ node_modules
 # Written by `msw init`, byte for byte, into the directory package.json's
 # `msw.workerDirectory` names. Reformatting it makes the next `msw init` a diff.
 public/mockServiceWorker.js
+
+# The real server's configuration JSON Schema, dumped verbatim from
+# `schemars::schema_for!(hs_config::Config)`; see src/lib/config-model.real-schema.test.ts.
+src/test/fixtures/hs-config-schema.json
