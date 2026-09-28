@@ -408,41 +408,78 @@ What is *not* in those percentages, and should temper them: no security review, 
 beyond a loadgen harness, `cargo fuzz` never run, Sytest never run, and no bridge has yet
 carried a message through an encrypted room. Each of those has historically found things.
 
-## In flight right now (2026-09-28): eight branches, none merged
+## Merged (2026-09-28): the eight agent branches of 2026-09-27
 
-The 2026-09-27 evening session on the owner's laptop fanned the completeness queue out to eight
-agents in worktrees, then stopped them all when the laptop ran short of disk, to resume on
-another machine. **Every branch is pushed to origin and none is merged to `main`** (the lead's
-merge into `main` was refused by the session's permission mode, so merging is the first job of
-the next session). Each branch's track status file has a "Where this stopped" section with its
-exact next steps. Run the full `cargo test --workspace --all-targets` and `npm run check` after
-the merges: every agent tested only the crates it touched.
+All eight branches of the 2026-09-27 evening session are merged into `main` as local `--no-ff`
+merges, in the planned order: `config-structured-editors`, `bootstrap-only-config`,
+`registration-tokens-server-notices`, `reports-tasks-stats`, `media-admin`,
+`federation-membership`, `federation-edus`, `two-pod-cluster`. The integration review is
+`docs/status/reviews/merge-2026-09-28.md`.
 
-| Branch | Head | What it is | Left on it |
-|---|---|---|---|
-| `agent/config-structured-editors` | `49e2477` | Decision 0010, web: the Configuration page edits lists of objects, variants and maps as forms, never as JSON; a test fails if any real setting lacks a control; the bridge access list is one row per Matrix ID. `npm run check` and 28/28 mock Playwright green | RFC 0020 (a hidden secret inside a list entry is lost on save; server side, track 15); a test that the web's schema fixture matches `schema_for!(Config)` (track 13); not run against a real server |
-| `agent/media-admin` | `ec81e07` | Media 9/9: list, search, quarantine, protect, delete, bulk delete, purge remote cache, last-access tracking; the Media page on real data; an e2e test through the real binary | `rooms.media.*`, `users.media.*`, `statistics.users_media`; paging the listing; bulk ops should go through `state.tasks.spawn` once the tasks branch is in; RFC 0004 vs the document on moderator read scope |
-| `agent/registration-tokens-server-notices` | `5bbb1cf` | RegistrationTokens 5/5 (tokens open a closed server, decision 0011; invite-by-link and a public sign-up page), ServerNotices 2/2 (`TestServerNotices` steps pass through the real server); full `cargo test -p hs-cli` green | `e2e-real` Playwright spec; Complement's `TestServerNotices` (laptop); notices to everyone/a room |
-| `agent/reports-tasks-stats` | `bf6873e` | Reports 4/4 (and the three client report endpoints, durable), Tasks 3/3 (a durable task registry), Statistics 4/4; survives a restart of the real binary | **The web pages are not built** (Reports, Tasks, Statistics, Overview sparklines), `schema.d.ts` not regenerated |
-| `agent/federation-membership` | `e6d4a71` | Invites, rejections, rescinded invites and knocks over federation, both directions; three two-server tests that fail without the fix | `createRoom`'s `invite` list for remote users; reject fallback when no resident helps; neutral error text; restricted joins; Complement |
-| `agent/federation-edus` | `e4543e4` | Typing, receipts, presence and device-list updates cross servers both ways; `/user/keys/query` and `claim` served; receipts and presence durable | `cargo clippy -p hs-cli` and the rest of `cargo test -p hs-cli` not run after its last change; to-device over federation; `m.signing_key_update`; EDUs in cluster mode go only through the owning replica |
-| `agent/bootstrap-only-config` | `0a23e9a` | Decision 0010, server: the bootstrap set (`crates/hs-config/src/bootstrap.rs`) is never seeded into the shared database and is refused by the API (fixes the two-replica listeners/mesh-port bug); registration files are imported once, then the bridge is the API's; media scanning and unstable features became settings | The docs sweep (README, chart comments, `docs/bridges`, regenerate `docs/config.md`); the web shows the per-setting `bootstrap` flag and `listeners` as a bootstrap section; PostgreSQL not exercised |
-| `agent/two-pod-cluster` | `a6fe124` | Nothing installed: dacrib0's etcd failed 36 of 111 readiness checks (23:31Z-00:10Z), black0n0's member logging 1-3 s fsyncs. `deploy/two-pod/verify.py` and `failover.py` written, not run; `storage.postgres.sslMode` documented as ignored (the server connects `NoTls`) | Resume steps at the top of `docs/status/03-cluster.md`; the SeaweedFS fix in `my-infra/.../apps/myelin-cluster/s3.yaml` is not applied; that directory is not committed |
+**Conflicts, all resolved by keeping both sides:** `AdminState` fields, constructors, `with_*`
+builders, `REAL_HANDLERS` and match arms in `crates/hs-admin/src/router.rs`; `lib.rs` module
+lists; `serve.rs` wiring (tokens, notices, reports, tasks, statistics, media); `RoomRegistry`
+fields; the web mocks, routes and test setup; `FederationState` initializers (`invites` from
+membership and `edu_sink` from EDUs, including the two initializers each branch added without
+the other's field); `transport/mod.rs`; the status files 06, 15 and 16; README and this file.
+Semantic conflicts the compiler found: two `MediaRecord` test initializers without
+`last_accessed_ms`. `web/src/api/schema.d.ts` was regenerated from `openapi.yaml`, not merged
+(two branches had edited the contract without regenerating it).
 
-**Merge order and expected conflicts.** Web and bootstrap first (few overlaps; bootstrap touches
-config crates, the web branch only `web/`). Then the three admin branches -- registration
-tokens, reports/tasks/stats, media -- which all edit `crates/hs-admin/src/router.rs`
-(`AdminState` fields, `REAL_HANDLERS`, match arms), `lib.rs`, `openapi.yaml`,
-`web/src/api/schema.d.ts` (regenerate rather than hand-merge), the mocks, `README.md` and this
-file's coverage numbers (recount with `python3 tools/admin_api_coverage.py`; expected about 97
-of 158). Then federation membership and EDUs, which both change `FederationState` constructors
-(EDUs added `edu_sink` to all twelve) and `transport/seams.rs`. The cluster branch last.
+**What the tests showed, after the merges** (rustc 1.98.1; the workspace needs 1.96 for
+`matrix-sdk` 0.19):
 
-**On the cluster** (`admin@dacrib0`): namespace `myelin-cluster` holds five Secrets, a bound
-`s3` PVC, and a crash-looping SeaweedFS pod and bucket Job (wrong flag; harmless). The database
-is the CNPG `Database` `dacrib/myelin-cluster` on the shared `postgres-cluster`, owned by
-`appuser`, reclaim `delete`. No Helm release. The demo in `myelin` is untouched. The cluster's
-etcd slowness predates this work and needs the owner's attention before the two-pod run.
+- `cargo fmt --all --check`: one module-order diff from the merge, fixed. Clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace --all-targets --no-fail-fast`: 78 test binaries, 2095 passed, 1
+  failed: `hs-admin`'s `authorized_request_to_undeclared_handler_is_501`. Each admin branch
+  had pointed it at the other's then-unserved area, so after the merge both were real. It now
+  asks `/api/v1/migration`, and `hs-admin` passes 220/220.
+- `web/`: `npm run check`: lint 0 errors (4 fast-refresh warnings, as before), typecheck clean,
+  Vitest 35 files and 277 tests passed, build ok, after restoring an `import {` the media merge
+  had dropped from `src/mocks/handlers.ts`. `npm run test:e2e`: 33/33 passed.
+- Admin coverage: `python3 tools/admin_api_coverage.py` says **97 of 158** (61%).
+
+**Found while merging** (the fixes are local commits on `main`):
+
+- The two bulk media operations answered `202` with `Location: /api/v1/tasks/{id}`, but never
+  put that task in the registry, so the Location answered 404. They now record the finished
+  task with `TaskRegistry::record_finished`, and the bulk-delete test follows the Location.
+  Running them on `state.tasks.spawn` changes the contract: the Media page reads the result
+  from the immediate answer, so it would have to poll. That is queue item 2g below.
+- The web's configuration-schema fixture (`web/src/test/fixtures/hs-config-schema.json`) was
+  captured before `bootstrap-only-config` added `media.scanning` and `server.unstable_features`.
+  Regenerated from `schemars::schema_for!(Config)`, the "every setting has a real control"
+  test fails on **`media.scanning.icap.preview`**: `PreviewMode` is an externally tagged enum
+  (`"negotiate"`, `"off"` or `{bytes: N}`), a shape `config-model.ts`'s `variantInfo` does not
+  handle, so it falls through to `unsupported`. The fixture was left stale so that
+  `npm run check` stays green. That is queue item 2b below.
+
+**Left on each branch, now queue items** (the numbers refer to the completeness queue below):
+
+| From | Left | Queue |
+|---|---|---|
+| `config-structured-editors` | RFC 0020: a hidden secret inside a list entry is lost on save (server side, track 15); a test that the web's schema fixture equals `schema_for!(Config)` (track 13), which would have caught the drift above; never run against a real server | 2b |
+| `bootstrap-only-config` | Docs sweep (README, chart comments, `docs/bridges`, regenerate `docs/config.md` with `cargo run -p hs-config --bin gen_config_docs`); the web shows the per-setting `bootstrap` flag and `listeners` as a bootstrap section; PostgreSQL not exercised | 2c |
+| `registration-tokens-server-notices` | `e2e-real` Playwright spec for Settings; Complement `TestServerNotices` (laptop); notices to everyone or to a room | 2d |
+| `reports-tasks-stats` | **The Reports, Tasks and Statistics pages and the Overview sparklines are not built**; their operations are real | 2a |
+| `media-admin` | `rooms.media.*`, `users.media.*`; paging the media listing; bulk operations on `state.tasks.spawn` (see above); RFC 0004 against the document on moderator read scope | 2e, 2g |
+| `federation-membership` | `createRoom`'s `invite` list for remote users; a reject fallback when no resident server helps; neutral error text; restricted joins; Complement | 3 |
+| `federation-edus` | To-device over federation; `m.signing_key_update`; in cluster mode, EDUs only through the owning replica. Its unrun `clippy`/`test -p hs-cli` are now run and green | 3 |
+| `two-pod-cluster` | Nothing installed: the verification cluster's etcd is slow (owner). `deploy/two-pod/verify.py` and `failover.py` are written but not run; the SeaweedFS fix in `my-infra/.../apps/myelin-cluster/s3.yaml` is not applied and that directory is not committed; `storage.postgres.sslMode` is ignored (the server connects `NoTls`). Resume steps at the top of `docs/status/03-cluster.md` | 6 |
+
+**On the cluster** (`admin@dacrib0`), unchanged: namespace `myelin-cluster` holds five
+Secrets, a bound `s3` PVC, and a crash-looping SeaweedFS pod and bucket Job (wrong flag;
+harmless). The database is the CNPG `Database` `dacrib/myelin-cluster` on the shared
+`postgres-cluster`, owned by `appuser`, reclaim `delete`. No Helm release. The demo in `myelin`
+is untouched. The cluster's etcd slowness predates this work and needs the owner's attention
+before the two-pod run.
+
+**Toolchain on the laptop.** The laptop's `~/.rustup` held only a minimal stable 1.93.0 (no
+`rustup` binary, no rustfmt or clippy), which cannot build `matrix-sdk` 0.19. This merge ran on
+a stable 1.98.1 installed with rustfmt and clippy into a throwaway `RUSTUP_HOME`/`CARGO_HOME`,
+and Playwright's chromium was also installed into a throwaway path. A laptop session needs a
+real `rustup` install first.
 
 **Carried over from 2026-09-27's cloud session** (still true): with several agents building into
 one shared `target/`, cargo links whichever worktree's copy of a crate was built last, and four
@@ -494,17 +531,44 @@ edit one is not. New settings and operations arrive with their interface control
    not yet measured under Complement), ~~Tasks 0/3~~ **3/3**, ~~Statistics 1/4~~ **4/4**
    (Reports, Tasks and Statistics server side only; their pages are queue items), Cluster 1/6,
    then the long tails of Users 14/41 and Rooms 6/23. `python3 tools/admin_api_coverage.py
-   --list` is the checklist. Alongside it, decision 0010: the Configuration page's JSON
-   textarea (`JsonControl`, for arrays of objects and maps) becomes structured editors, and
-   `appservices.registration_files` becomes an importer-only migration path.
-3. Federation completeness: invites, leaves and knocks over federation; EDUs (typing,
-   receipts, presence, device lists); restricted joins (ten Complement tests). Two in-process
-   servers verify each; Complement itself is a laptop item.
-4. Receipts and presence durable across a restart; `/search`.
+   --list` is the checklist. ~~Alongside it, decision 0010: the Configuration page's JSON
+   textarea becomes structured editors, and `appservices.registration_files` becomes an
+   importer-only migration path.~~ **Done 2026-09-27** (`config-structured-editors`,
+   `bootstrap-only-config`). What the merge of 2026-09-28 left, in order:
+   - **2a.** The Reports, Tasks and Statistics pages, and the Overview sparklines, on their
+     real operations (`reports.*`, `tasks.*`, `statistics.*`). Nothing an operator can see
+     uses them yet.
+   - **2b.** `media.scanning.icap.preview` gets a real control: `config-model.ts` learns
+     externally tagged enums (a unit-or-`{bytes: N}` choice), or `PreviewMode` is reshaped
+     (track 13's call, since it changes the file format). Then regenerate
+     `web/src/test/fixtures/hs-config-schema.json` from `schema_for!(Config)` and add a Rust
+     test that fails when the fixture differs from the schema. RFC 0020: a hidden secret
+     inside a list entry is lost on save.
+   - **2c.** The decision 0010 docs sweep (README, chart comments, `docs/bridges`, regenerate
+     `docs/config.md`); the Configuration page shows the per-setting `bootstrap` flag and
+     `listeners` as a bootstrap section; exercise the bootstrap split on PostgreSQL.
+   - **2d.** An `e2e-real` Playwright spec for Settings (tokens, invite link, notices);
+     server notices to everyone or to a room; `TestServerNotices` under Complement (laptop).
+   - **2e.** `rooms.media.*`, `users.media.*`, paging the media listing; settle RFC 0004
+     against the document on moderator read scope.
+   - **2f.** Cluster 1/6, then the long tails of Users 14/41 and Rooms 6/23.
+   - **2g.** Bulk media operations as spawned tasks (`state.tasks.spawn`, cancellable, with
+     progress), with the Media page following the task instead of reading the immediate
+     answer. Today they run inline and are recorded as finished tasks.
+3. Federation completeness: ~~invites, leaves and knocks over federation; EDUs (typing,
+   receipts, presence, device lists)~~ **done 2026-09-27** (`federation-membership`,
+   `federation-edus`, two in-process servers each). Left: restricted joins (ten Complement
+   tests); `createRoom`'s `invite` list for remote users; a reject fallback when no resident
+   server helps; neutral error text; to-device over federation; `m.signing_key_update`; EDUs in
+   cluster mode only through the owning replica. Complement itself is a laptop item.
+4. ~~Receipts and presence durable across a restart~~ **done 2026-09-27** (`federation-edus`);
+   `/search`.
 5. The operator's `Homeserver` reconciler (unit tests and `helm template` here; the cluster run
    is a laptop item), and the `Bridge` reconciler's first cluster run (laptop).
-6. Then the cluster items below that need the cluster (laptop): two pods with real traffic,
-   the demo's offering, the rolling update.
+6. Then the cluster items below that need the cluster (laptop): two pods with real traffic
+   (`deploy/two-pod/verify.py` and `failover.py`, written and not yet run; resume steps at the
+   top of `docs/status/03-cluster.md`; the cluster's etcd first), the demo's offering, the
+   rolling update. Also make `storage.postgres.sslMode` real (the server connects `NoTls`).
 
 ### 1. The standout: make the operations story true on a cluster
 
@@ -779,10 +843,10 @@ cannot do, in rough order of how often an operator will hit it:
   set an email or an external ID at creation (refused with a pointer rather than silently
   dropped), rename a device, or invite somebody by link so that the administrator never sees
   the password at all — that last one is the better design for
-  anything but a household, and wants registration tokens, which are 501.
-- **Edit an array of objects as a form.** `listeners.listeners`, `media.thumbnail_sizes` and
-  `auth.oidc_providers` fall back to a JSON textarea with live parse errors. Reachable, not
-  pleasant; the generic renderer is built to sit underneath hand-tuned editors for exactly these.
+  anything but a household, and wants registration tokens, which are real as of 2026-09-27.
+- ~~**Edit an array of objects as a form.**~~ **Done 2026-09-27** (decision 0010,
+  `config-structured-editors`): lists of objects, variants and maps are forms; the one shape
+  left without a control is `media.scanning.icap.preview` (queue item 2b).
 - **Switch a tagged-enum backend** — there is no "move from embedded to postgres" flow, only a
   view of whichever variant is live.
 - **See which *setting* changed.** `ConfigStore` records the merge patch per revision precisely so
@@ -895,7 +959,6 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | Invites, leaves and knocks over federation are seams | `hs-federation` | a user cannot leave a remote room audibly, or be invited into one |
 | Federation media fetch broken | `hs-media` | remote avatars and attachments fail |
 | `/search` unimplemented | `hs-room` | needs a cross-room index the actor model has no place for |
-| Admin UI cannot edit arrays of objects | `web` | listeners and OIDC providers are a JSON textarea |
 | Nothing hot-applies a config change | all | every change needs a restart, and says so |
 | One `/api/v1` fetch fails under the full `e2e-real` suite | `web` (dev proxy) | two tests fail together, pass alone |
 | CI does not run the Playwright suite | `.github` | two of its tests failed for an unknown length of time before anybody noticed (fixed 2026-09-21) |
@@ -945,4 +1008,4 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
   interface was embedded; it would have passed for the placeholder too, and the binary had the
   placeholder. Look at the decision itself (the build script's output, the log line, the byte on
   the wire), not at a test that is satisfied either way.
-- **Registered is not working, and a real handler is not working either.** 78 of 158 admin operations have a real handler (`tools/admin_api_coverage.py` counts them; the figure used to be quoted by hand and was different in every document). The rest answer 501. But `users.create` had a real handler for days while the only real user directory answered it 503 — so "has a handler" is a ceiling, and the floor is an end-to-end test through `hs serve`.
+- **Registered is not working, and a real handler is not working either.** 97 of 158 admin operations have a real handler (`tools/admin_api_coverage.py` counts them; the figure used to be quoted by hand and was different in every document). The rest answer 501. But `users.create` had a real handler for days while the only real user directory answered it 503 — so "has a handler" is a ceiling, and the floor is an end-to-end test through `hs serve`.
