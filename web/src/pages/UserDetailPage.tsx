@@ -5,8 +5,6 @@ import {
   useUser,
   useLockUser,
   useUnlockUser,
-  useSuspendUser,
-  useUnsuspendUser,
   useLogoutUser,
   useDeactivateUser,
 } from "@/api/users";
@@ -25,6 +23,8 @@ import { SendNoticeDialog } from "./settings/SendNoticeDialog";
 import { UserDevicesSection } from "./users/UserDevicesSection";
 import { UserIdentitySection } from "./users/UserIdentitySection";
 import { UserClientDataSection } from "./users/UserClientDataSection";
+import { ModerationCard } from "./users/ModerationCard";
+import { ActivityCard } from "./users/ActivityCard";
 
 /** `/users/:id` — flows.md flow 2 steps 2-5: understand and act on a user. */
 export function UserDetailPage() {
@@ -35,8 +35,6 @@ export function UserDetailPage() {
 
   const lock = useLockUser();
   const unlock = useUnlockUser();
-  const suspend = useSuspendUser();
-  const unsuspend = useUnsuspendUser();
   const logout = useLogoutUser();
   const deactivate = useDeactivateUser();
   const [resetOpen, setResetOpen] = useState(false);
@@ -148,61 +146,6 @@ export function UserDetailPage() {
               />
             </Dialog>
           )}
-          {user.suspended ? (
-            <Button
-              variant="secondary"
-              disabled={!canModerate}
-              onClick={() =>
-                unsuspend.mutate(
-                  { userId: id },
-                  { onSuccess: () => toast({ title: "User unsuspended" }) },
-                )
-              }
-            >
-              Unsuspend
-            </Button>
-          ) : (
-            <Dialog>
-              <DialogTrigger asChild>
-                <Button variant="secondary" disabled={!canModerate}>
-                  Suspend
-                </Button>
-              </DialogTrigger>
-              <DialogContent
-                title={`Suspend ${id}?`}
-                description="They can read but not send until you lift it."
-                footer={
-                  <>
-                    <DialogClose asChild>
-                      <Button variant="secondary">Cancel</Button>
-                    </DialogClose>
-                    <DialogClose asChild>
-                      <Button
-                        variant="danger"
-                        onClick={() =>
-                          suspend.mutate(
-                            { userId: id },
-                            {
-                              onSuccess: () =>
-                                toast({
-                                  title: "User suspended",
-                                  action: {
-                                    label: "Undo",
-                                    onClick: () => unsuspend.mutate({ userId: id }),
-                                  },
-                                }),
-                            },
-                          )
-                        }
-                      >
-                        Suspend
-                      </Button>
-                    </DialogClose>
-                  </>
-                }
-              />
-            </Dialog>
-          )}
           <Button
             variant="secondary"
             disabled={!canModerate || user.deactivated}
@@ -265,10 +208,15 @@ export function UserDetailPage() {
           <UserDevicesSection userId={id} canWrite={canWrite} canModerate={canModerate} />
           <UserIdentitySection userId={id} canWrite={canWrite} />
           <UserClientDataSection userId={id} canWrite={canWrite} />
+
+          <div className="mt-8">
+            <ActivityCard userId={id} />
+          </div>
         </div>
 
         <div>
-          <h2 className="text-md font-medium text-text">Danger</h2>
+          <ModerationCard user={user} />
+          <h2 className="mt-8 text-md font-medium text-text">Danger</h2>
           <div className="mt-3 rounded-md border border-danger-border bg-danger-bg p-4">
             <h3 className="text-sm font-medium text-text">Deactivate this user</h3>
             <p className="mt-1 text-sm text-text-muted">

@@ -267,6 +267,24 @@ impl<B: KvBackend> UserStore for TablesAuthStore<B> {
         self.update_user(user_id, |u| u.suspended = suspended).await
     }
 
+    async fn set_shadow_banned(
+        &self,
+        user_id: &UserId,
+        shadow_banned: bool,
+    ) -> Result<(), StoreError> {
+        self.update_user(user_id, |u| u.shadow_banned = shadow_banned)
+            .await
+    }
+
+    async fn set_rate_limit_override(
+        &self,
+        user_id: &UserId,
+        rate_limit: Option<super::RateLimitOverrideRecord>,
+    ) -> Result<(), StoreError> {
+        self.update_user(user_id, |u| u.rate_limit_override = rate_limit)
+            .await
+    }
+
     async fn set_deactivated(&self, user_id: &UserId, deactivated: bool) -> Result<(), StoreError> {
         self.update_user(user_id, |u| u.deactivated = deactivated)
             .await

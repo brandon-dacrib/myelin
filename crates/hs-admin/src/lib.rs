@@ -25,6 +25,9 @@
 //! - [`assets`]: serves the management interface's built assets at `/admin/`.
 //! - [`registration_tokens`]: the `registration_tokens.*` operations and the source they use.
 //! - [`server_notices`]: the `server_notices.*` operations and the source they use.
+//! - [`user_moderation`]: the moderation and activity half of the Users area (suspension,
+//!   shadow-bans, rate-limit overrides, support sessions, sessions, memberships, statistics,
+//!   a user's media, redacting what a user sent) and the two source traits it calls.
 //! - [`openapi`]: the embedded OpenAPI document.
 //!
 //! The `hs-admin-mock` binary (`src/bin/hs-admin-mock.rs`) is a separate, self-contained fixture
@@ -55,3 +58,4 @@ pub mod sources;
 pub mod statistics;
 pub mod tasks;
 pub mod user_identity;
+pub mod user_moderation;

@@ -83,6 +83,22 @@ pub struct UserRecord {
     /// a person. `default` so that rows written before the field existed still read.
     #[serde(default)]
     pub appservice_id: Option<String>,
+    /// An administrator's override of how fast this user may send events
+    /// (`hs-admin`'s `users.rate_limit.*`), replacing the server's `rate_limits.message` bucket
+    /// for this one account. `None` means no override. `default` so that rows written before the
+    /// field existed still read.
+    #[serde(default)]
+    pub rate_limit_override: Option<RateLimitOverrideRecord>,
+}
+
+/// A per-user message rate limit set by an administrator ([`UserRecord::rate_limit_override`]).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RateLimitOverrideRecord {
+    /// Sustained rate, events per second. `0` exempts the user from the limit entirely
+    /// (Synapse's convention for its `ratelimit_override` table).
+    pub per_second: f64,
+    /// How many events may be sent back to back before the sustained rate applies.
+    pub burst_count: u32,
 }
 
 impl UserRecord {
@@ -102,6 +118,7 @@ impl UserRecord {
             display_name: None,
             avatar_url: None,
             appservice_id: None,
+            rate_limit_override: None,
         }
     }
 }
@@ -215,6 +232,22 @@ pub trait UserStore: Send + Sync {
         &self,
         user_id: &ruma::UserId,
         suspended: bool,
+    ) -> Result<(), StoreError>;
+
+    /// Sets the shadow-banned flag ([`UserRecord::shadow_banned`]). Errors with
+    /// [`StoreError::NotFound`] if the user does not exist.
+    async fn set_shadow_banned(
+        &self,
+        user_id: &ruma::UserId,
+        shadow_banned: bool,
+    ) -> Result<(), StoreError>;
+
+    /// Sets or clears the user's rate-limit override ([`UserRecord::rate_limit_override`]).
+    /// Errors with [`StoreError::NotFound`] if the user does not exist.
+    async fn set_rate_limit_override(
+        &self,
+        user_id: &ruma::UserId,
+        rate_limit: Option<RateLimitOverrideRecord>,
     ) -> Result<(), StoreError>;
 
     /// Sets the deactivated flag. Deactivation is permanent in this trait's contract (no

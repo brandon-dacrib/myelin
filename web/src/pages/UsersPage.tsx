@@ -5,6 +5,7 @@ import { useUsers, type User } from "@/api/users";
 import { Button } from "@/components/ui/button/Button";
 import { Badge } from "@/components/ui/badge/Badge";
 import { Input } from "@/components/ui/input/Input";
+import { Switch } from "@/components/ui/switch/Switch";
 import { DataTable, type Column } from "@/components/ui/table/DataTable";
 import { EmptyState } from "@/components/ui/empty-state/EmptyState";
 import { ForbiddenState } from "@/components/ui/error-state/ErrorState";
@@ -29,6 +30,7 @@ export function UsersPage() {
   const { data, isLoading, isError, error, refetch } = useUsers({
     q: search.q,
     cursor: search.cursor,
+    suspended: search.suspended,
     limit: 20,
   });
 
@@ -142,7 +144,7 @@ export function UsersPage() {
         className="mt-4 flex max-w-md gap-2"
         onSubmit={(e) => {
           e.preventDefault();
-          navigate({ search: { q: queryInput || undefined } });
+          navigate({ search: { q: queryInput || undefined, suspended: search.suspended } });
         }}
       >
         <Input
@@ -166,6 +168,19 @@ export function UsersPage() {
         )}
       </form>
 
+      <div className="mt-3 flex items-center gap-2">
+        <Switch
+          id="users-suspended-only"
+          checked={Boolean(search.suspended)}
+          onCheckedChange={(on) =>
+            navigate({ search: { q: search.q, suspended: on ? true : undefined } })
+          }
+        />
+        <label htmlFor="users-suspended-only" className="text-sm text-text">
+          Suspended only
+        </label>
+      </div>
+
       {isError && (
         <div className="mt-6">
           <QueryProblemState
@@ -187,12 +202,12 @@ export function UsersPage() {
             loading={isLoading}
             onRowClick={(u) => navigate({ to: "/users/$userId", params: { userId: u.user_id } })}
             empty={
-              search.q ? (
+              search.q || search.suspended ? (
                 <EmptyState
                   variant="filtered"
                   icon={<UsersIcon aria-hidden="true" />}
                   title="No user matches"
-                  description={`No results for "${search.q}".`}
+                  description={search.q ? `No results for "${search.q}".` : "Nobody is suspended."}
                   action={
                     <Button
                       variant="ghost"

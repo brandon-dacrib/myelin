@@ -60,6 +60,7 @@ pub async fn post_upgrade<B: KvBackend + 'static>(
     RoomRequester(requester): RoomRequester,
     PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
+    crate::moderation::refuse_if_suspended(&requester)?;
     let old_room_id = parse_room_id(&room_id)?;
     let new_version_str = body
         .get("new_version")

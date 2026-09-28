@@ -105,6 +105,8 @@ pub async fn put_displayname(
 ) -> Result<Response, MatrixError> {
     let uid = parse_user_id(&user_id)?;
     require_self(&requester, &uid)?;
+    // MSC3823: a suspended account may not change its profile.
+    requester.require_not_suspended()?;
     // A `PUT` for a user id this server has never heard of (for example a deleted or never-real
     // account presented via a forged but well-formed token) is also worth a clear error rather
     // than silently creating profile data with no backing `UserRecord`; `set_profile_display_name`
@@ -147,6 +149,8 @@ pub async fn put_avatar_url(
 ) -> Result<Response, MatrixError> {
     let uid = parse_user_id(&user_id)?;
     require_self(&requester, &uid)?;
+    // MSC3823: a suspended account may not change its profile.
+    requester.require_not_suspended()?;
     let avatar_url = body
         .get("avatar_url")
         .and_then(Value::as_str)
@@ -228,6 +232,31 @@ mod tests {
             .unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["displayname"], "Alice");
+    }
+
+    #[tokio::test]
+    async fn a_suspended_account_cannot_change_its_profile() {
+        let state = state_with_user().await;
+        let mut requester = Requester::for_user(user_id!("@alice:example.org").to_owned());
+        requester.suspended = true;
+        let err = put_displayname(
+            State(state.clone()),
+            Path("@alice:example.org".to_string()),
+            requester.clone(),
+            PermissiveJson(json!({"displayname": "Spam"})),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.errcode().as_str(), "M_USER_SUSPENDED");
+        let err = put_avatar_url(
+            State(state),
+            Path("@alice:example.org".to_string()),
+            requester,
+            PermissiveJson(json!({"avatar_url": "mxc://example.org/spam"})),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.errcode().as_str(), "M_USER_SUSPENDED");
     }
 
     #[tokio::test]

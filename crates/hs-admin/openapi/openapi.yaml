@@ -5136,6 +5136,7 @@ paths:
     post:
       summary: Mint a support token for a user
       operationId: users.login_as
+      description: Mints a new session (a device and an access token) acting as the user, for support. Needs admin:write itself. The token is in this answer only; the audit entry, the user.impersonated event and a warn-level log line record that it was minted, by whom, for how long and why. The session is listed among the user's sessions with support_session true and can be signed out like any other. 409 for a deactivated account or the caller's own.
       tags:
       - Users
       security:
@@ -5144,6 +5145,20 @@ paths:
       parameters:
       - $ref: '#/components/parameters/UserId'
       - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                valid_for_seconds:
+                  type: integer
+                  minimum: 1
+                  maximum: 86400
+                  default: 3600
       responses:
         '201':
           description: A minted access token.
@@ -5151,7 +5166,14 @@ paths:
             application/json:
               schema:
                 type: object
+                required:
+                - user_id
+                - access_token
+                - device_id
+                - expires_at
                 properties:
+                  user_id:
+                    type: string
                   access_token:
                     type: string
                   device_id:
@@ -5159,6 +5181,8 @@ paths:
                   expires_at:
                     type: string
                     format: date-time
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '403':
@@ -5168,7 +5192,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          $ref: '#/components/responses/IdempotencyInFlight'
+          $ref: '#/components/responses/Conflict'
         '422':
           $ref: '#/components/responses/IdempotencyMismatch'
         '500':
@@ -5257,6 +5281,7 @@ paths:
           $ref: '#/components/responses/InvalidCursor'
     delete:
       summary: Delete a user's media (Task)
+      description: Deletes everything the user uploaded, except protected items. The task's action is media.delete. Its result has deleted, bytes and skipped_protected (integers) and failed, a list of {media_id, error}.
       operationId: users.media.delete
       tags:
       - Users
@@ -5385,6 +5410,7 @@ paths:
   /users/{user_id}/rate-limit:
     get:
       summary: Get a user's rate-limit override
+      description: The override replaces the server's rate_limits.message bucket for this user's event sending. An empty object means none is set.
       operationId: users.rate_limit.get
       tags:
       - Users
@@ -5526,6 +5552,7 @@ paths:
   /users/{user_id}/redact-events:
     post:
       summary: Redact a user's events (Task)
+      description: Redacts the user's non-state events not already redacted, newest first, in room_id only if given, at most limit if given. Each is redacted by the user while they are in the room, otherwise by the local member with the most power there if that is enough. The task's result has total, redacted and failed_count (integers) and failed, up to 50 entries of {room_id, event_id, error}. 404 if room_id names no room.
       operationId: users.redact_events
       tags:
       - Users
@@ -5734,11 +5761,36 @@ paths:
             application/json:
               schema:
                 type: object
+                required:
+                - user_id
+                - joins_count
+                - invites_sent_count
+                - events_sent_count
+                - rooms_created_count
                 properties:
+                  user_id:
+                    type: string
                   invites_sent_count:
                     type: integer
                   joins_count:
                     type: integer
+                    description: Rooms the user is joined to now.
+                  events_sent_count:
+                    type: integer
+                  rooms_created_count:
+                    type: integer
+                  media_count:
+                    type:
+                    - integer
+                    - 'null'
+                  media_bytes:
+                    type:
+                    - integer
+                    - 'null'
+                  session_count:
+                    type:
+                    - integer
+                    - 'null'
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '403':
@@ -5759,7 +5811,7 @@ paths:
       - Users
       security:
       - OAuth2:
-        - admin:write
+        - moderation:write
       parameters:
       - $ref: '#/components/parameters/UserId'
       - $ref: '#/components/parameters/IdempotencyKey'
@@ -6008,7 +6060,7 @@ paths:
       - Users
       security:
       - OAuth2:
-        - admin:write
+        - moderation:write
       parameters:
       - $ref: '#/components/parameters/UserId'
       - $ref: '#/components/parameters/IdempotencyKey'
@@ -6746,9 +6798,19 @@ components:
           format: date-time
     Session:
       type: object
+      required:
+      - device_id
+      - support_session
       properties:
         device_id:
           type: string
+        display_name:
+          type:
+          - string
+          - 'null'
+        support_session:
+          type: boolean
+          description: A session an administrator minted with users.login_as.
         ip:
           type:
           - string
@@ -6794,11 +6856,14 @@ components:
           type: string
     RateLimitOverride:
       type: object
+      description: Replaces the server's rate_limits.message bucket for one user. messages_per_second 0 exempts the user. On PUT messages_per_second is required and burst_count defaults to 10.
       properties:
         messages_per_second:
           type: number
+          minimum: 0
         burst_count:
           type: integer
+          minimum: 1
     Room:
       type: object
       required:
@@ -6867,6 +6932,14 @@ components:
     RoomMember:
       type: object
       properties:
+        room_id:
+          type: string
+          description: Set by users.memberships.list, which lists one user across rooms.
+        room_name:
+          type:
+          - string
+          - 'null'
+          description: Set by users.memberships.list.
         user_id:
           type: string
         membership:

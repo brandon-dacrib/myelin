@@ -350,6 +350,7 @@ pub async fn post_join<B: KvBackend + 'static>(
     RoomRequester(requester): RoomRequester,
     PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
+    crate::moderation::refuse_if_suspended(&requester)?;
     let via = requested_via(raw_query.as_deref());
     act_join(&state, &room_id, via, requester.user_id, &body).await
 }
@@ -364,6 +365,7 @@ pub async fn post_join_by_id_or_alias<B: KvBackend + 'static>(
     RoomRequester(requester): RoomRequester,
     PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
+    crate::moderation::refuse_if_suspended(&requester)?;
     let mut via = requested_via(raw_query.as_deref());
     let room_id = if room_id_or_alias.starts_with('!') {
         parse_room_id(&room_id_or_alias)?
@@ -486,6 +488,12 @@ pub async fn post_invite<B: KvBackend + 'static>(
     RoomRequester(requester): RoomRequester,
     PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
+    crate::moderation::refuse_if_suspended(&requester)?;
+    // A shadow-banned inviter is told the invitation was sent; nobody is invited.
+    if requester.shadow_banned {
+        crate::moderation::note_shadowed(&requester, "invite");
+        return Ok(Json(json!({})).into_response());
+    }
     let target = target_user(&body, &requester.user_id)?;
     act(
         &state,
@@ -505,6 +513,7 @@ pub async fn post_kick<B: KvBackend + 'static>(
     RoomRequester(requester): RoomRequester,
     PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
+    crate::moderation::refuse_if_suspended(&requester)?;
     let target = target_user(&body, &requester.user_id)?;
     act(
         &state,
@@ -524,6 +533,7 @@ pub async fn post_ban<B: KvBackend + 'static>(
     RoomRequester(requester): RoomRequester,
     PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
+    crate::moderation::refuse_if_suspended(&requester)?;
     let target = target_user(&body, &requester.user_id)?;
     act(
         &state,
@@ -543,6 +553,7 @@ pub async fn post_unban<B: KvBackend + 'static>(
     RoomRequester(requester): RoomRequester,
     PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
+    crate::moderation::refuse_if_suspended(&requester)?;
     let target = target_user(&body, &requester.user_id)?;
     act(
         &state,
@@ -618,6 +629,7 @@ pub async fn post_knock<B: KvBackend + 'static>(
     RoomRequester(requester): RoomRequester,
     PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
+    crate::moderation::refuse_if_suspended(&requester)?;
     let room_id = parse_room_id(&room_id)?;
     let via = requested_via(raw_query.as_deref());
     act_knock(&state, &room_id, via, requester.user_id, &body).await
@@ -632,6 +644,7 @@ pub async fn post_knock_by_id_or_alias<B: KvBackend + 'static>(
     RoomRequester(requester): RoomRequester,
     PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
+    crate::moderation::refuse_if_suspended(&requester)?;
     let mut via = requested_via(raw_query.as_deref());
     let room_id = if room_id_or_alias.starts_with('!') {
         parse_room_id(&room_id_or_alias)?

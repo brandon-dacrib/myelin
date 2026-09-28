@@ -15,6 +15,8 @@ const RUN_MS = 20_000;
 interface MockTask extends Task {
   /** When the clock-driven task started, for {@link advance}. */
   clockStart?: number;
+  /** Moves a task another part of the mock drives on, each time it is read (see {@link putDrivenTask}). */
+  step?: (task: Task) => void;
 }
 
 const admin = { kind: "user" as const, id: "@admin:example.org", display_name: "Operator" };
@@ -145,8 +147,25 @@ export function putTask(task: Omit<Task, "created_by"> & Partial<Pick<Task, "cre
   return recordFinishedTask(task);
 }
 
+/**
+ * Records a running task that `step` moves on each time it is read, so a page polling it sees
+ * it progress and finish without the mock needing a timer (a user's redaction does this).
+ */
+export function putDrivenTask(
+  task: Omit<Task, "created_by"> & Partial<Pick<Task, "created_by">>,
+  step: (task: Task) => void,
+): Task {
+  const recorded: MockTask = { created_by: admin, ...task, step };
+  tasks = [...tasks.filter((t) => t.id !== recorded.id), recorded];
+  return wire(recorded);
+}
+
 /** Moves the clock-driven task on:its progress follows the clock and it succeeds at the end. */
 function advance(task: MockTask): MockTask {
+  if (task.step && (task.status === "running" || task.status === "scheduled")) {
+    task.step(task);
+    return task;
+  }
   if (task.clockStart === undefined || task.status !== "running") return task;
   const elapsed = Date.now() - task.clockStart;
   const total = task.progress?.total ?? 4000;
@@ -164,7 +183,7 @@ function advance(task: MockTask): MockTask {
 }
 
 function wire(task: MockTask): Task {
-  const { clockStart: _clockStart, ...rest } = advance(task);
+  const { clockStart: _clockStart, step: _step, ...rest } = advance(task);
   return rest;
 }
 

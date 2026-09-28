@@ -1273,7 +1273,7 @@
       "method": "POST",
       "path": "/users/{user_id}/suspend",
       "operation_id": "users.suspend",
-      "scope": "admin:write",
+      "scope": "moderation:write",
       "public": false,
       "tag": "Users",
       "idempotent_post": true
@@ -1327,7 +1327,7 @@
       "method": "POST",
       "path": "/users/{user_id}/unsuspend",
       "operation_id": "users.unsuspend",
-      "scope": "admin:write",
+      "scope": "moderation:write",
       "public": false,
       "tag": "Users",
       "idempotent_post": true

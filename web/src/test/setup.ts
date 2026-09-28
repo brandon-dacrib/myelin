@@ -11,6 +11,7 @@ import { resetTasks } from "@/mocks/data/tasks";
 import { resetCluster } from "@/mocks/data/cluster";
 import { resetRoomContents } from "@/mocks/data/room-contents";
 import { resetMigration } from "@/mocks/data/migration";
+import { resetUserModeration } from "@/mocks/data/user-moderation";
 
 /**
  * Give the API client an absolute base URL before anything imports it.
@@ -88,5 +89,7 @@ afterEach(() => {
   resetRoomContents();
   // And its migration from Synapse, and the source the configuration names.
   resetMigration();
+  // And users' moderation flags, rate limits and support sessions.
+  resetUserModeration();
 });
 afterAll(() => server.close());

@@ -134,6 +134,15 @@ pub enum RoomError {
     /// Complement's `TestServerNotices` look for. Leaving after joining is allowed.
     #[error("you cannot reject the invitation to your server notices room")]
     CannotLeaveServerNoticeRoom,
+    /// The sender's account is suspended by an administrator (MSC3823; `hs-admin`'s
+    /// `users.suspend`), and this write is one suspension blocks. `403 M_USER_SUSPENDED`.
+    #[error("your account is suspended; you can read and leave rooms, but not send")]
+    UserSuspended,
+    /// The sender is over the rate-limit override an administrator set for them
+    /// (`crate::moderation::SendLimiter`). `429 M_LIMIT_EXCEEDED`, with how many milliseconds
+    /// to wait.
+    #[error("too many events; try again in {0} ms")]
+    LimitExceeded(u64),
 }
 
 impl RoomError {
@@ -175,6 +184,12 @@ impl RoomError {
             ),
             Self::Forbidden(msg) => MatrixError::forbidden(msg.clone()),
             Self::RoomBlocked(_) => MatrixError::forbidden(self.to_string()),
+            Self::UserSuspended => MatrixError::custom(
+                axum::http::StatusCode::FORBIDDEN,
+                MatrixErrorCode::Other("M_USER_SUSPENDED".to_owned()),
+                self.to_string(),
+            ),
+            Self::LimitExceeded(retry_after_ms) => MatrixError::rate_limited(*retry_after_ms),
             Self::CannotLeaveServerNoticeRoom => MatrixError::custom(
                 axum::http::StatusCode::FORBIDDEN,
                 MatrixErrorCode::Other("M_CANNOT_LEAVE_SERVER_NOTICE_ROOM".to_owned()),

@@ -51,6 +51,7 @@ pub async fn put_alias<B: KvBackend + 'static>(
     RoomRequester(requester): RoomRequester,
     PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
+    crate::moderation::refuse_if_suspended(&requester)?;
     let alias = parse_alias(&room_alias)?;
     let room_id_str = body
         .get("room_id")
@@ -89,6 +90,7 @@ pub async fn delete_alias<B: KvBackend + 'static>(
     Path(room_alias): Path<String>,
     RoomRequester(requester): RoomRequester,
 ) -> Result<Response, RoomError> {
+    crate::moderation::refuse_if_suspended(&requester)?;
     let alias = parse_alias(&room_alias)?;
     let room_id = state
         .rooms

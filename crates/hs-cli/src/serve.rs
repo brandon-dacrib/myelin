@@ -635,6 +635,15 @@ fn admin_state<B: KvBackend + 'static>(
     .with_rooms(Arc::new(hs_room::admin::RoomRegistryDirectory::new(
         rooms.clone(),
     )))
+    // A user's page: suspending, shadow-banning and rate-limiting the account (enforced by the
+    // room, profile and media write routes), its sessions and support sessions, and the rooms,
+    // counts and messages redacting a user works through.
+    .with_user_moderation(Arc::new(
+        hs_auth::admin_moderation::AuthStoreUserModeration::from_auth_state(auth),
+    ))
+    .with_user_activity(Arc::new(
+        hs_room::admin_users::RoomRegistryUserActivity::new(rooms.clone()),
+    ))
     // What lets the management interface create this server's first administrator, instead of
     // that taking a shared secret, `hs register --admin`, a `curl` and a pasted token.
     .with_setup(sources.setup)

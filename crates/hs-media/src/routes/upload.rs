@@ -56,6 +56,10 @@ pub(crate) async fn upload_sync<B: KvBackend>(
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> Result<(StatusCode, Json<UploadResponse>), MediaError> {
+    // MSC3823: a suspended account may not upload.
+    requester
+        .require_not_suspended()
+        .map_err(MediaError::Auth)?;
     let content_type = content_type_of(&headers);
     let limit = state.repository.max_upload_size();
     let bytes = collect_body(body, limit).await?;
@@ -80,6 +84,9 @@ pub(crate) async fn create<B: KvBackend>(
     State(state): State<MediaState<B>>,
     MediaRequester(requester): MediaRequester,
 ) -> Result<Json<CreateResponse>, MediaError> {
+    requester
+        .require_not_suspended()
+        .map_err(MediaError::Auth)?;
     let ctx = UploadContext {
         user_id: requester.user_id.to_string(),
         server_name: state.repository.server_name().to_string(),
@@ -106,6 +113,9 @@ pub(crate) async fn put_upload<B: KvBackend>(
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> Result<StatusCode, MediaError> {
+    requester
+        .require_not_suspended()
+        .map_err(MediaError::Auth)?;
     if server_name != state.repository.server_name() {
         return Err(MediaError::InvalidInput(
             "this server can only complete an upload reservation it made itself".into(),

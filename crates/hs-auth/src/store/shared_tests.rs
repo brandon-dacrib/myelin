@@ -109,6 +109,12 @@ pub(crate) async fn user_flag_setters_round_trip<S: AuthStore>(s: &S) {
     s.set_admin(&uid, true).await.unwrap();
     s.set_locked(&uid, true).await.unwrap();
     s.set_suspended(&uid, true).await.unwrap();
+    s.set_shadow_banned(&uid, true).await.unwrap();
+    let limit = super::RateLimitOverrideRecord {
+        per_second: 0.5,
+        burst_count: 3,
+    };
+    s.set_rate_limit_override(&uid, Some(limit)).await.unwrap();
     s.set_deactivated(&uid, true).await.unwrap();
 
     let got = s.get_user(&uid).await.unwrap().unwrap();
@@ -116,7 +122,20 @@ pub(crate) async fn user_flag_setters_round_trip<S: AuthStore>(s: &S) {
     assert!(got.is_admin);
     assert!(got.locked);
     assert!(got.suspended);
+    assert!(got.shadow_banned);
+    assert_eq!(got.rate_limit_override, Some(limit));
     assert!(got.deactivated);
+
+    s.set_rate_limit_override(&uid, None).await.unwrap();
+    s.set_shadow_banned(&uid, false).await.unwrap();
+    let got = s.get_user(&uid).await.unwrap().unwrap();
+    assert!(!got.shadow_banned);
+    assert_eq!(got.rate_limit_override, None);
+    assert!(
+        s.set_shadow_banned(user_id!("@ghost:example.org"), true)
+            .await
+            .is_err()
+    );
 }
 
 pub(crate) async fn set_password_hash_on_missing_user_is_not_found<S: AuthStore>(s: &S) {

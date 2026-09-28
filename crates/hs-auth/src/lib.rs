@@ -31,6 +31,7 @@
 #![warn(missing_docs)]
 
 pub mod admin_directory;
+pub mod admin_moderation;
 pub mod admin_verifier;
 pub mod appservice;
 pub mod clock;

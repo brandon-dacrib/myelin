@@ -91,6 +91,18 @@ import {
 import { rooms, roomMembers, findRoom } from "./data/rooms";
 import { roomContentHandlers } from "./room-handlers";
 import {
+  clearRateLimit,
+  deleteUserMedia,
+  getRateLimit,
+  listMemberships,
+  listSessions,
+  mintSupportSession,
+  setRateLimit,
+  startRedaction,
+  userMedia,
+  userStatistics,
+} from "./data/user-moderation";
+import {
   findRegistrationToken,
   generateMockToken,
   refreshValidity,
@@ -945,12 +957,16 @@ export const handlers = [
   http.get(`${API}/users`, ({ request }) => {
     const url = new URL(request.url);
     const q = url.searchParams.get("q");
-    const filtered = q
-      ? users.filter(
-          (u) =>
-            u.user_id.includes(q) || (u.display_name ?? "").toLowerCase().includes(q.toLowerCase()),
-        )
-      : users;
+    const suspended = url.searchParams.get("suspended");
+    const filtered = (
+      q
+        ? users.filter(
+            (u) =>
+              u.user_id.includes(q) ||
+              (u.display_name ?? "").toLowerCase().includes(q.toLowerCase()),
+          )
+        : users
+    ).filter((u) => suspended == null || Boolean(u.suspended) === (suspended === "true"));
     const { items, next_cursor, prev_cursor } = paginate(filtered, url);
     return HttpResponse.json({ items, next_cursor, prev_cursor });
   }),
@@ -1232,6 +1248,135 @@ export const handlers = [
     user.deactivated = true;
     return HttpResponse.json(user);
   }),
+
+  // ---- Users: moderation and activity (shadow-ban, rate limit, login-as, sessions,
+  // memberships, statistics, media, redact-events; ./data/user-moderation.ts) ----
+  ...(
+    [
+      ["shadow-ban", true],
+      ["unshadow-ban", false],
+    ] as const
+  ).map(([action, shadowBanned]) =>
+    http.post(`${API}/users/:user_id/${action}`, ({ params }) => {
+      const user = findUser(decodeURIComponent(String(params.user_id)));
+      if (!user) return problem(404, "not-found", "Not found", { detail: "no such user" });
+      user.shadow_banned = shadowBanned;
+      return HttpResponse.json(user);
+    }),
+  ),
+  http.get(`${API}/users/:user_id/rate-limit`, ({ params }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    if (!findUser(userId))
+      return problem(404, "not-found", "Not found", { detail: "no such user" });
+    return HttpResponse.json(getRateLimit(userId));
+  }),
+  http.put(`${API}/users/:user_id/rate-limit`, async ({ params, request }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    if (!findUser(userId))
+      return problem(404, "not-found", "Not found", { detail: "no such user" });
+    const body = (await request.json().catch(() => ({}))) as {
+      messages_per_second?: unknown;
+      burst_count?: unknown;
+    };
+    const rate = body.messages_per_second;
+    const burst = body.burst_count ?? 10;
+    if (typeof rate !== "number" || !Number.isFinite(rate) || rate < 0) {
+      const detail = "messages_per_second must be a number, 0 or more";
+      return problem(400, "validation-failed", "Validation failed", {
+        detail,
+        errors: [{ pointer: "/messages_per_second", detail }],
+      });
+    }
+    if (typeof burst !== "number" || !Number.isInteger(burst) || burst < 1) {
+      const detail = "burst_count must be a whole number, 1 or more";
+      return problem(400, "validation-failed", "Validation failed", {
+        detail,
+        errors: [{ pointer: "/burst_count", detail }],
+      });
+    }
+    return HttpResponse.json(
+      setRateLimit(userId, { messages_per_second: rate, burst_count: burst }),
+    );
+  }),
+  http.delete(`${API}/users/:user_id/rate-limit`, ({ params }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    if (!findUser(userId))
+      return problem(404, "not-found", "Not found", { detail: "no such user" });
+    clearRateLimit(userId);
+    return new HttpResponse(null, { status: 204 });
+  }),
+  http.post(`${API}/users/:user_id/login-as`, async ({ params, request }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    const user = findUser(userId);
+    if (!user) return problem(404, "not-found", "Not found", { detail: "no such user" });
+    if (user.deactivated) {
+      return problem(409, "conflict", "Conflict", {
+        detail: `${userId} is deactivated; there is nobody to sign in as`,
+      });
+    }
+    const body = (await request.json().catch(() => ({}))) as { valid_for_seconds?: number };
+    const valid = body.valid_for_seconds ?? 3600;
+    if (!Number.isInteger(valid) || valid < 1 || valid > 86_400) {
+      const detail = "valid_for_seconds must be between 1 and 86400";
+      return problem(400, "validation-failed", "Validation failed", {
+        detail,
+        errors: [{ pointer: "/valid_for_seconds", detail }],
+      });
+    }
+    return HttpResponse.json(mintSupportSession(userId, valid), { status: 201 });
+  }),
+  http.get(`${API}/users/:user_id/sessions`, ({ params, request }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    if (!findUser(userId))
+      return problem(404, "not-found", "Not found", { detail: "no such user" });
+    return HttpResponse.json(paginate(listSessions(userId), new URL(request.url)));
+  }),
+  http.get(`${API}/users/:user_id/memberships`, ({ params, request }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    if (!findUser(userId))
+      return problem(404, "not-found", "Not found", { detail: "no such user" });
+    const url = new URL(request.url);
+    const rows = listMemberships(userId, url.searchParams.get("membership"));
+    return HttpResponse.json(paginate(rows, url));
+  }),
+  http.get(`${API}/users/:user_id/statistics`, ({ params }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    if (!findUser(userId))
+      return problem(404, "not-found", "Not found", { detail: "no such user" });
+    return HttpResponse.json(userStatistics(userId));
+  }),
+  http.get(`${API}/users/:user_id/media`, ({ params, request }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    if (!findUser(userId))
+      return problem(404, "not-found", "Not found", { detail: "no such user" });
+    const rows = userMedia(userId);
+    return HttpResponse.json({ ...paginate(rows, new URL(request.url)), total: rows.length });
+  }),
+  http.delete(`${API}/users/:user_id/media`, ({ params }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    if (!findUser(userId))
+      return problem(404, "not-found", "Not found", { detail: "no such user" });
+    const task = deleteUserMedia(userId);
+    return HttpResponse.json(task, {
+      status: 202,
+      headers: { Location: `/api/v1/tasks/${task.id}` },
+    });
+  }),
+  http.post(`${API}/users/:user_id/redact-events`, async ({ params, request }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    if (!findUser(userId))
+      return problem(404, "not-found", "Not found", { detail: "no such user" });
+    const body = (await request.json().catch(() => ({}))) as { room_id?: string; limit?: number };
+    if (body.room_id && !findRoom(body.room_id)) {
+      return problem(404, "not-found", "Not found", { detail: `no room ${body.room_id}` });
+    }
+    const task = startRedaction(userId, body);
+    return HttpResponse.json(task, {
+      status: 202,
+      headers: { Location: `/api/v1/tasks/${task.id}` },
+    });
+  }),
+  // ---- end of Users: moderation and activity ----
 
   // ---- Registration tokens (Settings; the Users page's "Invite by link") ----
   http.get(`${API}/registration-tokens`, ({ request }) => {

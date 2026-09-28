@@ -139,6 +139,34 @@ impl UserStore for InMemoryAuthStore {
         Ok(())
     }
 
+    async fn set_shadow_banned(
+        &self,
+        user_id: &UserId,
+        shadow_banned: bool,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock();
+        let user = inner
+            .users
+            .get_mut(user_id)
+            .ok_or_else(|| StoreError::NotFound(user_id.to_string()))?;
+        user.shadow_banned = shadow_banned;
+        Ok(())
+    }
+
+    async fn set_rate_limit_override(
+        &self,
+        user_id: &UserId,
+        rate_limit: Option<super::RateLimitOverrideRecord>,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock();
+        let user = inner
+            .users
+            .get_mut(user_id)
+            .ok_or_else(|| StoreError::NotFound(user_id.to_string()))?;
+        user.rate_limit_override = rate_limit;
+        Ok(())
+    }
+
     async fn set_deactivated(&self, user_id: &UserId, deactivated: bool) -> Result<(), StoreError> {
         let mut inner = self.lock();
         let user = inner

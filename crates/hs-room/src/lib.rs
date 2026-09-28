@@ -34,12 +34,14 @@
 
 pub mod actor;
 pub mod admin;
+pub mod admin_users;
 pub mod backfill;
 pub mod error;
 pub mod fencing;
 pub mod history_visibility;
 pub mod identity;
 pub mod membership;
+pub mod moderation;
 pub mod persist;
 pub mod pipeline;
 pub mod protocol;

@@ -37,6 +37,12 @@ pub async fn put_send<B: KvBackend + 'static>(
     RoomRequester(requester): RoomRequester,
     PermissiveJson(content): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
+    crate::moderation::refuse_if_suspended(&requester)?;
+    crate::moderation::check_send_limit(&state, &requester).await?;
+    if requester.shadow_banned {
+        crate::moderation::note_shadowed(&requester, "send");
+        return Ok(Json(json!({"event_id": crate::moderation::shadow_event_id()})).into_response());
+    }
     let room_id = parse_room_id(&room_id)?;
     let handle = state.rooms.get_or_load(&room_id).await?;
     let event = handle
@@ -59,6 +65,12 @@ pub async fn put_state<B: KvBackend + 'static>(
     RoomRequester(requester): RoomRequester,
     PermissiveJson(content): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
+    crate::moderation::refuse_if_suspended(&requester)?;
+    crate::moderation::check_send_limit(&state, &requester).await?;
+    if requester.shadow_banned {
+        crate::moderation::note_shadowed(&requester, "state");
+        return Ok(Json(json!({"event_id": crate::moderation::shadow_event_id()})).into_response());
+    }
     let room_id = parse_room_id(&room_id)?;
     let handle = state.rooms.get_or_load(&room_id).await?;
     if event_type == "m.room.canonical_alias" && state_key.is_empty() {

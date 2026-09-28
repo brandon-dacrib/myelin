@@ -17,6 +17,8 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 ruma.workspace = true
+# `crate::moderation::shadow_event_id`: the event ID a shadow-banned sender is answered with.
+rand.workspace = true
 hs-model = { path = "../hs-model" }
 hs-state = { path = "../hs-state" }
 hs-kv = { path = "../hs-kv" }

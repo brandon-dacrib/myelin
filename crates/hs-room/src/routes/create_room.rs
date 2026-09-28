@@ -85,6 +85,7 @@ pub async fn post_create_room<B: KvBackend + 'static>(
     preassigned: Option<axum::Extension<hs_cluster::PreassignedRoomId>>,
     PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
+    crate::moderation::refuse_if_suspended(&requester)?;
     // `room_version` must be a JSON string if present at all -- a well-formed-but-wrong-typed
     // value (a number, an object, ...) is `M_BAD_JSON` (sytest/Complement: "rejects attempts to
     // create rooms with numeric versions"), distinct from a well-typed but unrecognized version
@@ -158,7 +159,12 @@ pub async fn post_create_room<B: KvBackend + 'static>(
     // published, and invite-only.
     let preset = preset.or_else(|| publish.then(|| "public_chat".to_owned()));
 
-    let invite = parse_user_list(&body, "invite")?;
+    let mut invite = parse_user_list(&body, "invite")?;
+    // A shadow-banned creator gets their room, and believes the invitations went out; none do.
+    if requester.shadow_banned && !invite.is_empty() {
+        crate::moderation::note_shadowed(&requester, "createRoom invite");
+        invite.clear();
+    }
     // The membership events creating the room sends -- the creator's join, the invitations --
     // say who these people are, like any other membership event. And the invitations of a
     // direct chat say that it is one: `is_direct` on the invitation is the only way the invitee's

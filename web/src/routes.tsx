@@ -234,10 +234,20 @@ function searchAndCursorValidator(search: Record<string, unknown>): SearchAndCur
   };
 }
 
+/** The users list's search: the shared text search and cursor, plus only-suspended. */
+function usersSearchValidator(
+  search: Record<string, unknown>,
+): SearchAndCursor & { suspended?: boolean } {
+  return {
+    ...searchAndCursorValidator(search),
+    suspended: search.suspended === true || search.suspended === "true" ? true : undefined,
+  };
+}
+
 const usersRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/users",
-  validateSearch: searchAndCursorValidator,
+  validateSearch: usersSearchValidator,
   component: UsersPage,
 });
 const userDetailRoute = createRoute({

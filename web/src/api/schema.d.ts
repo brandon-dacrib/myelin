@@ -2024,7 +2024,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Mint a support token for a user */
+        /**
+         * Mint a support token for a user
+         * @description Mints a new session (a device and an access token) acting as the user, for support. Needs admin:write itself. The token is in this answer only; the audit entry, the user.impersonated event and a warn-level log line record that it was minted, by whom, for how long and why. The session is listed among the user's sessions with support_session true and can be signed out like any other. 409 for a deactivated account or the caller's own.
+         */
         post: operations["users.login_as"];
         delete?: never;
         options?: never;
@@ -2060,7 +2063,10 @@ export interface paths {
         get: operations["users.media.list"];
         put?: never;
         post?: never;
-        /** Delete a user's media (Task) */
+        /**
+         * Delete a user's media (Task)
+         * @description Deletes everything the user uploaded, except protected items. The task's action is media.delete. Its result has deleted, bytes and skipped_protected (integers) and failed, a list of {media_id, error}.
+         */
         delete: operations["users.media.delete"];
         options?: never;
         head?: never;
@@ -2108,7 +2114,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Get a user's rate-limit override */
+        /**
+         * Get a user's rate-limit override
+         * @description The override replaces the server's rate_limits.message bucket for this user's event sending. An empty object means none is set.
+         */
         get: operations["users.rate_limit.get"];
         /** Set a user's rate-limit override */
         put: operations["users.rate_limit.put"];
@@ -2146,7 +2155,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Redact a user's events (Task) */
+        /**
+         * Redact a user's events (Task)
+         * @description Redacts the user's non-state events not already redacted, newest first, in room_id only if given, at most limit if given. Each is redacted by the user while they are in the room, otherwise by the local member with the most power there if that is enough. The task's result has total, redacted and failed_count (integers) and failed, up to 50 entries of {room_id, event_id, error}. 404 if room_id names no room.
+         */
         post: operations["users.redact_events"];
         delete?: never;
         options?: never;
@@ -2891,6 +2903,7 @@ export interface components {
              */
             type: string;
         };
+        /** @description Replaces the server's rate_limits.message bucket for one user. messages_per_second 0 exempts the user. On PUT messages_per_second is required and burst_count defaults to 10. */
         RateLimitOverride: {
             burst_count?: number;
             messages_per_second?: number;
@@ -3152,6 +3165,10 @@ export interface components {
             display_name?: string | null;
             /** @enum {string} */
             membership?: "join" | "invite" | "leave" | "ban" | "knock";
+            /** @description Set by users.memberships.list, which lists one user across rooms. */
+            room_id?: string;
+            /** @description Set by users.memberships.list. */
+            room_name?: string | null;
             user_id?: string;
         };
         RoomMemberPage: components["schemas"]["PageEnvelope"] & {
@@ -3229,11 +3246,14 @@ export interface components {
         Session: {
             /** Format: date-time */
             created_at?: string;
-            device_id?: string;
+            device_id: string;
+            display_name?: string | null;
             /** @description Redacted for moderation:* scopes. */
             ip?: string | null;
             /** Format: date-time */
             last_seen_at?: string | null;
+            /** @description A session an administrator minted with users.login_as. */
+            support_session: boolean;
             user_agent?: string | null;
         };
         SessionPage: components["schemas"]["PageEnvelope"] & {
@@ -8234,7 +8254,15 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody?: {
+            content: {
+                "application/json": {
+                    reason?: string;
+                    /** @default 3600 */
+                    valid_for_seconds?: number;
+                };
+            };
+        };
         responses: {
             /** @description A minted access token. */
             201: {
@@ -8243,17 +8271,19 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
-                        access_token?: string;
-                        device_id?: string;
+                        access_token: string;
+                        device_id: string;
                         /** Format: date-time */
-                        expires_at?: string;
+                        expires_at: string;
+                        user_id: string;
                     };
                 };
             };
+            400: components["responses"]["ValidationFailed"];
             401: components["responses"]["Unauthenticated"];
             403: components["responses"]["InsufficientScope"];
             404: components["responses"]["NotFound"];
-            409: components["responses"]["IdempotencyInFlight"];
+            409: components["responses"]["Conflict"];
             422: components["responses"]["IdempotencyMismatch"];
             429: components["responses"]["RateLimited"];
             500: components["responses"]["Internal"];
@@ -8810,8 +8840,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
-                        invites_sent_count?: number;
-                        joins_count?: number;
+                        events_sent_count: number;
+                        invites_sent_count: number;
+                        /** @description Rooms the user is joined to now. */
+                        joins_count: number;
+                        media_bytes?: number | null;
+                        media_count?: number | null;
+                        rooms_created_count: number;
+                        session_count?: number | null;
+                        user_id: string;
                     };
                 };
             };

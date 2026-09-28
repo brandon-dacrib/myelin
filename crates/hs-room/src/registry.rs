@@ -130,6 +130,8 @@ pub struct RoomRegistry<B: KvBackend> {
 
     /// Reports users have filed about events, rooms and other users (`crate::reports`).
     reports: crate::reports::ReportStore<B>,
+    /// The per-user rate-limit overrides' token buckets (`crate::moderation`).
+    send_limiter: crate::moderation::SendLimiter,
 }
 
 impl<B: KvBackend + 'static> RoomRegistry<B> {
@@ -163,6 +165,7 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             fencing: OnceLock::new(),
             server_notices_user: OnceLock::new(),
             reports,
+            send_limiter: crate::moderation::SendLimiter::new(),
         })
     }
 
@@ -170,6 +173,13 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     #[must_use]
     pub fn server_name(&self) -> &ruma::ServerName {
         &self.identity.server_name
+    }
+
+    /// The token buckets of the users an administrator has given a rate-limit override
+    /// (`crate::moderation`).
+    #[must_use]
+    pub fn send_limiter(&self) -> &crate::moderation::SendLimiter {
+        &self.send_limiter
     }
 
     /// The reports users have filed (`crate::routes::report` writes them, the admin API reads

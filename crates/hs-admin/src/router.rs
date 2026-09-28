@@ -41,6 +41,7 @@ use crate::sources::{
     RecoverySource, RoomDirectory, RoomFilter, SetupSource, SourceError, UserCreateRequest,
     UserDirectory, UserFilter, UserLookupQuery,
 };
+use crate::user_moderation as um;
 
 /// Everything an `hs-admin` handler needs. Cloned per-request by axum (cheap: everything inside
 /// is an `Arc`, a plain value type, or `Copy`).
@@ -131,6 +132,14 @@ pub struct AdminState {
     /// [`crate::migration`]). `None` until wired with [`AdminState::with_migration`]; until then
     /// they answer `503 unavailable`.
     pub migration: Option<Arc<dyn crate::migration::MigrationSource>>,
+    /// The account side of the Users area's moderation operations (suspension, shadow-bans,
+    /// rate-limit overrides, sessions, support sessions): see [`crate::user_moderation`].
+    /// `None` until wired with [`AdminState::with_user_moderation`].
+    pub user_moderation: Option<Arc<dyn crate::user_moderation::UserModerationSource>>,
+    /// The room side of a user's activity (memberships, statistics, redacting what they sent):
+    /// see [`crate::user_moderation`]. `None` until wired with
+    /// [`AdminState::with_user_activity`].
+    pub user_activity: Option<Arc<dyn crate::user_moderation::UserActivitySource>>,
     /// The `Idempotency-Key` cache every mutating handler that declares it consults (see
     /// [`crate::idempotency`]). Always present (never `None`): a client is never told its
     /// idempotency key was ignored.
@@ -170,6 +179,8 @@ impl AdminState {
             user_data: None,
             room_content: None,
             migration: None,
+            user_moderation: None,
+            user_activity: None,
             idempotency: Arc::new(IdempotencyStore::new()),
         }
     }
@@ -280,6 +291,29 @@ impl AdminState {
     #[must_use]
     pub fn with_room_content(mut self, rooms: Arc<dyn crate::rooms::RoomContentSource>) -> Self {
         self.room_content = Some(rooms);
+        self
+    }
+
+    /// Wires the account side of user moderation, making `users.suspend`, `users.shadow_ban`,
+    /// `users.rate_limit.*`, `users.sessions.list` and `users.login_as` (and their inverses)
+    /// real.
+    #[must_use]
+    pub fn with_user_moderation(
+        mut self,
+        moderation: Arc<dyn crate::user_moderation::UserModerationSource>,
+    ) -> Self {
+        self.user_moderation = Some(moderation);
+        self
+    }
+
+    /// Wires the room side of a user's activity, making `users.memberships.list`,
+    /// `users.statistics.get` and `users.redact_events` real.
+    #[must_use]
+    pub fn with_user_activity(
+        mut self,
+        activity: Arc<dyn crate::user_moderation::UserActivitySource>,
+    ) -> Self {
+        self.user_activity = Some(activity);
         self
     }
 
@@ -433,6 +467,20 @@ const REAL_HANDLERS: &[&str] = &[
     "users.pushers.list",
     "users.logout",
     "users.reset_password",
+    "users.suspend",
+    "users.unsuspend",
+    "users.shadow_ban",
+    "users.unshadow_ban",
+    "users.redact_events",
+    "users.rate_limit.get",
+    "users.rate_limit.put",
+    "users.rate_limit.delete",
+    "users.login_as",
+    "users.sessions.list",
+    "users.memberships.list",
+    "users.statistics.get",
+    "users.media.list",
+    "users.media.delete",
     "rooms.list",
     "rooms.get",
     "rooms.block",
@@ -4888,6 +4936,24 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         }
         "users.logout" => builder.add(method, &full_path, users_logout, meta),
         "users.reset_password" => builder.add(method, &full_path, users_reset_password, meta),
+        "users.suspend" => builder.add(method, &full_path, um::users_suspend, meta),
+        "users.unsuspend" => builder.add(method, &full_path, um::users_unsuspend, meta),
+        "users.shadow_ban" => builder.add(method, &full_path, um::users_shadow_ban, meta),
+        "users.unshadow_ban" => builder.add(method, &full_path, um::users_unshadow_ban, meta),
+        "users.redact_events" => builder.add(method, &full_path, um::users_redact_events, meta),
+        "users.rate_limit.get" => builder.add(method, &full_path, um::users_rate_limit_get, meta),
+        "users.rate_limit.put" => builder.add(method, &full_path, um::users_rate_limit_put, meta),
+        "users.rate_limit.delete" => {
+            builder.add(method, &full_path, um::users_rate_limit_delete, meta)
+        }
+        "users.login_as" => builder.add(method, &full_path, um::users_login_as, meta),
+        "users.sessions.list" => builder.add(method, &full_path, um::users_sessions_list, meta),
+        "users.memberships.list" => {
+            builder.add(method, &full_path, um::users_memberships_list, meta)
+        }
+        "users.statistics.get" => builder.add(method, &full_path, um::users_statistics_get, meta),
+        "users.media.list" => builder.add(method, &full_path, um::users_media_list, meta),
+        "users.media.delete" => builder.add(method, &full_path, um::users_media_delete, meta),
         "rooms.list" => builder.add(method, &full_path, rooms_list, meta),
         "rooms.get" => builder.add(method, &full_path, rooms_get, meta),
         "rooms.block" => builder.add(method, &full_path, rooms_block, meta),

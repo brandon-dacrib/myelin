@@ -43,6 +43,22 @@ pub async fn put_redact<B: KvBackend + 'static>(
         .map(str::to_owned);
 
     let handle = state.rooms.get_or_load(&room_id).await?;
+    // MSC3823: a suspended account may still redact its own events (cleaning up after itself
+    // is what suspension leaves it able to do), and nobody else's.
+    if requester.suspended {
+        let own = target.clone();
+        let sender = handle
+            .query(move |actor| actor.event_by_id(&own).map(|e| e.header().sender.clone()))
+            .await;
+        if sender.as_ref().is_some_and(|s| *s != requester.user_id) {
+            return Err(RoomError::UserSuspended);
+        }
+    }
+    crate::moderation::check_send_limit(&state, &requester).await?;
+    if requester.shadow_banned {
+        crate::moderation::note_shadowed(&requester, "redact");
+        return Ok(Json(json!({"event_id": crate::moderation::shadow_event_id()})).into_response());
+    }
     let event = handle
         .redact(
             requester.user_id.clone(),
