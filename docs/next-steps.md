@@ -430,6 +430,7 @@ configuration history and revert (`ConfigStore` already records the patch per re
 - 17:40 `agent/root-redirect` rebased (conflict only in status 15) and handed to
   `tools/merge-queue.sh`. Its previous gate failed only on `cluster_admin`'s drain test (the
   ownership bug `agent/two-pod-cluster-2` fixes); if that recurs it waits for that branch.
+- 17:45 started `agent/config-history` (background agent, own worktree): `GET /config/{section}/history` with the changed settings per revision, and a revert, in the API and on the section page.
 
 ## Handover (2026-09-28, 16:00 EDT): where the nine resumed agents stopped
 
