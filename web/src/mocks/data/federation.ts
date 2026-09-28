@@ -108,7 +108,7 @@ export function startKeyRefresh(server: string) {
     id,
     action: "federation.refetch_keys",
     status: "running",
-    resource: { type: "server", id: server },
+    resource: { type: "destination", id: server },
     progress: null,
     result: null,
     error: null,

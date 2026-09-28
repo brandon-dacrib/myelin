@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import { settle } from "./settle";
 
 /**
  * Proves the app against a real `hs serve`, not `hs-admin-mock`
@@ -140,6 +141,6 @@ test.describe("real server", () => {
  * up on the server under test), so the screenshot itself is the evidence. */
 async function screenshotHonestly(page: Page, path: string, filename: string) {
   await page.goto(path);
-  await page.waitForLoadState("networkidle");
+  await settle(page);
   await page.screenshot({ path: `test-results/${filename}`, fullPage: true });
 }

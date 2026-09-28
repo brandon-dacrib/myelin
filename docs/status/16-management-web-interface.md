@@ -173,6 +173,23 @@ inline Sessions list was:
   (`src/pages/federation/FederationPanels.tsx`, hooks in `src/api/federation.ts`, mocks in
   `src/mocks/data/federation.ts`: a failing destination's refetch fails).
   Tests: `src/pages/federation/FederationPanels.test.tsx` (5).
+- **Reports, Tasks and Statistics against the real binary** (`e2e-real/reports-tasks-statistics.spec.ts`,
+  3 flows, green against `hs serve`; screenshots `docs/design/screenshots/rts-*-real.png`): a
+  reported message and its sender's other report, decided from the page; a bridge's replay, a
+  failed key refetch and a remote media purge on the Tasks page; the "Now" tiles against the
+  server's own counts. What it confirmed: the real `Report.event` is `{event_id, type, sender,
+  origin_server_ts, content, redacted}`, which is what the report page reads. What it fixed: a
+  replay task's action was `appservices.replay` (the operation id), so the Tasks page's
+  Bridges filter (`appservice.`) never found it and it was labelled "Appservices replay"; the
+  server now records the contract's `appservice.replay` and the page names both. Its
+  `resource` is `{type: appservice, id}`, which links to the bridge. The overview never had
+  `media_count`/`media_bytes`, so the Statistics page's media tiles read "—"; the server now
+  counts them. Every `e2e-real` spec waited for `networkidle` before a screenshot, which never
+  comes now that each page holds the event stream open; they use `e2e-real/settle.ts`.
+  Run: `HS_REAL_SERVER_URL=http://127.0.0.1:8195 HS_REAL_ADMIN_TOKEN=... npm run test:e2e:real`.
+  The whole `e2e-real` suite that run: 11 passed, 3 failed on assumptions about the server they
+  last ran against (the user-detail case expects `@ops:test.local`; the bridge-offering flow needs
+  an operator; the invite link's register page expects registration closed).
 
 ## Earlier update: 2026-09-28 (Users-page invite links and notices; branch `agent/users-page-dialogs`)
 

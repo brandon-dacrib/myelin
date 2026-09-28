@@ -309,7 +309,7 @@ async fn a_report_reaches_the_inbox_is_resolved_and_everything_survives_a_restar
     let task_id = task["id"].as_str().unwrap().to_owned();
     let kept = client.get(&format!("/api/v1/tasks/{task_id}"), &ops).await;
     assert_eq!(kept["status"], "succeeded");
-    assert_eq!(kept["action"], "appservices.replay");
+    assert_eq!(kept["action"], "appservice.replay");
 
     // The statistics, from the real records.
     let media = client.get("/api/v1/statistics/users/media", &ops).await;

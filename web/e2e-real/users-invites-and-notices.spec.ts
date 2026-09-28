@@ -1,4 +1,5 @@
 import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
+import { settle } from "./settle";
 
 /**
  * The Users page's invite link and a user's "Send notice", against a real `hs serve`, nothing
@@ -24,7 +25,7 @@ const run = Date.now().toString(36);
 
 /** The whole page, or just the viewport for a dialog (a full-page capture scrolls it away). */
 async function shot(page: Page, name: string, fullPage = true) {
-  await page.waitForLoadState("networkidle");
+  await settle(page);
   await page.screenshot({ path: `${SHOTS}/users-${name}-real.png`, fullPage });
 }
 

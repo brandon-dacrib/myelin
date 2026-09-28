@@ -759,7 +759,7 @@ export interface paths {
         put?: never;
         /**
          * Refresh cached remote keys (Task)
-         * @description Fetches the server's signing keys again, whatever is cached. The task (action federation.refetch_keys, resource {type server, id server_name}) ends succeeded with the RemoteServerKeys the cache then holds as its result, or failed when the server could not be reached or its answer did not verify.
+         * @description Fetches the server's signing keys again, whatever is cached. The task (action federation.refetch_keys, resource {type destination, id server_name}) ends succeeded with the RemoteServerKeys the cache then holds as its result, or failed when the server could not be reached or its answer did not verify.
          */
         post: operations["federation.keys.refresh"];
         delete?: never;

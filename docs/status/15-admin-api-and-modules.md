@@ -182,7 +182,7 @@ offering operations); before that 2026-09-26 (three public recovery operations);
 >   count and the destination's; `404` for a server never reached that shares nothing) and
 >   `federation.keys.list` (this server's own keys), `.get` (what the key cache holds for a
 >   server, current and old, and when it was fetched; `404` when nothing) and `.refresh` (a
->   `federation.refetch_keys` task, resource `{type: server, id}`: fetches again whatever is
+>   `federation.refetch_keys` task, resource `{type: destination, id}`: fetches again whatever is
 >   cached, ends with the cache's keys as `result` or failed with why; audited, published as
 >   `federation.keys_refresh_started` and `federation.keys_refreshed`). `FederationSource`
 >   gained `own_keys`, `remote_keys` and `refresh_remote_keys` (default: unavailable);
@@ -192,14 +192,18 @@ offering operations); before that 2026-09-26 (three public recovery operations);
 >   Contract (additive): `DestinationRoom` gained `name`, `canonical_alias`,
 >   `destination_members_count` and a `required` list; `ServerSigningKey` and
 >   `RemoteServerKeys` gained descriptions and `required`, `cached_at` is nullable; the bulk
->   operations and the refresh describe their tasks. `tools/admin_api_coverage.py`: **106 of
->   158**.
+>   operations and the refresh describe their tasks. `tools/admin_api_coverage.py`: **119 of
+>   158** (with the Users devices-and-identity half merged beside it).
 > - **Verified through the real server** (`crates/hs-cli/tests/admin_followups.rs`, 3 tests):
 >   a bulk deletion of 24 uploads reporting progress on the event stream and cancelled midway
 >   (the rest stay; a second run deletes them; both audited as `202`; the task counters on
 >   `/metrics`); two servers, where A's refresh fetches B's key as B lists it, an unreachable
 >   server's refresh fails, and after Bob on B joins Alice's room on A, A lists that room as
 >   shared with B.
+> - **Found by the `e2e-real` run of Reports, Tasks and Statistics** (status 16): a replay's
+>   task action is now `appservice.replay`, the contract's name, not the operation id; the
+>   statistics overview counts media (`media_count`, `media_bytes`, from the media source,
+>   `ServerOverview::set_media`), which the Statistics page's tiles showed as absent.
 > - **Small fixes.** `registration_tokens.create`, `server_notices.send`, `users.create` and
 >   `appservices.create` record `outcome.status` 201 in the audit log, the status they answer
 >   (`router::record_mutation_with_status`; the old helper still records 200 for everything else).

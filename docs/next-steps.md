@@ -723,10 +723,11 @@ edit one is not. New settings and operations arrive with their interface control
      `report.created`/`task.changed` over SSE instead of polling~~ **done 2026-09-28 (later)**:
      the filters are in the contract, a report page lists the person's other reports, and the
      Reports and Tasks pages and the sidebar count follow the event stream, polling only while
-     it is down (status 15 and 16). Left: an `e2e-real` run of the three pages against `hs
-     serve` (the real `Report.event.content` shape, a replay task's `resource`); acting straight
+     it is down (status 15 and 16). ~~An `e2e-real` run of the three pages against `hs
+     serve`~~ **done** (`web/e2e-real/reports-tasks-statistics.spec.ts`; it fixed the replay
+     task's action and the missing media counts). Left: acting straight
      from a report (suspension and redacting a user's messages are real since 2h, but the
-     report page does not offer them yet).
+     report page does not offer them yet); the report page names the room by id, not name.
    - ~~**2b.** `media.scanning.icap.preview` gets a real control; a Rust test pins the web's
      schema fixture to `schema_for!(Config)`; RFC 0020 (a hidden secret inside a list entry is
      lost on save).~~ **Done 2026-09-28** (track 13): `PreviewMode` reads `negotiate`, `off`,

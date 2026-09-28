@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import { settle } from "./settle";
 
 /**
  * The Cluster page against a real single-node `hs serve`, nothing mocked: one replica, marked as
@@ -40,7 +41,7 @@ async function fetchAll<T>(path: string, query = ""): Promise<T[]> {
 }
 
 async function shot(page: Page, name: string) {
-  await page.waitForLoadState("networkidle");
+  await settle(page);
   await page.screenshot({ path: `test-results/real-cluster-${name}.png`, fullPage: true });
 }
 

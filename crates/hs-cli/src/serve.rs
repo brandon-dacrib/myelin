@@ -1417,7 +1417,11 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     let statistics_sampler = statistics
         .clone()
         .spawn_sampler(crate::statistics::SAMPLE_INTERVAL);
-    let media_repository = media_state.repository.clone();
+    let media_source: Arc<dyn hs_admin::media::MediaSource> = Arc::new(
+        hs_media::admin_source::RepositoryMediaSource::new(media_state.repository.clone()),
+    );
+    // The Statistics page's "Media files" and "Media stored".
+    overview.set_media(media_source.clone());
     // The Cluster page: the replica registry, the shard rows and drains, read from the shared
     // store every replica heartbeats into (`crate::cluster_admin`).
     let cluster_admin: Arc<dyn hs_admin::cluster::ClusterSource> = {
@@ -1452,7 +1456,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             push_state.pushers.clone(),
         ));
     let migration_hub = user_state.hub.clone();
-    let migration_media = media_repository.clone();
+    let migration_media = media_state.repository.clone();
     let migration_tasks = tasks.clone();
     let mut admin = admin_state(
         &auth_state,
@@ -1472,9 +1476,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             reports,
             tasks,
             statistics,
-            media: Arc::new(hs_media::admin_source::RepositoryMediaSource::new(
-                media_repository,
-            )),
+            media: media_source,
             cluster: cluster_admin,
             user_data,
             room_content: crate::room_admin::source(

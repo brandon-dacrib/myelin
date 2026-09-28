@@ -367,6 +367,10 @@ async fn a_bulk_media_deletion_is_a_task_that_reports_progress_and_stops_when_ca
         assert_eq!(response.status(), StatusCode::OK);
     }
     assert_eq!(local_media(&server).await, UPLOADS);
+    // The Statistics page's media tiles count them.
+    let overview = server.admin.get("/api/v1/statistics/overview").await;
+    assert_eq!(overview["media_count"], UPLOADS, "{overview}");
+    assert!(overview["media_bytes"].as_u64().unwrap() > 0, "{overview}");
     let mut stream = server.events(&["task.*", "media.*"]).await;
 
     // Everything unused since a date to come: every upload.

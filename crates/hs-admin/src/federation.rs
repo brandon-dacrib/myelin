@@ -16,7 +16,7 @@
 //! publishes. `federation.keys.get` is what the key cache holds for another server: the keys
 //! its signatures are checked against, current and old, and when they were fetched. Both read
 //! the [`FederationSource`]. `federation.keys.refresh` is a Task
-//! (`federation.refetch_keys`, resource `{type: server, id}`): it fetches the server's keys
+//! (`federation.refetch_keys`, resource `{type: destination, id}`): it fetches the server's keys
 //! again, whatever is cached, and ends `succeeded` with what the cache then holds as its
 //! `result`, or `failed` when the server could not be reached or answered something that does
 //! not verify. The request is audited (`federation.keys.refresh`) and published
@@ -243,7 +243,7 @@ pub(crate) async fn keys_refresh(
         return response;
     }
     let actor = principal.to_actor();
-    let resource = ResourceRef::new("server", server_name.clone());
+    let resource = ResourceRef::new("destination", server_name.clone());
     let refresh = Refresh {
         federation,
         server_name: server_name.clone(),
@@ -313,7 +313,7 @@ impl Refresh {
                 let value = serde_json::to_value(&keys).unwrap_or_default();
                 self.events.publish(
                     Event::new("federation.keys_refreshed", value.clone())
-                        .with_resource(ResourceRef::new("server", self.server_name.clone()))
+                        .with_resource(ResourceRef::new("destination", self.server_name.clone()))
                         .with_actor(self.actor),
                 );
                 Ok(value)

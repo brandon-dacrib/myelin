@@ -3461,8 +3461,10 @@ async fn appservice_action(
                     });
                     match appservices.replay(&id, request).await {
                         Ok(replayed) => {
+                            // The action the contract names for it (`Task.action`), not the
+                            // operation id the audit entry carries.
                             let mut task = crate::model::Task::scheduled(
-                                "appservices.replay",
+                                "appservice.replay",
                                 Some(ResourceRef::new("appservice", id.clone())),
                                 principal.to_actor(),
                             );

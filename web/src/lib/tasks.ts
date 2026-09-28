@@ -33,6 +33,8 @@ const TASK_ACTIONS: Record<string, string> = {
   "media.purge_remote_cache": "Purge remote media cache",
   "media.resume_scans": "Resume content scans",
   "appservice.replay": "Replay bridge transactions",
+  // What a server before 2026-09-28 recorded a replay as (the operation id).
+  "appservices.replay": "Replay bridge transactions",
   "migration.copy": "Copy data from Synapse",
   "migration.verify": "Verify the migration",
   "migration.cutover": "Cut over from Synapse",

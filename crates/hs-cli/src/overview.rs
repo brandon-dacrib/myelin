@@ -59,6 +59,8 @@ pub struct ServerOverview<B: KvBackend> {
     /// Where the count of open reports comes from. Absent until set, and the count is then
     /// absent too.
     reports: OnceLock<Arc<dyn hs_admin::reports::ReportSource>>,
+    /// Where the media counts come from. Absent until set, and the counts are then absent too.
+    media: OnceLock<Arc<dyn hs_admin::media::MediaSource>>,
     cached: tokio::sync::Mutex<Option<(Instant, StatisticsOverview)>>,
     ttl: Duration,
 }
@@ -74,6 +76,7 @@ impl<B: KvBackend + 'static> ServerOverview<B> {
             ownership: OnceLock::new(),
             federation: OnceLock::new(),
             reports: OnceLock::new(),
+            media: OnceLock::new(),
             cached: tokio::sync::Mutex::new(None),
             ttl: STATISTICS_TTL,
         }
@@ -94,6 +97,12 @@ impl<B: KvBackend + 'static> ServerOverview<B> {
     /// Hands over the federation source, so the overview can count failing destinations.
     pub fn set_federation(&self, federation: Arc<dyn hs_admin::sources::FederationSource>) {
         let _ = self.federation.set(federation);
+    }
+
+    /// Hands over the media repository, so the overview can count what it holds (every upload
+    /// and cached remote copy) and how many bytes that is.
+    pub fn set_media(&self, media: Arc<dyn hs_admin::media::MediaSource>) {
+        let _ = self.media.set(media);
     }
 
     /// Hands over the reports, so the overview can count the ones awaiting action.
@@ -149,14 +158,25 @@ impl<B: KvBackend + 'static> ServerOverview<B> {
             Some(reports) => Some(reports.open_count().await?),
             None => None,
         };
+        let (media_count, media_bytes) = match self.media.get() {
+            Some(media) => {
+                let items = media.list().await?;
+                (
+                    Some(items.len() as u64),
+                    Some(items.iter().map(|m| m.size_bytes).sum()),
+                )
+            }
+            None => (None, None),
+        };
         Ok(StatisticsOverview {
             users_count: Some(users),
             rooms_count: Some(rooms),
+            media_count,
+            media_bytes,
             daily_active_users: Some(daily),
             monthly_active_users: Some(monthly),
             federation_destinations_failing_count: failing,
             pending_reports_count,
-            ..StatisticsOverview::default()
         })
     }
 }

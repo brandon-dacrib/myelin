@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import { settle } from "./settle";
 
 /**
  * RFC 0017 through the interface against a real `hs serve`, nothing mocked: offer WhatsApp
@@ -17,7 +18,7 @@ const SHOTS = "../docs/design/screenshots";
 
 /** The whole page, or just the viewport for a dialog (a full-page capture scrolls it away). */
 async function shot(page: Page, name: string, fullPage = true) {
-  await page.waitForLoadState("networkidle");
+  await settle(page);
   await page.screenshot({ path: `${SHOTS}/bridge-offerings-${name}-real.png`, fullPage });
 }
 
