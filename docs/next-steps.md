@@ -44,7 +44,7 @@ buckets other than messages are still unenforced, and message buckets are per re
 
 ## Where this stopped (2026-09-28, late): start here
 
-**`main` has everything; no agent branch is open.** The last two, `agent/two-pod-cluster-2`
+**`main` has all the cluster work; no cluster branch is open.** The last two, `agent/two-pod-cluster-2`
 (two pods on the real cluster, the handoff fix, the `hs_cluster_*` metrics) and
 `agent/cluster-admin` (drain and undrain through the admin API, the Cluster page), are merged;
 `agent/two-pod-cluster` is superseded and deleted.
