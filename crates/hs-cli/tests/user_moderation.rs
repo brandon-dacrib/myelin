@@ -110,6 +110,21 @@ impl Caller {
     }
 }
 
+/// The value of `hs_room_moderated_writes_total{outcome}` on `/metrics`. The counter is
+/// process-wide and this binary's tests share a process, so callers assert a lower bound.
+async fn moderated_writes(base: &str, outcome: &str) -> u64 {
+    let text = reqwest::get(format!("{base}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let prefix = format!("hs_room_moderated_writes_total{{outcome=\"{outcome}\"}} ");
+    text.lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .map_or(0, |n| n.trim().parse().unwrap())
+}
+
 fn escape(id: &str) -> String {
     id.replace('!', "%21")
         .replace('#', "%23")
@@ -213,6 +228,7 @@ async fn a_suspended_user_reads_but_cannot_send_until_unsuspended() {
     let (status, refused) = alice.send(&room, "t1", "while suspended").await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
     assert_eq!(refused["errcode"], "M_USER_SUSPENDED");
+    assert!(moderated_writes(&admin.base, "suspended").await >= 1);
     // Other writes are refused too, and reads keep working.
     let (status, refused) = alice
         .call(
@@ -275,6 +291,7 @@ async fn a_shadow_banned_users_message_reaches_nobody() {
         bob.bodies(&room).await.is_empty(),
         "bob saw a shadow-banned message"
     );
+    assert!(moderated_writes(&admin.base, "shadow_banned").await >= 1);
     // An invitation from a shadow-banned user is answered as made, and is not.
     let (status, _) = alice
         .call(
@@ -328,6 +345,7 @@ async fn a_rate_limit_override_throttles_until_it_is_cleared() {
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{limited}");
     assert_eq!(limited["errcode"], "M_LIMIT_EXCEEDED");
     assert!(limited["retry_after_ms"].as_u64().unwrap() > 1000);
+    assert!(moderated_writes(&admin.base, "rate_limited").await >= 1);
 
     admin
         .expect(Method::DELETE, &path, None, StatusCode::NO_CONTENT)

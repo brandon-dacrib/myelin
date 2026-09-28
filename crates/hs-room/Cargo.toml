@@ -19,6 +19,8 @@ tracing.workspace = true
 ruma.workspace = true
 # `crate::moderation::shadow_event_id`: the event ID a shadow-banned sender is answered with.
 rand.workspace = true
+# `crate::moderation::ModerationMetrics`: `hs_room_moderated_writes_total` on `/metrics`.
+prometheus-client.workspace = true
 hs-model = { path = "../hs-model" }
 hs-state = { path = "../hs-state" }
 hs-kv = { path = "../hs-kv" }

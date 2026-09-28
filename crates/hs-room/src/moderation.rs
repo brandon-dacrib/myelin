@@ -18,18 +18,54 @@
 //!   exempts the user. Without an override nothing is limited here: the server-wide
 //!   `rate_limits.message` bucket has never been enforced by this crate, and turning it on is
 //!   a separate decision (it changes the pace of every client and test).
+//!
+//! Every write refused, swallowed or throttled here is counted in
+//! `hs_room_moderated_writes_total{outcome}` (`suspended`, `shadow_banned`, `rate_limited`),
+//! which `hs serve` registers through [`register_metrics`]; the per-write logs are `debug`.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 use hs_auth::requester::Requester;
 use hs_auth::store::RateLimitOverrideRecord;
 use hs_kv::KvBackend;
+use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
 use rand::Rng;
 use ruma::{OwnedUserId, UserId};
 
 use crate::error::RoomError;
 use crate::state::RoomState;
+
+/// The `outcome` label of `hs_room_moderated_writes_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+struct ModeratedLabels {
+    outcome: &'static str,
+}
+
+/// Process-wide, like the account flags it counts: the enforcement points are free functions
+/// on the request path with no registry at hand, and a counter is only an atomic.
+static MODERATED_WRITES: LazyLock<Family<ModeratedLabels, Counter>> =
+    LazyLock::new(Family::default);
+
+fn count(outcome: &'static str) {
+    MODERATED_WRITES
+        .get_or_create(&ModeratedLabels { outcome })
+        .inc();
+}
+
+/// Registers `hs_room_moderated_writes_total{outcome}` into `registry`: writes this crate
+/// refused from a suspended account (`suspended`), swallowed from a shadow-banned one
+/// (`shadow_banned`) or throttled under a rate-limit override (`rate_limited`).
+pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
+    // Registered without `_total`: the text encoder appends it.
+    registry.register(
+        "hs_room_moderated_writes",
+        "Room writes refused, swallowed or throttled because of an administrator's moderation of \
+         the account, by outcome: suspended, shadow_banned, rate_limited",
+        MODERATED_WRITES.clone(),
+    );
+}
 
 /// `403 M_USER_SUSPENDED` if the requester's account is suspended.
 ///
@@ -38,6 +74,7 @@ use crate::state::RoomState;
 pub(crate) fn refuse_if_suspended(requester: &Requester) -> Result<(), RoomError> {
     if requester.suspended {
         tracing::debug!(user = %requester.user_id, "refused a write from a suspended account");
+        count("suspended");
         Err(RoomError::UserSuspended)
     } else {
         Ok(())
@@ -60,6 +97,7 @@ pub fn shadow_event_id() -> String {
 /// fill a log as fast as a room.
 pub(crate) fn note_shadowed(requester: &Requester, what: &str) {
     tracing::debug!(user = %requester.user_id, what, "dropped a write from a shadow-banned account");
+    count("shadow_banned");
 }
 
 struct Bucket {
@@ -174,6 +212,7 @@ pub(crate) async fn check_send_limit<B: KvBackend + 'static>(
         .check(&requester.user_id, limit, now_ms())
         .map_err(|retry_after_ms| {
             tracing::debug!(user = %requester.user_id, retry_after_ms, "a sender is over their rate-limit override");
+            count("rate_limited");
             RoomError::LimitExceeded(retry_after_ms)
         })
 }

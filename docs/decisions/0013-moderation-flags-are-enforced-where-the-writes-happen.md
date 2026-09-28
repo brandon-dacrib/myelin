@@ -41,3 +41,6 @@ no per-user rate limit anywhere: no route in the server enforces `rate_limits.me
   per-room; a user spamming many rooms on many replicas gets a multiple of the override.
 - A support session minted by `users.login_as` is a device whose ID starts with
   `ADMINSUPPORT`; that prefix is how `users.sessions.list` marks it.
+- Every room write refused, swallowed or throttled this way is counted in
+  `hs_room_moderated_writes_total{outcome}` (`suspended`, `shadow_banned`, `rate_limited`);
+  the per-write logs are `debug`, so a shadow-banned spammer cannot fill the log.
