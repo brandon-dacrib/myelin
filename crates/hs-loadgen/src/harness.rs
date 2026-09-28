@@ -141,9 +141,15 @@ pub async fn spawn(server_name: &str) -> Result<ServerHandle> {
     Ok(handle)
 }
 
+/// How long [`spawn`] waits for `/_matrix/client/versions` to answer.
+const BOOT_DEADLINE: Duration = Duration::from_secs(120);
+
 async fn wait_for_ready(handle: &mut ServerHandle) -> Result<()> {
     let client = reqwest::Client::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    // A first boot creates every table's keyspace, each one an fsync; on a disk shared with
+    // parallel builds that alone can pass fifteen seconds. The hs-cli real-binary harnesses
+    // allow the same two minutes.
+    let deadline = tokio::time::Instant::now() + BOOT_DEADLINE;
     let mut last_err: Option<String> = None;
 
     while tokio::time::Instant::now() < deadline {
@@ -176,8 +182,9 @@ async fn wait_for_ready(handle: &mut ServerHandle) -> Result<()> {
     }
 
     bail!(
-        "hs serve at {} never became ready within 15s; last error: {}",
+        "hs serve at {} never became ready within {}s; last error: {}",
         handle.base_url,
+        BOOT_DEADLINE.as_secs(),
         last_err.unwrap_or_else(|| "none observed".to_owned())
     );
 }
