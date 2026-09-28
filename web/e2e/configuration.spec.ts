@@ -101,15 +101,20 @@ test.describe("configuration", () => {
     domGuard.assertClean();
   });
 
-  test("a listener's resources are checkboxes and its TLS a nested form", async ({ page }) => {
+  test("listeners are set at install: shown as the replica runs them, never offered for edit", async ({
+    page,
+  }) => {
     const domGuard = installDomNestingGuard(page);
     await signInAsOperator(page);
 
     await page.goto("/admin/configuration/listeners");
-    const listener = page.getByRole("group", { name: /^Listener 1/ });
-    await expect(listener.getByRole("checkbox", { name: "Client" })).toBeChecked();
-    await listener.getByRole("button", { name: "Set up TLS" }).click();
-    await expect(listener.getByLabel(/^Certificate path/)).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Listeners", level: 1 })).toBeVisible();
+    await expect(page.getByText("Bootstrap only")).toBeVisible();
+    await expect(page.getByText("Set at install", { exact: true })).toBeVisible();
+    await expect(page.getByText("client, federation, media, health, admin")).toBeVisible();
+    // Decision 0010: nothing here can be stored, so nothing is offered for edit.
+    await expect(page.getByRole("checkbox")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Review and save" })).toHaveCount(0);
     await expectNoAxeViolations(page, "configuration section, listeners");
 
     domGuard.assertClean();

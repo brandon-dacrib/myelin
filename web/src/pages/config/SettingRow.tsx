@@ -42,6 +42,13 @@ const ORIGIN_COPY: Record<ConfigOrigin, { label: string; detail: string }> = {
   },
 };
 
+/**
+ * Why a bootstrap setting (decision 0010) is shown but not offered for edit:
+ * it is what a process needs before it can read anything from the database.
+ */
+export const BOOTSTRAP_DETAIL =
+  "Set at install: in the bootstrap file, an HS__ environment variable or the Helm values. A process needs it before it can read the database, so it is never stored there and cannot be changed here.";
+
 export function OriginBadge({ origin }: { origin: ConfigOrigin }) {
   const copy = ORIGIN_COPY[origin];
   const status = origin === "environment" ? "warning" : origin === "default" ? "neutral" : "info";
@@ -161,6 +168,11 @@ export function SettingRow({
 
         <div className="mt-2.5 flex flex-wrap items-center gap-2">
           {origin && <OriginBadge origin={origin} />}
+          {field.bootstrap && (
+            <Badge status="neutral" hideIcon>
+              Set at install
+            </Badge>
+          )}
           {changed && !pinned && (
             <Badge status="info" hideIcon>
               Changed from default
@@ -202,7 +214,10 @@ export function SettingRow({
         </div>
 
         {pinned && <p className="mt-2 text-xs text-warning">{ORIGIN_COPY.environment.detail}</p>}
-        {!pinned && !locked && !field.editable && !field.readOnly && (
+        {!pinned && !locked && field.bootstrap && (
+          <p className="mt-2 text-xs text-text-muted">{BOOTSTRAP_DETAIL}</p>
+        )}
+        {!pinned && !locked && !field.bootstrap && !field.editable && !field.readOnly && (
           <p className="mt-2 text-xs text-warning">
             This server will not accept a change to this setting.
           </p>

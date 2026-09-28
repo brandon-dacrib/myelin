@@ -313,10 +313,13 @@ function SectionForm({ section, data, schema, schemaSettled, onReread }: Section
           icon={<Lock size={16} aria-hidden="true" />}
           title="This section cannot be stored in the database"
         >
-          <code className="font-identifier">{section}</code> says where the database is, so it is
-          read before there is a database to read it from. Set it on the command line, in an{" "}
-          <code className="font-identifier">HS__</code> environment variable, or in the bootstrap
-          file. It is shown here so you can see what this replica is actually running with.
+          <code className="font-identifier">{section}</code> is set at install:{" "}
+          {section === "listeners"
+            ? "which ports this replica listens on belongs to the process, not to the whole server, and it is needed to serve the setup page before anything is administered."
+            : "it says where the database is, so it is read before there is a database to read it from."}{" "}
+          Set it on the command line, in an <code className="font-identifier">HS__</code>{" "}
+          environment variable, in the bootstrap file, or in the Helm values. It is shown here so
+          you can see what this replica is actually running with.
         </Notice>
       )}
 

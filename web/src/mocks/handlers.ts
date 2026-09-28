@@ -33,6 +33,7 @@ import {
   patchPointers,
   recordConfigChange,
   sectionSource,
+  restoreEchoedSecrets,
   stripEchoedSecrets,
   validateDocument,
   validateSection,
@@ -1473,8 +1474,8 @@ export const handlers = [
 
     const meta = configSchemaDocument.sections.find((s) => s.name === name);
     if (meta?.bootstrap) {
-      return problem(400, "validation-failed", "Validation failed", {
-        detail: `${name} says where the database is, so it is read before there is a database to read it from. Set it on the command line, in an HS__ variable, or in the bootstrap file.`,
+      return problem(409, "conflict", "Conflict", {
+        detail: `"${name}" is a bootstrap section: it is read before this server's database is open, or belongs to one process rather than to the whole server, so it cannot be stored in the database — set it on the command line, in an HS__ environment variable, or in the bootstrap file`,
       });
     }
 
@@ -1485,7 +1486,18 @@ export const handlers = [
       });
     }
 
-    const patch = stripEchoedSecrets((await request.json()) as JsonValue);
+    const restored = restoreEchoedSecrets(
+      (await request.json()) as JsonValue,
+      configValues[name],
+      name,
+    );
+    if (restored.errors.length > 0) {
+      return problem(400, "validation-failed", "Validation failed", {
+        detail: "a hidden secret in this change names nowhere a secret is stored",
+        errors: restored.errors,
+      });
+    }
+    const patch = stripEchoedSecrets(restored.patch);
 
     const pinned = environmentPinned(name);
     const touched = patchPointers(patch);

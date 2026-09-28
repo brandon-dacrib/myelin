@@ -58,8 +58,15 @@ describe("normalizeConfigSchema", () => {
       origin: "database",
       secret: false,
       reloadable: false,
+      bootstrap: false,
       editable: true,
     });
+    // A bootstrap setting inside an administered section (decision 0010).
+    expect(schema.settings["server.signing_key_path"]).toMatchObject({
+      bootstrap: true,
+      editable: false,
+    });
+    expect(schema.settings["listeners.listeners"]).toMatchObject({ bootstrap: true });
     // Pinned by an HS__ variable: the server says it will not take a change.
     expect(schema.settings["server.server_name"]).toMatchObject({
       origin: "environment",

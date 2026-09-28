@@ -19,6 +19,10 @@ import realSchema from "@/test/fixtures/hs-config-schema.json";
 import { normalizeConfigSchema, resolveRef, type JsonValue } from "@/api/config-schema";
 import {
   buildSectionModel,
+  choiceInfo,
+  choicePayloadField,
+  chosenChoice,
+  switchChoice,
   emptyValue,
   flattenFields,
   itemField,
@@ -57,6 +61,11 @@ function nestedFields(field: SettingField, depth = 0): SettingField[] {
       children = (variantInfo(field.schema, field.defs ?? {})?.options ?? []).flatMap((option) =>
         propertyFields(field, switchVariant(field, undefined, option.value)),
       );
+      break;
+    case "choice":
+      children = (choiceInfo(field.schema, field.defs ?? {}) ?? [])
+        .filter((option) => option.payload)
+        .map((option) => choicePayloadField(field, option, undefined));
       break;
     case "object-list":
       children = [itemField(field, 0, undefined)];
@@ -190,5 +199,23 @@ describe("the real server's configuration schema", () => {
     expect(propertyFields(storage, s3).find((f) => f.key === "secret_access_key")?.kind).toBe(
       "secret",
     );
+  });
+
+  it("edits the ICAP preview mode, an externally tagged enum, as a choice", () => {
+    const preview = sectionFields("media").get("scanning.icap.preview")!;
+    expect(preview.fullPath).toBe("media.scanning.icap.preview");
+    expect(preview.kind).toBe("choice");
+    expect(choiceInfo(preview.schema, preview.defs ?? {})?.map((o) => o.value)).toEqual([
+      "negotiate",
+      "bytes",
+      "off",
+    ]);
+    expect(chosenChoice(preview, "negotiate")?.label).toBe("Negotiate");
+    expect(chosenChoice(preview, { bytes: 4096 })?.value).toBe("bytes");
+    expect(switchChoice(preview, "negotiate", "off")).toBe("off");
+    expect(switchChoice(preview, "off", "bytes")).toEqual({ bytes: "" });
+    expect(switchChoice(preview, { bytes: 4096 }, "bytes")).toEqual({ bytes: 4096 });
+    const bytes = chosenChoice(preview, { bytes: 4096 })!;
+    expect(choicePayloadField(preview, bytes, { bytes: 4096 }).kind).toBe("integer");
   });
 });

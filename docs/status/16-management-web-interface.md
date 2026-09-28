@@ -32,6 +32,24 @@ inline Sessions list was:
   Screenshots `docs/design/screenshots/users-identity-rename-real.png`,
   `users-identity-page-real.png`.
 
+## Update: 2026-09-28 (Configuration page: the ICAP preview control, RFC 0020, bootstrap; by track 13)
+
+- **Every setting in the real schema has a real control.** `config-model.ts` models the
+  unit-or-`{bytes: N}` choice of `media.scanning.icap.preview` as a variant choice with a
+  number beneath it (`StructuredControls.tsx`). The schema fixture
+  (`src/test/fixtures/hs-config-schema.json`) is regenerated, and a Rust test
+  (`crates/hs-config/tests/web_schema_fixture.rs`) now fails when it drifts from
+  `schema_for!(Config)`.
+- **RFC 0020 in the list editor.** Before moving or removing an entry, the editor marks each
+  untouched hidden secret in the list with `$from` (`markSecretOrigins`), so the server puts
+  it back at the entry's new place; the "saving this list loses its secrets" warning is gone.
+  The mock does what the server does (`restoreEchoedSecrets`).
+- **Decision 0010 on the page.** Each setting's `bootstrap` flag from `GET /config/schema` is
+  shown as "Set at install" with the reason, never offered for edit; `listeners` is shown as a
+  bootstrap section (`SettingRow.tsx`, `ConfigSectionPage.tsx`).
+- **Proved against the real binary**: `web/e2e-real/configuration.spec.ts` (3 flows), 3/3
+  twice in a row against `hs serve`. Vitest 45 files, 349 tests; `npm run check` green.
+
 ## Earlier update: 2026-09-28 (Users-page invite links and notices; branch `agent/users-page-dialogs`)
 
 The audit of the superseded `worktree-agent-aafb071194d2144c6` branch (registration tokens,

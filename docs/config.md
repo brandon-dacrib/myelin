@@ -6,6 +6,10 @@ Every field also accepts an `HS__SECTION__FIELD` environment variable override (
 
 A field with no `Default` shown is required.
 
+## Bootstrap and administered settings
+
+Decision 0010: this server is administered through the admin API and the web interface, never by editing files. Every setting below is **administered** -- stored in the database, changed in the interface's Configuration section or with `PATCH /api/v1/config/{section}` -- except the **bootstrap** ones, marked *(bootstrap)* here, which a process needs before it can read the database (where the database is, its listeners, the server name, the signing key's path, a replica's cluster identity, registration files imported once). Those come only from the bootstrap file, `HS__` variables and the command line (Helm values in Kubernetes), are never stored in the database, and are shown read-only in the interface. A file's administered settings seed the database on the first start and are outranked by it after that.
+
 ## Reload boundary
 
 Sections not listed here require a process restart to change; see the doc comment on `hs_config::reload` for why each one does or does not. Currently reloadable without a restart: `rate_limits`, `federation`, `telemetry`, `appservices`.
@@ -20,12 +24,13 @@ process has ever produced.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `server_name` | string | *required* | The domain in `@user:server_name`, room aliases and event origins. Corresponds to Synapse's `server_name`. Changing it after any room exists is not supported by any Matrix homeserver, including this one. |
+| `server_name` *(bootstrap)* | string | *required* | The domain in `@user:server_name`, room aliases and event origins. Corresponds to Synapse's `server_name`. Changing it after any room exists is not supported by any Matrix homeserver, including this one. |
 | `public_baseurl` | string \| null | — | The externally reachable base URL for clients, if different from `https://{server_name}`. Corresponds to Synapse's `public_baseurl`. |
 | `well_known_server` | string \| null | — | The value this server advertises at `GET /.well-known/matrix/server`: the `host[:port]` a remote server should actually connect to for federation, when that differs from `server_name`. Corresponds to Synapse's `serve_server_wellknown` plus the document Synapse serves from it, collapsed into one field: `None` (the default) means the route is not served at all — a deployment that does not delegate should 404 there, not serve a document pointing at itself, since a well-known that names the server name itself is indistinguishable from no delegation and only adds a failure mode (`crates/hs-federation/src/discovery.rs` implements the resolution order this feeds). |
-| `signing_key_path` | string | `"./signing-keys"` | Directory holding this server's Ed25519 signing keys. Corresponds to Synapse's `signing_key_path` (a file here; a directory in our layout because multiple active keys are normal during rotation). |
+| `signing_key_path` *(bootstrap)* | string | `"./signing-keys"` | Directory holding this server's Ed25519 signing keys. Corresponds to Synapse's `signing_key_path` (a file here; a directory in our layout because multiple active keys are normal during rotation). |
 | `admin_contact` | string \| null | — | Contact address advertised for abuse reports and shown to operators of other servers. Corresponds to Synapse's `admin_contact`. |
 | `report_stats` | boolean | `false` | Whether this server opts in to the anonymised statistics-reporting endpoint. Corresponds to Synapse's `report_stats`. |
+| `unstable_features` | object | `{}` | Extra `unstable_features` flags advertised by `GET /_matrix/client/versions`, by MSC identifier (`org.matrix.msc3202: true`). Merged over the server's built-in set, which is empty: every flag gates a feature a client or bridge will then use, so advertise one only for a feature this server serves. `false` suppresses a built-in flag. |
 
 
 ## `listeners`
@@ -33,7 +38,7 @@ process has ever produced.
 All configured listeners. Restart required to change (see
 [`crate::reload`]): sockets are bound once at startup.
 
-**Restart required to change.**
+**Bootstrap: set at install (bootstrap file, `HS__` variables, command line or Helm values), never stored in the database.**
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -45,7 +50,7 @@ All configured listeners. Restart required to change (see
 Which storage backend this replica uses, and its backend-specific
 settings. Restart required to change (see [`crate::reload`]).
 
-**Restart required to change.**
+**Bootstrap: set at install (bootstrap file, `HS__` variables, command line or Helm values), never stored in the database.**
 
 ### `storage` variant: `embedded`
 
@@ -100,6 +105,7 @@ Media repository settings.
 | `url_preview_timeout` | string \| integer | — | A duration: a string of <number><unit> groups (ms, s, m, h, d, w, y), or an integer number of milliseconds. |
 | `url_preview_max_fetch_size` | string \| integer | — | A byte size: a number with an optional unit (K, M, G, T with 1024 multipliers; KiB/MiB/GiB; KB/MB/GB with 1000 multipliers), or an integer byte count. |
 | `url_preview_cache_lifetime` | string \| integer | — | A duration: a string of <number><unit> groups (ms, s, m, h, d, w, y), or an integer number of milliseconds. |
+| `scanning` | object | — | Top-level scanning/adaptation configuration (`media.scanning` in the operator's YAML). |
 
 
 ## `federation`
@@ -166,14 +172,14 @@ Authentication, session and registration settings.
 
 ## `appservices`
 
-Appservice registry bootstrap settings.
+Appservice delivery settings, and registration files to import once.
 
 **Reloadable without a restart.**
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | boolean | `true` | Master switch for appservice transaction delivery. |
-| `registration_files` | array<string> | `[]` | Static registration YAML files loaded at startup (and on reload). Corresponds to Synapse's `app_service_config_files`. Appservices registered later through the admin API do not need an entry here. |
+| `registration_files` *(bootstrap)* | array<string> | `[]` | Registration YAML files to import into the appservice registry, once each. Corresponds to Synapse's `app_service_config_files`, and exists for migrating from it: the first start that sees a file imports it (unless the registry already has an appservice with that id) and records the import; every later start skips it, even if the file has changed. From then on the bridge is managed in the Bridges section of the interface. Bootstrap only: set in the bootstrap file or the environment, never stored in the database. |
 | `tracking_failure_threshold` | integer | `50` | Consecutive delivery failures to one appservice before it is marked unhealthy and moved to backlog-only delivery. |
 
 
@@ -199,10 +205,10 @@ Cluster topology and ownership tuning.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `single_node` | boolean | `true` | Run as a single replica owning everything, with the ownership manager inert and no mesh listener. Corresponds to `hs serve --single-node`. |
+| `single_node` *(bootstrap)* | boolean | `true` | Run as a single replica owning everything, with the ownership manager inert and no mesh listener. Corresponds to `hs serve --single-node`. |
 | `room_shards` | integer | `256` | Number of room ownership shards. Fixed at cluster creation. |
 | `user_shards` | integer | `256` | Number of user-session ownership shards. Fixed at cluster creation. |
-| `mesh` | object | — | Internal mesh transport between replicas. |
+| `mesh` *(bootstrap)* | object | — | Internal mesh transport between replicas. |
 | `heartbeat_interval` | string \| integer | — | A duration: a string of <number><unit> groups (ms, s, m, h, d, w, y), or an integer number of milliseconds. |
 | `lease_ttl` | string \| integer | — | A duration: a string of <number><unit> groups (ms, s, m, h, d, w, y), or an integer number of milliseconds. |
 

@@ -115,7 +115,7 @@ impl SecretPaths {
                 let echoed: Vec<String> = map
                     .iter()
                     .filter(|(key, child)| {
-                        is_placeholder(child)
+                        is_marker(child)
                             && self.is_secret(&format!("{prefix}/{}", escape_token(key)))
                     })
                     .map(|(key, _)| key.clone())
@@ -138,7 +138,158 @@ impl SecretPaths {
         }
         stripped
     }
+
+    /// Puts back, in place, every secret inside a list entry that the client echoed as a
+    /// placeholder (RFC 0020), from `current` -- the section's values as they are stored now,
+    /// unredacted, whose own JSON Pointer is `prefix` (`"/auth"`). Run it before
+    /// [`SecretPaths::strip_echoed_secrets`], which then drops whatever placeholders are left.
+    ///
+    /// A merge patch replaces an array wholesale, so the interface has to send a whole list of
+    /// OIDC providers to change one provider's name, and each untouched secret comes back as the
+    /// placeholder it was shown. Dropping that placeholder -- right for a setting of its own --
+    /// would store the entry *without* its secret. So inside an array a placeholder is replaced
+    /// by the value stored now, found in one of two ways:
+    ///
+    /// - `{"$secret": true, "$from": "/auth/oidc_providers/2/client_secret"}` names the pointer
+    ///   (whole-configuration, in the stored document) the secret came from. That survives the
+    ///   list editor moving or removing entries ahead of it. The named pointer must be a secret
+    ///   setting in this section and must hold a value; otherwise it is a validation error on the
+    ///   placeholder's own pointer, and nothing is written. `$from` is honoured outside arrays
+    ///   too.
+    /// - `{"$secret": true}` inside an array means "the secret stored at this same pointer". When
+    ///   nothing is stored there, the placeholder is left for `strip_echoed_secrets` to drop,
+    ///   which is what it always meant.
+    ///
+    /// Returns how many secrets were restored, or the `(pointer, message)` of every `$from` that
+    /// could not be honoured.
+    ///
+    /// # Errors
+    /// The `(pointer, message)` pairs described above, when any `$from` is unusable.
+    pub fn restore_echoed_secrets(
+        &self,
+        patch: &mut Value,
+        prefix: &str,
+        current: &Value,
+    ) -> Result<usize, Vec<(String, String)>> {
+        let mut restored = 0;
+        let mut errors = Vec::new();
+        self.restore_walk(
+            patch,
+            prefix,
+            prefix,
+            current,
+            false,
+            &mut restored,
+            &mut errors,
+        );
+        if errors.is_empty() {
+            Ok(restored)
+        } else {
+            Err(errors)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn restore_walk(
+        &self,
+        node: &mut Value,
+        pointer: &str,
+        section_prefix: &str,
+        current: &Value,
+        in_array: bool,
+        restored: &mut usize,
+        errors: &mut Vec<(String, String)>,
+    ) {
+        if self.is_secret(pointer)
+            && let Some(marker) = node.as_object()
+            && marker.get(SECRET_PLACEHOLDER_KEY) == Some(&Value::Bool(true))
+        {
+            let from = marker.get(SECRET_FROM_KEY);
+            if marker.len() == 2
+                && let Some(from) = from
+            {
+                let Some(origin) = from.as_str() else {
+                    errors.push((
+                        pointer.to_owned(),
+                        "`$from` must be a JSON Pointer string".to_owned(),
+                    ));
+                    return;
+                };
+                match self.stored_secret(origin, section_prefix, current) {
+                    Some(value) => {
+                        *node = value;
+                        *restored += 1;
+                    }
+                    None => errors.push((
+                        pointer.to_owned(),
+                        format!(
+                            "`$from` names {origin:?}, where no secret of this section is \
+                             stored now; send the secret itself instead"
+                        ),
+                    )),
+                }
+                return;
+            }
+            if in_array
+                && marker.len() == 1
+                && let Some(value) = self.stored_secret(pointer, section_prefix, current)
+            {
+                *node = value;
+                *restored += 1;
+            }
+            return;
+        }
+        match node {
+            Value::Object(map) => {
+                for (key, child) in map.iter_mut() {
+                    let child_pointer = format!("{pointer}/{}", escape_token(key));
+                    self.restore_walk(
+                        child,
+                        &child_pointer,
+                        section_prefix,
+                        current,
+                        in_array,
+                        restored,
+                        errors,
+                    );
+                }
+            }
+            Value::Array(items) => {
+                for (index, child) in items.iter_mut().enumerate() {
+                    self.restore_walk(
+                        child,
+                        &format!("{pointer}/{index}"),
+                        section_prefix,
+                        current,
+                        true,
+                        restored,
+                        errors,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The value stored now at `pointer` (whole-configuration) when it is a secret setting of the
+    /// section whose values `current` are (at `section_prefix`) and it is set.
+    fn stored_secret(&self, pointer: &str, section_prefix: &str, current: &Value) -> Option<Value> {
+        if !self.is_secret(pointer) {
+            return None;
+        }
+        let rest = pointer.strip_prefix(section_prefix)?;
+        if !rest.is_empty() && !rest.starts_with('/') {
+            return None;
+        }
+        current
+            .pointer(rest)
+            .filter(|value| !value.is_null() && !is_placeholder(value))
+            .cloned()
+    }
 }
+
+/// The member of a placeholder that names where its secret came from (RFC 0020).
+pub const SECRET_FROM_KEY: &str = "$from";
 
 /// The redaction marker itself.
 fn placeholder() -> Value {
@@ -153,6 +304,17 @@ fn is_placeholder(value: &Value) -> bool {
     value.as_object().is_some_and(|map| {
         map.len() == 1 && map.get(SECRET_PLACEHOLDER_KEY) == Some(&Value::Bool(true))
     })
+}
+
+/// The placeholder, or the placeholder with a `$from` naming where it came from (RFC 0020): either
+/// way, "the secret the client was shown, untouched".
+fn is_marker(value: &Value) -> bool {
+    is_placeholder(value)
+        || value.as_object().is_some_and(|map| {
+            map.len() == 2
+                && map.get(SECRET_PLACEHOLDER_KEY) == Some(&Value::Bool(true))
+                && map.contains_key(SECRET_FROM_KEY)
+        })
 }
 
 /// Descends one subschema, recording a pattern wherever `x-secret` appears.
@@ -410,6 +572,95 @@ mod tests {
         let mut patch = json!({"session_secret": "a-new-one"});
         assert!(!paths.strip_echoed_secrets(&mut patch, "/auth"));
         assert_eq!(patch, json!({"session_secret": "a-new-one"}));
+    }
+
+    /// RFC 0020: editing one OIDC provider sends the whole list back, and the secrets the
+    /// operator did not touch must survive it.
+    #[test]
+    fn a_secret_inside_a_list_entry_is_restored_from_what_is_stored() {
+        let paths = secret_paths();
+        let current = json!({
+            "oidc_providers": [
+                {"idp_id": "a", "client_id": "x", "client_secret": "first"},
+                {"idp_id": "b", "client_id": "y", "client_secret": "second"},
+            ],
+        });
+        let mut patch = json!({
+            "oidc_providers": [
+                {"idp_id": "a", "idp_name": "Renamed", "client_id": "x",
+                 "client_secret": {"$secret": true}},
+                {"idp_id": "b", "client_id": "y", "client_secret": {"$secret": true}},
+            ],
+        });
+        assert_eq!(
+            paths.restore_echoed_secrets(&mut patch, "/auth", &current),
+            Ok(2)
+        );
+        assert!(!paths.strip_echoed_secrets(&mut patch, "/auth"));
+        assert_eq!(patch["oidc_providers"][0]["client_secret"], json!("first"));
+        assert_eq!(patch["oidc_providers"][0]["idp_name"], json!("Renamed"));
+        assert_eq!(patch["oidc_providers"][1]["client_secret"], json!("second"));
+    }
+
+    /// The list editor moves and removes entries; `$from` says where each secret came from.
+    #[test]
+    fn a_secret_follows_its_entry_when_the_list_is_reordered() {
+        let paths = secret_paths();
+        let current = json!({
+            "oidc_providers": [
+                {"idp_id": "a", "client_id": "x", "client_secret": "first"},
+                {"idp_id": "b", "client_id": "y", "client_secret": "second"},
+            ],
+        });
+        let mut patch = json!({
+            "oidc_providers": [
+                {"idp_id": "b", "client_id": "y", "client_secret":
+                    {"$secret": true, "$from": "/auth/oidc_providers/1/client_secret"}},
+            ],
+        });
+        assert_eq!(
+            paths.restore_echoed_secrets(&mut patch, "/auth", &current),
+            Ok(1)
+        );
+        assert_eq!(patch["oidc_providers"][0]["client_secret"], json!("second"));
+    }
+
+    #[test]
+    fn a_from_that_names_no_stored_secret_is_refused() {
+        let paths = secret_paths();
+        let current = json!({"oidc_providers": [{"idp_id": "a", "client_id": "x"}]});
+        for from in [
+            json!("/auth/oidc_providers/0/client_secret"),
+            json!("/auth/oidc_providers/0/client_id"),
+            json!("/storage/password"),
+            json!(7),
+        ] {
+            let mut patch = json!({
+                "oidc_providers": [{"idp_id": "a", "client_id": "x",
+                    "client_secret": {"$secret": true, "$from": from}}],
+            });
+            let errors = paths
+                .restore_echoed_secrets(&mut patch, "/auth", &current)
+                .unwrap_err();
+            assert_eq!(errors[0].0, "/auth/oidc_providers/0/client_secret");
+        }
+    }
+
+    /// A new entry has nothing stored at its index; its placeholder means what it always did.
+    #[test]
+    fn a_placeholder_with_nothing_stored_behind_it_is_still_dropped() {
+        let paths = secret_paths();
+        let current = json!({"oidc_providers": []});
+        let mut patch = json!({
+            "oidc_providers": [{"idp_id": "a", "client_id": "x",
+                "client_secret": {"$secret": true}}],
+        });
+        assert_eq!(
+            paths.restore_echoed_secrets(&mut patch, "/auth", &current),
+            Ok(0)
+        );
+        assert!(paths.strip_echoed_secrets(&mut patch, "/auth"));
+        assert_eq!(patch["oidc_providers"][0].get("client_secret"), None);
     }
 
     #[test]

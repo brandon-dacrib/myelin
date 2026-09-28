@@ -7,9 +7,12 @@ metadata:
   labels:
     {{- include "hs.labels" . | nindent 4 }}
 data:
-  # The *file* layer of the server's configuration (docs/rfcs/0016): it seeds the database on
-  # the first start and is outranked by the database after that, so what is here is what an
-  # operator may later change in the admin interface. What must always apply -- the server name,
+  # The *file* layer of the server's configuration (docs/rfcs/0016, decision 0010). Its
+  # bootstrap settings -- `listeners`, `storage`, and in cluster mode `cluster.single_node` and
+  # `cluster.mesh` -- are read from here on every start and never stored in the database, since
+  # a process needs them before it can read the database and each replica has its own. The rest
+  # seeds the database on the first start and is outranked by it after that: it is what an
+  # operator then administers in the admin interface. What must always apply -- the server name,
   # the public base URL, the signing-key path, the database connection -- is not here: the
   # StatefulSet passes those as `HS__` environment variables, which outrank everything.
   homeserver.yaml: |

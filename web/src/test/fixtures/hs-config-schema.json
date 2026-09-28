@@ -13,7 +13,8 @@
         "well_known_server": null,
         "signing_key_path": "./signing-keys",
         "admin_contact": null,
-        "report_stats": false
+        "report_stats": false,
+        "unstable_features": {}
       }
     },
     "listeners": {
@@ -98,7 +99,30 @@
         "allow_legacy_unauthenticated_media": true,
         "url_preview_timeout": "30s",
         "url_preview_max_fetch_size": "10M",
-        "url_preview_cache_lifetime": "1h"
+        "url_preview_cache_lifetime": "1h",
+        "scanning": {
+          "mode": "off",
+          "provider": "none",
+          "fail": null,
+          "allow_replacement": false,
+          "timeout": "30s",
+          "max_size": "100M",
+          "oversize": "quarantine",
+          "cache": {
+            "ttl": "1w",
+            "unversioned_ttl": "1h",
+            "capacity": 100000
+          },
+          "unscannable": {
+            "encrypted": "allow",
+            "other": "block"
+          },
+          "appservice_bypass": {
+            "exempt_appservice_ids": []
+          },
+          "icap": null,
+          "http": null
+        }
       }
     },
     "federation": {
@@ -263,7 +287,7 @@
           "default": null
         },
         "well_known_server": {
-          "description": "The value this server advertises at `GET /.well-known/matrix/server`:\nthe `host[:port]` a remote server should actually connect to for\nfederation, when that differs from `server_name`. Corresponds to\nSynapse's `serve_server_wellknown` plus the document Synapse serves\nfrom it, collapsed into one field: `None` (the default) means the\nroute is not served at all \u2014 a deployment that does not delegate\nshould 404 there, not serve a document pointing at itself, since a\nwell-known that names the server name itself is indistinguishable\nfrom no delegation and only adds a failure mode\n(`crates/hs-federation/src/discovery.rs` implements the resolution\norder this feeds).",
+          "description": "The value this server advertises at `GET /.well-known/matrix/server`:\nthe `host[:port]` a remote server should actually connect to for\nfederation, when that differs from `server_name`. Corresponds to\nSynapse's `serve_server_wellknown` plus the document Synapse serves\nfrom it, collapsed into one field: `None` (the default) means the\nroute is not served at all — a deployment that does not delegate\nshould 404 there, not serve a document pointing at itself, since a\nwell-known that names the server name itself is indistinguishable\nfrom no delegation and only adds a failure mode\n(`crates/hs-federation/src/discovery.rs` implements the resolution\norder this feeds).",
           "type": [
             "string",
             "null"
@@ -287,6 +311,14 @@
           "description": "Whether this server opts in to the anonymised statistics-reporting\nendpoint. Corresponds to Synapse's `report_stats`.",
           "type": "boolean",
           "default": false
+        },
+        "unstable_features": {
+          "description": "Extra `unstable_features` flags advertised by `GET /_matrix/client/versions`, by MSC\nidentifier (`org.matrix.msc3202: true`). Merged over the server's built-in set, which is\nempty: every flag gates a feature a client or bridge will then use, so advertise one only\nfor a feature this server serves. `false` suppresses a built-in flag.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "boolean"
+          },
+          "default": {}
         }
       },
       "additionalProperties": false,
@@ -490,7 +522,7 @@
               "default": null
             },
             "pool_size": {
-              "description": "Connection pool size. Corresponds to Synapse's\n`database.args.cp_max`. Accepted by `hs_kv::postgres_backend::PostgresBackend::open`'s\ncaller today but not yet threaded through \u2014 `open` hardcodes a pool size of 16 regardless\nof this value (see `docs/status/01-storage-engine.md`'s \"Wiring the integration lead must\nadd\" item 5, checked); wiring it is a small change to that backend's public constructor,\nnot a config-schema gap.",
+              "description": "Connection pool size. Corresponds to Synapse's\n`database.args.cp_max`. Accepted by `hs_kv::postgres_backend::PostgresBackend::open`'s\ncaller today but not yet threaded through — `open` hardcodes a pool size of 16 regardless\nof this value (see `docs/status/01-storage-engine.md`'s \"Wiring the integration lead must\nadd\" item 5, checked); wiring it is a small change to that backend's public constructor,\nnot a config-schema gap.",
               "type": "integer",
               "format": "uint32",
               "minimum": 0,
@@ -652,7 +684,7 @@
           "default": true
         },
         "url_preview_timeout": {
-          "description": "Per-request timeout for a `preview_url` fetch (each redirect hop is\ntimed separately). Synapse has no config knob for this \u2014 it hardcodes\na 30-second body-read timeout in its HTTP client\n(`refs/synapse/synapse/http/client.py`'s `get_file`, `timeout_deferred(...,\ntimeout=30, ...)`); this project exposes it as a real setting instead.\nSee `docs/rfcs/0006-url-previews.md` section 4.5 and\n`hs_media::preview::FetchLimits::timeout`, which this field is meant\nto populate (`hs-media` cannot depend on this crate's consumer wiring\n\u2014 see that crate's status file for the one-line change needed).",
+          "description": "Per-request timeout for a `preview_url` fetch (each redirect hop is\ntimed separately). Synapse has no config knob for this — it hardcodes\na 30-second body-read timeout in its HTTP client\n(`refs/synapse/synapse/http/client.py`'s `get_file`, `timeout_deferred(...,\ntimeout=30, ...)`); this project exposes it as a real setting instead.\nSee `docs/rfcs/0006-url-previews.md` section 4.5 and\n`hs_media::preview::FetchLimits::timeout`, which this field is meant\nto populate (`hs-media` cannot depend on this crate's consumer wiring\n— see that crate's status file for the one-line change needed).",
           "$ref": "#/$defs/Duration",
           "default": "30s"
         },
@@ -662,9 +694,36 @@
           "default": "10M"
         },
         "url_preview_cache_lifetime": {
-          "description": "How long a `preview_url` response is cached before it is fetched\nagain. Synapse has no config knob for this either \u2014 it hardcodes a\none-hour cache lifetime (`refs/synapse/synapse/media/url_previewer.py`:\n`ONE_HOUR = 60 * 60 * 1000`, used as both the in-memory and the\non-disk `url_cache` expiry); this project exposes it as a real\nsetting instead. See `hs_media::preview::DEFAULT_PREVIEW_CACHE_TTL_MS`,\nwhich this field is meant to replace.",
+          "description": "How long a `preview_url` response is cached before it is fetched\nagain. Synapse has no config knob for this either — it hardcodes a\none-hour cache lifetime (`refs/synapse/synapse/media/url_previewer.py`:\n`ONE_HOUR = 60 * 60 * 1000`, used as both the in-memory and the\non-disk `url_cache` expiry); this project exposes it as a real\nsetting instead. See `hs_media::preview::DEFAULT_PREVIEW_CACHE_TTL_MS`,\nwhich this field is meant to replace.",
           "$ref": "#/$defs/Duration",
           "default": "1h"
+        },
+        "scanning": {
+          "description": "Content scanning of uploads (RFC 0008): when to scan, with which provider, and what to do\nwhen the scanner cannot answer. Off by default. See [`crate::scanning`].",
+          "$ref": "#/$defs/ScanningConfig",
+          "default": {
+            "mode": "off",
+            "provider": "none",
+            "fail": null,
+            "allow_replacement": false,
+            "timeout": "30s",
+            "max_size": "100M",
+            "oversize": "quarantine",
+            "cache": {
+              "ttl": "1w",
+              "unversioned_ttl": "1h",
+              "capacity": 100000
+            },
+            "unscannable": {
+              "encrypted": "allow",
+              "other": "block"
+            },
+            "appservice_bypass": {
+              "exempt_appservice_ids": []
+            },
+            "icap": null,
+            "http": null
+          }
         }
       },
       "additionalProperties": false
@@ -864,6 +923,332 @@
         }
       ]
     },
+    "ScanningConfig": {
+      "description": "Top-level scanning/adaptation configuration (`media.scanning` in the operator's YAML).",
+      "type": "object",
+      "properties": {
+        "mode": {
+          "description": "When scanning happens. `Off` disables scanning entirely, regardless of `provider`.",
+          "$ref": "#/$defs/ScanMode",
+          "default": "off"
+        },
+        "provider": {
+          "description": "Which provider adapter to use.",
+          "$ref": "#/$defs/ProviderKind",
+          "default": "none"
+        },
+        "fail": {
+          "description": "Fail-open or fail-closed on scanner error/timeout. **Not defaulted**: `None` is only\nvalid when `mode == Off`; enabling scanning without choosing this is a configuration\nerror (RFC section 5). Kept as `Option` specifically so serde does not silently supply a\nvalue the operator never chose.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FailPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "allow_replacement": {
+          "description": "Whether a service may return a modified body (RFC section 3.4). Off by default: an\noperator who has not asked for content rewriting must never silently get it. When\n`false`, a provider that returns adapted content is treated as a scanner error under\n`fail` (see `hs_media::scanning::engine`).",
+          "type": "boolean",
+          "default": false
+        },
+        "timeout": {
+          "description": "Per-scan deadline.",
+          "$ref": "#/$defs/Duration",
+          "default": "30s"
+        },
+        "max_size": {
+          "description": "Content above this size is treated per `oversize` instead of being scanned.",
+          "$ref": "#/$defs/ByteSize",
+          "default": "100M"
+        },
+        "oversize": {
+          "description": "What to do with content over `max_size`.",
+          "$ref": "#/$defs/Action",
+          "default": "quarantine"
+        },
+        "cache": {
+          "description": "The verdict cache.",
+          "$ref": "#/$defs/CacheConfig",
+          "default": {
+            "ttl": "1w",
+            "unversioned_ttl": "1h",
+            "capacity": 100000
+          }
+        },
+        "unscannable": {
+          "description": "Per-`UnscannableReason` policy.",
+          "$ref": "#/$defs/UnscannablePolicy",
+          "default": {
+            "encrypted": "allow",
+            "other": "block"
+          }
+        },
+        "appservice_bypass": {
+          "description": "Appservice scanning bypass.",
+          "$ref": "#/$defs/AppserviceBypass",
+          "default": {
+            "exempt_appservice_ids": []
+          }
+        },
+        "icap": {
+          "description": "`icap` provider settings. Required (and validated) when `provider == Icap`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IcapConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "http": {
+          "description": "`http` provider settings. Required when `provider == Http`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HttpConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "ScanMode": {
+      "description": "When scanning happens relative to the upload becoming servable (RFC section 5).",
+      "oneOf": [
+        {
+          "description": "The upload fails until a verdict arrives. Safest; adds upload latency.",
+          "type": "string",
+          "const": "block"
+        },
+        {
+          "description": "The upload succeeds but the media is not retrievable (`404`, indistinguishable from\nunknown media) until a verdict arrives.",
+          "type": "string",
+          "const": "defer"
+        },
+        {
+          "description": "The media is served immediately; quarantined after the fact if the verdict is bad.",
+          "type": "string",
+          "const": "quarantine"
+        },
+        {
+          "description": "No scanning. The default.",
+          "type": "string",
+          "const": "off"
+        }
+      ]
+    },
+    "ProviderKind": {
+      "description": "Which provider adapter to use. See `hs_media::scanning::providers`.",
+      "oneOf": [
+        {
+          "description": "No scanning (the default). `mode` is ignored if set to anything but `off` — see\n[`ScanningConfig::validated`].",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "description": "ICAP RESPMOD (RFC 3507). The provider: c-icap (fronting ClamAV or anything else),\ncommercial engines with native ICAP interfaces, and cloud gateways such as ICAPeg all\nreach us through this one adapter. See `hs_media::scanning::providers::icap`.",
+          "type": "string",
+          "const": "icap"
+        },
+        {
+          "description": "The JSON submit-and-poll HTTP contract, for cloud APIs with no ICAP fronting (notably\nCrowdStrike Falcon). See `hs_media::scanning::providers::http`.",
+          "type": "string",
+          "const": "http"
+        }
+      ]
+    },
+    "FailPolicy": {
+      "description": "What happens when the scanner cannot produce a verdict in time (timeout, connection refused,\nmalformed response). Not defaulted: see [`ScanningConfig::validated`].",
+      "oneOf": [
+        {
+          "description": "Treat scanner errors and timeouts as rejection.",
+          "type": "string",
+          "const": "closed"
+        },
+        {
+          "description": "Allow the upload through and record the failure.",
+          "type": "string",
+          "const": "open"
+        }
+      ]
+    },
+    "Action": {
+      "description": "A tri-state action, used for [`ScanningConfig::oversize`] and\n[`UnscannablePolicy`]'s per-reason actions.",
+      "oneOf": [
+        {
+          "description": "Let the content through as if it were clean.",
+          "type": "string",
+          "const": "allow"
+        },
+        {
+          "description": "Reject the upload (or, in quarantine mode, quarantine it) as if it were infected.",
+          "type": "string",
+          "const": "block"
+        },
+        {
+          "description": "Serve it, but quarantine so an admin must explicitly clear it.",
+          "type": "string",
+          "const": "quarantine"
+        }
+      ]
+    },
+    "CacheConfig": {
+      "description": "The verdict cache's knobs (RFC section 6).",
+      "type": "object",
+      "properties": {
+        "ttl": {
+          "description": "How long a verdict is cached when the provider reports an `engine_version`.",
+          "$ref": "#/$defs/Duration",
+          "default": "1w"
+        },
+        "unversioned_ttl": {
+          "description": "How long a verdict is cached when the provider cannot report an `engine_version`\n(`ContentScanner::engine_version` returned `None`).",
+          "$ref": "#/$defs/Duration",
+          "default": "1h"
+        },
+        "capacity": {
+          "description": "Maximum number of cached verdicts. Oldest-inserted entries are evicted first once\nexceeded.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 100000
+        }
+      },
+      "additionalProperties": false
+    },
+    "UnscannablePolicy": {
+      "description": "The policy applied to each `hs_media::scanning::types::UnscannableReason`. RFC section 7:\nencrypted media defaults to allow (\"blocking it disables encrypted media entirely\"); every\nother unscannable reason defaults to the more conservative block, since — unlike encryption —\nthose reasons (archive too deep, oversized, unrecognized format) are not an inherent property\nof end-to-end encryption and an operator may want them investigated.",
+      "type": "object",
+      "properties": {
+        "encrypted": {
+          "description": "Action for `hs_media::scanning::types::UnscannableReason::Encrypted`. Default: allow.",
+          "$ref": "#/$defs/Action",
+          "default": "allow"
+        },
+        "other": {
+          "description": "Action for every other unscannable reason (`TooDeep`, `UnsupportedFormat`, `Other`).\n`TooLarge` is governed by [`ScanningConfig::oversize`] instead, not this field. Default:\nblock.",
+          "$ref": "#/$defs/Action",
+          "default": "block"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AppserviceBypass": {
+      "description": "Per-appservice scanning bypass (RFC section 4: \"a bridge may be configured to bypass only by\nexplicit per-appservice configuration, which is recorded in the audit log\").",
+      "type": "object",
+      "properties": {
+        "exempt_appservice_ids": {
+          "description": "Appservice registration IDs (`hs_auth::requester::AppserviceIdentity::appservice_id`)\nexempt from scanning. Every use of this list is written to the audit log — see\n`hs_media::scanning::audit`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        }
+      },
+      "additionalProperties": false
+    },
+    "IcapConfig": {
+      "description": "`icap` provider settings.",
+      "type": "object",
+      "properties": {
+        "host": {
+          "description": "ICAP server host.",
+          "type": "string"
+        },
+        "port": {
+          "description": "ICAP server port (default 1344).",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 1344
+        },
+        "service": {
+          "description": "The ICAP service name, e.g. `virus_scan` (c-icap's ClamAV service alias) or `avscan`.",
+          "type": "string"
+        },
+        "preview": {
+          "description": "Preview negotiation.",
+          "$ref": "#/$defs/PreviewMode",
+          "default": "negotiate"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "host",
+        "service"
+      ]
+    },
+    "PreviewMode": {
+      "description": "How the client negotiates ICAP preview mode. `negotiate`/`off` serialize as bare strings;\na forced size serializes as `{bytes: N}`, matching the RFC's `preview: negotiate` example.\n\nSerde is written by hand rather than derived (track 13, 2026-09-28). The derived externally\ntagged form reads `{bytes: N}` only from JSON: this crate parses every configuration --\na file, a database section, an admin API patch -- through `serde_yaml_ng`, which expects a\ndata-carrying variant as a YAML tag (`!bytes 4096`) and refused the map, so a forced size\ncould not be set at all. It now reads `negotiate`, `off`, `{bytes: N}`, and a bare number of\nbytes (the `negotiate | <bytes> | off` of `docs/rfcs/0008-content-scanning.md`), from any of\nthem, and always writes `negotiate`, `off` or `{bytes: N}`. The JSON Schema is still derived\n(the `serde` attribute below is read by `schemars` only) and describes exactly that written\nshape, which is what the web interface's \"choice\" control edits.",
+      "oneOf": [
+        {
+          "description": "Follow the server's `OPTIONS`-advertised `Transfer-Preview`/`Transfer-Ignore`/\n`Transfer-Complete` policy (the default, and what real ICAP services such as c-icap\nexpect an operator to rely on).",
+          "type": "string",
+          "const": "negotiate"
+        },
+        {
+          "description": "Force a specific preview size regardless of what `OPTIONS` advertises.",
+          "type": "object",
+          "properties": {
+            "bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "bytes"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "Never preview; always send the complete body.",
+          "type": "string",
+          "const": "off"
+        }
+      ]
+    },
+    "HttpConfig": {
+      "description": "`http` provider settings: the submit endpoint, and an optional separate poll endpoint for\nproviders that answer asynchronously (RFC section 3, CrowdStrike Falcon's submit-then-poll\nAPI).",
+      "type": "object",
+      "properties": {
+        "submit_url": {
+          "description": "`POST` here with the scan submission.",
+          "type": "string"
+        },
+        "poll_url": {
+          "description": "`GET <poll_url>/<ticket>` to poll a pending scan. Defaults to `submit_url` (some\nproviders poll the same endpoint with a `?ticket=` query, which this crate's client\nappends automatically when `poll_url` is unset).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "auth_token": {
+          "description": "A bearer token or API key sent as `Authorization: Bearer <token>`, if set. A secret: the\nadmin API serves it redacted.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "x-secret": true
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "submit_url"
+      ]
+    },
     "FederationConfig": {
       "description": "Federation reachability and transport policy.",
       "type": "object",
@@ -911,7 +1296,7 @@
           "default": []
         },
         "verify_certificates": {
-          "description": "Verify TLS certificates on outbound federation requests.\nCorresponds to Synapse's `federation_verify_certificates`.\n\nLeave this `true` in production: setting it `false` makes outbound federation TLS accept\n*any* certificate, which is trivially machine-in-the-middled. It exists for test\ndeployments and conformance harnesses (Complement and similar) that terminate TLS with a\ncertificate this server has no other way to trust yet. The outbound client logs a\nprominent startup warning whenever this is `false`, precisely so it cannot go unnoticed in\na real deployment. Prefer [`Self::custom_ca_certificates`] instead, if the actual goal is\nfederating with one specific server whose certificate chains to a CA this server does not\nalready trust \u2014 that trusts exactly the named CA, not every certificate on the internet.",
+          "description": "Verify TLS certificates on outbound federation requests.\nCorresponds to Synapse's `federation_verify_certificates`.\n\nLeave this `true` in production: setting it `false` makes outbound federation TLS accept\n*any* certificate, which is trivially machine-in-the-middled. It exists for test\ndeployments and conformance harnesses (Complement and similar) that terminate TLS with a\ncertificate this server has no other way to trust yet. The outbound client logs a\nprominent startup warning whenever this is `false`, precisely so it cannot go unnoticed in\na real deployment. Prefer [`Self::custom_ca_certificates`] instead, if the actual goal is\nfederating with one specific server whose certificate chains to a CA this server does not\nalready trust — that trusts exactly the named CA, not every certificate on the internet.",
           "type": "boolean",
           "default": true
         },
@@ -924,7 +1309,7 @@
           "default": []
         },
         "trust_os_root_store": {
-          "description": "Whether outbound federation TLS also trusts whatever CA store the *operating system*\ntrusts, in addition to this server's bundled public root CAs. Defaults to `false`.\n\nTrusting the OS store is the right choice for some deployments: an administrator who runs\n`update-ca-certificates` (or the platform equivalent) to add a corporate or internal CA\nreasonably expects every TLS client on that machine, including this one, to honour it\nautomatically, and it is what many other pieces of server software do by default. It is\nthe wrong choice as this *server's* unconditional default, though: outbound federation\ntraffic authenticates events between servers that never agreed on a shared root of trust\nahead of time (unlike, say, an internal service mesh with its own CA hierarchy), so\nsilently broadening federation's trust to include every CA some unrelated piece of\ninstalled software, corporate TLS-inspecting proxy, or forgotten test certificate has\nadded to the OS store is a real, if quiet, security regression for exactly the traffic\nthis setting controls \u2014 and it is a regression the operator of *this* server may not even\nhave chosen (the OS store can be broadened by anyone with root on the machine, for reasons\nhaving nothing to do with running a homeserver). Defaulting to `false` and pairing it with\n[`Self::custom_ca_certificates`] for the explicit, narrow case (name exactly the CA meant\nto be trusted) keeps that choice with the person configuring federation, not with whoever\nlast ran an unrelated `update-ca-certificates`.",
+          "description": "Whether outbound federation TLS also trusts whatever CA store the *operating system*\ntrusts, in addition to this server's bundled public root CAs. Defaults to `false`.\n\nTrusting the OS store is the right choice for some deployments: an administrator who runs\n`update-ca-certificates` (or the platform equivalent) to add a corporate or internal CA\nreasonably expects every TLS client on that machine, including this one, to honour it\nautomatically, and it is what many other pieces of server software do by default. It is\nthe wrong choice as this *server's* unconditional default, though: outbound federation\ntraffic authenticates events between servers that never agreed on a shared root of trust\nahead of time (unlike, say, an internal service mesh with its own CA hierarchy), so\nsilently broadening federation's trust to include every CA some unrelated piece of\ninstalled software, corporate TLS-inspecting proxy, or forgotten test certificate has\nadded to the OS store is a real, if quiet, security regression for exactly the traffic\nthis setting controls — and it is a regression the operator of *this* server may not even\nhave chosen (the OS store can be broadened by anyone with root on the machine, for reasons\nhaving nothing to do with running a homeserver). Defaulting to `false` and pairing it with\n[`Self::custom_ca_certificates`] for the explicit, narrow case (name exactly the CA meant\nto be trusted) keeps that choice with the person configuring federation, not with whoever\nlast ran an unrelated `update-ca-certificates`.",
           "type": "boolean",
           "default": false
         },
@@ -956,7 +1341,7 @@
       "type": "object",
       "properties": {
         "enabled": {
-          "description": "Master switch; when false, no limiter runs (tests and benchmarking\nonly \u2014 never recommended in production).",
+          "description": "Master switch; when false, no limiter runs (tests and benchmarking\nonly — never recommended in production).",
           "type": "boolean",
           "default": true
         },
@@ -1028,7 +1413,7 @@
       "additionalProperties": false
     },
     "RateLimitBucket": {
-      "description": "A token-bucket rate limit: `burst_count` tokens refilling at\n`per_second` tokens/second.\n\n# A note on partial environment overrides\n\nUnlike most structs in this crate, `per_second` and `burst_count` have\nno individual `serde(default = ...)`: each named bucket on\n[`RateLimitConfig`] (`message`, `login`, ...) has its own default values\nfor the two fields, and a per-field default function has no way to know\nwhich bucket it is filling in. The practical effect: `HS__` overrides\nthat set only one field of a bucket (`HS__RATE_LIMITS__LOGIN__PER_SECOND`)\nrequire the base config to already spell out that bucket in full \u2014 the\noverride then replaces just the one field, keeping the file's own value\nfor the other. Overriding a field of a bucket that is entirely absent\nfrom the base config is a parse error (a clear \"missing field\", not a\nsilently wrong bucket).",
+      "description": "A token-bucket rate limit: `burst_count` tokens refilling at\n`per_second` tokens/second.\n\n# A note on partial environment overrides\n\nUnlike most structs in this crate, `per_second` and `burst_count` have\nno individual `serde(default = ...)`: each named bucket on\n[`RateLimitConfig`] (`message`, `login`, ...) has its own default values\nfor the two fields, and a per-field default function has no way to know\nwhich bucket it is filling in. The practical effect: `HS__` overrides\nthat set only one field of a bucket (`HS__RATE_LIMITS__LOGIN__PER_SECOND`)\nrequire the base config to already spell out that bucket in full — the\noverride then replaces just the one field, keeping the file's own value\nfor the other. Overriding a field of a bucket that is entirely absent\nfrom the base config is a parse error (a clear \"missing field\", not a\nsilently wrong bucket).",
       "type": "object",
       "properties": {
         "per_second": {
@@ -1304,7 +1689,7 @@
       ]
     },
     "AppservicesConfig": {
-      "description": "Appservice registry bootstrap settings.",
+      "description": "Appservice delivery settings, and registration files to import once.",
       "type": "object",
       "properties": {
         "enabled": {
@@ -1313,7 +1698,7 @@
           "default": true
         },
         "registration_files": {
-          "description": "Static registration YAML files loaded at startup (and on reload).\nCorresponds to Synapse's `app_service_config_files`. Appservices\nregistered later through the admin API do not need an entry here.",
+          "description": "Registration YAML files to import into the appservice registry, once each. Corresponds to\nSynapse's `app_service_config_files`, and exists for migrating from it: the first start\nthat sees a file imports it (unless the registry already has an appservice with that id)\nand records the import; every later start skips it, even if the file has changed. From\nthen on the bridge is managed in the Bridges section of the interface. Bootstrap only: set\nin the bootstrap file or the environment, never stored in the database.",
           "type": "array",
           "items": {
             "type": "string"

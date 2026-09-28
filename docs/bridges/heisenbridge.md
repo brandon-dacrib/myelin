@@ -5,6 +5,12 @@ run, it is one container, and it needs nothing external until you tell it which 
 join -- so it exercises the whole of the appservice surface a bridge touches on its first day,
 with nothing to sign up for.
 
+How a bridge is added, since decision 0010 (2026-09-27): through the Bridges section of the
+interface or `POST /api/v1/appservices`, never by listing its registration in a configuration
+file. On 2026-09-22 the registration was listed in `appservices.registration_files`; that setting
+is now a Synapse-migration path only (each file is imported once and then managed through the
+API), and the reproduction below registers it through the API instead.
+
 What was verified, against the real binary, with a local IRC server (`ergo`) in a second
 container:
 
@@ -54,7 +60,8 @@ docker run --rm -v $D/hb:/data hif1/heisenbridge -c /data/heisenbridge.yaml --ge
 # The server's copy points at the port Docker maps; the bridge's own copy keeps 0.0.0.0.
 sed 's#url: http://0.0.0.0:9898#url: http://127.0.0.1:9898#' $D/hb/heisenbridge.yaml > $D/heisenbridge-for-hs.yaml
 
-# 2. The server, with the registration in its configuration.
+# 2. The server. Only bootstrap goes in its file (decision 0010): the bridge is registered
+#    through the admin API in step 3, the way the Bridges section of the interface does it.
 cat > $D/homeserver.yaml <<YAML
 server:
   server_name: test.local
@@ -73,8 +80,6 @@ media:
     path: "$D/media"
 rate_limits:
   enabled: false
-appservices:
-  registration_files: ["$D/heisenbridge-for-hs.yaml"]
 YAML
 target/debug/hs serve -c $D/homeserver.yaml > $D/hs.log 2>&1 &
 sleep 5
@@ -87,6 +92,9 @@ ADMIN=$(curl -s -X POST http://127.0.0.1:8008/api/v1/setup -H 'content-type: app
 curl -s -X POST http://127.0.0.1:8008/api/v1/users -H "authorization: Bearer $ADMIN" \
   -H 'content-type: application/json' \
   -d '{"localpart":"brandon","password":"brandonpassword123","display_name":"Brandon"}'
+# The bridge's registration, as the Bridges section's "Add bridge > I have a registration" does.
+curl -s -X POST http://127.0.0.1:8008/api/v1/appservices -H "authorization: Bearer $ADMIN" \
+  -H 'content-type: application/yaml' --data-binary @$D/heisenbridge-for-hs.yaml
 
 # 4. The bridge, and an IRC server for it to talk to.
 docker run -d --name heisenbridge -p 9898:9898 -v $D/hb:/data hif1/heisenbridge \

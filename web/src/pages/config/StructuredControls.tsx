@@ -24,8 +24,13 @@ import type { JsonValue } from "@/api/config-schema";
 import {
   SCALAR_KINDS,
   STRUCTURED_KINDS,
+  choiceInfo,
+  choicePayloadField,
+  chosenChoice,
   chosenVariant,
-  containsSecret,
+  switchChoice,
+  markSecretOrigins,
+  pointerOf,
   emptyValue,
   entryNoun,
   entrySummary,
@@ -297,6 +302,62 @@ export function VariantControl(props: ControlProps) {
 }
 
 /**
+ * An externally tagged enum — `media.scanning.icap.preview` is `negotiate`,
+ * `off`, or a forced size (`{"bytes": N}`). The choice is a select; a choice
+ * that carries a value gets that value's own control beneath it.
+ */
+export function ChoiceControl(props: ControlProps) {
+  const { field, value, disabled, id, describedBy, labelledBy, onChange } = props;
+  const pickerId = useId();
+  const pickerHintId = `${pickerId}-hint`;
+  const options = choiceInfo(field.schema, field.defs ?? {});
+  if (!options) return <UnsupportedControl {...props} />;
+
+  const chosen = chosenChoice(field, value);
+  const payload = chosen?.payload ? choicePayloadField(field, chosen, value) : undefined;
+
+  return (
+    <div
+      id={id}
+      role="group"
+      aria-labelledby={labelledBy}
+      aria-describedby={describedBy}
+      className="flex flex-col gap-4 rounded-md border border-border p-3"
+    >
+      <div className="max-w-xs">
+        <label htmlFor={pickerId} className="text-sm font-medium text-text">
+          {field.label}
+        </label>
+        <Select
+          id={pickerId}
+          options={options.map(({ value: optionValue, label }) => ({ value: optionValue, label }))}
+          value={chosen?.value}
+          placeholder="Choose one"
+          disabled={disabled}
+          aria-describedby={chosen?.description ? pickerHintId : undefined}
+          onValueChange={(choice) => onChange(switchChoice(field, value, choice))}
+        />
+        {chosen?.description && (
+          <p id={pickerHintId} className="mt-1 text-xs text-text-muted">
+            {chosen.description}
+          </p>
+        )}
+      </div>
+      {chosen && payload && (
+        <div className="max-w-xs">
+          <NestedField
+            field={payload}
+            value={isRecord(value) ? value[chosen.value] : undefined}
+            disabled={disabled}
+            onChange={(next) => onChange({ [chosen.value]: next ?? emptyValue(payload) })}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
  * A list of objects: one form per entry, each with its own controls to move
  * it up or down and to remove it, and one button to add another. Keyboard
  * focus follows the entry being moved, lands in a new entry's first field,
@@ -335,8 +396,15 @@ export function ObjectListControl({
   const entryId = (index: number) => `${baseId}-entry-${index}`;
   const controlId = (index: number, action: string) => `${baseId}-entry-${index}-${action}`;
 
+  // Before entries shift, every hidden secret says where it is stored now, so
+  // the server can put the right one back (docs/rfcs/0020).
+  const marked = () =>
+    entries.map((entry, index) =>
+      markSecretOrigins(entry, `${pointerOf(field.fullPath)}/${index}`),
+    );
+
   function move(from: number, to: number) {
-    const next = [...entries];
+    const next = marked();
     const [moved] = next.splice(from, 1);
     next.splice(to, 0, moved);
     // Stay on the same button, unless the entry has reached the end it was
@@ -349,7 +417,7 @@ export function ObjectListControl({
   }
 
   function remove(index: number) {
-    const next = entries.filter((_, i) => i !== index);
+    const next = marked().filter((_, i) => i !== index);
     pendingFocus.current =
       next.length === 0
         ? { id: addId, inside: false }
@@ -466,14 +534,6 @@ export function ObjectListControl({
           Add {sentenceNoun(noun)}
         </Button>
       </div>
-      {entries.some(containsSecret) && (
-        <p role="note" className="text-xs text-warning">
-          Some entries hold a hidden secret. The server keeps a hidden secret only where it is a
-          setting of its own, not inside a list: saving a change to this list clears them, so enter
-          each one again (or point its <span className="font-identifier">*_file</span> setting at a
-          file) before saving. See docs/rfcs/0020.
-        </p>
-      )}
     </div>
   );
 }

@@ -7,6 +7,7 @@ import { configSchemaDocument } from "@/mocks/data/config";
 import { buildSectionModel, flattenFields, type SettingField } from "@/lib/config-model";
 import { SettingControl } from "./SettingControls";
 import { ReadOnlyValue } from "./StructuredControls";
+import realSchema from "@/test/fixtures/hs-config-schema.json";
 
 const schema = normalizeConfigSchema(configSchemaDocument);
 
@@ -152,16 +153,36 @@ describe("a list of objects", () => {
     expect(screen.getByRole("button", { name: "Add thumbnail size" })).toHaveFocus();
   });
 
-  it("warns that a hidden secret inside a list does not survive saving it", () => {
-    renderControl(fieldOf("auth", "oidc_providers"), [
+  it("keeps each hidden secret's origin when entries move, so the server restores the right one", async () => {
+    const user = userEvent.setup();
+    const { last } = renderControl(fieldOf("auth", "oidc_providers"), [
+      { idp_id: "a", issuer: "https://a/", client_id: "x", client_secret: { $secret: true } },
+      { idp_id: "b", issuer: "https://b/", client_id: "y", client_secret: { $secret: true } },
+    ]);
+    expect(screen.queryByRole("note")).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Move OIDC provider 2 up" }));
+    const moved = last() as Record<string, JsonValue>[];
+    expect(moved.map((p) => p.idp_id)).toEqual(["b", "a"]);
+    expect(moved[0].client_secret).toEqual({
+      $secret: true,
+      $from: "/auth/oidc_providers/1/client_secret",
+    });
+    expect(moved[1].client_secret).toEqual({
+      $secret: true,
+      $from: "/auth/oidc_providers/0/client_secret",
+    });
+
+    // A second move keeps the first origin: it is where the secret is stored.
+    await user.click(screen.getByRole("button", { name: "Remove OIDC provider 2" }));
+    expect(last()).toEqual([
       {
-        idp_id: "google",
-        issuer: "https://accounts.google.com/",
-        client_id: "c",
-        client_secret: { $secret: true },
+        idp_id: "b",
+        issuer: "https://b/",
+        client_id: "y",
+        client_secret: { $secret: true, $from: "/auth/oidc_providers/1/client_secret" },
       },
     ]);
-    expect(screen.getByRole("note")).toHaveTextContent(/saving a change to this list clears them/);
   });
 
   it("replaces a nested secret without ever showing it, and cancelling puts the marker back", async () => {
@@ -339,5 +360,45 @@ describe("ReadOnlyValue", () => {
     expect(screen.getByText("google")).toBeInTheDocument();
     expect(screen.getByText("set, hidden")).toBeInTheDocument();
     expect(screen.getAllByText("IdP ID")).toHaveLength(2);
+  });
+});
+
+describe("an externally tagged enum", () => {
+  const realField = (): SettingField => {
+    const real = normalizeConfigSchema({ schema: realSchema });
+    const field = flattenFields(buildSectionModel(real, "media", {})).find(
+      (f) => f.path === "scanning.icap.preview",
+    );
+    if (!field) throw new Error("no media.scanning.icap.preview in the real schema");
+    return field;
+  };
+
+  it("is a choice, with no text box, showing the current one", () => {
+    const { container } = renderControl(realField(), "negotiate");
+
+    expect(screen.getByRole("group", { name: "Preview" })).toBeInTheDocument();
+    expect(screen.getByRole("combobox")).toHaveTextContent("Negotiate");
+    expect(container.querySelector("textarea")).toBeNull();
+  });
+
+  it("picks a name, or a size with a number beneath it", async () => {
+    const user = userEvent.setup();
+    const { last } = renderControl(realField(), "negotiate");
+
+    await choose(user, screen.getByRole("combobox"), "Off");
+    expect(last()).toBe("off");
+
+    await choose(user, screen.getByRole("combobox"), "Bytes");
+    expect(last()).toEqual({ bytes: "" });
+    const size = screen.getByLabelText(/^Bytes/);
+    await user.type(size, "4096");
+    await user.tab();
+    expect(last()).toEqual({ bytes: 4096 });
+  });
+
+  it("shows a forced size as it is", () => {
+    renderControl(realField(), { bytes: 1024 });
+    expect(screen.getByRole("combobox")).toHaveTextContent("Bytes");
+    expect(screen.getByLabelText(/^Bytes/)).toHaveValue("1024");
   });
 });

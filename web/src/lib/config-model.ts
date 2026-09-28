@@ -55,6 +55,12 @@ export type FieldKind =
   | "map"
   /** An internally tagged enum: pick the variant, then fill in that variant's fields. */
   | "variant"
+  /**
+   * An externally tagged enum (serde's default representation): each choice
+   * is either a bare string (`"negotiate"`) or a one-key object carrying that
+   * choice's value (`{"bytes": 4096}`). Pick the choice, then fill in its value.
+   */
+  | "choice"
   /** A shape this interface cannot describe. Shown read-only, with a note. */
   | "unsupported";
 
@@ -76,6 +82,7 @@ export const STRUCTURED_KINDS: ReadonlySet<FieldKind> = new Set<FieldKind>([
   "object-list",
   "map",
   "variant",
+  "choice",
   "unsupported",
 ]);
 
@@ -117,6 +124,11 @@ export interface SettingField {
    * inferred from the origin, which is what it was before the field existed.
    */
   editable: boolean;
+  /**
+   * Set at install, never administered here (decision 0010): the server's
+   * `ConfigSettingInfo.bootstrap`, or the whole section being bootstrap.
+   */
+  bootstrap: boolean;
   /**
    * The schema node the field was built from, `$ref`s followed and `Option<T>`
    * unwrapped. The structured kinds build their nested forms from it.
@@ -439,6 +451,126 @@ export function variantInfo(
   };
 }
 
+/** One choice of an externally tagged enum. */
+export interface ChoiceOption extends SettingOption {
+  /**
+   * The schema of the value this choice carries (`{"bytes": N}`'s `N`), or
+   * `undefined` for a choice that is just its name (`"negotiate"`).
+   */
+  payload?: JsonSchemaNode;
+}
+
+/**
+ * Recognises an externally tagged Rust enum — serde's default representation,
+ * which `schemars` renders as a `oneOf` whose unit variants are string
+ * `const`s and whose data-carrying variants are objects with exactly one
+ * required property, the variant's name. `media.scanning.icap.preview`
+ * (`PreviewMode`: `"negotiate"`, `"off"` or `{"bytes": N}`) is one. At least
+ * one variant must carry data; an enum of names only is an `enum`, and one of
+ * internally tagged objects is a `variant` (both are tried first).
+ */
+export function choiceInfo(
+  node: JsonSchemaNode | undefined,
+  defs: Record<string, JsonSchemaNode>,
+): ChoiceOption[] | null {
+  if (!node || Object.keys(node.properties ?? {}).length > 0) return null;
+  const variants = (node.oneOf ?? node.anyOf ?? [])
+    .map((v) => resolveRef(v, defs))
+    .filter((v) => !isNullOnly(v));
+  if (variants.length === 0) return null;
+  const options: ChoiceOption[] = [];
+  let carriesData = false;
+  for (const variant of variants) {
+    if (typeof variant.const === "string") {
+      options.push({
+        value: variant.const,
+        label: humanizeKey(variant.const),
+        description: summarize(variant.description),
+      });
+      continue;
+    }
+    if (variant.enum?.length && variant.enum.every((v) => typeof v === "string")) {
+      options.push(...(variant.enum as string[]).map((v) => ({ value: v, label: humanizeKey(v) })));
+      continue;
+    }
+    const properties = variant.properties ?? {};
+    const keys = Object.keys(properties);
+    if (
+      keys.length === 1 &&
+      (variant.required ?? []).includes(keys[0]) &&
+      resolveRef(properties[keys[0]], defs).const === undefined
+    ) {
+      carriesData = true;
+      options.push({
+        value: keys[0],
+        label: humanizeKey(keys[0]),
+        description: summarize(variant.description),
+        payload: properties[keys[0]],
+      });
+      continue;
+    }
+    return null;
+  }
+  return carriesData ? options : null;
+}
+
+/** The choice a value of an externally tagged enum is: by its string, or by its one key. */
+export function chosenChoice(
+  field: SettingField,
+  value: JsonValue | undefined,
+): ChoiceOption | undefined {
+  const options = choiceInfo(field.schema, field.defs ?? {});
+  if (!options) return undefined;
+  if (typeof value === "string") return options.find((o) => o.value === value && !o.payload);
+  if (isRecord(value)) {
+    const keys = Object.keys(value);
+    if (keys.length === 1) return options.find((o) => o.value === keys[0] && o.payload);
+  }
+  return undefined;
+}
+
+/** The value a data-carrying choice holds, as a field of its own: `bytes` for `{"bytes": N}`. */
+export function choicePayloadField(
+  field: SettingField,
+  option: ChoiceOption,
+  value: JsonValue | undefined,
+): SettingField {
+  return makeField({
+    key: option.value,
+    raw: option.payload ?? {},
+    defs: field.defs ?? {},
+    path: `${field.path}.${option.value}`,
+    fullPath: `${field.fullPath}.${option.value}`,
+    value: isRecord(value) ? value[option.value] : undefined,
+    required: true,
+    editable: field.editable,
+    bootstrap: field.bootstrap,
+    label: option.label,
+  });
+}
+
+/**
+ * The value picking `choice` produces: the bare name for a choice that is only
+ * a name, or `{choice: blank}` for one that carries a value, keeping the value
+ * already there when the choice does not change.
+ */
+export function switchChoice(
+  field: SettingField,
+  value: JsonValue | undefined,
+  choice: string,
+): JsonValue {
+  const option = choiceInfo(field.schema, field.defs ?? {})?.find((o) => o.value === choice);
+  if (!option) return value ?? choice;
+  if (!option.payload) return choice;
+  if (isRecord(value) && choice in value) return value;
+  const payload = choicePayloadField(field, option, undefined);
+  const blank =
+    payload.hasDefault && payload.defaultValue !== undefined
+      ? cloneJson(payload.defaultValue)
+      : emptyValue(payload);
+  return { [choice]: blank };
+}
+
 /** A map's value schema: an object with no fixed properties but `additionalProperties: {…}`. */
 function mapValueSchema(node: JsonSchemaNode): JsonSchemaNode | null {
   if (Object.keys(node.properties ?? {}).length > 0) return null;
@@ -493,6 +625,7 @@ function classify(
   if (Object.keys(resolved.properties ?? {}).length > 0) return "object";
   if (variantInfo(resolved, defs)) return "variant";
   if (mapValueSchema(resolved)) return "map";
+  if (choiceInfo(resolved, defs)) return "choice";
   return "unsupported";
 }
 
@@ -513,6 +646,8 @@ interface FieldSpec {
   info?: ConfigSettingInfo;
   /** Overrides {@link ConfigSettingInfo.editable}: a nested field inherits its setting's. */
   editable?: boolean;
+  /** Overrides {@link ConfigSettingInfo.bootstrap}: a nested field inherits its setting's. */
+  bootstrap?: boolean;
   /** Overrides the label the key or the schema's `title` would give. */
   label?: string;
 }
@@ -547,6 +682,7 @@ function makeField(spec: FieldSpec): SettingField {
     maximum: resolved.maximum,
     readOnly: resolved.const !== undefined,
     editable: spec.editable ?? (info ? info.editable : true),
+    bootstrap: spec.bootstrap ?? info?.bootstrap ?? false,
     schema: resolved,
     defs,
     nullable: admitsNull(base, defs),
@@ -643,6 +779,7 @@ function propertyFieldsOf(
         value: isRecord(value) ? value[key] : undefined,
         required: required.has(key),
         editable: field.editable,
+        bootstrap: field.bootstrap,
       }),
     );
 }
@@ -692,6 +829,7 @@ export function itemField(
     value,
     required: true,
     editable: field.editable,
+    bootstrap: field.bootstrap,
     label: `${entryNoun(field)} ${index + 1}`,
   });
 }
@@ -714,6 +852,7 @@ export function mapEntryField(
     // "required" in any sense worth marking.
     required: false,
     editable: field.editable,
+    bootstrap: field.bootstrap,
     label: key || "New entry",
   });
 }
@@ -750,6 +889,10 @@ export function emptyValue(field: SettingField): JsonValue {
       const info = variantInfo(field.schema, field.defs ?? {});
       const first = info?.options[0];
       return info && first ? switchVariant(field, undefined, first.value) : {};
+    }
+    case "choice": {
+      const first = choiceInfo(field.schema, field.defs ?? {})?.[0];
+      return first ? switchChoice(field, undefined, first.value) : "";
     }
     default:
       return "";
@@ -819,6 +962,52 @@ export function entrySummary(
     if (variant) parts.unshift(variant.label);
   }
   return parts.length > 0 ? parts.join(" · ") : undefined;
+}
+
+/** The member of a hidden secret that says where it came from (docs/rfcs/0020). */
+export const SECRET_FROM = "$from";
+
+/**
+ * A setting's whole-configuration JSON Pointer from its dotted `fullPath`:
+ * `auth.oidc_providers` → `/auth/oidc_providers`, `a.list[2].b` → `/a/list/2/b`.
+ */
+export function pointerOf(fullPath: string): string {
+  return `/${fullPath
+    .replace(/\[(\d+)\]/g, ".$1")
+    .split(".")
+    .filter(Boolean)
+    .map((token) => token.replace(/~/g, "~0").replace(/\//g, "~1"))
+    .join("/")}`;
+}
+
+/**
+ * Marks every hidden secret inside `value` with where it is stored now
+ * (`{"$secret": true, "$from": "/auth/oidc_providers/1/client_secret"}`),
+ * `value` being what is stored at `pointer`. The list editor does this to
+ * every entry before it moves or removes one, so each untouched secret still
+ * names its own origin after the entries around it have shifted, and the
+ * server puts back the right one (docs/rfcs/0020). A secret already marked
+ * keeps its mark: it names where it was first shown.
+ */
+export function markSecretOrigins(value: JsonValue, pointer: string): JsonValue {
+  if (isSecretValue(value)) {
+    const record = value as Record<string, JsonValue>;
+    return SECRET_FROM in record ? value : { [SECRET_MARKER]: true, [SECRET_FROM]: pointer };
+  }
+  if (Array.isArray(value)) {
+    return value.map((item, index) => markSecretOrigins(item, `${pointer}/${index}`));
+  }
+  if (isRecord(value)) {
+    const out: Record<string, JsonValue> = {};
+    for (const [key, child] of Object.entries(value)) {
+      out[key] = markSecretOrigins(
+        child,
+        `${pointer}/${key.replace(/~/g, "~0").replace(/\//g, "~1")}`,
+      );
+    }
+    return out;
+  }
+  return value;
 }
 
 /** Whether a value holds a redacted secret anywhere inside it. */

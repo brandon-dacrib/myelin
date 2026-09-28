@@ -12,6 +12,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use hs_config::Config;
+use hs_config::bootstrap::{is_bootstrap_pointer, is_bootstrap_section};
 use hs_config::reload::RELOADABLE_SECTIONS;
 use serde_json::{Map, Value};
 
@@ -84,6 +85,19 @@ fn render_header(out: &mut String) {
          time instead (see `crates/hs-config/src/secret.rs`); at most one of the pair may be set.\n\n",
     );
     out.push_str("A field with no `Default` shown is required.\n\n");
+    out.push_str("## Bootstrap and administered settings\n\n");
+    out.push_str(
+        "Decision 0010: this server is administered through the admin API and the web interface, \
+         never by editing files. Every setting below is **administered** -- stored in the \
+         database, changed in the interface's Configuration section or with `PATCH \
+         /api/v1/config/{section}` -- except the **bootstrap** ones, marked *(bootstrap)* here, \
+         which a process needs before it can read the database (where the database is, its \
+         listeners, the server name, the signing key's path, a replica's cluster identity, \
+         registration files imported once). Those come only from the bootstrap file, `HS__` \
+         variables and the command line (Helm values in Kubernetes), are never stored in the \
+         database, and are shown read-only in the interface. A file's administered settings seed \
+         the database on the first start and are outranked by it after that.\n\n",
+    );
     out.push_str("## Reload boundary\n\n");
     let _ = writeln!(
         out,
@@ -119,7 +133,10 @@ fn render_section(out: &mut String, section: &str, schema: &Value, defs: &Map<St
     let _ = writeln!(
         out,
         "**{}**\n",
-        if reloadable {
+        if is_bootstrap_section(section) {
+            "Bootstrap: set at install (bootstrap file, `HS__` variables, command line or Helm \
+             values), never stored in the database."
+        } else if reloadable {
             "Reloadable without a restart."
         } else {
             "Restart required to change."
@@ -142,15 +159,15 @@ fn render_section(out: &mut String, section: &str, schema: &Value, defs: &Map<St
                 if let Some(desc) = resolved.get("description").and_then(Value::as_str) {
                     let _ = writeln!(out, "{desc}\n");
                 }
-                render_field_table(out, &resolved, defs);
+                render_field_table(out, section, &resolved, defs);
             }
         }
-        None => render_field_table(out, schema, defs),
+        None => render_field_table(out, section, schema, defs),
     }
     out.push('\n');
 }
 
-fn render_field_table(out: &mut String, schema: &Value, defs: &Map<String, Value>) {
+fn render_field_table(out: &mut String, section: &str, schema: &Value, defs: &Map<String, Value>) {
     let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
         return;
     };
@@ -186,9 +203,16 @@ fn render_field_table(out: &mut String, schema: &Value, defs: &Map<String, Value
             None => "—".to_owned(),
         };
         let secret_note = if is_secret { " *(secret)*" } else { "" };
+        let bootstrap_note = if !is_bootstrap_section(section)
+            && is_bootstrap_pointer(&format!("/{section}/{name}"))
+        {
+            " *(bootstrap)*"
+        } else {
+            ""
+        };
         let _ = writeln!(
             out,
-            "| `{name}`{secret_note} | {type_str} | {default_str} | {desc} |"
+            "| `{name}`{secret_note}{bootstrap_note} | {type_str} | {default_str} | {desc} |"
         );
     }
     out.push('\n');

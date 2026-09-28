@@ -1101,6 +1101,214 @@ mod tests {
         assert_eq!(resolved.config.cluster.mesh.port, 28449);
     }
 
+    /// A fresh database on a reachable PostgreSQL server (`HS_BOOTSTRAP_TEST_POSTGRES_DSN`, or
+    /// the local one `crates/hs-cli/tests/cluster_admin.rs` documents), dropped afterwards; or
+    /// `None`, after saying so, when there is no server.
+    struct PgDatabase {
+        admin_dsn: String,
+        name: String,
+        config: postgres::Config,
+    }
+
+    impl PgDatabase {
+        fn create() -> Option<Self> {
+            let admin_dsn = std::env::var("HS_BOOTSTRAP_TEST_POSTGRES_DSN")
+                .unwrap_or_else(|_| "postgres://postgres:hspg@127.0.0.1:5439/postgres".to_owned());
+            let config: postgres::Config = admin_dsn.parse().ok()?;
+            let mut client = match config.connect(postgres::NoTls) {
+                Ok(client) => client,
+                Err(e) => {
+                    eprintln!(
+                        "SKIP: the bootstrap-split test on PostgreSQL needs a server at \
+                         {admin_dsn:?}: {e}. Start one with: docker run --rm -d \
+                         -e POSTGRES_PASSWORD=hspg -p 127.0.0.1:5439:5432 postgres:17"
+                    );
+                    return None;
+                }
+            };
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let name = format!("hs_bootstrap_{}_{nanos}", std::process::id());
+            client
+                .batch_execute(&format!("CREATE DATABASE {name}"))
+                .unwrap();
+            Some(Self {
+                admin_dsn,
+                name,
+                config,
+            })
+        }
+
+        /// The `storage` block of a bootstrap file pointing at this database.
+        fn storage_yaml(&self) -> String {
+            let host = match self.config.get_hosts().first() {
+                Some(postgres::config::Host::Tcp(host)) => host.clone(),
+                _ => "127.0.0.1".to_owned(),
+            };
+            format!(
+                "storage:\n  backend: postgres\n  host: {host}\n  port: {port}\n  database: {db}\n  user: {user}\n  password: {password:?}\n",
+                port = self.config.get_ports().first().copied().unwrap_or(5432),
+                db = self.name,
+                user = self.config.get_user().unwrap_or("postgres"),
+                password = String::from_utf8_lossy(self.config.get_password().unwrap_or_default()),
+            )
+        }
+    }
+
+    impl Drop for PgDatabase {
+        fn drop(&mut self) {
+            if let Ok(mut client) = self
+                .admin_dsn
+                .parse::<postgres::Config>()
+                .and_then(|c| c.connect(postgres::NoTls))
+            {
+                let _ = client.batch_execute(&format!(
+                    "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+                    self.name
+                ));
+            }
+        }
+    }
+
+    fn postgres_replica_file(
+        dir: &Path,
+        db: &PgDatabase,
+        name: &str,
+        client_port: u16,
+        mesh_port: u16,
+    ) -> PathBuf {
+        let path = dir.join(format!("{name}.yaml"));
+        std::fs::write(
+            &path,
+            format!(
+                "server:\n  server_name: example.org\n\
+                 {storage}\
+                 listeners:\n  listeners:\n    - port: {client_port}\n      bind_addresses: ['127.0.0.1']\n      resources: [client, federation, health]\n\
+                 cluster:\n  single_node: false\n  lease_ttl: 20s\n  mesh:\n    port: {mesh_port}\n    advertise_address: {name}.local\n\
+                 appservices:\n  registration_files: [{name}-bridge.yaml]\n\
+                 auth:\n  enable_registration: true\n",
+                storage = db.storage_yaml(),
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    /// Decision 0010's bootstrap split on the backend a cluster actually shares: two replicas
+    /// booted at the same time on one PostgreSQL database each resolve their own listeners and
+    /// mesh identity, share the administered settings the first one seeded, cannot store a
+    /// bootstrap setting, and a pre-0010 row holding one is purged at the next boot.
+    #[test]
+    fn on_postgres_two_replicas_keep_their_own_bootstrap_and_share_the_rest() {
+        use hs_kv::{KvBackend, KvWrite, TransactConfig};
+
+        let Some(db) = PgDatabase::create() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let a_file = postgres_replica_file(dir.path(), &db, "replica-a", 18008, 18449);
+        let b_file = postgres_replica_file(dir.path(), &db, "replica-b", 28008, 28449);
+
+        let a = boot_file(&a_file);
+        assert!(matches!(a.storage, OpenedStorage::Postgres(_)));
+        assert!(a.seeded.is_some(), "the first replica seeds the database");
+        // B boots while A is still running: PostgreSQL, unlike the embedded store, is shared.
+        let mut b = boot_file(&b_file);
+        assert!(b.seeded.is_none(), "the database was already seeded by A");
+
+        let stored = b.store.load().unwrap();
+        for pointer in [
+            "/storage",
+            "/listeners",
+            "/server/server_name",
+            "/cluster/single_node",
+            "/cluster/mesh",
+            "/appservices/registration_files",
+        ] {
+            assert_eq!(
+                stored.document.pointer(pointer),
+                None,
+                "{pointer} was stored in the shared PostgreSQL database"
+            );
+        }
+        assert_eq!(stored.meta.server_name.as_deref(), Some("example.org"));
+
+        for (booted, client_port, mesh_port, advertised) in [
+            (&a, 18008, 18449, "replica-a.local"),
+            (&b, 28008, 28449, "replica-b.local"),
+        ] {
+            let resolved = booted.resolve().unwrap();
+            assert_eq!(resolved.config.listeners.listeners[0].port, client_port);
+            assert_eq!(resolved.config.cluster.mesh.port, mesh_port);
+            assert_eq!(
+                resolved.config.cluster.mesh.advertise_address.as_deref(),
+                Some(advertised)
+            );
+            assert!(resolved.config.auth.enable_registration);
+        }
+
+        // An administered change made through one replica is what the other reads.
+        a.store
+            .patch_section(
+                "auth",
+                &serde_json::json!({"enable_registration": false}),
+                Some("@ops:example.org"),
+                1,
+            )
+            .unwrap();
+        b.refresh().unwrap();
+        assert!(!b.resolve().unwrap().config.auth.enable_registration);
+
+        // A bootstrap setting cannot be stored, whole section or single setting.
+        assert!(matches!(
+            a.store
+                .patch_section("listeners", &serde_json::json!({"listeners": []}), None, 2),
+            Err(StoreError::BootstrapSection { .. } | StoreError::BootstrapSetting { .. })
+        ));
+        assert!(
+            a.store
+                .patch_section(
+                    "cluster",
+                    &serde_json::json!({"mesh": {"port": 1}}),
+                    None,
+                    2
+                )
+                .is_err()
+        );
+
+        // What a pre-0010 seed left behind in the shared database is purged at the next boot.
+        {
+            let OpenedStorage::Postgres(backend) = &a.storage else {
+                unreachable!("asserted above");
+            };
+            let keyspace = backend.keyspace(hs_config::store::KEYSPACE).unwrap();
+            hs_kv::transact(backend, TransactConfig::default(), |txn| {
+                txn.put(
+                    &keyspace,
+                    b"section/listeners",
+                    br#"{"listeners":[{"port":18008,"bind_addresses":["127.0.0.1"],"resources":["client"]}]}"#,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        }
+        drop(a);
+        drop(b);
+        let b = boot_file(&b_file);
+        assert!(
+            b.notes.iter().any(|n| n.contains("/listeners")),
+            "the purge is reported: {:?}",
+            b.notes
+        );
+        assert_eq!(b.store.load().unwrap().document.get("listeners"), None);
+        assert_eq!(
+            b.resolve().unwrap().config.listeners.listeners[0].port,
+            28008
+        );
+    }
+
     #[test]
     fn the_data_layout_keeps_the_database_in_its_own_subdirectory() {
         let layout = DataLayout::new(Path::new("/srv/myelin"));

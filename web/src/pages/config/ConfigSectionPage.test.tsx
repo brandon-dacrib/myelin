@@ -247,22 +247,51 @@ describe("ConfigSectionPage", () => {
 
   it("lands an error about one list entry on the list, saying which entry", async () => {
     const user = userEvent.setup();
-    renderSection("listeners");
+    renderSection("media");
+    const before = (configValues.media.thumbnail_sizes as JsonValue[]).length;
 
-    await user.click(await screen.findByRole("button", { name: "Add listener" }));
-    const added = within(screen.getByRole("group", { name: /^Listener 2/ }));
-    await user.click(added.getByRole("checkbox", { name: "Client" }));
+    await user.click(await screen.findByRole("button", { name: "Add thumbnail size" }));
+    const added = within(
+      screen.getByRole("group", { name: new RegExp(`^Thumbnail size ${before + 1}`) }),
+    );
+    await user.type(added.getByLabelText(/^Width/), "64");
 
     await user.click(await screen.findByRole("button", { name: "Review and save" }));
     const dialog = within(await screen.findByRole("dialog"));
     await user.click(dialog.getByRole("button", { name: "Save changes" }));
 
     expect(await screen.findByText("The server rejected 1 setting")).toBeInTheDocument();
-    const row = document.getElementById("setting-listeners")!;
+    const row = document.getElementById("setting-thumbnail_sizes")!;
     expect(within(row).getByRole("alert")).toHaveTextContent(
-      "Entry 2, port: must be a TCP port, 1 to 65535",
+      `Entry ${before + 1}, height: must be a whole number of pixels, at least 1`,
     );
-    expect(configValues.listeners.listeners).toHaveLength(1);
+    expect(configValues.media.thumbnail_sizes).toHaveLength(before);
+  });
+
+  it("shows listeners as set at install, with no way to edit them", async () => {
+    renderSection("listeners");
+    expect(await screen.findByText("This section cannot be stored in the database")).toBeVisible();
+    const row = await waitFor(() => {
+      const el = document.getElementById("setting-listeners");
+      if (!el) throw new Error("no row yet");
+      return el;
+    });
+    expect(within(row).getByText("Set at install")).toBeInTheDocument();
+    expect(within(row).queryByRole("button", { name: "Add listener" })).not.toBeInTheDocument();
+  });
+
+  it("marks a bootstrap setting inside an administered section", async () => {
+    renderSection("server");
+    const row = await waitFor(() => {
+      const el = document.getElementById("setting-signing_key_path");
+      if (!el) throw new Error("no row yet");
+      return el;
+    });
+    expect(within(row).getByText("Set at install")).toBeInTheDocument();
+    expect(row.textContent).toContain(
+      "the bootstrap file, an HS__ environment variable or the Helm values",
+    );
+    expect(within(row).queryByRole("textbox")).not.toBeInTheDocument();
   });
 
   it("shows a structured setting it may not change as names and values, not JSON", async () => {

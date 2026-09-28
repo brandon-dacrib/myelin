@@ -33,6 +33,19 @@ offering operations); before that 2026-09-26 (three public recovery operations);
 >   body, bulk all-or-nothing and replay, normalisation, feature merge and refusal, events);
 >   the real-binary test `crates/hs-cli/tests/admin_user_identity.rs`.
 >
+
+> **2026-09-28, RFC 0020 server side (by track 13, queue item 2b).** `config.update` now puts
+> back a hidden secret inside a list entry instead of storing the entry without it:
+> `SecretPaths::restore_echoed_secrets` (`crates/hs-admin/src/config_schema.rs`) runs before
+> `strip_echoed_secrets`. Inside an array `{"$secret": true}` takes the value stored at its own
+> pointer; `{"$secret": true, "$from": "<pointer>"}` takes the one at the pointer it names (a
+> secret setting of the same section that holds a value, or `400 validation-failed` on the
+> placeholder's pointer). It logs how many it kept. Tests: `config_schema::tests::a_secret_*`,
+> `a_from_that_names_no_stored_secret_is_refused`,
+> `router::tests::a_secret_inside_a_list_survives_saving_the_list`; against the real binary,
+> `web/e2e-real/configuration.spec.ts`. The `openapi.yaml` description of `ConfigSettingInfo`
+> mentions it; no operation changed.
+
 > **2026-09-28, served for real: Cluster 6/6** (branch `agent/cluster-admin`, rebuilt on main
 > from the superseded `worktree-agent-ae592ed29bb65b973`, whose cluster pieces it replaces).
 > `tools/admin_api_coverage.py` now counts **102 of 158** operations with a real handler.

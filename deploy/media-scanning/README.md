@@ -39,7 +39,18 @@ and confirm the log shows c-icap listening on `1344` and ClamAV's database loade
   track's own tests). Uncomment and adapt that service once that startup wiring exists.
 - **`media-scanning.yaml`**: the `media.scanning` configuration block, in
   `ScanningConfig::from_yaml`'s exact shape, pointing `icap.host`/`icap.port` at the `clamav-icap`
-  service by its compose-network hostname, with `service: avscan`.
+  service by its compose-network hostname, with `service: avscan`. It is a reference for what the
+  settings should say, not something to hand the server.
+
+## Turning scanning on (decision 0010)
+
+`media.scanning` is an administered setting like any other, so it is turned on in the admin
+interface, not by editing a file: **Configuration > Media > Scanning**, set the provider to
+`icap`, the ICAP host, port and service (`avscan` here), the preview mode (a choice: negotiate,
+off, or a forced size in bytes), a fail policy, and the mode (`block` or `quarantine`). The same
+change through the API is one `PATCH /api/v1/config/media` with a `scanning` object in the shape
+of `media-scanning.yaml`. The `--media-scanning-config` flag of `hs serve` still reads that file,
+deprecated, and says so at startup; it will go.
 
 ## Signature freshness
 
@@ -61,15 +72,13 @@ in production and assume its virus database stays current.
    (mirroring `crates/hs-media/tests/s3_backend.rs`'s pattern: skip cleanly with an `eprintln!`
    when the env var is unset, run for real when it is) that submits the EICAR test string through
    this compose stack over ICAP and asserts `Verdict::Infected`.
-2. **Track 13's config folding.** `hs_config::MediaConfig` has no `scanning` field yet
-   (`crates/hs-media/src/scanning/config.rs`'s module doc) -- `media-scanning.yaml` is what to
-   fold in under a `media.scanning` key once that field exists.
+2. ~~**Track 13's config folding.**~~ Done 2026-09-27: `media.scanning` is a setting of
+   `hs_config::MediaConfig` (`crates/hs-config/src/scanning.rs`), administered in the interface
+   (see "Turning scanning on" above).
 3. **Track 12's Helm sub-chart.** `deploy/helm/hs` has no equivalent of this compose stack for a
    Kubernetes deployment (a `c-icap`+ClamAV sub-chart or sidecar, with the homeserver chart's
    `values.yaml` exposing the same `media.scanning` block). Not attempted here: `deploy/helm` is
    track 12's, not this track's, to edit.
-4. **The homeserver startup wiring itself** (see `compose.yaml`'s comment): once a listener binary
-   exists, it needs to read `media.scanning` from its config, build a
-   `hs_media::scanning::ScanEngine` from it (`ScanningConfig::validated` then `ScanEngine::new`),
-   and call `MediaRepository::with_scanning` before serving any request. None of that glue exists
-   yet; only the pieces it would call do.
+4. ~~**The homeserver startup wiring itself.**~~ `hs serve` builds the scan engine from the
+   configured `media.scanning` (`crates/hs-cli/src/media.rs`); `compose.yaml`'s commented-out
+   `homeserver` service predates that and has not been revisited.

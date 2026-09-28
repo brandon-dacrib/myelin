@@ -113,7 +113,10 @@ on, and the wizard now does or says it.
 ## Reproducing it
 
 From the repository root, with Docker running and `cargo build -p hs-cli --bin hs` done.
-About a minute, most of it the image pull.
+About a minute, most of it the image pull. The file below is the bootstrap a test server needs
+(decision 0010); its `media` and `rate_limits` lines only seed the database on the first start,
+and on a real server they are set in the interface's Configuration section. The bridge itself is
+added through the interface, never in the file.
 
 ```sh
 D=$(mktemp -d); mkdir -p $D/wa && chmod 777 $D/wa

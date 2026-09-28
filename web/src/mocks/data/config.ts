@@ -891,7 +891,28 @@ const SECRET_POINTERS = [
 ];
 
 const RELOADABLE = new Set(["rate_limits", "federation", "telemetry", "appservices"]);
-const BOOTSTRAP = new Set(["storage"]);
+/** `hs_config::store::BOOTSTRAP_SECTIONS`: bootstrap as a whole (decision 0010). */
+const BOOTSTRAP = new Set(["storage", "listeners"]);
+
+/**
+ * `hs_config::bootstrap::BOOTSTRAP_SETTINGS` inside administered sections: set at install, never
+ * stored in the database. A pointer at or under one of these is a bootstrap setting.
+ */
+const BOOTSTRAP_SETTINGS = [
+  "/server/server_name",
+  "/server/signing_key_path",
+  "/cluster/single_node",
+  "/cluster/mesh",
+  "/appservices/registration_files",
+];
+
+function isBootstrapPointer(pointer: string): boolean {
+  const section = pointer.split("/")[1];
+  return (
+    BOOTSTRAP.has(section) ||
+    BOOTSTRAP_SETTINGS.some((p) => pointer === p || pointer.startsWith(`${p}/`))
+  );
+}
 
 const sectionInfos = [
   "server",
@@ -919,20 +940,24 @@ const sectionInfos = [
  * the fixture stays readable. The interface treats a setting absent from this
  * list exactly as the boring answer, which is the same thing.
  */
-const settingInfos = [...new Set([...Object.keys(configOrigins), ...SECRET_POINTERS])]
+const settingInfos = [
+  ...new Set([...Object.keys(configOrigins), ...SECRET_POINTERS, ...BOOTSTRAP_SETTINGS]),
+]
   .sort()
   .map((pointer) => {
     const section = pointer.split("/")[1];
     const origin = configOrigins[pointer] ?? "default";
+    const bootstrap = isBootstrapPointer(pointer);
     return {
       pointer,
       section,
       origin,
       secret: SECRET_POINTERS.includes(pointer),
       reloadable: RELOADABLE.has(section),
+      bootstrap,
       // The server's own answer to "would config.update take this?". False
-      // for a bootstrap section and for anything an HS__ variable pins.
-      editable: origin !== "environment" && !BOOTSTRAP.has(section),
+      // for a bootstrap setting and for anything an HS__ variable pins.
+      editable: origin !== "environment" && !bootstrap,
     };
   });
 
@@ -1174,20 +1199,89 @@ function isSecretPlaceholder(value: JsonValue): boolean {
   return isObject(value) && Object.keys(value).length === 1 && value.$secret === true;
 }
 
+function isSecretMarker(value: JsonValue): value is Record<string, JsonValue> {
+  return (
+    isSecretPlaceholder(value) ||
+    (isObject(value) &&
+      Object.keys(value).length === 2 &&
+      value.$secret === true &&
+      typeof value.$from === "string")
+  );
+}
+
+function valueAt(root: JsonValue | undefined, pointer: string): JsonValue | undefined {
+  let node: JsonValue | undefined = root;
+  for (const token of pointer.split("/").slice(1)) {
+    const key = token.replace(/~1/g, "/").replace(/~0/g, "~");
+    if (Array.isArray(node)) node = node[Number(key)];
+    else if (isObject(node)) node = node[key];
+    else return undefined;
+  }
+  return node;
+}
+
+/**
+ * `SecretPaths::restore_echoed_secrets` (docs/rfcs/0020): inside a list, which the interface sends
+ * back whole, an untouched secret is put back from what is stored now — from the pointer its
+ * `$from` names, or from the same pointer when it has none — instead of being dropped with its
+ * entry. A `$from` naming nothing stored is an error on the placeholder's own pointer. The mock
+ * stores its secrets as the placeholder itself, so "put back" keeps the placeholder.
+ */
+export function restoreEchoedSecrets(
+  patch: JsonValue,
+  current: JsonValue | undefined,
+  section: string,
+): { patch: JsonValue; errors: { pointer: string; detail: string }[] } {
+  const errors: { pointer: string; detail: string }[] = [];
+  const walk = (node: JsonValue, pointer: string, inArray: boolean): JsonValue | undefined => {
+    if (isSecretMarker(node)) {
+      const from = node.$from;
+      if (typeof from === "string") {
+        const stored = from.startsWith(`/${section}/`)
+          ? valueAt(current, from.slice(section.length + 1))
+          : undefined;
+        if (stored === undefined || stored === null) {
+          errors.push({
+            pointer: `/${section}${pointer}`,
+            detail: `$from names ${from}, where no secret of this section is stored now`,
+          });
+        }
+        return stored ?? undefined;
+      }
+      if (!inArray) return node;
+      // Nothing stored here: dropped, as `strip_echoed_secrets` would.
+      const stored = valueAt(current, pointer);
+      return stored === null ? undefined : stored;
+    }
+    if (Array.isArray(node)) {
+      return node.map((item, index) => walk(item, `${pointer}/${index}`, true) ?? null);
+    }
+    if (isObject(node)) {
+      const out: Record<string, JsonValue> = {};
+      for (const [key, child] of Object.entries(node)) {
+        const next = walk(child, `${pointer}/${key}`, inArray);
+        if (next !== undefined) out[key] = next;
+      }
+      return out;
+    }
+    return node;
+  };
+  return { patch: walk(patch, "", false) ?? {}, errors };
+}
+
 /**
  * `SecretPaths::strip_echoed_secrets` in `crates/hs-admin/src/config_schema.rs`: a form
  * round-trips the secrets it was shown as `{"$secret": true}`, and the server drops each one from
- * the patch, which is what "the operator left this alone" means for a setting of its own. It does
- * the same inside a list entry, and there the effect is different — the list replaces the stored
- * one wholesale, so the entry loses its secret. The mock does exactly that too, rather than
- * pretend; docs/rfcs/0020 asks the server to keep it.
+ * the patch, which is what "the operator left this alone" means for a setting of its own. Inside
+ * a list, `restoreEchoedSecrets` has already put back or dropped each one (the mock stores its
+ * secrets as the placeholder itself, so lists are left alone here).
  */
 export function stripEchoedSecrets(patch: JsonValue): JsonValue {
-  if (Array.isArray(patch)) return patch.map(stripEchoedSecrets);
+  if (Array.isArray(patch)) return patch;
   if (!isObject(patch)) return patch;
   const out: Record<string, JsonValue> = {};
   for (const [key, value] of Object.entries(patch)) {
-    if (isSecretPlaceholder(value)) continue;
+    if (isSecretMarker(value)) continue;
     out[key] = stripEchoedSecrets(value);
   }
   return out;

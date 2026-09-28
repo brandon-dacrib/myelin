@@ -36,6 +36,7 @@ import { Select } from "@/components/ui/select/Select";
 import { Switch } from "@/components/ui/switch/Switch";
 import { cn } from "@/lib/cn";
 import {
+  ChoiceControl,
   MapControl,
   ObjectControl,
   ObjectListControl,
@@ -87,6 +88,8 @@ export function SettingControl(props: ControlProps) {
       return <MapControl {...props} />;
     case "variant":
       return <VariantControl {...props} />;
+    case "choice":
+      return <ChoiceControl {...props} />;
     case "unsupported":
       return <UnsupportedControl {...props} />;
     default:

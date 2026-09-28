@@ -4,9 +4,56 @@ Track brief: `docs/workstreams/13-config-compat-and-migration.md`. Owner
 crates/files: `crates/hs-config`, `crates/hs-compat`,
 `tools/synapse_inventory.py`, `docs/synapse-inventory.md`.
 
-Last updated: 2026-09-27 (decision 0010: bootstrap-only settings, importer-only registration files; see "Where this stopped"). Before that: 2026-09-19 (session 2 — catching up `hs-config`/`hs-compat` with day one's
+Last updated: 2026-09-28 (queue items 2b and 2c, see the first section). Before that: 2026-09-27 (decision 0010: bootstrap-only settings, importer-only registration files; see "Where this stopped"). Before that: 2026-09-19 (session 2 — catching up `hs-config`/`hs-compat` with day one's
 shipped work: URL-preview config fields, the `serve_server_wellknown`/`federation_custom_ca_list`/
 `max_spider_size` translation-table corrections, and a first slice of `/_synapse/admin` routes).
+
+## 2026-09-28: queue items 2b and 2c (the ICAP preview control, RFC 0020, the 0010 sweep)
+
+**Done and verified against the real `hs` binary:**
+
+1. **`PreviewMode` is reshaped (2b; track 13's call, since it is the file format).**
+   `crates/hs-config/src/scanning.rs` writes its serde by hand. The derived externally tagged
+   form read `{bytes: N}` only from JSON, but every configuration (file, database section,
+   admin API patch) is parsed through `serde_yaml_ng`, which wanted a YAML tag (`!bytes 4096`),
+   so a forced preview size could not be set at all. It now reads `negotiate`, `off`,
+   `{bytes: N}` and a bare number, from YAML and JSON, and always writes `negotiate`, `off` or
+   `{bytes: N}`. The JSON Schema is unchanged in shape. Test:
+   `a_forced_preview_size_is_read_from_every_form_and_written_as_a_map`.
+2. **The web's schema fixture is pinned to `schema_for!(Config)`.**
+   `crates/hs-config/tests/web_schema_fixture.rs` fails when
+   `web/src/test/fixtures/hs-config-schema.json` differs from the live schema, and says how to
+   regenerate it (`HS_UPDATE_WEB_SCHEMA_FIXTURE=1 cargo test -p hs-config --test web_schema_fixture`).
+   The fixture is regenerated; `config-model.ts` handles the unit-or-`{bytes: N}` choice, so
+   every setting in the real schema has a real control.
+3. **RFC 0020 (a hidden secret inside a list entry is lost on save)** is implemented in both
+   forms, server side in `hs-admin` (`SecretPaths::restore_echoed_secrets`) and in the web
+   (`markSecretOrigins`). See the RFC's "As implemented". `config.update` logs how many secrets
+   it kept (`kept hidden secrets inside list entries ...`, `info`).
+4. **Decision 0010 docs sweep (2c).** The Helm chart's `values.yaml` and `configmap.yaml`
+   comments say which settings are bootstrap and that the rest are administered in the
+   interface; `docs/bridges/heisenbridge.md` and `mautrix.md` register bridges through the admin
+   API, not `registration_files`; `deploy/media-scanning/README.md` sets scanning through the
+   API; `gen_config_docs` marks bootstrap sections and settings, and `docs/config.md` is
+   regenerated. The README already described a server with no configuration file.
+5. **The Configuration page shows the bootstrap split** (per-setting `bootstrap` flag, "Set at
+   install", `listeners` as a bootstrap section), against the real binary:
+   `web/e2e-real/configuration.spec.ts` (3 flows: the preview choice stored as `{bytes: 4096}`
+   then `off`; bootstrap settings shown and refused with 409; two OIDC providers reordered and
+   renamed with both secrets kept). Passed 3/3, twice in a row, against `hs serve`.
+6. **The bootstrap split on PostgreSQL**:
+   `hs-cli` `bootstrap::tests::on_postgres_two_replicas_keep_their_own_bootstrap_and_share_the_rest`
+   boots two replicas on one PostgreSQL database; each keeps its own listeners and mesh
+   identity, they share the administered settings, a bootstrap setting cannot be stored, and a
+   pre-0010 row holding one is purged at the next boot. It needs a server at
+   `HS_BOOTSTRAP_TEST_POSTGRES_DSN` (default `postgres://postgres:hspg@127.0.0.1:5439/postgres`)
+   and skips, saying so, without one.
+
+Verify: `cargo test -p hs-config`; `cargo test -p hs-admin config_schema`;
+`docker run --rm -d --name hs-pg -e POSTGRES_PASSWORD=hspg -p 127.0.0.1:5439:5432 postgres:17`
+then `cargo test -p hs-cli --lib on_postgres`; in `web/`, `npm run check` and, with a running
+`hs serve`, `HS_REAL_SERVER_URL=... HS_REAL_ADMIN_TOKEN=... npx playwright test --config
+playwright.real.config.ts e2e-real/configuration.spec.ts`.
 
 ## Where this stopped (2026-09-27, branch `agent/bootstrap-only-config`, decision 0010 server side)
 

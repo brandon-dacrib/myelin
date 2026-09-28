@@ -459,8 +459,8 @@ Semantic conflicts the compiler found: two `MediaRecord` test initializers witho
 
 | From | Left | Queue |
 |---|---|---|
-| `config-structured-editors` | RFC 0020: a hidden secret inside a list entry is lost on save (server side, track 15); a test that the web's schema fixture equals `schema_for!(Config)` (track 13), which would have caught the drift above; never run against a real server | 2b |
-| `bootstrap-only-config` | Docs sweep (README, chart comments, `docs/bridges`, regenerate `docs/config.md` with `cargo run -p hs-config --bin gen_config_docs`); the web shows the per-setting `bootstrap` flag and `listeners` as a bootstrap section; PostgreSQL not exercised | 2c |
+| `config-structured-editors` | ~~RFC 0020; a test that the web's schema fixture equals `schema_for!(Config)`; never run against a real server~~ (done 2026-09-28) | 2b |
+| `bootstrap-only-config` | ~~Docs sweep; the web shows the per-setting `bootstrap` flag and `listeners` as a bootstrap section; PostgreSQL not exercised~~ (done 2026-09-28) | 2c |
 | `registration-tokens-server-notices` | ~~`e2e-real` spec for the Users-page entry points~~ (done 2026-09-28); `e2e-real` for the Settings pages; Complement `TestServerNotices` (desktop); notices to everyone or to a room | 2d |
 | `reports-tasks-stats` | The Reports, Tasks and Statistics pages and the Overview sparklines (built by `admin-web-pages`, merged in the second round below) | 2a |
 | `media-admin` | `rooms.media.*`, `users.media.*`; paging the media listing; bulk operations on `state.tasks.spawn` (see above); RFC 0004 against the document on moderator read scope | 2e, 2g |
@@ -556,15 +556,20 @@ edit one is not. New settings and operations arrive with their interface control
      track 15 (**`GET /reports` filtered by `reported_user_id` / `reporter_id`**); acting
      straight from a report (suspend is 501, redaction has no admin operation);
      `report.created`/`task.changed` over SSE instead of polling.
-   - **2b.** `media.scanning.icap.preview` gets a real control: `config-model.ts` learns
-     externally tagged enums (a unit-or-`{bytes: N}` choice), or `PreviewMode` is reshaped
-     (track 13's call, since it changes the file format). Then regenerate
-     `web/src/test/fixtures/hs-config-schema.json` from `schema_for!(Config)` and add a Rust
-     test that fails when the fixture differs from the schema. RFC 0020: a hidden secret
-     inside a list entry is lost on save.
-   - **2c.** The decision 0010 docs sweep (README, chart comments, `docs/bridges`, regenerate
-     `docs/config.md`); the Configuration page shows the per-setting `bootstrap` flag and
-     `listeners` as a bootstrap section; exercise the bootstrap split on PostgreSQL.
+   - ~~**2b.** `media.scanning.icap.preview` gets a real control; a Rust test pins the web's
+     schema fixture to `schema_for!(Config)`; RFC 0020 (a hidden secret inside a list entry is
+     lost on save).~~ **Done 2026-09-28** (track 13): `PreviewMode` reads `negotiate`, `off`,
+     `{bytes: N}` or a bare number and writes `{bytes: N}` (the derived form could not be set
+     through the API at all); `crates/hs-config/tests/web_schema_fixture.rs`; RFC 0020
+     implemented server and web side. Proved by `web/e2e-real/configuration.spec.ts` against
+     `hs serve`. `docs/status/13-config-compat-and-migration.md`, first section.
+   - ~~**2c.** The decision 0010 docs sweep; the Configuration page shows the per-setting
+     `bootstrap` flag and `listeners` as a bootstrap section; exercise the bootstrap split on
+     PostgreSQL.~~ **Done 2026-09-28** (track 13): chart comments, `docs/bridges`,
+     `deploy/media-scanning/README.md`, `docs/config.md` regenerated with bootstrap settings
+     marked; the page shows "Set at install" (real-binary spec above); two replicas on one
+     PostgreSQL database keep their own bootstrap (`hs-cli`
+     `bootstrap::tests::on_postgres_two_replicas_keep_their_own_bootstrap_and_share_the_rest`).
    - **2d.** ~~The invite link and a notice from the Users page, against the real binary~~
      **Done 2026-09-28** (`agent/users-page-dialogs`): `web/e2e-real/users-invites-and-notices.spec.ts`
      drives "Invite by link" on the users list (the invited person registers in a signed-out
@@ -911,7 +916,7 @@ cannot do, in rough order of how often an operator will hit it:
   (`docs/design/screenshots/users-invite-*-real.png`).
 - ~~**Edit an array of objects as a form.**~~ **Done 2026-09-27** (decision 0010,
   `config-structured-editors`): lists of objects, variants and maps are forms; the one shape
-  left without a control is `media.scanning.icap.preview` (queue item 2b).
+  left without a control, `media.scanning.icap.preview`, has one since 2026-09-28 (queue item 2b).
 - **Switch a tagged-enum backend** — there is no "move from embedded to postgres" flow, only a
   view of whichever variant is live.
 - **See which *setting* changed.** `ConfigStore` records the merge patch per revision precisely so

@@ -79,8 +79,8 @@ export const KNOWN_RELOADABLE_SECTIONS: readonly string[] = [
   "appservices",
 ];
 
-/** Mirrors `hs_config::store::BOOTSTRAP_SECTIONS`: read before the database is open. */
-export const KNOWN_BOOTSTRAP_SECTIONS: readonly string[] = ["storage"];
+/** Mirrors `hs_config::store::BOOTSTRAP_SECTIONS` (decision 0010): set at install, never stored. */
+export const KNOWN_BOOTSTRAP_SECTIONS: readonly string[] = ["storage", "listeners"];
 
 /** Mirrors `hs_config::reload::SECTION_NAMES` — declaration order of the `Config` struct. */
 export const KNOWN_SECTION_ORDER: readonly string[] = [
@@ -143,6 +143,13 @@ export interface ConfigSettingInfo {
   /** The value is served redacted (`{"$secret": true}`). */
   secret: boolean;
   reloadable: boolean;
+  /**
+   * A bootstrap setting (decision 0010): where the database is, a listener,
+   * this replica's cluster identity, the server name, the signing key's path,
+   * registration files imported once. Set at install — the bootstrap file, an
+   * `HS__` variable or the Helm values — and never stored in the database.
+   */
+  bootstrap: boolean;
   /**
    * `config.update` would accept a change to it. False for a bootstrap
    * section and for anything an `HS__` variable pins — the server's own
@@ -237,16 +244,19 @@ function collectSettings(
     if (!path) continue;
     const origin = isOrigin(entry.origin) ? entry.origin : "default";
     const section = typeof entry.section === "string" ? entry.section : path.split(".")[0];
+    const bootstrap =
+      typeof entry.bootstrap === "boolean" ? entry.bootstrap : bootstrapSections.has(section);
     out[path] = {
       origin,
       secret: entry.secret === true,
       reloadable: entry.reloadable === true,
+      bootstrap,
       // An older server that does not send `editable` gets the inference this
       // interface used before the field existed.
       editable:
         typeof entry.editable === "boolean"
           ? entry.editable
-          : origin !== "environment" && !bootstrapSections.has(section),
+          : origin !== "environment" && !bootstrap,
     };
   }
   return out;
@@ -296,11 +306,13 @@ export function normalizeConfigSchema(raw: unknown): ConfigSchemaModel {
   const bootstrapSections = new Set(ordered.filter((s) => s.bootstrap).map((s) => s.name));
   for (const [path, origin] of Object.entries(origins)) {
     if (path in settings) continue;
+    const bootstrap = bootstrapSections.has(path.split(".")[0]);
     settings[path] = {
       origin,
       secret: false,
       reloadable: false,
-      editable: origin !== "environment" && !bootstrapSections.has(path.split(".")[0]),
+      bootstrap,
+      editable: origin !== "environment" && !bootstrap,
     };
   }
   for (const [path, info] of Object.entries(settings)) {

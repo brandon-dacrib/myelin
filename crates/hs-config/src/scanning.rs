@@ -77,9 +77,18 @@ pub enum ProviderKind {
 }
 
 /// How the client negotiates ICAP preview mode. `negotiate`/`off` serialize as bare strings;
-/// a forced size serializes as `{bytes: N}` (serde's default externally-tagged representation for
-/// a unit vs. tuple variant), matching the RFC's `preview: negotiate` example.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+/// a forced size serializes as `{bytes: N}`, matching the RFC's `preview: negotiate` example.
+///
+/// Serde is written by hand rather than derived (track 13, 2026-09-28). The derived externally
+/// tagged form reads `{bytes: N}` only from JSON: this crate parses every configuration --
+/// a file, a database section, an admin API patch -- through `serde_yaml_ng`, which expects a
+/// data-carrying variant as a YAML tag (`!bytes 4096`) and refused the map, so a forced size
+/// could not be set at all. It now reads `negotiate`, `off`, `{bytes: N}`, and a bare number of
+/// bytes (the `negotiate | <bytes> | off` of `docs/rfcs/0008-content-scanning.md`), from any of
+/// them, and always writes `negotiate`, `off` or `{bytes: N}`. The JSON Schema is still derived
+/// (the `serde` attribute below is read by `schemars` only) and describes exactly that written
+/// shape, which is what the web interface's "choice" control edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, JsonSchema, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PreviewMode {
     /// Follow the server's `OPTIONS`-advertised `Transfer-Preview`/`Transfer-Ignore`/
@@ -91,6 +100,50 @@ pub enum PreviewMode {
     Bytes(usize),
     /// Never preview; always send the complete body.
     Off,
+}
+
+/// The shapes [`PreviewMode`] is read from and written as (see its doc comment).
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum PreviewModeRepr {
+    Name(PreviewModeName),
+    Forced { bytes: usize },
+    Size(usize),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PreviewModeName {
+    Negotiate,
+    Off,
+}
+
+impl Serialize for PreviewMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match *self {
+            PreviewMode::Negotiate => PreviewModeRepr::Name(PreviewModeName::Negotiate),
+            PreviewMode::Off => PreviewModeRepr::Name(PreviewModeName::Off),
+            PreviewMode::Bytes(bytes) => PreviewModeRepr::Forced { bytes },
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PreviewMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match PreviewModeRepr::deserialize(deserializer).map_err(|_| {
+            serde::de::Error::custom(
+                "expected `negotiate`, `off`, a number of bytes, or `{bytes: N}` for the ICAP \
+                 preview mode",
+            )
+        })? {
+            PreviewModeRepr::Name(PreviewModeName::Negotiate) => Ok(PreviewMode::Negotiate),
+            PreviewModeRepr::Name(PreviewModeName::Off) => Ok(PreviewMode::Off),
+            PreviewModeRepr::Forced { bytes } | PreviewModeRepr::Size(bytes) => {
+                Ok(PreviewMode::Bytes(bytes))
+            }
+        }
+    }
 }
 
 /// `icap` provider settings.
@@ -457,6 +510,45 @@ icap:
         assert_eq!(cfg.fail, Some(FailPolicy::Closed));
         assert_eq!(cfg.max_size, ByteSize::mib(100));
         cfg.validated().unwrap();
+    }
+
+    /// A forced preview size is settable in every form the configuration arrives in -- a YAML
+    /// file, and the JSON an admin API patch or a database section is (the derived externally
+    /// tagged form refused the latter, since everything is parsed through `serde_yaml_ng`) --
+    /// and is written back as `{bytes: N}`, the shape the JSON Schema describes.
+    #[test]
+    fn a_forced_preview_size_is_read_from_every_form_and_written_as_a_map() {
+        for yaml in [
+            "preview: {bytes: 4096}",
+            "preview:\n  bytes: 4096",
+            "preview: 4096",
+        ] {
+            let text = format!("host: c-icap\nservice: avscan\n{yaml}\n");
+            let icap: IcapConfig = serde_yaml_ng::from_str(&text).unwrap();
+            assert_eq!(icap.preview, PreviewMode::Bytes(4096), "{yaml}");
+        }
+        let from_json = crate::Config::from_json(&serde_json::json!({
+            "server": {"server_name": "example.org"},
+            "media": {"scanning": {"icap": {
+                "host": "c-icap", "service": "avscan", "preview": {"bytes": 4096}
+            }}},
+        }))
+        .unwrap();
+        let icap = from_json.media.scanning.icap.unwrap();
+        assert_eq!(icap.preview, PreviewMode::Bytes(4096));
+        assert_eq!(
+            serde_json::to_value(icap.preview).unwrap(),
+            serde_json::json!({"bytes": 4096})
+        );
+        for (name, mode) in [
+            ("negotiate", PreviewMode::Negotiate),
+            ("off", PreviewMode::Off),
+        ] {
+            assert_eq!(serde_json::to_value(mode).unwrap(), serde_json::json!(name));
+            let parsed: PreviewMode = serde_yaml_ng::from_str(name).unwrap();
+            assert_eq!(parsed, mode);
+        }
+        assert!(serde_yaml_ng::from_str::<PreviewMode>("sometimes").is_err());
     }
 
     /// Scanning is part of the whole configuration now: an invalid `media.scanning` makes the

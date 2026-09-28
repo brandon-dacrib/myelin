@@ -2644,7 +2644,7 @@ export interface components {
             revision?: number;
             /** @description The highest-precedence layer that sets anything in this section: default, file, database or environment. */
             source?: string;
-            /** @description The section's effective values, keyed relative to the section. Secrets rendered as {"$secret": true}. A patch may set a secret; echoing the placeholder back means "leave it alone". */
+            /** @description The section's effective values, keyed relative to the section. Secrets rendered as {"$secret": true}. A patch may set a secret; echoing the placeholder back means "leave it alone". Inside a list, which a merge patch replaces whole, an echoed placeholder is put back from the value stored at the same pointer, or from the pointer its $from member names ({"$secret": true, "$from": "/auth/oidc_providers/1/client_secret"}), which survives entries being moved or removed; a $from naming nothing stored is a 400 on that pointer (RFC 0020). */
             values?: Record<string, never>;
         };
         ConfigSectionInfo: {

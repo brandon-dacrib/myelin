@@ -3661,6 +3661,35 @@ async fn config_update(
                     .into_response();
             }
 
+            // Inside a list (sent back whole, since a merge patch replaces arrays), an untouched
+            // secret is put back from what is stored now rather than dropped with its entry's
+            // value (RFC 0020).
+            match crate::config_schema::secret_paths().restore_echoed_secrets(
+                &mut patch,
+                &format!("/{section}"),
+                &current.values,
+            ) {
+                Ok(0) => {}
+                Ok(restored) => tracing::info!(
+                    section = %section,
+                    restored,
+                    "kept hidden secrets inside list entries the change sent back whole"
+                ),
+                Err(errors) => {
+                    return Problem::validation_failed()
+                        .with_detail(
+                            "a hidden secret in this change names nowhere a secret is stored",
+                        )
+                        .with_errors(
+                            errors
+                                .into_iter()
+                                .map(|(pointer, detail)| ValidationError::new(pointer, detail))
+                                .collect(),
+                        )
+                        .with_instance(instance)
+                        .into_response();
+                }
+            }
             // A form round-trips the secrets it was shown as `{"$secret": true}`. Writing that
             // literally would replace a real secret with a placeholder; dropping it is what
             // "the operator left this field alone" means.
@@ -6811,6 +6840,67 @@ mod tests {
             vec!["/auth/enable_registration"],
             "the untouched secret is not recorded as a change"
         );
+    }
+
+    /// RFC 0020 through the handler: renaming one OIDC provider sends the whole list back with
+    /// its secrets as placeholders, and both providers still have their secret afterwards.
+    #[tokio::test]
+    async fn a_secret_inside_a_list_survives_saving_the_list() {
+        use crate::sources::InMemoryConfigSource;
+        let state = test_state().with_config(Arc::new(
+            InMemoryConfigSource::new()
+                .with_file(
+                    "/etc/myelin/homeserver.yaml",
+                    json!({"server": {"server_name": "example.org"}}),
+                )
+                .with_database(json!({
+                    "auth": {"oidc_providers": [
+                        {"idp_id": "a", "issuer": "https://a.example", "client_id": "x",
+                         "client_secret": "first"},
+                        {"idp_id": "b", "issuer": "https://b.example", "client_id": "y",
+                         "client_secret": "second"},
+                    ]},
+                })),
+        ));
+        let (router, _manifest) = build_router(state);
+        let shown = get_section(&router, "auth").await;
+        let mut providers = shown.values["oidc_providers"].clone();
+        assert_eq!(providers[0]["client_secret"], json!({"$secret": true}));
+        providers[0]["idp_name"] = json!("Renamed");
+        // The second entry is moved ahead of the first, and says where its secret came from.
+        providers[1]["client_secret"] =
+            json!({"$secret": true, "$from": "/auth/oidc_providers/1/client_secret"});
+        let reordered = json!([providers[1].clone(), providers[0].clone()]);
+        let response = patch_section(
+            &router,
+            "auth",
+            &json!({"oidc_providers": reordered}).to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let raw = body_bytes(response).await;
+        assert!(!String::from_utf8_lossy(&raw).contains("first"));
+        let section: ConfigSection = serde_json::from_slice(&raw).unwrap();
+        let saved = &section.values["oidc_providers"];
+        assert_eq!(saved[0]["idp_id"], json!("b"));
+        assert_eq!(saved[0]["client_secret"], json!({"$secret": true}));
+        assert_eq!(saved[1]["idp_name"], json!("Renamed"));
+        assert_eq!(
+            saved[1]["client_secret"],
+            json!({"$secret": true}),
+            "the untouched secret of the renamed provider was kept, not dropped"
+        );
+
+        let response = patch_section(
+            &router,
+            "auth",
+            &json!({"oidc_providers": [{"idp_id": "c", "issuer": "https://c.example",
+                "client_id": "z",
+                "client_secret": {"$secret": true, "$from": "/auth/oidc_providers/9/client_secret"}}]})
+            .to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

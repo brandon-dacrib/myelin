@@ -61,9 +61,9 @@ describe("ConfigurationPage", () => {
     renderIndex();
     await screen.findByRole("link", { name: "Rate limits" });
 
-    // The four reloadable sections, plus `storage`, which cannot be written at all.
+    // The four reloadable sections, plus `storage` and `listeners`, which are set at install.
     expect(screen.getAllByText("Reloadable")).toHaveLength(4);
-    expect(screen.getByText("Bootstrap only")).toBeInTheDocument();
+    expect(screen.getAllByText("Bootstrap only")).toHaveLength(2);
     expect(screen.getAllByText("Restart required").length).toBeGreaterThan(0);
   });
 

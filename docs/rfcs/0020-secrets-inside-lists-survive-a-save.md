@@ -1,6 +1,6 @@
 # RFC 0020: a hidden secret inside a list entry survives saving the list
 
-Status: proposed, 2026-09-27. Author: track 16 (web). Needs: track 15 (`hs-admin`), with track 13
+Status: accepted and implemented (both forms), 2026-09-28, by track 13. Proposed 2026-09-27 by track 16 (web). Needs: track 15 (`hs-admin`), with track 13
 (`hs-config`) consulted.
 
 ## Problem
@@ -54,3 +54,19 @@ Nothing about the redaction on read changes, and a secret is still never returne
 
 None: today's plain placeholder inside an array already loses the secret, so any restoration is
 strictly better, and a client that never sends `$from` is unaffected.
+
+## As implemented (2026-09-28)
+
+- Server: `SecretPaths::restore_echoed_secrets` (`crates/hs-admin/src/config_schema.rs`) runs in
+  `config.update` before `strip_echoed_secrets`, against the section's stored (unredacted)
+  values. Inside an array a plain placeholder takes the value stored at its own pointer (dropped
+  as before when nothing is stored there); a `$from` placeholder, anywhere, takes the value at
+  the pointer it names, which must be a secret setting of the same section holding a value, or
+  the request is a `400 validation-failed` naming the placeholder's pointer and nothing is
+  written. `strip_echoed_secrets` drops either marker form wherever it is left. Tests:
+  `config_schema::tests::a_secret_*`, `a_from_that_names_no_stored_secret_is_refused`, and
+  `router::tests::a_secret_inside_a_list_survives_saving_the_list` through the handler.
+- Web: before the list editor moves or removes an entry it marks every untouched secret in the
+  list with `$from` (`markSecretOrigins` in `web/src/lib/config-model.ts`); the warning note is
+  gone, and the mock (`restoreEchoedSecrets` in `web/src/mocks/data/config.ts`) behaves as the
+  server does.
