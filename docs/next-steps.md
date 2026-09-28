@@ -435,7 +435,9 @@ The `/` redirect agent was told to stop, commit and push (see below). Their bran
 `agent/*` names on origin that are not in the table; their status files say where each stopped.
 `git branch -r --no-merged origin/main` is the checklist.
 
-**The merge procedure** (parallel agents, one merge at a time): take the lock with
+**The merge procedure** is `tools/merge-queue.sh --all` (or named branches), with
+`HS_CLUSTER_TEST_POSTGRES_DSN` set; a queue over all seven was running when this session ended,
+so check `git branch -r --no-merged origin/main` first. By hand (parallel agents, one merge at a time): take the lock with
 `mkdir .git/myelin-merge.lock` (in the main checkout's `.git`), `git fetch && git rebase
 origin/main`, run fmt, clippy, `cargo test --workspace --all-targets` (and the web checks if
 `web/` changed), `git push origin HEAD:main`, `rmdir` the lock even on failure, delete the
