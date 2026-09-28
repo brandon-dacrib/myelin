@@ -196,7 +196,9 @@ test.describe("User moderation against the real server", () => {
     // The support session is listed and marked.
     await activity.getByRole("tab", { name: "Sessions" }).click();
     await expect(
-      activity.getByRole("table", { name: "Sessions" }).getByText("Support session"),
+      activity
+        .getByRole("table", { name: "Sessions" })
+        .getByText("Support session", { exact: true }),
     ).toBeVisible();
     await shot(page, "support-session");
   });

@@ -19,7 +19,10 @@ import { defineConfig, devices } from "@playwright/test";
  * one case guaranteed to be exercisable against the server as of this writing).
  */
 const target = process.env.HS_REAL_SERVER_URL;
-const port = 4180;
+// `HS_REAL_UI_PORT` moves the dev server off 4180, so that two checkouts can each run the suite
+// against their own server at once (with `reuseExistingServer`, a second run on the same port
+// would silently drive the first checkout's dev server and its backend).
+const port = Number(process.env.HS_REAL_UI_PORT ?? 4180);
 
 export default defineConfig({
   testDir: "./e2e-real",
@@ -34,7 +37,7 @@ export default defineConfig({
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
   webServer: target
     ? {
-        command: `VITE_HS_API_PROXY_TARGET=${target} npm run dev:real`,
+        command: `VITE_HS_API_PROXY_TARGET=${target} npx vite --port ${port} --strictPort`,
         url: `http://localhost:${port}/admin/`,
         reuseExistingServer: true,
         timeout: 60_000,
