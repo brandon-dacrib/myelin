@@ -9,6 +9,7 @@
  * without the operator reloading. A server not running as a cluster refuses every drain with a
  * 409 (nothing could take the shards); the page shows that refusal's own `detail`.
  */
+import { useEffect, useRef } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, newIdempotencyKey } from "./client";
 import { unwrap } from "./problem";
@@ -83,6 +84,24 @@ export function useAllShards(options: { moving: boolean }) {
       ),
     refetchInterval: options.moving ? FAST_POLL_MS : SLOW_POLL_MS,
   });
+}
+
+/**
+ * Reads the shards again the moment the replicas stop moving. While a drain runs the shards poll
+ * fast; when the replicas say it is over, the shard polls drop to the slow interval, and the last
+ * read may be from just before the end (a shard between owners, or one still on the drained
+ * replica). Without this the summary would say a shard has no owner for up to 15 seconds after
+ * the drain finished.
+ */
+export function useRefreshShardsWhenSettled(moving: boolean) {
+  const qc = useQueryClient();
+  const wasMoving = useRef(moving);
+  useEffect(() => {
+    if (wasMoving.current && !moving) {
+      void qc.invalidateQueries({ queryKey: ["cluster-shards"] });
+    }
+    wasMoving.current = moving;
+  }, [moving, qc]);
 }
 
 export interface ShardPageFilters {

@@ -4,6 +4,7 @@ import { Boxes, Server } from "lucide-react";
 import {
   replicaIsMoving,
   useAllShards,
+  useRefreshShardsWhenSettled,
   useReplicas,
   useShardPage,
   type Replica,
@@ -56,6 +57,7 @@ export function ClusterPage() {
   const replicas = useReplicas();
   const moving = Boolean(replicas.data?.some(replicaIsMoving));
   const allShards = useAllShards({ moving });
+  useRefreshShardsWhenSettled(moving);
 
   if (!hasScope("admin:read")) {
     return (

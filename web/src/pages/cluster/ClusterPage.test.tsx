@@ -3,7 +3,7 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { server } from "@/mocks/node";
-import { drainReplica, listShards, setDrainDuration } from "@/mocks/data/cluster";
+import { drainReplica, getReplica, listShards, setDrainDuration } from "@/mocks/data/cluster";
 import { signIn, signOut } from "@/lib/auth";
 import { renderRoutes } from "@/test/render-route";
 import { ClusterPage } from "./ClusterPage";
@@ -102,6 +102,14 @@ describe("Cluster", () => {
 
   it("drains a replica after saying what that does, and follows it until it is drained", async () => {
     setDrainDuration(1_200);
+    // Shard reads made once the drain has finished on the server.
+    let settledShardReads = 0;
+    server.use(
+      http.get("/api/v1/cluster/shards", () => {
+        if (getReplica("hs-1")?.status === "drained") settledShardReads += 1;
+        return undefined;
+      }),
+    );
     const user = userEvent.setup();
     const before = { hs1: owned("hs-1"), hs0: owned("hs-0") };
     open();
@@ -134,6 +142,10 @@ describe("Cluster", () => {
     await waitFor(() =>
       expect(hs0.getByText(String(before.hs0 + Math.ceil(before.hs1 / 2)))).toBeInTheDocument(),
     );
+    // The shards are read again as soon as the drain settles, not at the next slow poll (15s
+    // later), so the summary does not go on counting a shard that was between owners.
+    await waitFor(() => expect(settledShardReads).toBeGreaterThan(0), { timeout: 3_000 });
+    await waitFor(() => expect(screen.getByText("Every shard has an owner")).toBeInTheDocument());
   }, 15_000);
 
   it("undrains a drained replica, which takes its shards back", async () => {
