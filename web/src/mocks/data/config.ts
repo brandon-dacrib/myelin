@@ -932,7 +932,24 @@ const SECRET_POINTERS = [
   "/migration/synapse/database/password",
 ];
 
-const RELOADABLE = new Set(["rate_limits", "federation", "telemetry", "appservices", "migration"]);
+/**
+ * `hs_config::reload::HOT_SETTINGS`: what a running server re-reads when it changes. A pointer
+ * covers everything beneath it; the sections hot throughout are `RELOADABLE`.
+ */
+export const HOT_SETTINGS = [
+  "/rate_limits",
+  "/migration",
+  "/federation/domain_allowlist",
+  "/federation/ip_range_blocklist",
+  "/federation/ip_range_allowlist",
+  "/telemetry/logging/level",
+];
+const RELOADABLE = new Set(["rate_limits", "migration"]);
+
+/** Whether the setting at `pointer` takes effect without a restart. */
+export function isHotSetting(pointer: string): boolean {
+  return HOT_SETTINGS.some((hot) => pointer === hot || pointer.startsWith(`${hot}/`));
+}
 /** `hs_config::store::BOOTSTRAP_SECTIONS`: bootstrap as a whole (decision 0010). */
 const BOOTSTRAP = new Set(["storage", "listeners"]);
 
@@ -984,7 +1001,13 @@ const sectionInfos = [
  * list exactly as the boring answer, which is the same thing.
  */
 const settingInfos = [
-  ...new Set([...Object.keys(configOrigins), ...SECRET_POINTERS, ...BOOTSTRAP_SETTINGS]),
+  ...new Set([
+    ...Object.keys(configOrigins),
+    ...SECRET_POINTERS,
+    ...BOOTSTRAP_SETTINGS,
+    // A hot setting inside a section that is not hot throughout is worth saying so about.
+    ...HOT_SETTINGS.filter((pointer) => !RELOADABLE.has(pointer.split("/")[1])),
+  ]),
 ]
   .sort()
   .map((pointer) => {
@@ -996,7 +1019,7 @@ const settingInfos = [
       section,
       origin,
       secret: SECRET_POINTERS.includes(pointer),
-      reloadable: RELOADABLE.has(section),
+      reloadable: RELOADABLE.has(section) || isHotSetting(pointer),
       bootstrap,
       // The server's own answer to "would config.update take this?". False
       // for a bootstrap setting and for anything an HS__ variable pins.

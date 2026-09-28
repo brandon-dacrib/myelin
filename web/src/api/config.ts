@@ -108,6 +108,11 @@ export interface ConfigSection {
   source: string;
   last_reloaded_at?: string | null;
   values: Record<string, JsonValue>;
+  /**
+   * Only on the answer to a save (`config.update`): what the save did to the
+   * running server. `null` from a server that does not say.
+   */
+  applied?: ConfigReloadReport | null;
 }
 
 export interface ConfigValidateReport {
@@ -118,9 +123,11 @@ export interface ConfigValidateReport {
 }
 
 export interface ConfigReloadReport {
+  /** Sections in which a changed setting was applied to the running server, now. */
   reloaded_sections: string[];
+  /** A reloadable section the running server could not take on, at its pointer (`/rate_limits`). */
   errors: components["schemas"]["ValidationError"][];
-  /** Sections the reload could not apply, because they are not reloadable. */
+  /** Sections holding a change that is only read at startup, so it waits for a restart. */
   requires_restart: string[];
 }
 
@@ -139,7 +146,52 @@ function asConfigSection(raw: unknown): ConfigSection {
     source: record.source ?? "unknown",
     last_reloaded_at: record.last_reloaded_at ?? null,
     values: (record.values ?? {}) as Record<string, JsonValue>,
+    applied: record.applied
+      ? {
+          reloaded_sections: record.applied.reloaded_sections ?? [],
+          errors: record.applied.errors ?? [],
+          requires_restart: record.applied.requires_restart ?? [],
+        }
+      : null,
   };
+}
+
+/**
+ * What a save did, in a sentence: whether `section`'s change is in force now,
+ * waits for a restart, or both. Read from the server's own answer when it
+ * gives one; otherwise inferred from whether the change was hot.
+ */
+export function describeApplied(
+  applied: ConfigReloadReport | null | undefined,
+  section: string,
+  hotWithoutAnswer: boolean,
+): { description: string; failed: boolean } {
+  if (!applied) {
+    return {
+      description: hotWithoutAnswer
+        ? "Applied to the running server."
+        : "Stored. It takes effect the next time this server restarts.",
+      failed: false,
+    };
+  }
+  const failure = applied.errors.find((e) => e.pointer === `/${section}`);
+  if (failure) {
+    return {
+      description: `Stored, but the running server could not take it on and keeps the old value: ${failure.detail}`,
+      failed: true,
+    };
+  }
+  const now = applied.reloaded_sections.includes(section);
+  const later = applied.requires_restart.includes(section);
+  const description =
+    now && later
+      ? "Part of it applies to the running server now; the rest takes effect the next time this server restarts."
+      : later
+        ? "Stored. It takes effect the next time this server restarts."
+        : now
+          ? "Applied to the running server."
+          : "Stored. The running server already uses these values.";
+  return { description, failed: false };
 }
 
 export function useConfigSections() {

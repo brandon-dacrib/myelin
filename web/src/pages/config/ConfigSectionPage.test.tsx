@@ -143,6 +143,40 @@ describe("ConfigSectionPage", () => {
 
     await waitFor(() => expect(configValues.federation.client_timeout).toBe("90s"));
     expect(await screen.findByText("Federation saved")).toBeInTheDocument();
+    // The server's answer says the timeout is only read at startup.
+    expect(
+      screen.getByText("Stored. It takes effect the next time this server restarts."),
+    ).toBeInTheDocument();
+  });
+
+  it("says after saving a hot change that the running server has it now", async () => {
+    const user = userEvent.setup();
+    renderSection("rate_limits");
+
+    const [burst] = await screen.findAllByLabelText(/^Burst count/);
+    await user.clear(burst);
+    await user.type(burst, "4");
+    await user.tab();
+
+    await user.click(await screen.findByRole("button", { name: "Review and save" }));
+    const dialog = within(await screen.findByRole("dialog"));
+    expect(
+      dialog.getByText("Saving applies this to the running server straight away."),
+    ).toBeInTheDocument();
+    await user.click(dialog.getByRole("button", { name: "Save changes" }));
+
+    expect(await screen.findByText("Rate limits saved")).toBeInTheDocument();
+    expect(screen.getByText("Applied to the running server.")).toBeInTheDocument();
+  });
+
+  it("names the settings of a mostly-restart section that apply at once", async () => {
+    renderSection("federation");
+    expect(
+      await screen.findByText("Most changes here take effect at the next restart"),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/apply to the running server at once/)).toHaveTextContent(
+      /Domain allowlist/,
+    );
   });
 
   it("checks a change against the server without saving it", async () => {

@@ -42,7 +42,19 @@ recorded" with no revert.
 - **Checks**: after the rebase onto `agent/admin-followups`, `npm run check` (441 unit tests) and `npm run test:e2e` 50/50;
   `npm run test:e2e:real -- e2e-real/configuration.spec.ts` 4/4 against a fresh `hs serve`.
 
-## Earlier update: 2026-09-28 (a user's moderation and activity; branch `agent/user-moderation`)
+## Update: 2026-09-28 (Configuration: saying whether a save took effect; by track 15, branch `agent/config-reload`)
+
+The server now hot-applies some settings (decision 0015) and says so in `config.update`'s answer
+(`ConfigSection.applied`). The section page's toast reads it: "Applied to the running server.",
+"Stored. It takes effect the next time this server restarts.", both, or the reason the running
+server could not take it. The review dialog and the unsaved-changes bar judge the pending changes
+per setting (`ConfigSettingInfo.reloadable`), and a section with only some hot settings
+(`federation`'s allow and block lists, `telemetry.logging.level`) names them in its notice. The
+mocks follow the server's `HOT_SETTINGS`. Checked: `npm run check` (408 tests), `npm run
+test:e2e` (49), and `e2e-real/configuration.spec.ts` against a real `hs serve` (4, including a
+new one that saves a rate limit on the page and checks the toast and `hs_config_reloads_total`).
+
+## Current update: 2026-09-28 (a user's moderation and activity; branch `agent/user-moderation`)
 
 A user's page gained two cards on the fourteen operations track 15 made real the same day
 (`docs/status/15-admin-api-and-modules.md`):

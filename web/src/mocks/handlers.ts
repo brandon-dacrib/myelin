@@ -32,6 +32,7 @@ import {
   configSchemaDocument,
   configValues,
   environmentPinned,
+  isHotSetting,
   mergePatch,
   patchPointers,
   recordConfigChange,
@@ -1730,13 +1731,26 @@ export const handlers = [
     const before = beforeValues(configValues[name], patch);
     configValues[name] = candidate;
     configRevisions[name] = (configRevisions[name] ?? 0) + 1;
-    if (meta?.reloadable) configLastReloaded[name] = new Date().toISOString();
+    // What the real server's answer says (`ConfigSection.applied`): the hot settings in the
+    // change were applied now; any other setting waits for a restart.
+    const leaves = patchPointers(patch).map((pointer) => `/${name}${pointer}`);
+    const hot = leaves.filter(isHotSetting);
+    if (hot.length > 0) configLastReloaded[name] = new Date().toISOString();
     recordConfigChange(name, configRevisions[name]);
     recordConfigHistory(name, configRevisions[name], patch as Record<string, JsonValue>, before);
 
-    return HttpResponse.json(configSectionBody(name), {
-      headers: { ETag: configEtag(name) },
-    });
+    return HttpResponse.json(
+      {
+        ...configSectionBody(name),
+        applied: {
+          reloaded_sections: hot.length > 0 ? [name] : [],
+          errors: [],
+          requires_restart: hot.length < leaves.length ? [name] : [],
+          revision: configRevisions[name],
+        },
+      },
+      { headers: { ETag: configEtag(name) } },
+    );
   }),
 
   // `config.history.list`: newest first, one row per setting, paged by revision (`r<revision>`).
@@ -1809,9 +1823,9 @@ export const handlers = [
     const document = (await request.json()) as Record<string, JsonValue>;
     const errors = validateDocument(document);
     // Which of the sections in the candidate document the running process
-    // could not adopt without being restarted.
-    const requires_restart = Object.keys(document).filter(
-      (name) => !configSchemaDocument.sections.find((s) => s.name === name)?.reloadable,
+    // could not adopt without being restarted: those with a setting that is not hot.
+    const requires_restart = Object.keys(document).filter((name) =>
+      patchPointers(document[name]).some((pointer) => !isHotSetting(`/${name}${pointer}`)),
     );
     return HttpResponse.json({ valid: errors.length === 0, errors, requires_restart });
   }),

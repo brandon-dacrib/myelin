@@ -20,6 +20,7 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react
 import { Link, useNavigate, useParams, useRouterState, useSearch } from "@tanstack/react-router";
 import { ChevronLeft, Lock, TriangleAlert } from "lucide-react";
 import {
+  describeApplied,
   useConfigSchema,
   useConfigSection,
   useUpdateConfigSection,
@@ -141,6 +142,30 @@ function SectionForm({ section, data, schema, schemaSettled, onReread }: Section
   );
   const fields = useMemo(() => flattenFields(model), [model]);
   const changes = useMemo(() => changeEntries(fields, values, draft), [fields, values, draft]);
+
+  // Settings of this section that apply without a restart when the section as
+  // a whole does not (`ConfigSettingInfo.reloadable`, per setting): the
+  // federation allow and block lists, the log level.
+  const hotSettings = useMemo(
+    () =>
+      Object.entries(schema?.settings ?? {})
+        .filter(([path, info]) => info.reloadable && path.startsWith(`${section}.`))
+        .map(([path]) => path),
+    [schema, section],
+  );
+  const isHot = useCallback(
+    (fullPath: string) =>
+      reloadable || hotSettings.some((p) => fullPath === p || fullPath.startsWith(`${p}.`)),
+    [reloadable, hotSettings],
+  );
+  const hotLabels = useMemo(
+    () => fields.filter((f) => hotSettings.includes(f.fullPath)).map((f) => f.label),
+    [fields, hotSettings],
+  );
+  // When the pending changes take effect: all now, all at the next restart, or some of each.
+  const hotChanges = changes.filter((c) => isHot(c.field?.fullPath ?? `${section}.${c.path}`));
+  const timing =
+    hotChanges.length === changes.length ? "now" : hotChanges.length === 0 ? "restart" : "mixed";
   // The settings whose pending edit actually changes something — which is not
   // every setting in the draft: typing a value back to what it already was
   // leaves an entry behind that changes nothing.
@@ -204,16 +229,18 @@ function SectionForm({ section, data, schema, schemaSettled, onReread }: Section
     update.mutate(
       { section, patch, etag: data.etag },
       {
-        onSuccess: () => {
+        onSuccess: (result) => {
           setDraft({});
           setConflict(null);
           setReport(undefined);
           setReviewOpen(false);
+          // The server's answer says what happened to the running process; the
+          // schema's flags are only the fallback for a server that does not.
+          const outcome = describeApplied(result.section.applied, section, timing === "now");
           toast({
             title: `${model.label} saved`,
-            description: reloadable
-              ? "Applied to the running server."
-              : "Stored. It takes effect the next time this server restarts.",
+            description: outcome.description,
+            variant: outcome.failed ? "danger" : undefined,
           });
         },
         onError: handleSaveError,
@@ -325,10 +352,18 @@ function SectionForm({ section, data, schema, schemaSettled, onReread }: Section
         </Notice>
       )}
 
-      {!bootstrap && !reloadable && (
+      {!bootstrap && !reloadable && hotLabels.length === 0 && (
         <Notice tone="info" title="Changes here take effect at the next restart">
           Saving stores the new value straight away, but this section is not reloadable — the
           running process keeps the old one until it is restarted.
+        </Notice>
+      )}
+
+      {!bootstrap && !reloadable && hotLabels.length > 0 && (
+        <Notice tone="info" title="Most changes here take effect at the next restart">
+          Saving stores the new value straight away. {hotLabels.join(", ")}{" "}
+          {hotLabels.length === 1 ? "applies" : "apply"} to the running server at once; for
+          everything else the running process keeps the old value until it is restarted.
         </Notice>
       )}
 
@@ -442,7 +477,12 @@ function SectionForm({ section, data, schema, schemaSettled, onReread }: Section
           <div className="mx-auto flex max-w-[68rem] flex-wrap items-center justify-between gap-3 px-6 py-3">
             <p className="text-sm text-text">
               {changes.length} unsaved change{changes.length === 1 ? "" : "s"}
-              {!reloadable && <span className="text-text-muted"> · takes effect on restart</span>}
+              {timing === "restart" && (
+                <span className="text-text-muted"> · takes effect on restart</span>
+              )}
+              {timing === "mixed" && (
+                <span className="text-text-muted"> · some take effect on restart</span>
+              )}
             </p>
             <div className="flex gap-2">
               <Button variant="ghost" onClick={discardAll}>
@@ -458,7 +498,7 @@ function SectionForm({ section, data, schema, schemaSettled, onReread }: Section
         open={reviewOpen}
         onOpenChange={setReviewOpen}
         sectionLabel={model.label}
-        reloadable={reloadable}
+        timing={timing}
         changes={changes}
         patch={patch}
         report={report}

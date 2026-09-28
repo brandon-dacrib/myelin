@@ -217,4 +217,38 @@ test.describe("configuration against the real server", () => {
     // Tidy up: back to the default.
     expect((await api("PATCH", "/config/federation", { client_timeout: null })).status).toBe(200);
   });
+
+  test("a rate limit saved on the page is in force on the running server at once (decision 0015)", async ({
+    page,
+  }) => {
+    test.setTimeout(90_000);
+    const before = (await api("GET", "/config/rate_limits")).json.values.message;
+    await signIn(page);
+    await page.goto("/admin/configuration/rate_limits");
+    await expect(page.getByText("Reloadable", { exact: true })).toBeVisible();
+
+    // `message` is the first bucket, so its burst count is the first on the page.
+    const burst = page.getByLabel(/^Burst count/).first();
+    await burst.fill(String(before.burst_count === 7 ? 8 : 7));
+    await burst.blur();
+    await page.getByRole("button", { name: "Review and save" }).click();
+    await expect(
+      page
+        .getByRole("dialog")
+        .getByText("Saving applies this to the running server straight away."),
+    ).toBeVisible();
+    await page.getByRole("dialog").getByRole("button", { name: "Save changes" }).click();
+    await expect(page.getByText("Rate limits saved", { exact: true })).toBeVisible();
+    await expect(page.getByText("Applied to the running server.", { exact: true })).toBeVisible();
+    await shot(page, "rate-limits-applied");
+
+    // The server counted it as applied, not merely stored.
+    const metrics = await (await fetch(`${server}/metrics`)).text();
+    expect(metrics).toMatch(
+      /hs_config_reloads_total\{section="rate_limits",outcome="applied"\} \d+/,
+    );
+
+    // Tidy up.
+    expect((await api("PATCH", "/config/rate_limits", { message: before })).status).toBe(200);
+  });
 });

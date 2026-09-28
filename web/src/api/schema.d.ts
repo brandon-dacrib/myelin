@@ -2708,9 +2708,11 @@ export interface components {
             items: components["schemas"]["ConfigChange"][];
         };
         ConfigReloadReport: {
+            /** @description Sections whose change could not be applied although they are reloadable, one error per section at its pointer (/rate_limits); the old value stays in force. */
             errors?: components["schemas"]["ValidationError"][];
+            /** @description Sections in which a changed setting was applied to the running server, now. A section whose change needed nothing re-read is not listed. */
             reloaded_sections?: string[];
-            /** @description Sections that changed but could not be hot-applied. Reported rather than swallowed. */
+            /** @description Sections holding a setting that differs from what this process started on and that is only read at startup. Reported rather than swallowed. A section can be listed here and in reloaded_sections when settings of both kinds changed. */
             requires_restart?: string[];
             revision?: number;
         };
@@ -2729,6 +2731,8 @@ export interface components {
             settings?: components["schemas"]["ConfigSettingInfo"][];
         };
         ConfigSection: {
+            /** @description Only on the answer to config.update: what the write did to the running server -- the sections it hot-applied (reloaded_sections) and those whose change waits for a restart (requires_restart), as config.reload reports them. Absent on reads. */
+            applied?: components["schemas"]["ConfigReloadReport"];
             /** @description Whether this whole section is bootstrap (decision 0010) -- read before the database is open or belonging to one process, and so never stored in it (storage, listeners). Read-only; config.update refuses it with 409. Sections holding only some bootstrap settings mark them per setting (ConfigSettingInfo.bootstrap). */
             bootstrap?: boolean;
             /** @description The most recent changes to this section, newest first. Returned by config.get; omitted by config.list. */

@@ -78,6 +78,14 @@ offering operations); before that 2026-09-26 (three public recovery operations);
 >   behind `tracing_subscriber::reload`; `Guard::log_level()` hands out a `LogLevelHandle`
 >   (`set_level`), wired in `run_serve`. When `RUST_LOG` set the filter it is not wired, so a
 >   change is reported as waiting for a restart rather than claimed.
+> - **Web** (`web/src/pages/config/`): the toast after a save reads the server's `applied`
+>   ("Applied to the running server." / "Stored. It takes effect the next time this server
+>   restarts." / both / the failure); the review dialog and the unsaved bar judge the pending
+>   changes setting by setting, and a section with some hot settings (federation, telemetry)
+>   names them. Mocks follow `HOT_SETTINGS`. `web/e2e-real/configuration.spec.ts` saves a rate
+>   limit on the page against a real `hs serve` and checks the toast and
+>   `hs_config_reloads_total` -- which is how the one-field-of-a-bucket bug (status 13) was
+>   found.
 > - **Answers**: `ConfigSection.applied` (a `ConfigReloadReport`) on `config.update`'s answer;
 >   `config.reload` reports what `LiveConfig` applied rather than nothing.
 > - **Verified on the real binary**: `crates/hs-cli/tests/config_reload.rs` boots `hs serve`,

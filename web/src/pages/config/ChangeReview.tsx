@@ -18,7 +18,11 @@ export interface ChangeReviewProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   sectionLabel: string;
-  reloadable: boolean;
+  /**
+   * When these changes take effect: all on the running server now, all at the
+   * next restart, or some of each (a section with some hot settings).
+   */
+  timing: "now" | "restart" | "mixed";
   changes: ChangeEntry[];
   patch: Record<string, JsonValue>;
   report?: ConfigValidateReport;
@@ -32,7 +36,7 @@ export function ChangeReview({
   open,
   onOpenChange,
   sectionLabel,
-  reloadable,
+  timing,
   changes,
   patch,
   report,
@@ -47,9 +51,11 @@ export function ChangeReview({
         size="form"
         title={`Review ${changes.length} change${changes.length === 1 ? "" : "s"} to ${sectionLabel}`}
         description={
-          reloadable
-            ? "This section is reloadable: saving applies it to the running server straight away."
-            : "This section is not reloadable. Saving stores the change; it takes effect the next time the server restarts."
+          timing === "now"
+            ? "Saving applies this to the running server straight away."
+            : timing === "mixed"
+              ? "Saving stores every change. Some apply to the running server straight away; the rest take effect the next time the server restarts."
+              : "These settings are read at startup. Saving stores the change; it takes effect the next time the server restarts."
         }
         footer={
           <>
