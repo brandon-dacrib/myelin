@@ -408,28 +408,47 @@ What is *not* in those percentages, and should temper them: no security review, 
 beyond a loadgen harness, `cargo fuzz` never run, Sytest never run, and no bridge has yet
 carried a message through an encrypted room. Each of those has historically found things.
 
-## In flight right now (2026-09-27)
+## In flight right now (2026-09-28): eight branches, none merged
 
-Nothing is in flight on a branch. The 2026-09-27 cloud session's round is merged on
-`claude/exciting-cori-g5mxwh`: five agents in worktrees, every branch pushed the moment it
-had a commit, merged by the lead in the order storage (measurement only), federation, sync,
-cluster, bridges, with `docs/status/{01,03,05,06,11}-*.md` carrying each one's account. Two
-things to keep from how it went: with several agents building into one shared `target/`,
-cargo links whichever worktree's copy of a workspace crate was built last (a `touch` of the
-crate's sources before a build is the workaround, and a "tests pass" from a busy shared
-target deserves suspicion until CI agrees), and four parallel builds fill a 250 GB disk with
-test executables in a few hours (delete `target/debug/deps`' executables, never the rlibs,
-to get it back). On 2026-09-26 five agents were started in parallel in git
-worktrees on the owner's machine, committing to `worktree-agent-*` branches that were never
-pushed. One was merged (`50fa29f`, the chart install as a CD gate). The other four -- the
-cold-boot measurement (track 01), the pod's own mesh address with mTLS wired and `/createRoom`
-shard-gated (03), cluster-aware `/sync` (05), and the durable outbound federation queue (06)
--- **were deleted with the worktrees before they were pushed, and that work is lost.** Their
-tasks are back in the list below as if never started; nothing from them reached `main`.
+The 2026-09-27 evening session on the owner's laptop fanned the completeness queue out to eight
+agents in worktrees, then stopped them all when the laptop ran short of disk, to resume on
+another machine. **Every branch is pushed to origin and none is merged to `main`** (the lead's
+merge into `main` was refused by the session's permission mode, so merging is the first job of
+the next session). Each branch's track status file has a "Where this stopped" section with its
+exact next steps. Run the full `cargo test --workspace --all-targets` and `npm run check` after
+the merges: every agent tested only the crates it touched.
 
-The lesson is cheap to keep: an agent's branch is pushed the moment it has a commit worth
-keeping (`git push -u origin <branch>`), not when the lead gets to it. `.claude/worktrees/` is
-excluded from git locally; a branch that exists only there is one `rm -rf` from gone.
+| Branch | Head | What it is | Left on it |
+|---|---|---|---|
+| `agent/config-structured-editors` | `49e2477` | Decision 0010, web: the Configuration page edits lists of objects, variants and maps as forms, never as JSON; a test fails if any real setting lacks a control; the bridge access list is one row per Matrix ID. `npm run check` and 28/28 mock Playwright green | RFC 0020 (a hidden secret inside a list entry is lost on save; server side, track 15); a test that the web's schema fixture matches `schema_for!(Config)` (track 13); not run against a real server |
+| `agent/media-admin` | `ec81e07` | Media 9/9: list, search, quarantine, protect, delete, bulk delete, purge remote cache, last-access tracking; the Media page on real data; an e2e test through the real binary | `rooms.media.*`, `users.media.*`, `statistics.users_media`; paging the listing; bulk ops should go through `state.tasks.spawn` once the tasks branch is in; RFC 0004 vs the document on moderator read scope |
+| `agent/registration-tokens-server-notices` | `5bbb1cf` | RegistrationTokens 5/5 (tokens open a closed server, decision 0011; invite-by-link and a public sign-up page), ServerNotices 2/2 (`TestServerNotices` steps pass through the real server); full `cargo test -p hs-cli` green | `e2e-real` Playwright spec; Complement's `TestServerNotices` (laptop); notices to everyone/a room |
+| `agent/reports-tasks-stats` | `bf6873e` | Reports 4/4 (and the three client report endpoints, durable), Tasks 3/3 (a durable task registry), Statistics 4/4; survives a restart of the real binary | **The web pages are not built** (Reports, Tasks, Statistics, Overview sparklines), `schema.d.ts` not regenerated |
+| `agent/federation-membership` | `e6d4a71` | Invites, rejections, rescinded invites and knocks over federation, both directions; three two-server tests that fail without the fix | `createRoom`'s `invite` list for remote users; reject fallback when no resident helps; neutral error text; restricted joins; Complement |
+| `agent/federation-edus` | `e4543e4` | Typing, receipts, presence and device-list updates cross servers both ways; `/user/keys/query` and `claim` served; receipts and presence durable | `cargo clippy -p hs-cli` and the rest of `cargo test -p hs-cli` not run after its last change; to-device over federation; `m.signing_key_update`; EDUs in cluster mode go only through the owning replica |
+| `agent/bootstrap-only-config` | `0a23e9a` | Decision 0010, server: the bootstrap set (`crates/hs-config/src/bootstrap.rs`) is never seeded into the shared database and is refused by the API (fixes the two-replica listeners/mesh-port bug); registration files are imported once, then the bridge is the API's; media scanning and unstable features became settings | The docs sweep (README, chart comments, `docs/bridges`, regenerate `docs/config.md`); the web shows the per-setting `bootstrap` flag and `listeners` as a bootstrap section; PostgreSQL not exercised |
+| `agent/two-pod-cluster` | `a6fe124` | Nothing installed: dacrib0's etcd failed 36 of 111 readiness checks (23:31Z-00:10Z), black0n0's member logging 1-3 s fsyncs. `deploy/two-pod/verify.py` and `failover.py` written, not run; `storage.postgres.sslMode` documented as ignored (the server connects `NoTls`) | Resume steps at the top of `docs/status/03-cluster.md`; the SeaweedFS fix in `my-infra/.../apps/myelin-cluster/s3.yaml` is not applied; that directory is not committed |
+
+**Merge order and expected conflicts.** Web and bootstrap first (few overlaps; bootstrap touches
+config crates, the web branch only `web/`). Then the three admin branches -- registration
+tokens, reports/tasks/stats, media -- which all edit `crates/hs-admin/src/router.rs`
+(`AdminState` fields, `REAL_HANDLERS`, match arms), `lib.rs`, `openapi.yaml`,
+`web/src/api/schema.d.ts` (regenerate rather than hand-merge), the mocks, `README.md` and this
+file's coverage numbers (recount with `python3 tools/admin_api_coverage.py`; expected about 97
+of 158). Then federation membership and EDUs, which both change `FederationState` constructors
+(EDUs added `edu_sink` to all twelve) and `transport/seams.rs`. The cluster branch last.
+
+**On the cluster** (`admin@dacrib0`): namespace `myelin-cluster` holds five Secrets, a bound
+`s3` PVC, and a crash-looping SeaweedFS pod and bucket Job (wrong flag; harmless). The database
+is the CNPG `Database` `dacrib/myelin-cluster` on the shared `postgres-cluster`, owned by
+`appuser`, reclaim `delete`. No Helm release. The demo in `myelin` is untouched. The cluster's
+etcd slowness predates this work and needs the owner's attention before the two-pod run.
+
+**Carried over from 2026-09-27's cloud session** (still true): with several agents building into
+one shared `target/`, cargo links whichever worktree's copy of a crate was built last, and four
+parallel builds fill a 250 GB disk; this round gave each worktree its own target with
+`CARGO_PROFILE_DEV_DEBUG=0` and deleted test executables at the end, and still ran the laptop
+short. An agent's branch is pushed the moment it has a commit worth keeping.
 
 **Where sessions run now.** The owner works from cloud sessions (Claude Code on the web) as
 well as the laptop. A cloud session has the repository, a Rust toolchain that builds the
