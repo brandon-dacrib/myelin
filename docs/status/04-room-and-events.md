@@ -5,6 +5,11 @@ Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 Last updated: 2026-09-28 (session 10: the admin API's room long tail, below). Before that,
 2026-09-26 (session 9, next paragraph).
 
+> **Branch state (2026-09-28):** `agent/rooms-admin`, rebased on `8cc6b92`, not yet on main. Done: all
+> 17 Rooms operations, the room page, e2e-real passed against `hs serve`. Gate: fmt and workspace clippy clean;
+> workspace tests 789 passed, 2 `e2e.rs` boot-timeout failures under load that pass alone; `npm run check` and
+> `test:e2e` (45/45) green. Left: merge; `events.get` in cluster mode reads on a non-owner.
+>
 > **2026-09-28, session 10: what an administrator does to a room.** `hs-admin`'s 17 unserved
 > Rooms operations are served, and this crate is their source.
 >
