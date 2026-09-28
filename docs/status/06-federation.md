@@ -36,6 +36,14 @@ in cluster mode only through the owning replica". Branch `agent/federation-to-de
   The rest of that branch is on main already (audited behaviour by behaviour; its remaining
   differences are test scenarios and the `make_knock`-on-an-old-room-version status, 400 here, 403
   in Synapse).
+  From the superseded `worktree-agent-ab238ddfa2a8532e6`, one thing main lacked: a device
+  deleted in `hs-auth` kept its keys in `hs-e2e` and went on being served; now they are removed
+  (status 08). Its remote device-list cache was not ported: main's no-cache design is deliberate
+  (`hs_e2e::federation`, "No cache").
+  Also from that branch, the real-binary restart test the federation-edus session listed as
+  next: `crates/hs-cli/tests/e2e.rs::receipts_and_presence_are_still_there_after_a_restart_of_the_real_binary`
+  (stops `hs serve`, starts it over the same data directory, and finds the read receipt and
+  presence in an initial and an incremental sync). It passes on main as it is.
 
 Tests (all fail with the fix turned off, checked by editing the code and running them):
 
