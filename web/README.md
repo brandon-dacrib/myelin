@@ -61,7 +61,8 @@ src/
                      wizard), UsersPage/UserDetailPage, RoomsPage/RoomDetailPage,
                      FederationPage/FederationDestinationPage, config/ (ConfigurationPage +
                      ConfigSectionPage: the generated configuration forms), settings/
-                     (registration tokens and server notices), PlaceholderPage
+                     (registration tokens and server notices), cluster/ (replicas, drain
+                     and undrain, the shard map and table), PlaceholderPage
                      for the remaining information-architecture sections not yet built
   routes.tsx          the route tree (TanStack Router, code-based, every page lazy-loaded
                      via lazyRouteComponent for route-level code splitting)
@@ -69,7 +70,8 @@ e2e/                 Playwright specs against the mock (npm run test:e2e): add-b
                      (flows.md flow 1 end to end), bridges-list.spec.ts (nested-interactive-
                      element regression coverage, desktop and phone viewport),
                      users-rooms-federation.spec.ts, degrade-honestly.spec.ts (501/503/403
-                     treatment, forced via window.__hsAdminMock.setForceProblem)
+                     treatment, forced via window.__hsAdminMock.setForceProblem),
+                     cluster.spec.ts (drain a replica to drained and undrain it)
 e2e-real/            Playwright specs against a real hs serve (npm run test:e2e:real) —
                      see "Real-server mode" below
 mocks/openapi.yaml   this track's own OpenAPI draft; fallback only, see Requirements above
@@ -122,9 +124,16 @@ Configuration, and Settings: registration tokens (each an invite link to the pub
 `/admin/register?token=...` page, which registers through the Matrix client-server API with no
 administrator session) and server notices (send, history; also "Send notice" on a user).
 
-Not built (routes exist as `PlaceholderPage` so navigation matches the full information
-architecture, but the pages themselves are Phase 1/2 per the brief): Reports, Media, Cluster and
-Migration. Settings has no scheduled-tasks or appearance view yet. See
+Also built since: Reports, Tasks, Statistics, Media and Cluster (`/cluster`: the replicas with
+their status, shards, zone, heartbeat and version; drain and undrain behind a confirmation that
+says what each does, following a drain to `drained` through its task; the shard map coloured by
+owner with a kind filter, and a paged shard table for reading them one by one; a single node is
+told plainly that it has nothing to drain to, and is not offered a button that can only fail).
+The mock (`src/mocks/data/cluster.ts`) is a cluster of three whose drains move shards over a
+few seconds and put a `cluster.replicas.drain` task on the Tasks page.
+
+Not built (the route exists as `PlaceholderPage` so navigation matches the full information
+architecture, but the page itself is Phase 1/2 per the brief): Migration. Settings has no scheduled-tasks or appearance view yet. See
 `docs/status/16-management-web-interface.md` for what is next, including narrower gaps on the
 pages that are built.
 

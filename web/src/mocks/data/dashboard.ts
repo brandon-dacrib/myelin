@@ -1,4 +1,5 @@
 import type { components } from "@/api/schema";
+import { clusterSummary } from "./cluster";
 
 type StatisticsOverview = components["schemas"]["StatisticsOverview"];
 type ServerInfo = components["schemas"]["ServerInfo"];
@@ -29,12 +30,12 @@ export const serverInfo: ServerInfo = {
   contract_version: "0.1.0-draft",
 };
 
-export const clusterStatus: ClusterStatus = {
-  mode: "single-node",
-  epoch: 1,
-  replica_count: 1,
-  shard_count: 1,
-};
+/**
+ * `GET /cluster` as the mock starts: the three-replica cluster in `./cluster`, whose own
+ * `clusterSummary()` the handler answers with (this snapshot is what `window.__hsAdminMock`'s
+ * `setClusterMode` overrides start from).
+ */
+export const clusterStatus: ClusterStatus = clusterSummary();
 
 export const federationDestinations: Destination[] = [
   {

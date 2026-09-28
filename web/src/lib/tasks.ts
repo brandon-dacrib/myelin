@@ -37,6 +37,7 @@ const TASK_ACTIONS: Record<string, string> = {
   "migration.verify": "Verify the migration",
   "migration.cutover": "Cut over from Synapse",
   "federation.refetch_keys": "Refetch server keys",
+  "cluster.replicas.drain": "Drain replica",
 };
 
 export function describeTaskAction(action: string): string {

@@ -4,7 +4,6 @@ import { EmptyState } from "@/components/ui/empty-state/EmptyState";
 
 const TITLES: Record<string, string> = {
   media: "Media",
-  cluster: "Cluster",
   migration: "Migration",
   audit: "Audit log",
 };

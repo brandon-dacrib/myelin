@@ -136,7 +136,16 @@ export function recordFinishedTask(
   return wire(recorded);
 }
 
-/** Moves the clock-driven task on: its progress follows the clock and it succeeds at the end. */
+/**
+ * Records or replaces a task another part of the mock drives itself (a replica's drain, which
+ * `./cluster` moves on and finishes as its shards are handed off), so it is on the Tasks page
+ * exactly as the server's own task would be.
+ */
+export function putTask(task: Omit<Task, "created_by"> & Partial<Pick<Task, "created_by">>): Task {
+  return recordFinishedTask(task);
+}
+
+/** Moves the clock-driven task on:its progress follows the clock and it succeeds at the end. */
 function advance(task: MockTask): MockTask {
   if (task.clockStart === undefined || task.status !== "running") return task;
   const elapsed = Date.now() - task.clockStart;

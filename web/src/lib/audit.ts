@@ -72,6 +72,7 @@ export function targetRoute(
   | { to: "/configuration/$section"; params: { section: string } }
   | { to: "/reports/$reportId"; params: { reportId: string } }
   | { to: "/tasks/$taskId"; params: { taskId: string } }
+  | { to: "/cluster"; params: Record<string, never> }
   | null {
   switch (target.type) {
     case "user":
@@ -88,6 +89,9 @@ export function targetRoute(
       return { to: "/reports/$reportId", params: { reportId: target.id } };
     case "task":
       return { to: "/tasks/$taskId", params: { taskId: target.id } };
+    case "replica":
+      // One page lists every replica; the id is on its row.
+      return { to: "/cluster", params: {} };
     default:
       return null;
   }

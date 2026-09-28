@@ -37,12 +37,17 @@ import {
   validateDocument,
   validateSection,
 } from "./data/config";
+import { statisticsOverview, serverInfo, federationDestinations } from "./data/dashboard";
 import {
-  statisticsOverview,
-  serverInfo,
-  clusterStatus,
-  federationDestinations,
-} from "./data/dashboard";
+  clusterSummary,
+  drainReplica,
+  getReplica,
+  listReplicas,
+  listShards,
+  settleCluster,
+  undrainReplica,
+  type ReplicaOutcome,
+} from "./data/cluster";
 import { auditEntries } from "./data/audit";
 import {
   deleteReport,
@@ -425,10 +430,13 @@ export const handlers = [
 
   // ---- Tasks (crates/hs-admin/src/tasks.rs) ----
   http.get(`${API}/tasks`, ({ request }) => {
+    // A replica's drain is a task too; move it on before answering.
+    settleCluster();
     const url = new URL(request.url);
     return HttpResponse.json(paginate(listTasks(url.searchParams), url));
   }),
   http.get(`${API}/tasks/:id`, ({ params }) => {
+    settleCluster();
     const task = getTask(String(params.id));
     return task ? HttpResponse.json(task) : problem(404, "not-found", "Task not found");
   }),
@@ -440,7 +448,33 @@ export const handlers = [
   http.get(`${API}/server/health`, () =>
     HttpResponse.json({ status: "ok", checks: { storage: "ok", federation: "ok" } }),
   ),
-  http.get(`${API}/cluster`, () => HttpResponse.json(clusterStatus)),
+  // ---- Cluster (the replicas and shards in ./data/cluster) ----
+  http.get(`${API}/cluster`, () => HttpResponse.json(clusterSummary())),
+  http.get(`${API}/cluster/replicas`, ({ request }) =>
+    HttpResponse.json(paginate(listReplicas(), new URL(request.url))),
+  ),
+  http.get(`${API}/cluster/replicas/:id`, ({ params }) => {
+    const replica = getReplica(String(params.id));
+    return replica
+      ? HttpResponse.json(replica)
+      : problem(404, "not-found", "Not found", {
+          detail: `no replica "${String(params.id)}" is registered`,
+        });
+  }),
+  http.post(`${API}/cluster/replicas/:id/drain`, ({ params }) =>
+    replicaAnswer(drainReplica(String(params.id))),
+  ),
+  http.post(`${API}/cluster/replicas/:id/undrain`, ({ params }) =>
+    replicaAnswer(undrainReplica(String(params.id))),
+  ),
+  http.get(`${API}/cluster/shards`, ({ request }) => {
+    const url = new URL(request.url);
+    const all = listShards(url.searchParams.get("kind"));
+    return HttpResponse.json({
+      ...paginate(all, url),
+      ...(url.searchParams.get("include_total") === "true" ? { total: all.length } : {}),
+    });
+  }),
   http.get(`${API}/federation/destinations`, ({ request }) => {
     const url = new URL(request.url);
     const { items, next_cursor, prev_cursor } = paginate(federationDestinations, url);
@@ -1464,6 +1498,14 @@ export const handlers = [
     return new HttpResponse(svg, { headers: { "Content-Type": "image/svg+xml" } });
   }),
 ];
+
+/** A drain or undrain's answer: the replica, or the problem the server would give. */
+function replicaAnswer(outcome: ReplicaOutcome) {
+  if ("replica" in outcome) return HttpResponse.json(outcome.replica);
+  return outcome.problem === "not-found"
+    ? problem(404, "not-found", "Not found", { detail: outcome.detail })
+    : problem(409, "conflict", "Conflict", { detail: outcome.detail });
+}
 
 function mediaNotFound() {
   return problem(404, "not-found", "Not found", { detail: "this server holds no such media" });

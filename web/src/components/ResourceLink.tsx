@@ -58,5 +58,11 @@ export function ResourceLink({ target, className }: { target: AuditTarget; class
           {target.id}
         </Link>
       );
+    case "/cluster":
+      return (
+        <Link to={route.to} className={linkClasses}>
+          {target.id}
+        </Link>
+      );
   }
 }

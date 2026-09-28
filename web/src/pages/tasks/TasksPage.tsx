@@ -22,6 +22,7 @@ const ACTION_FAMILIES = [
   { value: "appservice.", label: "Bridges" },
   { value: "federation.", label: "Federation" },
   { value: "migration.", label: "Migration" },
+  { value: "cluster.", label: "Cluster" },
 ];
 
 /**

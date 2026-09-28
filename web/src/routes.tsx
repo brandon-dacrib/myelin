@@ -14,6 +14,7 @@ import { validateMediaSearch } from "@/pages/media/media-search";
 import { validateReportsSearch } from "@/pages/reports/reports-search";
 import { validateTasksSearch } from "@/pages/tasks/tasks-search";
 import { validateStatisticsSearch } from "@/pages/statistics/statistics-search";
+import { validateClusterSearch } from "@/pages/cluster/cluster-search";
 
 // Route-level code splitting: each page (and its own dependency graph —
 // react-query hooks, mock-independent UI, etc.) lands in its own chunk,
@@ -96,6 +97,7 @@ const TaskDetailPage = lazyRouteComponent(
   () => import("@/pages/tasks/TaskDetailPage"),
   "TaskDetailPage",
 );
+const ClusterPage = lazyRouteComponent(() => import("@/pages/cluster/ClusterPage"), "ClusterPage");
 const StatisticsPage = lazyRouteComponent(
   () => import("@/pages/statistics/StatisticsPage"),
   "StatisticsPage",
@@ -317,7 +319,12 @@ const mediaRoute = createRoute({
   validateSearch: validateMediaSearch,
   component: MediaPage,
 });
-const clusterRoute = placeholderRoute("/cluster");
+const clusterRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/cluster",
+  validateSearch: validateClusterSearch,
+  component: ClusterPage,
+});
 const migrationRoute = placeholderRoute("/migration");
 const auditRoute = createRoute({
   getParentRoute: () => rootRoute,

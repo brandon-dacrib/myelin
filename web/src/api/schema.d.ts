@@ -466,7 +466,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Drain a replica */
+        /**
+         * Drain a replica
+         * @description Asks the replica to hand every shard it owns to the other replicas, and answers it as `draining`. The request is recorded in the shared database, so it reaches the replica whichever replica received it, and it outlives a restart. A task (`drain_task_id`, action `cluster.replicas.drain`, resource `{type: replica, id}`) follows the drain and succeeds once the replica owns no shards. Draining a replica that is already draining or drained changes nothing. 409 when no other replica is active to take the shards, which includes a server not running as a cluster.
+         */
         post: operations["cluster.replicas.drain"];
         delete?: never;
         options?: never;
@@ -483,7 +486,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Undrain a replica */
+        /**
+         * Undrain a replica
+         * @description Withdraws a drain request. The replica becomes active again and takes back its share of the shards, and the task following the drain, if it was still running, is cancelled. Undraining a replica that is not draining changes nothing.
+         */
         post: operations["cluster.replicas.undrain"];
         delete?: never;
         options?: never;
@@ -498,7 +504,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List shards */
+        /**
+         * List shards
+         * @description Every shard of the layout in layout order (rooms, users, federation, appservices, then the global shard), or only those of `kind`, with the owner as the answering replica knows it.
+         */
         get: operations["cluster.shards.list"];
         put?: never;
         post?: never;
@@ -2903,13 +2912,42 @@ export interface components {
             keys?: components["schemas"]["ServerSigningKey"][];
             server_name?: string;
         };
+        /** @description One replica of the cluster, as the replica answering the request sees it. A server not running as a cluster is a cluster of one (`role` is `single-node`). */
         Replica: {
-            epoch?: number;
-            id?: string;
-            role?: string;
-            shard_count?: number;
-            /** @enum {string} */
-            status?: "active" | "draining" | "drained" | "unreachable";
+            /**
+             * Format: date-time
+             * @description When an administrator asked it to drain; null unless it is draining or drained at an administrator's request. A drain request outlives a restart, so a drained replica comes back drained.
+             */
+            drain_requested_at?: string | null;
+            /** @description Who asked it to drain. */
+            drain_requested_by?: string | null;
+            /** @description The task following the drain (`GET /tasks/{id}`), which succeeds once the replica owns no shards. */
+            drain_task_id?: string | null;
+            /** @description The replica's generation, which changes each time it starts. */
+            epoch: number;
+            id: string;
+            /**
+             * Format: date-time
+             * @description Its last heartbeat; null for a single node, which has none.
+             */
+            last_heartbeat_at?: string | null;
+            /** @description `host:port` of its mesh listener; null for a single node. */
+            mesh_addr?: string | null;
+            /** @description `single-node` for the one replica of a server not running as a cluster, `replica` otherwise. */
+            role: string;
+            /** @description Shards this replica owns. */
+            shard_count: number;
+            /**
+             * @description `joining`: heartbeating, not yet taking shards. `active`: serving and owning shards. `draining`: an administrator asked it to hand its shards to the other replicas (or it is shutting down), and it still owns some. `drained`: asked to drain, and it owns none; it keeps serving requests, forwarding each to the shard's owner. A drained replica that is stopped stays listed, drained, until it is undrained, and comes back drained if it is started again. `unreachable`: its heartbeats stopped, and the others are taking its shards.
+             * @enum {string}
+             */
+            status: "joining" | "active" | "draining" | "drained" | "unreachable";
+            /** @description Whether this is the replica that answered the request. */
+            this_replica: boolean;
+            /** @description Its server version, as it reported it. */
+            version?: string | null;
+            /** @description Its topology zone, when configured. */
+            zone?: string | null;
         };
         ReplicaPage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["Replica"][];
@@ -3120,11 +3158,21 @@ export interface components {
             /** @description True while this server has no administrator and is offering to create one. False from the moment one exists, however it came to. */
             needs_setup: boolean;
         };
+        /** @description One unit of ownership. Rooms, users, federation destinations and appservices are each hashed onto a fixed number of shards, and every shard has at most one owning replica. */
         Shard: {
-            id?: string;
-            kind?: string;
-            owner?: string;
-            state?: string;
+            /** @description The fencing epoch, which increases every time the shard changes owner. */
+            epoch: number;
+            /** @description `kind/index`, for example `room/3`. */
+            id: string;
+            /** @enum {string} */
+            kind: "room" | "user" | "federation" | "appservice" | "global";
+            /** @description The owning replica; null while nobody owns it. */
+            owner: string | null;
+            /**
+             * @description `owned`; `released`, it had an owner and has none now (typically for a moment during a handoff); or `unassigned`, never owned.
+             * @enum {string}
+             */
+            state: "owned" | "released" | "unassigned";
         };
         ShardPage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["Shard"][];
@@ -4521,7 +4569,7 @@ export interface operations {
             401: components["responses"]["Unauthenticated"];
             403: components["responses"]["InsufficientScope"];
             404: components["responses"]["NotFound"];
-            409: components["responses"]["IdempotencyInFlight"];
+            409: components["responses"]["Conflict"];
             422: components["responses"]["IdempotencyMismatch"];
             429: components["responses"]["RateLimited"];
             500: components["responses"]["Internal"];
@@ -4569,7 +4617,8 @@ export interface operations {
                 cursor?: components["parameters"]["Cursor"];
                 /** @description Ask for the total count. Only honoured where a count is cheap; otherwise total is omitted. */
                 include_total?: components["parameters"]["IncludeTotal"];
-                kind?: string;
+                /** @description Only shards of this kind. */
+                kind?: "room" | "user" | "federation" | "appservice" | "global";
                 /** @description Page size. Values above the resource's max are clamped, not rejected. */
                 limit?: components["parameters"]["Limit"];
             };

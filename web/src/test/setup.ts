@@ -8,6 +8,7 @@ import { resetServerNotices } from "@/mocks/data/server-notices";
 import { resetMedia } from "@/mocks/data/media";
 import { resetReports } from "@/mocks/data/reports";
 import { resetTasks } from "@/mocks/data/tasks";
+import { resetCluster } from "@/mocks/data/cluster";
 
 /**
  * Give the API client an absolute base URL before anything imports it.
@@ -79,5 +80,7 @@ afterEach(() => {
   resetMedia();
   resetReports();
   resetTasks();
+  // And its cluster: a drain moves shards and puts a task on the Tasks page.
+  resetCluster();
 });
 afterAll(() => server.close());
