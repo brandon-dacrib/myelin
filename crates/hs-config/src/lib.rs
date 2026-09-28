@@ -39,6 +39,7 @@ pub mod listeners;
 pub mod media;
 pub mod ratelimit;
 pub mod reload;
+pub mod scanning;
 pub mod secret;
 pub mod server;
 pub mod size;

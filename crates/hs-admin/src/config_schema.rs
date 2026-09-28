@@ -309,6 +309,7 @@ mod tests {
             "/media/storage/access_key",
             "/telemetry/sentry/dsn",
             "/cluster/mesh/shared_secret",
+            "/media/scanning/http/auth_token",
         ] {
             assert!(
                 paths.is_secret(pointer),

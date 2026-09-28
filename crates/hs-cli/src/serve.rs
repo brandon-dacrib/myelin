@@ -123,19 +123,17 @@ pub enum ServeError {
 /// be the tail wagging the dog.
 #[derive(Clone, Default)]
 pub struct ServeOptions {
-    /// `--capabilities-config`: an optional YAML file overriding
-    /// `crate::versions::default_unstable_features`.
+    /// `--capabilities-config`: deprecated. An optional YAML file whose `unstable_features` win
+    /// over the configured `server.unstable_features` (see `crate::versions`).
     pub capabilities_config: Option<PathBuf>,
     /// `--routes-manifest`: an optional path to write the `routes.json` manifest to at startup.
     /// When `None`, the manifest is still computed (cheap: no I/O, no Kubernetes/network calls)
     /// but not written — use the `hs routes-manifest` subcommand to get it without booting a
     /// server at all.
     pub routes_manifest_path: Option<PathBuf>,
-    /// `--media-scanning-config`: an optional `media.scanning` YAML file
-    /// (`hs_media::scanning::ScanningConfig::from_yaml`'s shape — see `crate::media`'s module doc
-    /// for why this cannot live in `-c`/`--config`'s native config file yet). Omitted means no
-    /// content scanning is attached (`ScanningConfig::default()`'s `mode: off`, zero behavioral
-    /// change).
+    /// `--media-scanning-config`: deprecated. An optional standalone `media.scanning` YAML file
+    /// that replaces the configured `media.scanning` section wholesale (see `crate::media`'s
+    /// module doc). Omitted, scanning is whatever the configuration says -- off by default.
     pub media_scanning_config: Option<PathBuf>,
     /// The configuration source the admin API writes through
     /// (`crate::config_source::StoreConfigSource`). `None` leaves every `/config*` operation
@@ -1269,6 +1267,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
 
     let ready = Arc::new(AtomicBool::new(true));
     let unstable_features = Arc::new(versions::load_unstable_features(
+        &config.server.unstable_features,
         options.capabilities_config.as_deref(),
     )?);
 

@@ -1,5 +1,6 @@
 //! Server identity: the homeserver's name and its Ed25519 signing key.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use schemars::JsonSchema;
@@ -53,6 +54,13 @@ pub struct ServerConfig {
     /// endpoint. Corresponds to Synapse's `report_stats`.
     #[serde(default)]
     pub report_stats: bool,
+
+    /// Extra `unstable_features` flags advertised by `GET /_matrix/client/versions`, by MSC
+    /// identifier (`org.matrix.msc3202: true`). Merged over the server's built-in set, which is
+    /// empty: every flag gates a feature a client or bridge will then use, so advertise one only
+    /// for a feature this server serves. `false` suppresses a built-in flag.
+    #[serde(default)]
+    pub unstable_features: BTreeMap<String, bool>,
 }
 
 fn default_signing_key_path() -> PathBuf {
@@ -68,6 +76,7 @@ impl Default for ServerConfig {
             signing_key_path: default_signing_key_path(),
             admin_contact: None,
             report_stats: false,
+            unstable_features: BTreeMap::new(),
         }
     }
 }

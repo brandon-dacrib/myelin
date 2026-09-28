@@ -122,9 +122,9 @@ pub struct ServeArgs {
     #[arg(long = "translation-report-out")]
     pub translation_report_out: Option<PathBuf>,
 
-    /// An optional YAML file overriding the `unstable_features` advertised by
-    /// `GET /_matrix/client/versions` (see `crate::versions`'s module doc for the file shape and
-    /// why this cannot live in `-c`/`--config`'s native `hs-config` file).
+    /// Deprecated: set `server.unstable_features` in the admin interface's Configuration page
+    /// instead. A YAML file whose `unstable_features` win over the configured ones in
+    /// `GET /_matrix/client/versions` (see `crate::versions`'s module doc for the file shape).
     #[arg(long = "capabilities-config")]
     pub capabilities_config: Option<PathBuf>,
 
@@ -134,10 +134,10 @@ pub struct ServeArgs {
     #[arg(long = "routes-manifest")]
     pub routes_manifest: Option<PathBuf>,
 
-    /// An optional `media.scanning` YAML file (`hs_media::scanning::ScanningConfig::from_yaml`'s
-    /// shape, e.g. `deploy/media-scanning/media-scanning.yaml`) attaching content scanning to the
-    /// media repository. Omit for no scanning (`crate::media`'s module doc explains why this
-    /// cannot live in `-c`/`--config`'s native config file yet).
+    /// Deprecated: set `media.scanning` in the admin interface's Configuration page instead. A
+    /// standalone `media.scanning` YAML file (the shape of
+    /// `deploy/media-scanning/media-scanning.yaml`) that replaces the configured section
+    /// wholesale, with a warning at startup.
     #[arg(long = "media-scanning-config")]
     pub media_scanning_config: Option<PathBuf>,
 }

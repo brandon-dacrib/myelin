@@ -139,7 +139,7 @@ impl<B: hs_kv::KvBackend> ScanEngine<B> {
         metrics: Arc<ScanMetrics>,
         audit: Arc<dyn AuditSink>,
     ) -> Result<Self, crate::error::MediaError> {
-        let config = config.validated()?;
+        let config = crate::scanning::config::validated(config)?;
         let scanner = crate::scanning::providers::build(&config)?;
         let cache = VerdictCache::open(backend, &config.cache)?;
         Ok(Self {
