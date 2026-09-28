@@ -303,6 +303,34 @@ async fn lowering_the_send_limit_through_the_admin_api_limits_the_next_message_w
     assert_eq!(reload["reloaded_sections"], json!([]), "{reload}");
     assert_eq!(reload["requires_restart"], json!(["federation"]));
 
+    // The federation allowlist is hot although the rest of the section is not: applied now,
+    // with the timeout still waiting for a restart. The very next outbound request is refused
+    // before anything is resolved or sent.
+    let allow = ops
+        .expect(
+            Method::PATCH,
+            "/api/v1/config/federation",
+            Some(json!({"domain_allowlist": ["friend.example"]})),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        allow["applied"]["reloaded_sections"],
+        json!(["federation"]),
+        "{allow}"
+    );
+    assert_eq!(allow["applied"]["requires_restart"], json!(["federation"]));
+    hs.wait_for("the federation domain and IP-range lists are now in force");
+    let (status, body) = alice
+        .call(
+            Method::POST,
+            "/_matrix/client/v3/join/%21elsewhere%3Adenied.example?server_name=denied.example",
+            Some(json!({})),
+        )
+        .await;
+    assert!(!status.is_success(), "{status}: {body}");
+    hs.wait_for("not in the domain allowlist");
+
     // Switched off, the client sends again at once.
     let off = ops
         .expect(

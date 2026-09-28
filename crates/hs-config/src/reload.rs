@@ -14,6 +14,10 @@
 //!   The other buckets are not enforced anywhere yet, so a change to them has nothing to wait
 //!   for either.
 //! - `migration` — read when a migration from Synapse starts, never at startup.
+//! - `federation.domain_allowlist`, `federation.ip_range_blocklist` and
+//!   `federation.ip_range_allowlist` — the outbound client checks both lists on every request,
+//!   through shared handles the running server replaces. (Only with federation enabled: a server
+//!   that booted without it has no client to change.)
 //!
 //! # Restart required
 //!
@@ -33,8 +37,9 @@
 //! - `cluster` — shard counts and mesh identity are agreed with every other
 //!   replica; changing them locally without a coordinated rolling restart
 //!   would fragment ownership.
-//! - `federation`, `telemetry`, `appservices` — built into the federation client, the logging
-//!   layer and the appservice scheduler once, at startup.
+//! - The rest of `federation` (enabling it, timeouts, certificates), `telemetry`, and
+//!   `appservices` — built into the federation client, the logging layer and the appservice
+//!   scheduler once, at startup.
 
 use serde_json::Value;
 
@@ -42,7 +47,13 @@ use crate::Config;
 
 /// The settings a running server re-reads when they change, as JSON Pointers into the whole
 /// configuration. A pointer covers everything beneath it: `/rate_limits` is the whole section.
-pub const HOT_SETTINGS: &[&str] = &["/rate_limits", "/migration"];
+pub const HOT_SETTINGS: &[&str] = &[
+    "/rate_limits",
+    "/migration",
+    "/federation/domain_allowlist",
+    "/federation/ip_range_blocklist",
+    "/federation/ip_range_allowlist",
+];
 
 /// Top-level [`Config`] field names whose every setting is hot (see [`HOT_SETTINGS`]): a change
 /// anywhere in them takes effect without a restart. A section with only some hot settings is
@@ -211,6 +222,23 @@ mod tests {
             !old.federation.allow_public_rooms_over_federation;
         assert_eq!(sections_requiring_restart(&old, &new), vec!["federation"]);
         assert!(!is_reloadable("federation"));
+    }
+
+    #[test]
+    fn a_section_with_some_hot_settings_needs_a_restart_only_for_the_others() {
+        let old = Config::default();
+        let mut new = old.clone();
+        new.federation.domain_allowlist = Some(vec!["friend.example".to_owned()]);
+        new.federation.ip_range_blocklist = Vec::new();
+        assert!(sections_requiring_restart(&old, &new).is_empty());
+        assert_eq!(hot_sections_changed(&old, &new), vec!["federation"]);
+        assert!(is_hot_setting("/federation/domain_allowlist"));
+        assert!(!is_hot_setting("/federation/client_timeout"));
+
+        // And both at once: applied now, and still pending.
+        new.federation.client_timeout = crate::Duration::from_secs(45);
+        assert_eq!(sections_requiring_restart(&old, &new), vec!["federation"]);
+        assert_eq!(hot_sections_changed(&old, &new), vec!["federation"]);
     }
 
     #[test]

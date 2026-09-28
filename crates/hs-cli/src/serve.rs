@@ -1243,6 +1243,28 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             options.federation_scheme,
         )?;
         let mut mount = mount;
+        // Who this server may federate with: the client checks both lists on every request, so
+        // an operator's change is in force for the next one.
+        if let Some(live) = &options.live_config {
+            let client = mount.client.clone();
+            live.on_change("federation", move |config| {
+                let federation = &config.federation;
+                client
+                    .domain_policy()
+                    .set(federation.domain_allowlist.clone());
+                client.ip_policy().set_cidrs(
+                    &federation.ip_range_blocklist,
+                    &federation.ip_range_allowlist,
+                );
+                tracing::info!(
+                    domain_allowlist = ?federation.domain_allowlist,
+                    ip_range_blocklist = federation.ip_range_blocklist.len(),
+                    ip_range_allowlist = federation.ip_range_allowlist.len(),
+                    "the federation domain and IP-range lists are now in force"
+                );
+                Ok(())
+            });
+        }
         // Ephemeral data across servers (`crate::edus`): EDUs that arrive go to the session hub
         // and the device-list stream; this server's own users' typing, receipts and presence go
         // out through the sender; a key query or claim for a remote user asks their server.

@@ -45,17 +45,21 @@ pub struct FederationConfig {
 
     /// If set, federation traffic is restricted to exactly these server
     /// names. Corresponds to Synapse's `federation_domain_whitelist`.
+    /// Checked on every outbound request; a change applies to the running
+    /// server at once.
     #[serde(default)]
     pub domain_allowlist: Option<Vec<String>>,
 
     /// IP ranges (CIDR) federation requests must not be sent to.
     /// Corresponds to Synapse's `federation_ip_range_blacklist`.
+    /// A change applies to the running server at once.
     #[serde(default = "default_ip_range_blocklist")]
     pub ip_range_blocklist: Vec<String>,
 
     /// IP ranges exempted from `ip_range_blocklist` (for federating with a
     /// deliberately private deployment). Corresponds to Synapse's
-    /// `federation_ip_range_whitelist`.
+    /// `federation_ip_range_whitelist`. A change applies to the running
+    /// server at once.
     #[serde(default)]
     pub ip_range_allowlist: Vec<String>,
 

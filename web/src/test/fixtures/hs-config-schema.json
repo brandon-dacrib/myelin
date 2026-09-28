@@ -1266,7 +1266,7 @@
           "default": true
         },
         "domain_allowlist": {
-          "description": "If set, federation traffic is restricted to exactly these server\nnames. Corresponds to Synapse's `federation_domain_whitelist`.",
+          "description": "If set, federation traffic is restricted to exactly these server\nnames. Corresponds to Synapse's `federation_domain_whitelist`.\nChecked on every outbound request; a change applies to the running\nserver at once.",
           "type": [
             "array",
             "null"
@@ -1277,7 +1277,7 @@
           "default": null
         },
         "ip_range_blocklist": {
-          "description": "IP ranges (CIDR) federation requests must not be sent to.\nCorresponds to Synapse's `federation_ip_range_blacklist`.",
+          "description": "IP ranges (CIDR) federation requests must not be sent to.\nCorresponds to Synapse's `federation_ip_range_blacklist`.\nA change applies to the running server at once.",
           "type": "array",
           "items": {
             "type": "string"
@@ -1295,7 +1295,7 @@
           ]
         },
         "ip_range_allowlist": {
-          "description": "IP ranges exempted from `ip_range_blocklist` (for federating with a\ndeliberately private deployment). Corresponds to Synapse's\n`federation_ip_range_whitelist`.",
+          "description": "IP ranges exempted from `ip_range_blocklist` (for federating with a\ndeliberately private deployment). Corresponds to Synapse's\n`federation_ip_range_whitelist`. A change applies to the running\nserver at once.",
           "type": "array",
           "items": {
             "type": "string"

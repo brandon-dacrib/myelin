@@ -14,6 +14,9 @@
 //! - `rate_limits` — the room layer's [`hs_room::moderation::SendLimiter`] gets the new
 //!   server-wide `message` limit ([`message_limit`]).
 //! - `migration` — read when a migration starts; nothing to swap.
+//! - `federation` (its allow and block lists) — the outbound client's
+//!   [`hs_federation::client::DomainPolicy`] and [`hs_federation::client::IpPolicy`] are
+//!   replaced in place. Only when federation is enabled.
 //!
 //! Every section applied, failed or found unwired is logged, and counted in
 //! `hs_config_reloads_total{section,outcome}` (`applied`, `failed`, `unwired`).

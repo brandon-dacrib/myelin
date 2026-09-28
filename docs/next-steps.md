@@ -1164,10 +1164,11 @@ cannot do, in rough order of how often an operator will hit it:
   constraint spanning two only fails at save.
 - **Reload anything — started (decision 0015, branch `agent/config-reload`).** A change to
   `rate_limits` now takes effect on the running server the moment it is saved (the server-wide
-  send limit is enforced for the first time, and swapped live), and `config.update`,
-  `config.reload` and `config.validate` say which sections were applied and which wait for a
-  restart (`hs_config::reload::HOT_SETTINGS`, `hs_cli::live_config`). Left: the federation
-  allow/deny lists and the log level (the next two to wire); the rest of `rate_limits`
+  send limit is enforced for the first time, and swapped live), and so does a change to the
+  federation domain allowlist and IP-range lists; `config.update`, `config.reload` and
+  `config.validate` say which sections were applied and which wait for a restart
+  (`hs_config::reload::HOT_SETTINGS`, `hs_cli::live_config`). Left: the log level (next to
+  wire); the rest of `rate_limits`
   (`login`, `registration`, `joins_*`, `federation`, ... are accepted but enforced nowhere);
   `appservices` tuning; and other replicas of a cluster, which take a change on only at their
   own next write or `config.reload`.

@@ -26,10 +26,27 @@ pub const DEFAULT_PER_DESTINATION_CONCURRENCY: usize = 1;
 /// Parsed CIDR allow/deny policy for outbound connection targets, built once from
 /// `hs-config::FederationConfig`'s string lists (this crate does not depend on `hs-config`'s
 /// struct directly, to keep this module testable without it — see [`IpPolicy::from_cidrs`]).
+///
+/// A shared handle: clones see the same lists, and [`IpPolicy::set_cidrs`] replaces them for
+/// every one of them, so a running server takes an operator's change on the next request.
 #[derive(Debug, Clone, Default)]
 pub struct IpPolicy {
+    lists: Arc<std::sync::RwLock<IpLists>>,
+}
+
+#[derive(Debug, Default)]
+struct IpLists {
     blocklist: Vec<IpNet>,
     allowlist: Vec<IpNet>,
+}
+
+impl IpLists {
+    fn parse(blocklist: &[String], allowlist: &[String]) -> Self {
+        Self {
+            blocklist: blocklist.iter().filter_map(|s| s.parse().ok()).collect(),
+            allowlist: allowlist.iter().filter_map(|s| s.parse().ok()).collect(),
+        }
+    }
 }
 
 impl IpPolicy {
@@ -40,9 +57,18 @@ impl IpPolicy {
     #[must_use]
     pub fn from_cidrs(blocklist: &[String], allowlist: &[String]) -> Self {
         Self {
-            blocklist: blocklist.iter().filter_map(|s| s.parse().ok()).collect(),
-            allowlist: allowlist.iter().filter_map(|s| s.parse().ok()).collect(),
+            lists: Arc::new(std::sync::RwLock::new(IpLists::parse(blocklist, allowlist))),
         }
+    }
+
+    /// Replaces both lists, for this handle and every clone of it, parsed as
+    /// [`IpPolicy::from_cidrs`] parses them.
+    pub fn set_cidrs(&self, blocklist: &[String], allowlist: &[String]) {
+        *self
+            .lists
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            IpLists::parse(blocklist, allowlist);
     }
 
     /// Whether `addr` is allowed to be connected to: not in `blocklist`, or in `allowlist` (an
@@ -51,31 +77,53 @@ impl IpPolicy {
     /// deployment).
     #[must_use]
     pub fn allows(&self, addr: IpAddr) -> bool {
-        let blocked = self.blocklist.iter().any(|net| net.contains(&addr));
+        let lists = self
+            .lists
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let blocked = lists.blocklist.iter().any(|net| net.contains(&addr));
         if !blocked {
             return true;
         }
-        self.allowlist.iter().any(|net| net.contains(&addr))
+        lists.allowlist.iter().any(|net| net.contains(&addr))
     }
 }
 
 /// The domain allow/deny check (`FederationConfig::domain_allowlist`), applied against the
 /// *original* server name we were asked to federate with (threat model 2.6: delegation must not
 /// bypass this).
+///
+/// A shared handle, like [`IpPolicy`]: [`DomainPolicy::set`] replaces the list for every clone.
 #[derive(Debug, Clone, Default)]
 pub struct DomainPolicy {
-    allowlist: Option<Vec<String>>,
+    allowlist: Arc<std::sync::RwLock<Option<Vec<String>>>>,
 }
 
 impl DomainPolicy {
+    /// A policy allowing exactly `allowlist`, or every server when `None`.
     #[must_use]
     pub fn new(allowlist: Option<Vec<String>>) -> Self {
-        Self { allowlist }
+        Self {
+            allowlist: Arc::new(std::sync::RwLock::new(allowlist)),
+        }
     }
 
+    /// Replaces the allowlist, for this handle and every clone of it.
+    pub fn set(&self, allowlist: Option<Vec<String>>) {
+        *self
+            .allowlist
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = allowlist;
+    }
+
+    /// Whether this server may federate with `server_name`.
     #[must_use]
     pub fn allows(&self, server_name: &str) -> bool {
-        match &self.allowlist {
+        match &*self
+            .allowlist
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
             None => true,
             Some(list) => list.iter().any(|s| s == server_name),
         }
@@ -252,6 +300,20 @@ pub struct FederationClient {
 }
 
 impl FederationClient {
+    /// The domain allowlist this client checks every destination against, as a shared handle:
+    /// [`DomainPolicy::set`] on it changes what the next request is allowed to reach.
+    #[must_use]
+    pub fn domain_policy(&self) -> &DomainPolicy {
+        &self.config.domain_policy
+    }
+
+    /// The IP-range policy this client checks every resolved address against, as a shared
+    /// handle: [`IpPolicy::set_cidrs`] on it changes what the next request may connect to.
+    #[must_use]
+    pub fn ip_policy(&self) -> &IpPolicy {
+        &self.config.ip_policy
+    }
+
     #[must_use]
     pub fn new(
         own_server_name: impl Into<String>,
@@ -1137,6 +1199,26 @@ mod tests {
         let p = DomainPolicy::new(Some(vec!["a.example.org".to_string()]));
         assert!(p.allows("a.example.org"));
         assert!(!p.allows("b.example.org"));
+    }
+
+    #[test]
+    fn a_policy_replaced_through_one_handle_is_replaced_for_every_clone() {
+        let domains = DomainPolicy::new(Some(vec!["a.example.org".to_string()]));
+        let in_client = domains.clone();
+        domains.set(Some(vec!["b.example.org".to_string()]));
+        assert!(!in_client.allows("a.example.org"));
+        assert!(in_client.allows("b.example.org"));
+        domains.set(None);
+        assert!(in_client.allows("anything.example.org"));
+
+        let ips = IpPolicy::from_cidrs(&["10.0.0.0/8".to_string()], &[]);
+        let in_client = ips.clone();
+        let private: IpAddr = "10.1.2.3".parse().unwrap();
+        assert!(!in_client.allows(private));
+        ips.set_cidrs(&["10.0.0.0/8".to_string()], &["10.1.0.0/16".to_string()]);
+        assert!(in_client.allows(private));
+        ips.set_cidrs(&[], &[]);
+        assert!(in_client.allows(private));
     }
 
     /// A peer with the two media paths: the federation one answers only a signed request, the

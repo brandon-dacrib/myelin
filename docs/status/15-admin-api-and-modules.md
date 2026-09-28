@@ -69,14 +69,21 @@ offering operations); before that 2026-09-26 (three public recovery operations);
 >   bucket, clamped to the new burst. Refusals are counted in
 >   `hs_room_server_rate_limited_writes_total`. Complement's and `hs-loadgen`'s configurations
 >   switch it off, as Synapse's Complement image does.
+> - **Federation lists**: `federation.domain_allowlist`, `ip_range_blocklist` and
+>   `ip_range_allowlist` are hot (`hs_federation::client::{DomainPolicy, IpPolicy}` are now shared
+>   handles with `set` / `set_cidrs`, reached through `FederationClient::{domain_policy,
+>   ip_policy}`); the rest of `federation` still needs a restart, and a save touching both kinds
+>   reports the section in both `reloaded_sections` and `requires_restart`.
 > - **Answers**: `ConfigSection.applied` (a `ConfigReloadReport`) on `config.update`'s answer;
 >   `config.reload` reports what `LiveConfig` applied rather than nothing.
 > - **Verified on the real binary**: `crates/hs-cli/tests/config_reload.rs` boots `hs serve`,
 >   sends three messages, lowers `rate_limits.message` with `PATCH /api/v1/config/rate_limits`
 >   (answer: `applied.reloaded_sections == ["rate_limits"]`), and the next-but-one message is
 >   `429 M_LIMIT_EXCEEDED`; a `federation` change answers `requires_restart: ["federation"]`
->   (update, validate and reload alike); switching the limit off lets the client send at once;
->   the log line and both counters are checked.
+>   (update, validate and reload alike); a `domain_allowlist` save is applied at once (and the
+>   timeout still pending), and the next remote join is refused "not in the domain allowlist";
+>   switching the limit off lets the client send at once; the log lines and both counters are
+>   checked.
 >
 > **2026-09-28, Users: moderation and activity, 14 operations** (branch
 > `agent/user-moderation`). `tools/admin_api_coverage.py` now counts **154 of 158** with
