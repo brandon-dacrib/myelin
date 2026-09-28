@@ -80,7 +80,12 @@ impl<B: KvBackend + 'static> FederationRemoteJoin<B> {
                 Ok(outcome) => return Ok(outcome),
                 Err(error) => {
                     tracing::warn!(destination, what, %error, "a server could not complete the handshake");
-                    let mapped = map_outbound_error(&error);
+                    let mapped = match map_outbound_error(&error) {
+                        RoomError::RemoteJoinFailed(detail) => {
+                            RoomError::RemoteJoinFailed(format!("{what}: {detail}"))
+                        }
+                        other => other,
+                    };
                     if matches!(mapped, RoomError::Forbidden(_)) {
                         return Err(mapped);
                     }
@@ -89,7 +94,9 @@ impl<B: KvBackend + 'static> FederationRemoteJoin<B> {
             }
         }
         Err(last_error.unwrap_or_else(|| {
-            RoomError::RemoteJoinFailed("no server to ask: the only candidate was this one".into())
+            RoomError::RemoteJoinFailed(format!(
+                "{what}: no server to ask, the only candidate was this one"
+            ))
         }))
     }
 }
@@ -104,7 +111,7 @@ fn map_outbound_error(error: &OutboundJoinError) -> RoomError {
         } => RoomError::Forbidden(
             body.get("error")
                 .and_then(Value::as_str)
-                .unwrap_or("the room refused the join")
+                .unwrap_or("the other server refused the request")
                 .to_owned(),
         ),
         OutboundJoinError::Rejected { status: 404, .. } => {
@@ -178,7 +185,12 @@ impl<B: KvBackend + 'static> hs_room::remote_join::RemoteJoin for FederationRemo
                 }
                 Err(error) => {
                     tracing::warn!(%room_id, %user_id, destination, %error, "a server could not sponsor the join");
-                    let mapped = map_outbound_error(&error);
+                    let mapped = match map_outbound_error(&error) {
+                        RoomError::RemoteJoinFailed(detail) => {
+                            RoomError::RemoteJoinFailed(format!("join: {detail}"))
+                        }
+                        other => other,
+                    };
                     // The room itself saying no is the answer, whoever relays it; keep trying
                     // other servers only for failures that are about the server, not the room.
                     if matches!(mapped, RoomError::Forbidden(_)) {
@@ -189,7 +201,9 @@ impl<B: KvBackend + 'static> hs_room::remote_join::RemoteJoin for FederationRemo
             }
         }
         Err(last_error.unwrap_or_else(|| {
-            RoomError::RemoteJoinFailed("no server to ask: the only candidate was this one".into())
+            RoomError::RemoteJoinFailed(
+                "join: no server to ask, the only candidate was this one".into(),
+            )
         }))
     }
 
@@ -285,7 +299,9 @@ impl<B: KvBackend + 'static> hs_room::remote_join::RemoteJoin for FederationRemo
             tracing::warn!(event_id = %event.event_id(), destination, %error, "the invitee's server did not take the invite");
             match map_outbound_error(&error) {
                 // The invitee's server not knowing the room is the normal case, not a refusal.
-                RoomError::RoomNotFound(_) => RoomError::RemoteJoinFailed(error.to_string()),
+                RoomError::RoomNotFound(_) | RoomError::RemoteJoinFailed(_) => {
+                    RoomError::RemoteJoinFailed(format!("invite: {error}"))
+                }
                 other => other,
             }
         })

@@ -99,6 +99,22 @@ pub async fn verify_pdu(
     room_version: &RoomVersionId,
     key_cache: &DynRemoteKeyCache,
 ) -> Result<Event, PduError> {
+    verify_pdu_to_authorise(raw, room_version, key_cache, None).await
+}
+
+/// [`verify_pdu`], for a restricted join this server is being asked to authorise (`send_join`
+/// naming one of `own_server_name`'s users in `join_authorised_via_users_server`): the
+/// authoriser's signature is the one this server is about to add, so it is not required yet.
+/// Every other check is the same.
+///
+/// # Errors
+/// As [`verify_pdu`].
+pub async fn verify_pdu_to_authorise(
+    raw: &Value,
+    room_version: &RoomVersionId,
+    key_cache: &DynRemoteKeyCache,
+    own_server_name: Option<&str>,
+) -> Result<Event, PduError> {
     let event = Event::parse(raw, room_version.clone())
         .map_err(|e| reject(format!("malformed event: {e}")))?;
 
@@ -123,7 +139,44 @@ pub async fn verify_pdu(
     // one.
     let sender_server = event.header().sender.server_name().as_str().to_owned();
     verify_server_signature(&event, &sender_server, key_cache).await?;
+    if let Some(authoriser) = join_authoriser_server(&event)
+        && authoriser != sender_server
+        && Some(authoriser.as_str()) != own_server_name
+    {
+        verify_server_signature(&event, &authoriser, key_cache).await?;
+    }
     Ok(event)
+}
+
+/// The server of the user a restricted join names as its authoriser
+/// (`content.join_authorised_via_users_server`), in a room version that checks it (8 and up):
+/// the spec's "Validating hashes and signatures on received events" requires that server's
+/// signature on the join as well as the sender's. `None` for any other event, and for a value
+/// that is not a user ID (event authorization rejects that).
+#[must_use]
+pub fn join_authoriser_server(event: &Event) -> Option<String> {
+    let rules = hs_model::room_version::rules_for(&event.header().room_version)?;
+    if !rules.check_join_authorised_via_users_server || event.header().event_type != "m.room.member"
+    {
+        return None;
+    }
+    let content = event
+        .json()
+        .get("content")
+        .and_then(CanonicalJsonValue::as_object)?;
+    if content
+        .get("membership")
+        .and_then(CanonicalJsonValue::as_str)
+        != Some("join")
+    {
+        return None;
+    }
+    let via = content
+        .get("join_authorised_via_users_server")
+        .and_then(CanonicalJsonValue::as_str)?;
+    ruma::UserId::parse(via)
+        .ok()
+        .map(|user| user.server_name().to_string())
 }
 
 /// Checks that `event` carries a valid signature from `server` over its redacted form -- the

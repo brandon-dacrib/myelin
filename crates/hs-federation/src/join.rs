@@ -46,12 +46,13 @@ use std::collections::HashMap;
 
 use hs_model::canonical::{CanonicalJsonObject, CanonicalJsonValue, to_canonical_object};
 use hs_model::room_version::EventsReferenceFormat;
+use hs_model::signing::SigningKeyPair;
 use hs_state::auth::{self, IncomingEvent};
 use hs_state::state_fetch::{StateEntry, StateFetch};
 use ruma::{OwnedUserId, RoomId, RoomVersionId, UserId};
 use serde_json::Value;
 
-use crate::inbound::{RoomWriteSink, WriteOutcome, event_json, verify_pdu};
+use crate::inbound::{RoomWriteSink, WriteOutcome, event_json, verify_pdu_to_authorise};
 use crate::keys::DynRemoteKeyCache;
 use crate::room_source::{RoomDataSource, RoomSourceError};
 use crate::sender::OutboundPduSink;
@@ -72,6 +73,10 @@ pub enum JoinError {
         origin: String,
     },
     NotAuthorized(String),
+    /// A restricted join this server cannot vouch for: it is in none of the rooms the join
+    /// rules allow, or none of its users there may invite. The spec's
+    /// `400 M_UNABLE_TO_AUTHORISE_JOIN`, which tells the joining server to ask another resident.
+    UnableToAuthorise(String),
     Store(String),
 }
 
@@ -94,7 +99,8 @@ impl std::fmt::Display for JoinError {
                 f,
                 "event sender's server ({sender_server}) does not match the requesting server ({origin})"
             ),
-            Self::NotAuthorized(e) => write!(f, "join not authorized: {e}"),
+            Self::NotAuthorized(e) => write!(f, "not authorized: {e}"),
+            Self::UnableToAuthorise(e) => write!(f, "cannot authorise the join: {e}"),
             Self::Store(e) => write!(f, "{e}"),
         }
     }
@@ -203,6 +209,131 @@ fn encode_ref(event_id: &str, format: EventsReferenceFormat) -> Result<Value, Jo
     }
 }
 
+/// Authorizes a membership event `user` would send about themself with `content`, against
+/// `flat` (current state), the way [`auth::check_event_auth`] would authorize the real one.
+fn authorize_template(
+    rules: &hs_model::room_version::RoomVersionRules,
+    flat: &FlatState,
+    user: &UserId,
+    room_id: &RoomId,
+    content: &Value,
+    prev_event_count: usize,
+) -> Result<(), JoinError> {
+    let content = to_canonical_object(content, rules.strict_canonical_json)
+        .map_err(|e| JoinError::MalformedEvent(e.to_string()))?;
+    let incoming = IncomingEvent {
+        event_type: "m.room.member",
+        sender: user,
+        room_id: Some(room_id),
+        state_key: Some(user.as_str()),
+        content: &content,
+        prev_event_count,
+        only_prev_event_is_room_create: false,
+        event_id: None,
+        redacts: None,
+    };
+    auth::check_event_auth(rules, &incoming, flat)
+        .map_err(|e| JoinError::NotAuthorized(e.to_string()))
+}
+
+/// The rooms a restricted room's join rules allow joining from (`allow` entries of type
+/// `m.room_membership`), if the room's current join rule is `restricted` (room version 8 and
+/// up) or `knock_restricted` (10 and up). `None` for any other join rule.
+fn restricted_allow_list(
+    rules: &hs_model::room_version::RoomVersionRules,
+    flat: &FlatState,
+) -> Option<Vec<String>> {
+    let entry = flat.get("m.room.join_rules", "")?;
+    let rule = entry
+        .content
+        .get("join_rule")
+        .and_then(CanonicalJsonValue::as_str);
+    let restricted = (rules.restricted_join_rule && rule == Some("restricted"))
+        || (rules.knock_restricted_join_rule && rule == Some("knock_restricted"));
+    if !restricted {
+        return None;
+    }
+    let allowed = entry
+        .content
+        .get("allow")
+        .and_then(|allow| match allow {
+            CanonicalJsonValue::Array(entries) => Some(entries),
+            _ => None,
+        })
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(CanonicalJsonValue::as_object)
+                .filter(|entry| {
+                    entry.get("type").and_then(CanonicalJsonValue::as_str)
+                        == Some("m.room_membership")
+                })
+                .filter_map(|entry| entry.get("room_id").and_then(CanonicalJsonValue::as_str))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(allowed)
+}
+
+/// Whether `user` is joined to one of `allowed`, as far as this server can tell: only the rooms
+/// it has a joined member in count, since those are the only ones whose membership it knows.
+///
+/// # Errors
+/// [`JoinError::UnableToAuthorise`] if this server is in none of `allowed` (another resident
+/// may be), [`JoinError::NotAuthorized`] if it is in some and `user` is joined to none of them.
+async fn check_allow_list(
+    rooms: &dyn RoomDataSource,
+    own_server_name: &str,
+    allowed: &[String],
+    user: &UserId,
+) -> Result<(), JoinError> {
+    let mut resident_in_any = false;
+    for room in allowed {
+        if !rooms
+            .member_servers(room)
+            .await
+            .iter()
+            .any(|server| server == own_server_name)
+        {
+            continue;
+        }
+        resident_in_any = true;
+        if rooms.membership_of(room, user.as_str()).await.as_deref() == Some("join") {
+            return Ok(());
+        }
+    }
+    if resident_in_any {
+        Err(JoinError::NotAuthorized(format!(
+            "{user} is not joined to any room the join rules allow"
+        )))
+    } else {
+        Err(JoinError::UnableToAuthorise(
+            "this server is in none of the rooms the join rules allow".to_owned(),
+        ))
+    }
+}
+
+/// This server's users joined to the room, in a stable order: the candidates to authorise a
+/// restricted join.
+fn local_members(flat: &FlatState, own_server_name: &str) -> Vec<OwnedUserId> {
+    let mut members: Vec<OwnedUserId> = flat
+        .by_key
+        .iter()
+        .filter(|((event_type, _), (_, content, _))| {
+            event_type == "m.room.member"
+                && content
+                    .get("membership")
+                    .and_then(CanonicalJsonValue::as_str)
+                    == Some("join")
+        })
+        .filter_map(|((_, state_key), _)| UserId::parse(state_key.as_str()).ok())
+        .filter(|user| user.server_name().as_str() == own_server_name)
+        .collect();
+    members.sort();
+    members
+}
+
 /// An unsigned join template, as `make_join` returns it.
 #[derive(Debug, Clone)]
 pub struct JoinTemplate {
@@ -224,6 +355,13 @@ fn now_ms() -> i64 {
 /// current state. `supported_versions` is the requester's `?ver=` list (empty means "no
 /// preference stated", which every version satisfies, matching the spec's default).
 ///
+/// A join to a **restricted** room (`restricted`, room version 8+; `knock_restricted`, 10+) by
+/// a user who is neither invited nor joined is authorised here when this server can vouch for
+/// it: the user is joined to one of the rooms the join rules allow (as this server sees it), and
+/// one of this server's users in the room may invite. The template then names that user in
+/// `join_authorised_via_users_server`, and [`send_join`] co-signs the join. A server in none of
+/// the allowed rooms answers [`JoinError::UnableToAuthorise`] so the joiner asks another.
+///
 /// # Errors
 /// See [`JoinError`].
 pub async fn make_join(
@@ -231,8 +369,17 @@ pub async fn make_join(
     room_id: &str,
     user_id: &str,
     supported_versions: &[String],
+    own_server_name: &str,
 ) -> Result<JoinTemplate, JoinError> {
-    make_membership(rooms, room_id, user_id, supported_versions, Handshake::Join).await
+    make_membership(
+        rooms,
+        room_id,
+        user_id,
+        supported_versions,
+        Handshake::Join,
+        own_server_name,
+    )
+    .await
 }
 
 /// [`make_join`] for any [`Handshake`]: an unsigned `m.room.member` template with `handshake`'s
@@ -248,6 +395,7 @@ pub async fn make_membership(
     user_id: &str,
     supported_versions: &[String],
     handshake: Handshake,
+    own_server_name: &str,
 ) -> Result<JoinTemplate, JoinError> {
     let Some(room_version_str) = rooms.room_version(room_id).await else {
         return Err(JoinError::RoomNotFound);
@@ -289,7 +437,56 @@ pub async fn make_membership(
     let state = rooms.state_for_join(room_id).await.map_err(source_err)?;
     let flat = FlatState::build(&state.state);
 
-    let content = serde_json::json!({ "membership": handshake.membership() });
+    let mut content = serde_json::json!({ "membership": handshake.membership() });
+    // A best-effort early check: authorizing the template we are about to hand out against
+    // *current* state, so a request that is hopeless (banned user, invite-only room with no
+    // invite) gets a clear rejection now rather than a template the eventual `send_join` will
+    // reject anyway. This is not a substitute for `send_join`'s own check -- state can move
+    // between the two calls -- it is a courtesy.
+    let authorized = authorize_template(
+        &rules,
+        &flat,
+        &user,
+        &parsed_room_id,
+        &content,
+        extremities.len(),
+    );
+    if let Err(refusal) = authorized {
+        // A restricted room the user may join without an invite, if a member of one of the
+        // rooms its join rules allow: this server vouches for that by naming one of its own
+        // users who may invite (`join_authorised_via_users_server`), and co-signs the join at
+        // `send_join`. Whether the user is in an allowed room is this server's view of it.
+        let allowed = match handshake {
+            Handshake::Join => restricted_allow_list(&rules, &flat),
+            Handshake::Leave | Handshake::Knock => None,
+        };
+        let Some(allowed) = allowed else {
+            return Err(refusal);
+        };
+        check_allow_list(rooms, own_server_name, &allowed, &user).await?;
+        let authoriser = local_members(&flat, own_server_name)
+            .into_iter()
+            .find(|candidate| {
+                let mut with = content.clone();
+                with["join_authorised_via_users_server"] = Value::String(candidate.to_string());
+                authorize_template(
+                    &rules,
+                    &flat,
+                    &user,
+                    &parsed_room_id,
+                    &with,
+                    extremities.len(),
+                )
+                .is_ok()
+            })
+            .ok_or_else(|| {
+                JoinError::UnableToAuthorise(
+                    "no user of this server in the room may invite".to_owned(),
+                )
+            })?;
+        content["join_authorised_via_users_server"] = Value::String(authoriser.to_string());
+    }
+
     let content_canonical = to_canonical_object(&content, rules.strict_canonical_json)
         .map_err(|e| JoinError::MalformedEvent(e.to_string()))?;
     let incoming = IncomingEvent {
@@ -311,14 +508,6 @@ pub async fn make_membership(
             auth_events.push(encode_ref(id, rules.events_reference_format)?);
         }
     }
-
-    // A best-effort early check: authorizing the template we are about to hand out against
-    // *current* state, so a request that is hopeless (banned user, invite-only room with no
-    // invite) gets a clear rejection now rather than a template the eventual `send_join` will
-    // reject anyway. This is not a substitute for `send_join`'s own check -- state can move
-    // between the two calls -- it is a courtesy.
-    auth::check_event_auth(&rules, &incoming, &flat)
-        .map_err(|e| JoinError::NotAuthorized(e.to_string()))?;
 
     let event = serde_json::json!({
         "type": "m.room.member",
@@ -375,6 +564,7 @@ pub async fn send_join(
     origin: &str,
     own_server_name: &str,
     forward: Option<&dyn OutboundPduSink>,
+    authorise_with: Option<&SigningKeyPair>,
 ) -> Result<SendJoinResult, JoinError> {
     send_membership(
         rooms,
@@ -387,6 +577,7 @@ pub async fn send_join(
         own_server_name,
         forward,
         Handshake::Join,
+        authorise_with,
     )
     .await
 }
@@ -396,6 +587,13 @@ pub async fn send_join(
 /// other servers exactly as a join is. The result carries the room's state for every handshake;
 /// `send_leave` answers with none of it and `send_knock` with its stripped form
 /// (`crate::stripped`), which is the transport's business.
+///
+/// A restricted join naming one of this server's users in `join_authorised_via_users_server`
+/// (the template [`make_join`] handed out, or one the joining server made up) is checked the way
+/// `make_join` checks it -- the user is joined to a room the join rules allow, as this server
+/// sees it -- and co-signed with `authorise_with`, this server's event-signing key; the
+/// co-signed event is what is stored, forwarded and answered with. Without a key such a join
+/// needs this server's signature already, which it will not have.
 ///
 /// # Errors
 /// See [`JoinError`].
@@ -411,6 +609,7 @@ pub async fn send_membership(
     own_server_name: &str,
     forward: Option<&dyn OutboundPduSink>,
     handshake: Handshake,
+    authorise_with: Option<&SigningKeyPair>,
 ) -> Result<SendJoinResult, JoinError> {
     let Some(room_version_str) = rooms.room_version(room_id).await else {
         return Err(JoinError::RoomNotFound);
@@ -420,7 +619,8 @@ pub async fn send_membership(
     let rules = hs_model::room_version::rules_for(&room_version)
         .ok_or_else(|| JoinError::UnsupportedRoomVersion(room_version_str.clone()))?;
 
-    let event = verify_pdu(signed_event, &room_version, key_cache)
+    let authorising = authorise_with.map(|_| own_server_name);
+    let mut event = verify_pdu_to_authorise(signed_event, &room_version, key_cache, authorising)
         .await
         .map_err(|e| JoinError::MalformedEvent(e.to_string()))?;
 
@@ -458,7 +658,7 @@ pub async fn send_membership(
     if event_room_id != Some(room_id) {
         return Err(JoinError::RoomIdMismatch);
     }
-    let sender_server = event.header().sender.server_name().as_str();
+    let sender_server = event.header().sender.server_name().as_str().to_owned();
     if sender_server != origin {
         return Err(JoinError::SenderServerMismatch {
             sender_server: sender_server.to_owned(),
@@ -489,6 +689,39 @@ pub async fn send_membership(
     };
     auth::check_event_auth(&rules, &incoming, &flat)
         .map_err(|e| JoinError::NotAuthorized(e.to_string()))?;
+
+    let authoriser = crate::inbound::join_authoriser_server(&event);
+    if let (Some(key), Some(authoriser)) = (authorise_with, authoriser.as_deref())
+        && handshake == Handshake::Join
+        && authoriser == own_server_name
+        && authoriser != sender_server
+    {
+        // The auth check above has established that the named user is joined and may invite;
+        // what it cannot know is whether the joiner may join through the allow list, which is
+        // this server's to vouch for. An invited (or already joined) user needs no vouching.
+        let sender: &UserId = event.header().sender.as_ref();
+        let current = flat
+            .get("m.room.member", sender.as_str())
+            .and_then(|entry| {
+                entry
+                    .content
+                    .get("membership")
+                    .and_then(CanonicalJsonValue::as_str)
+            })
+            .map(str::to_owned);
+        if !matches!(current.as_deref(), Some("join" | "invite"))
+            && let Some(allowed) = restricted_allow_list(&rules, &flat)
+        {
+            check_allow_list(rooms, own_server_name, &allowed, sender).await?;
+        }
+        let own = ruma::ServerName::parse(own_server_name)
+            .map_err(|e| JoinError::Store(format!("this server's name: {e}")))?;
+        let cosigned = crate::invite::cosign(&event, &own, key)
+            .map_err(|e| JoinError::Store(e.to_string()))?;
+        event = hs_model::Event::parse(&cosigned, room_version.clone())
+            .map_err(|e| JoinError::Store(format!("the co-signed join does not parse: {e}")))?;
+        tracing::info!(room_id, event_id, "authorised a restricted join");
+    }
 
     let value = event_json(&event);
     let outcome = sink
@@ -707,6 +940,7 @@ mod tests {
             "joiner.example.org",
             "resident.example.org",
             Some(&forward),
+            None,
         )
         .await
         .unwrap();
@@ -751,6 +985,7 @@ mod tests {
             "joiner.example.org",
             "resident.example.org",
             Some(&forward),
+            None,
         )
         .await
         .unwrap();
@@ -778,6 +1013,7 @@ mod tests {
             "@bob:joiner.example.org",
             &[],
             Handshake::Leave,
+            "resident.example.org",
         )
         .await
         .unwrap();
@@ -792,6 +1028,7 @@ mod tests {
             "@stranger:joiner.example.org",
             &[],
             Handshake::Leave,
+            "resident.example.org",
         )
         .await
         .unwrap_err();
@@ -807,6 +1044,7 @@ mod tests {
             "@bob:joiner.example.org",
             &["11".to_owned()],
             Handshake::Knock,
+            "resident.example.org",
         )
         .await
         .unwrap();
@@ -819,6 +1057,7 @@ mod tests {
             "@bob:joiner.example.org",
             &["11".to_owned()],
             Handshake::Knock,
+            "resident.example.org",
         )
         .await
         .unwrap_err();
@@ -871,6 +1110,7 @@ mod tests {
             "resident.example.org",
             Some(&forward),
             Handshake::Knock,
+            None,
         )
         .await
         .unwrap();
@@ -903,6 +1143,7 @@ mod tests {
             "resident.example.org",
             None,
             Handshake::Knock,
+            None,
         )
         .await
         .unwrap_err();
@@ -946,6 +1187,7 @@ mod tests {
             "resident.example.org",
             None,
             Handshake::Leave,
+            None,
         )
         .await
         .unwrap();
@@ -955,9 +1197,15 @@ mod tests {
     #[tokio::test]
     async fn make_join_builds_a_real_template_against_current_state() {
         let (rooms, room_id, room_version) = room_with_creator();
-        let template = make_join(&rooms, &room_id, "@bob:remote.example.org", &[])
-            .await
-            .unwrap();
+        let template = make_join(
+            &rooms,
+            &room_id,
+            "@bob:remote.example.org",
+            &[],
+            "resident.example.org",
+        )
+        .await
+        .unwrap();
         assert_eq!(template.room_version, room_version);
         assert_eq!(template.event["type"], "m.room.member");
         assert_eq!(template.event["state_key"], "@bob:remote.example.org");
@@ -981,6 +1229,7 @@ mod tests {
             &room_id,
             "@bob:remote.example.org",
             &["9".to_owned()],
+            "resident.example.org",
         )
         .await
         .unwrap_err();
@@ -990,10 +1239,116 @@ mod tests {
     #[tokio::test]
     async fn make_join_unknown_room_is_room_not_found() {
         let rooms = InMemoryRoomSource::new();
-        let err = make_join(&rooms, "!nope:x", "@bob:remote.example.org", &[])
-            .await
-            .unwrap_err();
+        let err = make_join(
+            &rooms,
+            "!nope:x",
+            "@bob:remote.example.org",
+            &[],
+            "resident.example.org",
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, JoinError::RoomNotFound));
+    }
+
+    /// A restricted room joinable from `!lobby:resident.example.org`, and the lobby: held here
+    /// (this server has a member in it) when `lobby_held`, with bob joined to it when
+    /// `bob_in_lobby`.
+    fn restricted_fixture(lobby_held: bool, bob_in_lobby: bool) -> (InMemoryRoomSource, String) {
+        let lobby_id = "!lobby:resident.example.org";
+        let allow = serde_json::json!({
+            "event_id": "$allow",
+            "type": "m.room.join_rules",
+            "room_id": "!r:resident.example.org",
+            "sender": "@creator:resident.example.org",
+            "state_key": "",
+            "content": {
+                "join_rule": "restricted",
+                "allow": [{"type": "m.room_membership", "room_id": lobby_id}],
+            },
+        });
+        let (mut rooms, room_id, _) = room_fixture(
+            "restricted",
+            vec![allow],
+            vec!["resident.example.org".to_owned()],
+        );
+        let bob_join = serde_json::json!({
+            "event_id": "$boblobby",
+            "type": "m.room.member",
+            "room_id": lobby_id,
+            "sender": "@bob:remote.example.org",
+            "state_key": "@bob:remote.example.org",
+            "content": {"membership": "join"},
+        });
+        rooms.insert_room(
+            lobby_id,
+            FakeRoom {
+                room_version: Some("11".to_owned()),
+                state: if bob_in_lobby {
+                    vec![bob_join]
+                } else {
+                    Vec::new()
+                },
+                joined_servers: if lobby_held {
+                    vec!["resident.example.org".to_owned()]
+                } else {
+                    Vec::new()
+                },
+                ..FakeRoom::default()
+            },
+        );
+        (rooms, room_id)
+    }
+
+    #[tokio::test]
+    async fn make_join_names_a_local_authoriser_for_a_restricted_room() {
+        let (rooms, room_id) = restricted_fixture(true, true);
+        let template = make_join(
+            &rooms,
+            &room_id,
+            "@bob:remote.example.org",
+            &[],
+            "resident.example.org",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            template.event["content"]["join_authorised_via_users_server"],
+            "@creator:resident.example.org"
+        );
+        let auth_events = template.event["auth_events"].as_array().unwrap();
+        assert!(
+            auth_events.contains(&serde_json::json!("$creatorjoin")),
+            "the authoriser's membership is an auth event: {auth_events:?}"
+        );
+        assert!(auth_events.contains(&serde_json::json!("$allow")));
+    }
+
+    #[tokio::test]
+    async fn make_join_refuses_a_restricted_join_it_cannot_vouch_for() {
+        let (rooms, room_id) = restricted_fixture(true, false);
+        let err = make_join(
+            &rooms,
+            &room_id,
+            "@bob:remote.example.org",
+            &[],
+            "resident.example.org",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, JoinError::NotAuthorized(_)), "{err}");
+
+        let (rooms, room_id) = restricted_fixture(false, true);
+        let err = make_join(
+            &rooms,
+            &room_id,
+            "@bob:remote.example.org",
+            &[],
+            "resident.example.org",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, JoinError::UnableToAuthorise(_)), "{err}");
     }
 
     fn sign_member_event(
@@ -1089,6 +1444,7 @@ mod tests {
             "joiner.example.org",
             "resident.example.org",
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -1133,6 +1489,7 @@ mod tests {
             "impersonator.example.org",
             "resident.example.org",
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -1174,6 +1531,7 @@ mod tests {
             &signed,
             "joiner.example.org",
             "resident.example.org",
+            None,
             None,
         )
         .await

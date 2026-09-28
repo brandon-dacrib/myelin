@@ -533,3 +533,333 @@ async fn a_knock_from_another_server_is_accepted_and_one_is_refused() {
     a.handle.shutdown().await;
     b.handle.shutdown().await;
 }
+
+/// `createRoom`'s `invite` list names a user of another server: the invitation goes out over
+/// `PUT /invite` like any other, so it reaches bob's `/sync` on B (with `is_direct`, since this
+/// is a direct chat) and he can join through A.
+#[tokio::test]
+async fn a_create_room_invite_list_invites_a_user_of_another_server() {
+    let (a, b) = (start().await, start().await);
+    let client = reqwest::Client::new();
+    let alice = register(&client, &a, "alice").await;
+    let bob = register(&client, &b, "bob").await;
+    let carol = register(&client, &a, "carol").await;
+
+    let room_id = create_room(
+        &client,
+        &alice,
+        json!({
+            "preset": "trusted_private_chat",
+            "is_direct": true,
+            "name": "a direct chat",
+            "room_version": "11",
+            "invite": [bob.id, carol.id],
+        }),
+    )
+    .await;
+    assert_eq!(
+        membership_on(&client, &alice, &room_id, &bob.id)
+            .await
+            .as_deref(),
+        Some("invite"),
+        "A holds bob's invite as soon as createRoom returns"
+    );
+    assert_eq!(
+        membership_on(&client, &alice, &room_id, &carol.id)
+            .await
+            .as_deref(),
+        Some("invite"),
+        "the local invitee is invited as before"
+    );
+
+    let sync = sync_until(&client, &bob, |s| {
+        s["rooms"]["invite"].get(&room_id).is_some()
+    })
+    .await;
+    let invite_state = &sync["rooms"]["invite"][&room_id]["invite_state"]["events"];
+    let own = stripped(invite_state, "m.room.member", &bob.id)
+        .unwrap_or_else(|| panic!("bob's own invite is in the invite state: {invite_state}"));
+    assert_eq!(own["membership"], "invite");
+    assert_eq!(own["is_direct"], true, "{invite_state}");
+    assert_eq!(
+        stripped(invite_state, "m.room.name", "").map(|c| c["name"].clone()),
+        Some(json!("a direct chat")),
+        "{invite_state}"
+    );
+
+    let (status, body) = post(&client, &bob, &format!("join/{room_id}"), json!({})).await;
+    assert_eq!(status, 200, "the join failed: {body}");
+    wait_for_membership(&client, &alice, &room_id, &bob.id, "join").await;
+    send_message(&client, &bob, &room_id, "invited at birth").await;
+    sync_until(&client, &alice, |s| {
+        timeline_bodies(s, &room_id).contains(&"invited at birth".to_owned())
+    })
+    .await;
+
+    a.handle.shutdown().await;
+    b.handle.shutdown().await;
+}
+
+/// A restricted room (`join_rule: restricted`, room version 8+) that `owner` creates, joinable
+/// from `lobby`, and `lobby` itself, public.
+async fn restricted_room_and_lobby(client: &reqwest::Client, owner: &User) -> (String, String) {
+    let lobby = create_room(
+        client,
+        owner,
+        json!({"preset": "public_chat", "name": "lobby", "room_version": "11"}),
+    )
+    .await;
+    let restricted = create_room(
+        client,
+        owner,
+        json!({
+            "preset": "private_chat",
+            "name": "members only",
+            "room_version": "11",
+            "initial_state": [{
+                "type": "m.room.join_rules",
+                "state_key": "",
+                "content": {
+                    "join_rule": "restricted",
+                    "allow": [{"type": "m.room_membership", "room_id": lobby}],
+                },
+            }],
+        }),
+    )
+    .await;
+    (lobby, restricted)
+}
+
+/// The content of `user`'s `m.room.member` event in `room_id`, read by `viewer`.
+async fn member_content(
+    client: &reqwest::Client,
+    viewer: &User,
+    room_id: &str,
+    user: &str,
+) -> Value {
+    client
+        .get(format!(
+            "{}/_matrix/client/v3/rooms/{room_id}/state/m.room.member/{user}",
+            viewer.base
+        ))
+        .bearer_auth(&viewer.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// Restricted joins over federation, both ways round. A user of the other server who is not in
+/// the allowed room is refused; once in it, the resident authorises the join by naming one of
+/// its own users in `join_authorised_via_users_server` and co-signing it, and the joining
+/// server keeps the co-signed event. A resident that is in none of the allowed rooms says
+/// `M_UNABLE_TO_AUTHORISE_JOIN`.
+#[tokio::test]
+async fn a_restricted_room_is_joined_through_a_resident_that_authorises_it() {
+    let (a, b) = (start().await, start().await);
+    let client = reqwest::Client::new();
+    let alice = register(&client, &a, "alice").await;
+    let bob = register(&client, &b, "bob").await;
+
+    // Bob on B joins alice's restricted room on A.
+    let (lobby, restricted) = restricted_room_and_lobby(&client, &alice).await;
+    let (status, body) = post(&client, &bob, &format!("join/{restricted}"), json!({})).await;
+    assert_eq!(
+        status, 403,
+        "bob is in no room the join rules allow: {body}"
+    );
+    let (status, body) = post(&client, &bob, &format!("join/{lobby}"), json!({})).await;
+    assert_eq!(status, 200, "joining the lobby failed: {body}");
+    let (status, body) = post(&client, &bob, &format!("join/{restricted}"), json!({})).await;
+    assert_eq!(status, 200, "the restricted join failed: {body}");
+    wait_for_membership(&client, &alice, &restricted, &bob.id, "join").await;
+    let on_a = member_content(&client, &alice, &restricted, &bob.id).await;
+    assert_eq!(
+        on_a["join_authorised_via_users_server"], alice.id,
+        "A named its own user as the authoriser: {on_a}"
+    );
+    let on_b = member_content(&client, &bob, &restricted, &bob.id).await;
+    assert_eq!(on_b["membership"], "join", "B holds bob's join: {on_b}");
+    send_message(&client, &bob, &restricted, "let in through the lobby").await;
+    sync_until(&client, &alice, |s| {
+        timeline_bodies(s, &restricted).contains(&"let in through the lobby".to_owned())
+    })
+    .await;
+
+    // Alice leaves and comes back through B, which now authorises her (bob may invite, and
+    // she is in the lobby). B's answer carries the room's state, bob's join among it, and A
+    // checks that join for its own signature: B has to have kept the co-signed copy.
+    let (status, body) = post(
+        &client,
+        &alice,
+        &format!("rooms/{restricted}/leave"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    wait_for_membership(&client, &bob, &restricted, &alice.id, "leave").await;
+    let (status, body) = post(
+        &client,
+        &alice,
+        &format!("join/{restricted}?server_name={}", b.name),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "rejoining through B failed: {body}");
+    let on_a = member_content(&client, &alice, &restricted, &alice.id).await;
+    assert_eq!(on_a["join_authorised_via_users_server"], bob.id, "{on_a}");
+    wait_for_membership(&client, &bob, &restricted, &alice.id, "join").await;
+
+    // The other way round: alice on A joins bob's restricted room on B.
+    let (bobs_lobby, bobs_restricted) = restricted_room_and_lobby(&client, &bob).await;
+    let (status, body) = post(&client, &alice, &format!("join/{bobs_lobby}"), json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post(
+        &client,
+        &alice,
+        &format!("join/{bobs_restricted}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "the restricted join failed: {body}");
+    wait_for_membership(&client, &bob, &bobs_restricted, &alice.id, "join").await;
+    let on_b = member_content(&client, &bob, &bobs_restricted, &alice.id).await;
+    assert_eq!(on_b["join_authorised_via_users_server"], bob.id, "{on_b}");
+    send_message(&client, &alice, &bobs_restricted, "and back").await;
+    sync_until(&client, &bob, |s| {
+        timeline_bodies(s, &bobs_restricted).contains(&"and back".to_owned())
+    })
+    .await;
+
+    // A room whose join rules allow only a room A is not in: A cannot vouch for anybody.
+    let elsewhere = format!("!elsewhere:{}", b.name);
+    let unvouched = create_room(
+        &client,
+        &alice,
+        json!({
+            "preset": "private_chat",
+            "room_version": "11",
+            "initial_state": [{
+                "type": "m.room.join_rules",
+                "state_key": "",
+                "content": {
+                    "join_rule": "restricted",
+                    "allow": [{"type": "m.room_membership", "room_id": elsewhere}],
+                },
+            }],
+        }),
+    )
+    .await;
+    let (status, body) = post(&client, &bob, &format!("join/{unvouched}"), json!({})).await;
+    assert_eq!(status, 502, "{body}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("M_UNABLE_TO_AUTHORISE_JOIN"),
+        "A said it could not authorise the join: {error}"
+    );
+
+    a.handle.shutdown().await;
+    b.handle.shutdown().await;
+}
+
+/// The inviting server is gone: bob's rejection cannot go through any server in the room, so B
+/// rejects the invite alone, and his `/sync` moves the room to `leave`. A knock that no server
+/// can take fails with a message that names the knock, not a join.
+#[tokio::test]
+async fn an_invite_is_rejected_locally_when_no_server_in_the_room_answers() {
+    let (a, b) = (start().await, start().await);
+    let client = reqwest::Client::new();
+    let alice = register(&client, &a, "alice").await;
+    let bob = register(&client, &b, "bob").await;
+
+    let room_id = create_room(
+        &client,
+        &alice,
+        json!({"preset": "private_chat", "name": "soon gone", "room_version": "11"}),
+    )
+    .await;
+    let knock_room = create_room(
+        &client,
+        &alice,
+        json!({
+            "preset": "private_chat",
+            "room_version": "11",
+            "initial_state": [{
+                "type": "m.room.join_rules",
+                "state_key": "",
+                "content": {"join_rule": "knock"},
+            }],
+        }),
+    )
+    .await;
+    let (status, body) = post(
+        &client,
+        &alice,
+        &format!("rooms/{room_id}/invite"),
+        json!({"user_id": bob.id}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    sync_until(&client, &bob, |s| {
+        s["rooms"]["invite"].get(&room_id).is_some()
+    })
+    .await;
+
+    let a_name = a.name.clone();
+    a.handle.shutdown().await;
+
+    let (status, body) = post(
+        &client,
+        &bob,
+        &format!("rooms/{room_id}/leave"),
+        json!({"reason": "nobody home"}),
+    )
+    .await;
+    assert_eq!(status, 200, "rejecting the invite failed: {body}");
+    let sync = sync_until(&client, &bob, |s| {
+        s["rooms"]["leave"].get(&room_id).is_some()
+    })
+    .await;
+    assert!(
+        sync["rooms"]["invite"].get(&room_id).is_none(),
+        "a rejected invite is not still an invite: {sync}"
+    );
+    let leave = sync["rooms"]["leave"][&room_id]["timeline"]["events"]
+        .as_array()
+        .and_then(|events| {
+            events
+                .iter()
+                .rfind(|e| e["type"] == "m.room.member" && e["state_key"] == bob.id)
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("bob's leave is in his timeline: {sync}"));
+    assert_eq!(leave["content"]["membership"], "leave");
+    assert_eq!(leave["content"]["reason"], "nobody home");
+    assert_eq!(leave["sender"], bob.id);
+
+    // Rejecting again: nothing left to reject, and no server to ask.
+    let (status, _) = post(&client, &bob, &format!("rooms/{room_id}/leave"), json!({})).await;
+    assert_ne!(status, 200, "a second rejection has nothing to reject");
+
+    let (status, body) = post(
+        &client,
+        &bob,
+        &format!("knock/{knock_room}?server_name={a_name}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 502, "{body}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("knock"),
+        "the error names the knock: {error}"
+    );
+    assert!(
+        !error.contains("join"),
+        "the error does not call a knock a join: {error}"
+    );
+
+    b.handle.shutdown().await;
+}

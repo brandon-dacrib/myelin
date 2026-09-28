@@ -74,6 +74,12 @@ pub struct CreateRoomRequest {
     /// room's ID *before* creating it (to put it in the old room's `m.room.tombstone` content)
     /// and therefore cannot let this function choose.
     pub room_id: Option<OwnedRoomId>,
+    /// When `true`, only the users in `invite` who belong to this server are invited while the
+    /// room is created; the invitations of users of other servers are the caller's to send once
+    /// the room exists (`crate::routes::create_room`, over federation: an invite has to be
+    /// co-signed by the invitee's server before it goes into the room). They are still invitees
+    /// for everything else, such as `trusted_private_chat`'s power levels.
+    pub local_invites_only: bool,
 }
 
 /// One `initial_state` entry.
@@ -2413,6 +2419,62 @@ impl<B: KvBackend> RoomActor<B> {
         Ok(RemoteEventOutcome::Stored(event_sn))
     }
 
+    /// Builds the leave that rejects `user`'s invite (or withdraws their knock) here alone, for
+    /// when no server in the room would take the leave: see
+    /// [`pipeline::build_out_of_band_leave`]. Built and signed, not persisted; the caller records
+    /// it with [`RoomActor::accept_out_of_room_membership`].
+    ///
+    /// # Errors
+    /// [`RoomError::Forbidden`] if a user of this server is joined (the room is held for real,
+    /// and a leave goes through it) or `user`'s current membership is not `invite` or `knock`;
+    /// [`RoomError::State`] if the state cannot be read; building errors otherwise.
+    pub fn build_out_of_band_leave(
+        &self,
+        user: &UserId,
+        extra: serde_json::Value,
+        now_ms: i64,
+    ) -> Result<Event, RoomError> {
+        if self.local_user_joined() {
+            return Err(RoomError::Forbidden(format!(
+                "a user of this server is in {}; a leave goes through the room",
+                self.room_id
+            )));
+        }
+        let state = self.full_state()?;
+        let current = state.iter().find(|event| {
+            event.header().event_type == "m.room.member"
+                && event.header().state_key.as_deref() == Some(user.as_str())
+        });
+        let Some(current) = current.filter(|event| {
+            matches!(
+                event
+                    .json()
+                    .get("content")
+                    .and_then(CanonicalJsonValue::as_object)
+                    .and_then(|content| content.get("membership"))
+                    .and_then(CanonicalJsonValue::as_str),
+                Some("invite" | "knock")
+            )
+        }) else {
+            return Err(RoomError::Forbidden(format!(
+                "{user} has no invite or knock in {} to reject",
+                self.room_id
+            )));
+        };
+        let membership = pipeline::event_ref(current, &self.rules)?;
+        pipeline::build_out_of_band_leave(
+            &self.room_version,
+            &self.rules,
+            &self.room_id,
+            &self.identity.server_name,
+            &self.identity.signing_key,
+            now_ms,
+            &membership,
+            user,
+            membership::content_for(Action::Leave, extra),
+        )
+    }
+
     /// Whether any user of this server is currently joined to the room.
     #[must_use]
     pub fn local_user_joined(&self) -> bool {
@@ -2810,6 +2872,9 @@ impl<B: KvBackend> RoomActor<B> {
         }
 
         for user in &request.invite {
+            if request.local_invites_only && user.server_name() != &*actor.identity.server_name {
+                continue;
+            }
             actor.membership_action(
                 creator.clone(),
                 Action::Invite,
@@ -4996,6 +5061,25 @@ impl<B: KvBackend> RoomActorHandle<B> {
     {
         self.with_actor(move |actor| actor.accept_out_of_room_membership(event))
             .await
+    }
+
+    /// [`RoomActor::build_out_of_band_leave`] then
+    /// [`RoomActor::accept_out_of_room_membership`]: rejects `user`'s invite (or withdraws their
+    /// knock) here alone, when no server in the room would take the leave.
+    pub async fn reject_out_of_band(
+        &self,
+        user: OwnedUserId,
+        extra: serde_json::Value,
+        now_ms: i64,
+    ) -> Result<RemoteEventOutcome, RoomError>
+    where
+        B: 'static,
+    {
+        self.with_actor(move |actor| {
+            let leave = actor.build_out_of_band_leave(&user, extra, now_ms)?;
+            actor.accept_out_of_room_membership(leave)
+        })
+        .await
     }
 
     /// [`RoomActor::build_membership_event`]: the membership event `action` would send, built and

@@ -181,6 +181,29 @@ pub trait RoomDataSource: Send + Sync {
     /// [`RoomDataSource::is_visible_to`]: the caller is this server itself, deciding where to
     /// send, not a remote asking to read.
     async fn member_servers(&self, room_id: &str) -> Vec<String>;
+
+    /// `user_id`'s current membership in `room_id` (`join`, `invite`, `leave`, ...), or `None`
+    /// for a room this server does not hold or a user with no membership in it. What `make_join`
+    /// and `send_join` use to decide whether a restricted room's join rules let a user in
+    /// (`crate::join`), so -- like [`RoomDataSource::member_servers`] -- not gated by
+    /// [`RoomDataSource::is_visible_to`]. The default reads it out of
+    /// [`RoomDataSource::state_for_join`]; an implementation with a cheaper lookup should
+    /// override it.
+    async fn membership_of(&self, room_id: &str, user_id: &str) -> Option<String> {
+        let state = self.state_for_join(room_id).await.ok()?;
+        state.state.iter().find_map(|(_, event)| {
+            (event.get("type").and_then(Value::as_str) == Some("m.room.member")
+                && event.get("state_key").and_then(Value::as_str) == Some(user_id))
+            .then(|| {
+                event
+                    .get("content")
+                    .and_then(|content| content.get("membership"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .flatten()
+        })
+    }
 }
 
 /// The current state plus its auth chain, as `send_join`/`make_join` need it. See
