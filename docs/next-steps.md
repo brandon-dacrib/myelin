@@ -478,6 +478,17 @@ configuration history and revert (`ConfigStore` already records the patch per re
   `npm run check` 441, `test:e2e` 50/50 green; coverage **160 of 160** with it. It is stacked on
   the follow-ups, so merge it right after them: `tools/merge-queue.sh agent/admin-followups
   agent/config-history`.
+- 19:40 `agent/config-reload` finished (`0a6728a`, on `main`): rate limits, the federation
+  allow and block lists and the log level apply to a running server when saved; a clustered
+  replica picks changes up within 10 s; `config.update` answers what was applied. **Behaviour
+  change:** the server-wide `rate_limits.message` bucket is now enforced (Synapse's burst 10,
+  0.2/s); fast harnesses set `rate_limits: {enabled: false}`. Verified on the real binary
+  (`crates/hs-cli/tests/config_reload.rs`, `e2e-real/configuration.spec.ts` 4/4); per-crate and
+  web checks green, full gate not run. **Before merging:** its decision is also numbered 0015,
+  like `agent/config-history`'s; whichever merges second renumbers to 0016. Expect a conflict
+  with config-history in `crates/hs-cli/src/config_source.rs`. Merge order:
+  `tools/merge-queue.sh agent/admin-followups agent/config-history agent/config-reload`
+  (after the follow-ups' two test failures are fixed).
 
 ## Handover (2026-09-28, 16:00 EDT): where the nine resumed agents stopped
 
