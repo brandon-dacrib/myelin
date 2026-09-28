@@ -23,6 +23,7 @@ import { RelativeTime } from "@/components/RelativeTime";
 import { toast } from "@/components/ui/toast/toast-store";
 import { hasScope } from "@/lib/auth";
 import { ResetPasswordDialog } from "./users/ResetPasswordDialog";
+import { SendNoticeDialog } from "./settings/SendNoticeDialog";
 
 /** `/users/:id` — flows.md flow 2 steps 2-5: understand and act on a user. */
 export function UserDetailPage() {
@@ -45,6 +46,7 @@ export function UserDetailPage() {
   const signOutDevice = useSignOutDevice();
   const deactivate = useDeactivateUser();
   const [resetOpen, setResetOpen] = useState(false);
+  const [noticeOpen, setNoticeOpen] = useState(false);
 
   if (!hasScope("admin:read")) {
     return (
@@ -207,6 +209,15 @@ export function UserDetailPage() {
               />
             </Dialog>
           )}
+          <Button
+            variant="secondary"
+            disabled={!canModerate || user.deactivated}
+            title={!canModerate ? "Needs moderation:write" : undefined}
+            onClick={() => setNoticeOpen(true)}
+          >
+            Send notice
+          </Button>
+          <SendNoticeDialog userId={id} open={noticeOpen} onOpenChange={setNoticeOpen} />
           <Button variant="secondary" disabled={!canWrite} onClick={() => setResetOpen(true)}>
             Reset password
           </Button>

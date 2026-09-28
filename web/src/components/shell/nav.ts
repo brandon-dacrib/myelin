@@ -80,3 +80,22 @@ export const navItems: NavItem[] = [
   },
   { id: "settings", label: "Settings", href: "/settings", icon: Settings, scope: "admin:read" },
 ];
+
+/**
+ * Views inside a section that the command palette offers by name, beside the sections
+ * themselves: "Go to Registration tokens" is quicker than Settings and then a tab.
+ */
+export const subNavItems: Omit<NavItem, "icon">[] = [
+  {
+    id: "settings-registration-tokens",
+    label: "Registration tokens",
+    href: "/settings/registration-tokens",
+    scope: "admin:read",
+  },
+  {
+    id: "settings-server-notices",
+    label: "Server notices",
+    href: "/settings/server-notices",
+    scope: "moderation:read",
+  },
+];

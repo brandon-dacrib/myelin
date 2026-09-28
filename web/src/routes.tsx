@@ -68,6 +68,14 @@ const PlaceholderPage = lazyRouteComponent(
   () => import("@/pages/PlaceholderPage"),
   "PlaceholderPage",
 );
+const RegistrationTokensPage = lazyRouteComponent(
+  () => import("@/pages/settings/RegistrationTokensPage"),
+  "RegistrationTokensPage",
+);
+const ServerNoticesPage = lazyRouteComponent(
+  () => import("@/pages/settings/ServerNoticesPage"),
+  "ServerNoticesPage",
+);
 const AuditPage = lazyRouteComponent(() => import("@/pages/audit/AuditPage"), "AuditPage");
 const AuditEntryPage = lazyRouteComponent(
   () => import("@/pages/audit/AuditEntryPage"),
@@ -270,7 +278,39 @@ const auditEntryRoute = createRoute({
   validateSearch: validateAuditSearch,
   component: AuditEntryPage,
 });
-const settingsRoute = placeholderRoute("/settings");
+// Settings (information-architecture.md, Settings): one view per kind of thing, each at its own
+// address. `/settings` itself goes to the first.
+const settingsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings",
+  component: () => <Navigate to="/settings/registration-tokens" replace />,
+});
+interface CursorSearch {
+  cursor?: string;
+}
+function cursorValidator(search: Record<string, unknown>): CursorSearch {
+  return { cursor: typeof search.cursor === "string" ? search.cursor : undefined };
+}
+const registrationTokensRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings/registration-tokens",
+  validateSearch: cursorValidator,
+  component: RegistrationTokensPage,
+});
+const serverNoticesRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings/server-notices",
+  validateSearch: cursorValidator,
+  component: ServerNoticesPage,
+});
+
+// `/register` is the page an invite link opens (`Register.tsx`). `AppShell` renders it in place
+// of everything else, with or without a session, so this route only has to exist.
+const registerRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/register",
+  component: () => null,
+});
 
 const routeTree = rootRoute.addChildren([
   indexRoute,
@@ -298,6 +338,9 @@ const routeTree = rootRoute.addChildren([
   auditRoute,
   auditEntryRoute,
   settingsRoute,
+  registrationTokensRoute,
+  serverNoticesRoute,
+  registerRoute,
 ]);
 
 export const router = createRouter({ routeTree, basepath: "/admin" });

@@ -2849,22 +2849,31 @@ export interface components {
             /** @description The administrator account to reset, a full user ID on this server. */
             user_id: string;
         };
+        /** @description A token that lets someone register an account, even while open registration is off. `pending` counts registrations that have presented the token and not finished yet; `completed` counts accounts created with it. A token is `valid` while it has not expired and `pending + completed` is below `uses_allowed` (no limit when null). */
         RegistrationToken: {
-            completed?: number;
+            completed: number;
             /** Format: date-time */
-            created_at?: string;
+            created_at: string;
             /** Format: date-time */
-            expires_at?: string | null;
-            pending?: number;
-            token?: string;
-            uses_allowed?: number | null;
+            expires_at: string | null;
+            pending: number;
+            token: string;
+            uses_allowed: number | null;
+            /** @description Whether the token would admit a new registration right now. */
+            valid: boolean;
         };
         RegistrationTokenCreate: {
-            /** Format: date-time */
-            expires_at?: string;
+            /**
+             * Format: date-time
+             * @description When the token stops working; null or absent for never.
+             */
+            expires_at?: string | null;
+            /** @description The length of a generated token, 16 when absent. Ignored when `token` is given. */
             length?: number;
+            /** @description The token to create. Omit it to have the server generate one of `length` characters. At most 64 characters from `A-Z a-z 0-9 . _ ~ -`. */
             token?: string;
-            uses_allowed?: number;
+            /** @description How many accounts the token may create; null or absent for no limit. */
+            uses_allowed?: number | null;
         };
         RegistrationTokenPage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["RegistrationToken"][];
@@ -3008,14 +3017,31 @@ export interface components {
             uptime_ms?: number;
             version?: string;
         };
+        /** @description One notice sent to one or more local users. Each recipient gets it in their own server-notices room (tagged `m.server_notice`), sent by the server-notices user. */
         ServerNotice: {
-            event_ids?: string[];
-            recipients?: string[];
+            /** @description The event content that was sent. */
+            content: {
+                [key: string]: unknown;
+            };
+            event_ids: string[];
+            /** @description The notice's identifier in the history. */
+            id: string;
+            recipients: string[];
+            /** @description Each recipient's server-notices room, in the order of `recipients`. */
+            room_ids: string[];
+            /** @description The server-notices user the notice was sent as. */
+            sender: string;
             /** Format: date-time */
-            sent_at?: string;
+            sent_at: string;
+            /** @description The event type that was sent. */
+            type: string;
         };
         ServerNoticeCreate: {
-            content: Record<string, never>;
+            /** @description The event content, for example `{"msgtype":"m.text","body":"..."}`. */
+            content: {
+                [key: string]: unknown;
+            };
+            /** @description Local user IDs to send the notice to. Every one must exist; nothing is sent if any does not. */
             recipients: string[];
             state_key?: string | null;
             /** @default m.room.message */

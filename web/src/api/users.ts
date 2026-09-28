@@ -28,6 +28,24 @@ export function useUsers(filters: UserListFilters) {
   });
 }
 
+/**
+ * Up to `limit` users matching `q`, for a picker that suggests people as an administrator types
+ * (the server-notice recipients). Only asks once there is something to search for.
+ */
+export function useUserSuggestions(q: string, limit = 5) {
+  const query = q.trim().replace(/^@/, "");
+  return useQuery({
+    queryKey: ["user-suggestions", query, limit],
+    enabled: query.length >= 2,
+    queryFn: async () => {
+      const result = await api.GET("/users", { params: { query: { q: query, limit } } });
+      return unwrap(result).items;
+    },
+    staleTime: 15_000,
+    retry: false,
+  });
+}
+
 export function useUser(userId: string | undefined) {
   return useQuery({
     queryKey: ["user", userId],

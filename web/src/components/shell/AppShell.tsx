@@ -6,6 +6,7 @@ import { CommandPalette } from "./CommandPalette";
 import { SignIn } from "./SignIn";
 import { Setup } from "./Setup";
 import { Recover } from "./Recover";
+import { Register } from "./Register";
 import { Sheet, SheetContent } from "../ui/sheet/Sheet";
 import { Toaster } from "../ui/toast/Toaster";
 import { getSession, subscribeSession } from "@/lib/auth";
@@ -73,8 +74,13 @@ export function AppShell() {
   // A server with no administrator cannot be signed in to, and neither can one whose
   // administrators are locked out, so the setup page and its sibling the recovery page are
   // served here, in place of the sign-in form, rather than as routes behind it.
+  const page = pathname.replace(/^\/admin/, "");
+  // An invite link is for the person being invited, not for whoever may be signed in to this
+  // browser as an administrator: the registration page is the same with or without a session,
+  // and never shows the app around it.
+  if (page === "/register") return <Register />;
+
   if (!session) {
-    const page = pathname.replace(/^\/admin/, "");
     if (page === "/setup") return <Setup />;
     if (page === "/recover") return <Recover />;
     return <SignIn />;

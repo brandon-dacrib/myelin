@@ -3,7 +3,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { Root, Portal, Overlay, Content, Title } from "radix-ui/dialog";
 import { Search } from "lucide-react";
 import { cn } from "@/lib/cn";
-import { navItems } from "./nav";
+import { navItems, subNavItems } from "./nav";
 import { hasScope } from "@/lib/auth";
 import { useAppservices, deriveDisplayName } from "@/api/bridges";
 
@@ -43,7 +43,7 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
   }
 
   const items = useMemo<PaletteItem[]>(() => {
-    const navChoices: PaletteItem[] = navItems
+    const navChoices: PaletteItem[] = [...navItems, ...subNavItems]
       .filter((n) => !n.scope || hasScope(n.scope))
       .map((n) => ({
         id: `nav-${n.id}`,

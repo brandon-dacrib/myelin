@@ -60,7 +60,8 @@ src/
   pages/             route components: DashboardPage, bridges/ (list, detail, add-bridge
                      wizard), UsersPage/UserDetailPage, RoomsPage/RoomDetailPage,
                      FederationPage/FederationDestinationPage, config/ (ConfigurationPage +
-                     ConfigSectionPage: the generated configuration forms), PlaceholderPage
+                     ConfigSectionPage: the generated configuration forms), settings/
+                     (registration tokens and server notices), PlaceholderPage
                      for the remaining information-architecture sections not yet built
   routes.tsx          the route tree (TanStack Router, code-based, every page lazy-loaded
                      via lazyRouteComponent for route-level code splitting)
@@ -116,14 +117,16 @@ down to tablet width, keyboard navigation), the dashboard, the bridges list/deta
 wizard pages (flows.md flow 1 in full, including the Kubernetes and self-managed deployment
 paths, the namespace-conflict branch, and the forbidden branch), the Users, Rooms and
 Federation list/detail pages (flows.md flows 2-4: search, understand, and the primary actions
-— lock/suspend/deactivate a user, block a room, reset a federation destination's backoff), and
-Configuration.
+— lock/suspend/deactivate a user, block a room, reset a federation destination's backoff),
+Configuration, and Settings: registration tokens (each an invite link to the public
+`/admin/register?token=...` page, which registers through the Matrix client-server API with no
+administrator session) and server notices (send, history; also "Send notice" on a user).
 
 Not built (routes exist as `PlaceholderPage` so navigation matches the full information
-architecture, but the pages themselves are Phase 1/2 per the brief): Reports, Media, Cluster,
-Migration, Audit log, and the rest of Settings (registration tokens, server notices, scheduled
-tasks, appearance). See `docs/status/16-management-web-interface.md` for what is next, including
-narrower gaps on the pages that are built (e.g. no reset-password flow yet).
+architecture, but the pages themselves are Phase 1/2 per the brief): Reports, Media, Cluster and
+Migration. Settings has no scheduled-tasks or appearance view yet. See
+`docs/status/16-management-web-interface.md` for what is next, including narrower gaps on the
+pages that are built.
 
 ## Configuration (`/configuration`)
 
