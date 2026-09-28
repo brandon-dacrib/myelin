@@ -4,9 +4,101 @@ Track brief: `docs/workstreams/13-config-compat-and-migration.md`. Owner
 crates/files: `crates/hs-config`, `crates/hs-compat`,
 `tools/synapse_inventory.py`, `docs/synapse-inventory.md`.
 
-Last updated: 2026-09-28 (queue items 2b and 2c, see the first section). Before that: 2026-09-27 (decision 0010: bootstrap-only settings, importer-only registration files; see "Where this stopped"). Before that: 2026-09-19 (session 2 — catching up `hs-config`/`hs-compat` with day one's
+Last updated: 2026-09-28 (the Migration admin area and the online importer, first section; queue items 2b and 2c, second). Before that: 2026-09-27 (decision 0010: bootstrap-only settings, importer-only registration files; see "Where this stopped"). Before that: 2026-09-19 (session 2 — catching up `hs-config`/`hs-compat` with day one's
 shipped work: URL-preview config fields, the `serve_server_wellknown`/`federation_custom_ca_list`/
 `max_spider_size` translation-table corrections, and a first slice of `/_synapse/admin` routes).
+
+## 2026-09-28: the Migration admin area and the online importer (8/8)
+
+Before this there was no importer, only its design (`docs/compat/synapse-importer-mapping.md`).
+Now a running server copies a Synapse deployment into itself through the admin API, and the
+Migration page walks an operator from pointing at Synapse to cutover without a file edited.
+Runbook: `docs/compat/synapse-migration-runbook.md`.
+
+**Done and verified:**
+
+1. **`hs-config`: the `migration` section** (`crates/hs-config/src/migration.rs`):
+   `migration.synapse = {database: {host, port, database, user, password}, media_store_path,
+   batch_size}`. Administered and reloadable; the password is a secret (redacted on read, kept on
+   save). `MigrationStartRequest.source_secret_ref` is a pointer into it (`/migration/synapse`
+   by default), so no connection string is ever in the migration API.
+2. **`hs-compat::migration`** (`crates/hs-compat/src/migration/`): `source.rs` reads Synapse's
+   PostgreSQL (`tokio-postgres`, rows as `to_jsonb` so a column an older or newer Synapse lacks
+   is absent rather than an error, keyset-paged on a stable key); `order.rs` plans each room's
+   replay (topological over `prev_events` and `auth_events`, ties by depth then stream order;
+   rejected events and outliers left out; a room without its own `m.room.create` is one joined
+   over federation and is skipped); `engine.rs` is `Migrator`, the state machine (`idle`,
+   `copying`, `paused`, `ready_for_cutover`, `verifying`, `cutting_over`, `completed`, `failed`,
+   `aborted`), the copy (six streams, a checkpoint per stream after each batch, every write
+   idempotent), verification (every row looked up, samples compared field by field, every
+   room's current state against `current_state_events`, media bytes) and cutover (a final pass,
+   then verification; `completed` only if it passes). A `run` counter makes a stopped copy
+   unable to overwrite what replaced it. `Migrator` implements `hs_admin::migration::MigrationSource`
+   and runs each step as a task (`migration.copy`, `.verify`, `.cutover`); `recover()` at startup
+   carries a running step on from its checkpoint.
+3. **`hs-admin::migration`**: the eight handlers (`migration.get/log/start/pause/resume/abort/
+   verify/cutover`), audited and published (`migration.started`, ...), `202` with `Location` for
+   verify and cutover. `openapi.yaml`: additive fields on `MigrationStatus` (`task_id`,
+   `started_at/by`, `updated_at`, `completed_at`, `cutover_by`, `verification`, and per stream
+   `skipped_count`, `failed_count`, `done`) and a `MigrationVerification` schema.
+4. **`hs-room`**: `RoomRegistry::import_shell`, `discard_import_shell`,
+   `RoomActorHandle::import_event` (authorized and stored as an event arriving over federation
+   is, but no `RoomUpdate` published: the federation sender, bridges and `/sync` never see old
+   history as new) and `import_redaction`. Test: `crates/hs-room/tests/import.rs`.
+5. **`hs-cli::migration`**: `StoreTarget` writes into `hs-auth` (accounts with Synapse's bcrypt
+   hash, flags and profile; devices; tokens by their SHA-256, so Synapse's token strings keep
+   signing in), `hs-user` (account data), `hs-room` (then one head update to the session hub, so
+   members' `/sync` lists the room) and `hs-media` (same media ids); `TablesMigrationStore`
+   (keyspaces `hs_compat.migration` and `hs_compat.migration_log`); `StoreSourceConfigs` reads
+   the source from the configuration store at start (`StoreConfigSource::current_config`);
+   `MigrationMetrics` (`hs_migration_rows_copied/skipped/failed/source{stream}`,
+   `hs_migration_status{status}`). Wired in `serve.rs`, with `recover()` spawned at boot.
+6. **The Migration page** (`web/src/pages/migration/MigrationPage.tsx`, track 16's area, built
+   here): source form, copy with pause/resume/abort, verification findings, the cutover
+   checklist, the log. The sidebar shows Migration once a migration exists, or on a server with
+   at most one account.
+7. **The fixture** `crates/hs-compat/tests/fixtures/synapse-small`: a real Synapse 1.161 on
+   PostgreSQL populated through its own client API (4 accounts, 6 devices and tokens, 2 rooms
+   with 43 events including an edit and a redaction, account data and a tag, 2 uploads), with our
+   own minimal `schema.sql` (column names only; nothing copied from Synapse) and the data rows.
+
+**Verified by:**
+
+- `cargo test -p hs-cli --test migration` (the real `hs` binary, 1 test): source set through
+  `config.update` (password never answered back), start, `ready_for_cutover` with the expected
+  counts, a restart (status kept), verify (a task; passed), cutover (a task; `completed`), a
+  restart; then alice's Synapse token still works (`whoami` with her device), her Synapse
+  password signs in, dave stays deactivated, both rooms in her `/sync`, the lobby's history with
+  the redacted message redacted, her profile, `#lobby:fixture.test` resolves, her account data
+  and tag, bob's picture byte for byte; the audit log, the migration log and the metrics.
+- `cargo test -p hs-compat --test migration` (5 tests, a real Synapse database, an in-memory
+  target): the reader, a copy verified then tampered with and caught, cutover's final pass
+  repairing it, pause/resume/abort without copying twice, a copy interrupted by a restart
+  carrying on after its checkpoint, refusals (no source, another server's Synapse, an
+  unreachable database).
+- `cargo test -p hs-admin migration` (5), `cargo test -p hs-room --test import` (2),
+  `hs-compat` unit tests (`order`, `source`).
+- `web/`: `MigrationPage.test.tsx` (4), `e2e/migration.spec.ts` (mock, axe on each state), and
+  `e2e-real/migration.spec.ts` against `hs serve` and the fixture database (passed; screenshots
+  `docs/design/screenshots/migration-*-real.png`).
+
+**Left** (also in `docs/next-steps.md`'s Known gaps): end-to-end keys and backups, push rules and
+pushers, receipts, filters and remote media are not copied; rooms joined over federation are
+skipped (their members rejoin); a room is replayed whole in memory, and nothing has measured a
+large Synapse; one replica runs the migration (whichever answered `start`), and its steps are
+serialized by a lock in that process only.
+
+**Decisions made:** PostgreSQL sources only (SQLite goes through `synapse_port_db` first). The
+source lives in the configuration (`migration` section), not in the migration API. Abort keeps
+what was copied (Synapse is never written, so nothing needs undoing there, and a new start carries
+on from it). The final pass at cutover re-reads everything rather than tracking per-table
+watermarks: simpler, idempotent, and correct for updated rows; slower for a large deployment.
+Imported room history is not announced (`import_event`), so nothing is re-sent over federation or
+to bridges. `hs-compat` now depends on `hs-admin` (for `MigrationSource` and the task registry);
+no cycle, `hs-admin` depends on neither.
+
+**Shared dependencies added:** none at the workspace level; `hs-compat` uses the workspace's
+`tokio-postgres`, `async-trait`, `tokio` and `tracing`.
 
 ## 2026-09-28: queue items 2b and 2c (the ICAP preview control, RFC 0020, the 0010 sweep)
 

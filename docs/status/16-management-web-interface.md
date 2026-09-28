@@ -55,6 +55,24 @@ inline Sessions list was:
   Screenshots `docs/design/screenshots/users-identity-rename-real.png`,
   `users-identity-page-real.png`.
 
+## Update: 2026-09-28 (the Migration page; by track 13)
+
+- **`/migration`** (`src/pages/migration/MigrationPage.tsx`, `src/api/migration.ts`,
+  `src/lib/migration.ts`), replacing the last placeholder route (`PlaceholderPage` is gone):
+  four steps -- point at Synapse (a form that writes the `migration` configuration section; the
+  password is write-only), copy (per-stream rows, rate, time left; pause, resume, abort with a
+  confirmation that says Synapse is untouched), verify (the findings per stream), cut over (a
+  two-item checklist, a confirmation; then what did not move) -- and the migration log. Polls
+  every 1.5s while something runs. The sidebar shows Migration once a migration exists or on a
+  server with at most one account (flows.md flow 5, "Discover").
+- **Mock**: `src/mocks/data/migration.ts` runs a migration on a clock; the mock configuration
+  has the `migration` section.
+- **Tests**: `MigrationPage.test.tsx` (4), `e2e/migration.spec.ts` (axe on each state),
+  `e2e-real/migration.spec.ts` against `hs serve` and a real Synapse database (passed; screenshots
+  `docs/design/screenshots/migration-*-real.png`). The configuration tests count the new
+  reloadable section; `e2e/configuration.spec.ts`'s listeners flow now checks that listeners are
+  shown as set at install (decision 0010), not edited.
+
 ## Update: 2026-09-28 (Configuration page: the ICAP preview control, RFC 0020, bootstrap; by track 13)
 
 - **Every setting in the real schema has a real control.** `config-model.ts` models the

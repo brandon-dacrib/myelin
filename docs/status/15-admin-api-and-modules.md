@@ -5,6 +5,18 @@ Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-a
 Last updated: 2026-09-28 (the Rooms area, 23/23; Users' devices-and-identity half; and the Cluster area, 6/6; all below); before that 2026-09-27 (media, registration tokens and server notices, reports, tasks and statistics, below; before that the bridge
 offering operations); before that 2026-09-26 (three public recovery operations); 2026-09-25 (additive schema change for the bridges wizard); the session log that follows is from 2026-09-19 (session 6).
 
+> **2026-09-28, served for real: Migration 8/8 (by track 13).** `crates/hs-admin/src/migration.rs`:
+> `migration.get`, `.log` (paged), `.start`, `.pause`, `.resume`, `.abort` (each answers the
+> status; a control that changes nothing is answered and not recorded; `409` with the reason for
+> one the status does not allow, `400` for a missing or unusable source) and `.verify`,
+> `.cutover` (`202`, the task, `Location`). Every change is audited (`migration.*`) and
+> published (`migration.started`, `.paused`, `.resumed`, `.aborted`, `.verifying`,
+> `.cutting_over`; the engine adds `.ready_for_cutover`, `.verified`, `.completed`, `.failed`).
+> Through `MigrationSource` (`AdminState::with_migration`), implemented by
+> `hs_compat::migration::Migrator`. `openapi.yaml` additions are additive (status fields and
+> `MigrationVerification`). `tools/admin_api_coverage.py`: **140 of 158** with Rooms 23/23 (below). The 501-seam test now
+> asks `/api/v1/federation/keys`. See `docs/status/13-config-compat-and-migration.md`.
+
 > **2026-09-28, served for real: Rooms 23/23.** `tools/admin_api_coverage.py` counts **132 of
 > 158** operations with a real handler, with Users' half below (Rooms was 6/23).
 >
