@@ -1,13 +1,7 @@
 import { useState, type ReactNode } from "react";
 import { useParams, Link } from "@tanstack/react-router";
 import { ChevronLeft } from "lucide-react";
-import {
-  useUser,
-  useLockUser,
-  useUnlockUser,
-  useLogoutUser,
-  useDeactivateUser,
-} from "@/api/users";
+import { useUser, useLockUser, useUnlockUser, useLogoutUser, useDeactivateUser } from "@/api/users";
 import { Button } from "@/components/ui/button/Button";
 import { Badge } from "@/components/ui/badge/Badge";
 import { Dialog, DialogTrigger, DialogClose, DialogContent } from "@/components/ui/dialog/Dialog";
