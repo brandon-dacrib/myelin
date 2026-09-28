@@ -518,6 +518,13 @@ impl PurgeRun<'_> {
                 .with_resource(target)
                 .with_actor(principal.to_actor()),
         );
+        // The answer's `Location` names this task, so it goes where `tasks.get` looks. The
+        // deletions have happened either way, so a store failure is logged, not answered.
+        if let Some(tasks) = &state.tasks
+            && let Err(error) = tasks.record_finished(task.clone()).await
+        {
+            tracing::warn!(%error, task = %task.id, "bulk media deletion: could not record its task");
+        }
 
         let body = serde_json::to_vec(&task).unwrap_or_default();
         if let Some(key) = idempotency_key(headers) {
@@ -1078,6 +1085,7 @@ mod tests {
         if let Some(media) = media {
             state = state.with_media(Arc::new(media));
         }
+        let state = state.with_tasks(crate::tasks::TaskRegistry::in_memory());
         let (router, _manifest) = build_router(state);
         Harness { router, events }
     }
@@ -1495,6 +1503,19 @@ mod tests {
         assert_eq!(rx.recv().await.unwrap().r#type, "media.deleted");
         assert_eq!(rx.recv().await.unwrap().r#type, "task.succeeded");
         assert_eq!(audit(&h, "media.delete_bulk").await.len(), 1);
+        // The `Location` answers: the finished task is in the registry the Tasks page reads.
+        let (status, _, fetched) = call(
+            &h,
+            "admin-token",
+            "GET",
+            headers.get("location").unwrap().to_str().unwrap(),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{fetched}");
+        assert_eq!(fetched["status"], "succeeded");
+        assert_eq!(fetched["result"]["deleted_count"], 1);
 
         let (_, _, page) = call(&h, "admin-token", "GET", "/api/v1/media", None, &[]).await;
         assert!(!ids(&page).contains(&"old".to_owned()));
