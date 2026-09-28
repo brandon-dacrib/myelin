@@ -1,6 +1,107 @@
 # 16. Management web interface: status
 
-## Current update: 2026-09-26 (bridge offerings, RFC 0017)
+## Current update: 2026-09-27 (Reports, Tasks, Statistics; branch `agent/admin-web-pages`)
+
+The pages for the server side track 15 built on `agent/reports-tasks-stats` (Reports 4/4,
+Tasks 3/3, Statistics 4/4). Client regenerated (`npm run generate:client`). Everything reads the
+real operations through the generated client. No page reads a 501, and nothing is edited as text
+(decision 0010).
+
+- **Hooks**: `src/api/reports.ts` (`useReports`, `useReport`, `useResolveReport`,
+  `useDeleteReport`; a resolve refreshes the report, the queue and the Overview count, and so
+  does a refused one, so a 409 shows whoever decided first), `src/api/tasks.ts` (`useTasks`
+  polls every 3 s while anything listed is running, `useTask` every 2 s while it is running or
+  scheduled, `useCancelTask`), `src/api/statistics.ts` (`useTimeseries(metric, range)` with
+  `RANGES` 24h/1h, 7d/6h, 30d/1d, 90d/1d, where the window is computed inside the query function
+  so the key stays stable; `useRoomStatistics`, `useUserMediaStatistics`; `isCounter`).
+  `useStatisticsOverview` takes `enabled`.
+- **Reports** (`/reports`, `/reports/$reportId`; `pages/reports/`): the queue opens on
+  `status=open` and filters by status, kind, order (newest, oldest, most offensive) and
+  `room_id`, all in the URL. The detail page shows what the reporter said, the reported message
+  as the server holds it now (redacted shown as redacted, "does not hold the message" when
+  `event` is null), reporter, sender or reported user, and room (each a link to the page where
+  something can be done about them), score in words, and the ids. While a report is open,
+  **Decide** is a radio card per resolution, each with a hint, plus a note (required for
+  "Something else"). The button reads "Dismiss report" for `no_action` and "Resolve report"
+  otherwise. The page says outright that recording a decision does not act on its own. Once a
+  report is closed it shows the decision instead: what was done, when, by whom, and the note.
+  **Delete report** sits behind a confirm dialog. A read-only moderator sees no form.
+- **Tasks** (`/tasks`, `/tasks/$taskId`; `pages/tasks/`): the list filters by status and by kind
+  (the `action` prefix families room./user./media./appservice./federation./migration.), shows a
+  progress bar under a running task's badge, and names the server as "The server" when it
+  started the task. The detail page has a live progress bar (a real `progressbar`), the failure's
+  problem as an alert, on / started by / created / runs at / started / finished / took, and the
+  result (a flat record as facts, anything else as read-only JSON). **Cancel task** asks first
+  and says "It will not run" for a scheduled task and "nothing is rolled back" for a running one.
+- **Statistics** (`/statistics`; `pages/statistics/`): a range select (URL `range`); **Now**
+  tiles from `statistics.overview`; **Activity** charts for daily active users, new accounts,
+  media uploaded, reports received, accounts and media stored. Each chart has a headline number
+  (the total over the range for a counter, the latest sample for a gauge). **Largest rooms** and
+  **Media by person** tables have server-side sort and cursor, both in the URL.
+  `components/TimeseriesChart.tsx`, a new shared chart: bars for counters, a line for gauges that
+  breaks at gaps in the samples rather than bridging them, one axis with whole-number gridlines
+  for counts, a crosshair and tooltip, "Show as table" (a keyboard-scrollable region), and a
+  summary `aria-label`. Colours are tokens, so it works in dark mode unchanged.
+- **Overview**: an **Activity** strip of four sparkline tiles (daily active users as a 7-day
+  trend, then new accounts, media uploaded and reports received over 7 days), each linking to
+  Statistics, with a tile's own "Not implemented" or "Unavailable" when its series fails. The
+  attention list gains a row for each task that failed in the last day ("Open task"), and
+  "tasks" joins the "It can't check ..." list when `/tasks` fails.
+- **Navigation**: Statistics (`admin:read`) after Media, and Tasks (`admin:read`) before Audit
+  log. The sidebar shows the open-report count on Reports. `ResourceLink` and the audit log now
+  link `report` and `task` targets to their pages.
+- **Mocks** (`src/mocks/data/reports.ts`, `tasks.ts`, `statistics.ts`, with handlers in
+  `handlers.ts`), shaped like the Rust wire types:
+  - Six reports: four open (an event report with a held event, a redacted one, a user report
+    and a room report), one resolved, one dismissed. Resolve gives 409 on a closed report and 400
+    on an unknown resolution; sort takes the server's four values; `event` is present on GET-one
+    only.
+  - Six tasks, one of which is a remote-media purge that runs on a 20-second clock, so polling
+    can be watched. Cancel follows the server's best-effort rules.
+  - Statistics: counters have a point for every step; gauges have points only for the last 21
+    days of "sampling". Steps are epoch-aligned, with the 1000-point limit and the 400 cases.
+  - The Overview's `pending_reports_count` counts open mock reports.
+  - Reports and tasks reset after every Vitest test.
+- **Tests**: Vitest now covers 31 files and 224 tests.
+  - `ReportsPage.test.tsx` (15): queue, URL to query, empty state, 501, forbidden, detail,
+    resolve with body, dismiss, validation, 409, redacted, closed, read-only, delete, 404.
+  - `TasksPage.test.tsx` (8).
+  - `StatisticsPage.test.tsx` (9).
+  - `DashboardPage.test.tsx` (+3: failed task row, sparklines, a failing series).
+  - `lib/reports.test.ts`, `lib/tasks.test.ts`, `format.test.ts` (+2), and
+    `mocks/data/statistics.test.ts`.
+  - Playwright: `e2e/reports-tasks-statistics.spec.ts` (5), with axe clean at every step and the
+    DOM-nesting guard. Flows: Overview to the reports queue to a decision, with the queue and
+    sidebar counts updating; filters in the URL and back; Overview failed task to the Tasks list
+    to a running task whose progress moves by polling, then cancelled; read-only with no cancel;
+    Overview activity to Statistics, a range change, the tooltip, the table view, and sorting.
+- **Screenshots** (`docs/design/screenshots/`): `overview-activity(-dark)`, `reports-queue`,
+  `report-detail-open`, `report-detail-resolved`, `tasks-list`, `task-running`, `task-failed`,
+  `statistics(-dark)`, `statistics-phone`.
+
+Checks: `npm run check` green (eslint 0 errors and the 4 pre-existing react-refresh warnings;
+31 files, 224 tests; build). `npm run test:e2e`: 31 passed.
+
+> **Where this stopped** (2026-09-27):
+> - Done and verified against mocks: everything above.
+> - **Not run against the real binary.** This session's machine had no Rust toolchain
+>   (`cargo: command not found`), so `hs serve` could not be built. Next, on a machine with one:
+>   start `cargo run -p hs-cli --bin hs -- serve ...` and `npm run dev:real`, then walk Reports
+>   (file one with `POST /rooms/{id}/report/{eventId}` from a client), Tasks (an
+>   `appservices.replay`) and Statistics (a fresh server shows gauges with a short history and
+>   the counters' zeros). Worth checking: the real `Report.event.content` shape, and the
+>   `resource` of a replay task.
+> - Not built: the reported user's other reports on the report page (`GET /reports` has no
+>   `reported_user_id`/`reporter_id` filter, which is a contract ask for track 15); actions
+>   straight from a report (suspend is still a 501, and redacting an event has no admin
+>   operation); live `report.created`/`task.changed` over the SSE stream (the pages poll
+>   instead); the Settings section, where the IA puts scheduled tasks. Tasks has its own top-level
+>   page for now.
+> - Decisions: Tasks and Statistics are top-level sections (Tasks moves under Settings if
+>   Settings is ever built). A decision on a report is recorded, not enacted, and the page says
+>   so. A counter's headline is its total over the range and a gauge's is its latest sample.
+
+## Update: 2026-09-26 (bridge offerings, RFC 0017)
 
 **Bridges are offerings first.** The management half of RFC 0017
 (`docs/rfcs/0017-the-server-deploys-its-own-bridges.md`): an administrator offers a bridge type,

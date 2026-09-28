@@ -70,6 +70,8 @@ export function targetRoute(
   | { to: "/bridges/$bridgeId"; params: { bridgeId: string } }
   | { to: "/federation/$serverName"; params: { serverName: string } }
   | { to: "/configuration/$section"; params: { section: string } }
+  | { to: "/reports/$reportId"; params: { reportId: string } }
+  | { to: "/tasks/$taskId"; params: { taskId: string } }
   | null {
   switch (target.type) {
     case "user":
@@ -82,6 +84,10 @@ export function targetRoute(
       return { to: "/federation/$serverName", params: { serverName: target.id } };
     case "config_section":
       return { to: "/configuration/$section", params: { section: target.id } };
+    case "report":
+      return { to: "/reports/$reportId", params: { reportId: target.id } };
+    case "task":
+      return { to: "/tasks/$taskId", params: { taskId: target.id } };
     default:
       return null;
   }
@@ -118,6 +124,7 @@ const ACTION_PHRASES: Record<string, string> = {
   "media.delete_one": "Deleted media",
   "media.purge_remote_cache": "Purged remote media cache",
   "reports.resolve": "Resolved report",
+  "reports.delete": "Deleted report",
   "server_notices.send": "Sent server notice",
   "migration.cutover": "Cut over migration",
   "migration.abort": "Aborted migration",

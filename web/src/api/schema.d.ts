@@ -1705,7 +1705,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** A metric's time series */
+        /**
+         * A metric's time series
+         * @description Counters (users.registered, media.uploaded, media.uploaded_bytes, reports.received) count what happened in each step, from the records' own timestamps, with 0 for a quiet step. Gauges (the StatisticsOverview field names) are the Overview's numbers sampled periodically by the server; a step with no sample has no point. from defaults to seven days before until, until to now; step (15m, 1h, 1d...) defaults to about a hundred points or fewer. At most 1000 points.
+         */
         get: operations["statistics.timeseries"];
         put?: never;
         post?: never;
@@ -2891,23 +2894,40 @@ export interface components {
         ReplicaPage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["Replica"][];
         };
+        /** @description A report filed through the client-server API (POST /rooms/{roomId}/report/{eventId}, POST /rooms/{roomId}/report, POST /users/{userId}/report). Resolving with no_action dismisses it; any other resolution resolves it. Either closes it for good. */
         Report: {
+            /** @description The reported event as this server now holds it (type, sender, origin_server_ts, content; redacted content shows redacted). Only on GET /reports/{id}, and only for an event report whose event this server has. */
+            event?: {
+                content?: Record<string, never>;
+                event_id?: string;
+                origin_server_ts?: number;
+                redacted?: boolean;
+                sender?: string;
+                type?: string;
+            } | null;
             event_id?: string | null;
-            id?: string;
-            /** @enum {string} */
-            kind?: "event" | "user";
+            id: string;
+            /**
+             * @description event (one event in a room), room (a whole room) or user.
+             * @enum {string}
+             */
+            kind: "event" | "room" | "user";
             reason?: string | null;
             /** Format: date-time */
-            received_at?: string;
+            received_at: string;
             reported_user_id?: string | null;
-            reporter_id?: string;
+            reporter_id: string;
             /** @enum {string|null} */
             resolution?: "no_action" | "warned" | "redacted" | "suspended" | "deactivated" | "room_blocked" | "other" | null;
             resolution_note?: string | null;
+            /** Format: date-time */
+            resolved_at?: string | null;
+            /** @description The user id of whoever closed it. */
+            resolved_by?: string | null;
             room_id?: string | null;
             score?: number | null;
             /** @enum {string} */
-            status?: "open" | "resolved" | "dismissed";
+            status: "open" | "resolved" | "dismissed";
         };
         ReportPage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["Report"][];
@@ -5924,7 +5944,7 @@ export interface operations {
                 cursor?: components["parameters"]["Cursor"];
                 /** @description Ask for the total count. Only honoured where a count is cheap; otherwise total is omitted. */
                 include_total?: components["parameters"]["IncludeTotal"];
-                kind?: "event" | "user";
+                kind?: "event" | "room" | "user";
                 /** @description Page size. Values above the resource's max are clamped, not rejected. */
                 limit?: components["parameters"]["Limit"];
                 room_id?: string;
@@ -7163,7 +7183,7 @@ export interface operations {
         parameters: {
             query: {
                 from?: string;
-                metric: string;
+                metric: "users.registered" | "media.uploaded" | "media.uploaded_bytes" | "reports.received" | "users_count" | "rooms_count" | "daily_active_users" | "monthly_active_users" | "media_count" | "media_bytes" | "pending_reports_count" | "federation_destinations_failing_count";
                 step?: string;
                 until?: string;
             };
@@ -7228,6 +7248,7 @@ export interface operations {
     "tasks.list": {
         parameters: {
             query?: {
+                /** @description An action (media.purge_remote_cache), or a prefix ending in a dot (media.). */
                 action?: string;
                 /** @description Opaque keyset cursor from a previous page's next_cursor or prev_cursor. */
                 cursor?: components["parameters"]["Cursor"];
@@ -7235,7 +7256,7 @@ export interface operations {
                 include_total?: components["parameters"]["IncludeTotal"];
                 /** @description Page size. Values above the resource's max are clamped, not rejected. */
                 limit?: components["parameters"]["Limit"];
-                status?: string;
+                status?: "scheduled" | "running" | "succeeded" | "failed" | "cancelled";
             };
             header?: never;
             path?: never;

@@ -1,5 +1,5 @@
 import { useMemo, type ReactNode } from "react";
-import { formatCount, formatUptime, joinWithOr } from "@/lib/format";
+import { formatBytes, formatCount, formatUptime, joinWithOr } from "@/lib/format";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { CheckCircle2, TriangleAlert, CircleX, Info } from "lucide-react";
 import {
@@ -10,6 +10,11 @@ import {
   useRecentAuditEntries,
 } from "@/api/dashboard";
 import { useAppservices, deriveDisplayName } from "@/api/bridges";
+import { useTasks } from "@/api/tasks";
+import { isCounter, useTimeseries, type Metric } from "@/api/statistics";
+import { Sparkline } from "@/components/Sparkline";
+import { hasScope } from "@/lib/auth";
+import { describeTaskAction } from "@/lib/tasks";
 import { classifyError } from "@/api/problem";
 import { Badge } from "@/components/ui/badge/Badge";
 import { QueryProblemState } from "@/components/QueryProblemState";
@@ -40,6 +45,7 @@ export function DashboardPage() {
   const appservices = useAppservices({ limit: 50 });
   const federation = useFederationDestinations(50);
   const auditLog = useRecentAuditEntries(5);
+  const failedTasks = useTasks({ status: "failed", limit: 20 });
 
   const isLoading =
     stats.isLoading ||
@@ -64,6 +70,7 @@ export function DashboardPage() {
   if (appservices.isError) unchecked.push("bridges");
   if (federation.isError) unchecked.push("federation");
   if (stats.isError || stats.data?.pending_reports_count == null) unchecked.push("reports");
+  if (failedTasks.isError) unchecked.push("tasks");
 
   const unhealthyBridges = useMemo(
     () => (appservices.data?.items ?? []).filter((b) => b.health !== "healthy" && !b.paused),
@@ -102,6 +109,20 @@ export function DashboardPage() {
         actionHref: "/federation",
       });
     }
+    for (const task of failedTasks.data?.items ?? []) {
+      // Same deliberate clock read as above: "failed in the last day" is about now.
+      // eslint-disable-next-line react-hooks/purity -- see comment above
+      const nowMs = Date.now();
+      const endedAt = Date.parse(task.finished_at ?? task.created_at);
+      if (nowMs - endedAt > 24 * 3_600_000) continue;
+      rows.push({
+        id: `task-${task.id}`,
+        severity: "danger",
+        summary: `Task "${describeTaskAction(task.action)}" failed${task.error?.detail ? `: ${task.error.detail}` : "."}`,
+        actionLabel: "Open task",
+        actionHref: `/tasks/${task.id}`,
+      });
+    }
     if ((stats.data?.pending_reports_count ?? 0) > 0) {
       rows.push({
         id: "pending-reports",
@@ -112,7 +133,7 @@ export function DashboardPage() {
       });
     }
     return rows;
-  }, [unhealthyBridges, failingDestinations, stats.data]);
+  }, [unhealthyBridges, failingDestinations, stats.data, failedTasks.data]);
 
   const singleNode = (cluster.data?.replica_count ?? 1) <= 1;
 
@@ -271,6 +292,8 @@ export function DashboardPage() {
           </div>
         </section>
 
+        {hasScope("admin:read") && <ActivityStrip />}
+
         <div className="grid grid-cols-1 gap-8 xl:grid-cols-2">
           {/* Bridges strip */}
           <section aria-labelledby="bridges-strip-heading">
@@ -421,6 +444,79 @@ export function DashboardPage() {
         </section>
       </div>
     </div>
+  );
+}
+
+const ACTIVITY: { metric: Metric; label: string; format: (value: number) => string }[] = [
+  { metric: "daily_active_users", label: "Daily active, 7-day trend", format: formatCount },
+  { metric: "users.registered", label: "New accounts, 7 days", format: formatCount },
+  { metric: "media.uploaded_bytes", label: "Media uploaded, 7 days", format: formatBytes },
+  { metric: "reports.received", label: "Reports received, 7 days", format: formatCount },
+];
+
+/**
+ * The last seven days at a glance (`GET /statistics/timeseries`): a sparkline and one number per
+ * metric -- the total for a counter, the latest sample for a gauge. Each links to Statistics.
+ */
+function ActivityStrip() {
+  return (
+    <section aria-labelledby="activity-heading">
+      <div className="flex items-baseline justify-between gap-3">
+        <h2 id="activity-heading" className="text-md font-medium text-text">
+          Activity
+        </h2>
+        <Link to="/statistics" className="text-sm text-accent hover:underline">
+          All statistics
+        </Link>
+      </div>
+      <div className="mt-3 grid grid-cols-2 gap-3 xl:grid-cols-4">
+        {ACTIVITY.map((item) => (
+          <ActivityTile key={item.metric} {...item} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ActivityTile({
+  metric,
+  label,
+  format,
+}: {
+  metric: Metric;
+  label: string;
+  format: (value: number) => string;
+}) {
+  const series = useTimeseries(metric, "7d");
+  const points = (series.data?.points ?? []).map((p) => ({ value: p.value ?? 0 }));
+  const value = isCounter(metric)
+    ? points.reduce((sum, p) => sum + p.value, 0)
+    : points[points.length - 1]?.value;
+  return (
+    <Link
+      to="/statistics"
+      className="block rounded-md border border-border bg-surface p-4 hover:bg-surface-sunken focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus)]"
+    >
+      <p className="text-xs text-text-muted">{label}</p>
+      {series.isLoading ? (
+        <Skeleton className="mt-2 h-12" />
+      ) : (
+        <>
+          <div className="mt-1 text-2xl text-text tabular-nums">
+            {series.isError ? (
+              <TileProblem error={series.error} />
+            ) : value == null ? (
+              "—"
+            ) : (
+              format(value)
+            )}
+          </div>
+          {!series.isError && points.length > 1 && (
+            <Sparkline points={points} className="mt-2 h-7 w-full text-accent" />
+          )}
+        </>
+      )}
+    </Link>
   );
 }
 

@@ -1,5 +1,25 @@
 import { describe, expect, it } from "vitest";
-import { formatCount, formatUptime, joinWithOr } from "./format";
+import { formatBytes, formatCount, formatDuration, formatUptime, joinWithOr } from "./format";
+
+describe("formatBytes", () => {
+  it("uses binary units, and a dash for a size the server did not send", () => {
+    expect(formatBytes(512)).toBe("512 B");
+    expect(formatBytes(1536)).toBe("1.5 KiB");
+    expect(formatBytes(38 * 1024 ** 3)).toBe("38.0 GiB");
+    expect(formatBytes(0)).toBe("0 B");
+    expect(formatBytes(undefined)).toBe("—");
+  });
+});
+
+describe("formatDuration", () => {
+  it("says a duration the way an operator would", () => {
+    expect(formatDuration(400)).toBe("under a second");
+    expect(formatDuration(40_000)).toBe("40s");
+    expect(formatDuration(130_000)).toBe("2m 10s");
+    expect(formatDuration(3_900_000)).toBe("1h 5m");
+    expect(formatDuration(26 * 3_600_000)).toBe("1d 2h");
+  });
+});
 
 describe("formatCount", () => {
   it("shows a real zero as zero, and a missing number as a dash", () => {

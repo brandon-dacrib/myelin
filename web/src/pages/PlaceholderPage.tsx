@@ -3,7 +3,6 @@ import { useRouterState } from "@tanstack/react-router";
 import { EmptyState } from "@/components/ui/empty-state/EmptyState";
 
 const TITLES: Record<string, string> = {
-  reports: "Reports",
   media: "Media",
   cluster: "Cluster",
   migration: "Migration",

@@ -11,6 +11,8 @@ import {
   ArrowRightLeft,
   ScrollText,
   Settings,
+  ChartLine,
+  ListChecks,
   SlidersHorizontal,
 } from "lucide-react";
 import type { Scope } from "@/lib/auth";
@@ -61,6 +63,13 @@ export const navItems: NavItem[] = [
     shortcut: "g f",
   },
   { id: "media", label: "Media", href: "/media", icon: Image, scope: "admin:read" },
+  {
+    id: "statistics",
+    label: "Statistics",
+    href: "/statistics",
+    icon: ChartLine,
+    scope: "admin:read",
+  },
   { id: "cluster", label: "Cluster", href: "/cluster", icon: Boxes, scope: "admin:read" },
   {
     id: "migration",
@@ -69,6 +78,7 @@ export const navItems: NavItem[] = [
     icon: ArrowRightLeft,
     scope: "admin:write",
   },
+  { id: "tasks", label: "Tasks", href: "/tasks", icon: ListChecks, scope: "admin:read" },
   { id: "audit", label: "Audit log", href: "/audit", icon: ScrollText, scope: "admin:read" },
   {
     id: "configuration",
