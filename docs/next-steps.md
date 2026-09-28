@@ -393,7 +393,7 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 | Configuration and first run | ~90% | database-backed, editable in the UI, one command from nothing to a working server |
 | Admin API | ~61% | 97 of 158 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Bridges 26/26, Media 9/9, Config 6/6, RegistrationTokens 5/5, Server 5/5, Reports 4/4, Statistics 4/4, AuditLog 3/3, Recovery 3/3, Tasks 3/3, ServerNotices 2/2, Setup 2/2, Events 1/1, Users 14/41, Rooms 6/23, Federation 3/7, Cluster 1/6, and Migration 0/8 |
 | Management web interface | ~80% | users (with devices, sign-out and password reset), rooms (with members), bridges (the catalogue, the wizard with the bridge's own config, the runbook, sign-in guides), federation destinations, media (previews, quarantine, protection, deletion, cache purge), registration tokens and invite links, server notices, configuration (lists, variants and maps as forms, decision 0010) and the audit log are real against the real server; the Reports, Tasks and Statistics pages and the Overview sparklines are not built on their (now real) operations |
-| **Federation** | **~30%** | 75/250 assertions, 14/88 top-level (run 7); a user here joins a room hosted elsewhere through the client API, messages flow both ways between two real servers, and the room's history from before the join is fetched as the client scrolls back; the outbound queue survives a restart and is shard-gated; no EDUs, no invites/leaves/knocks over federation |
+| **Federation** | **~30%** | 75/250 assertions, 14/88 top-level (run 7); a user here joins a room hosted elsewhere through the client API, messages flow both ways between two real servers, and the room's history from before the join is fetched as the client scrolls back; the outbound queue survives a restart and is shard-gated; invites, leaves, knocks and restricted joins cross servers; typing, receipts, presence, device lists, cross-signing keys (`m.signing_key_update`) and to-device messages cross in both directions, with EDU metrics; in cluster mode a non-owning replica drops request-born EDUs instead of forwarding them |
 | Bridges | ~75% | heisenbridge works end to end both directions (`docs/bridges/heisenbridge.md`); mautrix-whatsapp, added through the wizard, connects and starts in appservice-mode encryption (`docs/bridges/mautrix.md`); all 26 bridge operations are real; offerings and per-user instances (RFC 0017) run end to end against the real binary with the `elsewhere` runtime, a real heisenbridge reaching `ready` from the rendered files and the interface's flow passing as Playwright against the real server; no mautrix bridge has carried a message yet, because signing in needs a phone; the `cluster` runtime and the operator have not run against Kubernetes |
 | Operations (HA, scale-out) | ~50% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; the chart is published from `main` and installs from the registry in one sentence; a standing demo behind a Traefik Ingress with a Let's Encrypt certificate, scraped by Prometheus, its setup page opened in a browser at the public hostname; a locked-out administrator gets back in with `hs recover` run where the key is; readiness withdrawn the moment a shutdown begins; two replicas share a room on one PostgreSQL and a client's `/sync` works from either, woken over the mesh, with read-your-writes across them; the outbound federation sender is shard-gated; the cluster path has never carried real traffic on a cluster; the operator reconciles a `Bridge` into a pod, a Service and a volume in unit tests and has never been run against an API server, and `Homeserver` is still status-only |
 
@@ -465,7 +465,7 @@ Semantic conflicts the compiler found: two `MediaRecord` test initializers witho
 | `reports-tasks-stats` | The Reports, Tasks and Statistics pages and the Overview sparklines (built by `admin-web-pages`, merged in the second round below) | 2a |
 | `media-admin` | `rooms.media.*`, `users.media.*`; paging the media listing; bulk operations on `state.tasks.spawn` (see above); RFC 0004 against the document on moderator read scope | 2e, 2g |
 | `federation-membership` | `createRoom`'s `invite` list for remote users; a reject fallback when no resident server helps; neutral error text; restricted joins; Complement | 3 |
-| `federation-edus` | To-device over federation; `m.signing_key_update`; in cluster mode, EDUs only through the owning replica. Its unrun `clippy`/`test -p hs-cli` are now run and green | 3 |
+| `federation-edus` | ~~To-device over federation; `m.signing_key_update`~~ (done 2026-09-28, `federation-to-device`); in cluster mode, EDUs only through the owning replica. Its unrun `clippy`/`test -p hs-cli` are now run and green | 3 |
 | `two-pod-cluster` | Nothing installed: the verification cluster's etcd is slow (owner). `deploy/two-pod/verify.py` and `failover.py` are written but not run; the SeaweedFS fix in `my-infra/.../apps/myelin-cluster/s3.yaml` is not applied and that directory is not committed; `storage.postgres.sslMode` is ignored (the server connects `NoTls`). Resume steps at the top of `docs/status/03-cluster.md` | 6 |
 
 **Second round (2026-09-28): two more branches.** `agent/admin-web-pages` (the Reports,
@@ -587,13 +587,18 @@ edit one is not. New settings and operations arrive with their interface control
    `federation-edus`); ~~`createRoom`'s `invite` list for remote users, restricted joins over
    federation, a local reject fallback when no resident helps, neutral error text~~ **done
    2026-09-28** (`federation-membership-2`, six two-server tests in
-   `crates/hs-cli/tests/federation_membership.rs`). Left, in order
+   `crates/hs-cli/tests/federation_membership.rs`); ~~to-device over federation (with
+   `message_id` dedupe), `m.signing_key_update`~~ **done 2026-09-28**
+   (`federation-to-device`: two-server tests in `crates/hs-cli/tests/federation_edus.rs`, EDU
+   metrics `hs_federation_edus_{sent,received}_total`). Left, in order
    (`docs/status/06-federation.md`): a local user's join to a restricted room on its own
    server still needs the client to name an authoriser (`hs_room::actor::membership_action`
    should pick one as `make_join` does); when every resident refuses with
    `M_UNABLE_TO_AUTHORISE_JOIN`, fall back to the allowed rooms' servers; the invite and knock
-   stripped state kept in `unsigned` shows in the invitee's timeline rendering; to-device over
-   federation; `m.signing_key_update`; EDUs in cluster mode only through the owning replica;
+   stripped state kept in `unsigned` shows in the invitee's timeline rendering; EDUs in
+   cluster mode only through the owning replica (today a non-owning replica drops typing,
+   receipts, presence and to-device EDUs for destinations it does not send for; the design is
+   in status 06's twelfth session, and it needs a two-replica mesh test and the cluster);
    and Complement (`TestRestrictedRoomsRemoteJoin*`, `TestFederationRoomsInvite`,
    `TestKnocking`, `TestFederationRejectInvite`), a desktop item.
 4. ~~Receipts and presence durable across a restart~~ **done 2026-09-27** (`federation-edus`);

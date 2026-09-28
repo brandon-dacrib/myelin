@@ -1,5 +1,96 @@
 # 06 Federation: status
 
+## Twelfth session (2026-09-28): to-device messages and `m.signing_key_update` over federation
+
+Scope: `docs/next-steps.md` section 3's "to-device over federation; `m.signing_key_update`; EDUs
+in cluster mode only through the owning replica". Branch `agent/federation-to-device`, off
+`origin/main`, built on main's EDU design (`FederationSender::enqueue_edu`,
+`FederationState::edu_sink`, `hs_cli::edus`). The superseded `worktree-agent-ab238ddfa2a8532e6`
+(a different EDU design, `edu_queue.rs`) was read for reference and not merged. Touched `hs-e2e`
+(the to-device hook and the inbound half), `hs-cli` (`edus.rs`, `serve.rs`) and this crate.
+
+**Done and verified by running:**
+
+- **To-device, both directions.** `/sendToDevice` hands each remote server's share to
+  `hs_e2e::federation::ToDeviceOutbox` (implemented by `hs_cli::edus::SenderEduOutbox` over the
+  sender, never coalesced) as `m.direct_to_device` with a fresh `message_id`, split per user and
+  then per device past 65 000 bytes. Inbound, `hs_cli::edus::EduDispatcher` calls
+  `hs_e2e::federation::receive_direct_to_device`: sender must belong to the origin, each
+  `(sender, message_id)` is delivered once (durable, in `hs_e2e.to_device_txn`), `*` fans out to
+  every device. Details in `docs/status/08-e2ee.md`.
+- **`m.signing_key_update`.** `hs_cli::edus::DeviceListAnnouncer` remembers, per local user,
+  what it last announced (device keys, master and self-signing keys) and sends only the
+  difference: `m.device_list_update` per device added, changed or deleted (`deleted: true`,
+  new), `m.signing_key_update` when a cross-signing key changed. A cross-signing change used to
+  re-announce every device as a device-list update. The first change seen for a user after start
+  announces everything, as before.
+- **Metrics and logs.** New `hs_federation::metrics::EduMetrics`:
+  `hs_federation_edus_sent_total{edu_type}` (counted by the sender when a destination accepts the
+  transaction) and `hs_federation_edus_received_total{edu_type,outcome}` (`applied`,
+  `duplicate`, `dropped`; counted by the dispatcher). `edu_type` is one of the six handled types
+  or `other`. These are the first EDU metrics; they cover every EDU type, not only the new ones.
+  Every EDU sent (per EDU, after acceptance) and received (with its outcome) is logged at debug.
+  `hs-federation` now depends on `prometheus-client` (already a workspace dependency).
+- **Also ported** from the superseded `worktree-agent-a50b12a502b9ab4e5`: a cap of 64 on the
+  stripped state kept from a received invite or knock (`stripped::MAX_RECEIVED_STRIPPED_STATE`).
+  The rest of that branch is on main already (audited behaviour by behaviour; its remaining
+  differences are test scenarios and the `make_knock`-on-an-old-room-version status, 400 here, 403
+  in Synapse).
+
+Tests (all fail with the fix turned off, checked by editing the code and running them):
+
+- `crates/hs-cli/tests/federation_edus.rs::to_device_messages_cross_between_servers_in_both_directions_once`:
+  two in-process servers; alice (A) sends two messages to bob's device (and retries one request),
+  bob's `/sync` on B has exactly the two, in order, and nothing more a sync later; bob sends to
+  `*` of alice's devices and to himself in one request, alice's `/sync` on A has hers; each
+  server's `/metrics` counts the EDUs sent and received. Fails with the outbox not installed
+  (`only 0 of 2 to-device messages ... reached`) and with the dispatcher dropping
+  `m.direct_to_device`.
+- `...::a_cross_signing_key_change_is_a_signing_key_update_on_the_other_server`: alice's device
+  keys are announced first; then she uploads a master key; bob's `/sync` on B has alice in
+  `device_lists.changed`, B counts an applied `m.signing_key_update`, A counts one sent, and B's
+  `/keys/query` returns the new master key. Fails with the `m.signing_key_update` not queued (the
+  sync never shows the change).
+- `crates/hs-e2e/tests/remote_to_device.rs` (4): one EDU per server with distinct `message_id`s
+  and the local share delivered here, no outbox answers 200, an inbound `message_id` delivered
+  once (fails with the dedupe off), a forged sender or missing `message_id` dropped.
+- Unit: `hs_e2e::federation::tests::{a_small_share_is_one_edu_with_the_message_id_as_given,
+  a_share_too_large_for_one_edu_is_split_by_user_then_device_and_each_part_has_its_own_id}`,
+  `hs_cli::edus::tests::{the_first_change_seen_for_a_user_announces_everything,
+  a_cross_signing_change_is_a_signing_key_update_and_nothing_else,
+  only_changed_and_deleted_devices_are_announced_after_the_first_change}`,
+  `hs_federation::metrics::tests::edus_are_counted_by_type_and_an_unknown_type_is_other`,
+  `hs_federation::stripped::tests::at_most_a_bounded_number_of_received_entries_are_kept`, and
+  `sender::tests::an_edu_rides_with_waiting_pdus_and_goes_alone_when_nothing_waits` now also
+  checks the sent counter.
+
+**Not done: EDUs in cluster mode only through the owning replica.** It does not fit cleanly in
+this change, and could not be verified here (no cluster). Today the sender *drops* an EDU for a
+destination whose federation shard another replica owns (`FederationSender::enqueue_edu`). That
+is right for the device-list announcer (every replica follows the shared stream, so the owner
+announces it) and wrong for typing, receipts, presence and to-device messages, which only the
+replica that took the request knows about. The fix, for whoever picks it up:
+1. `hs-federation`: an `EduForwarder` hook on the sender, called instead of dropping, plus an
+   `enqueue_edu_local` (or a flag) for the announcer, which must never forward (every replica
+   would forward the same update).
+2. `hs-cli`: a mesh route (`federation.edu`) over `hs_cluster::mesh::Forwarder::send_to_peer` to
+   `ownership.owner_of(layout.federation_shard(destination))`, whose handler calls
+   `enqueue_edu_local`. `ClusterHandles` takes one `PeerHandler` (`OnceLock`), which
+   `sync_cluster::SessionPeerHandler` holds, so it needs a small route multiplexer first.
+3. A two-replica test with a real mesh, which does not exist in `hs-cli/tests` yet, and a run on
+   the cluster (a desktop item).
+
+**Decisions made:**
+
+- The inbound dedupe key is `(sender, message_id)`, stored in the existing to-device
+  idempotency table under a pseudo-device, rather than Synapse's `(origin, message_id)` in a new
+  table: the sender belongs to the origin (checked), so it is at least as strict, and no new
+  keyspace is needed.
+- Each part of a split share gets the base `message_id` with a `-n` suffix: a receiver
+  delivers each `message_id` once, so parts must differ.
+- EDU metrics live in `hs-federation` (not `hs-cli`) so the sender can count what a destination
+  actually accepted, rather than what was queued.
+
 ## Eleventh session (2026-09-27): createRoom invites, restricted joins, local rejection
 
 Scope: what the tenth session left (its "Not done" items 1, 2, 3 and 5). Branch
@@ -280,7 +371,7 @@ above):
   data dir); the durability proof is the hub-over-the-same-store unit test. Next: a test in the style of
   `crates/hs-cli/tests/federation_restart.rs` that sets a receipt and presence, SIGTERMs `hs serve`, restarts it
   over the same data dir, and checks an initial /sync.
-- To-device over federation (m.direct_to_device) is not sent or received. Cross-signing changes go out as
+- (To-device and m.signing_key_update: done 2026-09-28, see the twelfth session.) To-device over federation (m.direct_to_device) is not sent or received. Cross-signing changes go out as
   m.device_list_update, not m.signing_key_update. Device-list changes made while the server was down are not
   announced. EDUs are dropped (not stored) for destinations another cluster replica sends for, so in cluster
   mode a user's typing/receipts/presence reach only destinations their replica owns. Presence is not pushed to
@@ -1848,6 +1939,10 @@ this track can fix (`crates/hs-http/**` is out of this session's ownership).
 
 ## Interfaces provided
 
+- **`crate::metrics::{EduMetrics, EduOutcome}`** (2026-09-28): `EduMetrics::register(&mut
+  prometheus_client::registry::Registry)` (call through `hs_telemetry::metrics::Metrics::
+  with_registry`), `record_sent(edu_type)`, `record_received(edu_type, EduOutcome)`;
+  `FederationSender::install_edu_metrics(EduMetrics)`. Whoever applies inbound EDUs counts them.
 - **`crate::sender::{FederationSender, OutboundPduSink, SenderConfig, BACKOFF_POLL_INTERVAL}`**
   (new this eighth session): the outbound sender. `FederationSender::new(Arc<FederationClient>,
   own_server_name) -> Self` (wrap in `Arc`), `with_config(.., SenderConfig)`,
