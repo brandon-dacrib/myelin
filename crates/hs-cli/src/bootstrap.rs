@@ -51,7 +51,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 
 use hs_config::document::merge_patch;
-use hs_config::store::{ChangeRecord, ConfigMeta, StoreError, Stored};
+use hs_config::store::{ChangeRecord, ConfigMeta, HistoryPage, RevertPlan, StoreError, Stored};
 use hs_config::{Config, ConfigError, ConfigStore, FileLayer, Layers, Resolved};
 
 use crate::storage::{OpenedStorage, StorageOpenError, open_storage};
@@ -317,6 +317,40 @@ impl OpenedConfigStore {
     /// As [`ConfigStore::history`].
     pub fn history(&self, limit: usize) -> Result<Vec<ChangeRecord>, StoreError> {
         on_store!(self, store => store.history(limit))
+    }
+
+    /// See [`ConfigStore::history_page`].
+    ///
+    /// # Errors
+    /// As [`ConfigStore::history_page`].
+    pub fn history_page(
+        &self,
+        section: Option<&str>,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<HistoryPage, StoreError> {
+        on_store!(self, store => store.history_page(section, before, limit))
+    }
+
+    /// See [`ConfigStore::revert_plan`].
+    ///
+    /// # Errors
+    /// As [`ConfigStore::revert_plan`].
+    pub fn revert_plan(&self, section: &str, revision: u64) -> Result<RevertPlan, StoreError> {
+        on_store!(self, store => store.revert_plan(section, revision))
+    }
+
+    /// See [`ConfigStore::apply_revert`].
+    ///
+    /// # Errors
+    /// As [`ConfigStore::apply_revert`].
+    pub fn apply_revert(
+        &self,
+        plan: &RevertPlan,
+        actor: Option<&str>,
+        now_ms: i64,
+    ) -> Result<Stored, StoreError> {
+        on_store!(self, store => store.apply_revert(plan, actor, now_ms))
     }
 }
 

@@ -18,7 +18,10 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use hs_admin::model::{ConfigChange, ConfigReloadReport, ConfigSection, ConfigValidateReport};
-use hs_admin::sources::{ConfigPatch, ConfigSource, SourceError, config_section};
+use hs_admin::sources::{
+    ConfigHistoryPage, ConfigPatch, ConfigRevert, ConfigRevertOutcome, ConfigSource, SourceError,
+    config_change, config_section, revert_conflicts,
+};
 use hs_config::layered::Layers;
 use hs_config::store::StoreError;
 use hs_config::{Config, ConfigMeta};
@@ -110,18 +113,26 @@ impl StoreConfigSource {
             .into_iter()
             .filter(|change| change.section == section)
             .take(limit)
-            .map(change_to_model)
+            .map(|change| config_change(&change))
             .collect())
     }
-}
 
-fn change_to_model(change: hs_config::store::ChangeRecord) -> ConfigChange {
-    ConfigChange {
-        revision: change.revision,
-        section: change.section,
-        patch: change.patch,
-        actor: change.actor,
-        at: hs_http::time::rfc3339_from_millis(change.at_ms),
+    /// `section` as it resolves now, with its recent history -- what every write returns.
+    fn section_now(&self, state: &State, section: &str) -> Result<ConfigSection, SourceError> {
+        let resolved = state
+            .layers
+            .resolve()
+            .map_err(|e| SourceError::Unavailable(e.to_string()))?;
+        let mut out = config_section(
+            &resolved,
+            section,
+            state.meta.revision,
+            state.reloaded_at.get(section).cloned(),
+        );
+        out.history = self
+            .section_history(section, SECTION_HISTORY_LIMIT)
+            .map_err(|e| store_error(&e))?;
+        Ok(out)
     }
 }
 
@@ -130,7 +141,10 @@ fn change_to_model(change: hs_config::store::ChangeRecord) -> ConfigChange {
 fn store_error(e: &StoreError) -> SourceError {
     match e {
         StoreError::RevisionMismatch { .. } => SourceError::PreconditionFailed(e.to_string()),
-        StoreError::UnknownSection { .. } => SourceError::NotFound,
+        StoreError::UnknownSection { .. } | StoreError::NoSuchChange { .. } => {
+            SourceError::NotFound
+        }
+        StoreError::NotRevertible { .. } => SourceError::Conflict(e.to_string()),
         StoreError::BootstrapSection { .. } | StoreError::BootstrapSetting { .. } => {
             SourceError::Conflict(e.to_string())
         }
@@ -327,9 +341,110 @@ impl ConfigSource for StoreConfigSource {
                 .store
                 .history(limit)
                 .map_err(|e| store_error(&e))?
-                .into_iter()
-                .map(change_to_model)
+                .iter()
+                .map(config_change)
                 .collect()),
         }
+    }
+
+    async fn history_page(
+        &self,
+        section: &str,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<ConfigHistoryPage, SourceError> {
+        if !hs_config::reload::SECTION_NAMES.contains(&section) {
+            return Err(SourceError::NotFound);
+        }
+        let page = self
+            .store
+            .history_page(Some(section), before, limit)
+            .map_err(|e| store_error(&e))?;
+        Ok(ConfigHistoryPage {
+            changes: page.records.iter().map(config_change).collect(),
+            older: page.older,
+            newer: page.newer,
+        })
+    }
+
+    async fn revert(&self, request: ConfigRevert) -> Result<ConfigRevertOutcome, SourceError> {
+        let mut state = self.state.write().await;
+        if !hs_config::reload::SECTION_NAMES.contains(&request.section.as_str()) {
+            return Err(SourceError::NotFound);
+        }
+        // The store only writes a plan over the revision it was computed at. Without an
+        // `If-Match` the caller accepts whatever is current, so a write from another replica in
+        // between is planned again rather than reported as a precondition nobody set.
+        let mut attempts = 0;
+        let patch = loop {
+            attempts += 1;
+            let plan = self
+                .store
+                .revert_plan(&request.section, request.revision)
+                .map_err(|e| store_error(&e))?;
+            if let Some(expected) = request.expected_revision
+                && expected != plan.revision
+            {
+                return Err(store_error(&StoreError::RevisionMismatch {
+                    expected,
+                    actual: plan.revision,
+                }));
+            }
+            if !plan.conflicts.is_empty() && !request.force {
+                return Ok(ConfigRevertOutcome::Conflicts(revert_conflicts(
+                    &request.section,
+                    plan.conflicts,
+                )));
+            }
+            if plan
+                .patch
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+            {
+                Self::refresh(&mut state, &self.store).map_err(|e| store_error(&e))?;
+                return Ok(ConfigRevertOutcome::Unchanged(
+                    self.section_now(&state, &request.section)?,
+                ));
+            }
+            // The same four checks as `patch_section`, against the patch the revert would write:
+            // a revert is an ordinary write and must not be a way around any of them.
+            let bootstrap = Layers::bootstrap_in_patch(&request.section, &plan.patch);
+            if hs_config::store::is_bootstrap_section(&request.section) || !bootstrap.is_empty() {
+                return Err(store_error(&StoreError::bootstrap(
+                    &request.section,
+                    bootstrap,
+                )));
+            }
+            let pinned = state
+                .layers
+                .pinned_by_environment(&request.section, &plan.patch);
+            if !pinned.is_empty() {
+                return Err(SourceError::Conflict(format!(
+                    "pinned by an HS__ environment variable, which outranks the database: {}",
+                    pinned.join(", ")
+                )));
+            }
+            state
+                .layers
+                .resolve_with_patch(&request.section, &plan.patch)
+                .map_err(|e| SourceError::Invalid(e.to_string()))?;
+            match self
+                .store
+                .apply_revert(&plan, request.actor.as_deref(), now_ms())
+            {
+                Ok(_) => break plan.patch,
+                Err(StoreError::RevisionMismatch { .. })
+                    if request.expected_revision.is_none() && attempts < 3 =>
+                {
+                    Self::refresh(&mut state, &self.store).map_err(|e| store_error(&e))?;
+                }
+                Err(e) => return Err(store_error(&e)),
+            }
+        };
+        Self::refresh(&mut state, &self.store).map_err(|e| store_error(&e))?;
+        Ok(ConfigRevertOutcome::Reverted {
+            section: self.section_now(&state, &request.section)?,
+            patch,
+        })
     }
 }
