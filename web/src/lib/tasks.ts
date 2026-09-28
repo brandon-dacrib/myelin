@@ -38,6 +38,9 @@ const TASK_ACTIONS: Record<string, string> = {
   "migration.cutover": "Cut over from Synapse",
   "federation.refetch_keys": "Refetch server keys",
   "cluster.replicas.drain": "Drain replica",
+  "rooms.delete": "Delete room",
+  "rooms.purge_history": "Purge room history",
+  "rooms.media.quarantine": "Quarantine a room's media",
 };
 
 export function describeTaskAction(action: string): string {

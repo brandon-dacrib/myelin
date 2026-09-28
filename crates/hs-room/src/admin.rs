@@ -23,6 +23,8 @@ use ruma::{RoomId, UserId};
 use crate::error::RoomError;
 use crate::registry::RoomRegistry;
 
+mod content;
+
 fn now_ms() -> i64 {
     i64::try_from(
         SystemTime::now()
@@ -122,13 +124,44 @@ fn matches_filter(room: &AdminRoom, filter: &RoomFilter) -> bool {
 /// Adapts a [`RoomRegistry`] to [`hs_admin::sources::RoomDirectory`].
 pub struct RoomRegistryDirectory<B: KvBackend> {
     registry: Arc<RoomRegistry<B>>,
+    /// The accounts, for an administrator's join (the user must exist, and their profile goes
+    /// on their membership event). `None` in tests that have no accounts; a join then takes the
+    /// user id on trust.
+    auth: Option<hs_auth::state::AuthState>,
+    /// Told how each purge and deletion ended, for metrics (see [`RoomOperationObserver`]).
+    observer: Option<RoomOperationObserver>,
 }
+
+/// Called with `(operation, outcome, elapsed)` when a purge (`purge_history`) or deletion
+/// (`delete`) ends `succeeded` or `failed`: how `hs-cli` counts them into `/metrics` without this
+/// crate depending on a metrics library.
+pub type RoomOperationObserver =
+    Arc<dyn Fn(&str, &str, std::time::Duration) + Send + Sync + 'static>;
 
 impl<B: KvBackend + 'static> RoomRegistryDirectory<B> {
     /// Wraps `registry` for use as an `hs-admin` data source.
     #[must_use]
     pub fn new(registry: Arc<RoomRegistry<B>>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            auth: None,
+            observer: None,
+        }
+    }
+
+    /// Reports how each purge and deletion ends to `observer`.
+    #[must_use]
+    pub fn with_observer(mut self, observer: RoomOperationObserver) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Gives the directory this server's accounts, which an administrator's join checks the
+    /// user against and takes their profile from.
+    #[must_use]
+    pub fn with_auth(mut self, auth: hs_auth::state::AuthState) -> Self {
+        self.auth = Some(auth);
+        self
     }
 
     /// Loads `room_id`'s admin summary, or `Ok(None)` if the room does not exist -- the shape

@@ -2,7 +2,49 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
-Last updated: 2026-09-26 (session 9: the history before a remote join. `RoomActor::
+Last updated: 2026-09-28 (session 10: the admin API's room long tail, below). Before that,
+2026-09-26 (session 9, next paragraph).
+
+> **2026-09-28, session 10: what an administrator does to a room.** `hs-admin`'s 17 unserved
+> Rooms operations are served, and this crate is their source.
+>
+> - **`crate::actor::admin_ops`** (a child of `crate::actor`, so it reaches the actor's fields):
+>   `purge_plan` / `purge_positions` (Synapse's purge_history: message events before a point,
+>   never state, never the newest event or a forward extremity, local senders' only when asked);
+>   `forward_extremity_events` / `prune_forward_extremities` (keep the newest by depth then
+>   timeline position, forget the rest durably); `event_nearest` (MSC3030 over what is held);
+>   `referenced_media` (every `mxc://` in the timeline and current state); `local_members_to_remove`,
+>   `local_inviters`; `delete_everything` (every row of the room in batches: events, timeline,
+>   extremities, outliers, snapshots, relations, aliases, directory, joined-by index, metadata;
+>   the block row is kept on purpose); `RoomActorHandle::administer`.
+> - **A purged event** keeps its row as the redacted skeleton with `PersistedEvent::purged` set
+>   (the row stays because later events cite it and the state store derives state from
+>   ancestors). On load it is fed to the store and kept out of the timeline and relations; it is
+>   in `RoomActor::purged`, and `event_by_id` does not return it, so `/event`, `/context`,
+>   federation `/event` and the admin reads all say not found.
+> - **A deleted room**: `RoomActor::deleted` refuses every persist; the registry's
+>   `forget_resident` drops the actor; `room_meta` gone means `get_or_load` answers
+>   `RoomNotFound`, so joining it is refused. The state store's content-addressed rows are left.
+> - **Behaviour change:** a blocked room now accepts a `leave` membership event (everything else
+>   is still refused). Leaving takes nothing into the room, and a deletion with `block` empties
+>   the room after blocking it.
+> - **`crate::admin::content`**: `hs_admin::rooms::RoomContentSource` for
+>   `RoomRegistryDirectory` (`with_auth` for the join's user check and profile, `with_observer`
+>   for metrics). The admin join invites through the most powerful local member when the join
+>   rules refuse (Synapse's semantics). The deletion: block, new room (created by
+>   `new_room.creator`, the message posted, the members joined to it), every local member leaves,
+>   aliases removed and the room unpublished, then purge; progress at each step.
+> - `RoomRegistry::server_name`, `RoomRegistry::forget_resident`.
+> - **Tests**: `crates/hs-room/src/admin/content/tests.rs` (6: a purge that survives a reload,
+>   a fork pruned durably, the reads, a join into a private room, a space's hierarchy, a deletion
+>   that leaves the room gone and blocked and its members in the new room); end to end in
+>   `crates/hs-cli/tests/admin_rooms.rs` (see status 15).
+> - **Left**: a purge does not delete the rows it could (a skeleton is kept for every purged
+>   event); `created_at` is not recorded for aliases; the hierarchy reads only rooms this server
+>   holds (no federation `/hierarchy` for unknown children); deleting a room leaves remote members
+>   and other servers untouched, as Synapse does.
+
+Session 9 (2026-09-26: the history before a remote join. `RoomActor::
 accept_backfilled_events` places a verified batch of a room's earlier history in the timeline at
 negative positions below the join, each event with an explicit state computed by walking back
 from the join's snapshot -- reverting each state event passed to its predecessor in the batch --

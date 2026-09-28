@@ -373,7 +373,7 @@
       "method": "GET",
       "path": "/media",
       "operation_id": "media.list",
-      "scope": "admin:read",
+      "scope": "moderation:read",
       "public": false,
       "tag": "Media",
       "idempotent_post": false
@@ -409,7 +409,7 @@
       "method": "GET",
       "path": "/media/{server_name}/{media_id}",
       "operation_id": "media.get",
-      "scope": "admin:read",
+      "scope": "moderation:read",
       "public": false,
       "tag": "Media",
       "idempotent_post": false
@@ -652,7 +652,7 @@
       "method": "GET",
       "path": "/rooms",
       "operation_id": "rooms.list",
-      "scope": "admin:read",
+      "scope": "moderation:read",
       "public": false,
       "tag": "Rooms",
       "idempotent_post": false
@@ -661,7 +661,7 @@
       "method": "GET",
       "path": "/rooms/{room_id}",
       "operation_id": "rooms.get",
-      "scope": "admin:read",
+      "scope": "moderation:read",
       "public": false,
       "tag": "Rooms",
       "idempotent_post": false
@@ -670,7 +670,7 @@
       "method": "GET",
       "path": "/rooms/{room_id}/aliases",
       "operation_id": "rooms.aliases.list",
-      "scope": "admin:read",
+      "scope": "moderation:read",
       "public": false,
       "tag": "Rooms",
       "idempotent_post": false
@@ -760,7 +760,7 @@
       "method": "GET",
       "path": "/rooms/{room_id}/hierarchy",
       "operation_id": "rooms.hierarchy.get",
-      "scope": "admin:read",
+      "scope": "moderation:read",
       "public": false,
       "tag": "Rooms",
       "idempotent_post": false
@@ -787,7 +787,7 @@
       "method": "GET",
       "path": "/rooms/{room_id}/media",
       "operation_id": "rooms.media.list",
-      "scope": "admin:read",
+      "scope": "moderation:read",
       "public": false,
       "tag": "Rooms",
       "idempotent_post": false
@@ -805,7 +805,7 @@
       "method": "GET",
       "path": "/rooms/{room_id}/members",
       "operation_id": "rooms.members.list",
-      "scope": "admin:read",
+      "scope": "moderation:read",
       "public": false,
       "tag": "Rooms",
       "idempotent_post": false
@@ -832,7 +832,7 @@
       "method": "GET",
       "path": "/rooms/{room_id}/state",
       "operation_id": "rooms.state.list",
-      "scope": "admin:read",
+      "scope": "moderation:read",
       "public": false,
       "tag": "Rooms",
       "idempotent_post": false

@@ -603,7 +603,7 @@ pub(crate) async fn media_list(
     Query(query): Query<MediaListQuery>,
 ) -> Response {
     let instance = "/api/v1/media";
-    let (media, _) = match authorize(&state, &headers, instance, Scope::AdminRead).await {
+    let (media, _) = match authorize(&state, &headers, instance, Scope::ModerationRead).await {
         Ok(v) => v,
         Err(response) => return response,
     };
@@ -630,7 +630,7 @@ pub(crate) async fn media_get(
     Path((server_name, media_id)): Path<(String, String)>,
 ) -> Response {
     let instance = format!("/api/v1/media/{server_name}/{media_id}");
-    let (media, _) = match authorize(&state, &headers, &instance, Scope::AdminRead).await {
+    let (media, _) = match authorize(&state, &headers, &instance, Scope::ModerationRead).await {
         Ok(v) => v,
         Err(response) => return response,
     };
@@ -1288,10 +1288,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_moderator_can_act_on_media_but_not_list_it_and_not_purge_the_cache() {
+    async fn a_moderator_can_list_and_act_on_media_but_not_purge_the_cache() {
         let h = harness(Some(source()));
+        // Decision 0013: media is a moderation resource, readable with moderation:read.
         let (status, _, _) = call(&h, "moderator", "GET", "/api/v1/media", None, &[]).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "media.list needs admin:read");
+        assert_eq!(status, StatusCode::OK, "media.list needs moderation:read");
         let (status, _, _) = call(
             &h,
             "moderator",

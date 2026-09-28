@@ -2,6 +2,8 @@ import { useState } from "react";
 import { useNavigate, useSearch, Link } from "@tanstack/react-router";
 import { DoorOpen } from "lucide-react";
 import { useRooms, type Room } from "@/api/rooms";
+import { useFindEvent } from "@/api/room-contents";
+import { MutationError } from "@/components/MutationError";
 import { Button } from "@/components/ui/button/Button";
 import { Badge } from "@/components/ui/badge/Badge";
 import { Input } from "@/components/ui/input/Input";
@@ -16,7 +18,7 @@ export function RoomsPage() {
   const search = useSearch({ from: "/rooms" });
   const navigate = useNavigate({ from: "/rooms" });
   const [queryInput, setQueryInput] = useState(search.q ?? "");
-  const canRead = hasScope("admin:read");
+  const canRead = hasScope("moderation:read");
 
   const { data, isLoading, isError, error, refetch } = useRooms({
     q: search.q,
@@ -79,7 +81,7 @@ export function RoomsPage() {
     return (
       <div className="p-6">
         <h1 className="text-xl text-text">Rooms</h1>
-        <ForbiddenState scope="admin:read" />
+        <ForbiddenState scope="moderation:read" />
       </div>
     );
   }
@@ -116,12 +118,14 @@ export function RoomsPage() {
         )}
       </form>
 
+      {hasScope("admin:read") && <FindEvent />}
+
       {isError && (
         <div className="mt-6">
           <QueryProblemState
             error={error}
             resource="rooms"
-            scope="admin:read"
+            scope="moderation:read"
             onRetry={() => refetch()}
           />
         </div>
@@ -162,6 +166,49 @@ export function RoomsPage() {
             }}
           />
         </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * `events.get`: find any event this server holds by its id, and open it in its room's timeline.
+ * Reading an event is on the audit log, so this needs `admin:read`.
+ */
+function FindEvent() {
+  const [eventId, setEventId] = useState("");
+  const find = useFindEvent();
+  const navigate = useNavigate({ from: "/rooms" });
+  return (
+    <div className="mt-3 max-w-md">
+      <form
+        className="flex gap-2"
+        onSubmit={(e) => {
+          e.preventDefault();
+          const id = eventId.trim();
+          if (!id) return;
+          find.mutate(id, {
+            onSuccess: (event) =>
+              navigate({
+                to: "/rooms/$roomId",
+                params: { roomId: event.room_id },
+                search: { tab: "timeline", event: event.event_id },
+              }),
+          });
+        }}
+      >
+        <Input
+          aria-label="Find an event by its ID"
+          placeholder="Find an event by ID"
+          value={eventId}
+          onChange={(e) => setEventId(e.target.value)}
+        />
+        <Button type="submit" variant="secondary" disabled={!eventId.trim() || find.isPending}>
+          Find event
+        </Button>
+      </form>
+      {find.isError && (
+        <MutationError className="mt-2" error={find.error} action="find that event" />
       )}
     </div>
   );

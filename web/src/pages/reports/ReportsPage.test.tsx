@@ -78,7 +78,7 @@ describe("Reports queue", () => {
   });
 
   it("does not show the queue without moderation:read", async () => {
-    await signIn(["admin:read"]);
+    await signIn(["bridges:read"]);
     open("/reports");
     expect(await screen.findByText(/This needs the/)).toHaveTextContent("moderation:read");
   });

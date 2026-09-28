@@ -47,6 +47,7 @@ pub mod openapi;
 pub mod operations;
 pub mod registration_tokens;
 pub mod reports;
+pub mod rooms;
 pub mod router;
 pub mod server_notices;
 pub mod sources;

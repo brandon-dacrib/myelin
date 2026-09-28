@@ -166,6 +166,12 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
         })
     }
 
+    /// This server's name.
+    #[must_use]
+    pub fn server_name(&self) -> &ruma::ServerName {
+        &self.identity.server_name
+    }
+
     /// The reports users have filed (`crate::routes::report` writes them, the admin API reads
     /// them through [`crate::reports::RoomReports`]).
     #[must_use]
@@ -654,6 +660,12 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
                 registry.evict_idle(max_idle).await;
             }
         })
+    }
+
+    /// Drops `room_id`'s resident actor, if there is one, whatever its idle time: what a room
+    /// deletion does once the room's records are gone, so the next access finds it missing.
+    pub async fn forget_resident(&self, room_id: &ruma::RoomId) {
+        self.rooms.lock().await.remove(room_id);
     }
 
     /// How many rooms are currently resident. For tests and diagnostics.

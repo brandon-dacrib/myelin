@@ -2,8 +2,47 @@
 
 Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-admin`, `hs-modules`, `hs-identity`, `hs-http` (shared with 07 and 14).
 
-Last updated: 2026-09-28 (Users' devices-and-identity half, and the Cluster area, 6/6, below); before that 2026-09-27 (media, registration tokens and server notices, reports, tasks and statistics, below; before that the bridge
+Last updated: 2026-09-28 (the Rooms area, 23/23; Users' devices-and-identity half; and the Cluster area, 6/6; all below); before that 2026-09-27 (media, registration tokens and server notices, reports, tasks and statistics, below; before that the bridge
 offering operations); before that 2026-09-26 (three public recovery operations); 2026-09-25 (additive schema change for the bridges wizard); the session log that follows is from 2026-09-19 (session 6).
+
+> **2026-09-28, served for real: Rooms 23/23.** `tools/admin_api_coverage.py` counts **132 of
+> 158** operations with a real handler, with Users' half below (Rooms was 6/23).
+>
+> - **Handlers** (`crates/hs-admin/src/rooms.rs`, over a new `RoomContentSource` trait,
+>   `AdminState::with_room_content`, `InMemoryRoomContent` for tests): `rooms.state.list`,
+>   `rooms.messages.list` (newest first, cursor), `rooms.events.get`, `rooms.events.at` (MSC3030
+>   over what the server holds), `rooms.events.context`, `events.get`; `rooms.aliases.list/add/
+>   remove`; `rooms.hierarchy.get`; `rooms.join` (a local user joins; invited through the most
+>   powerful local member when the join rules refuse, as Synapse does); `rooms.forward_extremities.
+>   list/delete` (keeps the newest by depth); `rooms.media.list` and `rooms.media.quarantine`;
+>   `rooms.purge_history` and `rooms.delete`. Purge, delete and media quarantine answer `202` with
+>   a task (`TaskRegistry::spawn`): progress per step, cancellable between batches, a result on
+>   success. `rooms.delete` is Synapse's: optionally block, optionally a new room (creator, name,
+>   message) the local members are moved into, every local member leaves, aliases removed and the
+>   room unpublished, then purge; afterwards the room is not found and cannot be joined.
+> - **Scopes: decision 0013** (`docs/decisions/0013-moderators-read-rooms-and-media-not-messages.md`,
+>   settles RFC 0004 against the document for queue item 2e). `admin:read` satisfies every
+>   `*:read`; room and media metadata is `moderation:read`; message content (`rooms.messages.list`,
+>   `rooms.events.*`, `events.get`) stays `admin:read` and every successful read writes an audit
+>   entry `rooms.content.read` with the path read.
+> - **Observability**: every write audited (`rooms.aliases.add/remove`, `rooms.join`,
+>   `rooms.forward_extremities.delete`, `rooms.media.quarantine`, `rooms.purge_history`,
+>   `rooms.delete`) and published (`room.alias_added/removed`, `room.member_joined`,
+>   `room.forward_extremities_pruned`, `room.purge_started`/`room.history_purged`,
+>   `room.delete_started`/`room.deleted`, `room.media_quarantine_started`/`room.media_quarantined`);
+>   `/metrics` has `hs_admin_room_operations_total{operation,outcome}` and
+>   `hs_admin_room_operation_duration_seconds{operation}` for purges and deletions
+>   (`crates/hs-cli/src/room_admin.rs`).
+> - **Cluster**: every `/api/v1/rooms/{room_id}/...` path is forwarded to the room's owner by the
+>   room shard gate, so reads, writes and the tasks run there. **Gap**: `GET /api/v1/events/{id}`
+>   has no room in its path, so on a non-owning replica it loads the room locally to read it; the
+>   room page uses the room-scoped `rooms.events.get` instead.
+> - **Tests**: `crates/hs-admin/src/rooms/tests.rs` (25: scopes, audit of content reads,
+>   validation, tasks, idempotency); `crates/hs-room/src/admin/content/tests.rs` (6, see status
+>   04); end to end through `hs serve` in `crates/hs-cli/tests/admin_rooms.rs` (4: the reads,
+>   aliases resolving for clients, join, hierarchy, media and quarantine; a purge gone from the
+>   members' own `/messages`; a deletion after which nobody can join; and, through the real `hs`
+>   binary across a restart, a fork reported and trimmed while the room goes on).
 
 > **2026-09-28, served for real: Users' devices-and-identity half, 13 operations** (branch
 > `users-devices-identity`; Users is 27/41). `tools/admin_api_coverage.py` now counts

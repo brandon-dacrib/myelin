@@ -29,6 +29,8 @@ use crate::protocol::{ChangedStateKey, MembershipDelta, RoomUpdate};
 use crate::relations;
 use crate::timeline::{Direction, PaginationToken};
 
+pub mod admin_ops;
+
 fn to_kv(e: hs_tables::keyspace::TableError) -> hs_kv::KvError {
     match e {
         hs_tables::keyspace::TableError::Kv(kv) => kv,
@@ -303,6 +305,14 @@ pub struct RoomActor<B: KvBackend> {
     /// [`RoomActor::membership_action`] clears an entry the moment its user rejoins (the spec's
     /// "Can re-join room if re-invited" case: forgetting must not be permanent).
     forgotten: HashSet<OwnedUserId>,
+    /// Events an administrator purged (`hs-admin`'s `rooms.purge_history`, see
+    /// `crate::actor::admin_ops`): held as redacted skeletons so the room's graph and state stay
+    /// whole, fed to the state store, and out of the timeline and every read.
+    purged: HashSet<EventSn>,
+    /// Set once an administrator has deleted this room (`crate::actor::admin_ops`). A handle
+    /// somebody still holds refuses every write from then on, so nothing can be written into a
+    /// room whose records are being removed.
+    deleted: bool,
     publish: tokio::sync::broadcast::Sender<RoomUpdate>,
     /// The registry's global stream, once this actor is resident in a registry
     /// ([`crate::registry::RoomRegistry`] installs it on insert or load). Every update this
@@ -445,6 +455,8 @@ impl<B: KvBackend> RoomActor<B> {
             txn_dedup: HashMap::new(),
             event_txn: HashMap::new(),
             forgotten: HashSet::new(),
+            purged: HashSet::new(),
+            deleted: false,
             publish,
             global: None,
             fencing: None,
@@ -544,7 +556,7 @@ impl<B: KvBackend> RoomActor<B> {
         // stored with (`redacted`, `outlier`, ...) restored -- `Event::parse` starts every event
         // with no flags, and a flag is exactly the part of the record the JSON does not carry.
         let events_table = actor.tables.events.clone();
-        let read_event = |event_sn: EventSn| -> Result<Option<Event>, RoomError> {
+        let read_event_row = |event_sn: EventSn| -> Result<Option<(Event, bool)>, RoomError> {
             let Some(bytes) = events_table.get(&snapshot, &(event_sn,))? else {
                 return Ok(None);
             };
@@ -552,7 +564,10 @@ impl<B: KvBackend> RoomActor<B> {
                 serde_json::from_slice(&bytes).map_err(|e| RoomError::Internal(e.to_string()))?;
             let mut event = Event::parse(&persisted.json, room_version.clone())?;
             *event.flags_mut() = EventFlags::from_byte(persisted.flags);
-            Ok(Some(event))
+            Ok(Some((event, persisted.purged)))
+        };
+        let read_event = |event_sn: EventSn| -> Result<Option<Event>, RoomError> {
+            Ok(read_event_row(event_sn)?.map(|(event, _)| event))
         };
 
         // Outliers first: the state snapshot a federation join brought with it. Sorted
@@ -611,10 +626,14 @@ impl<B: KvBackend> RoomActor<B> {
                 actor.timeline.insert(room_pos, event_sn);
                 continue;
             }
-            let Some(event) = read_event(event_sn)? else {
+            let Some((event, purged)) = read_event_row(event_sn)? else {
                 continue;
             };
             let explicit_state = explicit_states.remove(&event_sn);
+            if purged {
+                actor.absorb_purged_event(event_sn, event, room_pos, explicit_state.as_deref())?;
+                continue;
+            }
             actor.absorb_loaded_event(event_sn, event, room_pos, explicit_state.as_deref())?;
         }
 
@@ -993,7 +1012,15 @@ impl<B: KvBackend> RoomActor<B> {
         now_ms: i64,
         prev_events: &[EventSn],
     ) -> Result<Event, RoomError> {
-        if let Some(reason) = self.blocked_reason()? {
+        // A blocked room refuses everything except somebody leaving it: leaving takes nothing
+        // into the room, and it is how an administrator's deletion empties a blocked room
+        // (`crate::admin`).
+        let is_leave = event_type == "m.room.member"
+            && content
+                .get("membership")
+                .and_then(serde_json::Value::as_str)
+                == Some("leave");
+        if !is_leave && let Some(reason) = self.blocked_reason()? {
             return Err(RoomError::RoomBlocked(reason));
         }
         let prev_refs = self.refs_for(prev_events)?;
@@ -1347,6 +1374,9 @@ impl<B: KvBackend> RoomActor<B> {
     /// room's first timeline event (outliers persisted before it do not count), the membership
     /// index, the fencing check, the [`RoomUpdate`] with its `membership_deltas` -- is the same.
     fn persist_with(&mut self, event: Event, kind: PersistKind) -> Result<EventSn, RoomError> {
+        if self.deleted {
+            return Err(RoomError::RoomNotFound(self.room_id.to_string()));
+        }
         let full_json: serde_json::Value = serde_json::from_slice(event.canonical_bytes())
             .map_err(|e| RoomError::Internal(e.to_string()))?;
         let content = full_json
@@ -1395,6 +1425,7 @@ impl<B: KvBackend> RoomActor<B> {
             room_version: self.room_version.as_str().to_owned(),
             flags: event.header().flags.to_byte(),
             room_pos: Some(self.next_room_pos),
+            purged: false,
         };
         let persisted_bytes =
             serde_json::to_vec(&persisted).map_err(|e| RoomError::Internal(e.to_string()))?;
@@ -1649,6 +1680,7 @@ impl<B: KvBackend> RoomActor<B> {
                     room_version: self.room_version.as_str().to_owned(),
                     flags: event.header().flags.to_byte(),
                     room_pos: None,
+                    purged: false,
                 };
                 let bytes = serde_json::to_vec(&persisted)
                     .map_err(|e| RoomError::Internal(e.to_string()))?;
@@ -1893,6 +1925,7 @@ impl<B: KvBackend> RoomActor<B> {
                     room_version: self.room_version.as_str().to_owned(),
                     flags: flags.to_byte(),
                     room_pos: Some(p.room_pos),
+                    purged: false,
                 };
                 let bytes = serde_json::to_vec(&persisted)
                     .map_err(|e| RoomError::Internal(e.to_string()))?;
@@ -3599,6 +3632,9 @@ impl<B: KvBackend> RoomActor<B> {
     #[must_use]
     pub fn event_by_id(&self, event_id: &EventId) -> Option<&Event> {
         let sn = self.event_id_index.get(event_id)?;
+        if self.purged.contains(sn) {
+            return None;
+        }
         self.events.get(sn)
     }
 

@@ -33,6 +33,20 @@ describe("auth", () => {
     expect(hasScope("admin:read")).toBe(false);
   });
 
+  it("treats admin:read as covering every :read, and no write (decision 0013)", async () => {
+    await signIn(["admin:read"]);
+    expect(hasScope("moderation:read")).toBe(true);
+    expect(hasScope("bridges:read")).toBe(true);
+    expect(hasScope("moderation:write")).toBe(false);
+    expect(hasScope("admin:write")).toBe(false);
+  });
+
+  it("does not let moderation:read reach admin:read (message content)", async () => {
+    await signIn(["moderation:read"]);
+    expect(hasScope("moderation:read")).toBe(true);
+    expect(hasScope("admin:read")).toBe(false);
+  });
+
   it("clears the session on sign out", async () => {
     await signIn(["admin:read"]);
     signOut();

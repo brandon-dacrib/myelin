@@ -114,6 +114,12 @@ pub struct PersistedEvent {
     /// outlier (see [`OutlierKey`]): held for its body and its place in the room's state, never
     /// shown in `/messages`, `/sync` or any other timeline read.
     pub room_pos: Option<i64>,
+    /// The event was purged by an administrator (`hs-admin`'s `rooms.purge_history`): `json` is
+    /// its redacted skeleton, kept so the room's graph and state stay whole, and it is shown by
+    /// no read -- not the timeline, not `/event`, not the admin API. Absent (false) on every row
+    /// written before purging existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub purged: bool,
 }
 
 /// A room's fixed metadata.

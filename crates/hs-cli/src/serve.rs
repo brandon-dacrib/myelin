@@ -658,6 +658,9 @@ fn admin_state<B: KvBackend + 'static>(
     .with_media(sources.media)
     // The Cluster page: replicas, shards, and draining a replica out of service.
     .with_cluster(sources.cluster)
+    // The room page's long tail: state, timeline, aliases, hierarchy, extremities and media,
+    // and purging and deleting a room as tasks.
+    .with_room_content(sources.room_content)
     .with_server_info(hs_admin::model::ServerInfo {
         name: server_name.to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -698,6 +701,7 @@ struct AdminSources {
     media: Arc<dyn hs_admin::media::MediaSource>,
     cluster: Arc<dyn hs_admin::cluster::ClusterSource>,
     user_data: Arc<dyn hs_admin::user_identity::UserDataSource>,
+    room_content: Arc<dyn hs_admin::rooms::RoomContentSource>,
 }
 
 /// The `/api/v1` state for [`route_manifest`]'s throwaway router: routes are registered the same
@@ -1452,6 +1456,11 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
                 )),
                 cluster: cluster_admin,
                 user_data,
+                room_content: crate::room_admin::source(
+                    rooms.clone(),
+                    auth_state.clone(),
+                    crate::room_admin::RoomOperationMetrics::register(&metrics),
+                ),
             },
         ),
     };

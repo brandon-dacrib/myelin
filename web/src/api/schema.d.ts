@@ -633,7 +633,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Fetch any event by id (room unknown) */
+        /**
+         * Fetch any event by id (room unknown)
+         * @description Reads message content, so it needs admin:read (a moderator's moderation:read does not reach it; see decision 0013), and every call is recorded in the audit log as `rooms.content.read`.
+         */
         get: operations["events.get"];
         put?: never;
         post?: never;
@@ -1353,7 +1356,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Delete a room (Task) */
+        /**
+         * Delete a room (Task)
+         * @description Synapse's delete-room semantics. Every local member leaves (their invitations and knocks are withdrawn too); when `new_room` is given they are first joined to a new room created by `new_room.creator`, where `message` is posted. The room's local aliases are removed and it is taken out of the directory. With `block` (default false) nobody on this server can join it again. With `purge` (default true) every event is then removed from this server, the room stops existing here, and joining it answers not found. Runs as a task with progress; cancelling stops it between steps.
+         */
         post: operations["rooms.delete"];
         delete?: never;
         options?: never;
@@ -1368,7 +1374,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Get an event in a room */
+        /**
+         * Get an event in a room
+         * @description Reads message content, so it needs admin:read (a moderator's moderation:read does not reach it; see decision 0013), and every call is recorded in the audit log as `rooms.content.read`.
+         */
         get: operations["rooms.events.get"];
         put?: never;
         post?: never;
@@ -1385,7 +1394,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Get an event's context */
+        /**
+         * Get an event's context
+         * @description Reads message content, so it needs admin:read (a moderator's moderation:read does not reach it; see decision 0013), and every call is recorded in the audit log as `rooms.content.read`.
+         */
         get: operations["rooms.events.context"];
         put?: never;
         post?: never;
@@ -1402,7 +1414,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Find the event nearest a timestamp */
+        /**
+         * Find the event nearest a timestamp
+         * @description Reads message content, so it needs admin:read (a moderator's moderation:read does not reach it; see decision 0013), and every call is recorded in the audit log as `rooms.content.read`.
+         */
         get: operations["rooms.events.at"];
         put?: never;
         post?: never;
@@ -1423,7 +1438,10 @@ export interface paths {
         get: operations["rooms.forward_extremities.list"];
         put?: never;
         post?: never;
-        /** Prune extra forward extremities */
+        /**
+         * Prune extra forward extremities
+         * @description Keeps the newest forward extremity (highest depth, then newest in this server's timeline) and forgets every other one, as Synapse's `DELETE /_synapse/admin/v1/rooms/{room_id}/forward_extremities` does. The room's current state is then the state at the one kept. A recovery tool for a room slowed down by too many extremities; answers what was deleted and what remains.
+         */
         delete: operations["rooms.forward_extremities.delete"];
         options?: never;
         head?: never;
@@ -1539,7 +1557,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List a room's timeline (cursor paginated) */
+        /**
+         * List a room's timeline (cursor paginated)
+         * @description Reads message content, so it needs admin:read (a moderator's moderation:read does not reach it; see decision 0013), and every call is recorded in the audit log as `rooms.content.read`.
+         */
         get: operations["rooms.messages.list"];
         put?: never;
         post?: never;
@@ -1558,7 +1579,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Purge a room's history (Task) */
+        /**
+         * Purge a room's history (Task)
+         * @description Removes the room's message events older than `before` from this server (Synapse's purge_history semantics). State events are kept, and so is the newest event; events sent by this server's own users are kept unless `delete_local_events` is true. A purged event is gone from `/messages`, `/context`, `/event` and the admin reads; its redacted skeleton stays so the room's graph stays whole. Runs as a task with progress, and can be cancelled between batches.
+         */
         post: operations["rooms.purge_history"];
         delete?: never;
         options?: never;
@@ -2718,14 +2742,27 @@ export interface components {
             type: string;
         };
         EventContext: {
-            event?: components["schemas"]["RoomEvent"];
-            events_after?: components["schemas"]["RoomEvent"][];
-            events_before?: components["schemas"]["RoomEvent"][];
-            state?: components["schemas"]["StateEvent"][];
+            event: components["schemas"]["RoomEvent"];
+            events_after: components["schemas"]["RoomEvent"][];
+            events_before: components["schemas"]["RoomEvent"][];
+            state: components["schemas"]["StateEvent"][];
         };
         ExternalId: {
             external_id: string;
             provider: string;
+        };
+        ForwardExtremitiesPruned: {
+            /** @description The event ids that are no longer forward extremities. */
+            deleted: string[];
+            remaining: components["schemas"]["ForwardExtremity"][];
+        };
+        ForwardExtremity: {
+            depth: number;
+            event_id: string;
+            origin_server_ts: number;
+            sender: string;
+            state_key?: string | null;
+            type: string;
         };
         MediaItem: {
             content_type: string | null;
@@ -3025,25 +3062,49 @@ export interface components {
             version?: string;
         };
         RoomAlias: {
-            alias?: string;
-            /** Format: date-time */
-            created_at?: string;
+            alias: string;
+            /** @description Whether the room's m.room.canonical_alias names it. */
+            canonical: boolean;
+            /**
+             * Format: date-time
+             * @description Not recorded for aliases made before it was; null then.
+             */
+            created_at?: string | null;
+            /** @description Who made the alias, when that is known. */
+            creator: string | null;
         };
         RoomEvent: {
-            content?: Record<string, never>;
-            event_id?: string;
-            origin_server_ts?: number;
-            sender?: string;
-            state_key?: string | null;
-            type?: string;
+            content: {
+                [key: string]: unknown;
+            };
+            event_id: string;
+            origin_server_ts: number;
+            /** @description The event has been redacted; `content` is what redaction left. */
+            redacted: boolean;
+            /** @description For an `m.room.redaction`, the event it redacts. */
+            redacts?: string | null;
+            room_id: string;
+            sender: string;
+            state_key: string | null;
+            type: string;
         };
         RoomEventPage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["RoomEvent"][];
         };
         RoomHierarchyNode: {
-            children?: string[];
-            name?: string | null;
-            room_id?: string;
+            canonical_alias?: string | null;
+            children: string[];
+            /** @description How far below the requested room this node is (0 for the room itself). */
+            depth: number;
+            join_rule?: string | null;
+            joined_members_count?: number | null;
+            /** @description Whether this server holds the room. A child it does not hold is listed by id only. */
+            known: boolean;
+            name: string | null;
+            room_id: string;
+            /** @description m.space for a space. */
+            room_type?: string | null;
+            topic?: string | null;
         };
         RoomHierarchyNodePage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["RoomHierarchyNode"][];
@@ -3178,12 +3239,14 @@ export interface components {
             items: components["schemas"]["Shard"][];
         };
         StateEvent: {
-            content?: Record<string, never>;
-            event_id?: string;
-            origin_server_ts?: number;
-            sender?: string;
-            state_key?: string;
-            type?: string;
+            content: {
+                [key: string]: unknown;
+            };
+            event_id: string;
+            origin_server_ts: number;
+            sender: string;
+            state_key: string;
+            type: string;
         };
         StateEventPage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["StateEvent"][];
@@ -6416,12 +6479,16 @@ export interface operations {
         requestBody?: {
             content: {
                 "application/json": {
+                    /** @default false */
                     block?: boolean;
+                    /** @description Posted in the new room by its creator. Only used with `new_room`. */
                     message?: string;
                     new_room?: {
-                        creator?: string;
+                        /** @description A local user who creates the new room and becomes its admin. */
+                        creator: string;
                         name?: string;
                     };
+                    /** @default true */
                     purge?: boolean;
                 };
             };
@@ -6438,6 +6505,7 @@ export interface operations {
                     "application/json": components["schemas"]["Task"];
                 };
             };
+            400: components["responses"]["ValidationFailed"];
             401: components["responses"]["Unauthenticated"];
             403: components["responses"]["InsufficientScope"];
             404: components["responses"]["NotFound"];
@@ -6571,13 +6639,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Forward extremities. */
+            /** @description The room's forward extremities, newest first. More than one means the room's history has forked and has not yet been merged by a later event. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": string[];
+                    "application/json": components["schemas"]["ForwardExtremity"][];
                 };
             };
             401: components["responses"]["Unauthenticated"];
@@ -6603,12 +6671,14 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Deleted. */
-            204: {
+            /** @description What was deleted and what remains. */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["ForwardExtremitiesPruned"];
+                };
             };
             401: components["responses"]["Unauthenticated"];
             403: components["responses"]["InsufficientScope"];
@@ -6677,6 +6747,7 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": {
+                    /** @description A local user. When the room's join rules do not let them in by themselves, a local member with the power to invite invites them first (Synapse's semantics). */
                     user_id: string;
                 };
             };
@@ -6691,10 +6762,11 @@ export interface operations {
                     "application/json": components["schemas"]["RoomMember"];
                 };
             };
+            400: components["responses"]["ValidationFailed"];
             401: components["responses"]["Unauthenticated"];
             403: components["responses"]["InsufficientScope"];
             404: components["responses"]["NotFound"];
-            409: components["responses"]["IdempotencyInFlight"];
+            409: components["responses"]["Conflict"];
             413: components["responses"]["PayloadTooLarge"];
             415: components["responses"]["UnsupportedMediaType"];
             422: components["responses"]["IdempotencyMismatch"];
@@ -6925,8 +6997,14 @@ export interface operations {
         requestBody?: {
             content: {
                 "application/json": {
-                    /** Format: date-time */
+                    /**
+                     * Format: date-time
+                     * @description Purge events sent before this instant. Required unless `before_event_id` is given.
+                     */
                     before?: string;
+                    /** @description Purge events older than this event (it is kept). */
+                    before_event_id?: string;
+                    /** @default false */
                     delete_local_events?: boolean;
                 };
             };
@@ -6943,6 +7021,7 @@ export interface operations {
                     "application/json": components["schemas"]["Task"];
                 };
             };
+            400: components["responses"]["ValidationFailed"];
             401: components["responses"]["Unauthenticated"];
             403: components["responses"]["InsufficientScope"];
             404: components["responses"]["NotFound"];

@@ -123,6 +123,10 @@ pub struct AdminState {
     /// What `users.account_data.list` and `users.pushers.list` read. `None` until wired with
     /// [`AdminState::with_user_data`]; until then they answer `503`.
     pub user_data: Option<Arc<dyn crate::user_identity::UserDataSource>>,
+    /// What the room long-tail operations read and act through: a room's state, timeline,
+    /// aliases, hierarchy, extremities and media, and purging and deleting it (see
+    /// [`crate::rooms`]). `None` until wired with [`AdminState::with_room_content`].
+    pub room_content: Option<Arc<dyn crate::rooms::RoomContentSource>>,
     /// The `Idempotency-Key` cache every mutating handler that declares it consults (see
     /// [`crate::idempotency`]). Always present (never `None`): a client is never told its
     /// idempotency key was ignored.
@@ -160,6 +164,7 @@ impl AdminState {
             cluster: None,
             user_identity: None,
             user_data: None,
+            room_content: None,
             idempotency: Arc::new(IdempotencyStore::new()),
         }
     }
@@ -255,6 +260,14 @@ impl AdminState {
     #[must_use]
     pub fn with_cluster(mut self, cluster: Arc<dyn crate::cluster::ClusterSource>) -> Self {
         self.cluster = Some(cluster);
+        self
+    }
+
+    /// Wires the room content source, making the room long-tail operations real (see
+    /// [`crate::rooms`]).
+    #[must_use]
+    pub fn with_room_content(mut self, rooms: Arc<dyn crate::rooms::RoomContentSource>) -> Self {
+        self.room_content = Some(rooms);
         self
     }
 
@@ -406,6 +419,23 @@ const REAL_HANDLERS: &[&str] = &[
     "rooms.unblock",
     "rooms.make_admin",
     "rooms.members.list",
+    "rooms.state.list",
+    "rooms.messages.list",
+    "rooms.events.get",
+    "rooms.events.at",
+    "rooms.events.context",
+    "events.get",
+    "rooms.aliases.list",
+    "rooms.aliases.add",
+    "rooms.aliases.remove",
+    "rooms.hierarchy.get",
+    "rooms.join",
+    "rooms.forward_extremities.list",
+    "rooms.forward_extremities.delete",
+    "rooms.media.list",
+    "rooms.media.quarantine",
+    "rooms.purge_history",
+    "rooms.delete",
     "appservices.list",
     "appservices.get",
     "appservices.create",
@@ -1491,7 +1521,7 @@ async fn rooms_list(
     match require_scope(
         state.verifier.as_ref(),
         authorization_header(&headers),
-        Some(Scope::AdminRead),
+        Some(Scope::ModerationRead),
     )
     .await
     {
@@ -1537,7 +1567,7 @@ async fn rooms_get(
     match require_scope(
         state.verifier.as_ref(),
         authorization_header(&headers),
-        Some(Scope::AdminRead),
+        Some(Scope::ModerationRead),
     )
     .await
     {
@@ -1927,7 +1957,7 @@ async fn rooms_members_list(
     match require_scope(
         state.verifier.as_ref(),
         authorization_header(&headers),
-        Some(Scope::AdminRead),
+        Some(Scope::ModerationRead),
     )
     .await
     {
@@ -4836,6 +4866,41 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         "rooms.unblock" => builder.add(method, &full_path, rooms_unblock, meta),
         "rooms.make_admin" => builder.add(method, &full_path, rooms_make_admin, meta),
         "rooms.members.list" => builder.add(method, &full_path, rooms_members_list, meta),
+        "rooms.state.list" => builder.add(method, &full_path, crate::rooms::state_list, meta),
+        "rooms.messages.list" => builder.add(method, &full_path, crate::rooms::messages_list, meta),
+        "rooms.events.get" => {
+            builder.add(method, &full_path, crate::rooms::events_get_in_room, meta)
+        }
+        "rooms.events.at" => builder.add(method, &full_path, crate::rooms::events_at, meta),
+        "rooms.events.context" => {
+            builder.add(method, &full_path, crate::rooms::events_context, meta)
+        }
+        "events.get" => builder.add(method, &full_path, crate::rooms::events_get, meta),
+        "rooms.aliases.list" => builder.add(method, &full_path, crate::rooms::aliases_list, meta),
+        "rooms.aliases.add" => builder.add(method, &full_path, crate::rooms::aliases_add, meta),
+        "rooms.aliases.remove" => {
+            builder.add(method, &full_path, crate::rooms::aliases_remove, meta)
+        }
+        "rooms.hierarchy.get" => builder.add(method, &full_path, crate::rooms::hierarchy_get, meta),
+        "rooms.join" => builder.add(method, &full_path, crate::rooms::join, meta),
+        "rooms.forward_extremities.list" => builder.add(
+            method,
+            &full_path,
+            crate::rooms::forward_extremities_list,
+            meta,
+        ),
+        "rooms.forward_extremities.delete" => builder.add(
+            method,
+            &full_path,
+            crate::rooms::forward_extremities_delete,
+            meta,
+        ),
+        "rooms.media.list" => builder.add(method, &full_path, crate::rooms::media_list, meta),
+        "rooms.media.quarantine" => {
+            builder.add(method, &full_path, crate::rooms::media_quarantine, meta)
+        }
+        "rooms.purge_history" => builder.add(method, &full_path, crate::rooms::purge_history, meta),
+        "rooms.delete" => builder.add(method, &full_path, crate::rooms::delete, meta),
         "appservices.list" => builder.add(method, &full_path, appservices_list, meta),
         "appservices.get" => builder.add(method, &full_path, appservices_get, meta),
         "appservices.create" => builder.add(method, &full_path, appservices_create, meta),

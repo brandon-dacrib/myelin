@@ -1,6 +1,29 @@
 # 16. Management web interface: status
 
-## Current update: 2026-09-28 (a user's devices and identity; branch `users-devices-identity`)
+## Current update: 2026-09-28 (the room page's long tail)
+
+A room's page (`src/pages/RoomDetailPage.tsx`, tabs in `src/pages/rooms/`) now covers every
+Rooms operation: **Overview**, **State** (`RoomStateTab`), **Timeline** (`RoomTimelineTab`:
+newest first with "older", jump to a date, an event in its context; a banner says that reading
+messages is recorded in the audit log), **Aliases** (add, remove), **Media** (list, quarantine
+all, as a task), **Extremities** (list, trim), **Space** (`RoomHierarchyTab`, for a space), and
+the header actions **Join a user**, **Purge history** and **Delete room** (`RoomActionDialogs`;
+purge and delete follow their task in the dialog through `RoomTaskFollow`, and delete lands on
+the rooms list). Tabs that need `admin:read` are hidden from a moderator (`hasScope` in
+`src/lib/auth.ts` now lets `admin:read` satisfy every `*:read`, decision 0013). The rooms list
+searches by alias or id as well as name (`src/lib/rooms.ts`).
+
+- **Proved against the real binary**: `web/e2e-real/room-page.spec.ts` (1 flow: read state and
+  timeline, add an alias, one extremity, purge older messages as a task, delete the room, then
+  the admin API answers 404 and the user cannot join). Passed against `hs serve` on 2026-09-28.
+  Screenshots `docs/design/screenshots/rooms-*-real.png` (overview, state, timeline, aliases,
+  extremities, purge dialog and result, timeline after purge, delete dialog, after delete).
+- **Playwright on the mock**: `web/e2e/room-page.spec.ts` (4 flows); `npm run test:e2e` 45/45.
+- **Vitest**: `RoomDetailPage.test.tsx` (13), `RoomsPage.test.tsx` (3), `lib/rooms.test.ts` (4),
+  `lib/auth.test.ts` (scope cases added). Mocks: `src/mocks/room-handlers.ts`,
+  `src/mocks/data/room-contents.ts`; typed calls in `src/api/room-contents.ts`.
+
+## Earlier update: 2026-09-28 (a user's devices and identity; branch `users-devices-identity`)
 
 A user's page gains the controls for the thirteen devices-and-identity operations that became
 real in the admin API the same day (`docs/status/15-admin-api-and-modules.md`). Each lives in

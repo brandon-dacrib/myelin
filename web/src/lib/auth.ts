@@ -102,6 +102,9 @@ export function hasScope(scope: Scope): boolean {
   // admin:write "implies every other scope" (openapi.yaml's OAuth2 scheme
   // description); bridges:write/moderation:write each imply their own :read.
   if (granted.includes("admin:write")) return true;
+  // admin:read reads every resource, so it satisfies every other :read
+  // (RFC 0004 section 8.2; docs/decisions/0013).
+  if (scope.endsWith(":read") && granted.includes("admin:read")) return true;
   if (scope === "bridges:read" && granted.includes("bridges:write")) return true;
   if (scope === "moderation:read" && granted.includes("moderation:write")) return true;
   return granted.includes(scope);

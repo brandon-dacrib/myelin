@@ -78,6 +78,7 @@ import {
   useMockRecoveryLink,
 } from "./data/recovery";
 import { rooms, roomMembers, findRoom } from "./data/rooms";
+import { roomContentHandlers } from "./room-handlers";
 import {
   findRegistrationToken,
   generateMockToken,
@@ -1449,6 +1450,9 @@ export const handlers = [
       );
     return HttpResponse.json(room);
   }),
+
+  // ---- A room's contents and its long tail (./data/room-contents) ----
+  ...roomContentHandlers(),
 
   // ---- Configuration (crates/hs-config; docs/config.md) ----
   //

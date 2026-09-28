@@ -1541,6 +1541,7 @@ paths:
   /events/{event_id}:
     get:
       summary: Fetch any event by id (room unknown)
+      description: Reads message content, so it needs admin:read (a moderator's moderation:read does not reach it; see decision 0013), and every call is recorded in the audit log as `rooms.content.read`.
       operationId: events.get
       tags:
       - Rooms
@@ -1837,7 +1838,7 @@ paths:
       - Media
       security:
       - OAuth2:
-        - admin:read
+        - moderation:read
       parameters:
       - $ref: '#/components/parameters/Limit'
       - $ref: '#/components/parameters/Cursor'
@@ -2008,7 +2009,7 @@ paths:
       - Media
       security:
       - OAuth2:
-        - admin:read
+        - moderation:read
       parameters:
       - $ref: '#/components/parameters/ServerName'
       - $ref: '#/components/parameters/MediaId'
@@ -2967,7 +2968,7 @@ paths:
       - Rooms
       security:
       - OAuth2:
-        - admin:read
+        - moderation:read
       parameters:
       - $ref: '#/components/parameters/Limit'
       - $ref: '#/components/parameters/Cursor'
@@ -3029,7 +3030,7 @@ paths:
       - Rooms
       security:
       - OAuth2:
-        - admin:read
+        - moderation:read
       parameters:
       - $ref: '#/components/parameters/RoomId'
       responses:
@@ -3059,7 +3060,7 @@ paths:
       - Rooms
       security:
       - OAuth2:
-        - admin:read
+        - moderation:read
       parameters:
       - $ref: '#/components/parameters/RoomId'
       responses:
@@ -3216,6 +3217,7 @@ paths:
   /rooms/{room_id}/delete:
     post:
       summary: Delete a room (Task)
+      description: Synapse's delete-room semantics. Every local member leaves (their invitations and knocks are withdrawn too); when `new_room` is given they are first joined to a new room created by `new_room.creator`, where `message` is posted. The room's local aliases are removed and it is taken out of the directory. With `block` (default false) nobody on this server can join it again. With `purge` (default true) every event is then removed from this server, the room stops existing here, and joining it answers not found. Runs as a task with progress; cancelling stops it between steps.
       operationId: rooms.delete
       tags:
       - Rooms
@@ -3234,18 +3236,26 @@ paths:
               properties:
                 block:
                   type: boolean
+                  default: false
                 purge:
                   type: boolean
+                  default: true
                 message:
                   type: string
+                  description: Posted in the new room by its creator. Only used with `new_room`.
                 new_room:
                   type: object
+                  required:
+                  - creator
                   properties:
                     name:
                       type: string
                     creator:
                       type: string
+                      description: A local user who creates the new room and becomes its admin.
       responses:
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
         '202':
           description: Accepted; a Task tracks progress.
           headers:
@@ -3280,6 +3290,7 @@ paths:
   /rooms/{room_id}/events/at:
     get:
       summary: Find the event nearest a timestamp
+      description: Reads message content, so it needs admin:read (a moderator's moderation:read does not reach it; see decision 0013), and every call is recorded in the audit log as `rooms.content.read`.
       operationId: rooms.events.at
       tags:
       - Rooms
@@ -3325,6 +3336,7 @@ paths:
   /rooms/{room_id}/events/{event_id}:
     get:
       summary: Get an event in a room
+      description: Reads message content, so it needs admin:read (a moderator's moderation:read does not reach it; see decision 0013), and every call is recorded in the audit log as `rooms.content.read`.
       operationId: rooms.events.get
       tags:
       - Rooms
@@ -3356,6 +3368,7 @@ paths:
   /rooms/{room_id}/events/{event_id}/context:
     get:
       summary: Get an event's context
+      description: Reads message content, so it needs admin:read (a moderator's moderation:read does not reach it; see decision 0013), and every call is recorded in the audit log as `rooms.content.read`.
       operationId: rooms.events.context
       tags:
       - Rooms
@@ -3402,13 +3415,13 @@ paths:
       - $ref: '#/components/parameters/RoomId'
       responses:
         '200':
-          description: Forward extremities.
+          description: The room's forward extremities, newest first. More than one means the room's history has forked and has not yet been merged by a later event.
           content:
             application/json:
               schema:
                 type: array
                 items:
-                  type: string
+                  $ref: '#/components/schemas/ForwardExtremity'
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '403':
@@ -3423,6 +3436,7 @@ paths:
           $ref: '#/components/responses/Unavailable'
     delete:
       summary: Prune extra forward extremities
+      description: Keeps the newest forward extremity (highest depth, then newest in this server's timeline) and forgets every other one, as Synapse's `DELETE /_synapse/admin/v1/rooms/{room_id}/forward_extremities` does. The room's current state is then the state at the one kept. A recovery tool for a room slowed down by too many extremities; answers what was deleted and what remains.
       operationId: rooms.forward_extremities.delete
       tags:
       - Rooms
@@ -3432,8 +3446,12 @@ paths:
       parameters:
       - $ref: '#/components/parameters/RoomId'
       responses:
-        '204':
-          description: Deleted.
+        '200':
+          description: What was deleted and what remains.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForwardExtremitiesPruned'
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '403':
@@ -3454,7 +3472,7 @@ paths:
       - Rooms
       security:
       - OAuth2:
-        - admin:read
+        - moderation:read
       parameters:
       - $ref: '#/components/parameters/RoomId'
       - $ref: '#/components/parameters/Limit'
@@ -3504,6 +3522,7 @@ paths:
               properties:
                 user_id:
                   type: string
+                  description: A local user. When the room's join rules do not let them in by themselves, a local member with the power to invite invites them first (Synapse's semantics).
       responses:
         '200':
           description: Membership result.
@@ -3511,6 +3530,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RoomMember'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '403':
@@ -3520,7 +3541,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          $ref: '#/components/responses/IdempotencyInFlight'
+          $ref: '#/components/responses/Conflict'
         '422':
           $ref: '#/components/responses/IdempotencyMismatch'
         '500':
@@ -3587,7 +3608,7 @@ paths:
       - Rooms
       security:
       - OAuth2:
-        - admin:read
+        - moderation:read
       parameters:
       - $ref: '#/components/parameters/RoomId'
       - $ref: '#/components/parameters/Limit'
@@ -3662,7 +3683,7 @@ paths:
       - Rooms
       security:
       - OAuth2:
-        - admin:read
+        - moderation:read
       parameters:
       - $ref: '#/components/parameters/RoomId'
       - $ref: '#/components/parameters/Limit'
@@ -3702,6 +3723,7 @@ paths:
   /rooms/{room_id}/messages:
     get:
       summary: List a room's timeline (cursor paginated)
+      description: Reads message content, so it needs admin:read (a moderator's moderation:read does not reach it; see decision 0013), and every call is recorded in the audit log as `rooms.content.read`.
       operationId: rooms.messages.list
       tags:
       - Rooms
@@ -3750,6 +3772,7 @@ paths:
   /rooms/{room_id}/purge-history:
     post:
       summary: Purge a room's history (Task)
+      description: Removes the room's message events older than `before` from this server (Synapse's purge_history semantics). State events are kept, and so is the newest event; events sent by this server's own users are kept unless `delete_local_events` is true. A purged event is gone from `/messages`, `/context`, `/event` and the admin reads; its redacted skeleton stays so the room's graph stays whole. Runs as a task with progress, and can be cancelled between batches.
       operationId: rooms.purge_history
       tags:
       - Rooms
@@ -3769,9 +3792,16 @@ paths:
                 before:
                   type: string
                   format: date-time
+                  description: Purge events sent before this instant. Required unless `before_event_id` is given.
+                before_event_id:
+                  type: string
+                  description: Purge events older than this event (it is kept).
                 delete_local_events:
                   type: boolean
+                  default: false
       responses:
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
         '202':
           description: Accepted; a Task tracks progress.
           headers:
@@ -3811,7 +3841,7 @@ paths:
       - Rooms
       security:
       - OAuth2:
-        - admin:read
+        - moderation:read
       parameters:
       - $ref: '#/components/parameters/RoomId'
       - $ref: '#/components/parameters/Limit'
@@ -6025,20 +6055,20 @@ components:
           authorizationUrl: https://example.org/_matrix/client/oauth2/authorize
           tokenUrl: https://example.org/_matrix/client/oauth2/token
           scopes:
-            admin:read: Read every resource, including the audit log, configuration (secrets redacted), cluster and migration status.
+            admin:read: Read every resource, including the audit log, configuration (secrets redacted), cluster and migration status. Satisfies every other :read scope.
             admin:write: Everything. Implies every other scope.
             bridges:read: Read appservices, bridge types, their health and backlog, and appservice tasks and events.
             bridges:write: bridges:read plus create, update, delete, pause, resume, replay, rotate tokens, export registrations, render bridge types.
-            moderation:read: Read users, rooms, reports, media, their sub-resources, moderation tasks and events. Sessions' IP addresses and account data are redacted.
+            moderation:read: Read users, rooms, reports, media, their sub-resources, moderation tasks and events. Sessions' IP addresses and account data are redacted. Not message content (a room's timeline and its events), which needs admin:read (decision 0013).
             moderation:write: moderation:read plus suspend, lock, shadow-ban, deactivate, redact, reset password, logout, room block/delete/purge, quarantine and delete media, resolve reports, server notices.
         clientCredentials:
           tokenUrl: https://example.org/_matrix/client/oauth2/token
           scopes:
-            admin:read: Read every resource, including the audit log, configuration (secrets redacted), cluster and migration status.
+            admin:read: Read every resource, including the audit log, configuration (secrets redacted), cluster and migration status. Satisfies every other :read scope.
             admin:write: Everything. Implies every other scope.
             bridges:read: Read appservices, bridge types, their health and backlog, and appservice tasks and events.
             bridges:write: bridges:read plus create, update, delete, pause, resume, replay, rotate tokens, export registrations, render bridge types.
-            moderation:read: Read users, rooms, reports, media, their sub-resources, moderation tasks and events. Sessions' IP addresses and account data are redacted.
+            moderation:read: Read users, rooms, reports, media, their sub-resources, moderation tasks and events. Sessions' IP addresses and account data are redacted. Not message content (a room's timeline and its events), which needs admin:read (decision 0013).
             moderation:write: moderation:read plus suspend, lock, shadow-ban, deactivate, redact, reset password, logout, room block/delete/purge, quarantine and delete media, resolve reports, server notices.
   parameters:
     Limit:
@@ -6857,6 +6887,13 @@ components:
           - 'null'
     StateEvent:
       type: object
+      required:
+      - event_id
+      - type
+      - state_key
+      - sender
+      - content
+      - origin_server_ts
       properties:
         event_id:
           type: string
@@ -6868,12 +6905,24 @@ components:
           type: string
         content:
           type: object
+          additionalProperties: true
         origin_server_ts:
           type: integer
     RoomEvent:
       type: object
+      required:
+      - event_id
+      - room_id
+      - type
+      - sender
+      - content
+      - origin_server_ts
+      - state_key
+      - redacted
       properties:
         event_id:
+          type: string
+        room_id:
           type: string
         type:
           type: string
@@ -6881,14 +6930,28 @@ components:
           type: string
         content:
           type: object
+          additionalProperties: true
         origin_server_ts:
           type: integer
         state_key:
           type:
           - string
           - 'null'
+        redacted:
+          type: boolean
+          description: The event has been redacted; `content` is what redaction left.
+        redacts:
+          type:
+          - string
+          - 'null'
+          description: For an `m.room.redaction`, the event it redacts.
     EventContext:
       type: object
+      required:
+      - event
+      - events_before
+      - events_after
+      - state
       properties:
         event:
           $ref: '#/components/schemas/RoomEvent'
@@ -6906,6 +6969,12 @@ components:
             $ref: '#/components/schemas/StateEvent'
     RoomHierarchyNode:
       type: object
+      required:
+      - room_id
+      - name
+      - children
+      - depth
+      - known
       properties:
         room_id:
           type: string
@@ -6913,18 +6982,98 @@ components:
           type:
           - string
           - 'null'
+        topic:
+          type:
+          - string
+          - 'null'
+        canonical_alias:
+          type:
+          - string
+          - 'null'
+        room_type:
+          type:
+          - string
+          - 'null'
+          description: m.space for a space.
+        join_rule:
+          type:
+          - string
+          - 'null'
+        joined_members_count:
+          type:
+          - integer
+          - 'null'
+        depth:
+          type: integer
+          description: How far below the requested room this node is (0 for the room itself).
+        known:
+          type: boolean
+          description: Whether this server holds the room. A child it does not hold is listed by id only.
         children:
           type: array
           items:
             type: string
     RoomAlias:
       type: object
+      required:
+      - alias
+      - creator
+      - canonical
       properties:
         alias:
           type: string
         created_at:
-          type: string
+          type:
+          - string
+          - 'null'
           format: date-time
+          description: Not recorded for aliases made before it was; null then.
+        creator:
+          type:
+          - string
+          - 'null'
+          description: Who made the alias, when that is known.
+        canonical:
+          type: boolean
+          description: Whether the room's m.room.canonical_alias names it.
+    ForwardExtremity:
+      type: object
+      required:
+      - event_id
+      - type
+      - sender
+      - depth
+      - origin_server_ts
+      properties:
+        event_id:
+          type: string
+        type:
+          type: string
+        sender:
+          type: string
+        depth:
+          type: integer
+        origin_server_ts:
+          type: integer
+        state_key:
+          type:
+          - string
+          - 'null'
+    ForwardExtremitiesPruned:
+      type: object
+      required:
+      - deleted
+      - remaining
+      properties:
+        deleted:
+          type: array
+          description: The event ids that are no longer forward extremities.
+          items:
+            type: string
+        remaining:
+          type: array
+          items:
+            $ref: '#/components/schemas/ForwardExtremity'
     MediaItem:
       type: object
       required:

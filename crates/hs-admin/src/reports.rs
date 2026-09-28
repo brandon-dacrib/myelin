@@ -773,10 +773,13 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(problem["errors"][0]["pointer"], "/status");
 
-            // Not for a token that can only read the server's settings.
+            // admin:read reads every resource (decision 0013); a write-only moderation token
+            // cannot be had, so the refusal is shown with no token at all.
             let (status, _, _) =
                 call(&state, "GET", "/api/v1/reports", Some("read"), None, None).await;
-            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(status, StatusCode::OK);
+            let (status, _, _) = call(&state, "GET", "/api/v1/reports", None, None, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
         }
 
         #[tokio::test]

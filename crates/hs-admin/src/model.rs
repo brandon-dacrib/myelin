@@ -58,7 +58,9 @@ impl Scope {
     }
 
     /// Whether holding `self` satisfies a requirement for `required` (RFC 0004 D15.8:
-    /// `admin:write` satisfies everything; each `*:write` satisfies its own `*:read`).
+    /// `admin:write` satisfies everything; each `*:write` satisfies its own `*:read`; and, per
+    /// section 8.2 and decision 0013, `admin:read` -- "read every resource" -- satisfies every
+    /// other `*:read`).
     pub fn satisfies(self, required: Scope) -> bool {
         if self == required || self == Scope::AdminWrite {
             return true;
@@ -67,6 +69,7 @@ impl Scope {
             (self, required),
             (Scope::BridgesWrite, Scope::BridgesRead)
                 | (Scope::ModerationWrite, Scope::ModerationRead)
+                | (Scope::AdminRead, Scope::BridgesRead | Scope::ModerationRead)
         )
     }
 }
@@ -1332,8 +1335,12 @@ mod tests {
     }
 
     #[test]
-    fn admin_read_does_not_satisfy_bridges_read() {
-        assert!(!Scope::AdminRead.satisfies(Scope::BridgesRead));
+    fn admin_read_satisfies_every_read_and_no_write() {
+        assert!(Scope::AdminRead.satisfies(Scope::BridgesRead));
+        assert!(Scope::AdminRead.satisfies(Scope::ModerationRead));
+        assert!(!Scope::AdminRead.satisfies(Scope::ModerationWrite));
+        assert!(!Scope::AdminRead.satisfies(Scope::BridgesWrite));
+        assert!(!Scope::ModerationRead.satisfies(Scope::AdminRead));
     }
 
     #[test]
