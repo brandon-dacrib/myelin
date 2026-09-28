@@ -1,5 +1,28 @@
 # 16. Management web interface: status
 
+## Update: 2026-09-27 (the Media page)
+
+`/media` is a real page (`web/src/pages/media/`), no longer the placeholder. It lists every
+upload and cached remote copy from `GET /media` with a thumbnail, filename and `mxc://` URI,
+status badges (Quarantined, Protected, Remote), uploader (or origin server), type, size, when
+uploaded and when last viewed; search, origin, status and sort live in the URL
+(`media-search.ts`). Previews are fetched from `GET /_matrix/client/v1/media/thumbnail` with the
+operator's own token (an `<img src>` cannot send one) and shown as object URLs; quarantined media
+and non-images get an icon, never a request. A row opens a sheet (kept fresh from `GET
+/media/{server}/{id}`) with Quarantine (behind a dialog saying what it does), Lift quarantine,
+Protect/Unprotect (each disabled with the reason when the other is set, which the API refuses
+with 409), and Delete (behind a confirmation that says whether the file is gone for good or only
+this server's copy). "Delete old media" and "Purge remote cache" are form dialogs (a date, a
+size floor or a server) that say in a sentence what will go and what is kept, then report the
+finished Task's counts in a toast. Scopes follow the contract: the page needs `admin:read`,
+actions `moderation:write`, the purge `admin:write`. No text editing anywhere (decision 0010).
+Mocks: `src/mocks/data/media.ts` (reset between tests in `src/test/setup.ts`) and handlers for
+all nine operations plus the thumbnail route, with the server's semantics (409s, `before`
+required, protected and quarantined-remote items skipped). `src/api/schema.d.ts` regenerated
+(`npm run generate:client`). `formatBytes` joins `lib/format.ts`. Verified: `npm run check`
+(lint, typecheck, 192 tests including 11 in `MediaPage.test.tsx`, build), and the page looked at
+in mock mode in a browser (list and sheet).
+
 ## Current update: 2026-09-26 (bridge offerings, RFC 0017)
 
 **Bridges are offerings first.** The management half of RFC 0017

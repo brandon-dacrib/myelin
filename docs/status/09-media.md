@@ -2,9 +2,74 @@
 
 Track brief: `docs/workstreams/09-media.md`. Owner crate: `hs-media`.
 
-Last updated: 2026-09-19 (session 4: closed the two Complement gaps — MSC2246 async upload's real
-`/_matrix/media/v1/create` path and `GET .../preview_url` — plus the content-scanning durability
-gap session 3 flagged). Sessions 1-3's records are unchanged below this section.
+Last updated: 2026-09-27 (session 5: the admin API's Media area, below). Session 4 (2026-09-19)
+closed the two Complement gaps — MSC2246 async upload's real `/_matrix/media/v1/create` path and
+`GET .../preview_url` — plus the content-scanning durability gap session 3 flagged. Sessions 1-4's
+records are unchanged below.
+
+## Session 5 (2026-09-27): the admin API's Media area, over this repository
+
+The nine `media.*` admin operations were 501; they are real now, and the interface's Media page
+reads and acts on them (`docs/status/15-...` and `16-...` have those halves).
+
+### Done
+
+- `crate::admin_source::RepositoryMediaSource<B>`: `hs_admin::media::MediaSource` over
+  `MediaRepository`. An item is `local` when its server name is this server's, `remote`
+  otherwise; unfinished async-upload reservations are not listed; `quarantined` means actually
+  withheld (quarantined and not protected, which includes an upload still waiting on a
+  `defer`-mode scan). Wired in `hs serve` (`crates/hs-cli/src/serve.rs`, `AdminSources.media`)
+  over the same `Arc<MediaRepository>` the media routes serve from.
+- `MediaRecord.last_accessed_ms` (`#[serde(default)]`, so existing rows read as never
+  accessed): `get_content` and `get_thumbnail` record an access when the stored one is older
+  than `repository::ACCESS_RESOLUTION_MS` (an hour), so a popular item costs one metadata
+  write an hour, not one per download; a failed write is logged and never fails the download.
+  `MediaRecord::last_used_ms` is last access or creation. This is Synapse's `last_access_ts`,
+  and what the bulk deletions mean by "unused since".
+- `MetadataStore::list_media` (full scan), `update_media` (read-modify-write in one
+  transaction) and `delete_media` (the row, its thumbnail rows and any pending-scan marker, in
+  one transaction, returning the thumbnail variants).
+- `MediaRepository::list_media`, `quarantine` (returns the row), `set_protected`, and
+  `delete_media`: bytes first (content and every thumbnail; already-missing bytes are fine),
+  then rows. If the object store refuses, the rows stay and the item is still listed, so the
+  deletion can be retried; the other order could strand bytes nothing refers to, which for
+  content deleted because it must not be kept is the worse failure. A thumbnail generated in
+  between has its bytes removed after the row.
+
+### Verification
+
+- `CARGO_PROFILE_DEV_DEBUG=0 cargo test -p hs-media` (253 lib tests pass, 4 new in
+  `admin_source::tests`: listing local/remote without reservations; access recorded at an
+  hour's resolution by a download and by a thumbnail; quarantine withholds and protection is
+  reported; deletion removes content bytes, thumbnail bytes and rows).
+- `CARGO_PROFILE_DEV_DEBUG=0 cargo test -p hs-cli --test e2e
+  an_administrator_can_find_quarantine_protect_and_delete_uploaded_media`: against the real
+  server, alice uploads two files; the list shows uploader, name, type, size and a last access
+  after a download; quarantine makes her download 404 and lifting it makes it 200; protected
+  media refuses quarantine (409) and survives a bulk delete that takes the other file; a single
+  delete of the protected file removes it; each step is in the audit log.
+- `cargo clippy -p hs-admin -p hs-media -p hs-cli --all-targets -- -D warnings`, `cargo fmt
+  --all --check`: clean.
+
+### Decisions made
+
+- Protection is "keep this": exempt from quarantine and from both bulk deletions, but not from
+  a single deletion an administrator names. Protection and quarantine exclude each other (the
+  admin handler answers 409 rather than record a quarantine protection would silently override).
+- The bulk deletions skip quarantined *remote* copies: deleting the local copy would let the
+  next request fetch it again from its origin, undoing the quarantine.
+- `media.delete_bulk` without `server_name` deletes this server's uploads only (Synapse's
+  semantics); with one, that server's items of either origin. `before` is required.
+- `hs-media` now depends on `hs-admin` (for the trait), as `hs-federation` does; no cycle.
+
+### Next
+
+- Quarantine by room (`rooms.media.quarantine`) and by user (`users.media.delete`,
+  `users.media.list`), and `statistics.users_media`: the first needs a room's `mxc://`
+  references, which this crate does not index; the others are a filter over `list_media`.
+- Remote media is never fetched over federation yet, so `origin: remote` rows exist only by
+  import; the purge is ready for when they do.
+- `list_media` is a full scan; paging it in the store is the next step if media counts grow.
 
 ## Session 4: the `/_matrix/media/v1/create` path, URL previews, and scan-verdict durability
 
