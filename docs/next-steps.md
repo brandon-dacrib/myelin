@@ -419,6 +419,15 @@ also raises `hs-loadgen`'s boot deadline to 120 s); the Configuration follow-ups
 preview size, a hidden secret in a list entry, the bootstrap flag: `bed8c49`); the operator's
 `Homeserver` reconciler (`e0e6d0e`, `c0bc875`; never run against a real API server).
 
+**Merge queue result (16:05-16:43):** merged `agent/federation-media` (`8991e0d`) and
+`agent/rooms-admin` (`ac7831a`), both through the full gate. Not merged: `agent/two-pod-cluster-2`,
+`agent/admin-followups`, `agent/federation-leftovers` and `agent/root-redirect` stopped on
+**rebase conflicts** with what merged today (each needs its owning track to rebase and resolve,
+keeping both sides; merge `two-pod-cluster-2` first, since the others' gates hit the ownership
+bug it fixes); `agent/user-moderation` rebased cleanly and passed fmt, clippy and the Rust tests,
+and **failed the web checks** (log in the queue's worktree, `target/merge-gate.log` of
+`.claude/worktrees/agent-ae0d1e0ef71b2441f`). Then `tools/merge-queue.sh --all`.
+
 **Finished, pushed to origin, not merged: the next session's first job.** Each needs the merge
 procedure below and nothing else unless its gate fails:
 
