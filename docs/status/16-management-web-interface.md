@@ -22,8 +22,15 @@ A user's page gained two cards on the fourteen operations track 15 made real the
 - **Mock layer**: `src/api/user-moderation.ts` (hooks), `src/mocks/data/user-moderation.ts` and
   the handlers; `schema.d.ts` regenerated from `openapi.yaml`.
 - **Tests**: Vitest `ModerationCard` (8), `RateLimitSection` (6), `ActivityCard` (5),
-  `LoginAsDialog` (3), `UsersSuspendedFilter` (1); `npm run check` 366 passed. Playwright on MSW
-  `e2e/user-moderation.spec.ts` (3); `npm run test:e2e` 44 passed.
+  `LoginAsDialog` (3), `UsersSuspendedFilter` (1); `npm run check` 406 passed after the rebase
+  onto the Rooms and Migration areas. Playwright on MSW `e2e/user-moderation.spec.ts` (3);
+  `npm run test:e2e` 49 passed.
+- **Cluster page fix**: the shard map is read again the moment a drain settles
+  (`useRefreshShardsWhenSettled`, `src/api/cluster.ts`). Before, the shard poll dropped to 15 s
+  when the replicas stopped moving and the summary kept its last mid-drain read ("1 shard
+  without an owner") for up to 15 s; that race was the intermittent failure of
+  `e2e/cluster.spec.ts:43` in the merge gate. `ClusterPage.test.tsx` checks the shards are read
+  after the drain finished (it failed 2 of 4 runs without the fix).
 - **Against the real binary**: `web/e2e-real/user-moderation.spec.ts` passed against `hs serve`
   (one flow: suspend and see the user's send refused `M_USER_SUSPENDED`, unsuspend and it goes
   through, shadow-ban and lift, set, read back and clear a rate limit, sessions, rooms and
