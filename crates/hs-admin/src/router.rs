@@ -4885,12 +4885,12 @@ mod tests {
 
     #[tokio::test]
     async fn authorized_request_to_undeclared_handler_is_501() {
-        // Reports are not in REAL_HANDLERS, and exercise the generic seam.
+        // Migration is not in REAL_HANDLERS, and exercises the generic seam.
         let (router, _manifest) = build_router(test_state());
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/reports")
+                    .uri("/api/v1/migration")
                     .header("authorization", "Bearer admin-token")
                     .body(Body::empty())
                     .unwrap(),
