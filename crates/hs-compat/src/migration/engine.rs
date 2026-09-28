@@ -383,14 +383,22 @@ impl Migrator {
             )
             .await?;
         let id = task.id.clone();
+        let mut superseded = false;
         let record = self
             .update(|r| {
                 if r.run == run {
                     r.task_id = Some(id);
+                } else {
+                    superseded = true;
                 }
             })
             .await
             .map_err(store_error)?;
+        // A pause or an abort that landed between starting the task and noting it here could not
+        // cancel it: do it now, so it stops before it copies anything more.
+        if superseded {
+            let _ = self.tasks.cancel(&task.id).await;
+        }
         Ok((task, record))
     }
 
@@ -543,7 +551,14 @@ impl Migrator {
             let mut checkpoint = progress.checkpoint.clone();
             loop {
                 let batch = self
-                    .copy_batch(stream, &source, checkpoint.as_deref(), batch_size, &config)
+                    .copy_batch(
+                        stream,
+                        &source,
+                        checkpoint.as_deref(),
+                        batch_size,
+                        &config,
+                        ctx,
+                    )
                     .await?;
                 if batch.handled == 0 && batch.fatal.is_none() {
                     let Some(record) = self
@@ -633,11 +648,15 @@ impl Migrator {
         after: Option<&str>,
         limit: i64,
         config: &SynapseSourceConfig,
+        ctx: &TaskContext,
     ) -> Result<Batch, MigrationError> {
         let mut batch = Batch::default();
         match stream {
             Stream::Users => {
                 for user in source.users(after, limit).await? {
+                    if ctx.is_cancelled() {
+                        break;
+                    }
                     let outcome = self.target.import_user(&user).await;
                     batch.tally(stream, &user.user_id, outcome);
                     batch.next = Some(user.user_id.clone());
@@ -650,6 +669,9 @@ impl Migrator {
                 let after = after.and_then(parse_device_key);
                 let after = after.as_ref().map(|(u, d)| (u.as_str(), d.as_str()));
                 for device in source.devices(after, limit).await? {
+                    if ctx.is_cancelled() {
+                        break;
+                    }
                     let key = format!("{}'s device {}", device.user_id, device.device_id);
                     let outcome = if device.hidden {
                         Ok(Imported::Skipped(
@@ -668,6 +690,9 @@ impl Migrator {
             Stream::AccessTokens => {
                 let after = after.and_then(|a| a.parse::<i64>().ok());
                 for token in source.access_tokens(after, limit).await? {
+                    if ctx.is_cancelled() {
+                        break;
+                    }
                     let key = format!("access token {} of {}", token.id, token.user_id);
                     let outcome = if token.puppets_user_id.is_some() {
                         Ok(Imported::Skipped(
@@ -686,6 +711,9 @@ impl Migrator {
             Stream::AccountData => {
                 let after = after.and_then(parse_account_data_key);
                 for (data, key) in source.account_data(after.as_ref(), limit).await? {
+                    if ctx.is_cancelled() {
+                        break;
+                    }
                     let label = match &data.room_id {
                         Some(room) => format!("{}'s {} in {room}", data.user_id, data.data_type),
                         None => format!("{}'s {}", data.user_id, data.data_type),
@@ -706,6 +734,9 @@ impl Migrator {
             }
             Stream::Rooms => {
                 for room_id in source.room_ids(after, limit.min(ROOMS_PER_BATCH)).await? {
+                    if ctx.is_cancelled() {
+                        break;
+                    }
                     batch.next = Some(room_id.clone());
                     let Some(room) = source.room(&room_id).await? else {
                         continue;
@@ -779,6 +810,9 @@ impl Migrator {
             }
             Stream::Media => {
                 for (media, url_cache) in source.media(after, limit).await? {
+                    if ctx.is_cancelled() {
+                        break;
+                    }
                     batch.next = Some(media.media_id.clone());
                     let key = format!("media {}", media.media_id);
                     if url_cache {

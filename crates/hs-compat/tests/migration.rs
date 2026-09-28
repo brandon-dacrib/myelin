@@ -64,7 +64,9 @@ impl Fixture {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let name = format!("synapse_small_{}_{nanos}", std::process::id());
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!("synapse_small_{}_{nanos}_{n}", std::process::id());
         admin
             .batch_execute(&format!(
                 "CREATE DATABASE {name} ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0"
@@ -548,7 +550,14 @@ async fn a_paused_copy_resumes_where_it_stopped_and_an_abort_leaves_what_was_cop
         .await
         .unwrap();
     // One account copied; the copy waits on the second.
+    let deadline = Instant::now() + Duration::from_secs(30);
     while rig.target.users.lock().unwrap().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "nothing was copied: {:#?}\n{:#?}",
+            rig.store.load().await.unwrap(),
+            rig.store.log().await.unwrap()
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let task = rig.store.load().await.unwrap().task_id.unwrap();
@@ -559,10 +568,20 @@ async fn a_paused_copy_resumes_where_it_stopped_and_an_abort_leaves_what_was_cop
         rig.tasks.get(&task).await.unwrap().unwrap().status,
         hs_admin::model::TaskStatus::Cancelled
     );
-    // Nothing more is copied while paused, even with the gate open.
+    // Nothing more is copied while paused, even with the gate open. The copy stops at its next
+    // step, so the account it was waiting on may still land; nothing after it does.
     gate.add_permits(1_000);
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(rig.target.users.lock().unwrap().len(), 1);
+    let here: Vec<String> = rig.target.users.lock().unwrap().keys().cloned().collect();
+    assert!(
+        here.len() <= 2,
+        "{here:?}\n{:#?}",
+        rig.store.log().await.unwrap()
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(rig.target.users.lock().unwrap().len(), here.len());
+    assert!(rig.target.devices.lock().unwrap().is_empty());
+    assert_eq!(copied(&rig.store.load().await.unwrap(), Stream::Users), 0);
     assert_eq!(rig.store.load().await.unwrap().phase, Phase::Paused);
 
     rig.migrator.resume(&operator()).await.unwrap().unwrap();
