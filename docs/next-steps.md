@@ -448,6 +448,9 @@ configuration history and revert (`ConfigStore` already records the patch per re
 - 17:57 **merged `agent/user-moderation`** as `7587a7a` through the full gate (with
   `HS_CLUSTER_TEST_POSTGRES_DSN`). Admin coverage on `main`: **154 of 158**; the last four are
   on `agent/admin-followups`.
+- 18:15 started `agent/config-reload` (background agent, own worktree): rate limits, then the
+  federation policy, then the log filter re-read on a configuration change without a restart,
+  so `config.reload` and a save say truthfully what took effect.
 
 ## Handover (2026-09-28, 16:00 EDT): where the nine resumed agents stopped
 
