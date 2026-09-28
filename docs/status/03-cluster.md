@@ -15,15 +15,15 @@ Tests: `ownership::tests::an_administrators_drain_hands_every_shard_to_the_peer_
 
 ## 2026-09-28: two pods on the owner's cluster -- where this stopped
 
-Branch `agent/two-pod-cluster-2`. Two replicas as two pods on `dacrib0` (context
+Branch `agent/two-pod-cluster-2`, merged into `main` the same day. Two replicas as two pods on `dacrib0` (context
 `admin@dacrib0`, Talos v1.10.5, Kubernetes v1.33.2), namespace `myelin-cluster`, database the
 CloudNativePG `Database` `dacrib/myelin-cluster` on the shared `postgres-cluster`, media on
 SeaweedFS in the namespace. **The mesh between two pods carried real traffic for the first
 time: `verify.py` passed three times, `failover.py` and a rolling update ran, and both found the
 same gap: a request that lands while a shard changes hands reaches the client as a `503`.** The
-fix is in this branch, tested, and **not yet on the cluster**: the only way to get an image of a
-branch there is CD's `workflow_dispatch` with `publish`, which this session was not permitted to
-start, and main is not pushed from here. Everything below is measured unless it says otherwise.
+fix is on `main`, tested, and **not yet on the cluster**: the cluster runs an image from
+before it (CD builds images from `main`; a branch image needs CD's `workflow_dispatch`, which
+this session was not permitted to start). Everything below is measured unless it says otherwise.
 All times UTC.
 
 ### etcd, before anything was installed
@@ -71,7 +71,7 @@ reboots of black0n0 were not this session's (it ran only reads against etcd and 
    claim was grown in place (Longhorn allows expansion; deleting it was not allowed here) and
    volumes are now 256 MB, at most 16. Then `s3-make-bucket` was deleted and re-created:
    `make_bucket: hs-media`, Complete. The s3 pod is Ready and uploads work.
-2. **The chart**, from this branch, values `deploy/two-pod/values-dacrib0.yaml` (new: the
+2. **The chart**, from the branch, values `deploy/two-pod/values-dacrib0.yaml` (new: the
    values file the last session wrote was also on the other machine), image
    `ghcr.io/brandon-dacrib/myelin:sha-4a010ee07bdf7ca2616374ace0e9f2ef66305b40` (the server
    of `5b6cda9`, which the last session pinned; both are on ghcr):
@@ -145,7 +145,7 @@ client behind the Service would have gone to the other pod). `helm upgrade --wai
   45-46 some shards had no owner at all, and the forwarder gave up on the first lookup.
 - Worst successful send 1.7 s; typical 0.4-0.8 s.
 
-### The fix (this branch; tests pass; not yet on the cluster)
+### The fix (on `main`; tests pass; not yet on the cluster)
 
 - `hs_cluster::mesh::Forwarder::forward`: `421`, `503` without `Retry-After`, a refused
   connection and **no known owner** are all retried with a backoff that doubles from 10 ms and
@@ -183,8 +183,7 @@ new users with `hs register` if needed.
 
 ### Next, in order
 
-1. Get an image of this branch (merge to main, or CD `workflow_dispatch` with `publish` on
-   `agent/two-pod-cluster-2`), `helm upgrade --set image.tag=sha-<commit>` **while
+1. Get the image CD builds for `main`, `helm upgrade --set image.tag=sha-<commit>` **while
    `rolling.py` runs** (that upgrade is itself the rolling update to measure), then
    `failover.py`. Target: 0 failures in both. Check `/metrics` on a pod for the `hs_cluster_*`
    series (`kubectl port-forward pod/hs-0 19090:9090`).

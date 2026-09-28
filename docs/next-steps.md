@@ -42,6 +42,69 @@ was performed. The owner's Helm/port-forward steps below still apply. For the ne
 cross-section validation and an assisted storage-backend migration remain open. Rate-limit
 buckets other than messages are still unenforced, and message buckets are per replica.
 
+## Where this stopped (2026-09-28, late): start here
+
+**`main` has everything; no agent branch is open.** The last two, `agent/two-pod-cluster-2`
+(two pods on the real cluster, the handoff fix, the `hs_cluster_*` metrics) and
+`agent/cluster-admin` (drain and undrain through the admin API, the Cluster page), are merged;
+`agent/two-pod-cluster` is superseded and deleted.
+
+**The cluster, exactly** (`admin@dacrib0`, namespace `myelin-cluster`; the demo in `myelin` is
+untouched):
+
+- Helm release `hs`, **revision 2**, image `ghcr.io/brandon-dacrib/myelin:sha-982370ba22c2a79668000b498f29e3935d8390fd`,
+  values `deploy/two-pod/values-dacrib0.yaml`. That image **predates the handoff fix and the
+  metrics**. Pods `hs-0` and `hs-1`, Ready, on two nodes; mesh mutual TLS from Secret
+  `hs-mesh-tls`; database the CNPG `Database` `dacrib/myelin-cluster` (`myelin_cluster` on the
+  shared `postgres-cluster`, user `appuser`, plain connections).
+- `s3` (SeaweedFS 3.97) Ready, claim `s3` 20Gi, bucket `hs-media` made by the completed Job
+  `s3-make-bucket`. Users `alice` and `bob` and 24 test rooms.
+
+**Next, in order:**
+
+1. Let CD build the image for this `main` (`sha-<commit>` on ghcr), then, with port-forwards to
+   both pods that re-open themselves and `rooms.json` from a fresh `verify.py`, run
+   `deploy/two-pod/rolling.py` and during it
+   `helm upgrade hs deploy/helm/hs -n myelin-cluster -f deploy/two-pod/values-dacrib0.yaml --set image.tag=sha-<commit> --wait`.
+   Then `deploy/two-pod/failover.py`. **Target: 0 failures in both** (before the fix: 322 in
+   the rolling update, 7 of 240 in the failover, all requests landing mid-handoff), and the
+   `hs_cluster_*` series on a pod's `/metrics` (`kubectl port-forward pod/hs-0 19090:9090`).
+   Exact commands and every number so far: the top of `docs/status/03-cluster.md`.
+2. Latency on that cluster, not investigated: `/createRoom` 1.5-2.2 s, concurrent sends up to
+   3.2 s, a cross-pod `/sync` wake 1.2-2.3 s after the send. Measure a pod's round trip to
+   `postgres-cluster` first; it shares disks with etcd (below).
+3. The remaining desktop items: Element through a port-forward to the Service; a bridge
+   registered; the demo's offering; make `storage.postgres.sslMode` real (the server connects
+   `NoTls`); the operator draining a pod through the admin API before evicting it (2f below).
+
+**For the owner: the SeaweedFS change to put in
+`my-infra/talos-clusters/dacrib0/apps/myelin-cluster/`** (applied to the namespace from the
+live objects; the directory with `s3.yaml` and `values.yaml` was on the other machine and does
+not exist in this machine's checkout, and nothing was committed there):
+
+```diff
+ PersistentVolumeClaim s3: spec.resources.requests.storage
+-  5Gi
++  20Gi
+ Deployment s3: spec.template.spec.containers[seaweedfs].args  (weed server)
+-  -filer.defaultStoreDir=/data/filer
+-  -volume.max=0
++  -volume.max=16
++  -master.volumeSizeLimitMB=256
+```
+
+`-filer.defaultStoreDir` does not exist in 3.97 (the crash loop). `-volume.max=0` with the
+default 30 GB volume preallocated ~4.8 GB on the 5 GiB claim, so the first upload failed with
+"No writable volumes" and the next start panicked with "no space left on device"; the claim was
+grown in place (Longhorn). The chart's values for this run are `deploy/two-pod/values-dacrib0.yaml`
+in this repository, replacing the lost `values.yaml`.
+
+**etcd.** After the owner's fix, black0n0 rebooted twice (about 01:07 and 01:23:52 UTC); from
+then on its member logged no slow fdatasync, and `/readyz/etcd` through all three apiservers
+was 428 of 429 ok over 49 minutes. **tp0n3 and tp0n1 still log an occasional slow fdatasync
+(1.0-3.0 s, a few an hour)**, and tp0n1's coincided with the only cluster-wide readiness
+failures seen. Worth the owner's look before load tests.
+
 ## The state of things
 
 **A real client works.** Element Web — the actual browser client most Matrix users run — signs in against this server, shows a room list, sends and receives messages live between two independent sessions, propagates a display-name change to an already-open tab, and scrolls back through history. Screenshots in `docs/design/screenshots/`, reproduction in `web/element-testing/README.md`. That was the project's stated definition of success from day one. The loud exception is closed: `/createRoom` merged its power-level override backwards, which made creating a room from the UI fail unconditionally, and it no longer does. `unsigned.prev_content` and `GET /account/3pid` went with it. Creating a room from Element's own dialog was re-checked in a real browser on 2026-09-21 (several times, encrypted rooms included); `prev_content` and `GET /account/3pid` have still only been checked by tests.
@@ -686,7 +749,7 @@ Semantic conflicts the compiler found: two `MediaRecord` test initializers witho
 | `rooms-admin` | `GET /api/v1/events/{id}` (no room in its path) reads the room on whichever replica gets it, not the owner; a purge keeps a redacted skeleton row per purged event instead of deleting rows; the hierarchy reads only rooms this server holds (no federation `/hierarchy`); deleting a room leaves remote members and other servers alone, as Synapse does | 2 |
 | `federation-membership` | `createRoom`'s `invite` list for remote users; a reject fallback when no resident server helps; neutral error text; restricted joins; Complement | 3 |
 | `federation-edus` | ~~To-device over federation; `m.signing_key_update`~~ (done 2026-09-28, `federation-to-device`); ~~in cluster mode, EDUs only through the owning replica~~ (done 2026-09-28). Its unrun `clippy`/`test -p hs-cli` are now run and green | 3 |
-| `two-pod-cluster` | Superseded by `agent/two-pod-cluster-2`: two pods ran on 2026-09-28; the handoff fix and the `hs_cluster_*` metrics are tested and not yet on the cluster (needs an image of the branch). SeaweedFS was fixed in the namespace (flag, volume size, claim grown to 20Gi; my-infra not committed); `storage.postgres.sslMode` is still ignored. See the top of `docs/status/03-cluster.md` | 6 |
+| `two-pod-cluster` | Superseded by `agent/two-pod-cluster-2`, merged 2026-09-28: two pods ran; the handoff fix (decision 0013) and the `hs_cluster_*` metrics are on `main`, not yet on the cluster. See "Where this stopped" at the top | 6 |
 
 **Second round (2026-09-28): two more branches.** `agent/admin-web-pages` (the Reports,
 Tasks and Statistics pages, the Overview sparklines, `TimeseriesChart`) and
@@ -700,12 +763,7 @@ federation merge had no textual conflicts and compiled as it was. The gate after
 fmt and clippy clean; `cargo test --workspace --all-targets` 78 binaries, 2101 passed, 0 failed; doc tests 3 passed; `npm run check` 41
 files and 320 tests; `npm run test:e2e` 38/38.
 
-**On the cluster** (`admin@dacrib0`), unchanged: namespace `myelin-cluster` holds five
-Secrets, a bound `s3` PVC, and a crash-looping SeaweedFS pod and bucket Job (wrong flag;
-harmless). The database is the CNPG `Database` `dacrib/myelin-cluster` on the shared
-`postgres-cluster`, owned by `appuser`, reclaim `delete`. No Helm release. The demo in `myelin`
-is untouched. The cluster's etcd slowness predates this work and needs the owner's attention
-before the two-pod run.
+**On the cluster** (`admin@dacrib0`): superseded; see "Where this stopped" at the top of this file.
 
 **Toolchain on the desktop.** The owner's desktop has a `rustup` install (stable 1.98.1 with
 rustfmt and clippy, in `~/.rustup` and `~/.cargo`, sourced from `~/.cargo/env`); the workspace
@@ -900,10 +958,9 @@ edit one is not. New settings and operations arrive with their interface control
    three and three, forwarding, identical `/messages`, cross-pod `/sync` wakes, media across
    pods); `failover.py` lost 7 of 240 sends and a rolling update 322 in three windows, all
    requests landing mid-handoff. The fix (forwards wait out a handoff, decision 0013; the
-   `hs_cluster_*` metrics exported) is on branch `agent/two-pod-cluster-2`, tested, and **not
-   yet on the cluster**: next is its image, upgraded to while `deploy/two-pod/rolling.py` runs
-   (that is the rolling update), then `failover.py`, both to 0 failures. Then the demo's
-   offering. Also make `storage.postgres.sslMode` real (the server connects `NoTls`), and look
+   `hs_cluster_*` metrics exported) is on `main`, tested, and **not yet on the cluster**: next
+   is its image, upgraded to while `deploy/two-pod/rolling.py` runs (that is the rolling
+   update), then `failover.py`, both to 0 failures. Then the demo's offering. Also make `storage.postgres.sslMode` real (the server connects `NoTls`), and look
    at `/createRoom` 1.5 s and `/sync` wakes 1.2-2.3 s on that cluster.
 
 ### 1. The standout: make the operations story true on a cluster
