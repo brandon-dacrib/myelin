@@ -451,6 +451,18 @@ configuration history and revert (`ConfigStore` already records the patch per re
 - 18:15 started `agent/config-reload` (background agent, own worktree): rate limits, then the
   federation policy, then the log filter re-read on a configuration change without a restart,
   so `config.reload` and a save say truthfully what took effect.
+- ~18:05 `agent/admin-followups` rebased onto `origin/main` (`8a4ca9f`), tip pushed. What the
+  rebase found where it meets user moderation: (1) the 501-seam unit test asked
+  `/api/v1/federation/keys`, which this branch makes real, so no operation is left to reach the
+  seam through the router; the test now calls `not_implemented` directly. (2) The moderation
+  card never saw a user's redaction finish against the real server: the task ended in 2 ms, its
+  last `task.changed` reached the page before the `202` that started it, and the `202`'s
+  "running" snapshot was written over it; with the stream connected nothing polls. Every write of
+  a task into the cache now keeps the later state (`web/src/api/task-cache.ts`, also as
+  `useTask`'s `structuralSharing`). (3) The mock's step-driven redaction task only moved when
+  read, so it sat at 0 once pages stopped polling; the mock's ticker now drives it. And four
+  `e2e-real` specs from main waited for `networkidle`, which never comes with the stream open;
+  they use `settle()`. Checks in the branch table below. Ready for the queue.
 - 18:45 `agent/admin-followups` rebased onto `main` (`b9dcc82`): per-crate, web (49/49) and
   `e2e-real` (9/9) green; it also fixed a real race (a task's final `task.changed` arriving
   before the `202` that started it left a finished redaction at "0 of 2"; `web/src/api/task-cache.ts`
@@ -522,7 +534,7 @@ procedure below and nothing else unless its gate fails:
 | `agent/federation-media` | Known gap closed: remote avatars and attachments over signed federation media, legacy fallback, our media served to peers | fmt, clippy green; `federation_media` 3/3 with two real servers; full gate not run on the final rebase |
 | `agent/user-moderation` | Users 41/41: suspend, shadow-ban, rate limit, login-as, redact, media, sessions (decision 0014) | Rebased onto `75d2712` (rooms-admin, Migration): fmt and workspace clippy green; `hs-admin` 277, `hs-room` 123, `hs-auth` 235, `hs-media` 281, `hs-cli` lib 162 + `user_moderation` 6 + `admin_rooms` 4 green; `npm run check` 406/406, `npm run test:e2e` 49/49 (and `e2e/cluster.spec.ts` 60/60 repeated, after the shard-map fix). Full workspace gate not run on this rebase |
 | `agent/rooms-admin` | Rooms 23/23: state, messages, events, aliases, hierarchy, admin join, extremities, media and quarantine, purge and delete as tasks | fmt, clippy green; workspace tests 789/2 (two `e2e.rs` restart tests timed out at load 30-50, pass alone); web checks and `e2e-real/room-page` green |
-| `agent/admin-followups` | Reports filters and `report.created` over SSE, pages listen instead of polling; bulk media deletions as cancellable tasks; Federation 7/7; three bugs from a real-server Playwright run | fmt, clippy, `hs-admin` 237, `test:e2e` 41/41 green; full workspace tests not run since the rebase; `UserIdentity.test.tsx` "renames a device" needs one isolated rerun |
+| `agent/admin-followups` | Reports filters and `report.created` over SSE, pages listen instead of polling; bulk media deletions as cancellable tasks; Federation 7/7 (**158 of 158** with main); three bugs from a real-server Playwright run; after the rebase onto `7587a7a`, three fixes where moderation met the event stream (below) | Rebased onto `origin/main` (`8a4ca9f`): fmt and workspace clippy green; `hs-admin` 278 + contract 2 + mock 5 + tokens 7, `hs-federation` 178, `hs-media` 281, `hs-cli` lib 162 + `admin_followups` 3 + `reports_tasks_statistics` 1 + `user_moderation` 6 + `admin_rooms` 4 + `admin_user_identity` 1 + `root_page` 1 + `cluster_admin` 2 (no PostgreSQL DSN, so its two-replica case skipped); `admin_api_coverage.py` 158/158; `npm run check` 58 files / 426 tests; `npm run test:e2e` 49/49; `e2e-real` user-moderation, users-devices-and-identity, room-page, reports-tasks-statistics and configuration 9/9 against `hs serve`. `UserIdentity.test.tsx` "renames a device" is not flaky in logic: it passed 6/6 alone and 7/7 in full runs, but took 1.5 s with two suites running against one-second waits, so its waits are now 5 s. Full workspace gate not run (the coordinator runs it under the lock) |
 | `agent/federation-leftovers` | Local restricted join without an authoriser; joins ask only the servers the client named (Synapse's rule); stripped state out of the timeline; knock 403; v12 rooms cross servers; EDUs forwarded to the owning replica (`cluster_edus.rs`); four Complement-found fixes. Complement 14/18 top-level, 94/98 subtests (from 5/18) | per-crate clippy and tests green, `federation_membership` 12/12; full workspace gate not run on the tip; re-run Complement (`RemoteJoinFailOver` should now pass) |
 
 The `/` redirect agent was told to stop, commit and push (see below). Their branches are the

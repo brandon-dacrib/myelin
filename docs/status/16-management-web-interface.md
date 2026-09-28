@@ -136,6 +136,22 @@ inline Sessions list was:
 
 ## Update: 2026-09-28 (later), the admin API follow-ups (track 15's work, pages included)
 
+- **After the rebase onto user moderation (18:05).** A task written into the cache never goes
+  back in time: `src/api/task-cache.ts` (`rememberTask`, `taskIsBehind`) keeps whichever of two
+  sightings is further along (ended beats running beats scheduled; running, the larger
+  progress), and every place that writes a task uses it: the `task.changed` handler, the
+  mutations that answer with a task (redaction, a user's media, bulk media, key refetch,
+  cancel) and `useTask`'s `structuralSharing` for fetches. Found against `hs serve`: a
+  two-message redaction ended in 2 ms, its last event arrived before the `202`, the `202`'s
+  "running" snapshot overwrote it, and with the stream connected nothing polled, so the
+  moderation card said "0 of 2" forever. Test: `src/api/task-cache.test.ts` (the race and the
+  ordering rules). The mock's ticker now also drives step-driven tasks (a user's redaction),
+  which only moved when read. `e2e-real/{configuration,user-moderation,users-devices-and-identity,room-page}.spec.ts`
+  use `settle()` instead of `networkidle`. `UserIdentity.test.tsx` waits 5 s for the page and
+  each round trip (1.5 s under two concurrent suites) and checks the recorded request bodies
+  with `waitFor`. Verified: Vitest 58 files / 426 tests, Playwright 49/49, and against `hs serve`
+  the five specs above plus `reports-tasks-statistics` 9/9.
+
 - **Live pages.** `src/api/events.ts` reads the admin event stream with `fetch` (the bearer token
   cannot go on an `EventSource`), one connection per signed-in session started by `AppShell`.
   `report.*` refetches the report lists, that report and the Overview's counts (so the sidebar's

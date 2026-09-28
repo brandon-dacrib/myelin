@@ -159,14 +159,19 @@ offering operations); before that 2026-09-26 (three public recovery operations);
 > `web/e2e-real/configuration.spec.ts`. The `openapi.yaml` description of `ConfigSettingInfo`
 > mentions it; no operation changed.
 
-> **Branch state (2026-09-28, handed back unmerged):** `agent/admin-followups`, rebased on
-> `origin/main` at 8cc6b92. Done: everything below (bulk media tasks, Federation 7/7, reports by
-> person, SSE-driven pages, the small fixes, the e2e-real Reports/Tasks/Statistics run). Gate:
-> fmt and workspace clippy clean; `cargo test -p hs-admin`, `-p hs-federation`, and the
-> real-server tests `admin_followups` (3) and `reports_tasks_statistics` pass; `npm run test:e2e`
-> 41/41; `npm run check` green except load-related timeouts that pass when rerun alone; the full
-> `cargo test --workspace` was not run after the rebase (stopped for the merge queue). Left: the
-> full workspace test run and the merge.
+> **Branch state (2026-09-28, 18:05, ready for the merge queue):** `agent/admin-followups`,
+> rebased onto `origin/main` at `8a4ca9f` (user moderation merged). With it `main` has **158 of
+> 158** operations (`python3 tools/admin_api_coverage.py`). Three fixes came out of the rebase:
+> the 501-seam test (`router::tests::authorized_request_to_undeclared_handler_is_501`) calls
+> `not_implemented` directly, since no operation reaches it through the router any more; a task
+> that ends before its `202` reaches the page stays ended there (`web/src/api/task-cache.ts`,
+> status 16); the mock's redaction task moves while the event stream is open. Checks: fmt and
+> workspace clippy clean; `hs-admin` 278 (+ contract 2, mock 5, tokens 7), `hs-federation` 178,
+> `hs-media` 281, `hs-cli` lib 162, and the real-server tests `admin_followups` 3,
+> `reports_tasks_statistics` 1, `user_moderation` 6, `admin_rooms` 4, `admin_user_identity` 1,
+> `root_page` 1, `cluster_admin` 2 (two-replica case skipped without a PostgreSQL DSN); web
+> `npm run check` 426 tests, `test:e2e` 49/49, five `e2e-real` specs 9/9 against `hs serve`.
+> Left: the full workspace gate under the merge lock, and the merge.
 
 > **2026-09-28 (later): the admin API follow-ups** (queue items 2a and 2g of
 > `docs/next-steps.md`, and fixes other agents flagged). Tested through the real server in
