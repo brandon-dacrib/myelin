@@ -31,3 +31,21 @@ Work does not stay in branches. When a piece of work is done, it is merged into 
 - **Its tests pass.** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace --all-targets` for Rust changes; `npm run check` and `npm run test:e2e` for `web/` changes.
 
 Before merging, rebase onto (or merge) the latest `origin/main` and run the checks again. When several agents work in parallel they merge one at a time. Work that is not done is reported as not done, with what is left, and is never left quietly in a branch.
+
+## Working in Parallel
+
+These rules come from runs of nine agents at once (2026-09-28), where finished work sat unmerged for hours:
+
+- **Agents don't wait for the merge lock.** A subagent that waits a long time is sent back by the harness before it merges. When an agent's work is done, it commits, pushes `agent/<name>` to origin and reports. The coordinator merges serially with `tools/merge-queue.sh` (or `--all`). That script takes `.git/myelin-merge.lock`, rebases, runs the full gate, pushes to `main` and deletes the branch.
+- **Merge as soon as work is done, not at the end.** Branches merged in a batch at the end conflicted with each other in shared files (`hs-admin`'s router and `lib.rs`, `hs-cli`'s `serve.rs`, the status files). A usage limit mid-run then stranded them. Each merge makes the next branch's rebase smaller.
+- **Run the full workspace gate only under the lock.** Iterate with `cargo test -p <crate>`. Seven concurrent `cargo test --workspace` runs made each take 40+ minutes and made real-binary tests time out at boot. Keep a separate `target/` per worktree, and build with `CARGO_PROFILE_DEV_DEBUG=0`.
+- **Set `HS_CLUSTER_TEST_POSTGRES_DSN` for the gate.** Without it, the two-replica test in `crates/hs-cli/tests/cluster_admin.rs` prints `SKIP` and passes. Use a PostgreSQL whose user can create databases (see the script's header).
+- **Never `pkill -f` a pattern that other agents' processes also match** (`vitest`, `playwright`, the lock-wait loop). Kill your own PIDs.
+- **Installs and long builds belong to a background agent**, not the coordinating session.
+- **The handover lists every unmerged branch.** Before a session ends, `docs/next-steps.md` names each branch from `git branch -r --no-merged origin/main`, what it holds and how far its gate got.
+
+## The Owner's Desktop
+
+- **Docker works, and is how to get PostgreSQL** for tests. `docker pull` from Docker Hub fails in agent sessions because the credential helper needs the keychain; use the ECR mirror instead: `public.ecr.aws/docker/library/postgres:17`.
+- **Homebrew `kubectl`, `helm` and `talosctl` cannot reach the verification cluster** (`admin@dacrib0`) from Claude Code: "no route to host", from macOS's Local Network permission for the app. Apple's `curl` and `nc` reach it. Don't retry the CLIs. Work that needs the cluster is a desktop item for the owner's terminal: the owner runs port-forwards and `helm`, and the session drives the scripts in `deploy/two-pod/` against `localhost`.
+- **Cold boots are slow under load.** A debug `hs` can take 30–60 s to start, so real-binary harnesses allow 120 s.
