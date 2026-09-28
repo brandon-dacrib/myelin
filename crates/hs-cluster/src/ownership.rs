@@ -228,6 +228,15 @@ pub struct KvOwnership<B: KvBackend> {
     peers: RwLock<HashMap<ReplicaId, PeerLiveness>>,
     last_heartbeat_ok: RwLock<Option<Instant>>,
     draining: AtomicBool,
+    /// Whether an administrator has asked this replica to drain
+    /// ([`ClusterStore::request_drain`]), as of the last heartbeat that could read the request.
+    /// Like `draining`, it takes this replica out of hashing and releases its shards; unlike
+    /// it, it is withdrawn by [`ClusterStore::withdraw_drain`], after which the replica takes
+    /// shards again, and it neither makes the replica unready nor stops the manager.
+    admin_drained: AtomicBool,
+    /// Held by the heartbeat loop for each tick, and by [`Drainable::drain`] while it stops the
+    /// loop and deregisters (see there).
+    tick_lock: tokio::sync::Mutex<()>,
     nudge: Notify,
     stop: watch::Sender<bool>,
 }
@@ -271,6 +280,8 @@ impl<B: KvBackend> KvOwnership<B> {
             peers: RwLock::new(HashMap::new()),
             last_heartbeat_ok: RwLock::new(None),
             draining: AtomicBool::new(false),
+            admin_drained: AtomicBool::new(false),
+            tick_lock: tokio::sync::Mutex::new(()),
             nudge: Notify::new(),
             stop,
         });
@@ -316,6 +327,10 @@ impl<B: KvBackend> KvOwnership<B> {
                     }
                 }
             }
+            // Held for the whole tick, and checked for `stop` under it, so that `drain` (which
+            // takes it before deregistering) can never have a tick's heartbeat land after the
+            // row is removed and register this replica again.
+            let _ticking = self.tick_lock.lock().await;
             if *stop.borrow() {
                 return;
             }
@@ -323,8 +338,53 @@ impl<B: KvBackend> KvOwnership<B> {
         }
     }
 
+    /// Whether this replica is out of hashing and handing its shards off: shutting down, or
+    /// drained by an administrator.
+    fn stepping_aside(&self) -> bool {
+        self.draining.load(Ordering::SeqCst) || self.admin_drained.load(Ordering::SeqCst)
+    }
+
+    /// Whether an administrator's drain request for this replica was in force at the last
+    /// heartbeat.
+    #[must_use]
+    pub fn is_admin_drained(&self) -> bool {
+        self.admin_drained.load(Ordering::SeqCst)
+    }
+
+    /// Reads this replica's drain request and follows it. A failed read keeps the previous
+    /// answer: a store hiccup must neither start nor stop a drain.
+    async fn read_drain_request(&self) {
+        let store = self.store.clone();
+        let me = self.me.clone();
+        let request = tokio::task::spawn_blocking(move || store.drain_request(&me)).await;
+        let Ok(Ok(request)) = request else { return };
+        let wanted = request.is_some();
+        let was = self.admin_drained.swap(wanted, Ordering::SeqCst);
+        match (was, &request) {
+            (false, Some(request)) => tracing::info!(
+                replica = %self.me,
+                requested_by = %request.requested_by,
+                owned = self.owned_count(),
+                "an administrator asked this replica to drain: handing its shards to the others"
+            ),
+            (true, None) => tracing::info!(
+                replica = %self.me,
+                "this replica's drain was withdrawn: taking its share of the shards again"
+            ),
+            _ => {}
+        }
+    }
+
+    fn owned_count(&self) -> usize {
+        self.owned
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
     async fn tick(&self) {
-        let state = if self.draining.load(Ordering::SeqCst) {
+        self.read_drain_request().await;
+        let state = if self.stepping_aside() {
             ReplicaState::Draining
         } else {
             ReplicaState::Active
@@ -409,7 +469,7 @@ impl<B: KvBackend> KvOwnership<B> {
         let Ok(Ok(rows)) = rows else { return };
         let rows_by_shard: HashMap<ShardId, ShardRecord> = rows.into_iter().collect();
 
-        let draining = self.draining.load(Ordering::SeqCst);
+        let draining = self.stepping_aside();
         let mut new_map = HashMap::new();
 
         for shard in self.config.layout.all_shards() {
@@ -676,11 +736,16 @@ impl<B: KvBackend> Drainable for KvOwnership<B> {
             .len();
 
         // Deregister: remove our row entirely so we are not even counted as `Draining` overhead.
+        // The heartbeat loop is stopped first, with no tick in flight (`tick_lock`): a tick
+        // that was already running would otherwise write the row back after its removal, and
+        // this replica, restarted within the lease, would be refused as a live duplicate of
+        // itself.
+        let _no_tick = self.tick_lock.lock().await;
+        let _ = self.stop.send(true);
         let store = self.store.clone();
         let me = self.me.clone();
         let generation = self.generation;
         let _ = tokio::task::spawn_blocking(move || store.remove_replica(&me, generation)).await;
-        let _ = self.stop.send(true);
 
         DrainReport {
             handed_off,
@@ -774,5 +839,112 @@ mod tests {
         for shard in mgr.layout().all_shards() {
             assert!(!mgr.is_mine(shard));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_drained_replica_stays_deregistered_so_it_can_restart_at_once() {
+        let backend = MemoryBackend::new();
+        let store = ClusterStore::open(backend.clone()).unwrap();
+        for _ in 0..20 {
+            let (mgr, _handle) = KvOwnership::start(config("hs-0"), backend.clone())
+                .await
+                .unwrap();
+            assert!(
+                settle_until(Duration::from_millis(7), 200, || {
+                    store
+                        .list_replicas()
+                        .unwrap()
+                        .iter()
+                        .any(|r| r.id.as_str() == "hs-0")
+                })
+                .await
+            );
+            mgr.drain(Duration::from_secs(1)).await;
+            // However the drain raced the heartbeat loop, no heartbeat lands after it.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(
+                store.list_replicas().unwrap().is_empty(),
+                "the heartbeat loop registered the drained replica again"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_administrators_drain_hands_every_shard_to_the_peer_and_withdrawing_it_rebalances() {
+        let backend = MemoryBackend::new();
+        let (a, _ha) = KvOwnership::start(config("hs-0"), backend.clone())
+            .await
+            .unwrap();
+        let (b, _hb) = KvOwnership::start(config("hs-1"), backend.clone())
+            .await
+            .unwrap();
+        let layout = a.layout();
+        assert!(
+            settle_until(Duration::from_millis(60), 200, || {
+                layout.all_shards().all(|s| a.is_mine(s) || b.is_mine(s))
+                    && layout.all_shards().any(|s| a.is_mine(s))
+            })
+            .await,
+            "the two replicas never partitioned the shard space"
+        );
+
+        // Any replica (here, through the store directly) may ask hs-0 to drain.
+        let store = ClusterStore::open(backend.clone()).unwrap();
+        let request = crate::types::DrainRequest {
+            requested_unix_ms: 1,
+            requested_by: "@ops:example.org".into(),
+            task_id: None,
+        };
+        let (_, created) = store
+            .request_drain(&ReplicaId::new("hs-0"), &request)
+            .unwrap();
+        assert!(created);
+        assert!(
+            settle_until(Duration::from_millis(60), 400, || {
+                layout.all_shards().all(|s| b.is_mine(s) && !a.is_mine(s))
+            })
+            .await,
+            "hs-1 never took every shard from the drained hs-0"
+        );
+        assert!(a.is_admin_drained());
+        // Drained is not shut down: still ready, still heartbeating, just owning nothing.
+        assert_eq!(a.ready(), Readiness::Ready);
+        let row = store
+            .list_replicas()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id.as_str() == "hs-0")
+            .unwrap();
+        assert_eq!(row.state, ReplicaState::Draining);
+
+        // A second request keeps the first one's record.
+        let (kept, created) = store
+            .request_drain(
+                &ReplicaId::new("hs-0"),
+                &crate::types::DrainRequest {
+                    requested_by: "@someone-else:example.org".into(),
+                    ..request.clone()
+                },
+            )
+            .unwrap();
+        assert!(!created);
+        assert_eq!(kept.requested_by, "@ops:example.org");
+        assert_eq!(store.list_drain_requests().unwrap().len(), 1);
+
+        // Withdrawn: hs-0 is hashed again and takes its share back.
+        assert_eq!(
+            store.withdraw_drain(&ReplicaId::new("hs-0")).unwrap(),
+            Some(request)
+        );
+        assert_eq!(store.withdraw_drain(&ReplicaId::new("hs-0")).unwrap(), None);
+        assert!(
+            settle_until(Duration::from_millis(60), 400, || {
+                layout.all_shards().any(|s| a.is_mine(s))
+                    && layout.all_shards().all(|s| a.is_mine(s) != b.is_mine(s))
+            })
+            .await,
+            "hs-0 never took shards back after its drain was withdrawn"
+        );
+        assert!(!a.is_admin_drained());
     }
 }

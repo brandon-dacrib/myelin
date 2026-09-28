@@ -16,7 +16,7 @@ use hs_kv::{KvBackend, KvRead, KvWrite, RangeSpec, TransactConfig, transact};
 
 use crate::error::ClusterError;
 use crate::types::{
-    Epoch, Generation, ReplicaId, ReplicaRecord, ShardId, ShardLayout, ShardRecord,
+    DrainRequest, Epoch, Generation, ReplicaId, ReplicaRecord, ShardId, ShardLayout, ShardRecord,
 };
 
 const REPLICAS_KEYSPACE: &str = "cluster_replicas";
@@ -25,6 +25,13 @@ const LAYOUT_KEYSPACE: &str = "cluster_layout";
 const LAYOUT_KEY: &[u8] = b"layout";
 const REPLICA_PREFIX: &str = "replica/";
 const SHARD_PREFIX: &str = "shard/";
+/// Drain requests live in the replicas keyspace under their own prefix, so
+/// [`ClusterStore::list_replicas`]'s `replica/` range never sees them.
+const DRAIN_PREFIX: &str = "drain/";
+
+fn drain_key(id: &ReplicaId) -> Vec<u8> {
+    format!("{DRAIN_PREFIX}{}", id.as_str()).into_bytes()
+}
 
 fn replica_key(id: &ReplicaId) -> Vec<u8> {
     format!("{REPLICA_PREFIX}{}", id.as_str()).into_bytes()
@@ -225,6 +232,101 @@ impl<B: KvBackend> ClusterStore<B> {
         for item in snap.range(&self.replicas, RangeSpec::prefix(REPLICA_PREFIX.as_bytes())) {
             let (_, value) = item?;
             out.push(decode("ReplicaRecord", &value)?);
+        }
+        Ok(out)
+    }
+
+    /// Records that an administrator wants replica `id` to drain (RFC 0001 section 10, started
+    /// from the admin API rather than by `SIGTERM`). Any replica may write it; the named
+    /// replica notices at its next heartbeat, stops taking part in hashing and hands its shards
+    /// off, and keeps doing so until the request is withdrawn with
+    /// [`ClusterStore::withdraw_drain`] -- across restarts too, since the request is a row in the
+    /// shared store rather than state in the drained process.
+    ///
+    /// An existing request is kept, not replaced: the first request's time, author and task
+    /// stay the record of the drain in progress. Returns the request now in force and whether
+    /// this call created it.
+    ///
+    /// # Errors
+    /// Returns a store or decode error.
+    pub fn request_drain(
+        &self,
+        id: &ReplicaId,
+        request: &DrainRequest,
+    ) -> Result<(DrainRequest, bool), ClusterError> {
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let key = drain_key(id);
+            if let Some(existing) = txn.get(&self.replicas, &key)? {
+                return decode_kv::<DrainRequest>("DrainRequest", &existing).map(|r| (r, false));
+            }
+            txn.put(&self.replicas, &key, &encode(request))?;
+            Ok((request.clone(), true))
+        })
+        .map_err(ClusterError::Store)
+    }
+
+    /// Replaces the drain request for replica `id` if one is in force (to attach the task that
+    /// follows it, say); does nothing if there is none, so it can never resurrect a request
+    /// that was withdrawn meanwhile.
+    ///
+    /// # Errors
+    /// Returns a store or decode error.
+    pub fn update_drain(&self, id: &ReplicaId, request: &DrainRequest) -> Result<(), ClusterError> {
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let key = drain_key(id);
+            if txn.get(&self.replicas, &key)?.is_some() {
+                txn.put(&self.replicas, &key, &encode(request))?;
+            }
+            Ok(())
+        })
+        .map_err(ClusterError::Store)
+    }
+
+    /// Withdraws a drain request for replica `id`, returning the request that was in force (or
+    /// `None` if there was none, which is not an error).
+    ///
+    /// # Errors
+    /// Returns a store or decode error.
+    pub fn withdraw_drain(&self, id: &ReplicaId) -> Result<Option<DrainRequest>, ClusterError> {
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let key = drain_key(id);
+            let Some(existing) = txn.get(&self.replicas, &key)? else {
+                return Ok(None);
+            };
+            txn.delete(&self.replicas, &key)?;
+            decode_kv::<DrainRequest>("DrainRequest", &existing).map(Some)
+        })
+        .map_err(ClusterError::Store)
+    }
+
+    /// The drain request for replica `id`, if there is one. A snapshot read.
+    ///
+    /// # Errors
+    /// Returns a store or decode error.
+    pub fn drain_request(&self, id: &ReplicaId) -> Result<Option<DrainRequest>, ClusterError> {
+        let snap = self.backend.snapshot();
+        match snap.get(&self.replicas, &drain_key(id))? {
+            None => Ok(None),
+            Some(bytes) => decode("DrainRequest", &bytes).map(Some),
+        }
+    }
+
+    /// Every drain request in force, by replica. A snapshot read.
+    ///
+    /// # Errors
+    /// Returns a store or decode error.
+    pub fn list_drain_requests(&self) -> Result<Vec<(ReplicaId, DrainRequest)>, ClusterError> {
+        let snap = self.backend.snapshot();
+        let mut out = Vec::new();
+        for item in snap.range(&self.replicas, RangeSpec::prefix(DRAIN_PREFIX.as_bytes())) {
+            let (key, value) = item?;
+            let Some(id) = std::str::from_utf8(&key)
+                .ok()
+                .and_then(|k| k.strip_prefix(DRAIN_PREFIX))
+            else {
+                continue;
+            };
+            out.push((ReplicaId::new(id), decode("DrainRequest", &value)?));
         }
         Ok(out)
     }

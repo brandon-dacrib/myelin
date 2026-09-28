@@ -325,6 +325,21 @@ pub struct ReplicaRecord {
     pub heartbeat_unix_ms: u64,
 }
 
+/// An administrator's request that a replica drain: hand every shard it owns to the others and
+/// take none until the request is withdrawn (`cluster.replicas.drain` in the admin API). Stored
+/// by [`crate::store::ClusterStore::request_drain`] and honoured by the named replica's own
+/// ownership manager at its next heartbeat, wherever the request was made.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct DrainRequest {
+    /// When it was asked for (Unix milliseconds).
+    pub requested_unix_ms: u64,
+    /// Who asked (an administrator's user id, or a token's principal).
+    pub requested_by: String,
+    /// The admin API task following the drain, once one has been started.
+    #[serde(default)]
+    pub task_id: Option<String>,
+}
+
 /// A shard's ownership row (RFC 0001 section 6).
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct ShardRecord {

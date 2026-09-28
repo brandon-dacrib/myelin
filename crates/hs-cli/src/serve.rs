@@ -636,6 +636,8 @@ fn admin_state<B: KvBackend + 'static>(
     // The Media page: every upload and cached remote copy, and quarantine, protection and
     // deletion over the same repository the media routes serve from.
     .with_media(sources.media)
+    // The Cluster page: replicas, shards, and draining a replica out of service.
+    .with_cluster(sources.cluster)
     .with_server_info(hs_admin::model::ServerInfo {
         name: server_name.to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -674,6 +676,7 @@ struct AdminSources {
     tasks: Arc<hs_admin::tasks::TaskRegistry>,
     statistics: Arc<dyn hs_admin::statistics::StatisticsSource>,
     media: Arc<dyn hs_admin::media::MediaSource>,
+    cluster: Arc<dyn hs_admin::cluster::ClusterSource>,
 }
 
 /// The `/api/v1` state for [`route_manifest`]'s throwaway router: routes are registered the same
@@ -1361,6 +1364,33 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         .clone()
         .spawn_sampler(crate::statistics::SAMPLE_INTERVAL);
     let media_repository = media_state.repository.clone();
+    // The Cluster page: the replica registry, the shard rows and drains, read from the shared
+    // store every replica heartbeats into (`crate::cluster_admin`).
+    let cluster_admin: Arc<dyn hs_admin::cluster::ClusterSource> = {
+        let drain_metrics = crate::cluster_admin::DrainMetrics::register(&metrics);
+        if config.cluster.single_node {
+            Arc::new(
+                crate::cluster_admin::ClusterAdmin::<B>::single_node(
+                    cluster_handles.origin().clone(),
+                    cluster_handles.origin_generation().0,
+                    cluster_handles.layout,
+                )
+                .with_metrics(drain_metrics),
+            )
+        } else {
+            Arc::new(
+                crate::cluster_admin::ClusterAdmin::clustered(
+                    cluster_handles.origin().clone(),
+                    cluster_handles.origin_generation().0,
+                    cluster_handles.layout,
+                    hs_cluster::store::ClusterStore::open(backend.clone())
+                        .map_err(|e| ServeError::Sessions(Box::new(e)))?,
+                    config.cluster.lease_ttl.as_std(),
+                )
+                .with_metrics(drain_metrics),
+            )
+        }
+    };
 
     let mounts = Mounts {
         room: room_state,
@@ -1391,6 +1421,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
                 media: Arc::new(hs_media::admin_source::RepositoryMediaSource::new(
                     media_repository,
                 )),
+                cluster: cluster_admin,
             },
         ),
     };

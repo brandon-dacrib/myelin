@@ -20,6 +20,8 @@
 //!   type's own JSON Schema, and the redaction the `/config*` handlers apply because of it.
 //! - [`reports`], [`tasks`], [`statistics`]: the Reports and Tasks areas and the statistics
 //!   beyond the Overview: their wire shapes, source traits and handlers.
+//! - [`cluster`]: the Cluster area's replicas and shards, drain and undrain, and the
+//!   [`cluster::ClusterSource`] they call, implemented for real in `hs-cli` over `hs-cluster`.
 //! - [`assets`]: serves the management interface's built assets at `/admin/`.
 //! - [`registration_tokens`]: the `registration_tokens.*` operations and the source they use.
 //! - [`server_notices`]: the `server_notices.*` operations and the source they use.
@@ -34,6 +36,7 @@ pub mod audit;
 pub mod auth;
 pub mod bridge_offerings;
 pub mod bridge_types;
+pub mod cluster;
 pub mod config_schema;
 pub mod events;
 mod handler_kit;

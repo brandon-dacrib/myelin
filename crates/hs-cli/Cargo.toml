@@ -24,6 +24,7 @@ hs-kv = { path = "../hs-kv" }
 hs-tables = { path = "../hs-tables" }
 bytes = { workspace = true }
 hs-telemetry = { path = "../hs-telemetry" }
+prometheus-client = { workspace = true }
 hs-http = { path = "../hs-http" }
 hs-room = { path = "../hs-room" }
 hs-federation = { path = "../hs-federation" }
@@ -63,6 +64,9 @@ ruma = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `tests/cluster_admin.rs`: two real `hs serve` processes on one PostgreSQL need a database of
+# their own per run, made and dropped with a plain client.
+postgres = { workspace = true }
 # The fake federation peer `tests/federation_sender.rs` sends real transactions to; the same
 # double `hs-federation`'s own client and sender tests use.
 hs-testkit = { path = "../hs-testkit" }

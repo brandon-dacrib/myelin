@@ -2,8 +2,60 @@
 
 Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-admin`, `hs-modules`, `hs-identity`, `hs-http` (shared with 07 and 14).
 
-Last updated: 2026-09-27 (media, registration tokens and server notices, reports, tasks and statistics, below; before that the bridge
+Last updated: 2026-09-28 (the Cluster area, 6/6, below); before that 2026-09-27 (media, registration tokens and server notices, reports, tasks and statistics, below; before that the bridge
 offering operations); before that 2026-09-26 (three public recovery operations); 2026-09-25 (additive schema change for the bridges wizard); the session log that follows is from 2026-09-19 (session 6).
+
+> **2026-09-28, served for real: Cluster 6/6** (branch `agent/cluster-admin`, rebuilt on main
+> from the superseded `worktree-agent-ae592ed29bb65b973`, whose cluster pieces it replaces).
+> `tools/admin_api_coverage.py` now counts **102 of 158** operations with a real handler.
+>
+> - **Handlers** (`crates/hs-admin/src/cluster.rs`): `cluster.replicas.list`, `.get`, `.drain`,
+>   `.undrain` and `cluster.shards.list` over a new `ClusterSource` trait
+>   (`AdminState::with_cluster`; `InMemoryCluster` for tests). Lists page with the usual
+>   cursor; `kind` is validated (`/kind`). Drain and undrain honour `Idempotency-Key`, are
+>   audited (`cluster.replicas.drain` / `.undrain`, with the status change) and published
+>   (`cluster.replica_draining` / `cluster.replica_undrained`) only when they change something.
+>   A drain starts a `cluster.replicas.drain` task (`follow_drain`: progress in shards handed
+>   off, succeeds when the replica owns none, fails after 15 minutes without undoing the drain)
+>   and answers the replica `draining` with `drain_task_id`; undrain cancels that task. `409`
+>   when no other active replica would take the shards (always, for a single node).
+> - **The real source** (`crates/hs-cli/src/cluster_admin.rs`, wired in `serve.rs`): replicas
+>   from the registry rows, shard counts and owners from the shard rows, drain requests from the
+>   store; single-node mode is one `single-node` replica owning the whole layout. A drain is a
+>   row in the shared store that the drained replica honours itself (decision 0012,
+>   `docs/decisions/0012-a-drain-is-a-request-in-the-shared-store.md`), so any replica can take
+>   the request, undrain works, and a drained replica stays drained across a restart and stays
+>   listed while stopped. `hs-cluster` (track 03's crate, edited with this work): `DrainRequest`,
+>   `ClusterStore::{request_drain, update_drain, withdraw_drain, drain_request,
+>   list_drain_requests}`, `KvOwnership` reading its drain request every heartbeat
+>   (`is_admin_drained`), and a fix for a heartbeat racing deregistration (`tick_lock`).
+> - **Observability**: logs on both sides (`an administrator asked a replica to drain`, `an
+>   administrator asked this replica to drain`, `a replica drained: it owns no shards`, `a drain
+>   was refused`, `this replica's drain was withdrawn`), `hs_cluster_admin_drains_total{event}`
+>   (`requested`, `completed`, `timed_out`, `undrained`) and
+>   `hs_cluster_admin_drain_duration_seconds` on `/metrics`, the audit entries and events above.
+> - **Contract** (`openapi.yaml`, additive): `Replica` gained `joining`, `this_replica`,
+>   `mesh_addr`, `version`, `zone`, `last_heartbeat_at`, `drain_requested_at`,
+>   `drain_requested_by`, `drain_task_id` and a `required` list; `Shard` gained `epoch`, a
+>   nullable `owner`, enums for `kind` and `state` and a `required` list; `kind` on
+>   `GET /cluster/shards` is an enum; drain's `409` is `Conflict`; descriptions say what drain
+>   does. `web/src/api/schema.d.ts` regenerated.
+> - **Verified**: `cargo test -p hs-admin` (7 new handler tests in `cluster::tests`),
+>   `cargo test -p hs-cluster` (an administrator's drain handing every shard to the peer and
+>   back; a drained replica staying deregistered), `cargo test -p hs-cli --lib cluster_admin`
+>   (3), and `cargo test -p hs-cli --test cluster_admin`, through the real `hs` binary: single
+>   node (one replica owning every shard, the `409` with its reason, the metrics exported), and
+>   two `hs serve` processes on one PostgreSQL (drain B through A, the task succeeding, B
+>   `drained` by its own account while `/health/ready` stays 200, A owning all 137 shards, A
+>   refused, the audit entry and counters, B stopped and still listed drained, B restarted and
+>   still drained, undrained through B and taking shards back). The PostgreSQL test skips with a
+>   message when no server is reachable (`HS_CLUSTER_TEST_POSTGRES_DSN`, default
+>   `postgres://postgres:hspg@127.0.0.1:5439/postgres`; the command is in the file's docs).
+> - **Left**: a drain started by `SIGTERM` still deregisters and stops (that is shutdown); the
+>   operator (track 12) does not yet drain a pod through the API before evicting it;
+>   `cluster.get`'s `replica_count` counts owning replicas, so a drained replica is not in it
+>   (the Cluster page counts from the replica list); the two-pod run on the real cluster is a
+>   desktop item (`docs/status/03-cluster.md`).
 
 > **2026-09-27, served for real: RegistrationTokens 5/5 and ServerNotices 2/2.**
 > `tools/admin_api_coverage.py` now counts **78 of 158** operations with a real handler.
@@ -398,6 +450,8 @@ All added to `[workspace.dependencies]` in the root `Cargo.toml`, under a new "A
 - `rustls-pemfile` — parsing PEM certificates/keys for `hs_http::listener`'s TLS support.
 - `async-stream` — the `hs-admin-mock` SSE handler's stream construction.
 - `reqwest` (default-features off, `json` + `rustls-tls`) — `hs_modules::client::HttpCallbackClient`'s HTTP transport.
+
+No new workspace entries on 2026-09-28; two existing ones were added to `hs-cli`: `prometheus-client` (the drain metrics in `cluster_admin.rs`) and, as a dev-dependency, `postgres` (the two-replica test makes and drops its own database).
 
 ## How to verify this session's work
 

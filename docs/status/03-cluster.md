@@ -1,3 +1,18 @@
+## 2026-09-28: an administrator can drain and undrain any replica (edited by track 15)
+
+The admin API's `cluster.replicas.drain`/`undrain` needed what this crate did not have: draining a
+peer, and a way back. Added (decision 0012): `DrainRequest` and
+`ClusterStore::{request_drain, update_drain, withdraw_drain, drain_request,
+list_drain_requests}` (rows under `drain/` in `cluster_replicas`); `KvOwnership` reads its own
+request every heartbeat and, while one is in force, heartbeats `Draining` and releases every shard
+without deregistering or becoming unready (`is_admin_drained`); withdrawing the row makes it
+`Active` again. A drain request outlives a restart. Also fixed: a tick already in flight when
+`Drainable::drain` deregistered could write the row back, so a replica restarted within the lease
+was refused as a live duplicate of itself (`tick_lock`; found by the two-process test below).
+Tests: `ownership::tests::an_administrators_drain_hands_every_shard_to_the_peer_and_withdrawing_it_rebalances`,
+`a_drained_replica_stays_deregistered_so_it_can_restart_at_once`, and
+`crates/hs-cli/tests/cluster_admin.rs` (two real `hs serve` processes on one PostgreSQL).
+
 ## 2026-09-27, late: two pods on the owner's cluster -- where this stopped
 
 Branch `agent/two-pod-cluster`. The task was `docs/next-steps.md` item 1's "cluster mode with

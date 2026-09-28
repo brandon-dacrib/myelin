@@ -112,6 +112,10 @@ pub struct AdminState {
     /// [`crate::media`]). `None` until wired with [`AdminState::with_media`]; until then they
     /// answer `503 unavailable`.
     pub media: Option<Arc<dyn crate::media::MediaSource>>,
+    /// What the `cluster.replicas.*` and `cluster.shards.list` operations read and act through:
+    /// the replica registry and the shard rows (see [`crate::cluster`]). `None` until wired with
+    /// [`AdminState::with_cluster`]; until then they answer `503 unavailable`.
+    pub cluster: Option<Arc<dyn crate::cluster::ClusterSource>>,
     /// The `Idempotency-Key` cache every mutating handler that declares it consults (see
     /// [`crate::idempotency`]). Always present (never `None`): a client is never told its
     /// idempotency key was ignored.
@@ -146,6 +150,7 @@ impl AdminState {
             tasks: None,
             statistics: None,
             media: None,
+            cluster: None,
             idempotency: Arc::new(IdempotencyStore::new()),
         }
     }
@@ -216,6 +221,14 @@ impl AdminState {
     #[must_use]
     pub fn with_media(mut self, media: Arc<dyn crate::media::MediaSource>) -> Self {
         self.media = Some(media);
+        self
+    }
+
+    /// Wires the cluster's replicas and shards, making the `cluster.replicas.*` and
+    /// `cluster.shards.list` operations real.
+    #[must_use]
+    pub fn with_cluster(mut self, cluster: Arc<dyn crate::cluster::ClusterSource>) -> Self {
+        self.cluster = Some(cluster);
         self
     }
 
@@ -329,6 +342,11 @@ const REAL_HANDLERS: &[&str] = &[
     "server.health",
     "statistics.overview",
     "cluster.get",
+    "cluster.replicas.list",
+    "cluster.replicas.get",
+    "cluster.replicas.drain",
+    "cluster.replicas.undrain",
+    "cluster.shards.list",
     "users.list",
     "users.get",
     "users.update",
@@ -4645,6 +4663,19 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         "server.health" => builder.add(method, &full_path, server_health, meta),
         "statistics.overview" => builder.add(method, &full_path, statistics_overview, meta),
         "cluster.get" => builder.add(method, &full_path, cluster_get, meta),
+        "cluster.replicas.list" => {
+            builder.add(method, &full_path, crate::cluster::replicas_list, meta)
+        }
+        "cluster.replicas.get" => {
+            builder.add(method, &full_path, crate::cluster::replicas_get, meta)
+        }
+        "cluster.replicas.drain" => {
+            builder.add(method, &full_path, crate::cluster::replicas_drain, meta)
+        }
+        "cluster.replicas.undrain" => {
+            builder.add(method, &full_path, crate::cluster::replicas_undrain, meta)
+        }
+        "cluster.shards.list" => builder.add(method, &full_path, crate::cluster::shards_list, meta),
         "users.list" => builder.add(method, &full_path, users_list, meta),
         "users.get" => builder.add(method, &full_path, users_get, meta),
         "users.update" => builder.add(method, &full_path, users_update, meta),

@@ -28,4 +28,4 @@ pub use config::{ClusterConfig, HandoffConfig, MeshConfig};
 pub use create_room::{PREASSIGNED_ROOM_ID_HEADER, PreassignedRoomId, ViaMesh};
 pub use fence::Fence;
 pub use ownership::{DrainReport, Drainable, Ownership, OwnershipEvent, Readiness, ShardMap};
-pub use types::{Epoch, Generation, ReplicaId, ShardId, ShardKind, ShardLayout};
+pub use types::{DrainRequest, Epoch, Generation, ReplicaId, ShardId, ShardKind, ShardLayout};

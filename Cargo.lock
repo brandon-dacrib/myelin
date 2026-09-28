@@ -2310,6 +2310,8 @@ dependencies = [
  "hs-user",
  "http",
  "object_store",
+ "postgres",
+ "prometheus-client",
  "rand 0.9.5",
  "rand_core 0.6.4",
  "rcgen",
