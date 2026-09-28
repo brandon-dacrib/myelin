@@ -139,8 +139,13 @@ pub const TRANSITIONS: &[(Action, &[PriorState])] = &[
     ),
     // Unban is only meaningful from a ban.
     (Action::Unban, &[PriorState::Ban]),
-    // Knocking is only sane if the user is not already a member in some other capacity.
-    (Action::Knock, &[PriorState::None, PriorState::Leave]),
+    // Knocking is only sane if the user is not already a member in some other capacity. A
+    // knock may be repeated (the auth rules allow a knock from any membership but ban, invite
+    // and join; Complement's "A user that has already knocked is allowed to knock again").
+    (
+        Action::Knock,
+        &[PriorState::None, PriorState::Leave, PriorState::Knock],
+    ),
 ];
 
 /// Checks `action` against [`TRANSITIONS`] for the target's `prior` membership state. See the
@@ -247,6 +252,17 @@ mod tests {
         assert!(!rules.knocking);
         let err = precheck(&rules, Action::Knock, PriorState::None).unwrap_err();
         assert_eq!(err, PrecheckError::KnockingUnsupported);
+    }
+
+    /// The auth rules allow a knock from any membership but ban, invite and join, so a user
+    /// who has knocked may knock again (Complement's `TestKnocking`).
+    #[test]
+    fn a_knock_may_follow_a_knock_but_not_an_invite_or_a_join() {
+        let rules = room_version::rules_for(&RoomVersionId::V7).unwrap();
+        assert!(precheck(&rules, Action::Knock, PriorState::Knock).is_ok());
+        assert!(precheck(&rules, Action::Knock, PriorState::Invite).is_err());
+        assert!(precheck(&rules, Action::Knock, PriorState::Join).is_err());
+        assert!(precheck(&rules, Action::Knock, PriorState::Ban).is_err());
     }
 
     #[test]

@@ -830,20 +830,35 @@ async fn out_of_room_ending<B: KvBackend + 'static>(
         return false;
     };
     let sender_server = header.sender.server_name().to_string();
+    let sender = header.sender.clone();
+    let cited = hs_room::pipeline::decode_event_ids(event.json().get("auth_events"));
+    let is_leave = membership == Some("leave");
     handle
         .query(move |actor| {
             if actor.local_user_joined() {
                 return false;
             }
-            let prior = actor
-                .state_event("m.room.member", &target)
-                .ok()
-                .flatten()
-                .and_then(|e| content_str(e, "membership").map(str::to_owned));
-            matches!(prior.as_deref(), Some("invite" | "knock"))
-                && actor
-                    .servers_to_join_through()
-                    .is_some_and(|servers| servers.contains(&sender_server))
+            let Some(prior) = actor.state_event("m.room.member", &target).ok().flatten() else {
+                return false;
+            };
+            let known_server = actor
+                .servers_to_join_through()
+                .is_some_and(|servers| servers.contains(&sender_server));
+            match content_str(prior, "membership") {
+                // Only the inviter can rescind an invite this server cannot check the room's
+                // power levels for, and only with a leave that cites the invite (Synapse's
+                // `_process_received_pdu` rule): someone else in the room kicking the invitee
+                // is not shown to them, as Complement's "Non-invitee user cannot rescind invite
+                // over federation" expects.
+                Some("invite") => {
+                    is_leave
+                        && prior.header().sender == sender
+                        && cited.iter().any(|id| id == prior.event_id())
+                        && known_server
+                }
+                Some("knock") => known_server,
+                _ => false,
+            }
         })
         .await
 }

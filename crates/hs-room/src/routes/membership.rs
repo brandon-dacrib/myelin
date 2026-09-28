@@ -65,8 +65,14 @@ fn target_user(body: &Value, requester: &ruma::UserId) -> Result<ruma::OwnedUser
     }
 }
 
+/// The `m.room.member` content key naming who authorised a restricted join. Only the server
+/// decides it (`RoomActor::restricted_join`, or the resident in `make_join`); whatever a client
+/// puts there is dropped, as Synapse's `update_membership` does, so a join -> join profile change
+/// carrying a stale or bogus value is not refused for it.
+pub const AUTHORISING_USER: &str = "join_authorised_via_users_server";
+
 /// Builds the extra `m.room.member` content fields beyond `membership` itself: the client-supplied
-/// `reason`/`join_authorised_via_users_server`, plus -- for [`Action::Join`], [`Action::Invite`]
+/// `reason` (never `join_authorised_via_users_server`, see [`AUTHORISING_USER`]), plus -- for [`Action::Join`], [`Action::Invite`]
 /// and [`Action::Knock`] -- the target's current profile. See the module docs for exactly what
 /// this does and does not cover.
 async fn extra<B: hs_kv::KvBackend + 'static>(
@@ -87,16 +93,13 @@ async fn extra<B: hs_kv::KvBackend + 'static>(
         && let Some(object) = body.as_object()
     {
         for (key, value) in object {
-            if key != "third_party_signed" && key != "membership" {
+            if key != "third_party_signed" && key != "membership" && key != AUTHORISING_USER {
                 out[key] = value.clone();
             }
         }
     }
     if let Some(reason) = body.get("reason") {
         out["reason"] = reason.clone();
-    }
-    if let Some(via) = body.get("join_authorised_via_users_server") {
-        out["join_authorised_via_users_server"] = via.clone();
     }
     if matches!(action, Action::Join | Action::Invite | Action::Knock) {
         fill_in_profile(state, target, &mut out).await;

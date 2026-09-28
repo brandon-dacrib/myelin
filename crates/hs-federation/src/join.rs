@@ -279,16 +279,23 @@ fn restricted_allow_list(
 /// Whether `user` is joined to one of `allowed`, as far as this server can tell: only the rooms
 /// it has a joined member in count, since those are the only ones whose membership it knows.
 ///
+/// The error follows Synapse's `check_restricted_join_rules`: when some allowed room is one this
+/// server is not in, another server might know `user` is joined there, so the answer is
+/// `M_UNABLE_TO_AUTHORISE_JOIN` and the joining server asks another; when this server is in
+/// every allowed room (or the join rules allow none at all), nobody can vouch for the join,
+/// and it is refused.
+///
 /// # Errors
-/// [`JoinError::UnableToAuthorise`] if this server is in none of `allowed` (another resident
-/// may be), [`JoinError::NotAuthorized`] if it is in some and `user` is joined to none of them.
+/// [`JoinError::UnableToAuthorise`] if `user` is joined to none of the allowed rooms this server
+/// is in and it is not in some other allowed room; [`JoinError::NotAuthorized`] if it is in every
+/// allowed room (or there are none) and `user` is joined to none of them.
 async fn check_allow_list(
     rooms: &dyn RoomDataSource,
     own_server_name: &str,
     allowed: &[String],
     user: &UserId,
 ) -> Result<(), JoinError> {
-    let mut resident_in_any = false;
+    let mut missing_any = false;
     for room in allowed {
         if !rooms
             .member_servers(room)
@@ -296,21 +303,23 @@ async fn check_allow_list(
             .iter()
             .any(|server| server == own_server_name)
         {
+            missing_any = true;
             continue;
         }
-        resident_in_any = true;
         if rooms.membership_of(room, user.as_str()).await.as_deref() == Some("join") {
             return Ok(());
         }
     }
-    if resident_in_any {
+    if missing_any {
+        Err(JoinError::UnableToAuthorise(
+            "this server is not in every room the join rules allow, and the user is joined to \
+             none of those it is in"
+                .to_owned(),
+        ))
+    } else {
         Err(JoinError::NotAuthorized(format!(
             "{user} is not joined to any room the join rules allow"
         )))
-    } else {
-        Err(JoinError::UnableToAuthorise(
-            "this server is in none of the rooms the join rules allow".to_owned(),
-        ))
     }
 }
 
@@ -1377,6 +1386,31 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, JoinError::UnableToAuthorise(_)), "{err}");
+
+        // Join rules that allow no room at all: nobody can vouch for the join (Synapse's 403).
+        let allow_none = serde_json::json!({
+            "event_id": "$allow",
+            "type": "m.room.join_rules",
+            "room_id": "!r:resident.example.org",
+            "sender": "@creator:resident.example.org",
+            "state_key": "",
+            "content": {"join_rule": "knock_restricted", "allow": []},
+        });
+        let (rooms, room_id, _) = room_fixture(
+            "knock_restricted",
+            vec![allow_none],
+            vec!["resident.example.org".to_owned()],
+        );
+        let err = make_join(
+            &rooms,
+            &room_id,
+            "@bob:remote.example.org",
+            &[],
+            "resident.example.org",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, JoinError::NotAuthorized(_)), "{err}");
     }
 
     fn sign_member_event(

@@ -123,6 +123,19 @@ async fn post(client: &reqwest::Client, user: &User, path: &str, body: Value) ->
     (status, response.json().await.unwrap_or(Value::Null))
 }
 
+/// `PUT`s `body` to `path` as `user`; the status and the JSON answer.
+async fn put(client: &reqwest::Client, user: &User, path: &str, body: Value) -> (u16, Value) {
+    let response = client
+        .put(format!("{}/_matrix/client/v3/{path}", user.base))
+        .bearer_auth(&user.token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, response.json().await.unwrap_or(Value::Null))
+}
+
 async fn create_room(client: &reqwest::Client, user: &User, body: Value) -> String {
     let (status, created) = post(client, user, "createRoom", body).await;
     assert_eq!(status, 200, "createRoom failed: {created}");
@@ -480,6 +493,16 @@ async fn a_knock_from_another_server_is_accepted_and_one_is_refused() {
         Some(json!("knock")),
         "{knock_state}"
     );
+    // Knocking again is allowed (Complement's "A user that has already knocked is allowed to
+    // knock again on the same room").
+    let (status, body) = post(
+        &client,
+        &bob,
+        &format!("knock/{accepted}?server_name={}", a.name),
+        json!({"reason": "still here"}),
+    )
+    .await;
+    assert_eq!(status, 200, "the second knock failed: {body}");
 
     // Alice lets him in by inviting him; the invite replaces the knock on B.
     let (status, body) = post(
@@ -904,6 +927,24 @@ async fn a_local_user_joins_a_restricted_room_without_naming_an_authoriser() {
     )
     .await;
     assert_eq!(status, 200, "{body}");
+    // A client's own `join_authorised_via_users_server` is dropped, never checked (Synapse's
+    // `update_membership`; Complement's "Join should succeed when joined to allowed room").
+    let (status, body) = put(
+        &client,
+        &carol,
+        &format!("rooms/{restricted}/state/m.room.member/{}", carol.id),
+        json!({"membership": "join", "displayname": "Carol", "join_authorised_via_users_server": "unused"}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a profile change naming a bogus authoriser: {body}"
+    );
+    let content = member_content(&client, &alice, &restricted, &carol.id).await;
+    assert!(
+        content.get("join_authorised_via_users_server").is_none(),
+        "the client's value is not kept: {content}"
+    );
     for room in [&restricted, &lobby] {
         let (status, body) = post(&client, &carol, &format!("rooms/{room}/leave"), json!({})).await;
         assert_eq!(status, 200, "{body}");
@@ -1338,6 +1379,74 @@ async fn a_version_12_room_is_joined_and_used_across_servers() {
         timeline_bodies(s, &room_id).contains(&"from A".to_owned())
     })
     .await;
+
+    a.handle.shutdown().await;
+    b.handle.shutdown().await;
+}
+
+/// Only the inviter can rescind an invite over federation: B cannot check the room's power
+/// levels, so a kick of bob's invite by anyone else in the room is not shown to him, and he is
+/// still invited (Synapse's rule; Complement's "Non-invitee user cannot rescind invite over
+/// federation"). The inviter's own rescission still reaches him.
+#[tokio::test]
+async fn only_the_inviter_rescinds_an_invite_across_servers() {
+    let (a, b) = (start().await, start().await);
+    let client = reqwest::Client::new();
+    let alice = register(&client, &a, "alice").await;
+    let alice2 = register(&client, &a, "alice2").await;
+    let bob = register(&client, &b, "bob").await;
+
+    // A room bob is in, to know when B has seen what A sent after the kick.
+    let shared = create_room(
+        &client,
+        &alice,
+        json!({"preset": "private_chat", "invite": [bob.id], "room_version": "11"}),
+    )
+    .await;
+    sync_until(&client, &bob, |s| {
+        s["rooms"]["invite"].get(&shared).is_some()
+    })
+    .await;
+    let (status, body) = post(&client, &bob, &format!("join/{shared}"), json!({})).await;
+    assert_eq!(status, 200, "{body}");
+
+    let room = create_room(
+        &client,
+        &alice,
+        json!({"preset": "private_chat", "invite": [alice2.id], "room_version": "11"}),
+    )
+    .await;
+    let (status, body) = post(&client, &alice2, &format!("join/{room}"), json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post(
+        &client,
+        &alice2,
+        &format!("rooms/{room}/invite"),
+        json!({"user_id": bob.id}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    sync_until(&client, &bob, |s| s["rooms"]["invite"].get(&room).is_some()).await;
+
+    // Alice, who did not invite him, kicks him.
+    let (status, body) = post(
+        &client,
+        &alice,
+        &format!("rooms/{room}/kick"),
+        json!({"user_id": bob.id, "reason": "not you"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    send_message(&client, &alice, &shared, "after the kick").await;
+    sync_until(&client, &bob, |s| {
+        timeline_bodies(s, &shared).contains(&"after the kick".to_owned())
+    })
+    .await;
+    let sync = sync_until(&client, &bob, |_| true).await;
+    assert!(
+        sync["rooms"]["invite"].get(&room).is_some(),
+        "bob is still invited: {sync}"
+    );
 
     a.handle.shutdown().await;
     b.handle.shutdown().await;

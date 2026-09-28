@@ -63,7 +63,7 @@ pub async fn put_state<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path((room_id, event_type, state_key)): Path<(String, String, String)>,
     RoomRequester(requester): RoomRequester,
-    PermissiveJson(content): PermissiveJson<Value>,
+    PermissiveJson(mut content): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
     crate::moderation::refuse_if_suspended(&requester)?;
     crate::moderation::check_send_limit(&state, &requester).await?;
@@ -73,6 +73,13 @@ pub async fn put_state<B: KvBackend + 'static>(
     }
     let room_id = parse_room_id(&room_id)?;
     let handle = state.rooms.get_or_load(&room_id).await?;
+    if event_type == "m.room.member"
+        && let Some(object) = content.as_object_mut()
+    {
+        // Only the server names who authorised a restricted join
+        // (`crate::routes::membership::AUTHORISING_USER`).
+        object.remove(crate::routes::membership::AUTHORISING_USER);
+    }
     if event_type == "m.room.canonical_alias" && state_key.is_empty() {
         check_canonical_alias(&state, &room_id, &handle, &content).await?;
     }
