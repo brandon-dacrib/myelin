@@ -2,6 +2,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, newIdempotencyKey } from "./client";
 import { unwrap } from "./problem";
+import { rememberTask } from "./task-cache";
 import type { components } from "./schema";
 
 export type Destination = components["schemas"]["Destination"];
@@ -104,7 +105,7 @@ export function useRefreshRemoteKeys() {
       return unwrap(result);
     },
     onSuccess: (task) => {
-      qc.setQueryData(["task", task.id], task);
+      rememberTask(qc, task);
       void qc.invalidateQueries({ queryKey: ["tasks"] });
     },
   });

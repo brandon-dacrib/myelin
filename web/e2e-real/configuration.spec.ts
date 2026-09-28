@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import { settle } from "./settle";
 
 /**
  * The Configuration page against a real `hs serve`, nothing mocked, for the three things the
@@ -42,7 +43,7 @@ async function signIn(page: Page) {
 }
 
 async function shot(page: Page, name: string) {
-  await page.waitForLoadState("networkidle");
+  await settle(page);
   await page.screenshot({ path: `test-results/real-configuration-${name}.png`, fullPage: true });
 }
 

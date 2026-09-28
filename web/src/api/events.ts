@@ -22,6 +22,7 @@
 import { useSyncExternalStore } from "react";
 import type { QueryClient } from "@tanstack/react-query";
 import { apiBaseUrl } from "./client";
+import { rememberTask } from "./task-cache";
 import type { components } from "./schema";
 import { getAccessToken } from "@/lib/auth";
 
@@ -103,7 +104,7 @@ export function applyAdminEvent(qc: QueryClient, event: AdminEvent): void {
     void qc.invalidateQueries({ queryKey: ["statistics-overview"] });
     if (resourceId) void qc.invalidateQueries({ queryKey: ["report", resourceId] });
   } else if (event.type === "task.changed" && isTask(event.data)) {
-    qc.setQueryData(["task", event.data.id], event.data);
+    rememberTask(qc, event.data);
     void qc.invalidateQueries({ queryKey: ["tasks"] });
   } else if (event.type.startsWith("task.")) {
     if (resourceId) void qc.invalidateQueries({ queryKey: ["task", resourceId] });

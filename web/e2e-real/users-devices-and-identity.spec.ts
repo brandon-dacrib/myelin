@@ -1,4 +1,5 @@
 import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
+import { settle } from "./settle";
 
 /**
  * The devices-and-identity controls on a user's page, against a real `hs serve`, nothing
@@ -22,7 +23,7 @@ const SHOTS = "../docs/design/screenshots";
 const run = Date.now().toString(36);
 
 async function shot(page: Page, name: string, fullPage = true) {
-  await page.waitForLoadState("networkidle");
+  await settle(page);
   await page.screenshot({ path: `${SHOTS}/users-identity-${name}-real.png`, fullPage });
 }
 

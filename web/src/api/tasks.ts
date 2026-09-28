@@ -11,6 +11,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, newIdempotencyKey } from "./client";
 import { useLiveEvents } from "./events";
+import { rememberTask, taskIsBehind } from "./task-cache";
 import { unwrap } from "./problem";
 import type { components, operations } from "./schema";
 import { hasScope } from "@/lib/auth";
@@ -66,6 +67,9 @@ export function useTask(id: string | undefined) {
     },
     refetchInterval: (query) =>
       !live && query.state.data && taskIsActive(query.state.data) ? 2_000 : false,
+    // A fetch answered before the task's last event was published must not undo that event.
+    structuralSharing: (old: unknown, next: unknown) =>
+      old && next && taskIsBehind(old as Task, next as Task) ? old : next,
   });
 }
 
@@ -78,8 +82,8 @@ export function useCancelTask() {
       });
       return unwrap(result);
     },
-    onSuccess: (task, id) => {
-      qc.setQueryData(["task", id], task);
+    onSuccess: (task) => {
+      rememberTask(qc, task);
       qc.invalidateQueries({ queryKey: ["tasks"] });
     },
   });

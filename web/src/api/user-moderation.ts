@@ -10,6 +10,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, newIdempotencyKey } from "./client";
 import { unwrap } from "./problem";
+import { rememberTask } from "./task-cache";
 import type { components, operations } from "./schema";
 import type { Task } from "./tasks";
 
@@ -250,7 +251,7 @@ export function useRedactUserEvents() {
       return unwrap(result);
     },
     onSuccess: (task) => {
-      qc.setQueryData(["task", task.id], task);
+      rememberTask(qc, task);
       qc.invalidateQueries({ queryKey: ["tasks"] });
     },
   });
@@ -267,7 +268,7 @@ export function useDeleteUserMedia() {
       return unwrap(result);
     },
     onSuccess: (task, { userId }) => {
-      qc.setQueryData(["task", task.id], task);
+      rememberTask(qc, task);
       qc.invalidateQueries({ queryKey: ["tasks"] });
       qc.invalidateQueries({ queryKey: ["user-media", userId] });
       qc.invalidateQueries({ queryKey: ["user-statistics", userId] });

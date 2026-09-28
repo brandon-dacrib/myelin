@@ -1,4 +1,5 @@
 import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
+import { settle } from "./settle";
 
 /**
  * The room page against a real `hs serve`, nothing mocked: a user makes a room and talks in it
@@ -16,7 +17,7 @@ const SHOTS = "../docs/design/screenshots";
 const run = Date.now().toString(36);
 
 async function shot(page: Page, name: string, fullPage = true) {
-  await page.waitForLoadState("networkidle");
+  await settle(page);
   await page.screenshot({ path: `${SHOTS}/rooms-${name}-real.png`, fullPage });
 }
 

@@ -6,6 +6,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, apiBaseUrl, newIdempotencyKey } from "./client";
 import { unwrap } from "./problem";
+import { rememberTask } from "./task-cache";
 import type { components } from "./schema";
 import { getAccessToken } from "@/lib/auth";
 
@@ -145,7 +146,7 @@ export function useBulkDeleteMedia() {
       return unwrap(result);
     },
     onSuccess: (task) => {
-      qc.setQueryData(["task", task.id], task);
+      rememberTask(qc, task);
       void qc.invalidateQueries({ queryKey: ["tasks"] });
       invalidateMedia(qc);
     },
@@ -167,7 +168,7 @@ export function usePurgeRemoteMediaCache() {
       return unwrap(result);
     },
     onSuccess: (task) => {
-      qc.setQueryData(["task", task.id], task);
+      rememberTask(qc, task);
       void qc.invalidateQueries({ queryKey: ["tasks"] });
       invalidateMedia(qc);
     },
