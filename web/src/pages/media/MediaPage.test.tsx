@@ -1,3 +1,4 @@
+import { listTasks } from "@/mocks/data/tasks";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -193,6 +194,13 @@ describe("Media", () => {
     // Protected, and last used before June too: kept.
     expect(findMedia("example.org", "teamLogoGhi789")).toBeDefined();
     expect(findMedia("matrix.org", "avatarMno345")).toBeDefined();
+    // The finished task is where the Tasks page (and the audit log's link) will look for it.
+    expect(listTasks(new URLSearchParams("action=media.delete"))).toContainEqual(
+      expect.objectContaining({
+        status: "succeeded",
+        result: expect.objectContaining({ deleted_count: 1, failed: [] }),
+      }),
+    );
     server.events.removeAllListeners();
   });
 

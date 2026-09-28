@@ -124,6 +124,18 @@ export function resetTasks(): void {
   tasks = seed();
 }
 
+/**
+ * Records a task that has already ended, as the server does for a bulk media deletion
+ * (`TaskRegistry::record_finished`), so the `Location` it answered with leads somewhere.
+ */
+export function recordFinishedTask(
+  task: Omit<Task, "created_by"> & Partial<Pick<Task, "created_by">>,
+): Task {
+  const recorded: MockTask = { created_by: admin, ...task };
+  tasks = [...tasks.filter((t) => t.id !== recorded.id), recorded];
+  return wire(recorded);
+}
+
 /** Moves the clock-driven task on: its progress follows the clock and it succeeds at the end. */
 function advance(task: MockTask): MockTask {
   if (task.clockStart === undefined || task.status !== "running") return task;

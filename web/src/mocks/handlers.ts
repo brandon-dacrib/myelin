@@ -51,7 +51,7 @@ import {
   openReportCount,
   resolveReport,
 } from "./data/reports";
-import { cancelTask, getTask, listTasks } from "./data/tasks";
+import { cancelTask, getTask, listTasks, recordFinishedTask } from "./data/tasks";
 import { roomStatistics, sortStatistics, timeseries, userMediaStatistics } from "./data/statistics";
 import type { ReportResolve } from "@/api/reports";
 import { succeeded } from "@/lib/audit";
@@ -1491,23 +1491,25 @@ function purgeMedia(action: string, inScope: (m: MediaItem) => boolean, before: 
   }
   const now = new Date().toISOString();
   const id = `task_${Math.random().toString(36).slice(2, 10)}`;
-  return HttpResponse.json(
-    {
-      id,
-      action,
-      status: "succeeded",
-      progress: { current: deleted, total: deleted, unit: "items" },
-      result: {
-        deleted_count: deleted,
-        deleted_bytes: bytes,
-        skipped_protected: skippedProtected,
-        skipped_quarantined: skippedQuarantined,
-        failed: [],
-      },
-      created_at: now,
-      started_at: now,
-      finished_at: now,
+  // Recorded where the Tasks page looks, as the server records it, so the Location answers.
+  const task = recordFinishedTask({
+    id,
+    action,
+    status: "succeeded",
+    progress: { current: deleted, total: deleted, unit: "items" },
+    result: {
+      deleted_count: deleted,
+      deleted_bytes: bytes,
+      skipped_protected: skippedProtected,
+      skipped_quarantined: skippedQuarantined,
+      failed: [],
     },
-    { status: 202, headers: { Location: `/api/v1/tasks/${id}` } },
-  );
+    created_at: now,
+    started_at: now,
+    finished_at: now,
+  });
+  return HttpResponse.json(task, {
+    status: 202,
+    headers: { Location: `/api/v1/tasks/${id}` },
+  });
 }
