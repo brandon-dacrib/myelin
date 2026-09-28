@@ -1083,9 +1083,9 @@ pub const OPTIONS: &[KeyInfo] = &[
     },
     KeyInfo {
         key: "app_service_config_files",
-        classification: Classification::Mapped,
+        classification: Classification::MappedDiff,
         native: "`appservices.registration_files`",
-        note: "",
+        note: "Synapse reads these files at every start and they are how its bridges exist. Here they are imported once into the appservice registry on the first start that sees each file (an appservice already registered under the same id is left alone), the import is recorded and audited as `appservices.import`, and the file is never read again: the bridge is then managed in the admin API and the Bridges section (decision 0010; `crates/hs-cli/src/appservices.rs`). A bootstrap setting, never stored in the configuration database.",
     },
     KeyInfo {
         key: "track_appservice_user_ips",

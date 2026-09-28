@@ -1,7 +1,8 @@
 //! The `AppService` custom resource: registers one Matrix application service (bridge or bot)
-//! against a `Homeserver`, the CRD-native equivalent of dropping a registration YAML file into
-//! `hs_config::appservice::AppservicesConfig::registration_files` (owned by track 13) or calling
-//! track 11's registry API. The operator's job for this kind is to keep that registration in sync
+//! against a `Homeserver`, the CRD-native equivalent of calling track 11's registry API
+//! (`POST /api/v1/appservices`). Not of listing a registration file in
+//! `hs_config::appservice::AppservicesConfig::registration_files`: since decision 0010 that is a
+//! one-time Synapse-migration import, read once and then never again. The operator's job for this kind is to keep that registration in sync
 //! with the referenced `Homeserver`, not to run any workload itself — an `AppService` describes a
 //! registration, a [`crate::crds::bridge::Bridge`] describes the process that uses it.
 

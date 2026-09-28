@@ -12,7 +12,7 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 
 | List | Mapped | Mapped (diff) | Unsupported | Total |
 |---|---|---|---|---|
-| Top-level options | 26 | 24 | 179 | 229 |
+| Top-level options | 25 | 25 | 179 | 229 |
 | `experimental_features` flags | 0 | 1 | 50 | 51 |
 
 (Counts are exact against the tables below; regenerate this summary whenever a row changes. See "Keeping this current".)
@@ -289,7 +289,7 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 |---|---|---|---|
 | `room_prejoin_state` | Unsupported | — | R-PHASE1 (hs-room). |
 | `track_puppeted_user_ips` | Unsupported | — | R-PHASE1 (hs-appservice/hs-auth). |
-| `app_service_config_files` | Mapped | `appservices.registration_files` | |
+| `app_service_config_files` | Mapped (diff) | `appservices.registration_files` | Synapse reads these files at every start and they are how its bridges exist. Here they are imported once into the appservice registry on the first start that sees each file (an appservice already registered under the same id is left alone), the import is recorded and audited as `appservices.import`, and the file is never read again: the bridge is then managed in the admin API and the Bridges section (decision 0010; `crates/hs-cli/src/appservices.rs`). A bootstrap setting, never stored in the configuration database. |
 | `track_appservice_user_ips` | Unsupported | — | R-PHASE1 (hs-appservice). |
 | `use_appservice_legacy_authorization` | Unsupported | — | R-SECURITY. Only the `Authorization: Bearer` header form of appservice auth is supported; the insecure legacy `access_token` query-parameter form is not offered, matching Synapse's own recommendation against it. |
 | `macaroon_secret_key` | Mapped (diff) | `auth.session_secret` | Synapse's macaroon key signs guest tokens, SSO short-term login tokens and email-unsubscribe tokens using the macaroon caveat scheme specifically; the native session secret signs native OAuth-issued tokens with a different (non-macaroon) scheme. Same operational role (rotate and every session in flight is invalidated), different format. |

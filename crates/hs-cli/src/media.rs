@@ -1,21 +1,17 @@
-//! Builds `hs-media`'s [`MediaState`] from native config, and (track assignment item 2) attaches
-//! content scanning per `docs/status/09-media.md`'s "The homeserver startup wiring itself" gap:
-//! that track built every piece (`ScanningConfig::from_yaml` / `::validated`,
-//! `ScanEngine::new`, `MediaRepository::with_scanning`) but noted "no `hs-*` binary reads
-//! `media.scanning` from a config file or calls `MediaRepository::with_scanning` at startup yet" —
-//! this module is that wiring.
+//! Builds `hs-media`'s [`MediaState`] from native config, and attaches content scanning
+//! (`ScanEngine::new`, `MediaRepository::with_scanning`) when the configuration turns it on.
 //!
-//! # Why `media.scanning` is its own file, not part of `-c`/`--config`
+//! # `media.scanning` is a setting like any other
 //!
-//! `hs_config::MediaConfig` has no `scanning` field (`crates/hs-media/src/scanning/config.rs`'s
-//! own module doc: `ScanningConfig` "deliberately does **not** live in `hs_config::MediaConfig`"
-//! since track 09 does not own that crate). Track 13 owns folding it in; until that lands, this
-//! follows the exact precedent `crate::versions` already set for the same shaped problem
-//! (`unstable_features` also cannot live in the main config file) — an optional
-//! `--media-scanning-config <path>` YAML file, read with [`hs_media::scanning::ScanningConfig::from_yaml`]
-//! directly (the shape `deploy/media-scanning/media-scanning.yaml` already documents). Omitting
-//! the flag is exactly [`hs_media::scanning::ScanningConfig::default`] — mode `off`, zero
-//! behavioral change, matching every existing `MediaRepository` caller.
+//! Content scanning is the `media.scanning` section of the configuration (`hs_config::scanning`,
+//! re-exported by `hs-media`), so it is stored in the database and changed through the admin API
+//! and the web interface (decision 0010). The default is mode `off`, and with it no engine is
+//! attached -- exactly what every `MediaRepository` caller had before scanning existed.
+//!
+//! `--media-scanning-config <path>` predates that and still works: a standalone YAML file of the
+//! same shape (`deploy/media-scanning/media-scanning.yaml`), which replaces the configured
+//! section wholesale, with a warning. It is deprecated -- a file on one process's disk is not how
+//! this server is administered, and the setting it overrides is invisible in the interface.
 
 use std::sync::Arc;
 
@@ -41,9 +37,10 @@ pub enum MediaSetupError {
         #[source]
         source: std::io::Error,
     },
-    /// `--media-scanning-config`'s YAML did not parse, or failed `ScanningConfig::validated`
-    /// (an unset failure policy while scanning is enabled, an empty provider config, etc).
-    #[error("invalid --media-scanning-config: {0}")]
+    /// `--media-scanning-config`'s YAML did not parse, or the scanning configuration in force
+    /// failed `ScanningConfig::validated` (an unset failure policy while scanning is enabled, an
+    /// empty provider config, etc).
+    #[error("invalid media.scanning configuration: {0}")]
     InvalidScanningConfig(hs_media::MediaError),
     /// Building the configured scan provider (or opening its verdict cache) failed.
     #[error("failed to build the content scanning engine: {0}")]
@@ -54,9 +51,9 @@ pub enum MediaSetupError {
 /// (`hs_media::store::build`, already written against `hs_config::MediaStorageBackend`), an
 /// `hs-tables`-backed [`hs_media::metadata::MetadataStore`] over `backend`, an unlimited
 /// [`hs_media::policy::InMemoryQuotaPolicy`] (`hs_config::MediaConfig` has no per-user/per-server
-/// quota fields yet — see `docs/status/12-platform-and-kubernetes.md`), and — if
-/// `media_scanning_config` is given — a real [`ScanEngine`] attached via
-/// [`MediaRepository::with_scanning`].
+/// quota fields yet — see `docs/status/12-platform-and-kubernetes.md`), and — when
+/// `config.media.scanning` is switched on, or the deprecated `media_scanning_config` file is
+/// given — a real [`ScanEngine`] attached via [`MediaRepository::with_scanning`].
 ///
 /// # Errors
 /// See [`MediaSetupError`].
@@ -86,8 +83,20 @@ pub fn build_media_state<B: KvBackend>(
         now_ms,
     );
 
-    if let Some(path) = media_scanning_config {
-        let engine = build_scan_engine(path, backend, metrics)?;
+    let scanning = match media_scanning_config {
+        Some(path) => {
+            tracing::warn!(
+                path = %path.display(),
+                "--media-scanning-config is deprecated and replaces the media.scanning setting \
+                 wholesale; set media.scanning in the admin interface's Configuration page instead"
+            );
+            Some(read_scanning_file(path)?)
+        }
+        None if config.media.scanning.is_enabled() => Some(config.media.scanning.clone()),
+        None => None,
+    };
+    if let Some(scanning) = scanning {
+        let engine = build_scan_engine(scanning, backend, metrics)?;
         repository = repository.with_scanning(engine);
     }
 
@@ -99,18 +108,23 @@ pub fn build_media_state<B: KvBackend>(
     })
 }
 
-fn build_scan_engine<B: KvBackend>(
-    path: &std::path::Path,
-    backend: B,
-    metrics: &hs_telemetry::metrics::Metrics,
-) -> Result<ScanEngine<B>, MediaSetupError> {
+fn read_scanning_file(path: &std::path::Path) -> Result<ScanningConfig, MediaSetupError> {
     let yaml =
         std::fs::read_to_string(path).map_err(|source| MediaSetupError::ReadScanningConfig {
             path: path.to_owned(),
             source,
         })?;
-    let config = ScanningConfig::from_yaml(&yaml)
-        .and_then(ScanningConfig::validated)
+    ScanningConfig::from_yaml(&yaml).map_err(|e| {
+        MediaSetupError::InvalidScanningConfig(hs_media::MediaError::InvalidInput(e.to_string()))
+    })
+}
+
+fn build_scan_engine<B: KvBackend>(
+    config: ScanningConfig,
+    backend: B,
+    metrics: &hs_telemetry::metrics::Metrics,
+) -> Result<ScanEngine<B>, MediaSetupError> {
+    let config = hs_media::scanning::config::validated(config)
         .map_err(MediaSetupError::InvalidScanningConfig)?;
     let scan_metrics = Arc::new(ScanMetrics::register(metrics));
     // `TracingAuditSink`: scan decisions land in the structured log stream until an operator
@@ -150,6 +164,25 @@ mod tests {
         )
         .unwrap();
         assert!(state.legacy_media_enabled);
+    }
+
+    /// Decision 0010: scanning is switched on through the configuration (the database, the admin
+    /// API), not a file named on the command line.
+    #[test]
+    fn attaches_a_scan_engine_when_the_configuration_turns_scanning_on() {
+        let mut config = test_config();
+        config.media.scanning = ScanningConfig::from_yaml(
+            "mode: block\nprovider: icap\nfail: closed\nicap:\n  host: c-icap\n  service: virus_scan\n",
+        )
+        .unwrap();
+        build_media_state(
+            &config,
+            MemoryBackend::new(),
+            hs_auth::state::AuthState::in_memory(),
+            None,
+            &hs_telemetry::metrics::Metrics::new(),
+        )
+        .unwrap();
     }
 
     #[test]

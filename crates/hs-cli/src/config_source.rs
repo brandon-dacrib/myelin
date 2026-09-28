@@ -121,7 +121,9 @@ fn store_error(e: &StoreError) -> SourceError {
     match e {
         StoreError::RevisionMismatch { .. } => SourceError::PreconditionFailed(e.to_string()),
         StoreError::UnknownSection { .. } => SourceError::NotFound,
-        StoreError::BootstrapSection { .. } => SourceError::Conflict(e.to_string()),
+        StoreError::BootstrapSection { .. } | StoreError::BootstrapSetting { .. } => {
+            SourceError::Conflict(e.to_string())
+        }
         StoreError::Kv(_) | StoreError::Corrupt { .. } => SourceError::Unavailable(e.to_string()),
     }
 }
@@ -188,6 +190,10 @@ impl ConfigSource for StoreConfigSource {
     }
 
     async fn validate(&self, candidate: &Value) -> Result<ConfigValidateReport, SourceError> {
+        let bootstrap = hs_admin::sources::bootstrap_validation_errors(candidate);
+        if !bootstrap.is_empty() {
+            return Ok(ConfigValidateReport::invalid(bootstrap));
+        }
         let state = self.state.read().await;
         let mut proposed = state.layers.clone();
         let mut database = proposed.database.clone();
@@ -215,10 +221,11 @@ impl ConfigSource for StoreConfigSource {
         if !hs_config::reload::SECTION_NAMES.contains(&request.section.as_str()) {
             return Err(SourceError::NotFound);
         }
-        if hs_config::store::is_bootstrap_section(&request.section) {
-            return Err(SourceError::Conflict(format!(
-                "{:?} says where this server's database is, so it cannot be stored in it",
-                request.section
+        let bootstrap = Layers::bootstrap_in_patch(&request.section, &request.patch);
+        if hs_config::store::is_bootstrap_section(&request.section) || !bootstrap.is_empty() {
+            return Err(store_error(&StoreError::bootstrap(
+                &request.section,
+                bootstrap,
             )));
         }
         // The handler checked this too. It is checked again here because between the two there is

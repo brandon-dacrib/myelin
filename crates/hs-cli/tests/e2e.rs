@@ -2139,6 +2139,12 @@ async fn stopping_the_server_does_not_wait_for_clients_to_finish_waiting() {
 ///
 /// Also: what happened while the bridge's server was down is sent when it comes back, because
 /// the pump keeps a durable cursor per room rather than trusting the live stream.
+///
+/// And the registration arrives by the Synapse-migration path, `appservices.registration_files`,
+/// which since decision 0010 is a one-time import: the file is read on the first start, the
+/// import is in the audit log, and the file is deleted before the restart to prove the second
+/// start does not need it -- the registry is the truth, and the bridge is managed through the
+/// admin API from then on.
 #[tokio::test]
 async fn a_bridge_is_sent_what_happens_in_a_room_its_bot_is_in_even_across_a_restart() {
     use std::sync::Arc;
@@ -2187,9 +2193,9 @@ async fn a_bridge_is_sent_what_happens_in_a_room_its_bot_is_in_even_across_a_res
     // storage lock released, which an in-process `shutdown()` does not manage (background
     // tasks hold the store), and the cursor that survives the restart is the point.
     let dir = tempfile::tempdir().unwrap();
-    let registration = dir.path().join("irc.yaml");
+    let registration_file = dir.path().join("irc.yaml");
     std::fs::write(
-        &registration,
+        &registration_file,
         format!(
             "id: irc\nurl: '{bridge_url}'\nas_token: as_secret\nhs_token: hs_secret\n\
              sender_localpart: ircbot\nnamespaces:\n  users:\n    - regex: '@irc_.*:example\\.org'\n      exclusive: true\n"
@@ -2203,7 +2209,7 @@ async fn a_bridge_is_sent_what_happens_in_a_room_its_bot_is_in_even_across_a_res
         format!(
             "{}appservices:\n  registration_files: [{:?}]\n",
             test_config_yaml(port, &dir.path().join("data")),
-            registration
+            registration_file
         ),
     )
     .unwrap();
@@ -2362,6 +2368,14 @@ async fn a_bridge_is_sent_what_happens_in_a_room_its_bot_is_in_even_across_a_res
     let health = admin_get("/appservices/irc/health").await;
     assert!(health["last_ping_at"].is_string(), "{health}");
     assert!(health["last_error"].is_string(), "{health}");
+    // The registration came from the file, and the audit log says so.
+    let imports = admin_get("/audit-log?action=appservices.import").await;
+    assert_eq!(imports["items"][0]["target"]["id"], "irc", "{imports}");
+    assert_eq!(imports["items"][0]["actor"]["kind"], "system", "{imports}");
+
+    // The file was imported once; the registry holds the bridge now. The file goes away and the
+    // configuration still lists it: the next start must neither need it nor import it again.
+    std::fs::remove_file(&registration_file).unwrap();
 
     // The server stops and comes back. Nothing can be said while it is down, so: something
     // said the moment it is up, before anything but the pump's own catch-up has had a chance
@@ -2381,6 +2395,20 @@ async fn a_bridge_is_sent_what_happens_in_a_room_its_bot_is_in_even_across_a_res
             "hello irc".to_owned(),
             "said just after the restart".to_owned()
         ]
+    );
+    let imports: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/api/v1/audit-log?action=appservices.import"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        imports["items"].as_array().map(Vec::len),
+        Some(1),
+        "imported once, not again on the restart: {imports}"
     );
     server.stop();
 }

@@ -10,17 +10,22 @@
 //! # The order of operations, and why it is not a straight line
 //!
 //! The database holds the configuration, and the configuration says where the database is. That
-//! circle is broken by [`hs_config::store::BOOTSTRAP_SECTIONS`]: `storage` is read before the
-//! database opens and can never be stored in it. So:
+//! circle is broken by the bootstrap settings ([`hs_config::bootstrap`], decision 0010): `storage`
+//! is read before the database opens, and it and every other bootstrap setting (listeners, this
+//! replica's mesh identity, the signing-key path, the server name) come only from the file, the
+//! command line and the environment. So:
 //!
 //! 1. Read the bootstrap file (if any) and the `HS__` environment into a two-layer document.
-//! 2. Deserialize *only* `storage` out of it and open that backend. A half-configured server has
-//!    no `server.server_name` yet -- it may be sitting in the database we have not opened -- so
-//!    this step deliberately does not validate the whole configuration.
-//! 3. Open [`hs_config::ConfigStore`] on that backend and, if nothing has ever been written to
-//!    it, seed it from the bootstrap file. Re-running is a no-op, which is what makes it safe to
-//!    leave the file mounted forever.
-//! 4. Put the database in as the middle layer and resolve for real.
+//! 2. Deserialize *only* `storage` out of it and open that backend. A second start may have no
+//!    `server.server_name` in either layer -- the database remembers it -- so this step
+//!    deliberately does not validate the whole configuration.
+//! 3. Open [`hs_config::ConfigStore`] on that backend, remove any bootstrap setting an earlier
+//!    version stored in it ([`hs_config::ConfigStore::purge_bootstrap`]), and, if nothing has
+//!    ever been written to it, seed it with the file's administered settings. Re-running is a
+//!    no-op, which is what makes it safe to leave the file mounted forever.
+//! 4. Put the database in as the middle layer and resolve for real. The server name the database
+//!    was created for ([`hs_config::ConfigMeta::server_name`]) fills in for a start that does
+//!    not declare one, and overrides a file or `--server-name` that declares a different one.
 //!
 //! # `--data-dir`: one directory instead of four hand-edits
 //!
@@ -266,6 +271,14 @@ impl OpenedConfigStore {
         on_store!(self, store => store.seed(document, source, now_ms))
     }
 
+    /// See [`ConfigStore::purge_bootstrap`].
+    ///
+    /// # Errors
+    /// As [`ConfigStore::purge_bootstrap`].
+    pub fn purge_bootstrap(&self, now_ms: i64) -> Result<Vec<String>, StoreError> {
+        on_store!(self, store => store.purge_bootstrap(now_ms))
+    }
+
     /// See [`ConfigStore::patch_section`].
     ///
     /// # Errors
@@ -304,6 +317,49 @@ impl OpenedConfigStore {
     /// As [`ConfigStore::history`].
     pub fn history(&self, limit: usize) -> Result<Vec<ChangeRecord>, StoreError> {
         on_store!(self, store => store.history(limit))
+    }
+}
+
+/// Puts the server name the database was created for into the file layer, in place of whatever
+/// the file or `--server-name` declared.
+///
+/// The name is a bootstrap setting and is never stored as configuration, but the store records
+/// it as its identity at the first seed, for two reasons this is where they meet: a second start
+/// with only `--data-dir` must still know who it is, and a start that declares a *different* name
+/// must not get it, because every identifier the server has issued carries the old one. A
+/// disagreement is reported in `notes` rather than refused, as it always has been.
+fn apply_server_identity(
+    file_document: &mut Value,
+    identity: &str,
+    options: &BootOptions,
+    notes: &mut Vec<String>,
+) {
+    let declared = file_document
+        .pointer("/server/server_name")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(declared) = declared.as_deref()
+        && declared != identity
+    {
+        let what = if options.server_name.as_deref() == Some(declared) {
+            format!("--server-name {declared}")
+        } else {
+            let from = options
+                .source
+                .path()
+                .map_or_else(|| NO_FILE.to_owned(), |p| p.display().to_string());
+            format!("the server name {declared} in {from}")
+        };
+        notes.push(format!(
+            "{what} was ignored: this server is already {identity}, which is recorded in its \
+             database and in every event it has ever signed"
+        ));
+    }
+    if declared.as_deref() != Some(identity) {
+        merge_patch(
+            file_document,
+            &serde_json::json!({"server": {"server_name": identity}}),
+        );
     }
 }
 
@@ -553,9 +609,19 @@ pub fn boot_with_env(
         return Err(BootError::NoDataDir);
     }
 
-    // Step 3: open the store, and seed it if this is the very first run.
+    // Step 3: open the store, clear out what an earlier version should not have stored, and seed
+    // it if this is the very first run.
     let storage = open_storage(&storage_config)?;
     let store = OpenedConfigStore::open(&storage)?;
+    let purged = store.purge_bootstrap(now_ms())?;
+    if !purged.is_empty() {
+        notes.push(format!(
+            "removed {} from the configuration database: these are bootstrap settings (decision \
+             0010), read from this process's own file and environment, and an earlier version \
+             stored them where one replica's values could override another's",
+            purged.join(", ")
+        ));
+    }
     let mut stored = store.load()?;
     let mut seeded = None;
     let seedable = declared
@@ -598,20 +664,22 @@ pub fn boot_with_env(
         file.document = file_document;
     }
 
-    if let Some(asked) = &options.server_name {
-        let effective = layers
-            .merged()
-            .pointer("/server/server_name")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        if let Some(effective) = effective
-            && &effective != asked
-        {
-            notes.push(format!(
-                "--server-name {asked} was ignored: this server is already {effective}, which is \
-                 recorded in its database and in every event it has ever signed"
-            ));
-        }
+    if let Some(identity) = stored.meta.server_name.clone()
+        && let Some(file) = layers.file.as_mut()
+    {
+        apply_server_identity(&mut file.document, &identity, options, &mut notes);
+    }
+    let environment_name = layers
+        .environment
+        .pointer("/server/server_name")
+        .and_then(Value::as_str);
+    if let (Some(identity), Some(pinned)) = (&stored.meta.server_name, environment_name)
+        && identity != pinned
+    {
+        notes.push(format!(
+            "HS__SERVER__SERVER_NAME is {pinned}, but this database was created for {identity}: \
+             the environment wins, and every user, room and event already stored names {identity}"
+        ));
     }
 
     Ok(Booted {
@@ -879,6 +947,158 @@ mod tests {
             read_file_document(&path).unwrap(),
             Value::Object(Map::new())
         );
+    }
+
+    /// A replica's own file, as the two-process cluster experiment ran them: one database, a
+    /// client port and a mesh port of its own.
+    fn replica_file(dir: &Path, name: &str, client_port: u16, mesh_port: u16) -> PathBuf {
+        let path = dir.join(format!("{name}.yaml"));
+        std::fs::write(
+            &path,
+            format!(
+                "server:\n  server_name: example.org\n\
+                 storage:\n  backend: embedded\n  data_dir: {db:?}\n\
+                 listeners:\n  listeners:\n    - port: {client_port}\n      bind_addresses: ['127.0.0.1']\n      resources: [client, federation, health]\n\
+                 cluster:\n  single_node: false\n  lease_ttl: 20s\n  mesh:\n    port: {mesh_port}\n    advertise_address: {name}.local\n\
+                 appservices:\n  registration_files: [{name}-bridge.yaml]\n\
+                 auth:\n  enable_registration: true\n",
+                db = dir.join("db"),
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn boot_file(path: &Path) -> Booted {
+        boot_with_env(
+            &BootOptions {
+                source: ConfigSource::Native(path.to_owned()),
+                data_dir: None,
+                server_name: None,
+            },
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    /// Decision 0010: the first boot seeds the database with the file's administered settings
+    /// only. The bootstrap ones are this process's own and stay in its file.
+    #[test]
+    fn bootstrap_settings_from_the_file_are_not_seeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let booted = boot_file(&replica_file(dir.path(), "replica-a", 18008, 18449));
+        assert!(booted.seeded.is_some());
+        let stored = booted.store.load().unwrap();
+        for pointer in [
+            "/storage",
+            "/listeners",
+            "/server/server_name",
+            "/cluster/single_node",
+            "/cluster/mesh",
+            "/appservices/registration_files",
+        ] {
+            assert_eq!(
+                stored.document.pointer(pointer),
+                None,
+                "{pointer} was seeded into the shared database"
+            );
+        }
+        assert_eq!(
+            stored.document.pointer("/auth/enable_registration"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            stored.document.pointer("/cluster/lease_ttl"),
+            Some(&Value::String("20s".to_owned()))
+        );
+        assert_eq!(stored.meta.server_name.as_deref(), Some("example.org"));
+
+        let resolved = booted.resolve().unwrap();
+        assert_eq!(resolved.config.listeners.listeners[0].port, 18008);
+        assert_eq!(resolved.config.cluster.mesh.port, 18449);
+        assert_eq!(
+            resolved.origin("/cluster/mesh/port"),
+            hs_config::Origin::File
+        );
+    }
+
+    /// The bug from the two-process cluster run (`docs/next-steps.md`, "Found on the way"): two
+    /// replicas seeding one database left the first one's `listeners` and `cluster.mesh.port` in
+    /// force for both after a restart, and replica B restarted on A's ports and failed to bind.
+    /// Each now keeps its own, in whichever order they boot and restart.
+    #[test]
+    fn two_replicas_booting_on_one_database_keep_their_own_listeners_and_mesh_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = replica_file(dir.path(), "replica-a", 18008, 18449);
+        let b = replica_file(dir.path(), "replica-b", 28008, 28449);
+
+        for (file, client_port, mesh_port, advertised) in [
+            (&a, 18008, 18449, "replica-a.local"),
+            (&b, 28008, 28449, "replica-b.local"),
+            (&a, 18008, 18449, "replica-a.local"),
+            (&b, 28008, 28449, "replica-b.local"),
+        ] {
+            // The embedded backend locks its directory, so the "replicas" take turns; what they
+            // share is the database, which is the point.
+            let booted = boot_file(file);
+            let resolved = booted.resolve().unwrap();
+            assert_eq!(resolved.config.listeners.listeners[0].port, client_port);
+            assert_eq!(resolved.config.cluster.mesh.port, mesh_port);
+            assert_eq!(
+                resolved.config.cluster.mesh.advertise_address.as_deref(),
+                Some(advertised)
+            );
+            assert_eq!(resolved.config.server.server_name, "example.org");
+        }
+    }
+
+    /// A database an earlier version seeded still holds the seeding replica's listeners and mesh
+    /// port. The next boot removes them, says so, and resolves this replica's own.
+    #[test]
+    fn a_database_seeded_by_an_earlier_version_is_purged_at_boot() {
+        use hs_kv::{KvBackend, KvWrite, TransactConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let a = replica_file(dir.path(), "replica-a", 18008, 18449);
+        {
+            let booted = boot_file(&a);
+            // What a pre-0010 seed from replica A left behind.
+            let OpenedStorage::Embedded(backend) = &booted.storage else {
+                panic!("the test file asks for the embedded backend");
+            };
+            let keyspace = backend.keyspace(hs_config::store::KEYSPACE).unwrap();
+            hs_kv::transact(backend, TransactConfig::default(), |txn| {
+                txn.put(
+                    &keyspace,
+                    b"section/listeners",
+                    br#"{"listeners":[{"port":18008,"bind_addresses":["127.0.0.1"],"resources":["client"]}]}"#,
+                )?;
+                txn.put(
+                    &keyspace,
+                    b"section/cluster",
+                    br#"{"mesh":{"port":18449},"lease_ttl":"20s"}"#,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        let b = replica_file(dir.path(), "replica-b", 28008, 28449);
+        let booted = boot_file(&b);
+        assert!(
+            booted
+                .notes
+                .iter()
+                .any(|n| n.contains("/listeners") && n.contains("/cluster/mesh")),
+            "the purge is reported: {:?}",
+            booted.notes
+        );
+        let stored = booted.store.load().unwrap();
+        assert_eq!(stored.document.get("listeners"), None);
+        assert_eq!(stored.document.pointer("/cluster/mesh"), None);
+        let resolved = booted.resolve().unwrap();
+        assert_eq!(resolved.config.listeners.listeners[0].port, 28008);
+        assert_eq!(resolved.config.cluster.mesh.port, 28449);
     }
 
     #[test]

@@ -238,6 +238,10 @@ fn write(
     verb: &str,
 ) -> Result<String, ConfigCmdError> {
     let (section, patch) = patch_for(pointer, value)?;
+    let bootstrap = hs_config::Layers::bootstrap_in_patch(&section, &patch);
+    if hs_config::store::is_bootstrap_section(&section) || !bootstrap.is_empty() {
+        return Err(hs_config::StoreError::bootstrap(&section, bootstrap).into());
+    }
     let pinned = booted.layers.pinned_by_environment(&section, &patch);
     if !pinned.is_empty() {
         return Err(ConfigCmdError::PinnedByEnvironment {
@@ -291,15 +295,19 @@ pub fn import(booted: &mut Booted, path: &Path) -> Result<String, ConfigCmdError
         });
     };
 
-    let mut skipped = Vec::new();
-    let mut importable: Vec<(String, Value)> = Vec::new();
-    for (name, value) in sections {
-        if hs_config::store::is_bootstrap_section(name) {
-            skipped.push(name.clone());
-        } else {
-            importable.push((name.clone(), value.clone()));
-        }
-    }
+    // The bootstrap settings (decision 0010) belong to one process and cannot be stored; the
+    // rest of the file is imported.
+    let mut administered = Value::Object(sections.clone());
+    let skipped = hs_config::bootstrap::strip_bootstrap(&mut administered);
+    let importable: Vec<(String, Value)> = administered
+        .as_object()
+        .map(|sections| {
+            sections
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
 
     let mut candidate = booted.layers.clone();
     let mut database = candidate.database.clone();
@@ -331,8 +339,10 @@ pub fn import(booted: &mut Booted, path: &Path) -> Result<String, ConfigCmdError
     );
     if !skipped.is_empty() {
         out.push_str(&format!(
-            "skipped {skipped:?}: that section says where this server's database is, so it is \
-             read before the database opens and cannot be stored in it\n"
+            "skipped {}: bootstrap settings (where the database is, what this process listens \
+             on, its cluster identity, the server name) come from the file and the environment \
+             and cannot be stored in the database\n",
+            skipped.join(", ")
         ));
     }
     Ok(out)
@@ -549,8 +559,11 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 fn layers_for_test() -> hs_config::Layers {
     hs_config::Layers {
-        file: None,
-        database: serde_json::json!({"server": {"server_name": "example.org"}}),
+        file: Some(hs_config::FileLayer {
+            path: std::path::PathBuf::from("homeserver.yaml"),
+            document: serde_json::json!({"server": {"server_name": "example.org"}}),
+        }),
+        database: serde_json::json!({"auth": {"enable_registration": true}}),
         environment: Value::Object(Map::new()),
     }
 }
@@ -721,13 +734,39 @@ mod tests {
     fn a_change_that_would_not_validate_is_refused_before_it_is_written() {
         let dir = tempfile::tempdir().unwrap();
         let mut booted = booted(dir.path(), Vec::new());
-        let err = set(&mut booted, "/server/server_name", "").unwrap_err();
+        let err = set(&mut booted, "/server/public_baseurl", "ftp://nope").unwrap_err();
         assert!(matches!(err, ConfigCmdError::WouldNotValidate(_)), "{err}");
         assert_eq!(
-            booted.resolve().unwrap().config.server.server_name,
-            "example.org",
+            booted.resolve().unwrap().config.server.public_baseurl,
+            None,
             "the refused change left the running configuration alone"
         );
+    }
+
+    /// A bootstrap setting (decision 0010) is refused by name: the database cannot hold it, and
+    /// the message says where it does come from.
+    #[test]
+    fn a_bootstrap_setting_is_refused_with_where_to_set_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut booted = booted(dir.path(), Vec::new());
+        for pointer in [
+            "/server/server_name",
+            "/cluster/mesh/port",
+            "/listeners/listeners",
+        ] {
+            let err = set(&mut booted, pointer, "1").unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigCmdError::Store(
+                        hs_config::StoreError::BootstrapSetting { .. }
+                            | hs_config::StoreError::BootstrapSection { .. }
+                    )
+                ),
+                "{pointer}: {err}"
+            );
+            assert!(err.to_string().contains("HS__"), "{err}");
+        }
     }
 
     /// Writing a setting the environment pins would be stored faithfully and then ignored, which
@@ -837,7 +876,12 @@ mod tests {
             .iter()
             .find(|(p, _, _)| p == "/server/server_name")
             .expect("server_name is in the effective configuration");
-        assert_eq!(server_name.2, Origin::Database);
+        assert_eq!(server_name.2, Origin::File);
+        let registration = rows
+            .iter()
+            .find(|(p, _, _)| p == "/auth/enable_registration")
+            .expect("enable_registration is in the effective configuration");
+        assert_eq!(registration.2, Origin::Database);
         let untouched = rows
             .iter()
             .find(|(p, _, _)| p == "/federation/client_timeout")

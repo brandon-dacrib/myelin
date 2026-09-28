@@ -80,9 +80,12 @@ pub enum ServeError {
     /// `--media-scanning-config` was given — the content scanning engine) failed.
     #[error(transparent)]
     Media(#[from] crate::media::MediaSetupError),
-    /// Loading `appservices.registration_files` failed.
+    /// Importing `appservices.registration_files` failed.
     #[error(transparent)]
     Appservices(#[from] crate::appservices::LoadAppservicesError),
+    /// Opening the audit log, or recording a registration file's import in it, failed.
+    #[error("failed to open or write the audit log: {0}")]
+    Audit(String),
     /// Starting the `hs-cluster` ownership manager (or, when clustered, its mesh forwarder)
     /// failed.
     #[error(transparent)]
@@ -120,19 +123,17 @@ pub enum ServeError {
 /// be the tail wagging the dog.
 #[derive(Clone, Default)]
 pub struct ServeOptions {
-    /// `--capabilities-config`: an optional YAML file overriding
-    /// `crate::versions::default_unstable_features`.
+    /// `--capabilities-config`: deprecated. An optional YAML file whose `unstable_features` win
+    /// over the configured `server.unstable_features` (see `crate::versions`).
     pub capabilities_config: Option<PathBuf>,
     /// `--routes-manifest`: an optional path to write the `routes.json` manifest to at startup.
     /// When `None`, the manifest is still computed (cheap: no I/O, no Kubernetes/network calls)
     /// but not written — use the `hs routes-manifest` subcommand to get it without booting a
     /// server at all.
     pub routes_manifest_path: Option<PathBuf>,
-    /// `--media-scanning-config`: an optional `media.scanning` YAML file
-    /// (`hs_media::scanning::ScanningConfig::from_yaml`'s shape — see `crate::media`'s module doc
-    /// for why this cannot live in `-c`/`--config`'s native config file yet). Omitted means no
-    /// content scanning is attached (`ScanningConfig::default()`'s `mode: off`, zero behavioral
-    /// change).
+    /// `--media-scanning-config`: deprecated. An optional standalone `media.scanning` YAML file
+    /// that replaces the configured `media.scanning` section wholesale (see `crate::media`'s
+    /// module doc). Omitted, scanning is whatever the configuration says -- off by default.
     pub media_scanning_config: Option<PathBuf>,
     /// The configuration source the admin API writes through
     /// (`crate::config_source::StoreConfigSource`). `None` leaves every `/config*` operation
@@ -990,7 +991,16 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // The first HTTP client is built in here (the ping transport); the roots are ready by now
     // on any machine that is not very slow, and on one that is, waiting beats blocking.
     let _ = roots.await;
+    // Opened here rather than with the admin API below: importing a registration file is audited,
+    // and the import happens now.
+    let audit = Arc::new(
+        crate::audit::TablesAuditSink::open(backend.clone())
+            .map_err(|e| ServeError::Audit(e.to_string()))?,
+    );
     let appservices = crate::appservices::load(&config.appservices, backend.clone(), &server_name)?;
+    crate::appservices::audit_imports(audit.as_ref(), &appservices.imports)
+        .await
+        .map_err(|e| ServeError::Audit(e.to_string()))?;
     // Replaces `hs-auth`'s stub `InMemoryAppserviceRegistry` (empty by default) with
     // `hs-appservice`'s real, store-backed registry, so an `as_token` a loaded registration
     // declares actually authenticates through `Requester` — see
@@ -1225,10 +1235,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         appservice_ping: appservices.ping_service,
         admin: admin_state(
             &auth_state,
-            Arc::new(
-                crate::audit::TablesAuditSink::open(backend.clone())
-                    .map_err(|e| ServeError::Sessions(Box::new(e)))?,
-            ),
+            audit,
             &rooms,
             server_name.as_str(),
             enabled_components,
@@ -1260,6 +1267,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
 
     let ready = Arc::new(AtomicBool::new(true));
     let unstable_features = Arc::new(versions::load_unstable_features(
+        &config.server.unstable_features,
         options.capabilities_config.as_deref(),
     )?);
 

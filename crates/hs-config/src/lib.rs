@@ -27,6 +27,7 @@
 
 pub mod appservice;
 pub mod auth;
+pub mod bootstrap;
 pub mod cluster;
 pub mod document;
 pub mod duration;
@@ -38,6 +39,7 @@ pub mod listeners;
 pub mod media;
 pub mod ratelimit;
 pub mod reload;
+pub mod scanning;
 pub mod secret;
 pub mod server;
 pub mod size;

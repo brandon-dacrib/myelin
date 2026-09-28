@@ -29,20 +29,20 @@
 //!
 //! # Configuration
 //!
-//! `unstable_features` cannot live in the main native `hs-config` YAML file: `hs_config::Config`
-//! denies unknown top-level keys (see that crate's `unknown_top_level_key_is_rejected` test), and
-//! this track does not own that schema. Instead, `hs serve --capabilities-config <path>`
-//! (optional) points at a small standalone YAML file:
+//! `server.unstable_features` (`hs_config::ServerConfig`) is merged over
+//! [`default_unstable_features`]: a setting like any other, stored in the database and changed
+//! through the admin API and the web interface (decision 0010). An explicit `false` suppresses a
+//! built-in flag.
+//!
+//! `hs serve --capabilities-config <path>` predates that setting and still works, deprecated: a
+//! small standalone YAML file
 //!
 //! ```yaml
 //! unstable_features:
 //!   org.matrix.msc1234: true
 //! ```
 //!
-//! merged onto [`default_unstable_features`] (entries in the file win; an explicit `false` can
-//! also suppress a built-in default). This is a stopgap `hs-cli`-owned config surface, not a
-//! long-term home — `docs/status/12-platform-and-kubernetes.md` lists "give `hs-config` a real
-//! `capabilities` section" as an interface needed from track 13.
+//! whose entries win over the configured ones, with a warning at startup.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -111,17 +111,25 @@ struct CapabilitiesConfigFile {
     unstable_features: BTreeMap<String, bool>,
 }
 
-/// Loads `unstable_features` overrides from an optional `--capabilities-config` file and merges
-/// them onto [`default_unstable_features`] (file entries win).
+/// The `unstable_features` this server advertises: [`default_unstable_features`], then the
+/// configured `server.unstable_features`, then the deprecated `--capabilities-config` file, each
+/// winning over the one before.
 ///
 /// # Errors
 /// Returns [`CapabilitiesConfigError`] if `path` is `Some` and the file cannot be read or parsed.
-/// `path: None` always succeeds with just the built-in defaults.
+/// `path: None` always succeeds.
 pub fn load_unstable_features(
+    configured: &BTreeMap<String, bool>,
     path: Option<&Path>,
 ) -> Result<BTreeMap<String, bool>, CapabilitiesConfigError> {
     let mut features = default_unstable_features();
+    features.extend(configured.iter().map(|(k, v)| (k.clone(), *v)));
     if let Some(path) = path {
+        tracing::warn!(
+            path = %path.display(),
+            "--capabilities-config is deprecated; set server.unstable_features in the admin \
+             interface's Configuration page instead"
+        );
         let contents =
             std::fs::read_to_string(path).map_err(|source| CapabilitiesConfigError::Read {
                 path: path.to_owned(),
@@ -171,8 +179,16 @@ mod tests {
 
     #[test]
     fn load_unstable_features_with_no_path_returns_defaults() {
-        let features = load_unstable_features(None).unwrap();
+        let features = load_unstable_features(&BTreeMap::new(), None).unwrap();
         assert_eq!(features, default_unstable_features());
+    }
+
+    /// Decision 0010: the flags are a configuration setting (database, admin API), not a file.
+    #[test]
+    fn configured_unstable_features_are_advertised() {
+        let configured = BTreeMap::from([("org.matrix.msc3202".to_owned(), true)]);
+        let features = load_unstable_features(&configured, None).unwrap();
+        assert_eq!(features.get("org.matrix.msc3202"), Some(&true));
     }
 
     #[test]
@@ -184,15 +200,27 @@ mod tests {
             "unstable_features:\n  org.matrix.msc9999: true\n  org.matrix.msc8888: false\n",
         )
         .unwrap();
-        let features = load_unstable_features(Some(&path)).unwrap();
-        assert_eq!(features.get("org.matrix.msc9999"), Some(&true));
+        let configured = BTreeMap::from([
+            ("org.matrix.msc9999".to_owned(), false),
+            ("org.matrix.msc7777".to_owned(), true),
+        ]);
+        let features = load_unstable_features(&configured, Some(&path)).unwrap();
+        assert_eq!(
+            features.get("org.matrix.msc9999"),
+            Some(&true),
+            "the file wins over the configured value"
+        );
+        assert_eq!(features.get("org.matrix.msc7777"), Some(&true));
         assert_eq!(features.get("org.matrix.msc8888"), Some(&false));
     }
 
     #[test]
     fn load_unstable_features_reports_a_missing_file_clearly() {
-        let err =
-            load_unstable_features(Some(std::path::Path::new("/no/such/file.yaml"))).unwrap_err();
+        let err = load_unstable_features(
+            &BTreeMap::new(),
+            Some(std::path::Path::new("/no/such/file.yaml")),
+        )
+        .unwrap_err();
         assert!(matches!(err, CapabilitiesConfigError::Read { .. }));
     }
 

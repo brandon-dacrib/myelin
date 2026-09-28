@@ -739,7 +739,8 @@ pub struct ConfigPatch {
 ///   `SourceError` for being unable to answer at all.
 /// - [`ConfigSource::patch_section`] must validate the configuration the patch would *produce*
 ///   (`Layers::resolve_with_patch`) and write nothing if it is invalid, must refuse a bootstrap
-///   section (`StoreError::BootstrapSection`) and a stale `expected_revision`
+///   section or setting (`StoreError::BootstrapSection`, `StoreError::BootstrapSetting`;
+///   `hs_config::bootstrap`) and a stale `expected_revision`
 ///   (`StoreError::RevisionMismatch` → [`SourceError::PreconditionFailed`]), and must refuse a
 ///   patch the environment pins. The handlers check all four first, so the implementation's own
 ///   checks are a backstop against a race, not the only guard — but they must be there, because
@@ -810,6 +811,31 @@ pub fn config_validation_errors(error: &hs_config::ConfigError) -> Vec<hs_http::
         // have one. Pointing at the root is honest; inventing a field would not be.
         other => vec![hs_http::ValidationError::new("", other.to_string())],
     }
+}
+
+/// The bootstrap settings (`hs_config::bootstrap`, decision 0010) a `config.validate` candidate
+/// would write, as validation errors. The database cannot hold them -- every replica would
+/// ignore the stored value -- so a candidate that sets one is not a configuration this server
+/// would accept, and saying "valid" would promise an edit `config.update` then refuses.
+#[must_use]
+pub fn bootstrap_validation_errors(candidate: &Value) -> Vec<hs_http::ValidationError> {
+    let Some(sections) = candidate.as_object() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (section, patch) in sections {
+        let pointers = if hs_config::store::is_bootstrap_section(section) {
+            vec![format!("/{section}")]
+        } else {
+            Layers::bootstrap_in_patch(section, patch)
+        };
+        for pointer in pointers {
+            let message =
+                hs_config::store::StoreError::bootstrap(section, vec![pointer.clone()]).to_string();
+            out.push(hs_http::ValidationError::new(pointer, message));
+        }
+    }
+    out
 }
 
 /// `auth.oidc_providers[0].client_secret` becomes `/auth/oidc_providers/0/client_secret`.
@@ -1040,6 +1066,10 @@ impl ConfigSource for InMemoryConfigSource {
     }
 
     async fn validate(&self, candidate: &Value) -> Result<ConfigValidateReport, SourceError> {
+        let bootstrap = bootstrap_validation_errors(candidate);
+        if !bootstrap.is_empty() {
+            return Ok(ConfigValidateReport::invalid(bootstrap));
+        }
         let state = self.state();
         let mut proposed = state.layers.clone();
         let mut database = proposed.database.clone();
@@ -1070,11 +1100,11 @@ impl ConfigSource for InMemoryConfigSource {
         if !hs_config::reload::SECTION_NAMES.contains(&request.section.as_str()) {
             return Err(SourceError::NotFound);
         }
-        if hs_config::store::is_bootstrap_section(&request.section) {
-            return Err(SourceError::Conflict(format!(
-                "{:?} says where this server's database is, so it cannot be stored in it",
-                request.section
-            )));
+        let bootstrap = Layers::bootstrap_in_patch(&request.section, &request.patch);
+        if hs_config::store::is_bootstrap_section(&request.section) || !bootstrap.is_empty() {
+            return Err(SourceError::Conflict(
+                hs_config::store::StoreError::bootstrap(&request.section, bootstrap).to_string(),
+            ));
         }
         if let Some(expected) = request.expected_revision
             && expected != state.revision

@@ -202,6 +202,10 @@ pub struct MediaConfig {
     /// which this field is meant to replace.
     #[serde(default = "default_url_preview_cache_lifetime")]
     pub url_preview_cache_lifetime: Duration,
+    /// Content scanning of uploads (RFC 0008): when to scan, with which provider, and what to do
+    /// when the scanner cannot answer. Off by default. See [`crate::scanning`].
+    #[serde(default)]
+    pub scanning: crate::scanning::ScanningConfig,
 }
 
 fn default_url_preview_timeout() -> Duration {
@@ -243,12 +247,15 @@ impl Default for MediaConfig {
             url_preview_timeout: default_url_preview_timeout(),
             url_preview_max_fetch_size: default_url_preview_max_fetch_size(),
             url_preview_cache_lifetime: default_url_preview_cache_lifetime(),
+            scanning: crate::scanning::ScanningConfig::default(),
         }
     }
 }
 
 impl Validate for MediaConfig {
     fn validate(&self, prefix: &str, errors: &mut ValidationErrors) {
+        self.scanning
+            .validate(&format!("{prefix}.scanning"), errors);
         if self.max_upload_size.as_u64() == 0 {
             errors.push(
                 format!("{prefix}.max_upload_size"),

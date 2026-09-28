@@ -8,20 +8,31 @@
 //!
 //! # What cannot live here
 //!
-//! [`BOOTSTRAP_SECTIONS`] — `storage` alone today — says where the database *is*, so it is read
-//! before there is a database to read it from. It comes from the command line, an `HS__` variable
-//! or the bootstrap file, and writing it here is refused with an error that says so rather than
-//! accepted and ignored.
+//! The bootstrap settings ([`crate::bootstrap`], decision 0010): where the database is, what this
+//! process listens on, this replica's identity in the cluster, paths on this process's own
+//! filesystem, the server's name, and the registration files imported once into the appservice
+//! registry. They come from the command line, an `HS__` variable or the bootstrap file. Seeding
+//! skips them, writing one is refused with an error that says so rather than accepted and
+//! ignored, and [`ConfigStore::purge_bootstrap`] removes any an earlier version stored.
+//! [`BOOTSTRAP_SECTIONS`] are the sections that are bootstrap as a whole.
+//!
+//! The server's name is the one bootstrap value the store does remember, as the database's
+//! *identity* ([`ConfigMeta::server_name`]) rather than as a setting: a second start with only a
+//! data directory must still know who it is, and a start that declares a different name must be
+//! told it cannot have it.
 //!
 //! # Layout
 //!
-//! One `hs-kv` keyspace, [`KEYSPACE`], with three kinds of key:
+//! One `hs-kv` keyspace, [`KEYSPACE`], with four kinds of key:
 //!
 //! - `section/<name>` — that section's sparse document, as JSON. Absent means the section sets
 //!   nothing and everything in it falls through to the file or the schema default.
 //! - `meta` — [`ConfigMeta`]: the revision counter, who last wrote and when.
 //! - `history/<revision>` — [`ChangeRecord`], one per write, so the web interface can show what
 //!   changed and when without a separate audit store.
+//! - `import/<kind>/<key>` — [`ImportRecord`], one per bootstrap-file item imported into the
+//!   database once (an appservice registration file, today), so that a file still listed after
+//!   the import is not imported again over what an operator has since changed.
 //!
 //! Keys are fixed ASCII with a zero-padded decimal revision, so `history/` scans in revision
 //! order. There is no tuple encoding and no index to maintain, which is why this does not go
@@ -34,27 +45,38 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::bootstrap::{self, strip_bootstrap};
 use crate::document::merge_patch;
 use crate::reload::SECTION_NAMES;
 
 /// The `hs-kv` keyspace this store owns.
 pub const KEYSPACE: &str = "config";
 
-/// Sections that are read before the database is open, and so cannot be stored in it.
-pub const BOOTSTRAP_SECTIONS: &[&str] = &["storage"];
+/// Sections that are bootstrap as a whole ([`crate::bootstrap`]), and so cannot be stored at all.
+/// Other sections hold some bootstrap settings among administered ones; see
+/// [`crate::bootstrap::BOOTSTRAP_SETTINGS`] for the full list.
+pub const BOOTSTRAP_SECTIONS: &[&str] = &["storage", "listeners"];
 
-/// True when `section` must come from the bootstrap layer rather than the database.
+/// True when the whole of `section` must come from the bootstrap layer rather than the database.
 #[must_use]
 pub fn is_bootstrap_section(section: &str) -> bool {
     BOOTSTRAP_SECTIONS.contains(&section)
 }
 
+/// The actor recorded against the history entries [`ConfigStore::purge_bootstrap`] writes.
+pub const PURGE_ACTOR: &str = "system: bootstrap settings are not stored (decision 0010)";
+
 const META_KEY: &[u8] = b"meta";
 const SECTION_PREFIX: &str = "section/";
 const HISTORY_PREFIX: &str = "history/";
+const IMPORT_PREFIX: &str = "import/";
 
 fn section_key(name: &str) -> Vec<u8> {
     format!("{SECTION_PREFIX}{name}").into_bytes()
+}
+
+fn import_key(kind: &str, key: &str) -> Vec<u8> {
+    format!("{IMPORT_PREFIX}{kind}/{key}").into_bytes()
 }
 
 fn history_key(revision: u64) -> Vec<u8> {
@@ -97,14 +119,48 @@ pub enum StoreError {
     },
     /// A section that cannot be stored in the database was written to it.
     #[error(
-        "{section:?} says where this server's database is, so it is read before the database is \
-         open and cannot be stored in it -- set it on the command line, in an HS__ environment \
-         variable, or in the bootstrap file"
+        "{section:?} is a bootstrap section: it is read before the database is open, or belongs \
+         to one process rather than to the whole server, so it cannot be stored in the database \
+         -- set it on the command line, in an HS__ environment variable, or in the bootstrap file"
     )]
     BootstrapSection {
         /// The section the caller tried to write.
         section: String,
     },
+    /// A patch would write one or more bootstrap settings inside an otherwise administered
+    /// section (`cluster.mesh.port`, `server.server_name`, ...).
+    #[error(
+        "{} cannot be stored in the database: it {} -- set it on the command line, in an HS__ \
+         environment variable, or in the bootstrap file",
+        pointers.join(", "),
+        explanation
+    )]
+    BootstrapSetting {
+        /// The whole-configuration JSON Pointers the patch would have written.
+        pointers: Vec<String>,
+        /// Why the first of them is bootstrap ([`crate::bootstrap::BootstrapReason`]).
+        explanation: &'static str,
+    },
+}
+
+impl StoreError {
+    /// The error for a patch against `section` that touches the bootstrap settings `pointers`.
+    #[must_use]
+    pub fn bootstrap(section: &str, pointers: Vec<String>) -> Self {
+        if is_bootstrap_section(section) {
+            return StoreError::BootstrapSection {
+                section: section.to_owned(),
+            };
+        }
+        let explanation = pointers
+            .first()
+            .and_then(|p| bootstrap::bootstrap_setting(p))
+            .map_or("is a bootstrap setting", |s| s.reason.explanation());
+        StoreError::BootstrapSetting {
+            pointers,
+            explanation,
+        }
+    }
 }
 
 /// Bookkeeping about the stored configuration as a whole.
@@ -120,6 +176,29 @@ pub struct ConfigMeta {
     pub updated_by: Option<String>,
     /// Where the initial contents came from, if this store was seeded from a file.
     pub seeded_from: Option<String>,
+    /// The server name this database was created for: its identity, not a setting. Recorded by
+    /// the first seed (or, for a store written before decision 0010, by
+    /// [`ConfigStore::purge_bootstrap`] from the `server.server_name` it used to hold) and never
+    /// changed after, because every identifier the server has issued carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+}
+
+/// One bootstrap-file item imported into the database once (`import/<kind>/<key>`).
+///
+/// The record is what makes an import one-time: a file still listed in the bootstrap layer after
+/// it has been imported is skipped on every later start, so a change made through the admin API
+/// to what it imported is not overwritten by the file on the next restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ImportRecord {
+    /// What kind of thing was imported (`appservice_registration`).
+    pub kind: String,
+    /// What identifies the source within its kind (a registration file's path).
+    pub key: String,
+    /// What it became (an appservice id), or why nothing was imported.
+    pub outcome: String,
+    /// When, in milliseconds since the Unix epoch.
+    pub at_ms: i64,
 }
 
 /// One configuration change, kept so the web interface can show a history without a separate
@@ -227,23 +306,34 @@ impl<B: KvBackend> ConfigStore<B> {
         }
     }
 
-    /// Writes `document`'s sections as the initial contents, but only if nothing has been written
-    /// yet. Returns `true` when it seeded and `false` when the store already held configuration
-    /// and was left untouched.
+    /// Writes `document`'s administered sections as the initial contents, but only if nothing
+    /// has been written yet. Returns `true` when it seeded and `false` when the store already
+    /// held configuration and was left untouched.
     ///
     /// This is how an existing `homeserver.yaml` deployment moves into the database: the first
     /// boot copies the file in, and from then on the database is what the server reads and the
     /// web interface writes. Re-running it is a no-op, so a file left mounted after the move
     /// cannot quietly revert a change made in the UI.
     ///
+    /// The bootstrap settings ([`crate::bootstrap`]) are not copied: they are per process, and a
+    /// second replica booting on the same database must keep its own. The server name, if the
+    /// document declares one, is recorded as the store's identity ([`ConfigMeta::server_name`]).
+    ///
     /// # Errors
     /// Returns [`StoreError::Kv`] on a backend failure.
     pub fn seed(&self, document: &Value, source: &str, now_ms: i64) -> Result<bool, StoreError> {
-        let sections: Vec<(String, Value)> = document
+        let server_name = document
+            .pointer("/server/server_name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
+        let mut administered = document.clone();
+        strip_bootstrap(&mut administered);
+        let sections: Vec<(String, Value)> = administered
             .as_object()
             .map(|map| {
                 map.iter()
-                    .filter(|(name, _)| !is_bootstrap_section(name))
+                    .filter(|(name, _)| SECTION_NAMES.contains(&name.as_str()))
                     .map(|(name, value)| (name.clone(), value.clone()))
                     .collect()
             })
@@ -264,6 +354,7 @@ impl<B: KvBackend> ConfigStore<B> {
                 updated_at_ms: now_ms,
                 updated_by: None,
                 seeded_from: Some(source.to_owned()),
+                server_name: server_name.clone(),
             };
             txn.put(&self.keyspace, META_KEY, &to_bytes(&meta))?;
             Ok(true)
@@ -283,7 +374,8 @@ impl<B: KvBackend> ConfigStore<B> {
     ///
     /// # Errors
     /// [`StoreError::UnknownSection`], [`StoreError::BootstrapSection`],
-    /// [`StoreError::RevisionMismatch`], [`StoreError::Corrupt`] or [`StoreError::Kv`].
+    /// [`StoreError::BootstrapSetting`], [`StoreError::RevisionMismatch`],
+    /// [`StoreError::Corrupt`] or [`StoreError::Kv`].
     pub fn patch_section(
         &self,
         section: &str,
@@ -293,10 +385,9 @@ impl<B: KvBackend> ConfigStore<B> {
         expected_revision: Option<u64>,
     ) -> Result<Stored, StoreError> {
         check_section_name(section)?;
-        if is_bootstrap_section(section) {
-            return Err(StoreError::BootstrapSection {
-                section: section.to_owned(),
-            });
+        let touched = bootstrap::bootstrap_pointers_in_patch(section, patch);
+        if is_bootstrap_section(section) || !touched.is_empty() {
+            return Err(StoreError::bootstrap(section, touched));
         }
 
         let key = section_key(section);
@@ -350,12 +441,140 @@ impl<B: KvBackend> ConfigStore<B> {
                     updated_at_ms: now_ms,
                     updated_by: actor.map(str::to_owned),
                     seeded_from: meta.seeded_from.clone(),
+                    server_name: meta.server_name.clone(),
                 }),
             )?;
             Ok(Ok(()))
         })?;
         outcome?;
         self.load()
+    }
+
+    /// Removes every bootstrap setting an earlier version stored, and returns the pointers it
+    /// removed (empty when there was nothing to do, which is every start after the first one on a
+    /// store written since decision 0010).
+    ///
+    /// Before that decision the store was seeded with the whole bootstrap file, `listeners` and
+    /// `cluster.mesh` included, so a cluster's database could hold one replica's ports and hand
+    /// them to every other. [`crate::Layers`] already ignores them when it resolves; this is
+    /// what makes the store itself stop claiming them, so the web interface does not show a
+    /// stored value that has no effect. Each section it changes gets a history entry under
+    /// [`PURGE_ACTOR`], a `null` patch for each setting it removed, so the removal is explained
+    /// where an operator looks for changes. A stored `server.server_name` becomes the store's
+    /// identity ([`ConfigMeta::server_name`]) if it had none.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] or [`StoreError::Kv`].
+    pub fn purge_bootstrap(&self, now_ms: i64) -> Result<Vec<String>, StoreError> {
+        hs_kv::transact(&self.backend, TransactConfig::default(), |txn| {
+            let mut meta: ConfigMeta = match txn.get(&self.keyspace, META_KEY)? {
+                Some(bytes) => match serde_json::from_slice(&bytes) {
+                    Ok(meta) => meta,
+                    Err(e) => return Ok(Err(corrupt("meta", &e))),
+                },
+                None => return Ok(Ok(Vec::new())),
+            };
+            let mut removed = Vec::new();
+            let mut identity_changed = false;
+            for &name in SECTION_NAMES {
+                let key = section_key(name);
+                let Some(bytes) = txn.get(&self.keyspace, &key)? else {
+                    continue;
+                };
+                let stored: Value = match serde_json::from_slice(&bytes) {
+                    Ok(value) => value,
+                    Err(e) => return Ok(Err(corrupt(name, &e))),
+                };
+                if meta.server_name.is_none()
+                    && name == "server"
+                    && let Some(server_name) = stored.get("server_name").and_then(Value::as_str)
+                {
+                    meta.server_name = Some(server_name.to_owned());
+                    identity_changed = true;
+                }
+                let mut document = Value::Object(Map::from_iter([(name.to_owned(), stored)]));
+                let gone = strip_bootstrap(&mut document);
+                if gone.is_empty() {
+                    continue;
+                }
+                match document.get(name) {
+                    Some(section) => txn.put(&self.keyspace, &key, &to_bytes(section))?,
+                    None => txn.delete(&self.keyspace, &key)?,
+                }
+                meta.revision = meta.revision.saturating_add(1);
+                let record = ChangeRecord {
+                    revision: meta.revision,
+                    section: name.to_owned(),
+                    patch: null_patch(name, &gone),
+                    actor: Some(PURGE_ACTOR.to_owned()),
+                    at_ms: now_ms,
+                };
+                txn.put(
+                    &self.keyspace,
+                    &history_key(meta.revision),
+                    &to_bytes(&record),
+                )?;
+                removed.extend(gone);
+            }
+            if !removed.is_empty() {
+                meta.updated_at_ms = now_ms;
+                meta.updated_by = Some(PURGE_ACTOR.to_owned());
+            }
+            if !removed.is_empty() || identity_changed {
+                txn.put(&self.keyspace, META_KEY, &to_bytes(&meta))?;
+            }
+            Ok(Ok(removed))
+        })?
+    }
+
+    /// The record of an earlier one-time import of `key` of `kind`, if there was one.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] or [`StoreError::Kv`].
+    pub fn import_record(&self, kind: &str, key: &str) -> Result<Option<ImportRecord>, StoreError> {
+        let snapshot = self.backend.snapshot();
+        match snapshot.get(&self.keyspace, &import_key(kind, key))? {
+            Some(bytes) => Ok(Some(parse(key, &bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Records a one-time import, unless one is already recorded for the same kind and key.
+    /// Returns `true` when this call recorded it and `false` when an earlier record stands --
+    /// two replicas importing the same file at once agree on one record, the first.
+    ///
+    /// # Errors
+    /// [`StoreError::Kv`].
+    pub fn record_import(&self, record: &ImportRecord) -> Result<bool, StoreError> {
+        let key = import_key(&record.kind, &record.key);
+        Ok(hs_kv::transact(
+            &self.backend,
+            TransactConfig::default(),
+            |txn| {
+                if txn.get(&self.keyspace, &key)?.is_some() {
+                    return Ok(false);
+                }
+                txn.put(&self.keyspace, &key, &to_bytes(record))?;
+                Ok(true)
+            },
+        )?)
+    }
+
+    /// Every recorded import of `kind`, in key order.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] or [`StoreError::Kv`].
+    pub fn imports(&self, kind: &str) -> Result<Vec<ImportRecord>, StoreError> {
+        let snapshot = self.backend.snapshot();
+        let mut out = Vec::new();
+        for entry in snapshot.range(
+            &self.keyspace,
+            RangeSpec::prefix(format!("{IMPORT_PREFIX}{kind}/").into_bytes()),
+        ) {
+            let (key, value) = entry?;
+            out.push(parse(&String::from_utf8_lossy(&key), &value)?);
+        }
+        Ok(out)
     }
 
     /// The most recent changes, newest first, at most `limit` of them.
@@ -376,6 +595,36 @@ impl<B: KvBackend> ConfigStore<B> {
         }
         Ok(out)
     }
+}
+
+/// The merge patch that removes each of `pointers` from `section`: `{"mesh": null}` for
+/// `/cluster/mesh`. What [`ConfigStore::purge_bootstrap`] records, so its history entry reads the
+/// same as an operator's reset would.
+fn null_patch(section: &str, pointers: &[String]) -> Value {
+    let prefix = format!("/{section}");
+    let mut patch = Map::new();
+    for pointer in pointers {
+        let relative = pointer.strip_prefix(&prefix).unwrap_or("");
+        let tokens: Vec<&str> = relative.split('/').filter(|t| !t.is_empty()).collect();
+        let Some((last, parents)) = tokens.split_last() else {
+            continue;
+        };
+        let mut cursor = &mut patch;
+        for token in parents {
+            let next = cursor
+                .entry((*token).to_owned())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if !next.is_object() {
+                *next = Value::Object(Map::new());
+            }
+            let Value::Object(map) = next else {
+                unreachable!("forced to an object directly above");
+            };
+            cursor = map;
+        }
+        cursor.insert((*last).to_owned(), Value::Null);
+    }
+    Value::Object(patch)
 }
 
 fn check_section_name(section: &str) -> Result<(), StoreError> {
@@ -526,15 +775,15 @@ mod tests {
     fn seeding_happens_once_and_skips_the_bootstrap_section() {
         let store = store();
         let document = json!({
-            "server": {"server_name": "example.org"},
+            "server": {"server_name": "example.org", "admin_contact": "mailto:a@example.org"},
             "storage": {"backend": "embedded", "data_dir": "/var/lib/myelin"},
         });
         assert!(store.seed(&document, "homeserver.yaml", 10).unwrap());
 
         let stored = store.load().unwrap();
         assert_eq!(
-            stored.document.pointer("/server/server_name"),
-            Some(&json!("example.org"))
+            stored.document.pointer("/server/admin_contact"),
+            Some(&json!("mailto:a@example.org"))
         );
         assert_eq!(
             stored.document.get("storage"),
@@ -548,7 +797,7 @@ mod tests {
         store
             .patch_section(
                 "server",
-                &json!({"server_name": "changed.example"}),
+                &json!({"admin_contact": "mailto:b@example.org"}),
                 None,
                 20,
                 None,
@@ -560,8 +809,196 @@ mod tests {
                 .load()
                 .unwrap()
                 .document
-                .pointer("/server/server_name"),
-            Some(&json!("changed.example"))
+                .pointer("/server/admin_contact"),
+            Some(&json!("mailto:b@example.org"))
+        );
+    }
+
+    /// Decision 0010: nothing a process needs before it can read its database, and nothing that
+    /// belongs to one replica rather than to the server, is copied into the shared store.
+    #[test]
+    fn bootstrap_settings_are_not_seeded_and_the_server_name_becomes_the_identity() {
+        let store = store();
+        let document = json!({
+            "server": {
+                "server_name": "example.org",
+                "signing_key_path": "/data/keys",
+                "public_baseurl": "https://matrix.example.org",
+            },
+            "listeners": {"listeners": [{"port": 8008, "bind_addresses": ["::"], "resources": ["client"]}]},
+            "cluster": {
+                "single_node": false,
+                "lease_ttl": "20s",
+                "mesh": {"port": 9449, "advertise_address": "hs-0.hs-headless"},
+            },
+            "appservices": {"registration_files": ["/etc/hs/irc.yaml"], "enabled": true},
+            "auth": {"enable_registration": true},
+        });
+        assert!(store.seed(&document, "homeserver.yaml", 10).unwrap());
+        let stored = store.load().unwrap();
+        for pointer in [
+            "/storage",
+            "/listeners",
+            "/server/server_name",
+            "/server/signing_key_path",
+            "/cluster/single_node",
+            "/cluster/mesh",
+            "/appservices/registration_files",
+        ] {
+            assert_eq!(
+                stored.document.pointer(pointer),
+                None,
+                "{pointer} is bootstrap and must not be seeded"
+            );
+        }
+        assert_eq!(
+            stored.document,
+            json!({
+                "server": {"public_baseurl": "https://matrix.example.org"},
+                "cluster": {"lease_ttl": "20s"},
+                "appservices": {"enabled": true},
+                "auth": {"enable_registration": true},
+            }),
+            "every administered setting is seeded"
+        );
+        assert_eq!(stored.meta.server_name.as_deref(), Some("example.org"));
+    }
+
+    #[test]
+    fn a_patch_that_writes_a_bootstrap_setting_is_refused_and_writes_nothing() {
+        let store = store();
+        for (section, patch) in [
+            ("cluster", json!({"mesh": {"port": 9000}})),
+            ("cluster", json!({"single_node": false})),
+            ("server", json!({"server_name": "other.example"})),
+            ("server", json!({"signing_key_path": "/elsewhere"})),
+            ("appservices", json!({"registration_files": ["/x.yaml"]})),
+        ] {
+            let err = store
+                .patch_section(section, &patch, None, 1, None)
+                .unwrap_err();
+            assert!(
+                matches!(err, StoreError::BootstrapSetting { .. }),
+                "{section} {patch}: {err:?}"
+            );
+        }
+        let err = store
+            .patch_section("listeners", &json!({"listeners": []}), None, 1, None)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::BootstrapSection { .. }));
+        assert_eq!(
+            store.load().unwrap().meta.revision,
+            0,
+            "nothing was written"
+        );
+
+        // A sibling administered setting in the same section is still writable.
+        store
+            .patch_section("cluster", &json!({"lease_ttl": "30s"}), None, 2, None)
+            .unwrap();
+    }
+
+    /// A store written before decision 0010 holds the seeding replica's listeners and mesh port.
+    /// The purge removes them, keeps the server name as the identity, explains itself in the
+    /// history, and is a no-op the second time.
+    #[test]
+    fn a_legacy_store_is_purged_of_its_bootstrap_settings_once() {
+        let backend = MemoryBackend::new();
+        let store = ConfigStore::open(backend.clone()).unwrap();
+        // Write the legacy shape directly, as a pre-0010 seed did.
+        let keyspace = backend.keyspace(KEYSPACE).unwrap();
+        hs_kv::transact(&backend, TransactConfig::default(), |txn| {
+            txn.put(
+                &keyspace,
+                &section_key("server"),
+                &to_bytes(&json!({"server_name": "example.org", "admin_contact": "a@b"})),
+            )?;
+            txn.put(
+                &keyspace,
+                &section_key("listeners"),
+                &to_bytes(&json!({"listeners": [{"port": 18008}]})),
+            )?;
+            txn.put(
+                &keyspace,
+                &section_key("cluster"),
+                &to_bytes(&json!({"mesh": {"port": 18449}, "lease_ttl": "20s"})),
+            )?;
+            txn.put(
+                &keyspace,
+                META_KEY,
+                &to_bytes(&ConfigMeta {
+                    revision: 1,
+                    updated_at_ms: 1,
+                    updated_by: None,
+                    seeded_from: Some("replica-a.yaml".to_owned()),
+                    server_name: None,
+                }),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let mut removed = store.purge_bootstrap(50).unwrap();
+        removed.sort();
+        assert_eq!(
+            removed,
+            vec!["/cluster/mesh", "/listeners", "/server/server_name"]
+        );
+        let stored = store.load().unwrap();
+        assert_eq!(
+            stored.document,
+            json!({"server": {"admin_contact": "a@b"}, "cluster": {"lease_ttl": "20s"}})
+        );
+        assert_eq!(stored.meta.server_name.as_deref(), Some("example.org"));
+        assert_eq!(stored.meta.revision, 4, "one revision per section changed");
+        let history = store.history(10).unwrap();
+        assert_eq!(history.len(), 3);
+        assert!(
+            history
+                .iter()
+                .all(|h| h.actor.as_deref() == Some(PURGE_ACTOR))
+        );
+        let cluster = history.iter().find(|h| h.section == "cluster").unwrap();
+        assert_eq!(cluster.patch, json!({"mesh": null}));
+
+        assert!(store.purge_bootstrap(60).unwrap().is_empty());
+        assert_eq!(store.load().unwrap().meta.revision, 4);
+    }
+
+    #[test]
+    fn an_empty_store_has_nothing_to_purge() {
+        let store = store();
+        assert!(store.purge_bootstrap(1).unwrap().is_empty());
+        assert_eq!(store.load().unwrap().meta.revision, 0);
+    }
+
+    #[test]
+    fn an_import_is_recorded_once_and_the_first_record_stands() {
+        let store = store();
+        let kind = "appservice_registration";
+        assert_eq!(store.import_record(kind, "/etc/hs/irc.yaml").unwrap(), None);
+        let first = ImportRecord {
+            kind: kind.to_owned(),
+            key: "/etc/hs/irc.yaml".to_owned(),
+            outcome: "imported as irc".to_owned(),
+            at_ms: 1,
+        };
+        assert!(store.record_import(&first).unwrap());
+        let second = ImportRecord {
+            outcome: "something else".to_owned(),
+            at_ms: 2,
+            ..first.clone()
+        };
+        assert!(!store.record_import(&second).unwrap());
+        assert_eq!(
+            store.import_record(kind, "/etc/hs/irc.yaml").unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(store.imports(kind).unwrap(), vec![first]);
+        assert!(store.imports("other_kind").unwrap().is_empty());
+        assert!(
+            store.load().unwrap().is_empty(),
+            "an import record is not configuration"
         );
     }
 

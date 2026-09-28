@@ -1171,9 +1171,12 @@ pub struct ConfigSection {
     pub name: String,
     /// Whether this section can be swapped into a running server (`hs_config::reload`).
     pub reloadable: bool,
-    /// Whether this section is read before the database is open and so can never be stored in
-    /// it (`storage` today). The management interface renders these read-only; `config.update`
-    /// refuses them.
+    /// Whether this whole section is bootstrap (`hs_config::bootstrap`, decision 0010): read
+    /// before the database is open, or belonging to one process rather than to the server, and
+    /// so never stored in it (`storage`, `listeners`). The management interface renders these
+    /// read-only; `config.update` refuses them. Sections that hold only *some* bootstrap
+    /// settings (`server.server_name`, `cluster.mesh`) say so per setting instead
+    /// ([`ConfigSettingInfo::bootstrap`]).
     pub bootstrap: bool,
     /// The highest-precedence layer that sets anything in this section (`default`, `file`,
     /// `database` or `environment`) — what an operator sees at a glance in the section list.
@@ -1293,10 +1296,15 @@ pub struct ConfigSettingInfo {
     pub secret: bool,
     /// Whether changing it takes effect without a restart.
     pub reloadable: bool,
-    /// Whether `config.update` would accept a change to it. False for a bootstrap section and
+    /// Whether `config.update` would accept a change to it. False for a bootstrap setting and
     /// for anything an `HS__` environment variable pins, so the interface can show the field
     /// read-only with a reason instead of offering an edit that would be refused.
     pub editable: bool,
+    /// Whether it is a bootstrap setting (`hs_config::bootstrap`, decision 0010): set at install,
+    /// in the bootstrap file, the `HS__` environment or the Helm values, and never stored in the
+    /// database. The reason `editable` is false, when it is.
+    #[serde(default)]
+    pub bootstrap: bool,
 }
 
 #[cfg(test)]

@@ -9,7 +9,13 @@
 //! [`Layers::resolve`] merges the three into one document and deserializes it, and reports which
 //! layer each setting came from so the web interface can show an operator why a value is what it
 //! is, and refuse to offer an edit that the environment would override anyway.
+//!
+//! The database layer never supplies a bootstrap setting ([`crate::bootstrap`]): whatever it
+//! holds under one of those pointers -- only a store written before decision 0010 can -- is
+//! ignored when the layers are merged, so a replica's listeners and mesh identity always come
+//! from its own file and environment.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -102,21 +108,35 @@ impl Layers {
         self
     }
 
-    /// The layers in precedence order, lowest first.
-    fn ordered(&self) -> Vec<(Origin, &Value)> {
+    /// The layers in precedence order, lowest first, with the bootstrap settings taken out of the
+    /// database layer.
+    fn ordered(&self) -> Vec<(Origin, Cow<'_, Value>)> {
         let mut out = Vec::with_capacity(3);
         if let Some(file) = &self.file {
-            out.push((Origin::File, &file.document));
+            out.push((Origin::File, Cow::Borrowed(&file.document)));
         }
-        out.push((Origin::Database, &self.database));
-        out.push((Origin::Environment, &self.environment));
+        out.push((Origin::Database, self.administered_database()));
+        out.push((Origin::Environment, Cow::Borrowed(&self.environment)));
         out
+    }
+
+    /// The database layer without any bootstrap setting in it, borrowed when there was none.
+    fn administered_database(&self) -> Cow<'_, Value> {
+        let holds_bootstrap = crate::bootstrap::BOOTSTRAP_SETTINGS
+            .iter()
+            .any(|setting| self.database.pointer(setting.pointer).is_some());
+        if holds_bootstrap {
+            Cow::Owned(crate::bootstrap::without_bootstrap(&self.database))
+        } else {
+            Cow::Borrowed(&self.database)
+        }
     }
 
     /// Merges every layer into one document, without deserializing or validating it.
     #[must_use]
     pub fn merged(&self) -> Value {
-        document::merge_all(self.ordered().into_iter().map(|(_, doc)| doc))
+        let ordered = self.ordered();
+        document::merge_all(ordered.iter().map(|(_, doc)| doc.as_ref()))
     }
 
     /// Merges, deserializes, resolves file-backed secrets and validates.
@@ -128,10 +148,11 @@ impl Layers {
     pub fn resolve(&self) -> Result<Resolved, ConfigError> {
         let document = self.merged();
         let config = Config::from_json(&document)?;
+        let ordered = self.ordered();
         Ok(Resolved {
             config,
             document,
-            origins: document::origins(self.ordered()),
+            origins: document::origins(ordered.iter().map(|(origin, doc)| (*origin, doc.as_ref()))),
         })
     }
 
@@ -184,6 +205,14 @@ impl Layers {
     #[must_use]
     pub fn is_bootstrap_section(section: &str) -> bool {
         store::is_bootstrap_section(section)
+    }
+
+    /// The bootstrap settings a patch against `section` would write, as whole-configuration JSON
+    /// Pointers ([`crate::bootstrap::bootstrap_pointers_in_patch`]). The admin API refuses such a
+    /// patch: the database would store it and every replica would ignore it.
+    #[must_use]
+    pub fn bootstrap_in_patch(section: &str, patch: &Value) -> Vec<String> {
+        crate::bootstrap::bootstrap_pointers_in_patch(section, patch)
     }
 }
 
@@ -256,22 +285,40 @@ mod tests {
     fn a_patch_is_validated_against_the_configuration_it_would_produce() {
         let layers = layers();
         let err = layers
-            .resolve_with_patch("server", &json!({"server_name": ""}))
+            .resolve_with_patch("server", &json!({"public_baseurl": "ftp://nope"}))
             .unwrap_err();
         assert!(matches!(err, ConfigError::Validation(_)));
         // ... and the real configuration was not touched by the attempt.
-        assert_eq!(
-            layers.resolve().unwrap().config.server.server_name,
-            "example.org"
-        );
+        assert_eq!(layers.resolve().unwrap().config.server.public_baseurl, None);
     }
 
     #[test]
     fn a_patch_that_resolves_cleanly_produces_the_new_value() {
         let resolved = layers()
+            .resolve_with_patch(
+                "server",
+                &json!({"public_baseurl": "https://matrix.example.org"}),
+            )
+            .unwrap();
+        assert_eq!(
+            resolved.config.server.public_baseurl.as_deref(),
+            Some("https://matrix.example.org")
+        );
+    }
+
+    /// A patch to a bootstrap setting cannot take effect through the database, so a candidate
+    /// that includes one resolves exactly as if it did not.
+    #[test]
+    fn a_patch_to_a_bootstrap_setting_does_not_change_the_resolved_value() {
+        let layers = layers();
+        assert_eq!(
+            Layers::bootstrap_in_patch("server", &json!({"server_name": "new.example"})),
+            vec!["/server/server_name".to_owned()]
+        );
+        let resolved = layers
             .resolve_with_patch("server", &json!({"server_name": "new.example"}))
             .unwrap();
-        assert_eq!(resolved.config.server.server_name, "new.example");
+        assert_eq!(resolved.config.server.server_name, "example.org");
     }
 
     /// The `Default` impl exists because a derived one is a trap: `Value::Null` as a layer is an
@@ -334,12 +381,104 @@ mod tests {
         assert_eq!(resolved.origin("/auth/enable_registration"), Origin::File);
     }
 
+    /// A database written before decision 0010 may still hold a replica's listeners and mesh port.
+    /// They are ignored: the file (or the schema default) says what this process binds.
+    #[test]
+    fn the_database_never_supplies_a_bootstrap_setting() {
+        let layers = Layers {
+            file: Some(FileLayer {
+                path: PathBuf::from("/etc/myelin/homeserver.yaml"),
+                document: json!({
+                    "server": {"server_name": "example.org"},
+                    "cluster": {"mesh": {"port": 9449}},
+                }),
+            }),
+            database: json!({
+                "server": {"server_name": "stale.example", "admin_contact": "a@b"},
+                "listeners": {"listeners": [{"port": 18008, "bind_addresses": ["::"], "resources": ["client"]}]},
+                "cluster": {"mesh": {"port": 18449}, "lease_ttl": "20s"},
+            }),
+            environment: json!({}),
+        };
+        let resolved = layers.resolve().unwrap();
+        assert_eq!(resolved.config.server.server_name, "example.org");
+        assert_eq!(resolved.config.cluster.mesh.port, 9449);
+        assert_eq!(
+            resolved.config.listeners,
+            crate::ListenersConfig::default(),
+            "the stored listeners are ignored; nothing else sets them, so the default stands"
+        );
+        assert_eq!(resolved.origin("/cluster/mesh/port"), Origin::File);
+        assert_eq!(resolved.origin("/server/server_name"), Origin::File);
+        // Administered settings in the same sections still come from the database.
+        assert_eq!(resolved.origin("/server/admin_contact"), Origin::Database);
+        assert_eq!(resolved.origin("/cluster/lease_ttl"), Origin::Database);
+    }
+
+    /// The bug decision 0010 fixes, end to end through the store: two replicas boot on one
+    /// database, each with its own file. Whichever seeds first, and in whichever order they
+    /// restart, each resolves its own listeners and mesh port, never the other's.
+    #[test]
+    fn two_replicas_seeding_one_database_keep_their_own_listeners_and_mesh_port() {
+        let backend = hs_kv::memory::MemoryBackend::new();
+        let store = crate::store::ConfigStore::open(backend).unwrap();
+        let replica = |client_port: u16, mesh_port: u16, name: &str| FileLayer {
+            path: PathBuf::from(format!("/etc/myelin/{name}.yaml")),
+            document: json!({
+                "server": {"server_name": "example.org"},
+                "listeners": {"listeners": [{
+                    "port": client_port,
+                    "bind_addresses": ["127.0.0.1"],
+                    "resources": ["client", "federation", "health"],
+                }]},
+                "cluster": {
+                    "single_node": false,
+                    "mesh": {"port": mesh_port, "advertise_address": format!("{name}.local")},
+                },
+                "auth": {"enable_registration": true},
+            }),
+        };
+        let a = replica(18008, 18449, "replica-a");
+        let b = replica(28008, 28449, "replica-b");
+
+        assert!(store.seed(&a.document, "replica-a.yaml", 1).unwrap());
+        assert!(
+            !store.seed(&b.document, "replica-b.yaml", 2).unwrap(),
+            "the second replica finds the store already seeded"
+        );
+
+        for (file, client_port, mesh_port, advertised) in [
+            (b.clone(), 28008, 28449, "replica-b.local"),
+            (a.clone(), 18008, 18449, "replica-a.local"),
+            (b, 28008, 28449, "replica-b.local"),
+        ] {
+            let resolved = Layers {
+                file: Some(file),
+                ..Layers::default()
+            }
+            .with_database(store.load().unwrap().document)
+            .resolve()
+            .unwrap();
+            assert_eq!(resolved.config.listeners.listeners[0].port, client_port);
+            assert_eq!(resolved.config.cluster.mesh.port, mesh_port);
+            assert_eq!(
+                resolved.config.cluster.mesh.advertise_address.as_deref(),
+                Some(advertised)
+            );
+            assert!(!resolved.config.cluster.single_node);
+            assert!(
+                resolved.config.auth.enable_registration,
+                "the administered settings are shared"
+            );
+        }
+    }
+
     #[test]
     fn with_no_layers_at_all_the_schema_defaults_stand() {
         let layers = Layers {
             file: None,
-            database: json!({"server": {"server_name": "example.org"}}),
-            environment: json!({}),
+            database: json!({}),
+            environment: json!({"server": {"server_name": "example.org"}}),
         };
         let resolved = layers.resolve().unwrap();
         assert_eq!(resolved.config, {

@@ -43,3 +43,15 @@ operation.
 - The per-replica settings found by track 05 (a replica's `listeners` and `cluster.mesh.port`
   seeded into the shared database) belong to the bootstrap exception and are excluded from
   seeding, rather than made editable per replica in the interface.
+- **The bootstrap set, as built (track 13, 2026-09-27; `crates/hs-config/src/bootstrap.rs`).**
+  `storage`, `listeners`, `server.server_name`, `server.signing_key_path`,
+  `cluster.single_node`, `cluster.mesh` (port, advertise address, TLS paths, shared secret) and
+  `appservices.registration_files`. These come only from the bootstrap file, `HS__` variables and
+  the command line (Helm values in Kubernetes): never seeded into the shared database, refused by
+  `config.update` and `hs config set`, ignored if a pre-0010 store holds them, and purged from
+  such a store at boot. The server name is additionally recorded once as the database's
+  identity, so a second start with only a data directory still knows it. Everything else is
+  administered. `media.scanning` and `server.unstable_features`, which were only settable
+  through files named on the command line, are now administered settings (the flags remain,
+  deprecated). Registration files are imported once into the appservice registry, recorded and
+  audited as `appservices.import`, and never read again.
