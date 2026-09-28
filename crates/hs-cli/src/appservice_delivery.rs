@@ -289,6 +289,14 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
                         gate.stop_workers_not_mine();
                         continue;
                     }
+                    // Said as loudly as the acquisition, so the logs of two replicas never read
+                    // as if both ran delivery (the first two-pod run's did, 2026-09-28).
+                    Ok(OwnershipEvent::Released(shard) | OwnershipEvent::Lost { shard, .. })
+                        if shard == ShardId::GLOBAL =>
+                    {
+                        tracing::info!("this replica no longer runs appservice event delivery");
+                        continue;
+                    }
                     Ok(_) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         gate.nudge_everything_mine();

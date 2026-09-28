@@ -1367,6 +1367,13 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // (`crate::appservice_delivery`'s module docs). Inert in single-node mode
     // (`config.cluster.single_node`, the default).
     let cluster_handles = crate::cluster::start(&config, backend.clone()).await?;
+    // Clustered, the `hs_cluster_*` series (owned shards, ownership changes, forward latency and
+    // retries, fencing, live replicas, lease age) are read from the manager's counters on every
+    // scrape.
+    if let Some(cluster_metrics) = &cluster_handles.metrics {
+        let collector = hs_cluster::metrics::ClusterCollector::new(cluster_metrics.clone());
+        metrics.with_registry(|registry| registry.register_collector(Box::new(collector)));
+    }
     // `/sync` across replicas (`hs_user::cluster`): room owners wake this replica's long-polls
     // over the mesh, this replica reads rooms it does not own through a store-checked mirror,
     // and a `/sync` here waits for the peers' positions before it reads. Nothing in single-node

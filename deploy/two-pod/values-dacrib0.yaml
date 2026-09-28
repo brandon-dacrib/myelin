@@ -1,0 +1,95 @@
+# Values for the two-pod run on the owner's verification cluster (`admin@dacrib0`, namespace
+# `myelin-cluster`), the one `verify.py` and `failover.py` run against. The Secrets it names
+# already exist in the namespace (docs/status/03-cluster.md, "Where this stopped"); the
+# database is the CloudNativePG `Database` `dacrib/myelin-cluster` on the shared
+# `postgres-cluster`, reached as `appuser` with the password in `postgres-credentials`.
+#
+#   helm upgrade --install hs deploy/helm/hs -n myelin-cluster \
+#     -f deploy/two-pod/values-dacrib0.yaml --set image.tag=sha-<commit> --wait --timeout 10m
+#
+# No Ingress: clients reach each pod through `kubectl port-forward`, which is what the scripts
+# want (one port per pod, so the test controls which replica a request lands on).
+
+mode: cluster
+replicaCount: 2
+
+serverName: myelin-cluster.dacrib.net
+publicBaseUrl: http://127.0.0.1:18008
+
+image:
+  tag: ""
+
+storage:
+  backend: postgres
+  postgres:
+    host: postgres-cluster-rw.dacrib.svc.cluster.local
+    port: 5432
+    database: myelin_cluster
+    user: appuser
+    ## Ignored: the server connects without TLS (values.yaml says why).
+    sslMode: disable
+    password:
+      secret: postgres-credentials
+      secretKey: password
+
+## SeaweedFS in the namespace (`s3` Deployment and Service), bucket made by the
+## `s3-make-bucket` Job.
+media:
+  storage:
+    backend: s3
+    s3:
+      bucket: hs-media
+      region: us-east-1
+      endpoint: http://s3:9000
+      accessKeyId: hsmedia
+      existingSecret: hs-media-s3
+      secretAccessKeyKey: secret-access-key
+
+secrets:
+  signingKey:
+    existingSecret: hs-signing-key
+  registrationSharedSecret:
+    existingSecret: hs-registration
+
+cluster:
+  roomShards: 256
+  userShards: 256
+  heartbeatInterval: 2s
+  leaseTtl: 10s
+  clusterDomain: cluster.local
+  mesh:
+    port: 8449
+    ## CN and SAN `*.hs-headless.myelin-cluster.svc.cluster.local`, so the release is `hs`.
+    tls:
+      existingSecret: hs-mesh-tls
+  terminationGracePeriodSeconds: 40
+
+affinity:
+  podAntiAffinity:
+    enabled: true
+    style: soft
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+networkPolicy:
+  enabled: true
+
+ingress:
+  enabled: false
+
+bridges:
+  enabled: false
+
+telemetry:
+  logging:
+    format: text
+    level: info
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    memory: 1Gi

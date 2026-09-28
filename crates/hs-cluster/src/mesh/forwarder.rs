@@ -30,6 +30,11 @@ use crate::metrics::ClusterMetrics;
 use crate::ownership::Ownership;
 use crate::types::ReplicaId;
 
+/// The longest wait between two forward attempts. A shard handoff completes within a few
+/// heartbeats; polling the new owner four times a second keeps the added latency after it
+/// settles small without flooding a peer that is still starting.
+pub const MAX_BACKOFF: Duration = Duration::from_millis(250);
+
 /// Sends forwarded requests to shard owners, with the retry and ownership-refresh policy of RFC
 /// 0001 section 8.
 pub struct Forwarder {
@@ -79,8 +84,16 @@ impl Forwarder {
     }
 
     /// Forwards `env` to `env.shard`'s owner, retrying on connection failure, `421` (with
-    /// ownership refresh) and `503` (bounded backoff), up to `max_attempts` within `env.deadline`.
-    /// Application errors (any other status) are returned as-is, never retried.
+    /// ownership refresh) and `503` (the peer's `Retry-After`, else backoff), up to
+    /// `max_attempts` within `env.deadline`. Application errors (any other status) are returned
+    /// as-is, never retried.
+    ///
+    /// The backoff doubles from `base_backoff` up to [`MAX_BACKOFF`], so the default settings
+    /// (40 attempts from 10 ms, 10 s deadline) keep retrying for about nine seconds: long
+    /// enough to ride out a shard handoff, which is what a `421` or a refused connection
+    /// almost always is. Measured on two pods on a real cluster (2026-09-28): a graceful
+    /// drain left a 0.4 s window and a replica rejoining a 1.6 s one in which the believed
+    /// owner answered `421`; four attempts 10 ms apart turned both into client-visible `503`s.
     ///
     /// # Errors
     /// Returns [`ForwardError`] if no owner is known, the hop limit or deadline is exceeded, or
@@ -113,7 +126,8 @@ impl Forwarder {
                     // mesh announcements; the hint in the reply is informational only (the next
                     // `owner_of` call will already reflect a fresher view in the common case).
                     let _ = hdrs.get(headers::OWNER_HINT);
-                    if attempts >= self.max_attempts {
+                    let wait = self.backoff(attempts);
+                    if self.out_of_retries(attempts, wait, deadline_at) {
                         self.metrics.record_forward(
                             "forward",
                             "misdirected",
@@ -124,11 +138,18 @@ impl Forwarder {
                             payload: body,
                         });
                     }
-                    tokio::time::sleep(self.base_backoff).await;
+                    tracing::debug!(shard = %env.shard, %owner, attempt = attempts, "mesh forward misdirected (421), waiting for ownership to settle");
+                    tokio::time::sleep(wait).await;
                 }
                 Ok((status, hdrs, body)) if status == 503 => {
                     self.metrics.record_forward_retry("503");
-                    if attempts >= self.max_attempts {
+                    let wait = hdrs
+                        .get(headers::RETRY_AFTER_MS)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .map(Duration::from_millis)
+                        .unwrap_or_else(|| self.backoff(attempts));
+                    if self.out_of_retries(attempts, wait, deadline_at) {
                         self.metrics.record_forward(
                             "forward",
                             "unavailable",
@@ -139,16 +160,8 @@ impl Forwarder {
                             payload: body,
                         });
                     }
-                    let retry_after = hdrs
-                        .get(headers::RETRY_AFTER_MS)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .map(Duration::from_millis)
-                        .unwrap_or(self.base_backoff);
-                    tokio::time::sleep(
-                        retry_after.min(deadline_at.saturating_duration_since(Instant::now())),
-                    )
-                    .await;
+                    tracing::debug!(shard = %env.shard, %owner, attempt = attempts, "mesh forward unavailable (503), retrying");
+                    tokio::time::sleep(wait).await;
                 }
                 Ok((status, _hdrs, body)) => {
                     self.metrics
@@ -161,7 +174,8 @@ impl Forwarder {
                 Err(e) => {
                     self.metrics.record_forward_retry("connect");
                     tracing::debug!(shard = %env.shard, attempt = attempts, error = %e, "mesh forward attempt failed");
-                    if attempts >= self.max_attempts {
+                    let wait = self.backoff(attempts);
+                    if self.out_of_retries(attempts, wait, deadline_at) {
                         self.metrics
                             .record_forward("forward", "error", attempt_start.elapsed());
                         return Err(ForwardError::RetriesExhausted {
@@ -169,10 +183,30 @@ impl Forwarder {
                             attempts,
                         });
                     }
-                    tokio::time::sleep(self.base_backoff).await;
+                    tokio::time::sleep(wait).await;
                 }
             }
         }
+    }
+
+    /// Whether to stop after `attempts` attempts rather than wait `wait` and try again: the
+    /// attempt budget is spent, or the next attempt could not start before the deadline. The
+    /// caller then passes back the last refusal as it is, which says more than a bare
+    /// "deadline exceeded" would.
+    fn out_of_retries(&self, attempts: u32, wait: Duration, deadline_at: Instant) -> bool {
+        attempts >= self.max_attempts || Instant::now() + wait >= deadline_at
+    }
+
+    /// The wait before retry number `attempt + 1`: `base_backoff` doubled per attempt already
+    /// made, capped at [`MAX_BACKOFF`].
+    fn backoff(&self, attempt: u32) -> Duration {
+        let factor = 1u32
+            .checked_shl(attempt.saturating_sub(1))
+            .unwrap_or(u32::MAX);
+        self.base_backoff
+            .checked_mul(factor)
+            .unwrap_or(MAX_BACKOFF)
+            .min(MAX_BACKOFF)
     }
 
     /// Sends one replica-to-replica message (`POST /mesh/v1/peer`, see

@@ -1,10 +1,12 @@
 //! Cluster metrics: ownership churn, forward latency and lease age
 //! (`docs/rfcs/0001-cluster-ownership.md` section 15).
 //!
-//! Track 12 has not published `hs-telemetry`'s registry yet, so this module keeps counters in a
-//! plain `ClusterMetrics` snapshot (atomics plus a small histogram) that any exporter can read;
-//! once 12 lands, an `hs-telemetry` adapter reads these same fields and registers them as
-//! `hs_cluster_*` series under the names in the RFC.
+//! The counters live in a plain [`ClusterMetrics`] (atomics plus a small histogram) that the
+//! ownership manager and the forwarder write to; [`ClusterCollector`] reads them at scrape time
+//! and renders them as the `hs_cluster_*` series of the RFC, registered on the server's shared
+//! Prometheus registry by `hs-cli` (`registry.register_collector`). Until 2026-09-28 nothing
+//! registered them, so a clustered replica's `/metrics` had no `hs_cluster_*` series at all;
+//! found on the first two-pod run on a real cluster.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -38,7 +40,8 @@ impl ChurnReason {
 /// A fixed set of latency buckets (milliseconds) for forward-latency and lease-age observations.
 /// Coarse on purpose: this is a lightweight stand-in for a real histogram type until 12's
 /// telemetry registry lands.
-const BUCKETS_MS: [u64; 10] = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000];
+/// The top buckets cover a forward that waited out a shard handoff (seconds, not milliseconds).
+const BUCKETS_MS: [u64; 13] = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
 
 #[derive(Default)]
 struct Histogram {
@@ -57,6 +60,18 @@ impl Histogram {
         self.counts[bucket].fetch_add(1, Ordering::Relaxed);
         self.sum_ms.fetch_add(ms, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Per-bucket counts in seconds for a Prometheus histogram, the last bucket `f64::MAX`
+    /// (which the text encoder writes as `+Inf`, as for its own histograms); the
+    /// text encoder accumulates them.
+    fn prometheus_buckets(&self) -> Vec<(f64, u64)> {
+        BUCKETS_MS
+            .iter()
+            .map(|ms| *ms as f64 / 1000.0)
+            .chain(std::iter::once(f64::MAX))
+            .zip(self.counts.iter().map(|c| c.load(Ordering::Relaxed)))
+            .collect()
     }
 
     fn snapshot(&self) -> HistogramSnapshot {
@@ -225,9 +240,217 @@ pub struct MetricsSnapshot {
     pub lease_age: Duration,
 }
 
+/// Renders a replica's [`ClusterMetrics`] as Prometheus series on every scrape. Register it with
+/// `registry.register_collector(Box::new(ClusterCollector::new(metrics)))`.
+///
+/// Series (RFC 0001 section 15): `hs_cluster_owned_shards{kind}`,
+/// `hs_cluster_ownership_changes_total{kind,reason}`, `hs_cluster_forward_latency_seconds{route,
+/// outcome}` (histogram), `hs_cluster_forward_retries_total{reason}`,
+/// `hs_cluster_fenced_total{kind}`, `hs_cluster_live_replicas` and
+/// `hs_cluster_lease_age_seconds`.
+#[derive(Clone)]
+pub struct ClusterCollector {
+    metrics: std::sync::Arc<ClusterMetrics>,
+}
+
+impl ClusterCollector {
+    /// A collector reading `metrics`.
+    #[must_use]
+    pub fn new(metrics: std::sync::Arc<ClusterMetrics>) -> Self {
+        Self { metrics }
+    }
+}
+
+impl std::fmt::Debug for ClusterCollector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClusterCollector").finish_non_exhaustive()
+    }
+}
+
+/// Sorted copies of a map's entries, so every scrape lists series in the same order.
+fn sorted<K: Clone + Ord, V: Clone>(map: &Mutex<HashMap<K, V>>) -> Vec<(K, V)> {
+    let mut entries: Vec<(K, V)> = map
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+}
+
+/// Encodes one counter sample under `labels`.
+fn counter_sample(
+    family: &mut prometheus_client::encoding::MetricEncoder<'_>,
+    labels: &[(&str, &str)],
+    value: u64,
+) -> Result<(), std::fmt::Error> {
+    family
+        .encode_family(&labels)?
+        .encode_counter::<prometheus_client::encoding::NoLabelSet, _, u64>(&value, None)
+}
+
+impl prometheus_client::collector::Collector for ClusterCollector {
+    fn encode(
+        &self,
+        mut encoder: prometheus_client::encoding::DescriptorEncoder,
+    ) -> Result<(), std::fmt::Error> {
+        use prometheus_client::metrics::MetricType;
+        let m = &self.metrics;
+
+        let mut family = encoder.encode_descriptor(
+            "hs_cluster_owned_shards",
+            "Shards this replica owns, by shard kind",
+            None,
+            MetricType::Gauge,
+        )?;
+        for (kind, n) in sorted(&m.owned_shards) {
+            family.encode_family(&[("kind", kind)])?.encode_gauge(&n)?;
+        }
+
+        let mut family = encoder.encode_descriptor(
+            "hs_cluster_ownership_changes",
+            "Shard ownership changes on this replica, by shard kind and reason",
+            None,
+            MetricType::Counter,
+        )?;
+        let mut changes: Vec<((&'static str, &'static str), u64)> = m
+            .ownership_changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|((kind, reason), n)| ((*kind, reason.as_str()), *n))
+            .collect();
+        changes.sort();
+        for ((kind, reason), n) in changes {
+            counter_sample(&mut family, &[("kind", kind), ("reason", reason)], n)?;
+        }
+
+        let mut family = encoder.encode_descriptor(
+            "hs_cluster_forward_latency_seconds",
+            "Latency of requests forwarded over the mesh, retries included, by route and outcome",
+            None,
+            MetricType::Histogram,
+        )?;
+        {
+            let latency = m
+                .forward_latency
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut keys: Vec<&(String, &'static str)> = latency.keys().collect();
+            keys.sort();
+            for key in keys {
+                let Some(histogram) = latency.get(key) else {
+                    continue;
+                };
+                let snap = histogram.snapshot();
+                family
+                    .encode_family(&[("route", key.0.as_str()), ("outcome", key.1)])?
+                    .encode_histogram::<prometheus_client::encoding::NoLabelSet>(
+                        snap.sum_ms as f64 / 1000.0,
+                        snap.count,
+                        &histogram.prometheus_buckets(),
+                        None,
+                    )?;
+            }
+        }
+
+        let mut family = encoder.encode_descriptor(
+            "hs_cluster_forward_retries",
+            "Forward attempts retried, by reason (connect, 421, 503)",
+            None,
+            MetricType::Counter,
+        )?;
+        for (reason, n) in sorted(&m.forward_retries) {
+            counter_sample(&mut family, &[("reason", reason)], n)?;
+        }
+
+        let mut family = encoder.encode_descriptor(
+            "hs_cluster_fenced",
+            "Writes refused because this replica had lost the shard's fence, by shard kind",
+            None,
+            MetricType::Counter,
+        )?;
+        for (kind, n) in sorted(&m.fenced_total) {
+            counter_sample(&mut family, &[("kind", kind)], n)?;
+        }
+
+        let live = i64::try_from(m.live_replicas.load(Ordering::Relaxed)).unwrap_or(i64::MAX);
+        encoder
+            .encode_descriptor(
+                "hs_cluster_live_replicas",
+                "Replicas this replica currently judges live, itself included",
+                None,
+                MetricType::Gauge,
+            )?
+            .encode_gauge(&live)?;
+
+        let age = m
+            .lease_age
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_secs_f64();
+        encoder
+            .encode_descriptor(
+                "hs_cluster_lease_age_seconds",
+                "Time since this replica's last successful heartbeat",
+                None,
+                MetricType::Gauge,
+            )?
+            .encode_gauge(&age)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_collector_renders_every_series_under_its_rfc_name() {
+        let m = std::sync::Arc::new(ClusterMetrics::new());
+        m.record_ownership_change("room", ChurnReason::Acquire);
+        m.record_ownership_change("room", ChurnReason::Acquire);
+        m.record_ownership_change("room", ChurnReason::Release);
+        m.record_forward("forward", "ok", Duration::from_millis(3));
+        m.record_forward("forward", "ok", Duration::from_millis(1_800));
+        m.record_forward_retry("421");
+        m.record_fenced("room");
+        m.set_live_replicas(2);
+        m.set_lease_age(Duration::from_millis(1_500));
+
+        let mut registry = prometheus_client::registry::Registry::default();
+        registry.register_collector(Box::new(ClusterCollector::new(m)));
+        let mut text = String::new();
+        prometheus_client::encoding::text::encode(&mut text, &registry).expect("encode");
+
+        for line in [
+            "hs_cluster_owned_shards{kind=\"room\"} 1",
+            "hs_cluster_ownership_changes_total{kind=\"room\",reason=\"acquire\"} 2",
+            "hs_cluster_ownership_changes_total{kind=\"room\",reason=\"release\"} 1",
+            "hs_cluster_forward_latency_seconds_count{route=\"forward\",outcome=\"ok\"} 2",
+            "hs_cluster_forward_latency_seconds_sum{route=\"forward\",outcome=\"ok\"} 1.803",
+            "hs_cluster_forward_retries_total{reason=\"421\"} 1",
+            "hs_cluster_fenced_total{kind=\"room\"} 1",
+            "hs_cluster_live_replicas 2",
+            "hs_cluster_lease_age_seconds 1.5",
+        ] {
+            assert!(text.contains(line), "missing `{line}` in:\n{text}");
+        }
+        // Cumulative buckets: the 3 ms forward is under 5 ms, both are under 2.5 s.
+        let bucket = |le: &str| {
+            text.lines()
+                .find(|l| {
+                    l.starts_with("hs_cluster_forward_latency_seconds_bucket")
+                        && l.contains(&format!("le=\"{le}\""))
+                })
+                .map(|l| l.rsplit(' ').next().unwrap_or_default().to_owned())
+        };
+        assert_eq!(bucket("0.005").as_deref(), Some("1"), "{text}");
+        assert_eq!(bucket("2.5").as_deref(), Some("2"), "{text}");
+        assert_eq!(bucket("+Inf").as_deref(), Some("2"), "{text}");
+        assert!(!text.contains("_total_total"), "{text}");
+    }
 
     #[test]
     fn ownership_changes_update_owned_gauge() {

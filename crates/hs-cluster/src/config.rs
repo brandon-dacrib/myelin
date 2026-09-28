@@ -79,9 +79,13 @@ pub struct MeshConfig {
     pub max_fan_out: usize,
     /// Forwards are dropped rather than looped past this many hops.
     pub max_hops: u32,
-    /// Maximum retry attempts at the forwarding edge, within the request's deadline.
+    /// Maximum retry attempts at the forwarding edge, within the request's deadline. The
+    /// default (40, with the doubling backoff capped at 250 ms) keeps retrying for about nine
+    /// seconds, so a request that lands mid-handoff waits for the new owner instead of failing
+    /// (see `Forwarder::forward`).
     pub max_attempts: u32,
-    /// Base backoff between forward retries.
+    /// Base backoff between forward retries; doubles per attempt up to
+    /// [`crate::mesh::forwarder::MAX_BACKOFF`].
     pub retry_base_backoff: Duration,
     /// Default per-request deadline when the caller does not set one explicitly.
     pub default_deadline: Duration,
@@ -99,7 +103,7 @@ impl Default for MeshConfig {
             max_in_flight_per_peer: 1024,
             max_fan_out: 64,
             max_hops: 3,
-            max_attempts: 4,
+            max_attempts: 40,
             retry_base_backoff: Duration::from_millis(10),
             default_deadline: Duration::from_secs(10),
             idempotency_ttl: Duration::from_secs(60),

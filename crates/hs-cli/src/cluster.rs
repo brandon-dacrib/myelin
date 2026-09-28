@@ -101,6 +101,10 @@ pub struct ClusterHandles {
     /// single-node mode, where [`RoomShardGate`] must never need it (`is_mine` never returns
     /// `false`).
     pub forwarder: Option<Arc<Forwarder>>,
+    /// The ownership manager's and forwarder's counters, for `/metrics`
+    /// ([`hs_cluster::metrics::ClusterCollector`]). `None` in single-node mode, which has no
+    /// cluster to report on.
+    pub metrics: Option<Arc<hs_cluster::metrics::ClusterMetrics>>,
     origin: ReplicaId,
     origin_generation: Generation,
     default_deadline: Duration,
@@ -330,13 +334,14 @@ pub async fn start<B: KvBackend + 'static>(
         max_attempts,
         retry_base_backoff,
         ownership.clone(),
-        metrics,
+        metrics.clone(),
     )?);
 
     Ok(ClusterHandles {
         cluster,
         layout,
         forwarder: Some(forwarder),
+        metrics: Some(metrics),
         origin: me,
         origin_generation: Generation::fresh(None),
         default_deadline,
@@ -364,6 +369,7 @@ impl ClusterHandles {
             cluster: Cluster::single_node(me.clone()),
             layout,
             forwarder: None,
+            metrics: None,
             origin: me,
             origin_generation: Generation::fresh(None),
             default_deadline: Duration::from_secs(10),
@@ -779,7 +785,7 @@ impl RoomShardGate {
         };
         let shard = self.layout.room_shard(&room_id);
         if self.ownership.is_mine(shard) {
-            return next.run(req).await;
+            return self.run_owned(shard, req, next).await;
         }
         match &self.forwarder {
             Some(forwarder) => match self.forward(forwarder, shard, req).await {
@@ -787,6 +793,58 @@ impl RoomShardGate {
                 Err(reason) => self.refuse(shard, &reason),
             },
             None => self.refuse(shard, "no mesh forwarder is configured on this replica"),
+        }
+    }
+
+    /// Handles a room request whose shard this replica owned when it arrived. If the shard moves
+    /// away while the request runs, `hs-room`'s fence refuses the write with a `503` and nothing
+    /// is persisted; this then sends the same request on to the new owner instead of handing
+    /// the client that `503`. Seen on two pods on a real cluster (2026-09-28): a replica coming
+    /// back takes its shards from the survivor, and a send already past the gate on the survivor
+    /// was fenced.
+    ///
+    /// Only at the edge: a request that came in over the mesh returns its `503` to the replica
+    /// that forwarded it, whose forwarder retries against the current owner. In single-node mode
+    /// the request passes straight through (no forwarder, and no buffering).
+    async fn run_owned(&self, shard: ShardId, req: Request, next: Next) -> Response {
+        let Some(forwarder) = &self.forwarder else {
+            return next.run(req).await;
+        };
+        if req.extensions().get::<ViaMesh>().is_some() {
+            return next.run(req).await;
+        }
+        let (parts, body) = req.into_parts();
+        let body = match to_bytes(body, MAX_PROXIED_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(error) => {
+                return hs_http::error::MatrixError::custom(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    hs_http::error::MatrixErrorCode::TooLarge,
+                    format!("reading the request body: {error}"),
+                )
+                .into_response();
+            }
+        };
+        let response = next
+            .run(Request::from_parts(parts.clone(), Body::from(body.clone())))
+            .await;
+        if response.status() != StatusCode::SERVICE_UNAVAILABLE || self.ownership.is_mine(shard) {
+            return response;
+        }
+        tracing::info!(
+            %shard,
+            "the room's shard moved while a request for it ran here; sending it on to the new owner"
+        );
+        match self
+            .forward(
+                forwarder,
+                shard,
+                Request::from_parts(parts, Body::from(body)),
+            )
+            .await
+        {
+            Ok(forwarded) => forwarded,
+            Err(reason) => self.refuse(shard, &reason),
         }
     }
 
@@ -978,7 +1036,16 @@ impl RoomShardGate {
         // unrelated reasons; this workspace's client-server API does not use either today, so
         // the collision is only a latent risk, documented in `docs/status/03-cluster.md`.
         let proxied_response: ProxiedResponseBody = serde_json::from_slice(&reply.payload)
-            .map_err(|e| format!("decoding the forwarded response: {e}"))?;
+            .map_err(|e| match reply.status {
+                // The forwarder's own give-up: the believed owner still refused after every
+                // retry the deadline allowed, so the payload is that refusal, not a proxied
+                // response.
+                421 => "the believed owner answered that it does not own the shard (421) \
+                        until the request's deadline; ownership did not settle in time"
+                    .to_owned(),
+                503 => "the owner was unavailable (503) until the request's deadline".to_owned(),
+                _ => format!("decoding the forwarded response: {e}"),
+            })?;
         let body_bytes = base64_decode(&proxied_response.body_b64)
             .map_err(|e| format!("decoding the forwarded response body: {e}"))?;
         let status = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -1146,6 +1213,7 @@ mod tests {
             cluster: Cluster::single_node(ReplicaId::new("solo:1")),
             layout: ShardLayout::default(),
             forwarder: None,
+            metrics: None,
             origin: ReplicaId::new("solo:1"),
             origin_generation: Generation::fresh(None),
             default_deadline: Duration::from_secs(10),
@@ -1582,5 +1650,174 @@ mod tests {
         );
         assert_ne!(room_id, "!chosen-by-client:example.org");
         assert!(room_id.ends_with(":example.org"), "{room_id}");
+    }
+
+    // ---- a shard moving away while a request for it runs ----
+
+    /// An ownership that owns every shard until [`Flipping::give_away`], then believes `owner`
+    /// has them all: a handoff landing mid-request.
+    struct Flipping {
+        me: ReplicaId,
+        mine: std::sync::atomic::AtomicBool,
+        owner: ReplicaId,
+    }
+
+    impl Flipping {
+        fn give_away(&self) {
+            self.mine.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Ownership for Flipping {
+        fn me(&self) -> &ReplicaId {
+            &self.me
+        }
+        fn owner_of(&self, _shard: ShardId) -> Option<ReplicaId> {
+            Some(if self.is_mine(_shard) {
+                self.me.clone()
+            } else {
+                self.owner.clone()
+            })
+        }
+        fn is_mine(&self, _shard: ShardId) -> bool {
+            self.mine.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn fence(&self, shard: ShardId) -> Option<Fence> {
+            self.is_mine(shard).then(|| Fence::inert(shard))
+        }
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<hs_cluster::OwnershipEvent> {
+            tokio::sync::broadcast::channel(1).1
+        }
+        fn shard_map(&self) -> watch::Receiver<Arc<hs_cluster::ShardMap>> {
+            watch::channel(Arc::new(hs_cluster::ShardMap::default())).1
+        }
+    }
+
+    const SEND_PATH: &str = "/_matrix/client/v3/rooms/{roomId}/send/{eventType}/{txnId}";
+
+    fn send_request(body: &str) -> Request {
+        Request::builder()
+            .method("PUT")
+            .uri("/_matrix/client/v3/rooms/%21moving%3Aexample.org/send/m.room.message/t1")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_owned()))
+            .unwrap()
+    }
+
+    /// Starts replica B: owns every shard, serves the mesh, and answers a send with the body it
+    /// received. Returns B's mesh address, the bodies B's handler saw, and the sender that keeps
+    /// B's listener up while it is held.
+    async fn spawn_owner_b() -> (
+        String,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        watch::Sender<bool>,
+    ) {
+        let b_addr = format!("127.0.0.1:{}", free_port());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ownership_b: Arc<dyn Ownership> = scripted(&b_addr, true, None);
+        let recorded = seen.clone();
+        let router_b = axum::Router::new().route(
+            SEND_PATH,
+            axum::routing::put(move |body: String| {
+                let recorded = recorded.clone();
+                async move {
+                    recorded.lock().unwrap().push(body);
+                    axum::Json(serde_json::json!({ "event_id": "$sent-by-b" }))
+                }
+            }),
+        );
+        let app_b = gate(ownership_b.clone(), true).layer(router_b);
+        let deps = Arc::new(MeshDeps {
+            authenticator: Arc::new(SharedSecretAuthenticator::new(TEST_SECRET)),
+            ownership: ownership_b,
+            handler: Arc::new(ProxyShardHandler { app: app_b }),
+            idempotency: Arc::new(IdempotencyCache::new(Duration::from_secs(5), 16)),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(8)),
+            nudge: None,
+            peers: None,
+        });
+        let server = MeshServer::new(b_addr.clone(), None).unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            server.serve(deps, shutdown_rx).await.unwrap();
+        });
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(&b_addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (b_addr, seen, shutdown_tx)
+    }
+
+    #[tokio::test]
+    async fn a_request_fenced_by_a_handoff_mid_flight_is_sent_on_to_the_new_owner() {
+        let (b_addr, seen_b, _keep_b_up) = spawn_owner_b().await;
+        let ownership_a = Arc::new(Flipping {
+            me: ReplicaId::new("127.0.0.1:1"),
+            mine: std::sync::atomic::AtomicBool::new(true),
+            owner: ReplicaId::new(b_addr),
+        });
+        // A's handler is where the handoff lands: the shard moves to B while the send runs, and
+        // `hs-room`'s fence refuses the write with a 503, as `RoomError::Fenced` does.
+        let ran_on_a = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (flip, count) = (ownership_a.clone(), ran_on_a.clone());
+        let router_a = axum::Router::new().route(
+            SEND_PATH,
+            axum::routing::put(move || {
+                let (flip, count) = (flip.clone(), count.clone());
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    flip.give_away();
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(serde_json::json!({
+                            "errcode": "M_UNKNOWN",
+                            "error": "fenced: this replica no longer owns shard"
+                        })),
+                    )
+                }
+            }),
+        );
+        let app_a = gate(ownership_a, true).layer(router_a);
+
+        let response = app_a
+            .oneshot(send_request(r#"{"msgtype":"m.text","body":"hi"}"#))
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(String::from_utf8_lossy(&bytes).contains("$sent-by-b"));
+        assert_eq!(ran_on_a.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            seen_b.lock().unwrap().clone(),
+            vec![r#"{"msgtype":"m.text","body":"hi"}"#.to_owned()],
+            "B got the same body A was sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_503_from_a_shard_still_owned_here_is_passed_back_as_it_is() {
+        let ownership_a: Arc<dyn Ownership> = scripted("127.0.0.1:1", true, None);
+        let router_a = axum::Router::new().route(
+            SEND_PATH,
+            axum::routing::put(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(serde_json::json!({ "errcode": "M_LIMIT_EXCEEDED" })),
+                )
+            }),
+        );
+        let app_a = gate(ownership_a, true).layer(router_a);
+        let response = app_a.oneshot(send_request("{}")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("M_LIMIT_EXCEEDED"));
     }
 }
