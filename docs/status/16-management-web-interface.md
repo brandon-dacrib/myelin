@@ -1,6 +1,99 @@
 # 16. Management web interface: status
 
-## Current update: 2026-09-26 (bridge offerings, RFC 0017)
+## Current update: 2026-09-27 (Settings: registration tokens, server notices, invite links)
+
+**Settings is a real section.** Built against the new `registration_tokens.*` and
+`server_notices.*` operations in `crates/hs-admin/openapi/openapi.yaml` (tags RegistrationTokens,
+ServerNotices), which the server side is building in parallel; everything here runs on MSW mocks.
+Client regenerated (`npm run generate:client`). Every control is a real one (decision 0010): no
+JSON or YAML text anywhere.
+
+- **Routes**: `/settings` redirects to `/settings/registration-tokens`; `/settings/server-notices`
+  beside it (`pages/settings/SettingsTabs.tsx`, links like `BridgesTabs`, cursor in the URL). The
+  sidebar's Settings item highlights for both; the command palette offers "Go to Registration
+  tokens" and "Go to Server notices" (`subNavItems` in `shell/nav.ts`). `/settings` is no longer a
+  `PlaceholderPage`.
+- **Registration tokens** (`pages/settings/RegistrationTokensPage.tsx`, hooks in
+  `api/registration-tokens.ts`, pure helpers in `lib/registration-tokens.ts`): table of token
+  (monospace, copyable), status (the server's `valid` is the authority; when false the row says
+  why: Expired, Used up, or "Uses in progress" with the pending count), uses ("3 of 10", "4 of
+  unlimited"), pending, expires ("in 6 days", "2 days ago", a date past a month), created; row
+  actions Copy invite link, Edit, Delete (confirm). **Create** (`CreateTokenDialog.tsx`): Token
+  (Generate one with a length 1-64, or Choose my own, checked against `A-Za-z0-9._~-`/64 before
+  sending), Uses allowed (number, or the Unlimited switch; default 1), Expires (Never, 1 day,
+  7 days (default), 30 days, or a date-time picker). It ends on "Invite link ready" with the link
+  `${origin}/admin/register?token=...` in full and a Copy invite link button. 409 and field
+  pointers land beside the right field. **Edit** (`EditTokenDialog.tsx`): uses/unlimited and
+  never/date-time, PATCH; "Expire now" PATCHes `expires_at` to now.
+- **Users page**: "Invite by link" beside "Add user" opens the same create dialog.
+- **Server notices** (`pages/settings/ServerNoticesPage.tsx`, `SendNoticeForm.tsx`,
+  `RecipientsEditor.tsx`, hooks in `api/server-notices.ts`, recipient parsing in
+  `lib/server-notices.ts`): a send form with a recipients list editor (chips with remove buttons;
+  Enter or Add; a pasted list is split; a bare username is completed with the server's name from
+  `GET /server`; anything not `@local:<this server>` is refused beside the field; matching users
+  are suggested from `GET /users?q=` as you type, via the new `useUserSuggestions`) and a message
+  textarea sent as `{msgtype: "m.text", body}`. After sending it shows each recipient's room and
+  event ID. The server's 404 (a recipient that does not exist, nothing sent) is shown beside the
+  recipients. History table below: sent, recipients (three then "and N more"), message body,
+  sender. Gated on `moderation:write` / `moderation:read`.
+- **User detail page**: "Send notice" opens `SendNoticeDialog.tsx`, the same form with that user
+  fixed as the recipient.
+- **Public invite page** `/admin/register?token=...` (`components/shell/Register.tsx`, calls in
+  `lib/registration.ts`): rendered by `AppShell` in place of everything else **with or without an
+  admin session** (an invite is for the person invited, so it never shows the app around it and
+  never borrows the admin's token). It checks
+  `GET /_matrix/client/v1/register/m.login.registration_token/validity` first ("This invite link is
+  no longer valid..." when false; if the check itself fails it lets the registration judge). Form:
+  username (availability checked on blur via `GET /_matrix/client/v3/register/available`),
+  password, confirm. Submits `POST /_matrix/client/v3/register` with `inhibit_login: true` and
+  `auth: {type: "m.login.registration_token", token}`; on a 401 with a session it resends the
+  token stage in the session if still wanted, then `m.login.dummy` when that is all that remains,
+  and says plainly when the server wants anything else (email, CAPTCHA). Errors: M_USER_IN_USE,
+  M_EXCLUSIVE, M_INVALID_USERNAME beside the username; M_WEAK_PASSWORD beside the password;
+  M_FORBIDDEN/M_UNAUTHORIZED switch to the invalid-link message; M_LIMIT_EXCEEDED and others as a
+  general alert. Success shows the new user ID and the server address (`window.location.origin`)
+  to sign in with from any Matrix client.
+- **Mock** (`mocks/data/registration-tokens.ts`, `mocks/data/server-notices.ts`, handlers in
+  `mocks/handlers.ts`): five tokens covering every status (`welcome-team` unlimited, `carol-invite`
+  one use in 6 days, `spring-cohort` expired, `dave-invite` used up, `erin-invite` one pending);
+  create (400 on bad characters, 409 on a duplicate, generated tokens of `length`), PATCH, DELETE,
+  `valid` recomputed on every read. Two sent notices; send 404s on a non-existent recipient. The
+  three client-server endpoints (validity, available, register with the token stage; spending a
+  token increments `completed` and adds the user). Both fixtures reset after every Vitest test
+  (`src/test/setup.ts`). `npm run dev:mock` then `/admin/register?token=carol-invite` works with no
+  sign-in.
+- **Tests** (Vitest): `lib/registration-tokens.test.ts` (11), `lib/server-notices.test.ts` (5),
+  `settings/CreateTokenDialog.test.tsx` (5: generated default body and link + copy, custom +
+  unlimited + never, date-time expiry, client-side and 409 token errors, uses validation),
+  `settings/RegistrationTokensPage.test.tsx` (6: every status and its explanation, copy link,
+  create from the page, edit + expire now, delete with confirm, read-only),
+  `settings/ServerNoticesPage.test.tsx` (7: history, chip validation incl. non-local refusal and
+  bare-username completion, suggestions, exact request body and per-recipient confirmation, 404
+  shown, read-only, the user-page dialog), `shell/Register.test.tsx` (10: success with the exact
+  body, signed-in admin, invalid link, no token, M_USER_IN_USE on the field, availability on blur,
+  weak and mismatched passwords, token spent under the form, the dummy stage, an unsupported stage).
+  Playwright: `e2e/invites-and-notices.spec.ts` (5: invite by link from Users then the tokens table;
+  register with no session; spent link at phone width; send to two users and see the history; send
+  from a user's page), axe clean at every step.
+
+Checks (2026-09-27): `npm run check` green: eslint 0 errors (the 4 pre-existing react-refresh
+warnings), prettier clean, `tsc -b` clean, **31 test files, 224 tests** passed, build OK.
+`npm run test:e2e` **31 passed**.
+
+**Contract notes, resolved the same day** (track 15): `RegistrationToken` and `ServerNotice`
+now have `required` lists, `RegistrationTokenCreate.length` lost its `default` (the server ignores
+`length` beside a given `token`), and both `content` objects are `additionalProperties: true`, so
+the `{msgtype, body}` cast in `api/server-notices.ts` is gone; `schema.d.ts` regenerated. A notice
+to a recipient who does not exist is a `400` with a `/recipients` field error on the real server,
+and the mock now answers the same (it had a `404`).
+
+**Against the real server**: the same operations are real in `hs serve` as of this change
+(`docs/status/15-admin-api-and-modules.md`, 2026-09-27), and
+`crates/hs-cli/tests/invites_and_notices.rs` drives the exact requests these pages make (create
+a token, validity, `/register` with the token stage, send and list notices) through it. The
+Playwright suite has not been pointed at a real server for these pages yet (`test:e2e:real`).
+
+## Update: 2026-09-26 (bridge offerings, RFC 0017)
 
 **Bridges are offerings first.** The management half of RFC 0017
 (`docs/rfcs/0017-the-server-deploys-its-own-bridges.md`): an administrator offers a bridge type,
@@ -884,8 +977,24 @@ Element.
 - 11: nothing directly consumed this session (appservice data now comes from 15's real router, which is itself not yet backed by 11's actual registry — `/appservices` is still 501).
 - 03: cluster status is now consumed (`GET /cluster`) for the single-node/cluster heuristic; no further ask yet.
 - 13: reloadable-configuration schema for the Settings page (not built this session).
+- 15/07: ~~the real `registration_tokens.*` and `server_notices.*` handlers, and the
+  client-server `m.login.registration_token` stage plus its validity endpoint~~ done the same day
+  (see 15's status).
 
 ## Decisions made
+
+- **Settings, invite links and notices (2026-09-27).** Settings views are links with their own
+  addresses (`/settings/registration-tokens`, `/settings/server-notices`), `/settings` redirecting
+  to the first. The invite link is `${origin}/admin/register?token=...` (query string, as asked;
+  unlike the recovery token it is meant to be shared, and the server sees it anyway when it is
+  spent). The registration page is rendered by `AppShell` even when an administrator is signed in,
+  talks only to `/_matrix/client`, and never attaches the admin session. A failed validity check
+  (network, missing endpoint) shows the form rather than turning somebody away; the register call
+  is the authority. The create dialog defaults to one use, expiring in 7 days, generated at 16
+  characters (the usual case is inviting one person). "Expire now" lives in the edit dialog, and
+  the delete confirmation names it as the way to stop a link but keep its record. Server-notice
+  recipients are restricted to this server's name client-side when it is known (the server
+  refuses the whole notice otherwise); the message is plain `m.text` only.
 
 - **Bridges are offerings first (RFC 0017, 2026-09-26).** `/bridges` lists offerings; the
   registrations list lives at `/bridges/registrations` and the register-it-yourself wizard at

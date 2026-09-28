@@ -251,7 +251,7 @@ listener under `/_myelin/bridges`, whose namespace is every enabled offering's f
 `@bridges`: invite `@whatsappbot`, it joins, says it is setting up your bridge, and tells you
 when it is ready. The **admin API** has all ten operations RFC 0017 section 5 lists,
 `bridge_deployments.target` through `bridge_instances.files` (Bridges are 26 of 26 now, and
-the whole API is 71 of 158). The **operator** (`crates/hs-operator`, `hs operator`) reconciles
+the whole API was 71 of 158 then; 78 since registration tokens and server notices). The **operator** (`crates/hs-operator`, `hs operator`) reconciles
 a `Bridge` into a claim, a one-replica `Recreate` Deployment whose init container copies the
 files Secret into `/data` only where a file is missing (a mautrix bridge rewrites its config
 and mints its pickle key on first start), and a Service, and writes Ready or Degraded back
@@ -391,7 +391,7 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 | Client-server API | ~75% | 317/384 csapi assertions, 78/106 top-level (run 11); two real Element sessions sign in, create an encrypted room, invite, accept, and read each other's encrypted messages. The number understates the day: four of the fixes behind it were `/sync` silently losing events, which no percentage shows |
 | Storage, rooms, state resolution | ~85% | the engine underneath; 1600+ tests, two backends through one conformance suite, state bake-off done |
 | Configuration and first run | ~90% | database-backed, editable in the UI, one command from nothing to a working server |
-| Admin API | ~45% | 71 of 158 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Bridges 26/26, Config 6/6, Server 5/5, AuditLog 3/3, Recovery 3/3, Setup 2/2, Events 1/1, Users 14/41, Rooms 6/23, Federation 3/7, Statistics 1/4, Cluster 1/6, and Media 0/9, Migration 0/8, RegistrationTokens 0/5, Reports 0/4, Tasks 0/3, ServerNotices 0/2 |
+| Admin API | ~49% | 78 of 158 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Bridges 26/26, Config 6/6, Server 5/5, RegistrationTokens 5/5, AuditLog 3/3, Recovery 3/3, ServerNotices 2/2, Setup 2/2, Events 1/1, Users 14/41, Rooms 6/23, Federation 3/7, Statistics 1/4, Cluster 1/6, and Media 0/9, Migration 0/8, Reports 0/4, Tasks 0/3 |
 | Management web interface | ~75% | users (with devices, sign-out and password reset), rooms (with members), bridges (the catalogue, the wizard with the bridge's own config, the runbook, sign-in guides), federation destinations, configuration and the audit log are real against the real server; the media and reports pages still read from operations that answer 501; arrays-of-objects are a JSON textarea |
 | **Federation** | **~30%** | 75/250 assertions, 14/88 top-level (run 7); a user here joins a room hosted elsewhere through the client API, messages flow both ways between two real servers, and the room's history from before the join is fetched as the client scrolls back; the outbound queue survives a restart and is shard-gated; no EDUs, no invites/leaves/knocks over federation |
 | Bridges | ~75% | heisenbridge works end to end both directions (`docs/bridges/heisenbridge.md`); mautrix-whatsapp, added through the wizard, connects and starts in appservice-mode encryption (`docs/bridges/mautrix.md`); all 26 bridge operations are real; offerings and per-user instances (RFC 0017) run end to end against the real binary with the `elsewhere` runtime, a real heisenbridge reaching `ready` from the rendered files and the interface's flow passing as Playwright against the real server; no mautrix bridge has carried a message yet, because signing in needs a phone; the `cluster` runtime and the operator have not run against Kubernetes |
@@ -467,9 +467,12 @@ edit one is not. New settings and operations arrive with their interface control
    the Playwright suite against the real server, and a real heisenbridge from pip reaching
    `ready`. Left for the laptop: the `cluster` runtime with the operator, and the demo.
 2. The admin API's empty areas, each with its interface page reading real data:
-   RegistrationTokens 0/5 (which also gives invite-by-link user creation), Media 0/9, Reports
-   0/4, ServerNotices 0/2 (also `TestServerNotices`), Tasks 0/3, Statistics 1/4, Cluster 1/6,
-   then the long tails of Users 14/41 and Rooms 6/23. `python3 tools/admin_api_coverage.py
+   ~~RegistrationTokens 0/5~~ **5/5, 2026-09-27**, with invite-by-link user creation (a token
+   registers somebody while open registration is off; Settings > Registration tokens, and the
+   public `/admin/register?token=` page), Media 0/9, Reports 0/4, ~~ServerNotices 0/2~~ **2/2,
+   2026-09-27** (Settings > Server notices; `TestServerNotices`' whole flow passes in-process,
+   not yet measured under Complement), Tasks 0/3, Statistics 1/4, Cluster 1/6, then the long
+   tails of Users 14/41 and Rooms 6/23. `python3 tools/admin_api_coverage.py
    --list` is the checklist. Alongside it, decision 0010: the Configuration page's JSON
    textarea (`JsonControl`, for arrays of objects and maps) becomes structured editors, and
    `appservices.registration_files` becomes an importer-only migration path.
@@ -591,8 +594,10 @@ would do it; each ends in a transcript in `docs/status/12-platform-and-kubernete
 in `docs/status/complement-csapi-results.txt`), largest first. Count by test, not by log line:
 one polling test can print the same line twenty times.
 
-- **`TestServerNotices` (9)**: newly running, not newly broken. Server notices are unimplemented
-  (`ServerNotices` is 0 of 2 in the admin API too).
+- **`TestServerNotices` (9)**: implemented 2026-09-27 (`crates/hs-cli/src/server_notices.rs`,
+  the `send_server_notice` shims in `hs-compat`, the leave refusal in `hs-room`);
+  `crates/hs-cli/tests/invites_and_notices.rs` runs the test's every step against the real
+  router. Not yet re-measured under Complement.
 - **`TestSearch` (8)**: `/search` needs a cross-room index the room-actor model has no place for.
 - **`TestDeviceListUpdates` (5)**: every local case passes; the five that remain are the
   remote-user halves, which need device-list EDUs over federation (item 4).
@@ -919,4 +924,4 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
   interface was embedded; it would have passed for the placeholder too, and the binary had the
   placeholder. Look at the decision itself (the build script's output, the log line, the byte on
   the wire), not at a test that is satisfied either way.
-- **Registered is not working, and a real handler is not working either.** 71 of 158 admin operations have a real handler (`tools/admin_api_coverage.py` counts them; the figure used to be quoted by hand and was different in every document). The rest answer 501. But `users.create` had a real handler for days while the only real user directory answered it 503 — so "has a handler" is a ceiling, and the floor is an end-to-end test through `hs serve`.
+- **Registered is not working, and a real handler is not working either.** 78 of 158 admin operations have a real handler (`tools/admin_api_coverage.py` counts them; the figure used to be quoted by hand and was different in every document). The rest answer 501. But `users.create` had a real handler for days while the only real user directory answered it 503 — so "has a handler" is a ceiling, and the floor is an end-to-end test through `hs serve`.
