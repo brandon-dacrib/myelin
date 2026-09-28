@@ -247,19 +247,8 @@ pub trait UserStore: Send + Sync {
         avatar_url: Option<String>,
     ) -> Result<(), StoreError>;
 
-    /// Binds a third-party identifier (`medium` is `"email"` or `"msisdn"`) to a user, for
-    /// `m.login.password` login by email/phone identifier. A day-one, in-crate substitute for the
-    /// full 3PID/identity-server flow (`docs/workstreams/07-auth-and-identity.md`'s Phase 1/2
-    /// deliverables): no validation session, no identity server, just the bound-address index
-    /// login needs. `docs/rfcs/0002-auth-tokens-and-requester.md` section 8 has the follow-up.
-    async fn bind_threepid(
-        &self,
-        user_id: &ruma::UserId,
-        medium: &str,
-        address: &str,
-    ) -> Result<(), StoreError>;
-
-    /// Looks up the user bound to a third-party identifier, if any.
+    /// Looks up the user bound to a third-party identifier, if any. The address is matched
+    /// case-insensitively. Bindings are made through [`IdentityStore::add_threepid`].
     async fn get_user_by_threepid(
         &self,
         medium: &str,
@@ -515,7 +504,112 @@ pub(crate) fn tokens_match(stored: &str, presented: &str) -> bool {
     stored.as_bytes().ct_eq(presented.as_bytes()).into()
 }
 
+/// A third-party identifier (an email address or a phone number) bound to an account.
+///
+/// Bound by an administrator (`users.threepids.add`) or at account creation (`users.create`'s
+/// `threepids`); there is no self-service validation flow yet. What a binding does: the address
+/// signs in with `m.login.password` and an `m.id.thirdparty` identifier, `GET /account/3pid`
+/// lists it, and `users.lookup` finds the account by it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ThreepidRecord {
+    /// The account it is bound to.
+    pub user_id: OwnedUserId,
+    /// `"email"` or `"msisdn"`.
+    pub medium: String,
+    /// The address as it was bound (an email address is lower-cased on the way in by the
+    /// caller; a phone number is its digits).
+    pub address: String,
+    /// When it was bound, milliseconds since the Unix epoch.
+    pub added_at_ms: u64,
+    /// When it was validated, milliseconds since the Unix epoch. An administrator's binding is
+    /// taken as validated when it is made, as Synapse's admin API does.
+    pub validated_at_ms: u64,
+}
+
+/// A link from an account on an upstream identity provider (an OIDC `sub`, a SAML `NameID`, an
+/// LDAP DN) to a local account: `(provider, external_id)` names exactly one local user.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExternalIdRecord {
+    /// The local account.
+    pub user_id: OwnedUserId,
+    /// The provider's configured identifier (`oidc-google`, `saml`, `ldap`, ...).
+    pub provider: String,
+    /// The subject at that provider. Compared exactly: subjects are case-sensitive.
+    pub external_id: String,
+    /// When the link was made, milliseconds since the Unix epoch.
+    pub added_at_ms: u64,
+}
+
+/// Per-account identity links and settings an administrator manages: bound third-party
+/// identifiers, upstream-provider subject links, and per-user experimental-feature flags.
+#[async_trait]
+pub trait IdentityStore: Send + Sync {
+    /// Binds a third-party identifier. Binding one the same user already has is not an error
+    /// (the first binding is kept as it was); binding one another user has is
+    /// [`StoreError::Conflict`].
+    async fn add_threepid(&self, record: ThreepidRecord) -> Result<(), StoreError>;
+
+    /// Unbinds a third-party identifier (address matched case-insensitively) from `user_id`.
+    /// [`StoreError::NotFound`] if that user does not have it.
+    async fn remove_threepid(
+        &self,
+        user_id: &ruma::UserId,
+        medium: &str,
+        address: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Every third-party identifier bound to `user_id`, sorted by `(medium, address)`.
+    async fn list_threepids(
+        &self,
+        user_id: &ruma::UserId,
+    ) -> Result<Vec<ThreepidRecord>, StoreError>;
+
+    /// Links an upstream subject to a local account. Linking one the same user already has is
+    /// not an error; linking one another user has is [`StoreError::Conflict`].
+    async fn add_external_id(&self, record: ExternalIdRecord) -> Result<(), StoreError>;
+
+    /// Removes a link from `user_id`. [`StoreError::NotFound`] if that user does not have it.
+    async fn remove_external_id(
+        &self,
+        user_id: &ruma::UserId,
+        provider: &str,
+        external_id: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Every upstream subject linked to `user_id`, sorted by `(provider, external_id)`.
+    async fn list_external_ids(
+        &self,
+        user_id: &ruma::UserId,
+    ) -> Result<Vec<ExternalIdRecord>, StoreError>;
+
+    /// The local account an upstream subject is linked to, if any.
+    async fn get_user_by_external_id(
+        &self,
+        provider: &str,
+        external_id: &str,
+    ) -> Result<Option<OwnedUserId>, StoreError>;
+
+    /// The user's experimental-feature flags; empty for a user who has none set.
+    async fn experimental_features(
+        &self,
+        user_id: &ruma::UserId,
+    ) -> Result<std::collections::BTreeMap<String, bool>, StoreError>;
+
+    /// Replaces the user's experimental-feature flags with `features`.
+    async fn set_experimental_features(
+        &self,
+        user_id: &ruma::UserId,
+        features: std::collections::BTreeMap<String, bool>,
+    ) -> Result<(), StoreError>;
+}
+
 /// The union of every storage trait this crate needs, for callers that just want "the auth
-/// store" without naming each capability. [`memory::InMemoryAuthStore`] implements all five.
-pub trait AuthStore: UserStore + DeviceStore + TokenStore + UiaStore + SetupStore {}
-impl<T: UserStore + DeviceStore + TokenStore + UiaStore + SetupStore> AuthStore for T {}
+/// store" without naming each capability. [`memory::InMemoryAuthStore`] implements all six.
+pub trait AuthStore:
+    UserStore + DeviceStore + TokenStore + UiaStore + SetupStore + IdentityStore
+{
+}
+impl<T: UserStore + DeviceStore + TokenStore + UiaStore + SetupStore + IdentityStore> AuthStore
+    for T
+{
+}

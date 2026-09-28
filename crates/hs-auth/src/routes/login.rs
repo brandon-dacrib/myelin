@@ -485,7 +485,13 @@ mod tests {
         let state = state_with_password_user(user_id!("@dave:example.org"), "hunter2").await;
         state
             .store
-            .bind_threepid(user_id!("@dave:example.org"), "email", "dave@example.org")
+            .add_threepid(crate::store::ThreepidRecord {
+                user_id: user_id!("@dave:example.org").to_owned(),
+                medium: "email".to_owned(),
+                address: "dave@example.org".to_owned(),
+                added_at_ms: 1,
+                validated_at_ms: 1,
+            })
             .await
             .unwrap();
         let body = json!({

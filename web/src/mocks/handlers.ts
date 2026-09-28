@@ -62,6 +62,14 @@ import type { ReportResolve } from "@/api/reports";
 import { succeeded } from "@/lib/audit";
 import { users, userDevices, findUser } from "./data/users";
 import {
+  KNOWN_FEATURES,
+  userAccountData,
+  userExternalIds,
+  userFeatures,
+  userPushers,
+  userThreepids,
+} from "./data/user-identity";
+import {
   MOCK_RECOVERY_TOKEN,
   mockRecoveryExpiresAt,
   mockRecoveryLinkOpen,
@@ -997,6 +1005,162 @@ export const handlers = [
       );
     devices.splice(index, 1);
     return new HttpResponse(null, { status: 204 });
+  }),
+
+  // ---- a user's devices one at a time, 3PIDs, linked identities, features, client data ----
+
+  http.get(`${API}/users/:user_id/devices/:device_id`, ({ params }) => {
+    const devices = userDevices[decodeURIComponent(String(params.user_id))] ?? [];
+    const device = devices.find((d) => d.device_id === String(params.device_id));
+    return device ? HttpResponse.json(device) : problem(404, "not-found", "Not found");
+  }),
+
+  http.patch(`${API}/users/:user_id/devices/:device_id`, async ({ params, request }) => {
+    const devices = userDevices[decodeURIComponent(String(params.user_id))] ?? [];
+    const device = devices.find((d) => d.device_id === String(params.device_id));
+    if (!device) return problem(404, "not-found", "Not found");
+    const body = (await request.json()) as { display_name?: string | null };
+    if (!("display_name" in body))
+      return problem(400, "validation-failed", "Validation failed", {
+        errors: [{ pointer: "/display_name", detail: "display_name is required" }],
+      });
+    device.display_name = body.display_name?.trim() || null;
+    return HttpResponse.json(device);
+  }),
+
+  http.post(`${API}/users/:user_id/devices/bulk-delete`, async ({ params, request }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    const devices = userDevices[userId] ?? [];
+    const { device_ids = [] } = (await request.json()) as { device_ids?: string[] };
+    if (device_ids.length === 0)
+      return problem(400, "validation-failed", "Validation failed", {
+        errors: [{ pointer: "/device_ids", detail: "name at least one device" }],
+      });
+    if (!device_ids.every((id) => devices.some((d) => d.device_id === id)))
+      return problem(404, "not-found", "Not found", {
+        detail: `${userId} does not have every one of these devices`,
+      });
+    userDevices[userId] = devices.filter((d) => !device_ids.includes(d.device_id));
+    return new HttpResponse(null, { status: 204 });
+  }),
+
+  http.get(`${API}/users/:user_id/threepids`, ({ params }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    if (!findUser(userId)) return problem(404, "not-found", "Not found");
+    return HttpResponse.json(userThreepids[userId] ?? []);
+  }),
+
+  http.post(`${API}/users/:user_id/threepids`, async ({ params, request }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    if (!findUser(userId)) return problem(404, "not-found", "Not found");
+    const body = (await request.json()) as { medium: string; address: string };
+    const address =
+      body.medium === "email" ? body.address.trim().toLowerCase() : body.address.replace(/\D/g, "");
+    if (body.medium === "email" && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(address))
+      return problem(400, "validation-failed", "Validation failed", {
+        detail: `"${body.address}" is not an email address`,
+        errors: [{ pointer: "/address", detail: `"${body.address}" is not an email address` }],
+      });
+    const owner = Object.entries(userThreepids).find(([, list]) =>
+      list.some((t) => t.medium === body.medium && t.address === address),
+    )?.[0];
+    if (owner && owner !== userId)
+      return problem(409, "conflict", "Conflict", {
+        detail: `${body.medium} ${address} is bound to ${owner}`,
+      });
+    const added = {
+      medium: body.medium as "email" | "msisdn",
+      address,
+      added_at: new Date().toISOString(),
+    };
+    if (!owner) (userThreepids[userId] ??= []).push(added);
+    return HttpResponse.json(added, { status: 201 });
+  }),
+
+  http.delete(`${API}/users/:user_id/threepids/:medium/:address`, ({ params }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    const address = decodeURIComponent(String(params.address));
+    const list = userThreepids[userId] ?? [];
+    const index = list.findIndex((t) => t.medium === params.medium && t.address === address);
+    if (index < 0) return problem(404, "not-found", "Not found");
+    list.splice(index, 1);
+    return new HttpResponse(null, { status: 204 });
+  }),
+
+  http.get(`${API}/users/:user_id/external-ids`, ({ params }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    if (!findUser(userId)) return problem(404, "not-found", "Not found");
+    return HttpResponse.json(userExternalIds[userId] ?? []);
+  }),
+
+  http.post(`${API}/users/:user_id/external-ids`, async ({ params, request }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    if (!findUser(userId)) return problem(404, "not-found", "Not found");
+    const body = (await request.json()) as { provider: string; external_id: string };
+    if (!body.provider.trim())
+      return problem(400, "validation-failed", "Validation failed", {
+        errors: [{ pointer: "/provider", detail: "name the identity provider" }],
+      });
+    const owner = Object.entries(userExternalIds).find(([, list]) =>
+      list.some((x) => x.provider === body.provider && x.external_id === body.external_id),
+    )?.[0];
+    if (owner && owner !== userId)
+      return problem(409, "conflict", "Conflict", {
+        detail: `${body.provider} ${body.external_id} is linked to ${owner}`,
+      });
+    if (!owner) (userExternalIds[userId] ??= []).push(body);
+    return HttpResponse.json(body, { status: 201 });
+  }),
+
+  http.delete(`${API}/users/:user_id/external-ids/:provider/:external_id`, ({ params }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    const provider = decodeURIComponent(String(params.provider));
+    const externalId = decodeURIComponent(String(params.external_id));
+    const list = userExternalIds[userId] ?? [];
+    const index = list.findIndex((x) => x.provider === provider && x.external_id === externalId);
+    if (index < 0) return problem(404, "not-found", "Not found");
+    list.splice(index, 1);
+    return new HttpResponse(null, { status: 204 });
+  }),
+
+  http.get(`${API}/users/:user_id/experimental-features`, ({ params }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    if (!findUser(userId)) return problem(404, "not-found", "Not found");
+    const stored = userFeatures[userId] ?? {};
+    return HttpResponse.json(
+      Object.fromEntries(KNOWN_FEATURES.map((f) => [f, stored[f] ?? false])),
+    );
+  }),
+
+  http.put(`${API}/users/:user_id/experimental-features`, async ({ params, request }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    if (!findUser(userId)) return problem(404, "not-found", "Not found");
+    const body = (await request.json()) as Record<string, boolean>;
+    const unknown = Object.keys(body).find((k) => !KNOWN_FEATURES.includes(k));
+    if (unknown)
+      return problem(400, "validation-failed", "Validation failed", {
+        detail: `"${unknown}" is not an experimental feature this server knows`,
+      });
+    const stored = (userFeatures[userId] = { ...(userFeatures[userId] ?? {}), ...body });
+    return HttpResponse.json(
+      Object.fromEntries(KNOWN_FEATURES.map((f) => [f, stored[f] ?? false])),
+    );
+  }),
+
+  http.get(`${API}/users/:user_id/account-data`, ({ params }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    if (!findUser(userId)) return problem(404, "not-found", "Not found");
+    return HttpResponse.json(userAccountData[userId] ?? {});
+  }),
+
+  http.get(`${API}/users/:user_id/pushers`, ({ params, request }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    if (!findUser(userId)) return problem(404, "not-found", "Not found");
+    const { items, next_cursor, prev_cursor } = paginate(
+      userPushers[userId] ?? [],
+      new URL(request.url),
+    );
+    return HttpResponse.json({ items, next_cursor, prev_cursor });
   }),
 
   http.post(`${API}/users/:user_id/reset-password`, async ({ params, request }) => {

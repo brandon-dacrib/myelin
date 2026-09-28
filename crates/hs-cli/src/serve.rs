@@ -604,6 +604,13 @@ fn admin_state<B: KvBackend + 'static>(
     .with_users(Arc::new(
         hs_auth::admin_directory::AuthStoreUserDirectory::from_auth_state(auth),
     ))
+    // A user's devices one at a time, their 3PIDs, the upstream subjects linked to them and
+    // their experimental features: the same directory, through its second face.
+    .with_user_identity(Arc::new(
+        hs_auth::admin_directory::AuthStoreUserDirectory::from_auth_state(auth),
+    ))
+    // What their clients stored here: global account data and pushers.
+    .with_user_data(sources.user_data)
     // Until this, every `/api/v1/rooms*` operation answered an honest 503 saying no room source
     // was wired. It is wired now, and blocking a room through the admin API stops its very next
     // message.
@@ -677,6 +684,7 @@ struct AdminSources {
     statistics: Arc<dyn hs_admin::statistics::StatisticsSource>,
     media: Arc<dyn hs_admin::media::MediaSource>,
     cluster: Arc<dyn hs_admin::cluster::ClusterSource>,
+    user_data: Arc<dyn hs_admin::user_identity::UserDataSource>,
 }
 
 /// The `/api/v1` state for [`route_manifest`]'s throwaway router: routes are registered the same
@@ -1392,6 +1400,11 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         }
     };
 
+    let user_data: Arc<dyn hs_admin::user_identity::UserDataSource> =
+        Arc::new(crate::user_data::StoredUserData::new(
+            user_state.hub.store().clone(),
+            push_state.pushers.clone(),
+        ));
     let mounts = Mounts {
         room: room_state,
         federation,
@@ -1422,6 +1435,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
                     media_repository,
                 )),
                 cluster: cluster_admin,
+                user_data,
             },
         ),
     };

@@ -1,7 +1,7 @@
 //! An in-memory implementation of every trait in [`super`], for tests and for running this crate
 //! before `hs-tables` (track 01) is ready to back it. Not persistent, not shared across processes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -10,9 +10,9 @@ use rand::distr::Alphanumeric;
 use ruma::{DeviceId, OwnedDeviceId, OwnedUserId, UserId};
 
 use super::{
-    AccessTokenRecord, DeviceRecord, DeviceStore, LoginTokenRecord, RecoveryTokenRecord,
-    RefreshTokenRecord, SetupStore, StoreError, TokenStore, UiaStore, UserRecord, UserStore,
-    tokens_match,
+    AccessTokenRecord, DeviceRecord, DeviceStore, ExternalIdRecord, IdentityStore,
+    LoginTokenRecord, RecoveryTokenRecord, RefreshTokenRecord, SetupStore, StoreError,
+    ThreepidRecord, TokenStore, UiaStore, UserRecord, UserStore, tokens_match,
 };
 use crate::token::TokenHash;
 
@@ -31,7 +31,11 @@ struct Inner {
     refresh_tokens: HashMap<TokenHash, RefreshTokenRecord>,
     login_tokens: HashMap<TokenHash, LoginTokenRecord>,
     uia_sessions: HashMap<String, UiaSession>,
-    threepids: HashMap<(String, String), OwnedUserId>,
+    /// Keyed `(medium, address lower-cased)`.
+    threepids: HashMap<(String, String), ThreepidRecord>,
+    /// Keyed `(provider, external_id)`.
+    external_ids: HashMap<(String, String), ExternalIdRecord>,
+    experimental_features: HashMap<OwnedUserId, BTreeMap<String, bool>>,
     setup_token: Option<String>,
     recovery_token: Option<RecoveryTokenRecord>,
 }
@@ -173,19 +177,6 @@ impl UserStore for InMemoryAuthStore {
         Ok(())
     }
 
-    async fn bind_threepid(
-        &self,
-        user_id: &UserId,
-        medium: &str,
-        address: &str,
-    ) -> Result<(), StoreError> {
-        self.lock().threepids.insert(
-            (medium.to_string(), address.to_ascii_lowercase()),
-            user_id.to_owned(),
-        );
-        Ok(())
-    }
-
     async fn get_user_by_threepid(
         &self,
         medium: &str,
@@ -195,13 +186,147 @@ impl UserStore for InMemoryAuthStore {
             .lock()
             .threepids
             .get(&(medium.to_string(), address.to_ascii_lowercase()))
-            .cloned())
+            .map(|record| record.user_id.clone()))
     }
 
     async fn list_users(&self) -> Result<Vec<UserRecord>, StoreError> {
         let mut users: Vec<UserRecord> = self.lock().users.values().cloned().collect();
         users.sort_by(|a, b| a.user_id.cmp(&b.user_id));
         Ok(users)
+    }
+}
+
+#[async_trait]
+impl IdentityStore for InMemoryAuthStore {
+    async fn add_threepid(&self, record: ThreepidRecord) -> Result<(), StoreError> {
+        let key = (record.medium.clone(), record.address.to_ascii_lowercase());
+        let mut inner = self.lock();
+        match inner.threepids.get(&key) {
+            Some(existing) if existing.user_id == record.user_id => Ok(()),
+            Some(existing) => Err(StoreError::Conflict(format!(
+                "{} {} is bound to {}",
+                record.medium, record.address, existing.user_id
+            ))),
+            None => {
+                inner.threepids.insert(key, record);
+                Ok(())
+            }
+        }
+    }
+
+    async fn remove_threepid(
+        &self,
+        user_id: &UserId,
+        medium: &str,
+        address: &str,
+    ) -> Result<(), StoreError> {
+        let key = (medium.to_string(), address.to_ascii_lowercase());
+        let mut inner = self.lock();
+        match inner.threepids.get(&key) {
+            Some(existing) if existing.user_id == user_id => {
+                inner.threepids.remove(&key);
+                Ok(())
+            }
+            _ => Err(StoreError::NotFound(format!("{medium} {address}"))),
+        }
+    }
+
+    async fn list_threepids(&self, user_id: &UserId) -> Result<Vec<ThreepidRecord>, StoreError> {
+        let mut found: Vec<ThreepidRecord> = self
+            .lock()
+            .threepids
+            .values()
+            .filter(|r| r.user_id == user_id)
+            .cloned()
+            .collect();
+        found.sort_by(|a, b| {
+            (&a.medium, a.address.to_ascii_lowercase())
+                .cmp(&(&b.medium, b.address.to_ascii_lowercase()))
+        });
+        Ok(found)
+    }
+
+    async fn add_external_id(&self, record: ExternalIdRecord) -> Result<(), StoreError> {
+        let key = (record.provider.clone(), record.external_id.clone());
+        let mut inner = self.lock();
+        match inner.external_ids.get(&key) {
+            Some(existing) if existing.user_id == record.user_id => Ok(()),
+            Some(existing) => Err(StoreError::Conflict(format!(
+                "{} {} is linked to {}",
+                record.provider, record.external_id, existing.user_id
+            ))),
+            None => {
+                inner.external_ids.insert(key, record);
+                Ok(())
+            }
+        }
+    }
+
+    async fn remove_external_id(
+        &self,
+        user_id: &UserId,
+        provider: &str,
+        external_id: &str,
+    ) -> Result<(), StoreError> {
+        let key = (provider.to_string(), external_id.to_string());
+        let mut inner = self.lock();
+        match inner.external_ids.get(&key) {
+            Some(existing) if existing.user_id == user_id => {
+                inner.external_ids.remove(&key);
+                Ok(())
+            }
+            _ => Err(StoreError::NotFound(format!("{provider} {external_id}"))),
+        }
+    }
+
+    async fn list_external_ids(
+        &self,
+        user_id: &UserId,
+    ) -> Result<Vec<ExternalIdRecord>, StoreError> {
+        let mut found: Vec<ExternalIdRecord> = self
+            .lock()
+            .external_ids
+            .values()
+            .filter(|r| r.user_id == user_id)
+            .cloned()
+            .collect();
+        found.sort_by(|a, b| (&a.provider, &a.external_id).cmp(&(&b.provider, &b.external_id)));
+        Ok(found)
+    }
+
+    async fn get_user_by_external_id(
+        &self,
+        provider: &str,
+        external_id: &str,
+    ) -> Result<Option<OwnedUserId>, StoreError> {
+        Ok(self
+            .lock()
+            .external_ids
+            .get(&(provider.to_string(), external_id.to_string()))
+            .map(|r| r.user_id.clone()))
+    }
+
+    async fn experimental_features(
+        &self,
+        user_id: &UserId,
+    ) -> Result<BTreeMap<String, bool>, StoreError> {
+        Ok(self
+            .lock()
+            .experimental_features
+            .get(user_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn set_experimental_features(
+        &self,
+        user_id: &UserId,
+        features: BTreeMap<String, bool>,
+    ) -> Result<(), StoreError> {
+        self.lock()
+            .experimental_features
+            .insert(user_id.to_owned(), features);
+        Ok(())
     }
 }
 

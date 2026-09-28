@@ -10,8 +10,8 @@
 //! mounted, persist, and propagate into membership events. They kept reporting `false` for a
 //! while after those routes landed, which a real client reads as "this server will not let me
 //! change my name": a capability claim is only worth anything if it tracks the routes, so change
-//! both together. `m.3pid_changes` is still `false` — `hs_auth::store::UserStore` has
-//! `bind_threepid` at the storage-trait level and nothing exposes it over HTTP. Update this
+//! both together. `m.3pid_changes` is still `false` — only an administrator binds a 3PID
+//! (`users.threepids.*` in the admin API); a user cannot add or remove one themself. Update this
 //! alongside `crate::versions`'s `unstable_features` as more routers get mounted here.
 //!
 //! # `m.room_versions`

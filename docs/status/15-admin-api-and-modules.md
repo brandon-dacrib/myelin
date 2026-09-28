@@ -2,9 +2,37 @@
 
 Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-admin`, `hs-modules`, `hs-identity`, `hs-http` (shared with 07 and 14).
 
-Last updated: 2026-09-28 (the Cluster area, 6/6, below); before that 2026-09-27 (media, registration tokens and server notices, reports, tasks and statistics, below; before that the bridge
+Last updated: 2026-09-28 (Users' devices-and-identity half, and the Cluster area, 6/6, below); before that 2026-09-27 (media, registration tokens and server notices, reports, tasks and statistics, below; before that the bridge
 offering operations); before that 2026-09-26 (three public recovery operations); 2026-09-25 (additive schema change for the bridges wizard); the session log that follows is from 2026-09-19 (session 6).
 
+> **2026-09-28, served for real: Users' devices-and-identity half, 13 operations** (branch
+> `users-devices-identity`; Users is 27/41). `tools/admin_api_coverage.py` now counts
+> **115 of 158**.
+>
+> - **Handlers** (`crates/hs-admin/src/user_identity.rs`): `users.devices.get`,
+>   `users.devices.update` (`display_name` required; `null` or blank clears it),
+>   `users.devices.bulk_delete` (all or nothing, deduplicated, at most 1000, `Idempotency-Key`),
+>   `users.threepids.list/add/remove` (email lower-cased and checked, phone reduced to its
+>   digits, `/medium` and `/address` refusals, `409` when another account has it,
+>   `Idempotency-Key` on add), `users.external_ids.list/add/remove` (provider without `/`,
+>   subject kept exact), `users.experimental_features.get/put` (only Synapse's `msc3575`,
+>   `msc3881`, `msc4222`; `PUT` merges, as Synapse's does; `GET` reports every known flag),
+>   `users.account_data.list` (global account data, event type to content; the paging
+>   parameters are accepted and not needed) and `users.pushers.list` (paged). Two new seams on
+>   `AdminState`: `UserIdentitySource` (`with_user_identity`, implemented by
+>   `hs_auth::admin_directory::AuthStoreUserDirectory`) and `UserDataSource` (`with_user_data`,
+>   implemented by `hs_cli::user_data::StoredUserData` over `hs-user`'s and `hs-push`'s
+>   stores). Both are separate modules so this did not touch `sources.rs`' `UserDirectory`.
+> - **Observability**: every write is audited (the operation id as the action, the user as the
+>   target, before and after in `changes` for a rename, a 3PID, an external id and each
+>   feature flag) and published (`user.device_updated`, `user.devices_deleted`,
+>   `user.threepid_added`, `user.threepid_removed`, `user.external_id_added`,
+>   `user.external_id_removed`, `user.experimental_features_changed`), and logged at `info`
+>   with the actor.
+> - **Tests**: handler tests with a fake source (503 unwired, 403 for a read token, the rename
+>   body, bulk all-or-nothing and replay, normalisation, feature merge and refusal, events);
+>   the real-binary test `crates/hs-cli/tests/admin_user_identity.rs`.
+>
 > **2026-09-28, served for real: Cluster 6/6** (branch `agent/cluster-admin`, rebuilt on main
 > from the superseded `worktree-agent-ae592ed29bb65b973`, whose cluster pieces it replaces).
 > `tools/admin_api_coverage.py` now counts **102 of 158** operations with a real handler.

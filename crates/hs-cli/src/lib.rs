@@ -42,6 +42,7 @@ pub mod synapse_serve;
 pub mod synapse_shims;
 pub mod sync_cluster;
 pub mod tasks;
+pub mod user_data;
 pub mod versions;
 pub mod well_known;
 

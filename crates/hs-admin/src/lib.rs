@@ -52,3 +52,4 @@ pub mod server_notices;
 pub mod sources;
 pub mod statistics;
 pub mod tasks;
+pub mod user_identity;

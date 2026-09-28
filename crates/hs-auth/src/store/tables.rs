@@ -17,7 +17,9 @@
 //! | `hs_auth.refresh_tokens` | `(hash_hex,)` | `hs_auth.refresh_tokens_by_user` (non-unique, `(user_id,)`) | `TokenStore`'s refresh-token methods |
 //! | `hs_auth.login_tokens` | `(hash_hex,)` | none — only ever looked up by its own hash | `TokenStore`'s login-token methods |
 //! | `hs_auth.uia_sessions` | `(session_id,)` | none | `UiaStore` |
-//! | `hs_auth.threepids` | `(medium, address_lower)` | none — never looked up by user | `UserStore`'s 3PID methods |
+//! | `hs_auth.threepids` | `(medium, address_lower)` | `hs_auth.threepids_by_user` (`(user_id, medium, address_lower)`, the whole record, written in the same transaction) | `UserStore::get_user_by_threepid`, `IdentityStore`'s 3PID methods |
+//! | `hs_auth.external_ids` | `(provider, external_id)` | `hs_auth.external_ids_by_user` (`(user_id, provider, external_id)`, likewise) | `IdentityStore`'s external-id methods |
+//! | `hs_auth.experimental_features` | `(user_id,)` | none | `IdentityStore`'s experimental-feature methods |
 //!
 //! Every index is maintained by [`hs_tables::index::maintain_index`] inside the same write
 //! transaction as the row it indexes (never a separate write that could diverge). The property
@@ -25,7 +27,7 @@
 //! delete, that no orphaned index row is ever left behind — the same style
 //! `crates/hs-tables/tests/index_proptest.rs` already uses for `hs-tables` itself.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use hs_kv::{KvBackend, KvError, RangeSpec, TransactConfig, transact};
 use hs_tables::index::{IndexDef, lookup, maintain_index};
@@ -36,9 +38,9 @@ use ruma::{DeviceId, OwnedUserId, UserId};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AccessTokenRecord, DeviceRecord, DeviceStore, LoginTokenRecord, RecoveryTokenRecord,
-    RefreshTokenRecord, SetupStore, StoreError, TokenStore, UiaStore, UserRecord, UserStore,
-    tokens_match,
+    AccessTokenRecord, DeviceRecord, DeviceStore, ExternalIdRecord, IdentityStore,
+    LoginTokenRecord, RecoveryTokenRecord, RefreshTokenRecord, SetupStore, StoreError,
+    ThreepidRecord, TokenStore, UiaStore, UserRecord, UserStore, tokens_match,
 };
 use crate::token::TokenHash;
 
@@ -127,6 +129,10 @@ pub struct TablesAuthStore<B: KvBackend> {
     login_tokens: TypedKeyspace<B::Keyspace, (String,)>,
     uia_sessions: TypedKeyspace<B::Keyspace, (String,)>,
     threepids: TypedKeyspace<B::Keyspace, (String, String)>,
+    threepids_by_user: TypedKeyspace<B::Keyspace, (String, String, String)>,
+    external_ids: TypedKeyspace<B::Keyspace, (String, String)>,
+    external_ids_by_user: TypedKeyspace<B::Keyspace, (String, String, String)>,
+    experimental_features: TypedKeyspace<B::Keyspace, (String,)>,
     /// One row at most, under [`SETUP_TOKEN_KEY`].
     setup: TypedKeyspace<B::Keyspace, (String,)>,
 }
@@ -164,6 +170,10 @@ impl<B: KvBackend> TablesAuthStore<B> {
         let login_tokens = TypedKeyspace::new(open("hs_auth.login_tokens")?);
         let uia_sessions = TypedKeyspace::new(open("hs_auth.uia_sessions")?);
         let threepids = TypedKeyspace::new(open("hs_auth.threepids")?);
+        let threepids_by_user = TypedKeyspace::new(open("hs_auth.threepids_by_user")?);
+        let external_ids = TypedKeyspace::new(open("hs_auth.external_ids")?);
+        let external_ids_by_user = TypedKeyspace::new(open("hs_auth.external_ids_by_user")?);
+        let experimental_features = TypedKeyspace::new(open("hs_auth.experimental_features")?);
         let setup = TypedKeyspace::new(open("hs_auth.setup")?);
         Ok(Self {
             backend,
@@ -177,6 +187,10 @@ impl<B: KvBackend> TablesAuthStore<B> {
             login_tokens,
             uia_sessions,
             threepids,
+            threepids_by_user,
+            external_ids,
+            external_ids_by_user,
+            experimental_features,
             setup,
         })
     }
@@ -276,20 +290,6 @@ impl<B: KvBackend> UserStore for TablesAuthStore<B> {
             .await
     }
 
-    async fn bind_threepid(
-        &self,
-        user_id: &UserId,
-        medium: &str,
-        address: &str,
-    ) -> Result<(), StoreError> {
-        let key = (medium.to_string(), address.to_ascii_lowercase());
-        let value = encode(&user_id.to_string())?;
-        transact(&self.backend, TransactConfig::default(), |txn| {
-            self.threepids.put(txn, &key, &value).map_err(to_kv)
-        })
-        .map_err(store_err)
-    }
-
     async fn get_user_by_threepid(
         &self,
         medium: &str,
@@ -302,12 +302,7 @@ impl<B: KvBackend> UserStore for TablesAuthStore<B> {
             .get(&snap, &key)
             .map_err(|e| StoreError::Backend(e.to_string()))?
         {
-            Some(bytes) => {
-                let raw: String = decode(&bytes)?;
-                UserId::parse(&raw)
-                    .map(Some)
-                    .map_err(|e| StoreError::Backend(e.to_string()))
-            }
+            Some(bytes) => Ok(Some(decode_threepid(&key, &bytes)?.user_id)),
             None => Ok(None),
         }
     }
@@ -361,6 +356,233 @@ impl<B: KvBackend> TablesAuthStore<B> {
 #[derive(Debug, thiserror::Error)]
 #[error("encode/decode failure: {0}")]
 struct DecodeFail(String);
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct BoundElsewhere(String);
+
+/// A row of `hs_auth.threepids`. Rows written before the value became a [`ThreepidRecord`]
+/// (2026-09-28) held only the owner's user ID as a JSON string; they still resolve for login,
+/// with their medium and address taken from the key and zero timestamps.
+fn decode_threepid(key: &(String, String), bytes: &[u8]) -> Result<ThreepidRecord, StoreError> {
+    if let Ok(record) = serde_json::from_slice::<ThreepidRecord>(bytes) {
+        return Ok(record);
+    }
+    let raw: String = decode(bytes)?;
+    let user_id = UserId::parse(&raw).map_err(|e| StoreError::Backend(e.to_string()))?;
+    Ok(ThreepidRecord {
+        user_id,
+        medium: key.0.clone(),
+        address: key.1.clone(),
+        added_at_ms: 0,
+        validated_at_ms: 0,
+    })
+}
+
+fn kv_decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, KvError> {
+    serde_json::from_slice(bytes).map_err(|e| KvError::backend(DecodeFail(e.to_string())))
+}
+
+fn kv_encode<T: Serialize>(value: &T) -> Result<Vec<u8>, KvError> {
+    serde_json::to_vec(value).map_err(|e| KvError::backend(DecodeFail(e.to_string())))
+}
+
+fn identity_err(e: KvError) -> StoreError {
+    if let KvError::Backend(inner) = &e
+        && let Some(BoundElsewhere(detail)) = inner.downcast_ref::<BoundElsewhere>()
+    {
+        return StoreError::Conflict(detail.clone());
+    }
+    store_err(e)
+}
+
+/// Every write keeps a primary row (by the identifier, which is what makes it unique to one
+/// account) and a by-user row (what lists an account's identifiers without a scan) in the same
+/// transaction, so the two cannot disagree.
+#[async_trait::async_trait]
+impl<B: KvBackend> IdentityStore for TablesAuthStore<B> {
+    async fn add_threepid(&self, record: ThreepidRecord) -> Result<(), StoreError> {
+        let address_lower = record.address.to_ascii_lowercase();
+        let key = (record.medium.clone(), address_lower.clone());
+        let by_user = (
+            record.user_id.to_string(),
+            record.medium.clone(),
+            address_lower,
+        );
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            if let Some(bytes) = self.threepids.get(txn, &key).map_err(to_kv)? {
+                let existing = decode_threepid(&key, &bytes).map_err(to_kv)?;
+                if existing.user_id == record.user_id {
+                    return Ok(());
+                }
+                return Err(to_kv(BoundElsewhere(format!(
+                    "{} {} is bound to {}",
+                    record.medium, record.address, existing.user_id
+                ))));
+            }
+            let value = kv_encode(&record)?;
+            self.threepids.put(txn, &key, &value).map_err(to_kv)?;
+            self.threepids_by_user
+                .put(txn, &by_user, &value)
+                .map_err(to_kv)
+        })
+        .map_err(identity_err)
+    }
+
+    async fn remove_threepid(
+        &self,
+        user_id: &UserId,
+        medium: &str,
+        address: &str,
+    ) -> Result<(), StoreError> {
+        let address_lower = address.to_ascii_lowercase();
+        let key = (medium.to_string(), address_lower.clone());
+        let by_user = (user_id.to_string(), medium.to_string(), address_lower);
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let owned = match self.threepids.get(txn, &key).map_err(to_kv)? {
+                Some(bytes) => decode_threepid(&key, &bytes).map_err(to_kv)?.user_id == user_id,
+                None => false,
+            };
+            if !owned {
+                return Err(to_kv(RowMissing(format!("{medium} {address}"))));
+            }
+            self.threepids.delete(txn, &key).map_err(to_kv)?;
+            self.threepids_by_user.delete(txn, &by_user).map_err(to_kv)
+        })
+        .map_err(store_err)
+    }
+
+    async fn list_threepids(&self, user_id: &UserId) -> Result<Vec<ThreepidRecord>, StoreError> {
+        let snap = self.backend.snapshot();
+        let prefix =
+            TypedKeyspace::<B::Keyspace, (String, String, String)>::prefix(&(user_id.to_string(),));
+        self.threepids_by_user
+            .range(&snap, prefix)
+            .map(|item| {
+                let (_k, v) = item.map_err(|e| StoreError::Backend(e.to_string()))?;
+                decode(&v)
+            })
+            .collect()
+    }
+
+    async fn add_external_id(&self, record: ExternalIdRecord) -> Result<(), StoreError> {
+        let key = (record.provider.clone(), record.external_id.clone());
+        let by_user = (
+            record.user_id.to_string(),
+            record.provider.clone(),
+            record.external_id.clone(),
+        );
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            if let Some(bytes) = self.external_ids.get(txn, &key).map_err(to_kv)? {
+                let existing: ExternalIdRecord = kv_decode(&bytes)?;
+                if existing.user_id == record.user_id {
+                    return Ok(());
+                }
+                return Err(to_kv(BoundElsewhere(format!(
+                    "{} {} is linked to {}",
+                    record.provider, record.external_id, existing.user_id
+                ))));
+            }
+            let value = kv_encode(&record)?;
+            self.external_ids.put(txn, &key, &value).map_err(to_kv)?;
+            self.external_ids_by_user
+                .put(txn, &by_user, &value)
+                .map_err(to_kv)
+        })
+        .map_err(identity_err)
+    }
+
+    async fn remove_external_id(
+        &self,
+        user_id: &UserId,
+        provider: &str,
+        external_id: &str,
+    ) -> Result<(), StoreError> {
+        let key = (provider.to_string(), external_id.to_string());
+        let by_user = (
+            user_id.to_string(),
+            provider.to_string(),
+            external_id.to_string(),
+        );
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let owned = match self.external_ids.get(txn, &key).map_err(to_kv)? {
+                Some(bytes) => kv_decode::<ExternalIdRecord>(&bytes)?.user_id == user_id,
+                None => false,
+            };
+            if !owned {
+                return Err(to_kv(RowMissing(format!("{provider} {external_id}"))));
+            }
+            self.external_ids.delete(txn, &key).map_err(to_kv)?;
+            self.external_ids_by_user
+                .delete(txn, &by_user)
+                .map_err(to_kv)
+        })
+        .map_err(store_err)
+    }
+
+    async fn list_external_ids(
+        &self,
+        user_id: &UserId,
+    ) -> Result<Vec<ExternalIdRecord>, StoreError> {
+        let snap = self.backend.snapshot();
+        let prefix =
+            TypedKeyspace::<B::Keyspace, (String, String, String)>::prefix(&(user_id.to_string(),));
+        self.external_ids_by_user
+            .range(&snap, prefix)
+            .map(|item| {
+                let (_k, v) = item.map_err(|e| StoreError::Backend(e.to_string()))?;
+                decode(&v)
+            })
+            .collect()
+    }
+
+    async fn get_user_by_external_id(
+        &self,
+        provider: &str,
+        external_id: &str,
+    ) -> Result<Option<OwnedUserId>, StoreError> {
+        let snap = self.backend.snapshot();
+        let key = (provider.to_string(), external_id.to_string());
+        match self
+            .external_ids
+            .get(&snap, &key)
+            .map_err(|e| StoreError::Backend(e.to_string()))?
+        {
+            Some(bytes) => Ok(Some(decode::<ExternalIdRecord>(&bytes)?.user_id)),
+            None => Ok(None),
+        }
+    }
+
+    async fn experimental_features(
+        &self,
+        user_id: &UserId,
+    ) -> Result<BTreeMap<String, bool>, StoreError> {
+        let snap = self.backend.snapshot();
+        match self
+            .experimental_features
+            .get(&snap, &(user_id.to_string(),))
+            .map_err(|e| StoreError::Backend(e.to_string()))?
+        {
+            Some(bytes) => decode(&bytes),
+            None => Ok(BTreeMap::new()),
+        }
+    }
+
+    async fn set_experimental_features(
+        &self,
+        user_id: &UserId,
+        features: BTreeMap<String, bool>,
+    ) -> Result<(), StoreError> {
+        let key = (user_id.to_string(),);
+        let value = encode(&features)?;
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            self.experimental_features
+                .put(txn, &key, &value)
+                .map_err(to_kv)
+        })
+        .map_err(store_err)
+    }
+}
 
 #[async_trait::async_trait]
 impl<B: KvBackend> DeviceStore for TablesAuthStore<B> {

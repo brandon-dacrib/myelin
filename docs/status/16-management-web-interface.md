@@ -1,6 +1,38 @@
 # 16. Management web interface: status
 
-## Current update: 2026-09-28 (Users-page invite links and notices; branch `agent/users-page-dialogs`)
+## Current update: 2026-09-28 (a user's devices and identity; branch `users-devices-identity`)
+
+A user's page gains the controls for the thirteen devices-and-identity operations that became
+real in the admin API the same day (`docs/status/15-admin-api-and-modules.md`). Each lives in
+its own component under `src/pages/users/`, so `UserDetailPage.tsx` changed only where the old
+inline Sessions list was:
+
+- **Sessions** (`UserDevicesSection`): each device has a checkbox, **Rename** (a dialog; empty
+  clears the name) and **Sign out**; **Sign out selected (N)** signs the chosen ones out
+  together after a confirmation that says their keys go too.
+- **Email and phone** and **Linked identities** (`UserIdentitySection`): the bound addresses
+  with when they were added, and the upstream subjects with their provider, each removable
+  after a confirmation; an add form under each (a Kind select for email or phone). The
+  server's refusal is shown beside the field it names, and a conflict names the account that
+  has it. Read-only operators see the lists without the forms, and disabled Remove buttons.
+- **Experimental features, Push notifications, Account data** (`UserClientDataSection`): a
+  switch per known feature, described in words, saved as it is switched; the user's pushers;
+  their global account data as collapsible read-only JSON (shown, never edited).
+- Hooks in `src/api/user-identity.ts`; MSW handlers and fixtures
+  (`src/mocks/data/user-identity.ts`) that answer as the server does. No `schema.d.ts` change:
+  the operations were already in the contract.
+- **Vitest**: `src/pages/users/UserIdentity.test.tsx` (8): rename, bulk sign-out, add and
+  remove an address, a refusal beside the field, a conflict naming the owner, read-only
+  operators, a feature switch, pushers and account data.
+- **Against the real binary**: `web/e2e-real/users-devices-and-identity.spec.ts` (1 flow,
+  passed against `hs serve`): every control is checked through the person's own client
+  (rename seen in their device list, the signed-out token `401` and its keys gone from
+  `/keys/query`, sign-in by the added email then refused once removed, `users.lookup` by the
+  linked subject, the feature on in the API), and every write is in the audit log.
+  Screenshots `docs/design/screenshots/users-identity-rename-real.png`,
+  `users-identity-page-real.png`.
+
+## Earlier update: 2026-09-28 (Users-page invite links and notices; branch `agent/users-page-dialogs`)
 
 The audit of the superseded `worktree-agent-aafb071194d2144c6` branch (registration tokens,
 reports, server notices, invite links) listed two things main lacked: invite-by-link and

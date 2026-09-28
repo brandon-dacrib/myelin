@@ -3,13 +3,11 @@ import { useParams, Link } from "@tanstack/react-router";
 import { ChevronLeft } from "lucide-react";
 import {
   useUser,
-  useUserDevices,
   useLockUser,
   useUnlockUser,
   useSuspendUser,
   useUnsuspendUser,
   useLogoutUser,
-  useSignOutDevice,
   useDeactivateUser,
 } from "@/api/users";
 import { Button } from "@/components/ui/button/Button";
@@ -24,17 +22,14 @@ import { toast } from "@/components/ui/toast/toast-store";
 import { hasScope } from "@/lib/auth";
 import { ResetPasswordDialog } from "./users/ResetPasswordDialog";
 import { SendNoticeDialog } from "./settings/SendNoticeDialog";
+import { UserDevicesSection } from "./users/UserDevicesSection";
+import { UserIdentitySection } from "./users/UserIdentitySection";
+import { UserClientDataSection } from "./users/UserClientDataSection";
 
 /** `/users/:id` — flows.md flow 2 steps 2-5: understand and act on a user. */
 export function UserDetailPage() {
   const { userId } = useParams({ from: "/users/$userId" });
   const { data: user, isLoading, isError, error, refetch } = useUser(userId);
-  const {
-    data: devices,
-    isError: devicesIsError,
-    error: devicesError,
-    refetch: refetchDevices,
-  } = useUserDevices(userId);
   const canWrite = hasScope("admin:write");
   const canModerate = hasScope("moderation:write");
 
@@ -43,7 +38,6 @@ export function UserDetailPage() {
   const suspend = useSuspendUser();
   const unsuspend = useUnsuspendUser();
   const logout = useLogoutUser();
-  const signOutDevice = useSignOutDevice();
   const deactivate = useDeactivateUser();
   const [resetOpen, setResetOpen] = useState(false);
   const [noticeOpen, setNoticeOpen] = useState(false);
@@ -268,62 +262,9 @@ export function UserDetailPage() {
             <Fact label="Appservice" value={user.appservice_id ?? "—"} />
           </dl>
 
-          <h2 className="mt-8 text-md font-medium text-text">Sessions</h2>
-          {devicesIsError ? (
-            <QueryProblemState
-              error={devicesError}
-              resource="this user's sessions"
-              onRetry={() => refetchDevices()}
-            />
-          ) : (devices?.items.length ?? 0) === 0 ? (
-            <p className="mt-3 text-sm text-text-muted">No devices.</p>
-          ) : (
-            <ul className="mt-3 divide-y divide-border rounded-md border border-border">
-              {devices?.items.map((d) => (
-                <li key={d.device_id} className="flex items-center justify-between gap-3 px-4 py-3">
-                  <div>
-                    <p className="font-identifier text-text">{d.device_id}</p>
-                    {d.display_name && <p className="text-xs text-text-muted">{d.display_name}</p>}
-                  </div>
-                  <div className="flex items-center gap-3 text-xs text-text-muted">
-                    {d.last_seen_ip && <span className="font-identifier">{d.last_seen_ip}</span>}
-                    <RelativeTime at={d.last_seen_at} />
-                    <Dialog>
-                      <DialogTrigger asChild>
-                        <Button variant="ghost" size="sm" disabled={!canModerate}>
-                          Sign out
-                        </Button>
-                      </DialogTrigger>
-                      <DialogContent
-                        title={`Sign out ${d.display_name ?? d.device_id}?`}
-                        description="That device signs out immediately. The others stay signed in."
-                        footer={
-                          <>
-                            <DialogClose asChild>
-                              <Button variant="secondary">Cancel</Button>
-                            </DialogClose>
-                            <DialogClose asChild>
-                              <Button
-                                variant="danger"
-                                onClick={() =>
-                                  signOutDevice.mutate(
-                                    { userId: id, deviceId: d.device_id },
-                                    { onSuccess: () => toast({ title: "Signed out" }) },
-                                  )
-                                }
-                              >
-                                Sign out
-                              </Button>
-                            </DialogClose>
-                          </>
-                        }
-                      />
-                    </Dialog>
-                  </div>
-                </li>
-              ))}
-            </ul>
-          )}
+          <UserDevicesSection userId={id} canWrite={canWrite} canModerate={canModerate} />
+          <UserIdentitySection userId={id} canWrite={canWrite} />
+          <UserClientDataSection userId={id} canWrite={canWrite} />
         </div>
 
         <div>

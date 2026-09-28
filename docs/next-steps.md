@@ -391,7 +391,7 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 | Client-server API | ~75% | 317/384 csapi assertions, 78/106 top-level (run 11); two real Element sessions sign in, create an encrypted room, invite, accept, and read each other's encrypted messages. The number understates the day: four of the fixes behind it were `/sync` silently losing events, which no percentage shows |
 | Storage, rooms, state resolution | ~85% | the engine underneath; 1600+ tests, two backends through one conformance suite, state bake-off done |
 | Configuration and first run | ~90% | database-backed, editable in the UI, one command from nothing to a working server |
-| Admin API | ~65% | 102 of 158 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Bridges 26/26, Media 9/9, Cluster 6/6, Config 6/6, RegistrationTokens 5/5, Server 5/5, Reports 4/4, Statistics 4/4, AuditLog 3/3, Recovery 3/3, Tasks 3/3, ServerNotices 2/2, Setup 2/2, Events 1/1, Users 14/41, Rooms 6/23, Federation 3/7, and Migration 0/8 |
+| Admin API | ~73% | 115 of 158 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Bridges 26/26, Media 9/9, Cluster 6/6, Config 6/6, RegistrationTokens 5/5, Server 5/5, Reports 4/4, Statistics 4/4, AuditLog 3/3, Recovery 3/3, Tasks 3/3, ServerNotices 2/2, Setup 2/2, Events 1/1, Users 27/41, Rooms 6/23, Federation 3/7, and Migration 0/8 |
 | Management web interface | ~80% | users (with devices, sign-out and password reset), rooms (with members), bridges (the catalogue, the wizard with the bridge's own config, the runbook, sign-in guides), federation destinations, media (previews, quarantine, protection, deletion, cache purge), registration tokens and invite links, server notices, configuration (lists, variants and maps as forms, decision 0010), the Cluster page (replicas, the shard map, drain and undrain) and the audit log are real against the real server; the Reports, Tasks and Statistics pages and the Overview sparklines are not built on their (now real) operations |
 | **Federation** | **~30%** | 75/250 assertions, 14/88 top-level (run 7); a user here joins a room hosted elsewhere through the client API, messages flow both ways between two real servers, and the room's history from before the join is fetched as the client scrolls back; the outbound queue survives a restart and is shard-gated; invites, leaves, knocks and restricted joins cross servers; typing, receipts, presence, device lists, cross-signing keys (`m.signing_key_update`) and to-device messages cross in both directions, with EDU metrics; in cluster mode a non-owning replica drops request-born EDUs instead of forwarding them |
 | Bridges | ~75% | heisenbridge works end to end both directions (`docs/bridges/heisenbridge.md`); mautrix-whatsapp, added through the wizard, connects and starts in appservice-mode encryption (`docs/bridges/mautrix.md`); all 26 bridge operations are real; offerings and per-user instances (RFC 0017) run end to end against the real binary with the `elsewhere` runtime, a real heisenbridge reaching `ready` from the rendered files and the interface's flow passing as Playwright against the real server; no mautrix bridge has carried a message yet, because signing in needs a phone; the `cluster` runtime and the operator have not run against Kubernetes |
@@ -543,7 +543,7 @@ edit one is not. New settings and operations arrive with their interface control
    not yet measured under Complement), ~~Tasks 0/3~~ **3/3**, ~~Statistics 1/4~~ **4/4**
    (Reports, Tasks and Statistics server side only; their pages are queue items), ~~Cluster
    1/6~~ **6/6, 2026-09-28** (and the Cluster page; decision 0012),
-   then the long tails of Users 14/41 and Rooms 6/23. `python3 tools/admin_api_coverage.py
+   then the long tails of Users 14/41 (**27/41 since 2026-09-28**, item 2h) and Rooms 6/23. `python3 tools/admin_api_coverage.py
    --list` is the checklist. ~~Alongside it, decision 0010: the Configuration page's JSON
    textarea becomes structured editors, and `appservices.registration_files` becomes an
    importer-only migration path.~~ **Done 2026-09-27** (`config-structured-editors`,
@@ -588,6 +588,24 @@ edit one is not. New settings and operations arrive with their interface control
    - **2g.** Bulk media operations as spawned tasks (`state.tasks.spawn`, cancellable, with
      progress), with the Media page following the task instead of reading the immediate
      answer. Today they run inline and are recorded as finished tasks.
+   - **2h.** Users' long tail, the devices-and-identity half: **done 2026-09-28**
+     (`users-devices-identity`). Thirteen operations, each with a control on a user's page:
+     `users.devices.get/update/bulk_delete` (rename a device, pick several and sign them out;
+     their keys go with them), `users.threepids.list/add/remove` (an address bound here signs
+     its owner in with `m.id.thirdparty`, is listed by `GET /account/3pid`, and finds them in
+     `users.lookup`), `users.external_ids.list/add/remove` (`users.lookup` by provider and
+     subject), `users.experimental_features.get/put` (Synapse's three per-user names, stored,
+     merged, validated), `users.account_data.list` and `users.pushers.list` (read-only).
+     `users.create` now binds the `threepids` and `external_ids` it is given instead of
+     refusing them, and `users.lookup` works against the real directory (it answered 503).
+     Proved through the real binary (`crates/hs-cli/tests/admin_user_identity.rs`, restart
+     included) and the page against `hs serve`
+     (`web/e2e-real/users-devices-and-identity.spec.ts`). Users is 27/41; the other half
+     (suspend, shadow-ban, redact, rate limits, `login_as`, sessions, memberships, statistics,
+     media) is a parallel branch. Left here: no upstream OIDC/SAML/LDAP login exists yet, so
+     an external id is a lookup key and not yet a way in; no experimental feature changes
+     behaviour yet (none of the three is gated per user); account data is global only (room
+     account data needs the user's rooms).
 3. Federation completeness: ~~invites, leaves and knocks over federation; EDUs (typing,
    receipts, presence, device lists)~~ **done 2026-09-27** (`federation-membership`,
    `federation-edus`); ~~`createRoom`'s `invite` list for remote users, restricted joins over

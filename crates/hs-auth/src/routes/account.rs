@@ -106,36 +106,40 @@ pub async fn post_account_deactivate(
 /// `GET /account/3pid`: the third-party identifiers (email addresses, phone numbers) this
 /// homeserver has associated with the caller's account.
 ///
-/// **This server associates none, so the answer is always an empty list** — and an empty list is
-/// the spec-complete answer for an account with no third-party identifiers, not a stub. The
-/// response shape is exactly what
-/// `refs/matrix-spec/data/api/client-server/administrative_contact.yaml` defines; there is simply
-/// nothing to put in it.
+/// Since 2026-09-28 these are real: an administrator binds them (`users.threepids.add` in the
+/// admin API, [`crate::store::IdentityStore::add_threepid`]), and each is listed here with the
+/// `added_at`/`validated_at` timestamps the spec makes required (an administrator's binding is
+/// validated when it is made). A user still cannot add, bind or remove one themself -- that
+/// needs a mailer or SMS gateway and a validation-session store, or an identity-server client,
+/// none of which exist -- so `GET /_matrix/client/v3/capabilities` goes on reporting
+/// `m.3pid_changes: {"enabled": false}`.
 ///
-/// That is a statement about this server, not a guess. Nothing here can create a 3PID
-/// association: `POST /account/3pid/add` needs a validated session from `.../requestToken`, which
-/// needs a mailer or SMS gateway and a validation-session store, and `POST /account/3pid/bind`
-/// needs an identity-server client. None of those exist, which is exactly why
-/// `GET /_matrix/client/v3/capabilities` already reports `m.3pid_changes: {"enabled": false}`
-/// (`crates/hs-cli/src/capabilities.rs`) — the spec's own way for a server to say it does not do
-/// this. `UserStore::bind_threepid` is not a counter-example: it is a login-by-email index
-/// (`crate::routes::login`'s `m.id.thirdparty` identifier), keyed `(medium, address)` with the
-/// user ID as its only value, reachable from no HTTP route, and it stores neither of the
-/// `added_at`/`validated_at` timestamps the spec makes **required** on every entry here. Making
-/// this endpoint report real rows means a by-user index over that keyspace *and* a value format
-/// that carries both timestamps — worth doing when something can actually add a 3PID, and
-/// dishonest before then, because the alternative is inventing timestamps.
-///
-/// It answers `200` rather than `501` because the question has a true answer. Element's Settings
-/// page calls this on open and shows the user a visible error when it fails; "you have no
-/// third-party identifiers" is both what a client needs to render that page and what is actually
-/// the case.
-///
-/// The [`Requester`] parameter is the point of this signature even though the body ignores it:
-/// extracting it is what enforces the endpoint's `accessTokenBearer` security requirement, so an
-/// unauthenticated caller gets `401` instead of a list.
-pub async fn get_account_3pid(_requester: Requester) -> Json<Value> {
-    Json(json!({"threepids": []}))
+/// An account with none gets an empty list, which is the spec-complete answer, not a stub:
+/// Element's Settings page calls this on open and shows a visible error when it fails.
+pub async fn get_account_3pid(
+    State(state): State<AuthState>,
+    requester: Requester,
+) -> Result<Json<Value>, MatrixError> {
+    let threepids = state
+        .store
+        .list_threepids(&requester.user_id)
+        .await
+        .map_err(|error| {
+            tracing::error!(user_id = %requester.user_id, %error, "listing 3PIDs failed");
+            MatrixError::internal()
+        })?;
+    let threepids: Vec<Value> = threepids
+        .into_iter()
+        .map(|t| {
+            json!({
+                "medium": t.medium,
+                "address": t.address,
+                "added_at": t.added_at_ms,
+                "validated_at": t.validated_at_ms,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "threepids": threepids })))
 }
 
 /// `GET /password_policy`: unauthenticated, so clients can show requirements before registration.
@@ -347,12 +351,34 @@ mod tests {
     /// missing key is the same broken page by a different route.
     #[tokio::test]
     async fn account_3pid_reports_an_empty_list_for_an_account_with_none() {
-        let (_state, requester) = state_with_user("hunter2345").await;
-        let Json(body) = get_account_3pid(requester).await;
+        let (state, requester) = state_with_user("hunter2345").await;
+        let Json(body) = get_account_3pid(State(state), requester).await.unwrap();
         assert_eq!(
             body["threepids"],
             json!([]),
             "threepids must be present and an empty array, not absent: {body}"
+        );
+    }
+
+    /// A 3PID an administrator bound is listed with both timestamps the spec requires.
+    #[tokio::test]
+    async fn account_3pid_lists_what_an_administrator_bound() {
+        let (state, requester) = state_with_user("hunter2345").await;
+        state
+            .store
+            .add_threepid(crate::store::ThreepidRecord {
+                user_id: requester.user_id.clone(),
+                medium: "email".to_owned(),
+                address: "alice@example.org".to_owned(),
+                added_at_ms: 1_000,
+                validated_at_ms: 1_000,
+            })
+            .await
+            .unwrap();
+        let Json(body) = get_account_3pid(State(state), requester).await.unwrap();
+        assert_eq!(
+            body["threepids"],
+            json!([{"medium": "email", "address": "alice@example.org", "added_at": 1000, "validated_at": 1000}])
         );
     }
 

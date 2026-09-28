@@ -47,7 +47,8 @@ pub fn router() -> Router<AuthState> {
             "/account/deactivate",
             post(account::post_account_deactivate),
         )
-        // `GET` only: this server has no way to add, bind or delete a 3PID, and says so through
+        // `GET` only: a user cannot add, bind or delete a 3PID themself (only an administrator
+        // can, through `users.threepids.*`), and the server says so through
         // `m.3pid_changes: {"enabled": false}` in `GET /capabilities`. Registering the `POST
         // /account/3pid/*` half would claim a surface that cannot work -- see
         // `account::get_account_3pid`'s doc comment for what each of them would need first.

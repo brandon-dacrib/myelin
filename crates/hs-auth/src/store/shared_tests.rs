@@ -435,9 +435,146 @@ pub(crate) async fn consume_login_token_missing_returns_none<S: AuthStore>(s: &S
     assert!(result.is_none());
 }
 
+fn threepid(user: &ruma::UserId, medium: &str, address: &str) -> crate::store::ThreepidRecord {
+    crate::store::ThreepidRecord {
+        user_id: user.to_owned(),
+        medium: medium.to_owned(),
+        address: address.to_owned(),
+        added_at_ms: 7,
+        validated_at_ms: 7,
+    }
+}
+
+fn external(user: &ruma::UserId, provider: &str, id: &str) -> crate::store::ExternalIdRecord {
+    crate::store::ExternalIdRecord {
+        user_id: user.to_owned(),
+        provider: provider.to_owned(),
+        external_id: id.to_owned(),
+        added_at_ms: 9,
+    }
+}
+
+/// A 3PID belongs to one account: listed for it, not for anyone else, refused to a second
+/// account, idempotent for the first, and gone from both the list and login once removed.
+pub(crate) async fn threepids_are_listed_unique_and_removable<S: AuthStore>(s: &S) {
+    let alice = user_id!("@alice:example.org");
+    let bob = user_id!("@bob:example.org");
+    s.add_threepid(threepid(alice, "msisdn", "447700900001"))
+        .await
+        .unwrap();
+    s.add_threepid(threepid(alice, "email", "alice@example.org"))
+        .await
+        .unwrap();
+    s.add_threepid(threepid(alice, "email", "ALICE@example.org"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.add_threepid(threepid(bob, "email", "alice@example.org"))
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let listed = s.list_threepids(alice).await.unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|t| (t.medium.as_str(), t.address.as_str()))
+            .collect::<Vec<_>>(),
+        [("email", "alice@example.org"), ("msisdn", "447700900001")]
+    );
+    assert_eq!(listed[0].added_at_ms, 7);
+    assert!(s.list_threepids(bob).await.unwrap().is_empty());
+
+    assert!(matches!(
+        s.remove_threepid(bob, "email", "alice@example.org").await,
+        Err(StoreError::NotFound(_))
+    ));
+    s.remove_threepid(alice, "email", "Alice@Example.org")
+        .await
+        .unwrap();
+    assert!(
+        s.get_user_by_threepid("email", "alice@example.org")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(s.list_threepids(alice).await.unwrap().len(), 1);
+    // Freed, so somebody else may have it now.
+    s.add_threepid(threepid(bob, "email", "alice@example.org"))
+        .await
+        .unwrap();
+}
+
+/// External ids: unique per `(provider, subject)`, case-sensitive, listed per account,
+/// removable only by their owner.
+pub(crate) async fn external_ids_are_listed_unique_and_removable<S: AuthStore>(s: &S) {
+    let alice = user_id!("@alice:example.org");
+    let bob = user_id!("@bob:example.org");
+    s.add_external_id(external(alice, "oidc", "sub-1"))
+        .await
+        .unwrap();
+    s.add_external_id(external(alice, "oidc", "sub-1"))
+        .await
+        .unwrap();
+    s.add_external_id(external(alice, "ldap", "uid=alice"))
+        .await
+        .unwrap();
+    s.add_external_id(external(bob, "oidc", "SUB-1"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.add_external_id(external(bob, "oidc", "sub-1")).await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert_eq!(
+        s.get_user_by_external_id("oidc", "sub-1").await.unwrap(),
+        Some(alice.to_owned())
+    );
+    assert_eq!(
+        s.get_user_by_external_id("oidc", "SUB-1").await.unwrap(),
+        Some(bob.to_owned())
+    );
+    let listed = s.list_external_ids(alice).await.unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|e| (e.provider.as_str(), e.external_id.as_str()))
+            .collect::<Vec<_>>(),
+        [("ldap", "uid=alice"), ("oidc", "sub-1")]
+    );
+    assert!(matches!(
+        s.remove_external_id(bob, "oidc", "sub-1").await,
+        Err(StoreError::NotFound(_))
+    ));
+    s.remove_external_id(alice, "oidc", "sub-1").await.unwrap();
+    assert!(
+        s.get_user_by_external_id("oidc", "sub-1")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(s.list_external_ids(alice).await.unwrap().len(), 1);
+}
+
+pub(crate) async fn experimental_features_round_trip<S: AuthStore>(s: &S) {
+    let alice = user_id!("@alice:example.org");
+    assert!(s.experimental_features(alice).await.unwrap().is_empty());
+    let features: std::collections::BTreeMap<String, bool> =
+        [("msc3881".to_owned(), true), ("msc4222".to_owned(), false)].into();
+    s.set_experimental_features(alice, features.clone())
+        .await
+        .unwrap();
+    assert_eq!(s.experimental_features(alice).await.unwrap(), features);
+    assert!(
+        s.experimental_features(user_id!("@bob:example.org"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 pub(crate) async fn threepid_lookup_is_case_insensitive_on_address<S: AuthStore>(s: &S) {
     let uid = user_id!("@eve:example.org").to_owned();
-    s.bind_threepid(&uid, "email", "Eve@Example.Org")
+    s.add_threepid(threepid(&uid, "email", "Eve@Example.Org"))
         .await
         .unwrap();
     assert_eq!(
@@ -598,6 +735,9 @@ pub(crate) async fn run_all<S: AuthStore>(make_store: impl Fn() -> S) {
     login_token_expiry_is_enforced(&make_store()).await;
     consume_login_token_missing_returns_none(&make_store()).await;
     threepid_lookup_is_case_insensitive_on_address(&make_store()).await;
+    threepids_are_listed_unique_and_removable(&make_store()).await;
+    external_ids_are_listed_unique_and_removable(&make_store()).await;
+    experimental_features_round_trip(&make_store()).await;
     uia_session_tracks_completed_stages_and_data(&make_store()).await;
     uia_session_exists_is_false_for_unknown_id(&make_store()).await;
     uia_operations_on_missing_session_are_not_found(&make_store()).await;

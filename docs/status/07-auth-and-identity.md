@@ -2,13 +2,49 @@
 
 Track brief: `docs/workstreams/07-auth-and-identity.md`. Owner crate: `hs-auth`.
 
-Last updated: 2026-09-26 (session 8: administrator recovery, below). Session 7 (2026-09-19)
+Last updated: 2026-09-28 (session 9: devices, 3PIDs, external ids, below). Session 7 (2026-09-19)
 audited the login handshake against a real browser client
 (Element Web was being pointed at this server for the first time in the same integration window),
 found and fixed a real case-sensitivity bug in `POST /login`, re-confirmed `/capabilities` is still
 unfixed (held by another track this session), checked for Element-Web findings in
 `docs/status/16-management-web-interface.md` (none landed as of this write-up), and designed
 (without implementing) a UIA session-correlation scheme left open at the end of session 5).
+
+## Session 9 (2026-09-28): a user's devices, 3PIDs, external ids and experimental features
+
+The devices-and-identity half of Users' long tail in the admin API, with controls on a user's
+page. What landed in this crate:
+
+- **`store::IdentityStore`**, a sixth store trait (so `AuthStore` is now six), on both
+  backends with shared tests: 3PIDs (`add_threepid`/`remove_threepid`/`list_threepids`,
+  `ThreepidRecord` with `added_at_ms`/`validated_at_ms`), upstream subject links
+  (`add_external_id`/`remove_external_id`/`list_external_ids`/`get_user_by_external_id`,
+  `ExternalIdRecord`), and per-user experimental-feature flags. Each identifier is unique to one
+  account (`StoreError::Conflict` otherwise); adding one the account already has is a no-op. New
+  keyspaces: `hs_auth.threepids_by_user`, `hs_auth.external_ids`,
+  `hs_auth.external_ids_by_user`, `hs_auth.experimental_features`; `hs_auth.threepids` rows are
+  now whole `ThreepidRecord`s (an old row holding only a user ID still resolves for login).
+  `UserStore::bind_threepid` is gone; it had no caller outside tests.
+- **`AuthStoreUserDirectory` implements `hs_admin::user_identity::UserIdentitySource`**:
+  `get_device`, `rename_device` (announced to contacts as a device-list change),
+  `delete_devices` (all or nothing: every device is checked first; then each one's tokens and
+  the device go, and one device-list notification lets `hs-e2e` remove every gone device's
+  keys), the 3PID, external-id and experimental-feature operations. It also implements
+  `UserDirectory::lookup_user` now (`users.lookup` used to answer 503 on the real server), and
+  `create_user` binds the `threepids` and `external_ids` it is given (checked for conflicts
+  before the account is made) instead of refusing them.
+- **`GET /account/3pid` lists real rows**, with both required timestamps. `m.3pid_changes`
+  stays `false`: only an administrator binds one.
+
+Verified through the real binary: `crates/hs-cli/tests/admin_user_identity.rs` (a device
+renamed for its owner; a bulk sign-out that kills the token and stops `/keys/query` serving the
+keys; an address that signs in by `m.id.thirdparty` until removed; lookups by 3PID and external
+id; conflicts; audit entries; log lines; a restart that keeps them), and
+`web/e2e-real/users-devices-and-identity.spec.ts` against `hs serve`.
+
+Not done: there is no upstream OIDC/SAML/LDAP login yet, so an external id is a lookup key and
+not a way in; deactivation does not unbind 3PIDs (Synapse does); no self-service 3PID flow
+(needs a mailer or SMS gateway).
 
 ## Session 8 (2026-09-26): administrator recovery
 

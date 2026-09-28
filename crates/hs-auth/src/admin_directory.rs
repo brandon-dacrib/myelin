@@ -27,18 +27,28 @@
 //! - `erased`: account erasure is a Phase 1/2 lifecycle feature this crate has not built yet (see
 //!   this track's brief's "account lifecycle" line).
 //!
+//! The same type also implements `hs_admin::user_identity::UserIdentitySource`: one device read
+//! or renamed, several signed out at once, the account's 3PIDs and upstream-provider subject
+//! links ([`crate::store::IdentityStore`]), and its experimental-feature flags. `users.lookup`
+//! finds an account by either kind of link.
+//!
 //! [`hs_admin::sources::UserFilter::q`] is matched against `user_id` only -- not the display
 //! name -- unchanged by this pass; the free-text filter could reasonably grow to search
 //! `display_name` too, but no caller has asked for that yet.
 
 use std::sync::Arc;
 
-use hs_admin::model::{AdminDevice, AdminPasswordReset, AdminUser};
-use hs_admin::sources::{SourceError, UserCreateRequest, UserDirectory, UserFilter};
+use std::collections::BTreeMap;
+
+use hs_admin::model::{AdminDevice, AdminPasswordReset, AdminUser, ExternalId, ThreePid};
+use hs_admin::sources::{
+    SourceError, UserCreateRequest, UserDirectory, UserFilter, UserLookupQuery,
+};
+use hs_admin::user_identity::UserIdentitySource;
 
 use crate::admin_verifier::format_rfc3339_ms;
 use crate::state::AuthState;
-use crate::store::{AuthStore, StoreError, UserRecord};
+use crate::store::{AuthStore, ExternalIdRecord, StoreError, ThreepidRecord, UserRecord};
 
 /// The user directory `hs-admin`'s `/users` handlers call, over this crate's own [`AuthStore`].
 pub struct AuthStoreUserDirectory {
@@ -114,8 +124,283 @@ fn parse_user_id(user_id: &str) -> Result<ruma::OwnedUserId, SourceError> {
     ruma::UserId::parse(user_id).map_err(|e| SourceError::Invalid(e.to_string()))
 }
 
+impl AuthStoreUserDirectory {
+    /// Now, from the server's clock when there is one (so tests can pin it), else the system's.
+    fn now_ms(&self) -> u64 {
+        match &self.accounts {
+            Some(state) => state.now_ms(),
+            None => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0),
+        }
+    }
+
+    /// The account, or [`SourceError::NotFound`].
+    async fn existing_user(&self, user_id: &str) -> Result<ruma::OwnedUserId, SourceError> {
+        let uid = parse_user_id(user_id).map_err(|_| SourceError::NotFound)?;
+        match self.store.get_user(&uid).await.map_err(store_unavailable)? {
+            Some(_) => Ok(uid),
+            None => Err(SourceError::NotFound),
+        }
+    }
+
+    async fn notify_devices_changed(&self, uid: &ruma::UserId) {
+        if let Some(state) = &self.accounts {
+            state.notify_device_list_changed(uid).await;
+        }
+    }
+}
+
+fn to_admin_device(d: crate::store::DeviceRecord) -> AdminDevice {
+    AdminDevice {
+        device_id: d.device_id.to_string(),
+        display_name: d.display_name,
+        last_seen_ip: d.last_seen_ip,
+        last_seen_at: d.last_seen_ms.map(format_rfc3339_ms),
+    }
+}
+
+fn to_admin_threepid(t: ThreepidRecord) -> ThreePid {
+    ThreePid {
+        medium: t.medium,
+        address: t.address,
+        added_at: Some(format_rfc3339_ms(t.added_at_ms)),
+    }
+}
+
+fn map_identity_error(err: StoreError) -> SourceError {
+    match err {
+        StoreError::NotFound(_) => SourceError::NotFound,
+        StoreError::Conflict(detail) => SourceError::Conflict(detail),
+        other => SourceError::Unavailable(other.to_string()),
+    }
+}
+
+/// The admin API's devices-and-identity operations, over the same store as the rest of this
+/// directory. Each method answers [`SourceError::NotFound`] for an account this server does
+/// not have.
+#[async_trait::async_trait]
+impl UserIdentitySource for AuthStoreUserDirectory {
+    async fn get_device(&self, user_id: &str, device_id: &str) -> Result<AdminDevice, SourceError> {
+        let uid = self.existing_user(user_id).await?;
+        let device_id: ruma::OwnedDeviceId = device_id.into();
+        self.store
+            .get_device(&uid, &device_id)
+            .await
+            .map_err(store_unavailable)?
+            .map(to_admin_device)
+            .ok_or(SourceError::NotFound)
+    }
+
+    /// What `PUT /devices/{deviceId}` does, done by an administrator; the rename reaches the
+    /// user's contacts as a device-list change, the same as a self-service one.
+    async fn rename_device(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        display_name: Option<String>,
+    ) -> Result<AdminDevice, SourceError> {
+        let uid = self.existing_user(user_id).await?;
+        let device_id: ruma::OwnedDeviceId = device_id.into();
+        self.store
+            .set_display_name(&uid, &device_id, display_name)
+            .await
+            .map_err(map_identity_error)?;
+        self.notify_devices_changed(&uid).await;
+        self.get_device(user_id, device_id.as_str()).await
+    }
+
+    /// Checks every device first, then signs each out and deletes it, then announces the change
+    /// once: `hs-e2e`'s notifier removes the keys of every device that is gone, so none of them
+    /// is served by `/keys/query` again.
+    async fn delete_devices(
+        &self,
+        user_id: &str,
+        device_ids: &[String],
+    ) -> Result<(), SourceError> {
+        let uid = self.existing_user(user_id).await?;
+        let mut ids = Vec::with_capacity(device_ids.len());
+        for device_id in device_ids {
+            let device_id: ruma::OwnedDeviceId = device_id.as_str().into();
+            if self
+                .store
+                .get_device(&uid, &device_id)
+                .await
+                .map_err(store_unavailable)?
+                .is_none()
+            {
+                return Err(SourceError::NotFound);
+            }
+            ids.push(device_id);
+        }
+        for device_id in &ids {
+            self.store
+                .delete_access_tokens_for_device(&uid, device_id)
+                .await
+                .map_err(store_unavailable)?;
+            self.store
+                .delete_device(&uid, device_id)
+                .await
+                .map_err(store_unavailable)?;
+        }
+        self.notify_devices_changed(&uid).await;
+        Ok(())
+    }
+
+    async fn list_threepids(&self, user_id: &str) -> Result<Vec<ThreePid>, SourceError> {
+        let uid = self.existing_user(user_id).await?;
+        Ok(self
+            .store
+            .list_threepids(&uid)
+            .await
+            .map_err(store_unavailable)?
+            .into_iter()
+            .map(to_admin_threepid)
+            .collect())
+    }
+
+    async fn add_threepid(
+        &self,
+        user_id: &str,
+        threepid: ThreePid,
+    ) -> Result<ThreePid, SourceError> {
+        let uid = self.existing_user(user_id).await?;
+        let now = self.now_ms();
+        self.store
+            .add_threepid(ThreepidRecord {
+                user_id: uid.clone(),
+                medium: threepid.medium.clone(),
+                address: threepid.address.clone(),
+                added_at_ms: now,
+                validated_at_ms: now,
+            })
+            .await
+            .map_err(map_identity_error)?;
+        // Binding one the account already had keeps the first binding; answer that one.
+        let lower = threepid.address.to_ascii_lowercase();
+        self.store
+            .list_threepids(&uid)
+            .await
+            .map_err(store_unavailable)?
+            .into_iter()
+            .find(|t| t.medium == threepid.medium && t.address.to_ascii_lowercase() == lower)
+            .map(to_admin_threepid)
+            .ok_or_else(|| SourceError::Unavailable("the 3PID was not stored".to_owned()))
+    }
+
+    async fn remove_threepid(
+        &self,
+        user_id: &str,
+        medium: &str,
+        address: &str,
+    ) -> Result<(), SourceError> {
+        let uid = self.existing_user(user_id).await?;
+        self.store
+            .remove_threepid(&uid, medium, address)
+            .await
+            .map_err(map_identity_error)
+    }
+
+    async fn list_external_ids(&self, user_id: &str) -> Result<Vec<ExternalId>, SourceError> {
+        let uid = self.existing_user(user_id).await?;
+        Ok(self
+            .store
+            .list_external_ids(&uid)
+            .await
+            .map_err(store_unavailable)?
+            .into_iter()
+            .map(|e| ExternalId {
+                provider: e.provider,
+                external_id: e.external_id,
+            })
+            .collect())
+    }
+
+    async fn add_external_id(
+        &self,
+        user_id: &str,
+        external_id: ExternalId,
+    ) -> Result<ExternalId, SourceError> {
+        let uid = self.existing_user(user_id).await?;
+        self.store
+            .add_external_id(ExternalIdRecord {
+                user_id: uid,
+                provider: external_id.provider.clone(),
+                external_id: external_id.external_id.clone(),
+                added_at_ms: self.now_ms(),
+            })
+            .await
+            .map_err(map_identity_error)?;
+        Ok(external_id)
+    }
+
+    async fn remove_external_id(
+        &self,
+        user_id: &str,
+        provider: &str,
+        external_id: &str,
+    ) -> Result<(), SourceError> {
+        let uid = self.existing_user(user_id).await?;
+        self.store
+            .remove_external_id(&uid, provider, external_id)
+            .await
+            .map_err(map_identity_error)
+    }
+
+    async fn experimental_features(
+        &self,
+        user_id: &str,
+    ) -> Result<BTreeMap<String, bool>, SourceError> {
+        let uid = self.existing_user(user_id).await?;
+        self.store
+            .experimental_features(&uid)
+            .await
+            .map_err(store_unavailable)
+    }
+
+    async fn set_experimental_features(
+        &self,
+        user_id: &str,
+        features: BTreeMap<String, bool>,
+    ) -> Result<BTreeMap<String, bool>, SourceError> {
+        let uid = self.existing_user(user_id).await?;
+        self.store
+            .set_experimental_features(&uid, features)
+            .await
+            .map_err(store_unavailable)?;
+        self.store
+            .experimental_features(&uid)
+            .await
+            .map_err(store_unavailable)
+    }
+}
+
 #[async_trait::async_trait]
 impl UserDirectory for AuthStoreUserDirectory {
+    /// `users.lookup`: the account a 3PID is bound to, or an upstream subject is linked to.
+    async fn lookup_user(&self, query: UserLookupQuery) -> Result<Option<AdminUser>, SourceError> {
+        let found = match query {
+            UserLookupQuery::Threepid { medium, address } => self
+                .store
+                .get_user_by_threepid(&medium, address.trim())
+                .await
+                .map_err(store_unavailable)?,
+            UserLookupQuery::ExternalId {
+                provider,
+                external_id,
+            } => self
+                .store
+                .get_user_by_external_id(&provider, &external_id)
+                .await
+                .map_err(store_unavailable)?,
+        };
+        match found {
+            Some(uid) => self.get_user(uid.as_str()).await,
+            None => Ok(None),
+        }
+    }
+
     async fn get_user(&self, user_id: &str) -> Result<Option<AdminUser>, SourceError> {
         let uid = parse_user_id(user_id)?;
         match self.store.get_user(&uid).await.map_err(store_unavailable)? {
@@ -195,9 +480,11 @@ impl UserDirectory for AuthStoreUserDirectory {
     ///
     /// A password is required. An account without one could only ever be signed in to through
     /// SSO, which this server does not offer yet; creating one would be creating an account
-    /// nobody can use. `threepids`, `external_ids` and `user_type` are refused rather than
-    /// ignored, for the same reason `users.update` refuses the fields it cannot apply: a `201`
-    /// that silently dropped part of the request would be a lie about what now exists.
+    /// nobody can use. `threepids` and `external_ids` are bound as `users.threepids.add` and
+    /// `users.external_ids.add` would bind them, after checking that no other account has any of
+    /// them (a `409` then, and no account is made). `user_type` is refused rather than ignored,
+    /// for the same reason `users.update` refuses the fields it cannot apply: a `201` that
+    /// silently dropped part of the request would be a lie about what now exists.
     async fn create_user(&self, request: UserCreateRequest) -> Result<AdminUser, SourceError> {
         let Some(state) = &self.accounts else {
             return Err(SourceError::Unavailable(
@@ -205,16 +492,66 @@ impl UserDirectory for AuthStoreUserDirectory {
                     .to_string(),
             ));
         };
-        for (pointer, present) in [
-            ("/threepids", !request.threepids.is_empty()),
-            ("/external_ids", !request.external_ids.is_empty()),
-            ("/user_type", request.user_type.is_some()),
-        ] {
-            if present {
+        if request.user_type.is_some() {
+            return Err(SourceError::InvalidField {
+                pointer: "/user_type",
+                detail: "this server cannot set this when creating an account yet".to_string(),
+            });
+        }
+        // 3PIDs and external ids are bound after the account exists; check first that nobody
+        // else has any of them, so a refusal leaves no half-made account behind.
+        let mut threepids = Vec::with_capacity(request.threepids.len());
+        for threepid in &request.threepids {
+            let address = match threepid.medium.as_str() {
+                "email" => threepid.address.trim().to_lowercase(),
+                "msisdn" => threepid
+                    .address
+                    .chars()
+                    .filter(char::is_ascii_digit)
+                    .collect(),
+                other => {
+                    return Err(SourceError::InvalidField {
+                        pointer: "/threepids",
+                        detail: format!("{other:?} is not a medium; use email or msisdn"),
+                    });
+                }
+            };
+            if address.is_empty() {
                 return Err(SourceError::InvalidField {
-                    pointer,
-                    detail: "this server cannot set this when creating an account yet".to_string(),
+                    pointer: "/threepids",
+                    detail: "an address cannot be empty".to_string(),
                 });
+            }
+            if let Some(owner) = self
+                .store
+                .get_user_by_threepid(&threepid.medium, &address)
+                .await
+                .map_err(store_unavailable)?
+            {
+                return Err(SourceError::Conflict(format!(
+                    "{} {address} is bound to {owner}",
+                    threepid.medium
+                )));
+            }
+            threepids.push((threepid.medium.clone(), address));
+        }
+        for external in &request.external_ids {
+            if external.provider.trim().is_empty() || external.external_id.trim().is_empty() {
+                return Err(SourceError::InvalidField {
+                    pointer: "/external_ids",
+                    detail: "provider and external_id cannot be empty".to_string(),
+                });
+            }
+            if let Some(owner) = self
+                .store
+                .get_user_by_external_id(&external.provider, &external.external_id)
+                .await
+                .map_err(store_unavailable)?
+            {
+                return Err(SourceError::Conflict(format!(
+                    "{} {} is linked to {owner}",
+                    external.provider, external.external_id
+                )));
             }
         }
 
@@ -281,6 +618,30 @@ impl UserDirectory for AuthStoreUserDirectory {
                 return Err(SourceError::Conflict(format!("{user_id} already exists")));
             }
             Err(e) => return Err(store_unavailable(e)),
+        }
+        let now = state.now_ms();
+        for (medium, address) in threepids {
+            self.store
+                .add_threepid(ThreepidRecord {
+                    user_id: user_id.clone(),
+                    medium,
+                    address,
+                    added_at_ms: now,
+                    validated_at_ms: now,
+                })
+                .await
+                .map_err(map_identity_error)?;
+        }
+        for external in request.external_ids {
+            self.store
+                .add_external_id(ExternalIdRecord {
+                    user_id: user_id.clone(),
+                    provider: external.provider,
+                    external_id: external.external_id,
+                    added_at_ms: now,
+                })
+                .await
+                .map_err(map_identity_error)?;
         }
         self.to_admin_user(record).await
     }
@@ -754,6 +1115,107 @@ mod tests {
                 "{again}"
             );
         }
+    }
+
+    /// `users.create`'s 3PIDs and external ids are bound, `users.lookup` finds the account by
+    /// either, and a second account naming one of them is refused without being made.
+    #[tokio::test]
+    async fn create_user_binds_threepids_and_external_ids_that_lookup_then_finds() {
+        let (state, directory) = creating_directory();
+        let with_links = |name: &str| UserCreateRequest {
+            threepids: vec![ThreePid {
+                medium: "email".to_owned(),
+                address: " Carol@Example.org".to_owned(),
+                added_at: None,
+            }],
+            external_ids: vec![ExternalId {
+                provider: "oidc".to_owned(),
+                external_id: "sub-carol".to_owned(),
+            }],
+            ..create(name, "hunter2-carol")
+        };
+        directory.create_user(with_links("carol")).await.unwrap();
+        assert!(matches!(
+            directory.create_user(with_links("dave")).await,
+            Err(SourceError::Conflict(_))
+        ));
+        assert_eq!(state.store.list_users().await.unwrap().len(), 1);
+
+        let by_email = directory
+            .lookup_user(UserLookupQuery::Threepid {
+                medium: "email".to_owned(),
+                address: "CAROL@example.org".to_owned(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_email.user_id, "@carol:example.org");
+        let by_subject = directory
+            .lookup_user(UserLookupQuery::ExternalId {
+                provider: "oidc".to_owned(),
+                external_id: "sub-carol".to_owned(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_subject.user_id, "@carol:example.org");
+        let listed = directory
+            .list_threepids("@carol:example.org")
+            .await
+            .unwrap();
+        assert_eq!(listed[0].address, "carol@example.org");
+        assert!(listed[0].added_at.is_some());
+        assert!(
+            directory
+                .lookup_user(UserLookupQuery::ExternalId {
+                    provider: "oidc".to_owned(),
+                    external_id: "SUB-CAROL".to_owned(),
+                })
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Bulk sign-out checks every device before touching any, and takes each one's sessions.
+    #[tokio::test]
+    async fn delete_devices_is_all_or_nothing() {
+        let (state, directory) = creating_directory();
+        directory
+            .create_user(create("erin", "hunter2-erin"))
+            .await
+            .unwrap();
+        let uid = ruma::user_id!("@erin:example.org");
+        for device in ["A", "B"] {
+            state
+                .store
+                .upsert_device(crate::store::DeviceRecord {
+                    user_id: uid.to_owned(),
+                    device_id: device.into(),
+                    display_name: None,
+                    last_seen_ms: None,
+                    last_seen_ip: None,
+                })
+                .await
+                .unwrap();
+        }
+        let ids = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert!(matches!(
+            directory
+                .delete_devices("@erin:example.org", &ids(&["A", "Z"]))
+                .await,
+            Err(SourceError::NotFound)
+        ));
+        assert_eq!(state.store.list_devices(uid).await.unwrap().len(), 2);
+        directory
+            .delete_devices("@erin:example.org", &ids(&["A", "B"]))
+            .await
+            .unwrap();
+        assert!(state.store.list_devices(uid).await.unwrap().is_empty());
+        assert!(matches!(
+            directory.get_device("@nobody:example.org", "A").await,
+            Err(SourceError::NotFound)
+        ));
     }
 
     #[tokio::test]

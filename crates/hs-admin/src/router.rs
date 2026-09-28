@@ -116,6 +116,13 @@ pub struct AdminState {
     /// the replica registry and the shard rows (see [`crate::cluster`]). `None` until wired with
     /// [`AdminState::with_cluster`]; until then they answer `503 unavailable`.
     pub cluster: Option<Arc<dyn crate::cluster::ClusterSource>>,
+    /// What `users.devices.get/update/bulk_delete`, `users.threepids.*`, `users.external_ids.*`
+    /// and `users.experimental_features.*` act through (see [`crate::user_identity`]). `None`
+    /// until wired with [`AdminState::with_user_identity`]; until then they answer `503`.
+    pub user_identity: Option<Arc<dyn crate::user_identity::UserIdentitySource>>,
+    /// What `users.account_data.list` and `users.pushers.list` read. `None` until wired with
+    /// [`AdminState::with_user_data`]; until then they answer `503`.
+    pub user_data: Option<Arc<dyn crate::user_identity::UserDataSource>>,
     /// The `Idempotency-Key` cache every mutating handler that declares it consults (see
     /// [`crate::idempotency`]). Always present (never `None`): a client is never told its
     /// idempotency key was ignored.
@@ -151,6 +158,8 @@ impl AdminState {
             statistics: None,
             media: None,
             cluster: None,
+            user_identity: None,
+            user_data: None,
             idempotency: Arc::new(IdempotencyStore::new()),
         }
     }
@@ -214,6 +223,23 @@ impl AdminState {
         notices: Arc<dyn crate::server_notices::ServerNoticeSource>,
     ) -> Self {
         self.server_notices = Some(notices);
+        self
+    }
+
+    /// Wires a user's devices, 3PIDs, external ids and experimental features.
+    #[must_use]
+    pub fn with_user_identity(
+        mut self,
+        source: Arc<dyn crate::user_identity::UserIdentitySource>,
+    ) -> Self {
+        self.user_identity = Some(source);
+        self
+    }
+
+    /// Wires a user's account data and pushers.
+    #[must_use]
+    pub fn with_user_data(mut self, source: Arc<dyn crate::user_identity::UserDataSource>) -> Self {
+        self.user_data = Some(source);
         self
     }
 
@@ -359,6 +385,19 @@ const REAL_HANDLERS: &[&str] = &[
     "users.availability",
     "users.devices.list",
     "users.devices.delete",
+    "users.devices.get",
+    "users.devices.update",
+    "users.devices.bulk_delete",
+    "users.threepids.list",
+    "users.threepids.add",
+    "users.threepids.remove",
+    "users.external_ids.list",
+    "users.external_ids.add",
+    "users.external_ids.remove",
+    "users.experimental_features.get",
+    "users.experimental_features.put",
+    "users.account_data.list",
+    "users.pushers.list",
     "users.logout",
     "users.reset_password",
     "rooms.list",
@@ -4688,6 +4727,78 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         "users.availability" => builder.add(method, &full_path, users_availability, meta),
         "users.devices.list" => builder.add(method, &full_path, users_devices_list, meta),
         "users.devices.delete" => builder.add(method, &full_path, users_devices_delete, meta),
+        "users.devices.get" => {
+            builder.add(method, &full_path, crate::user_identity::devices_get, meta)
+        }
+        "users.devices.update" => builder.add(
+            method,
+            &full_path,
+            crate::user_identity::devices_update,
+            meta,
+        ),
+        "users.devices.bulk_delete" => builder.add(
+            method,
+            &full_path,
+            crate::user_identity::devices_bulk_delete,
+            meta,
+        ),
+        "users.threepids.list" => builder.add(
+            method,
+            &full_path,
+            crate::user_identity::threepids_list,
+            meta,
+        ),
+        "users.threepids.add" => builder.add(
+            method,
+            &full_path,
+            crate::user_identity::threepids_add,
+            meta,
+        ),
+        "users.threepids.remove" => builder.add(
+            method,
+            &full_path,
+            crate::user_identity::threepids_remove,
+            meta,
+        ),
+        "users.external_ids.list" => builder.add(
+            method,
+            &full_path,
+            crate::user_identity::external_ids_list,
+            meta,
+        ),
+        "users.external_ids.add" => builder.add(
+            method,
+            &full_path,
+            crate::user_identity::external_ids_add,
+            meta,
+        ),
+        "users.external_ids.remove" => builder.add(
+            method,
+            &full_path,
+            crate::user_identity::external_ids_remove,
+            meta,
+        ),
+        "users.experimental_features.get" => builder.add(
+            method,
+            &full_path,
+            crate::user_identity::experimental_features_get,
+            meta,
+        ),
+        "users.experimental_features.put" => builder.add(
+            method,
+            &full_path,
+            crate::user_identity::experimental_features_put,
+            meta,
+        ),
+        "users.account_data.list" => builder.add(
+            method,
+            &full_path,
+            crate::user_identity::account_data_list,
+            meta,
+        ),
+        "users.pushers.list" => {
+            builder.add(method, &full_path, crate::user_identity::pushers_list, meta)
+        }
         "users.logout" => builder.add(method, &full_path, users_logout, meta),
         "users.reset_password" => builder.add(method, &full_path, users_reset_password, meta),
         "rooms.list" => builder.add(method, &full_path, rooms_list, meta),
