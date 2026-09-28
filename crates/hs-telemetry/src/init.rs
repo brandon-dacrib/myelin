@@ -122,10 +122,61 @@ pub struct Guard {
     #[cfg(feature = "sentry")]
     #[allow(dead_code)]
     sentry_guard: Option<sentry::ClientInitGuard>,
+    /// The level filter, swappable while the process runs.
+    log_level: LogLevelHandle,
     // Keeps the struct non-empty (and this field used) when neither optional feature is
     // compiled in, so the struct's shape does not change across feature combinations in a way
     // that would otherwise trip an "unused" warning on the whole type.
     _private: (),
+}
+
+impl Guard {
+    /// A handle on the running level filter, for changing [`Options::level`] without a
+    /// restart.
+    #[must_use]
+    pub fn log_level(&self) -> LogLevelHandle {
+        self.log_level.clone()
+    }
+}
+
+/// Changes the level filter [`init`] installed, while the process runs. Cheap to clone.
+#[derive(Clone)]
+pub struct LogLevelHandle {
+    handle: tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>,
+    pinned_by_env: bool,
+}
+
+impl std::fmt::Debug for LogLevelHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogLevelHandle")
+            .field("pinned_by_env", &self.pinned_by_env)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LogLevelHandle {
+    /// Whether `RUST_LOG` set the filter at startup. It outranks [`Options::level`] then, and
+    /// [`LogLevelHandle::set_level`] refuses rather than silently overriding the operator who
+    /// set it.
+    #[must_use]
+    pub fn pinned_by_env(&self) -> bool {
+        self.pinned_by_env
+    }
+
+    /// Replaces the filter with what `level` means ([`Level`]'s directives); every event from
+    /// then on is filtered by it.
+    ///
+    /// # Errors
+    /// [`TelemetryError::LogFilterPinned`] when `RUST_LOG` set the filter;
+    /// [`TelemetryError::Reload`] if the subscriber is gone.
+    pub fn set_level(&self, level: Level) -> Result<(), TelemetryError> {
+        if self.pinned_by_env {
+            return Err(TelemetryError::LogFilterPinned);
+        }
+        self.handle
+            .reload(EnvFilter::new(level.default_directives()))
+            .map_err(|e| TelemetryError::Reload(e.to_string()))
+    }
 }
 
 impl Drop for Guard {
@@ -167,8 +218,17 @@ fn use_color(stdout_is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bo
 /// `hs_config::telemetry::TelemetryConfig` validation already requires an endpoint whenever
 /// tracing is enabled).
 pub fn init(options: &Options) -> Result<Guard, TelemetryError> {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(options.level.default_directives()));
+    let from_env = EnvFilter::try_from_default_env().ok();
+    let pinned_by_env = from_env.is_some();
+    let filter = from_env.unwrap_or_else(|| EnvFilter::new(options.level.default_directives()));
+    // Behind a reload layer, so the level can change on a running server
+    // ([`Guard::log_level`]). It is the first layer on the registry, which is what the handle's
+    // type says.
+    let (filter, filter_handle) = tracing_subscriber::reload::Layer::new(filter);
+    let log_level = LogLevelHandle {
+        handle: filter_handle,
+        pinned_by_env,
+    };
 
     let fmt_layer_json = matches!(options.format, LogFormat::Json).then(|| {
         tracing_subscriber::fmt::layer()
@@ -245,6 +305,7 @@ pub fn init(options: &Options) -> Result<Guard, TelemetryError> {
         otlp_provider,
         #[cfg(feature = "sentry")]
         sentry_guard,
+        log_level,
         _private: (),
     })
 }
@@ -305,6 +366,62 @@ mod tests {
         // Asking for more is asking for everything.
         let debug = lines_at(Level::Debug);
         assert!(debug.contains("Finished ingestion writer"), "{debug}");
+    }
+
+    /// The same composition `init` builds -- the filter behind a reload layer, first on the
+    /// registry -- with the level changed through the handle part-way through.
+    #[test]
+    fn the_level_changes_while_the_subscriber_runs_unless_rust_log_pinned_it() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let (filter, handle) = tracing_subscriber::reload::Layer::new(EnvFilter::new(
+            Level::Info.default_directives(),
+        ));
+        let subscriber = tracing_subscriber::registry().with(filter).with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(move || writer.clone()),
+        );
+        let level = LogLevelHandle {
+            handle,
+            pinned_by_env: false,
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(target: "hs_cli::serve", "before the change");
+            level.set_level(Level::Debug).unwrap();
+            tracing::debug!(target: "hs_cli::serve", "after the change");
+            level.set_level(Level::Warn).unwrap();
+            tracing::info!(target: "hs_cli::serve", "quieted");
+        });
+        let out = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(!out.contains("before the change"), "{out}");
+        assert!(out.contains("after the change"), "{out}");
+        assert!(!out.contains("quieted"), "{out}");
+
+        let pinned = LogLevelHandle {
+            pinned_by_env: true,
+            ..level
+        };
+        assert!(pinned.pinned_by_env());
+        assert!(matches!(
+            pinned.set_level(Level::Debug),
+            Err(TelemetryError::LogFilterPinned)
+        ));
     }
 
     #[test]

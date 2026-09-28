@@ -771,7 +771,7 @@ async fn run_serve(args: &ServeArgs) -> i32 {
 
     let telemetry_options =
         crate::config_bridge::telemetry_options_from(&config, "hs", env!("CARGO_PKG_VERSION"));
-    let _telemetry_guard = match hs_telemetry::init(&telemetry_options) {
+    let telemetry_guard = match hs_telemetry::init(&telemetry_options) {
         Ok(guard) => Some(guard),
         Err(e) => {
             eprintln!("hs serve: failed to initialize telemetry: {e}");
@@ -805,6 +805,23 @@ async fn run_serve(args: &ServeArgs) -> i32 {
     // applies every change it writes or reads back to this, and the server wires into it the
     // parts of itself that re-read a setting (`crate::live_config`).
     let live_config = std::sync::Arc::new(crate::live_config::LiveConfig::new(config.clone()));
+    // The log level, swapped into the running filter -- unless `RUST_LOG` set it, which outranks
+    // the configuration; a change then waits for a start without it, and is reported that way.
+    if let Some(guard) = &telemetry_guard {
+        let log_level = guard.log_level();
+        if log_level.pinned_by_env() {
+            tracing::info!(
+                "RUST_LOG sets the log filter, so a change to telemetry.logging.level takes effect only at a start without it"
+            );
+        } else {
+            live_config.on_change("telemetry", move |config| {
+                let level = crate::config_bridge::log_level_from(config);
+                log_level.set_level(level).map_err(|e| e.to_string())?;
+                tracing::info!(?level, "the log level is now in force");
+                Ok(())
+            });
+        }
+    }
     let config_source = std::sync::Arc::new(
         crate::config_source::StoreConfigSource::new(
             booted.layers,

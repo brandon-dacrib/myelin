@@ -18,6 +18,9 @@
 //!   `federation.ip_range_allowlist` — the outbound client checks both lists on every request,
 //!   through shared handles the running server replaces. (Only with federation enabled: a server
 //!   that booted without it has no client to change.)
+//! - `telemetry.logging.level` — the log filter sits behind a reload layer and is replaced.
+//!   (Unless `RUST_LOG` set it at startup, which outranks the configuration: then a change is
+//!   reported as waiting for a restart.)
 //!
 //! # Restart required
 //!
@@ -37,9 +40,9 @@
 //! - `cluster` — shard counts and mesh identity are agreed with every other
 //!   replica; changing them locally without a coordinated rolling restart
 //!   would fragment ownership.
-//! - The rest of `federation` (enabling it, timeouts, certificates), `telemetry`, and
-//!   `appservices` — built into the federation client, the logging layer and the appservice
-//!   scheduler once, at startup.
+//! - The rest of `federation` (enabling it, timeouts, certificates), the rest of `telemetry`
+//!   (log format, tracing export, metrics, Sentry), and `appservices` — built into the
+//!   federation client, the logging layer and the appservice scheduler once, at startup.
 
 use serde_json::Value;
 
@@ -53,6 +56,7 @@ pub const HOT_SETTINGS: &[&str] = &[
     "/federation/domain_allowlist",
     "/federation/ip_range_blocklist",
     "/federation/ip_range_allowlist",
+    "/telemetry/logging/level",
 ];
 
 /// Top-level [`Config`] field names whose every setting is hot (see [`HOT_SETTINGS`]): a change

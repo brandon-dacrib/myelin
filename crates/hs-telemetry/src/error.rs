@@ -15,6 +15,14 @@ pub enum TelemetryError {
     #[error("OTLP tracing was requested but no endpoint was configured")]
     MissingOtlpEndpoint,
 
+    /// `RUST_LOG` set the log filter at startup, and it outranks the configured level.
+    #[error("RUST_LOG set this process's log filter, which outranks telemetry.logging.level")]
+    LogFilterPinned,
+
+    /// The running log filter could not be replaced.
+    #[error("could not replace the log filter: {0}")]
+    Reload(String),
+
     /// Building the OTLP exporter or tracer provider failed.
     #[cfg(feature = "otlp")]
     #[error("failed to build the OTLP exporter: {0}")]

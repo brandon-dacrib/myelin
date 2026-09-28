@@ -17,6 +17,9 @@
 //! - `federation` (its allow and block lists) — the outbound client's
 //!   [`hs_federation::client::DomainPolicy`] and [`hs_federation::client::IpPolicy`] are
 //!   replaced in place. Only when federation is enabled.
+//! - `telemetry` (its log level) — [`hs_telemetry::LogLevelHandle::set_level`], wired in
+//!   `crate::cli`'s `run_serve`, which owns the telemetry guard. Not when `RUST_LOG` set the
+//!   filter: the change then waits for a restart and is reported so.
 //!
 //! Every section applied, failed or found unwired is logged, and counted in
 //! `hs_config_reloads_total{section,outcome}` (`applied`, `failed`, `unwired`).

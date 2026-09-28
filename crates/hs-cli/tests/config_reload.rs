@@ -3,9 +3,11 @@
 //! Configuration page does) and the very next messages from a Matrix client are refused
 //! `429 M_LIMIT_EXCEEDED` -- no restart. The answer to the update says it reloaded
 //! `rate_limits`; a change to a section only read at startup says it needs a restart instead,
-//! and so do `config.validate` and `config.reload`. Switching the limit off lets the client
-//! send again at once. The log says which section was reloaded and `/metrics` counts it in
-//! `hs_config_reloads_total{section,outcome}`.
+//! and so do `config.validate` and `config.reload`. The log level and the federation domain
+//! allowlist, hot settings, apply at once too: a debug line appears that the process started
+//! without, and a join to a server outside the list is refused. Switching the limit off lets
+//! the client send again at once. The log says which section was reloaded and `/metrics`
+//! counts it in `hs_config_reloads_total{section,outcome}`.
 
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
@@ -253,6 +255,24 @@ async fn lowering_the_send_limit_through_the_admin_api_limits_the_next_message_w
     let reloaded = hs.wait_for("configuration section reloaded");
     assert!(reloaded.contains("rate_limits"), "{reloaded}");
 
+    // The log level, too: turned up to debug, the refusal below is logged at a level the
+    // process started without.
+    let debug = ops
+        .expect(
+            Method::PATCH,
+            "/api/v1/config/telemetry",
+            Some(json!({"logging": {"level": "debug"}})),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        debug["applied"]["reloaded_sections"],
+        json!(["telemetry"]),
+        "{debug}"
+    );
+    assert_eq!(debug["applied"]["requires_restart"], json!([]));
+    hs.wait_for("the log level is now in force");
+
     // The same client, the same process: what was left of the burst is clamped to the new one,
     // and the message after that is refused.
     let (status, body) = alice.send(&room, "b1").await;
@@ -261,6 +281,15 @@ async fn lowering_the_send_limit_through_the_admin_api_limits_the_next_message_w
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
     assert_eq!(body["errcode"], "M_LIMIT_EXCEEDED", "{body}");
     assert!(body["retry_after_ms"].as_u64().unwrap() > 1_000, "{body}");
+    hs.wait_for("a sender is over the server-wide rate limit");
+    // And back down, so the rest of this test's log is readable.
+    ops.expect(
+        Method::PATCH,
+        "/api/v1/config/telemetry",
+        Some(json!({"logging": {"level": "info"}})),
+        StatusCode::OK,
+    )
+    .await;
 
     let text = metrics(&nobody.base).await;
     assert!(

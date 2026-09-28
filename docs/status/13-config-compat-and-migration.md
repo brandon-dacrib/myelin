@@ -13,7 +13,7 @@ shipped work: URL-preview config fields, the `serve_server_wellknown`/`federatio
 `crates/hs-config/src/reload.rs` claimed `rate_limits`, `federation`, `telemetry` and
 `appservices` were reloadable while nothing in `hs serve` re-read any of them. It is now
 setting-granular and truthful: `HOT_SETTINGS` (JSON Pointers) lists only what a running server
-re-reads -- today `/rate_limits`, `/migration` and the three federation allow/block lists -- and grows as something is wired
+re-reads -- today `/rate_limits`, `/migration`, the three federation allow/block lists and `/telemetry/logging/level` -- and grows as something is wired
 (`crates/hs-cli/src/live_config.rs`). `sections_requiring_restart` ignores hot settings, and
 `hot_sections_changed` says which sections a running server has to re-read. This supersedes the
 "reload boundary is section-granular" decision below. See status 15 for the rest.

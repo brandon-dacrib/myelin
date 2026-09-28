@@ -1,4 +1,4 @@
-//! Metrics, tracing, logging and error reporting. Read at startup (see
+//! Metrics, tracing, logging and error reporting. Read at startup, but for the log level (see
 //! [`crate::reload`]).
 
 use std::path::PathBuf;
@@ -93,7 +93,8 @@ fn default_log_level() -> LogLevel {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
-    /// Minimum level emitted.
+    /// Minimum level emitted. A change applies to the running server at
+    /// once, unless `RUST_LOG` set the filter when it started.
     #[serde(default = "default_log_level")]
     pub level: LogLevel,
     /// Emit JSON lines instead of human-readable text. Corresponds to

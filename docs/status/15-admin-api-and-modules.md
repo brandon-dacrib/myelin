@@ -74,11 +74,16 @@ offering operations); before that 2026-09-26 (three public recovery operations);
 >   handles with `set` / `set_cidrs`, reached through `FederationClient::{domain_policy,
 >   ip_policy}`); the rest of `federation` still needs a restart, and a save touching both kinds
 >   reports the section in both `reloaded_sections` and `requires_restart`.
+> - **Log level**: `telemetry.logging.level` is hot. `hs_telemetry::init` puts the `EnvFilter`
+>   behind `tracing_subscriber::reload`; `Guard::log_level()` hands out a `LogLevelHandle`
+>   (`set_level`), wired in `run_serve`. When `RUST_LOG` set the filter it is not wired, so a
+>   change is reported as waiting for a restart rather than claimed.
 > - **Answers**: `ConfigSection.applied` (a `ConfigReloadReport`) on `config.update`'s answer;
 >   `config.reload` reports what `LiveConfig` applied rather than nothing.
 > - **Verified on the real binary**: `crates/hs-cli/tests/config_reload.rs` boots `hs serve`,
 >   sends three messages, lowers `rate_limits.message` with `PATCH /api/v1/config/rate_limits`
->   (answer: `applied.reloaded_sections == ["rate_limits"]`), and the next-but-one message is
+>   (answer: `applied.reloaded_sections == ["rate_limits"]`), turns the log level up to debug
+>   (applied; the refusal that follows is logged at debug), and the next-but-one message is
 >   `429 M_LIMIT_EXCEEDED`; a `federation` change answers `requires_restart: ["federation"]`
 >   (update, validate and reload alike); a `domain_allowlist` save is applied at once (and the
 >   timeout still pending), and the next remote join is refused "not in the domain allowlist";

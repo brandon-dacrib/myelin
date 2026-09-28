@@ -74,6 +74,21 @@ pub fn auth_config_from(
     Ok(auth)
 }
 
+/// `telemetry.logging.level` as the logging layer's own [`hs_telemetry::Level`]: what
+/// [`telemetry_options_from`] starts with, and what a running `hs serve` swaps in when it changes
+/// (`crate::live_config`).
+#[must_use]
+pub fn log_level_from(config: &hs_config::Config) -> hs_telemetry::Level {
+    use hs_config::telemetry::LogLevel;
+    match config.telemetry.logging.level {
+        LogLevel::Trace => hs_telemetry::Level::Trace,
+        LogLevel::Debug => hs_telemetry::Level::Debug,
+        LogLevel::Info => hs_telemetry::Level::Info,
+        LogLevel::Warn => hs_telemetry::Level::Warn,
+        LogLevel::Error => hs_telemetry::Level::Error,
+    }
+}
+
 /// Builds a [`hs_telemetry::init::Options`] from a native [`hs_config::Config`]'s
 /// `telemetry` section, plus the service name/version this binary reports.
 #[must_use]
@@ -82,14 +97,7 @@ pub fn telemetry_options_from(
     service_name: &str,
     service_version: &str,
 ) -> hs_telemetry::Options {
-    use hs_config::telemetry::LogLevel;
-    let level = match config.telemetry.logging.level {
-        LogLevel::Trace => hs_telemetry::Level::Trace,
-        LogLevel::Debug => hs_telemetry::Level::Debug,
-        LogLevel::Info => hs_telemetry::Level::Info,
-        LogLevel::Warn => hs_telemetry::Level::Warn,
-        LogLevel::Error => hs_telemetry::Level::Error,
-    };
+    let level = log_level_from(config);
     let format = if config.telemetry.logging.json {
         hs_telemetry::LogFormat::Json
     } else {

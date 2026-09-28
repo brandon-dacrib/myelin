@@ -1814,7 +1814,7 @@
       "type": "object",
       "properties": {
         "level": {
-          "description": "Minimum level emitted.",
+          "description": "Minimum level emitted. A change applies to the running server at\nonce, unless `RUST_LOG` set the filter when it started.",
           "$ref": "#/$defs/LogLevel",
           "default": "info"
         },
