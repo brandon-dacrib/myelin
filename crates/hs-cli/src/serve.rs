@@ -80,9 +80,12 @@ pub enum ServeError {
     /// `--media-scanning-config` was given — the content scanning engine) failed.
     #[error(transparent)]
     Media(#[from] crate::media::MediaSetupError),
-    /// Loading `appservices.registration_files` failed.
+    /// Importing `appservices.registration_files` failed.
     #[error(transparent)]
     Appservices(#[from] crate::appservices::LoadAppservicesError),
+    /// Opening the audit log, or recording a registration file's import in it, failed.
+    #[error("failed to open or write the audit log: {0}")]
+    Audit(String),
     /// Starting the `hs-cluster` ownership manager (or, when clustered, its mesh forwarder)
     /// failed.
     #[error(transparent)]
@@ -990,7 +993,16 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // The first HTTP client is built in here (the ping transport); the roots are ready by now
     // on any machine that is not very slow, and on one that is, waiting beats blocking.
     let _ = roots.await;
+    // Opened here rather than with the admin API below: importing a registration file is audited,
+    // and the import happens now.
+    let audit = Arc::new(
+        crate::audit::TablesAuditSink::open(backend.clone())
+            .map_err(|e| ServeError::Audit(e.to_string()))?,
+    );
     let appservices = crate::appservices::load(&config.appservices, backend.clone(), &server_name)?;
+    crate::appservices::audit_imports(audit.as_ref(), &appservices.imports)
+        .await
+        .map_err(|e| ServeError::Audit(e.to_string()))?;
     // Replaces `hs-auth`'s stub `InMemoryAppserviceRegistry` (empty by default) with
     // `hs-appservice`'s real, store-backed registry, so an `as_token` a loaded registration
     // declares actually authenticates through `Requester` — see
@@ -1225,10 +1237,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         appservice_ping: appservices.ping_service,
         admin: admin_state(
             &auth_state,
-            Arc::new(
-                crate::audit::TablesAuditSink::open(backend.clone())
-                    .map_err(|e| ServeError::Sessions(Box::new(e)))?,
-            ),
+            audit,
             &rooms,
             server_name.as_str(),
             enabled_components,
