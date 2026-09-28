@@ -139,11 +139,14 @@ export function recordFinishedTask(
   return changed(wire(recorded));
 }
 
-// A running clock-driven task reports its progress on the event stream once a second, as a
-// server task does each time it records progress.
+// A running clock-driven or step-driven task reports its progress on the event stream once a
+// second, as a server task does each time it records progress. A step-driven task (a user's
+// redaction) moves on only when it is read, and a page does not poll while the stream is
+// connected, so the ticker is what reads it: without this it sat at its first step forever.
 registerMockTicker(() => {
   for (const task of tasks) {
-    if (task.clockStart !== undefined && task.status === "running") changed(wire(task));
+    const live = task.status === "running" || task.status === "scheduled";
+    if (live && (task.clockStart !== undefined || task.step !== undefined)) changed(wire(task));
   }
 });
 
@@ -172,7 +175,7 @@ export function putDrivenTask(
 ): Task {
   const recorded: MockTask = { created_by: admin, ...task, step };
   tasks = [...tasks.filter((t) => t.id !== recorded.id), recorded];
-  return wire(recorded);
+  return changed(wire(recorded));
 }
 
 /** Moves the clock-driven task on:its progress follows the clock and it succeeds at the end. */
