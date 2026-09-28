@@ -20,6 +20,7 @@ pub mod cluster;
 pub mod config_bridge;
 pub mod config_cmd;
 pub mod config_source;
+pub mod edus;
 pub mod federation;
 pub mod federation_sender;
 pub mod generate_config;

@@ -1,5 +1,51 @@
 # 06 Federation: status
 
+## Where this stopped (2026-09-27, branch `agent/federation-edus`): ephemeral data across servers and restarts
+
+**Done and verified by running** (all on this branch):
+
+- Receipts and presence are durable. `hs_user::store::UserStore` gained `put_receipt`/`list_room_receipts`
+  and `put_presence`/`get_presence` (keyspaces `hs_user.receipts`, `hs_user.presence`);
+  `ReceiptRegistry`/`PresenceRegistry` write through and load lazily per room/user. The typing, receipt
+  and presence counters are `hs_user::stamp::Stamps` (max(previous+1, unix micros)), so a token from
+  before a restart neither hides new data nor re-shows old. Tests:
+  `sync::tests::receipts_and_presence_are_in_sync_after_a_new_hub_over_the_same_store` (fails with the
+  registries built without the store -- checked), `receipts::tests::receipts_outlive_the_registry_that_recorded_them`,
+  `presence::tests::presence_outlives_the_registry_that_recorded_it`, `stamp::tests::*`.
+- EDUs both ways: `hs_user::edu` (EduOutbox seam, InboundEdu parsing with origin checks),
+  `SessionHub::install_edu_outbox`/`receive_edu` (typing incl. a stop EDU when a typing lapses, m.read
+  receipts only, presence on set and on a /sync-driven change). `hs_federation::sender::FederationSender::enqueue_edu`
+  (in-memory per destination, 100 per transaction, coalescing keys, gate-respecting),
+  `hs_federation::edu::InboundEduSink` + `FederationState::edu_sink`, `/user/keys/query` and
+  `/user/keys/claim` real (`transport/keys.rs`), `/user/devices` answers even with device-name lookup off
+  (names stripped). `hs_e2e::federation`: RemoteKeys hook so local /keys/query and /keys/claim ask a remote
+  user's server (no cache), plus `federation_keys_query`/`federation_keys_claim`. `hs_cli::edus`:
+  SenderEduOutbox, EduDispatcher (typing/receipts/presence to the hub, m.device_list_update and
+  m.signing_key_update to the device-list stream), DeviceListAnnouncer (polls the e2e stream every 200 ms and
+  sends m.device_list_update per device to servers sharing a room), ClientRemoteKeys; wired in `serve.rs`.
+- `crates/hs-cli/tests/federation_edus.rs` (two in-process servers): typing, stop-typing, read receipts and
+  presence cross A->B and B->A; a device added on B (login + key upload) is in alice's `device_lists.changed`
+  on A and A's /keys/query returns it from B, and the reverse. Both pass (76 s, debug build); both fail with
+  the inbound EDU sink not installed (checked).
+- Commands run green: `cargo fmt --all --check`; `cargo clippy -p hs-user -p hs-federation -p hs-e2e
+  --all-targets -- -D warnings`; `cargo test -p hs-user` (136+6), `-p hs-federation` (158), `-p hs-e2e`
+  (26 lib + 3 new `tests/remote_keys.rs` + existing), `cargo test -p hs-cli --test federation_edus` (2/2).
+
+**Not run / not done:**
+
+- `cargo clippy -p hs-cli --all-targets -- -D warnings` and the rest of `cargo test -p hs-cli` (e2e,
+  federation_two_servers, federation_writes, federation_reads, federation_restart) were not run after the
+  hs-cli wiring; `cargo check -p hs-cli --tests` passes. Run them first.
+- No real-binary restart test for receipts/presence yet (the in-process server cannot be restarted over its
+  data dir); the durability proof is the hub-over-the-same-store unit test. Next: a test in the style of
+  `crates/hs-cli/tests/federation_restart.rs` that sets a receipt and presence, SIGTERMs `hs serve`, restarts it
+  over the same data dir, and checks an initial /sync.
+- To-device over federation (m.direct_to_device) is not sent or received. Cross-signing changes go out as
+  m.device_list_update, not m.signing_key_update. Device-list changes made while the server was down are not
+  announced. EDUs are dropped (not stored) for destinations another cluster replica sends for, so in cluster
+  mode a user's typing/receipts/presence reach only destinations their replica owns. Presence is not pushed to
+  a server when it newly shares a room. Complement's TestDeviceListUpdates remote halves were not run (laptop).
+
 ## Ninth session (2026-09-27): the outbound queue survives a restart, and the sender is shard-gated
 
 Scope, per this session's brief: `docs/next-steps.md` item 4 ("The outbound queue is in

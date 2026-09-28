@@ -774,6 +774,9 @@ pub struct ServerQuerySource<B: KvBackend> {
     e2e: Arc<dyn hs_e2e::store::E2eStore>,
     rooms: Arc<RoomRegistry<B>>,
     own_server_name: String,
+    /// What answers `/user/keys/query` and `/user/keys/claim`
+    /// ([`ServerQuerySource::with_keys`]); `None` answers neither.
+    keys: Option<hs_e2e::state::E2eState<B>>,
 }
 
 impl<B: KvBackend + 'static> ServerQuerySource<B> {
@@ -790,7 +793,16 @@ impl<B: KvBackend + 'static> ServerQuerySource<B> {
             e2e,
             rooms,
             own_server_name: own_server_name.into(),
+            keys: None,
         }
+    }
+
+    /// Answers other servers' key queries and claims from `e2e`'s store
+    /// (`hs_e2e::federation::federation_keys_query` and `federation_keys_claim`).
+    #[must_use]
+    pub fn with_keys(mut self, e2e: hs_e2e::state::E2eState<B>) -> Self {
+        self.keys = Some(e2e);
+        self
     }
 }
 
@@ -843,6 +855,28 @@ impl<B: KvBackend + 'static> FederationQuerySource for ServerQuerySource<B> {
         // No OpenID token is ever issued (see the module doc), so every token presented here is
         // one this server did not mint.
         None
+    }
+
+    async fn keys_query(&self, origin: &str, device_keys: &Value) -> Option<Value> {
+        let e2e = self.keys.as_ref()?;
+        match hs_e2e::federation::federation_keys_query(e2e, device_keys).await {
+            Ok(answer) => Some(answer),
+            Err(error) => {
+                tracing::info!(origin, %error, "could not answer a remote key query");
+                None
+            }
+        }
+    }
+
+    async fn keys_claim(&self, origin: &str, one_time_keys: &Value) -> Option<Value> {
+        let e2e = self.keys.as_ref()?;
+        match hs_e2e::federation::federation_keys_claim(e2e, one_time_keys).await {
+            Ok(answer) => Some(answer),
+            Err(error) => {
+                tracing::info!(origin, %error, "could not answer a remote key claim");
+                None
+            }
+        }
     }
 }
 
@@ -951,7 +985,7 @@ pub fn build_mount<B: KvBackend + 'static>(
     rooms: Arc<RoomRegistry<B>>,
     directory: hs_user::store::DynUserStore,
     auth: Arc<dyn hs_auth::store::AuthStore>,
-    e2e: Arc<dyn hs_e2e::store::E2eStore>,
+    e2e: hs_e2e::state::E2eState<B>,
     scheme: Option<&'static str>,
 ) -> Result<FederationMount, hs_kv::KvError> {
     let server_name = identity.server_name.to_string();
@@ -1009,12 +1043,10 @@ pub fn build_mount<B: KvBackend + 'static>(
     let state = hs_federation::transport::FederationState {
         own_server_name: Arc::from(server_name.as_str()),
         rooms: Arc::new(RegistryRoomSource::new(rooms.clone(), directory)),
-        queries: Arc::new(ServerQuerySource::new(
-            auth,
-            e2e,
-            rooms.clone(),
-            server_name.clone(),
-        )),
+        queries: Arc::new(
+            ServerQuerySource::new(auth, e2e.store.clone(), rooms.clone(), server_name.clone())
+                .with_keys(e2e),
+        ),
         allow_public_rooms_over_federation: config.federation.allow_public_rooms_over_federation,
         allow_device_name_lookup_over_federation: config
             .federation

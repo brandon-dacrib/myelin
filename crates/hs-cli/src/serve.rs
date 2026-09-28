@@ -1073,9 +1073,25 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             rooms.clone(),
             user_state.hub.store().clone(),
             auth_state.store.clone(),
-            e2e_state.store.clone(),
+            e2e_state.clone(),
             options.federation_scheme,
         )?;
+        let mut mount = mount;
+        // Ephemeral data across servers (`crate::edus`): EDUs that arrive go to the session hub
+        // and the device-list stream; this server's own users' typing, receipts and presence go
+        // out through the sender; a key query or claim for a remote user asks their server.
+        mount.state.edu_sink = Some(Arc::new(crate::edus::EduDispatcher::new(
+            user_state.hub.clone(),
+            e2e_state.store.clone(),
+        )));
+        user_state
+            .hub
+            .install_edu_outbox(Arc::new(crate::edus::SenderEduOutbox::new(
+                mount.sender.clone(),
+            )));
+        e2e_state.install_remote_keys(Arc::new(crate::edus::ClientRemoteKeys::new(
+            mount.client.clone(),
+        )));
         federation_source = Arc::new(
             hs_federation::admin_source::DestinationStoreSource::new(mount.destinations.clone())
                 .with_sender(mount.sender.clone()),
@@ -1181,12 +1197,23 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // before any listener is bound: an event sent before the subscription existed would never
     // be sent anywhere (`crate::federation_sender`).
     let outbound_federation = federation_sender.map(|sender| {
-        crate::federation_sender::OutboundFederation::start(
-            rooms.clone(),
-            sender,
+        // Local device-list changes are announced to the servers that share a room with the
+        // user (`crate::edus::DeviceListAnnouncer`), through the same sender.
+        let device_lists = crate::edus::DeviceListAnnouncer::start(
+            user_state.hub.clone(),
+            e2e_state.store.clone(),
+            sender.clone(),
             server_name.clone(),
-            cluster_handles.cluster.ownership().clone(),
-            cluster_handles.layout,
+        );
+        (
+            crate::federation_sender::OutboundFederation::start(
+                rooms.clone(),
+                sender,
+                server_name.clone(),
+                cluster_handles.cluster.ownership().clone(),
+                cluster_handles.layout,
+            ),
+            device_lists,
         )
     });
 
@@ -1396,7 +1423,8 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         release_long_polls,
         stop_appservice_delivery: Box::new(move || appservice_delivery.stop()),
         stop_outbound_federation: Box::new(move || {
-            if let Some(outbound) = &outbound_federation {
+            if let Some((outbound, device_lists)) = &outbound_federation {
+                device_lists.stop();
                 outbound.stop();
             }
         }),
