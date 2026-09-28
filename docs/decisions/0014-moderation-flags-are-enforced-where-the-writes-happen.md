@@ -1,4 +1,4 @@
-# 0013. Moderation flags are recorded on the account and enforced where the writes happen
+# 0014. Moderation flags are recorded on the account and enforced where the writes happen
 
 Date: 2026-09-28. Status: accepted. Tracks: 15 (admin API), 07 (auth), 04 (rooms), 09 (media).
 

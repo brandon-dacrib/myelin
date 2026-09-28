@@ -1059,7 +1059,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
 
     let metrics = Arc::new(Metrics::new());
     // Writes refused, swallowed or throttled because an administrator suspended, shadow-banned
-    // or rate-limited the account (decision 0013).
+    // or rate-limited the account (decision 0014).
     metrics.with_registry(hs_room::moderation::register_metrics);
 
     // The first HTTP client is built in here (the ping transport); the roots are ready by now

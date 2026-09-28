@@ -23,8 +23,8 @@ offering operations); before that 2026-09-26 (three public recovery operations);
 >   `hs_room::admin_users::RoomRegistryUserActivity`), wired in `hs-cli/src/serve.rs`;
 >   `InMemoryUserModeration` / `InMemoryUserActivity` for tests. Media listing and deletion go
 >   through the existing `MediaSource`.
-> - **Enforcement** (decision 0013,
->   `docs/decisions/0013-moderation-flags-are-enforced-where-the-writes-happen.md`), in the
+> - **Enforcement** (decision 0014,
+>   `docs/decisions/0014-moderation-flags-are-enforced-where-the-writes-happen.md`), in the
 >   owning crates: `hs-auth` (`UserRecord.rate_limit_override`,
 >   `UserStore::{set_suspended, set_shadow_banned, set_rate_limit_override}`, profile writes
 >   refused while suspended), `hs-room` (`crate::moderation`: `403 M_USER_SUSPENDED` on every
@@ -45,7 +45,7 @@ offering operations); before that 2026-09-26 (three public recovery operations);
 >   media). The interface side (status 16) passed `web/e2e-real/user-moderation.spec.ts` against
 >   `hs serve`.
 > - **Left**: the server-wide `rate_limits.message` bucket is still not enforced (decision
->   0013); in cluster mode the override bucket is per replica; suspension of profile and media
+>   0014); in cluster mode the override bucket is per replica; suspension of profile and media
 >   writes is logged but not counted in the metric (those crates do not depend on `hs-room`).
 
 > **2026-09-28, the server's bare root lands somewhere useful.** Typing the demo's address

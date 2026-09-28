@@ -476,7 +476,7 @@ procedure below and nothing else unless its gate fails:
 |---|---|---|
 | `agent/two-pod-cluster-2` | Handoff waits instead of 503; `hs_cluster_*` on `/metrics`; **an ownership bug fixed** (a slow convergence outlived the lease and held shards were never checked against the store, so up to 69 of 137 shards stayed ownerless; `crates/hs-cluster/tests/slow_store.rs`) | `hs-cluster` green; the two-replica test passed 10/10 on PostgreSQL 17; full gate not run on the final rebase. **Run it with `HS_CLUSTER_TEST_POSTGRES_DSN` set** or `cluster_admin` prints SKIP and passes |
 | `agent/federation-media` | Known gap closed: remote avatars and attachments over signed federation media, legacy fallback, our media served to peers | fmt, clippy green; `federation_media` 3/3 with two real servers; full gate not run on the final rebase |
-| `agent/user-moderation` | Users 41/41: suspend, shadow-ban, rate limit, login-as, redact, media, sessions (decision 0013) | `cargo test --workspace` 2174/0 on the final rebase; clippy, `npm run check`, `npm run test:e2e` still to run |
+| `agent/user-moderation` | Users 41/41: suspend, shadow-ban, rate limit, login-as, redact, media, sessions (decision 0014) | `cargo test --workspace` 2174/0 on the final rebase; clippy, `npm run check`, `npm run test:e2e` still to run |
 | `agent/rooms-admin` | Rooms 23/23: state, messages, events, aliases, hierarchy, admin join, extremities, media and quarantine, purge and delete as tasks | fmt, clippy green; workspace tests 789/2 (two `e2e.rs` restart tests timed out at load 30-50, pass alone); web checks and `e2e-real/room-page` green |
 | `agent/admin-followups` | Reports filters and `report.created` over SSE, pages listen instead of polling; bulk media deletions as cancellable tasks; Federation 7/7; three bugs from a real-server Playwright run | fmt, clippy, `hs-admin` 237, `test:e2e` 41/41 green; full workspace tests not run since the rebase; `UserIdentity.test.tsx` "renames a device" needs one isolated rerun |
 | `agent/federation-leftovers` | Local restricted join without an authoriser; joins ask only the servers the client named (Synapse's rule); stripped state out of the timeline; knock 403; v12 rooms cross servers; EDUs forwarded to the owning replica (`cluster_edus.rs`); four Complement-found fixes. Complement 14/18 top-level, 94/98 subtests (from 5/18) | per-crate clippy and tests green, `federation_membership` 12/12; full workspace gate not run on the tip; re-run Complement (`RemoteJoinFailOver` should now pass) |
@@ -744,7 +744,7 @@ edit one is not. New settings and operations arrive with their interface control
      and lift it (writes answered as done and dropped), per-user rate-limit overrides (`429
      M_LIMIT_EXCEEDED`), login-as (a support session, audited loudly, `admin:write` held
      directly), sessions, memberships, statistics, the user's media and deleting it, and
-     redacting everything a user sent, both as tasks; decision 0013; the Moderation and
+     redacting everything a user sent, both as tasks; decision 0014; the Moderation and
      Activity cards on a user's page; `hs_room_moderated_writes_total{outcome}`. Proved in
      `crates/hs-cli/tests/user_moderation.rs` and `web/e2e-real/user-moderation.spec.ts`
      against `hs serve`. Left: the server-wide `rate_limits.message` bucket is still not
