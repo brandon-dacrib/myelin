@@ -1,5 +1,127 @@
 # 06 Federation: status
 
+## Tenth session (2026-09-27): invites, leaves and knocks over federation
+
+Scope: `docs/next-steps.md` section 4, "Invites, leaves and knocks over federation are seams".
+Branch `agent/federation-membership`. Touched beyond this crate, because a membership change
+crosses all of them: `hs-room` (the out-of-band membership entry point, the unpersisted
+invite, the routes), `hs-user` (stripped state for a room held only through an invite or
+knock), `hs-cli` (the adapters and the integration test). The EDU work running in parallel was
+left alone.
+
+### Where this stopped
+
+**Done and verified by running** (all green on this branch):
+
+```
+cargo fmt --all --check                                                   # clean
+cargo clippy -p hs-federation -p hs-room -p hs-user -p hs-cli --all-targets -- -D warnings   # clean
+cargo test -p hs-federation      # 165/165 (was 152)
+cargo test -p hs-room            # lib 79, backfill 4, remote_join 8, scenario 12,
+                                 # out_of_room_membership 4/4 (new)
+cargo test -p hs-user            # lib 123, sync_scenario 6
+cargo test -p hs-cli             # lib 137, e2e 25, federation_membership 3/3 (new),
+                                 # federation_reads 9, federation_restart 1, federation_sender 3,
+                                 # federation_two_servers 2, federation_writes 8, bridge_offerings 3
+```
+
+`crates/hs-cli/tests/federation_membership.rs` (two in-process servers, as
+`federation_two_servers.rs`):
+
+- `an_invite_from_another_server_reaches_the_invitee_who_joins_through_it`: alice on A invites
+  bob on B; A holds the invite when the request returns; bob's `/sync` on B has it under
+  `invite` with `invite_state` carrying his own invite, the room's name and create event and
+  alice's membership; bob joins with a bare `POST /join/{roomId}` (no `server_name`), which goes
+  through A; messages cross both ways.
+- `an_invite_is_rejected_by_the_invitee_and_rescinded_by_the_inviter_across_servers`: bob's
+  `POST /leave` on an invite to a room B is not in goes through `make_leave`/`send_leave` on A,
+  A shows him `leave` before the request returns, his `/sync` moves the room to `leave`; then
+  alice kicks a second invite and the leave reaches B over `/send` (B holds only the invite).
+- `a_knock_from_another_server_is_accepted_and_one_is_refused`: bob knocks with
+  `POST /knock/{roomId}?server_name=A`; A holds the knock; bob's `/sync` has it under `knock`
+  with `knock_state` from A's answer; alice invites him (accepting it), the invite replaces the
+  knock on B, bob joins and speaks; a second knock is refused with a kick and bob's `/sync`
+  shows `leave`.
+
+Mutation-checked: with `invites: None` in `build_mount` all three fail (A's invite answered
+`501`); with the remote leave in `hs_room::routes::membership::act` disabled the rejection fails
+(`403 no m.room.create event in auth events`: B tried to author the leave itself); with
+`out_of_room_ending` always false the refused knock never reaches bob's `/sync`.
+
+**What was built:**
+
+- `hs_federation::join`: `Handshake` (`Join`/`Leave`/`Knock`), `make_membership`,
+  `send_membership`; `make_join`/`send_join` are wrappers. The submitted event must carry the
+  handshake's membership and be about its own sender. Accepted leaves and knocks are forwarded
+  to the room's other servers exactly as joins are.
+- `hs_federation::transport::membership`: real `make_leave`, `send_leave` (v1 `[200, {}]`, v2
+  `{}`), `make_knock` (requires `ver`, `M_MISSING_PARAM` otherwise), `send_knock`
+  (`knock_room_state`), `invite` v1 and v2. A template is only handed to the server of the user
+  it is for. The seams for all of these are gone from `transport::seams`.
+- `hs_federation::invite`: `receive_invite` (verify, shape checks, co-sign over the redacted
+  form, hand to `InviteSink`), `InviteHandling` on `FederationState::invites` (new field; `None`
+  answers `501`). `hs_federation::stripped`: the stripped-state list and a sanitizer for what a
+  remote hands over. `hs_federation::inbound::verify_server_signature` (split out of
+  `verify_pdu`).
+- `hs_federation::outbound_membership`: `leave_room`, `knock_room`, `send_invite` (checks the
+  returned event has the same ID and the invitee server's valid signature).
+  `outbound_join::make_and_sign` is the shared first half of every handshake this server starts.
+- `hs-room`: `RoomActor::accept_out_of_room_membership` (+ handle, +
+  `RoomRegistry::accept_out_of_room_membership`, which makes a shell room as a remote join
+  does): an invite/leave/ban/knock for a local user in a room no local user is joined to, put in
+  the timeline with explicit state (current state + the event), superseding every extremity --
+  the remote-join persistence path reused. `build_membership_event` (built and signed, not
+  persisted), `stripped_state`, `local_user_joined`. `servers_to_join_through` falls back, when
+  nobody at all is joined, to the room ID's server and the servers that sent local users their
+  memberships (the inviter's). `RemoteJoin` gained default-refusing `leave`, `knock` and
+  `invite`. Routes: a user's own leave of a room nobody here is in goes through `remote.leave`;
+  an invite of a remote user is built, sent to be co-signed, and the co-signed event is put in
+  with `accept_remote_event`; `POST /knock` (both spellings) takes `server_name`/`via`, resolves
+  a remote alias, and goes through `remote.knock` when the room is not held or nobody here is
+  in it; knock answers `{room_id}` now. `membership::TRANSITIONS`: invite from `knock` (how a
+  knock is accepted), kick from `invite` and `knock` (rescinding and refusing).
+- `hs-user`: `stripped_state` adds `unsigned.invite_room_state`/`knock_room_state` from the
+  recipient's own membership event when the room holds no `m.room.create`.
+- `hs-cli`: `FederationRemoteJoin::{leave, knock, invite}`; `RegistryInviteSink` (records the
+  invite with `unsigned.invite_room_state`, or nothing when a local user is already in the room,
+  since the invite then arrives over `/send`); `RegistryWriteSink` falls back to out-of-band
+  recording for a `leave`/`ban` ending a local invite or knock, only from a server
+  `servers_to_join_through` names.
+
+**Decisions made:**
+
+- Out-of-band membership is held in a real room actor (shell + timeline event with explicit
+  state), not in a side table in `hs-user`: everything downstream (hub, feeds, `/sync`, the
+  join-through path, reload) already works off actors and `RoomUpdate`s.
+- The invite room state is kept on the stored event's `unsigned`. It is not covered by the
+  hashes or the event ID; it is rendered to clients as part of `unsigned` (Synapse did the same
+  historically).
+- A local user's invite is built, co-signed remotely and only then persisted, so a refusing
+  invitee server means no invite (Synapse's order).
+
+**Not done / next steps, in order:**
+
+1. `createRoom`'s `invite` list still persists invites for remote users without `PUT /invite`
+   (`hs_room::actor::RoomActor::create_room` calls `membership_action` directly). Fix: in
+   `routes::create_room`, route remote invitees through the same build/co-sign/accept path as
+   `act`, after the room exists.
+2. A leave whose `make_leave` fails everywhere (the invite was rescinded and B never heard, the
+   inviting server is gone) fails the client's request. Synapse then rejects locally with an
+   out-of-band leave; do the same (a leave event B signs itself, `prev_events` = the invite,
+   recorded with `accept_out_of_room_membership`).
+3. `RoomError::RemoteJoinFailed` is rendered as "could not join the room through federation"
+   for leave, knock and invite failures too; give it a neutral message.
+4. The invite and knock stripped state stored in `unsigned` shows up in B's timeline rendering
+   of those events; strip it there if a client complains.
+5. Restricted joins (`join_authorised_via_users_server`, room versions 8+): not started.
+   `make_join` for a restricted room has to pick an authorising local user with invite power and
+   `send_join` has to sign the event as the authorising server; about ten Complement tests.
+6. Measure against Complement's federation package (`TestFederationRoomsInvite`,
+   `TestKnocking`, `TestFederationRejectInvite`, ...) -- nothing here has met another
+   implementation yet.
+7. Update `docs/next-steps.md` section 4 and the known-gaps table (the seams bullet) once this
+   branch is merged.
+
 ## Ninth session (2026-09-27): the outbound queue survives a restart, and the sender is shard-gated
 
 Scope, per this session's brief: `docs/next-steps.md` item 4 ("The outbound queue is in

@@ -2310,6 +2310,226 @@ impl<B: KvBackend> RoomActor<B> {
         Ok(RemoteEventOutcome::Stored(event_sn))
     }
 
+    /// Records a membership event for one of this server's own users in a room this server is
+    /// not in -- one no user of this server is joined to, most often one it has never held
+    /// anything of. Three things arrive this way, each from a server that is in the room:
+    ///
+    /// - an **invite** for a local user (`PUT /invite`, co-signed here before this is called);
+    /// - the **leave or ban** that ends one -- the inviter rescinding it, a resident rejecting a
+    ///   knock -- sent here over `/send` because the target's server is not in the room;
+    /// - a local user's own **leave or knock** made through a resident (`make_leave`/
+    ///   `send_leave`, `make_knock`/`send_knock`), which the resident has accepted.
+    ///
+    /// None of these can be placed in the room's DAG here: their `prev_events` and most of their
+    /// `auth_events` are events this server does not hold. So the event goes into the timeline
+    /// the way a remote join's does ([`RoomActor::accept_remote_join_with_state`]): with its
+    /// state set explicitly, to whatever this actor's current state is with the event applied
+    /// over it, superseding every forward extremity. For a room held only this way that state is
+    /// nothing but the user's membership -- enough for `hs-user`'s session hub to put the room in
+    /// the user's `invite`, `knock` or `leave` section, and for a later join to go through a
+    /// server that is in it ([`RoomActor::servers_to_join_through`]) and apply its answer over
+    /// this.
+    ///
+    /// **What is not checked, and why**: the event's authorization against the room's state,
+    /// which this server does not have. The caller has verified its signature (the sender's
+    /// server, and for an invite this server's own); this checks its shape: an `m.room.member`
+    /// event of this room and version, about a user of this server, with a membership of
+    /// `invite`, `leave`, `ban` or `knock` -- never `join`, which comes with the room's state.
+    /// Synapse stores these the same way, as out-of-band membership.
+    ///
+    /// # Errors
+    /// [`RoomError::InvalidEvent`] for the wrong shape; [`RoomError::Forbidden`] if the target
+    /// is not a user of this server, or if one is joined (the room is held for real, and the
+    /// event must come through it); [`RoomError::Store`], [`RoomError::Fenced`] or
+    /// [`RoomError::State`] from persistence.
+    pub fn accept_out_of_room_membership(
+        &mut self,
+        event: Event,
+    ) -> Result<RemoteEventOutcome, RoomError> {
+        if self.event_id_index.contains_key(event.event_id()) {
+            return Ok(RemoteEventOutcome::AlreadyKnown);
+        }
+        let shape = |msg: String| RoomError::InvalidEvent(hs_model::EventError::Format(msg));
+        let room_id = event
+            .json()
+            .get("room_id")
+            .and_then(CanonicalJsonValue::as_str);
+        if room_id != Some(self.room_id.as_str()) {
+            return Err(shape(format!(
+                "event {} is for room {} not {}",
+                event.event_id(),
+                room_id.unwrap_or("<none>"),
+                self.room_id
+            )));
+        }
+        if event.header().room_version != self.room_version {
+            return Err(shape(format!(
+                "event {} was parsed under room version {} but this room is version {}",
+                event.event_id(),
+                event.header().room_version,
+                self.room_version
+            )));
+        }
+        if event.header().event_type != "m.room.member" {
+            return Err(shape(format!(
+                "event {} is not an m.room.member event",
+                event.event_id()
+            )));
+        }
+        let target = event
+            .header()
+            .state_key
+            .as_deref()
+            .and_then(|key| UserId::parse(key).ok())
+            .ok_or_else(|| shape("the membership event's state_key is not a user".to_owned()))?;
+        if target.server_name().as_str() != self.identity.server_name.as_str() {
+            return Err(RoomError::Forbidden(format!(
+                "{target} is not a user of this server"
+            )));
+        }
+        let membership = event
+            .json()
+            .get("content")
+            .and_then(CanonicalJsonValue::as_object)
+            .and_then(|content| content.get("membership"))
+            .and_then(CanonicalJsonValue::as_str);
+        if !matches!(membership, Some("invite" | "leave" | "ban" | "knock")) {
+            return Err(shape(format!(
+                "membership {membership:?} cannot be recorded without the room's state"
+            )));
+        }
+        if self.local_user_joined() {
+            return Err(RoomError::Forbidden(format!(
+                "a user of this server is in {}; its events come through the room",
+                self.room_id
+            )));
+        }
+        let snapshot: Vec<EventSn> = self
+            .full_state()?
+            .iter()
+            .filter_map(|held| self.event_id_index.get(held.event_id()).copied())
+            .collect();
+        let event_sn = self.persist_with(event, PersistKind::RemoteJoin { snapshot })?;
+        Ok(RemoteEventOutcome::Stored(event_sn))
+    }
+
+    /// Whether any user of this server is currently joined to the room.
+    #[must_use]
+    pub fn local_user_joined(&self) -> bool {
+        let own = self.identity.server_name.as_str();
+        self.joined_members()
+            .unwrap_or_default()
+            .iter()
+            .any(|member| {
+                member
+                    .header()
+                    .state_key
+                    .as_deref()
+                    .and_then(|key| UserId::parse(key).ok())
+                    .is_some_and(|user| user.server_name().as_str() == own)
+            })
+    }
+
+    /// Builds, signs and authorizes the `m.room.member` event `action` would send, **without
+    /// persisting it**: the first half of inviting a user of another server, whose server has to
+    /// co-sign the invite (`PUT /invite`) before it goes into the room. The co-signed event is
+    /// then persisted through [`RoomActor::accept_remote_event`], which authorizes it again
+    /// against the room as it is by then. The same precheck and idempotency as
+    /// [`RoomActor::membership_action`]: an unchanged membership returns the event already in
+    /// the room.
+    ///
+    /// # Errors
+    /// As [`RoomActor::membership_action`], less anything persistence can fail with.
+    pub fn build_membership_event(
+        &self,
+        sender: OwnedUserId,
+        action: Action,
+        target: OwnedUserId,
+        extra: serde_json::Value,
+        now_ms: i64,
+    ) -> Result<Event, RoomError> {
+        if let Some(reason) = self.blocked_reason()? {
+            return Err(RoomError::RoomBlocked(reason));
+        }
+        let prior = self.prior_membership(&target)?;
+        membership::precheck(&self.rules, action, prior)
+            .map_err(|e| RoomError::Forbidden(e.to_string()))?;
+        let content = membership::content_for(action, extra);
+        if let Some(existing) =
+            self.idempotent_state_reuse("m.room.member", Some(target.as_str()), &content)?
+        {
+            return Ok(existing);
+        }
+        let prev_sns = self.forward_extremities_vec();
+        let prev_refs = self.refs_for(&prev_sns)?;
+        let state = self.state_view(&prev_sns)?;
+        pipeline::build_and_authorize(
+            &self.room_version,
+            &self.rules,
+            Some(&self.room_id),
+            &self.identity.server_name,
+            &self.identity.signing_key,
+            now_ms,
+            &prev_refs,
+            &state,
+            NewEvent {
+                event_type: "m.room.member".to_owned(),
+                state_key: Some(target.to_string()),
+                sender,
+                content,
+                redacts: None,
+            },
+        )
+    }
+
+    /// The room described to somebody who is not in it (the client-server API's "stripped
+    /// state"): the current `m.room.create`, `join_rules`, `canonical_alias`, `name`, `avatar`,
+    /// `topic` and `encryption` events, plus the `m.room.member` events of `members` (the
+    /// inviter, say), each reduced to `type`, `state_key`, `sender` and `content`. What an
+    /// invite to another server carries as `invite_room_state`.
+    ///
+    /// # Errors
+    /// [`RoomError::State`] if the current state cannot be read.
+    pub fn stripped_state(&self, members: &[&str]) -> Result<Vec<serde_json::Value>, RoomError> {
+        const TYPES: &[&str] = &[
+            "m.room.create",
+            "m.room.join_rules",
+            "m.room.canonical_alias",
+            "m.room.name",
+            "m.room.avatar",
+            "m.room.topic",
+            "m.room.encryption",
+        ];
+        let mut out = Vec::new();
+        for event in self.full_state()? {
+            let header = event.header();
+            let wanted = TYPES.contains(&header.event_type.as_str())
+                || (header.event_type == "m.room.member"
+                    && header
+                        .state_key
+                        .as_deref()
+                        .is_some_and(|key| members.contains(&key)));
+            if !wanted {
+                continue;
+            }
+            let content = event
+                .json()
+                .get("content")
+                .map(|c| {
+                    serde_json::from_slice::<serde_json::Value>(&c.to_canonical_bytes())
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .unwrap_or_else(|| serde_json::json!({}));
+            out.push(serde_json::json!({
+                "type": header.event_type,
+                "state_key": header.state_key,
+                "sender": header.sender,
+                "content": content,
+            }));
+        }
+        Ok(out)
+    }
+
     /// Creates the local actor for `room_id` from a **verified** federation `send_join` response:
     /// an empty shell ([`RoomActor::empty_for`]) with
     /// [`RoomActor::accept_remote_join_with_state`] applied to it. See that method for what is
@@ -3874,7 +4094,9 @@ impl<B: KvBackend> RoomActor<B> {
     /// then; a join built against it would be authorized against rules that may have changed
     /// since, cite extremities the room has long moved past, and -- accepted or not by the
     /// resident -- never bring back what was missed. Synapse makes the same call
-    /// (`is_host_in_room`). The servers are the room ID's own first, then every joined member's.
+    /// (`is_host_in_room`). The servers are the room ID's own first, then every joined member's;
+    /// when no member is joined at all (a room held only through an invite or a knock), the room
+    /// ID's server and those of whoever sent this server's users their memberships.
     #[must_use]
     pub fn servers_to_join_through(&self) -> Option<Vec<String>> {
         let own = self.identity.server_name.as_str();
@@ -3896,8 +4118,35 @@ impl<B: KvBackend> RoomActor<B> {
                 servers.push(server.to_owned());
             }
         }
-        if local_joined || servers.is_empty() {
+        if local_joined {
             return None;
+        }
+        if servers.is_empty() {
+            // Nobody is joined whom this server could name -- a room held only through
+            // out-of-band membership (`RoomActor::accept_out_of_room_membership`: an invite, a
+            // knock), or one everybody has left. Whoever sent this server's users their
+            // memberships is in the room, or was: the inviter's server, or the resident that
+            // rejected a knock.
+            let mut senders: Vec<String> = Vec::new();
+            for member in self.members().unwrap_or_default() {
+                let about_local = member
+                    .header()
+                    .state_key
+                    .as_deref()
+                    .and_then(|k| UserId::parse(k).ok())
+                    .is_some_and(|user| user.server_name().as_str() == own);
+                let server = member.header().sender.server_name().as_str();
+                if about_local && server != own && !senders.iter().any(|s| s == server) {
+                    senders.push(server.to_owned());
+                }
+            }
+            if let Some(server) = self.room_id.server_name()
+                && server.as_str() != own
+                && !senders.iter().any(|s| s == server.as_str())
+            {
+                senders.insert(0, server.as_str().to_owned());
+            }
+            return (!senders.is_empty()).then_some(senders);
         }
         if let Some(server) = self.room_id.server_name()
             && server.as_str() != own
@@ -4732,6 +4981,38 @@ impl<B: KvBackend> RoomActorHandle<B> {
     {
         self.with_actor(move |actor| {
             actor.accept_remote_join_with_state(state, auth_chain, join_event)
+        })
+        .await
+    }
+
+    /// [`RoomActor::accept_out_of_room_membership`]: an invite, leave, ban or knock for one of
+    /// this server's users in a room this server is not in.
+    pub async fn accept_out_of_room_membership(
+        &self,
+        event: Event,
+    ) -> Result<RemoteEventOutcome, RoomError>
+    where
+        B: 'static,
+    {
+        self.with_actor(move |actor| actor.accept_out_of_room_membership(event))
+            .await
+    }
+
+    /// [`RoomActor::build_membership_event`]: the membership event `action` would send, built and
+    /// signed but not persisted.
+    pub async fn build_membership_event(
+        &self,
+        sender: OwnedUserId,
+        action: Action,
+        target: OwnedUserId,
+        extra: serde_json::Value,
+        now_ms: i64,
+    ) -> Result<Event, RoomError>
+    where
+        B: 'static,
+    {
+        self.with_actor(move |actor| {
+            actor.build_membership_event(sender, action, target, extra, now_ms)
         })
         .await
     }

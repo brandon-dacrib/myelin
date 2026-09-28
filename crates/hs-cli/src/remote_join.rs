@@ -49,6 +49,51 @@ impl<B: KvBackend + 'static> FederationRemoteJoin<B> {
     }
 }
 
+impl<B: KvBackend + 'static> FederationRemoteJoin<B> {
+    fn check_local(&self, user_id: &UserId) -> Result<(), RoomError> {
+        if user_id.server_name() == &*self.identity.server_name {
+            Ok(())
+        } else {
+            Err(RoomError::Forbidden(format!(
+                "{user_id} is not a user of this server"
+            )))
+        }
+    }
+
+    /// Runs `attempt` against each server in `via` but this one, in order, until one succeeds:
+    /// the room refusing (a `403`) is the answer whoever relays it, anything else is a reason to
+    /// ask the next server. `what` names the handshake in the log.
+    async fn through_each<T, F, Fut>(
+        &self,
+        via: &[String],
+        what: &str,
+        attempt: F,
+    ) -> Result<T, RoomError>
+    where
+        F: Fn(String) -> Fut,
+        Fut: std::future::Future<Output = Result<T, OutboundJoinError>>,
+    {
+        let own_name = self.identity.server_name.as_str();
+        let mut last_error: Option<RoomError> = None;
+        for destination in via.iter().filter(|d| d.as_str() != own_name) {
+            match attempt(destination.clone()).await {
+                Ok(outcome) => return Ok(outcome),
+                Err(error) => {
+                    tracing::warn!(destination, what, %error, "a server could not complete the handshake");
+                    let mapped = map_outbound_error(&error);
+                    if matches!(mapped, RoomError::Forbidden(_)) {
+                        return Err(mapped);
+                    }
+                    last_error = Some(mapped);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            RoomError::RemoteJoinFailed("no server to ask: the only candidate was this one".into())
+        }))
+    }
+}
+
 /// What one sponsoring server's refusal means for the client: a `403` is the room refusing the
 /// join and worth reporting as such; a `404` is that server not knowing the room; anything else
 /// is a failure to complete the handshake.
@@ -146,6 +191,104 @@ impl<B: KvBackend + 'static> hs_room::remote_join::RemoteJoin for FederationRemo
         Err(last_error.unwrap_or_else(|| {
             RoomError::RemoteJoinFailed("no server to ask: the only candidate was this one".into())
         }))
+    }
+
+    async fn leave(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+        via: &[String],
+        content: Value,
+    ) -> Result<(), RoomError> {
+        self.check_local(user_id)?;
+        let content = &content;
+        let outcome = self
+            .through_each(via, "leave", |destination| async move {
+                hs_federation::outbound_membership::leave_room(
+                    &self.client,
+                    &destination,
+                    room_id.as_str(),
+                    user_id.as_str(),
+                    &self.identity.server_name,
+                    &self.identity.signing_key,
+                    Some(content),
+                )
+                .await
+            })
+            .await?;
+        tracing::info!(%room_id, %user_id, "left a room this server is not in, through a server that is");
+        self.rooms
+            .accept_out_of_room_membership(room_id, outcome.room_version, outcome.event)
+            .await?;
+        Ok(())
+    }
+
+    async fn knock(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+        via: &[String],
+        content: Value,
+    ) -> Result<OwnedRoomId, RoomError> {
+        self.check_local(user_id)?;
+        let content = &content;
+        let outcome = self
+            .through_each(via, "knock", |destination| async move {
+                hs_federation::outbound_membership::knock_room(
+                    &self.client,
+                    &destination,
+                    room_id.as_str(),
+                    user_id.as_str(),
+                    &self.identity.server_name,
+                    &self.identity.signing_key,
+                    Some(content),
+                )
+                .await
+            })
+            .await?;
+        tracing::info!(%room_id, %user_id, "knocked on a room hosted elsewhere");
+        // The stripped state the resident answered with is what the user's client will show of
+        // the room; it is kept on the knock itself, where `hs-user`'s `/sync` reads it.
+        let mut json = hs_federation::inbound::event_json(&outcome.event);
+        json["unsigned"]["knock_room_state"] = Value::Array(outcome.room_state);
+        let event = hs_model::Event::parse(&json, outcome.room_version.clone())
+            .map_err(|e| RoomError::Internal(format!("the accepted knock does not parse: {e}")))?;
+        self.rooms
+            .accept_out_of_room_membership(room_id, outcome.room_version, event)
+            .await?;
+        Ok(room_id.to_owned())
+    }
+
+    async fn invite(
+        &self,
+        room_version: &ruma::RoomVersionId,
+        event: &hs_model::Event,
+        invite_room_state: Vec<Value>,
+    ) -> Result<hs_model::Event, RoomError> {
+        let destination = event
+            .header()
+            .state_key
+            .as_deref()
+            .and_then(|key| UserId::parse(key).ok())
+            .map(|user| user.server_name().to_string())
+            .ok_or_else(|| RoomError::BadRequest("the invite is not about a user".to_owned()))?;
+        hs_federation::outbound_membership::send_invite(
+            &self.client,
+            &self.key_cache,
+            &destination,
+            room_version,
+            event,
+            &invite_room_state,
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(event_id = %event.event_id(), destination, %error, "the invitee's server did not take the invite");
+            match map_outbound_error(&error) {
+                // The invitee's server not knowing the room is the normal case, not a refusal.
+                RoomError::RoomNotFound(_) => RoomError::RemoteJoinFailed(error.to_string()),
+                other => other,
+            }
+        })
     }
 
     async fn resolve_alias(

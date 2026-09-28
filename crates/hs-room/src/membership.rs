@@ -104,17 +104,27 @@ pub const TRANSITIONS: &[(Action, &[PriorState])] = &[
         ],
     ),
     // A user may be invited if they are not already joined or banned.
+    // Inviting somebody who knocked is how a knock is accepted.
     (
         Action::Invite,
-        &[PriorState::None, PriorState::Leave, PriorState::Invite],
+        &[
+            PriorState::None,
+            PriorState::Leave,
+            PriorState::Invite,
+            PriorState::Knock,
+        ],
     ),
     // The target may leave from join, invite or knock (retracting either of the latter two).
     (
         Action::Leave,
         &[PriorState::Join, PriorState::Invite, PriorState::Knock],
     ),
-    // Only a currently-joined user can be kicked.
-    (Action::Kick, &[PriorState::Join]),
+    // A kick removes a joined user, and is also how an invite is rescinded and a knock refused
+    // by somebody else (the spec's "leave" sent by a third party over `invite` or `knock`).
+    (
+        Action::Kick,
+        &[PriorState::Join, PriorState::Invite, PriorState::Knock],
+    ),
     // A ban can be placed from any state except an existing ban (banning an already-banned user
     // is a no-op the spec does not forbid, but this table treats it as not worth re-sending).
     (

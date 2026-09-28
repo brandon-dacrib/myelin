@@ -464,6 +464,44 @@ fn stripped_state(
     {
         out.push(strip(event));
     }
+    // A room this server is not in holds nothing but the recipient's own membership
+    // (`RoomActor::accept_out_of_room_membership`); what describes it is the stripped state the
+    // inviting server sent with the invite, or the resident answered the knock with, kept on
+    // that event as `unsigned.invite_room_state`/`knock_room_state`. Added for every key the
+    // room itself does not have.
+    if actor.state_event("m.room.create", "")?.is_none()
+        && let Some(own) = actor.state_event("m.room.member", recipient.as_str())?
+    {
+        let held: HashSet<(String, String)> = out
+            .iter()
+            .map(|e| {
+                (
+                    e["type"].as_str().unwrap_or("").to_owned(),
+                    e["state_key"].as_str().unwrap_or("").to_owned(),
+                )
+            })
+            .collect();
+        let unsigned = client_event_json(own)
+            .get("unsigned")
+            .cloned()
+            .unwrap_or(Value::Null);
+        for field in ["invite_room_state", "knock_room_state"] {
+            for entry in unsigned[field].as_array().into_iter().flatten() {
+                let key = (
+                    entry["type"].as_str().unwrap_or("").to_owned(),
+                    entry["state_key"].as_str().unwrap_or("").to_owned(),
+                );
+                if entry.is_object() && !held.contains(&key) {
+                    out.push(json!({
+                        "type": entry["type"],
+                        "state_key": entry["state_key"],
+                        "sender": entry["sender"],
+                        "content": entry.get("content").cloned().unwrap_or_else(|| json!({})),
+                    }));
+                }
+            }
+        }
+    }
     Ok(out)
 }
 

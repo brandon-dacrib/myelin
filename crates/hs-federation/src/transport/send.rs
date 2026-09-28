@@ -120,6 +120,7 @@ mod tests {
             ancestor_fetcher: None,
             backfill_limits: crate::backfill::BackfillLimits::default(),
             sender: None,
+            invites: None,
         }
     }
 

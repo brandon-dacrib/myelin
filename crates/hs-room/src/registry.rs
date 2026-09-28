@@ -415,6 +415,49 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
         }
     }
 
+    /// Records a membership event for one of this server's users in a room this server is not
+    /// in -- an invite from another server, the leave or ban that ends it, or the user's own
+    /// leave or knock made through a resident. See
+    /// [`crate::actor::RoomActor::accept_out_of_room_membership`] for what is checked and how
+    /// it is held. A room not held here at all is created for it, the way
+    /// [`RoomRegistry::bootstrap_from_remote_join`] creates one: an empty shell registered
+    /// first, so the event's [`RoomUpdate`] (how `hs-user` learns of the invite) is published
+    /// from an actor that is already resident, and dropped again if the event is refused.
+    ///
+    /// # Errors
+    /// Any error `accept_out_of_room_membership`, `RoomActor::empty_for` or
+    /// [`RoomRegistry::get_or_load`] can return.
+    pub async fn accept_out_of_room_membership(
+        &self,
+        room_id: &ruma::RoomId,
+        room_version: ruma::RoomVersionId,
+        event: hs_model::Event,
+    ) -> Result<RoomActorHandle<B>, RoomError> {
+        let handle = match self.get_or_load(room_id).await {
+            Ok(handle) => handle,
+            Err(RoomError::RoomNotFound(_)) => {
+                let backend = self.backend.clone();
+                let tables = self.tables.clone();
+                let identity = self.identity.clone();
+                let owned_room_id = room_id.to_owned();
+                let shell = tokio::task::spawn_blocking(move || {
+                    RoomActor::empty_for(backend, tables, identity, &owned_room_id, room_version)
+                })
+                .await
+                .expect("room shell task panicked")?;
+                self.insert_if_absent(shell).await
+            }
+            Err(e) => return Err(e),
+        };
+        match handle.accept_out_of_room_membership(event).await {
+            Ok(_) => Ok(handle),
+            Err(e) => {
+                self.drop_if_unbootstrapped(room_id, &handle).await;
+                Err(e)
+            }
+        }
+    }
+
     /// A stream of every [`RoomUpdate`] published by any room this registry loads or creates, from
     /// the moment the subscription is taken out. This is the fan-in hook
     /// `docs/rfcs/0012-room-registry-global-updates.md` asked for: it is what lets `hs-user`'s

@@ -13,9 +13,11 @@
 //! implemented against [`FederationState`]'s [`RoomDataSource`] and [`FederationQuerySource`]
 //! seams. The join/leave/knock/invite handshakes and `/send` are seams per section 2.5: they
 //! verify the signature (via the shared layer), bound-check the body, and reject with a typed
-//! "not implemented" error — nothing else.
+//! "not implemented" error — nothing else. `/send`, the join, leave and knock handshakes and
+//! `/invite` are real now (`send`, `join`, `membership`).
 
 mod join;
+mod membership;
 mod queries;
 mod read_routes;
 mod seams;
@@ -60,6 +62,10 @@ pub struct FederationState {
     /// nothing is forwarded (the manifest-only mount, and every handler test that does not care).
     /// See `crate::sender`.
     pub sender: Option<Arc<dyn crate::sender::OutboundPduSink>>,
+    /// Where `PUT /invite` puts an invite for one of this server's users, and the key it
+    /// co-signs it with (`crate::invite`). `None` answers `501`: the manifest-only mount, and
+    /// every handler test that does not care.
+    pub invites: Option<crate::invite::InviteHandling>,
 }
 
 fn matrix_federation(operation_id: &str) -> RouteMeta {
@@ -87,13 +93,14 @@ pub fn router(
     let builder = seams::add_routes(builder);
     let builder = send::add_routes(builder);
     let builder = join::add_routes(builder);
+    let builder = membership::add_routes(builder);
     let (merged, manifest) = builder.build();
 
     (apply_x_matrix_layer(merged, state, x_matrix_ctx), manifest)
 }
 
-/// Builds the **v2** federation router: `send_join`, plus the still-seam `send_leave` and
-/// `invite` v2 spellings, under the same `X-Matrix` layer as [`router`].
+/// Builds the **v2** federation router: `send_join`, `send_leave` and `invite`, under the same
+/// `X-Matrix` layer as [`router`].
 ///
 /// This exists as a second function (rather than one router covering both prefixes) because the
 /// v1 and v2 paths for `send_join`/`send_leave`/`invite` share the exact same route string
@@ -114,7 +121,7 @@ pub fn router_v2(
 ) -> (axum::Router, RouteManifest) {
     let builder = Builder::<FederationState>::new();
     let builder = join::add_routes_v2(builder);
-    let builder = seams::add_routes_v2(builder);
+    let builder = membership::add_routes_v2(builder);
     let (merged, manifest) = builder.build();
 
     (apply_x_matrix_layer(merged, state, x_matrix_ctx), manifest)
@@ -170,6 +177,7 @@ mod tests {
             ancestor_fetcher: None,
             backfill_limits: crate::backfill::BackfillLimits::default(),
             sender: None,
+            invites: None,
         }
     }
 

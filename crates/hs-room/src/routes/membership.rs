@@ -133,6 +133,19 @@ pub(crate) async fn fill_in_profile<B: hs_kv::KvBackend + 'static>(
     }
 }
 
+/// Performs a membership `action` in a room this server holds.
+///
+/// Two actions go through another server instead, when the federation hook is installed
+/// (`RoomState::remote_join`):
+///
+/// - A user's own **leave** of a room no user of this server is joined to
+///   (`RoomActor::servers_to_join_through`) -- rejecting an invite from another server, or
+///   withdrawing a knock. This server holds nothing current to author the leave against, so it
+///   asks a server in the room for a template (`make_leave`/`send_leave`).
+/// - An **invite** of a user of another server: the event is built and signed here but not
+///   persisted, sent to the invitee's server with the room's stripped state (`PUT /invite`),
+///   and the event that comes back co-signed is what goes into the room. An invitee's server
+///   that refuses means no invite.
 async fn act<B: KvBackend + 'static>(
     state: &RoomState<B>,
     room_id: &str,
@@ -144,6 +157,32 @@ async fn act<B: KvBackend + 'static>(
     let room_id = parse_room_id(room_id)?;
     let handle = state.rooms.get_or_load(&room_id).await?;
     let content = extra(state, action, &target, body).await;
+    if let Some(remote) = &state.remote_join {
+        if action == Action::Leave
+            && sender == target
+            && let Some(servers) = handle.query(|actor| actor.servers_to_join_through()).await
+        {
+            remote.leave(&sender, &room_id, &servers, content).await?;
+            return Ok(Json(json!({})).into_response());
+        }
+        if action == Action::Invite && target.server_name() != &*state.identity.server_name {
+            let inviter = sender.to_string();
+            let event = handle
+                .build_membership_event(sender, action, target, content, now_ms())
+                .await?;
+            let (room_version, stripped) = handle
+                .query(move |actor| {
+                    (
+                        actor.room_version().clone(),
+                        actor.stripped_state(&[inviter.as_str()]),
+                    )
+                })
+                .await;
+            let cosigned = remote.invite(&room_version, &event, stripped?).await?;
+            handle.accept_remote_event(cosigned).await?;
+            return Ok(Json(json!({})).into_response());
+        }
+    }
     handle
         .membership(sender, action, target, content, now_ms())
         .await?;
@@ -432,44 +471,109 @@ pub async fn post_unban<B: KvBackend + 'static>(
     .await
 }
 
+/// A knock, through federation when this server cannot make it: exactly the cases a join goes
+/// through federation in ([`act_join`]) -- a room not held here at all, or one no user of this
+/// server is joined to -- asking the servers the client named (`via`), the room ID's own, and
+/// whoever this server knows to be in the room. The resident's answer (the accepted knock and
+/// the room's stripped state) is recorded here, and the user's `/sync` shows the knock.
+async fn act_knock<B: KvBackend + 'static>(
+    state: &RoomState<B>,
+    room_id: &RoomId,
+    mut via: Vec<String>,
+    sender: ruma::OwnedUserId,
+    body: &Value,
+) -> Result<Response, RoomError> {
+    let content = extra(state, Action::Knock, &sender, body).await;
+    let handle = match state.rooms.get_or_load(room_id).await {
+        Ok(handle) => Some(handle),
+        Err(RoomError::RoomNotFound(_)) if state.remote_join.is_some() => None,
+        Err(e) => return Err(e),
+    };
+    if let Some(handle) = &handle {
+        let through = match &state.remote_join {
+            Some(_) => handle.query(|actor| actor.servers_to_join_through()).await,
+            None => None,
+        };
+        match through {
+            Some(servers) => {
+                for server in servers {
+                    if !via.contains(&server) {
+                        via.push(server);
+                    }
+                }
+            }
+            None => {
+                handle
+                    .membership(sender.clone(), Action::Knock, sender, content, now_ms())
+                    .await?;
+                return Ok(Json(json!({ "room_id": room_id })).into_response());
+            }
+        }
+    }
+    let Some(remote) = &state.remote_join else {
+        return Err(RoomError::RoomNotFound(room_id.to_string()));
+    };
+    if let Some(server) = room_id.server_name()
+        && server != &*state.identity.server_name
+        && !via.iter().any(|v| v == server.as_str())
+    {
+        via.push(server.to_string());
+    }
+    if via.is_empty() {
+        return Err(RoomError::RoomNotFound(room_id.to_string()));
+    }
+    let knocked = remote.knock(&sender, room_id, &via, content).await?;
+    Ok(Json(json!({ "room_id": knocked })).into_response())
+}
+
 /// `POST /rooms/{roomId}/knock`.
 pub async fn post_knock<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
     RoomRequester(requester): RoomRequester,
     PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
-    let user = requester.user_id.clone();
-    act(&state, &room_id, user.clone(), Action::Knock, user, &body).await
+    let room_id = parse_room_id(&room_id)?;
+    let via = requested_via(raw_query.as_deref());
+    act_knock(&state, &room_id, via, requester.user_id, &body).await
 }
 
-/// `POST /knock/{roomIdOrAlias}`.
+/// `POST /knock/{roomIdOrAlias}`. An alias on another server is resolved through that server's
+/// directory, as for a join.
 pub async fn post_knock_by_id_or_alias<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_id_or_alias): Path<String>,
+    RawQuery(raw_query): RawQuery,
     RoomRequester(requester): RoomRequester,
     PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
+    let mut via = requested_via(raw_query.as_deref());
     let room_id = if room_id_or_alias.starts_with('!') {
         parse_room_id(&room_id_or_alias)?
     } else {
         let alias = ruma::RoomAliasId::parse(&room_id_or_alias)
             .map_err(|e| RoomError::BadRequest(e.to_string()))?;
-        state
-            .rooms
-            .resolve_alias(&alias)?
-            .ok_or_else(|| RoomError::RoomNotFound(room_id_or_alias.clone()))?
+        match state.rooms.resolve_alias(&alias)? {
+            Some(room_id) => room_id,
+            None => match &state.remote_join {
+                Some(remote) if alias.server_name() != &*state.identity.server_name => {
+                    let (room_id, servers) = remote.resolve_alias(&alias).await?;
+                    for server in servers {
+                        if !via.contains(&server) {
+                            via.push(server);
+                        }
+                    }
+                    if !via.iter().any(|v| v == alias.server_name().as_str()) {
+                        via.push(alias.server_name().to_string());
+                    }
+                    room_id
+                }
+                _ => return Err(RoomError::RoomNotFound(room_id_or_alias.clone())),
+            },
+        }
     };
-    let user = requester.user_id.clone();
-    act(
-        &state,
-        room_id.as_str(),
-        user.clone(),
-        Action::Knock,
-        user,
-        &body,
-    )
-    .await
+    act_knock(&state, &room_id, via, requester.user_id, &body).await
 }
 
 #[cfg(test)]
