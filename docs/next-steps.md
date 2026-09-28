@@ -442,6 +442,9 @@ configuration history and revert (`ConfigStore` already records the patch per re
   0014, since Rooms took 0013), per-crate checks and web checks 49/49 green; the mock
   `cluster.spec.ts` failure was a race in the Cluster page (the shard map was not re-read when a
   drain settled), fixed in the page. In the merge queue now.
+- 18:10 the queue refused it once more on a docs-only conflict with the root redirect's status
+  entry; resolved (`5eb40e6`) and back in the queue. `agent/admin-followups` is being rebased
+  onto it by a background agent in `.claude/worktrees/agent-a36043e5849457912`.
 
 ## Handover (2026-09-28, 16:00 EDT): where the nine resumed agents stopped
 
