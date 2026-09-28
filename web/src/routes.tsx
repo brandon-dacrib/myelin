@@ -10,6 +10,7 @@ import { AppShell } from "@/components/shell/AppShell";
 import { WIZARD_STEPS, type WizardStep } from "@/pages/bridges/wizard/wizard-state";
 import { OFFER_STEPS, type OfferStep } from "@/pages/bridges/wizard/offer-state";
 import { validateAuditSearch } from "@/pages/audit/audit-search";
+import { validateMediaSearch } from "@/pages/media/media-search";
 
 // Route-level code splitting: each page (and its own dependency graph —
 // react-query hooks, mock-independent UI, etc.) lands in its own chunk,
@@ -68,6 +69,7 @@ const PlaceholderPage = lazyRouteComponent(
   () => import("@/pages/PlaceholderPage"),
   "PlaceholderPage",
 );
+const MediaPage = lazyRouteComponent(() => import("@/pages/media/MediaPage"), "MediaPage");
 const AuditPage = lazyRouteComponent(() => import("@/pages/audit/AuditPage"), "AuditPage");
 const AuditEntryPage = lazyRouteComponent(
   () => import("@/pages/audit/AuditEntryPage"),
@@ -255,7 +257,12 @@ function placeholderRoute<T extends string>(path: T) {
 }
 
 const reportsRoute = placeholderRoute("/reports");
-const mediaRoute = placeholderRoute("/media");
+const mediaRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/media",
+  validateSearch: validateMediaSearch,
+  component: MediaPage,
+});
 const clusterRoute = placeholderRoute("/cluster");
 const migrationRoute = placeholderRoute("/migration");
 const auditRoute = createRoute({

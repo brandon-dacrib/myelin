@@ -53,6 +53,15 @@ import {
   useMockRecoveryLink,
 } from "./data/recovery";
 import { rooms, roomMembers, findRoom } from "./data/rooms";
+import {
+  findMedia,
+  lastUsed,
+  listMedia,
+  mediaItems,
+  removeMedia,
+  thumbnailSvg,
+} from "./data/media";
+import type { MediaItem } from "@/api/media";
 import { ALL_SCOPES, type Scope } from "@/lib/auth";
 import type { AppService, BridgeOfferingRequest } from "@/api/bridges";
 import type { JsonValue } from "@/api/config-schema";
@@ -1036,4 +1045,142 @@ export const handlers = [
     destination.retry_last_at = null;
     return HttpResponse.json(destination);
   }),
+
+  // ---- Media (the nine media.* operations; crates/hs-admin/src/media.rs) ----
+  //
+  // The two bulk routes are registered before `/media/:server_name/:media_id` so a POST to
+  // `/media/delete` is never read as a media id.
+  http.post(`${API}/media/delete`, async ({ request }) => {
+    const body = (await request.json().catch(() => ({}))) as {
+      before?: string;
+      min_size_bytes?: number;
+    };
+    if (!body.before) {
+      return problem(400, "validation-failed", "Validation failed", {
+        detail: "before is required: a bulk deletion names how long media must have gone unused",
+        errors: [{ pointer: "/before", detail: "before is required" }],
+      });
+    }
+    const before = body.before;
+    return purgeMedia(
+      "media.delete",
+      (m) => m.origin === "local" && m.size_bytes >= (body.min_size_bytes ?? 0),
+      before,
+    );
+  }),
+
+  http.post(`${API}/media/purge-remote-cache`, async ({ request }) => {
+    const body = (await request.json().catch(() => ({}))) as {
+      before?: string;
+      server_name?: string;
+    };
+    return purgeMedia(
+      "media.purge_remote_cache",
+      (m) => m.origin === "remote" && (!body.server_name || m.server_name === body.server_name),
+      body.before ?? new Date().toISOString(),
+    );
+  }),
+
+  http.get(`${API}/media`, ({ request }) => {
+    const url = new URL(request.url);
+    const rows = listMedia(url.searchParams);
+    return HttpResponse.json({ ...paginate(rows, url), total: rows.length });
+  }),
+
+  http.get(`${API}/media/:server_name/:media_id`, ({ params }) => {
+    const item = findMedia(String(params.server_name), String(params.media_id));
+    return item ? HttpResponse.json(item) : mediaNotFound();
+  }),
+
+  http.delete(`${API}/media/:server_name/:media_id`, ({ params }) => {
+    const item = findMedia(String(params.server_name), String(params.media_id));
+    if (!item) return mediaNotFound();
+    removeMedia(item);
+    return new HttpResponse(null, { status: 204 });
+  }),
+
+  ...(["quarantine", "unquarantine", "protect", "unprotect"] as const).map((action) =>
+    http.post(`${API}/media/:server_name/:media_id/${action}`, ({ params }) => {
+      const item = findMedia(String(params.server_name), String(params.media_id));
+      if (!item) return mediaNotFound();
+      if (action === "quarantine" && item.protected) {
+        return problem(409, "conflict", "Conflict", {
+          detail: "this media is protected; unprotect it before quarantining it",
+        });
+      }
+      if (action === "protect" && item.quarantined) {
+        return problem(409, "conflict", "Conflict", {
+          detail: "this media is quarantined; lift the quarantine before protecting it",
+        });
+      }
+      if (action === "quarantine" || action === "unquarantine") {
+        item.quarantined = action === "quarantine";
+      } else {
+        item.protected = action === "protect";
+      }
+      return HttpResponse.json(item);
+    }),
+  ),
+
+  // The one Matrix route the Media page calls: an authenticated thumbnail, for previews.
+  http.get("*/_matrix/client/v1/media/thumbnail/:server_name/:media_id", ({ params, request }) => {
+    const url = new URL(request.url);
+    const item = findMedia(String(params.server_name), String(params.media_id));
+    if (!item || item.quarantined) {
+      return HttpResponse.json({ errcode: "M_NOT_FOUND", error: "Not found" }, { status: 404 });
+    }
+    const svg = thumbnailSvg(
+      item.media_id,
+      Number(url.searchParams.get("width") ?? 96),
+      Number(url.searchParams.get("height") ?? 96),
+    );
+    return new HttpResponse(svg, { headers: { "Content-Type": "image/svg+xml" } });
+  }),
 ];
+
+function mediaNotFound() {
+  return problem(404, "not-found", "Not found", { detail: "this server holds no such media" });
+}
+
+/**
+ * A bulk deletion as the server runs one: everything `inScope` selects that has gone unused
+ * since `before`, except protected items and quarantined remote copies, answered as a Task that
+ * has already finished.
+ */
+function purgeMedia(action: string, inScope: (m: MediaItem) => boolean, before: string) {
+  let deleted = 0;
+  let bytes = 0;
+  let skippedProtected = 0;
+  let skippedQuarantined = 0;
+  for (const item of [...mediaItems]) {
+    if (!inScope(item) || !(lastUsed(item) < before)) continue;
+    if (item.protected) skippedProtected += 1;
+    else if (item.origin === "remote" && item.quarantined) skippedQuarantined += 1;
+    else {
+      removeMedia(item);
+      deleted += 1;
+      bytes += item.size_bytes;
+    }
+  }
+  const now = new Date().toISOString();
+  const id = `task_${Math.random().toString(36).slice(2, 10)}`;
+  return HttpResponse.json(
+    {
+      id,
+      action,
+      status: "succeeded",
+      progress: { current: deleted, total: deleted, unit: "items" },
+      result: {
+        deleted_count: deleted,
+        deleted_bytes: bytes,
+        skipped_protected: skippedProtected,
+        skipped_quarantined: skippedQuarantined,
+        failed: [],
+      },
+      created_at: now,
+      started_at: now,
+      finished_at: now,
+    },
+    { status: 202, headers: { Location: `/api/v1/tasks/${id}` } },
+  );
+}
