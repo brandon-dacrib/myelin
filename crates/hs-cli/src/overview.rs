@@ -26,7 +26,9 @@
 //! Counting active users reads every account's devices, and the dashboard polls every thirty
 //! seconds from every open tab. So the statistics are computed at most once per
 //! [`STATISTICS_TTL`] and shared; callers that arrive during a computation wait for it rather
-//! than starting their own.
+//! than starting their own. `pending_reports_count` is the exception: it is cheap, and it is
+//! the number a moderator changes by filing or deciding a report, so it is read fresh on every
+//! call.
 
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -165,13 +167,21 @@ impl<B: KvBackend + 'static> OverviewSource for ServerOverview<B> {
         // Held across the count on purpose: a second caller should wait for this answer, not
         // start reading every account again beside it.
         let mut cached = self.cached.lock().await;
-        if let Some((at, statistics)) = cached.as_ref()
-            && at.elapsed() < self.ttl
-        {
-            return Ok(statistics.clone());
+        let mut statistics = match cached.as_ref() {
+            Some((at, statistics)) if at.elapsed() < self.ttl => statistics.clone(),
+            _ => {
+                let statistics = self.count().await?;
+                *cached = Some((Instant::now(), statistics.clone()));
+                statistics
+            }
+        };
+        drop(cached);
+        // The open-report count reads the reports alone, and it is what a moderator just changed:
+        // filing or deciding a report has to move the Overview and the sidebar at once, not
+        // up to a minute later. So it is never served from the cache.
+        if let Some(reports) = self.reports.get() {
+            statistics.pending_reports_count = Some(reports.open_count().await?);
         }
-        let statistics = self.count().await?;
-        *cached = Some((Instant::now(), statistics.clone()));
         Ok(statistics)
     }
 

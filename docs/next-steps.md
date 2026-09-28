@@ -461,7 +461,7 @@ Semantic conflicts the compiler found: two `MediaRecord` test initializers witho
 |---|---|---|
 | `config-structured-editors` | RFC 0020: a hidden secret inside a list entry is lost on save (server side, track 15); a test that the web's schema fixture equals `schema_for!(Config)` (track 13), which would have caught the drift above; never run against a real server | 2b |
 | `bootstrap-only-config` | Docs sweep (README, chart comments, `docs/bridges`, regenerate `docs/config.md` with `cargo run -p hs-config --bin gen_config_docs`); the web shows the per-setting `bootstrap` flag and `listeners` as a bootstrap section; PostgreSQL not exercised | 2c |
-| `registration-tokens-server-notices` | `e2e-real` Playwright spec for Settings; Complement `TestServerNotices` (desktop); notices to everyone or to a room | 2d |
+| `registration-tokens-server-notices` | ~~`e2e-real` spec for the Users-page entry points~~ (done 2026-09-28); `e2e-real` for the Settings pages; Complement `TestServerNotices` (desktop); notices to everyone or to a room | 2d |
 | `reports-tasks-stats` | The Reports, Tasks and Statistics pages and the Overview sparklines (built by `admin-web-pages`, merged in the second round below) | 2a |
 | `media-admin` | `rooms.media.*`, `users.media.*`; paging the media listing; bulk operations on `state.tasks.spawn` (see above); RFC 0004 against the document on moderator read scope | 2e, 2g |
 | `federation-membership` | `createRoom`'s `invite` list for remote users; a reject fallback when no resident server helps; neutral error text; restricted joins; Complement | 3 |
@@ -564,8 +564,18 @@ edit one is not. New settings and operations arrive with their interface control
    - **2c.** The decision 0010 docs sweep (README, chart comments, `docs/bridges`, regenerate
      `docs/config.md`); the Configuration page shows the per-setting `bootstrap` flag and
      `listeners` as a bootstrap section; exercise the bootstrap split on PostgreSQL.
-   - **2d.** An `e2e-real` Playwright spec for Settings (tokens, invite link, notices);
-     server notices to everyone or to a room; `TestServerNotices` under Complement (desktop).
+   - **2d.** ~~The invite link and a notice from the Users page, against the real binary~~
+     **Done 2026-09-28** (`agent/users-page-dialogs`): `web/e2e-real/users-invites-and-notices.spec.ts`
+     drives "Invite by link" on the users list (the invited person registers in a signed-out
+     browser, the spent link says so, the account is listed) and "Send notice" on a user's page
+     (their own `/sync` shows the "Server Notices" invitation from `@_server`), against
+     `hs serve`, screenshots `docs/design/screenshots/users-*-real.png`. The superseded
+     `worktree-agent-aafb071194d2144c6` branch's `admin_areas` tests are ported to
+     `crates/hs-cli/tests/admin_areas.rs`, and they found that the Overview's open-report count
+     was cached for a minute, so filing or deciding a report did not move the sidebar count.
+     It is now read fresh on every call (`crates/hs-cli/src/overview.rs`). Left: the Settings
+     pages themselves (token list, edit, delete; the notices history) in `e2e-real`; server
+     notices to everyone or to a room; `TestServerNotices` under Complement (desktop).
    - **2e.** `rooms.media.*`, `users.media.*`, paging the media listing; settle RFC 0004
      against the document on moderator read scope.
    - **2f.** Cluster 1/6, then the long tails of Users 14/41 and Rooms 6/23.
@@ -866,9 +876,10 @@ cannot do, in rough order of how often an operator will hit it:
   hands over once, and says whether sessions were kept; both watched working against the real
   binary (`docs/design/screenshots/user-reset-password-real.png`). What it does not do yet:
   set an email or an external ID at creation (refused with a pointer rather than silently
-  dropped), rename a device, or invite somebody by link so that the administrator never sees
-  the password at all — that last one is the better design for
-  anything but a household, and wants registration tokens, which are real as of 2026-09-27.
+  dropped) or rename a device. ~~Invite somebody by link so that the administrator never sees
+  the password at all.~~ **Done**: the Users page's "Invite by link" (registration tokens,
+  2026-09-27), watched working against the real binary on 2026-09-28
+  (`docs/design/screenshots/users-invite-*-real.png`).
 - ~~**Edit an array of objects as a form.**~~ **Done 2026-09-27** (decision 0010,
   `config-structured-editors`): lists of objects, variants and maps are forms; the one shape
   left without a control is `media.scanning.icap.preview` (queue item 2b).

@@ -1,6 +1,74 @@
 # 16. Management web interface: status
 
-## Current update: 2026-09-27 (Reports, Tasks, Statistics; branch `agent/admin-web-pages`)
+## Current update: 2026-09-28 (Users-page invite links and notices; branch `agent/users-page-dialogs`)
+
+The audit of the superseded `worktree-agent-aafb071194d2144c6` branch (registration tokens,
+reports, server notices, invite links) listed two things main lacked: invite-by-link and
+send-notice dialogs reachable from the Users page, and its `admin_areas` tests. The first
+turned out to be on main already: the users list has **Invite by link**, which opens Settings'
+`CreateTokenDialog`, and a user's page has **Send notice**, which opens `SendNoticeDialog`
+(Settings' `SendNoticeForm` with that user as the one recipient). Both came with 2026-09-27's
+`registration-tokens-server-notices`. Nothing was duplicated. What this branch adds:
+
+- **Proved against the real binary**: `web/e2e-real/users-invites-and-notices.spec.ts` (2
+  flows). "Invite by link" on the users list makes a one-use token. Its link, opened in a
+  fresh signed-out browser, registers an account with a password the person chose. The same
+  link then says it is no longer valid, and the account is in the users list. "Send notice" on
+  a user's page (the user is created through the admin API, so registration can stay closed)
+  says "Notice sent to 1 user.". The recipient's own `/sync` then shows the "Server Notices"
+  invitation from `@_server:<server>`, and the audit log lists the send. Passed 2/2 against
+  `hs serve` on a closed server. Screenshots: `docs/design/screenshots/users-invite-dialog-real`,
+  `users-invite-ready-real`, `users-invite-registered-real`, `users-invite-list-after-real`,
+  `users-notice-dialog-real`, `users-notice-sent-real`, `users-notice-audit-real`.
+- **Vitest**: `src/pages/UsersPage.test.tsx` (4). Invite by link from the list posts
+  `uses_allowed: 1` and ends on the link. An `admin:read` operator is offered neither "Invite
+  by link" nor "Add user". Send notice from a user's page posts that one recipient. Without
+  `moderation:write`, the button is disabled with "Needs moderation:write".
+- **Rust, ported from the old branch's `admin_areas.rs`**: `crates/hs-cli/tests/admin_areas.rs`
+  (3). It keeps only what `invites_and_notices.rs` and `reports_tasks_statistics.rs` did not
+  already cover:
+  - `registration_tokens.create` and `.delete` are audited with the token as the target.
+  - A registration against a UIA session that never existed takes no place on the token.
+  - The invited person signs in with the password they chose.
+  - A withdrawn token is 404, invalid, and admits nobody.
+  - A stranger's report of a private-room message and a report of a nonexistent local user
+    are both 404.
+  - `kind=event` / `kind=user` filtering; `no_action` gives "dismissed"; `reports.delete` is
+    audited.
+  - The Overview count moves at once.
+  - A notice sent through the native `POST /api/v1/server-notices` (the interface's path, not
+    Synapse's) arrives as an invitation to "Server Notices" from `@_server`, readable once
+    joined, and is audited with the notice as the target.
+- **Bug found by the port, fixed**: `pending_reports_count` came from the Overview's
+  one-minute cache (`crates/hs-cli/src/overview.rs`). Filing or deciding a report therefore
+  did not move the Overview or the sidebar's Reports count for up to a minute, even though
+  the web invalidates the query. The count is now read fresh on every call. The expensive
+  per-account active-user count stays cached.
+- **Observability**: the audit covers every action here. Checked on the real server:
+  `registration_tokens.create` (actor `@ops`, target the token), and `server_notices.send`
+  (target the notice id, shown in the audit log). The Rust tests also assert `.delete`,
+  `reports.resolve` and `reports.delete`. One oddity for track 15: the audit entry's
+  `outcome.status` for `registration_tokens.create` records `200`, while the response is
+  `201`.
+- **The rest of the old branch, checked**: everything else in its diff is on main in main's
+  own form. That covers the token store and `/register` gating, the v1 validity route,
+  reports in `hs-room` and the admin API, notices (main's are richer, per Complement), the
+  `M_CANNOT_LEAVE_SERVER_NOTICE_ROOM` refusal, the Overview's report count, the register
+  page, and the Reports page (main's is a queue and detail page rather than a dialog). The
+  old branch's `Clone` on `SourceError` and its OpenAPI `additionalProperties` note on
+  notice content are not needed by anything on main. Nothing is left in that branch worth
+  keeping.
+- **Checks**: `npm run check`: lint 0 errors (the 4 known fast-refresh warnings), typecheck,
+  Vitest 42 files and 324 tests, build. `ReportsPage.test.tsx` "opens on the open reports"
+  failed once while `cargo clippy` loaded the machine, and passed alone and in a full
+  rerun: a load flake in a test this branch does not touch. `npm run test:e2e` 38/38.
+  `e2e-real` for this spec: 2/2 against `hs serve`. Rust: `cargo fmt --all --check` and
+  `cargo clippy --workspace --all-targets -- -D warnings` clean. `cargo test --workspace
+  --all-targets` ran 79 binaries: 2103 passed, 1 failed. The failure was `hs-loadgen`'s
+  `real_client_encrypted`, whose `hs serve` did not become ready within its 15 s limit while
+  the machine was loaded. It passed on its own rerun.
+
+## Previous update: 2026-09-27 (Reports, Tasks, Statistics; branch `agent/admin-web-pages`)
 
 The pages for the server side track 15 built on `agent/reports-tasks-stats` (Reports 4/4,
 Tasks 3/3, Statistics 4/4). Client regenerated (`npm run generate:client`). Everything reads the
@@ -1189,6 +1257,11 @@ Element.
 
 ## Decisions made
 
+- **One dialog per flow, reachable from wherever it is needed (2026-09-28).** The Users list's
+  "Invite by link" and a user's "Send notice" open Settings' own `CreateTokenDialog` and
+  `SendNoticeDialog`. There are no Users-specific copies, so a change to either flow shows
+  in both places. The superseded branch's `InviteByLinkDialog` and `users/SendNoticeDialog`
+  were deliberately not brought back.
 - **No setting falls through to a text box (decision 0010, 2026-09-27).** A shape the schema
   cannot describe renders read-only with a note naming the admin API route, never as JSON to
   edit; `config-model.real-schema.test.ts` fails if any setting of the real schema reaches that
