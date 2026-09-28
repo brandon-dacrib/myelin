@@ -3,8 +3,10 @@
 ## The operator's `Homeserver` reconciler, with drain-before-evict (2026-09-28)
 
 Queue item 5 of `docs/next-steps.md`. Built and tested here against an in-memory cluster, a
-fake admin API server and `helm template`; **not run on a cluster** (the desktop steps are
-below; the cluster was in use by another agent and was not touched). The resource's reference
+fake admin API server and `helm template`; **not run against a real Kubernetes API server**:
+`kubectl` from the session that built it cannot reach the cluster (macOS Local Network
+permission, "no route to host") and no kind cluster was started, so the reconciler has only
+met the in-memory fake. The desktop steps are below. The resource's reference
 is `docs/crds/homeserver.md`.
 
 ### Done
