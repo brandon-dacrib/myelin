@@ -139,6 +139,47 @@ impl StoreConfigSource {
         Ok(Some(applied))
     }
 
+    /// Re-reads the store if its revision moved since this source last read it -- a write by
+    /// another replica sharing the database, or by `hs config` -- and hot-applies what changed,
+    /// exactly as a write through this source would. `None` when nothing moved.
+    ///
+    /// # Errors
+    /// The store could not be read.
+    pub async fn refresh_if_changed(&self) -> Result<Option<Applied>, StoreError> {
+        let known = self.state.read().await.meta.revision;
+        if self.store.load()?.meta.revision == known {
+            return Ok(None);
+        }
+        let mut state = self.state.write().await;
+        let before = state.meta.revision;
+        let applied = Self::refresh(&mut state, &self.store)?;
+        if state.meta.revision != before {
+            tracing::info!(
+                from = before,
+                to = state.meta.revision,
+                "the configuration changed elsewhere (another replica, or the command line); re-read it"
+            );
+        }
+        Ok(applied)
+    }
+
+    /// Calls [`Self::refresh_if_changed`] every `every` for as long as the process runs, so a
+    /// change another replica took is in force here within that long. Failures are logged and
+    /// tried again next time.
+    pub fn follow_store(self: Arc<Self>, every: std::time::Duration) {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                if let Err(error) = self.refresh_if_changed().await {
+                    tracing::warn!(%error, "could not check the configuration store for changes made elsewhere");
+                }
+            }
+        });
+    }
+
     /// This section's own changes, newest first.
     fn section_history(
         &self,
@@ -650,5 +691,59 @@ mod tests {
             assert_eq!(stored.meta.revision, latest.meta.revision);
             assert_eq!(stored.document, latest.document);
         }
+    }
+
+    /// Two sources over one store, as two replicas over one database: a write through one is
+    /// taken on by the other the next time it looks, and not before.
+    #[tokio::test]
+    async fn a_change_written_elsewhere_is_applied_when_the_store_is_next_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::open_storage(&hs_config::StorageConfig::Embedded(
+            hs_config::storage::EmbeddedStorageConfig {
+                data_dir: dir.path().to_owned(),
+            },
+        ))
+        .unwrap();
+        let layers = || Layers {
+            file: None,
+            database: json!({}),
+            environment: json!({"server": {"server_name": "example.org"}}),
+        };
+        let booted = layers().resolve().unwrap().config;
+        let replica = |live: Arc<LiveConfig>| {
+            let store = OpenedConfigStore::open(&storage).unwrap();
+            let meta = store.load().unwrap().meta;
+            StoreConfigSource::new(layers(), store, meta, booted.clone()).with_live(live)
+        };
+        let here_live = Arc::new(LiveConfig::new(booted.clone()));
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let record = seen.clone();
+        here_live.on_change("rate_limits", move |config| {
+            *record.lock().unwrap() = Some(config.rate_limits.message.burst_count);
+            Ok(())
+        });
+        let here = replica(here_live);
+        let elsewhere = replica(Arc::new(LiveConfig::new(booted.clone())));
+
+        assert!(here.refresh_if_changed().await.unwrap().is_none());
+        elsewhere
+            .patch_section(ConfigPatch {
+                section: "rate_limits".to_owned(),
+                patch: json!({"message": {"burst_count": 3}}),
+                actor: None,
+                expected_revision: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), None, "not before it looks");
+
+        let applied = here.refresh_if_changed().await.unwrap().unwrap();
+        assert_eq!(applied.reloaded, vec!["rate_limits"]);
+        assert_eq!(*seen.lock().unwrap(), Some(3));
+        let section = here.get_section("rate_limits").await.unwrap().unwrap();
+        assert_eq!(section.values["message"]["burst_count"], 3);
+        assert!(section.last_reloaded_at.is_some());
+        // Nothing moved since: nothing to do.
+        assert!(here.refresh_if_changed().await.unwrap().is_none());
     }
 }

@@ -48,7 +48,9 @@ honestly by never listing a section as reloaded, which made it honest and useles
 - A default `hs serve` now refuses an eleventh message within a couple of seconds from one user
   (Synapse's defaults: 0.2 per second, burst 10). Clients handle `429` with `retry_after_ms`;
   an operator who wants otherwise changes `rate_limits` in the interface, which applies at once.
-- In cluster mode a change is applied by the replica that took the write. The others take it on
-  when they next refresh from the store (their own `config.reload`, or their next write).
+- In cluster mode a change is applied at once by the replica that took the write. Every replica
+  also checks the store's revision every ten seconds (`StoreConfigSource::follow_store`) and
+  applies what moved, so the others follow within that long; so does a server whose store `hs
+  config` wrote to directly.
 - `federation`, `telemetry` and `appservices` are now reported as needing a restart, which is
   true; each is moved into `HOT_SETTINGS` a setting at a time as something re-reads it.

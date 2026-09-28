@@ -1170,8 +1170,9 @@ cannot do, in rough order of how often an operator will hit it:
   and which wait for a restart (`hs_config::reload::HOT_SETTINGS`, `hs_cli::live_config`).
   Left: the rest of `rate_limits`
   (`login`, `registration`, `joins_*`, `federation`, ... are accepted but enforced nowhere);
-  `appservices` tuning; and other replicas of a cluster, which take a change on only at their
-  own next write or `config.reload`.
+  `appservices` tuning; and a two-replica check on the cluster that the other replica follows
+  within its ten-second store check (`StoreConfigSource::follow_store`, covered by a unit test
+  over one shared store, not yet by `cluster_admin.rs`).
 - **Nothing here, as it turns out** — this bullet used to claim the interface signs an operator out
   when a request merely fails. It does not: `signInWithToken` already distinguishes a failed fetch
   ("Couldn't reach the server") from a 401 ("That token wasn't recognized"). What actually

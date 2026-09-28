@@ -63,6 +63,9 @@ offering operations); before that 2026-09-26 (three public recovery operations);
 >   and any later write path (a revert) hot-apply alike. A failed applier keeps the old value and
 >   is retried on the next write. Logged per section ("configuration section reloaded") and
 >   counted in `hs_config_reloads_total{section,outcome}` (`applied`, `failed`, `unwired`).
+>   Every ten seconds each server also checks the store's revision
+>   (`StoreConfigSource::follow_store` / `refresh_if_changed`), so another replica's write, or
+>   `hs config`'s, is applied here too.
 > - **Rate limits**: the server-wide `rate_limits.message` is enforced for the first time
 >   (`hs_room::moderation::SendLimiter::set_server_limit`, on send, state and redaction; an
 >   administrator's override still wins), and swapped live; a sender keeps what is left of their

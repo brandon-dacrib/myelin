@@ -831,6 +831,11 @@ async fn run_serve(args: &ServeArgs) -> i32 {
         )
         .with_live(live_config.clone()),
     );
+    // A change another replica (or `hs config`) wrote to the shared store is taken on here too,
+    // within this long.
+    config_source
+        .clone()
+        .follow_store(std::time::Duration::from_secs(10));
     let options = crate::serve::ServeOptions {
         capabilities_config: args.capabilities_config.clone(),
         routes_manifest_path: args.routes_manifest.clone(),
