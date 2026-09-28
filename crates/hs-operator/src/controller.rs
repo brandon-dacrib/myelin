@@ -26,6 +26,7 @@ use crate::bridge::{
     MANAGER, desired_deployment, desired_pvc, desired_service, pod_selector, status_from,
 };
 use crate::crds::{Bridge, Phase};
+use crate::metrics::OperatorMetrics;
 
 /// How soon a bridge that is not Ready yet is looked at again, besides the watches.
 pub const REQUEUE_NOT_READY: Duration = Duration::from_secs(15);
@@ -57,6 +58,7 @@ pub struct Options {
 struct Context {
     client: Client,
     options: Options,
+    metrics: OperatorMetrics,
 }
 
 /// Runs the `Bridge` controller in `namespace` until SIGTERM or Ctrl-C, then finishes the
@@ -77,6 +79,20 @@ pub async fn run_with(
     client: Client,
     namespace: String,
     options: Options,
+) -> Result<(), ControllerError> {
+    run_with_metrics(client, namespace, options, OperatorMetrics::default()).await
+}
+
+/// [`run_with`], timing each reconcile into `metrics` (`hs_operator_reconcile_duration_seconds`
+/// and `hs_operator_reconcile_errors_total` with `kind="Bridge"`).
+///
+/// # Errors
+/// As [`run`].
+pub async fn run_with_metrics(
+    client: Client,
+    namespace: String,
+    options: Options,
+    metrics: OperatorMetrics,
 ) -> Result<(), ControllerError> {
     let bridges: Api<Bridge> = Api::namespaced(client.clone(), &namespace);
     let deployments: Api<Deployment> = Api::namespaced(client.clone(), &namespace);
@@ -104,6 +120,7 @@ pub async fn run_with(
             Arc::new(Context {
                 client: client.clone(),
                 options,
+                metrics,
             }),
         )
         .for_each(|result| async move {
@@ -118,6 +135,18 @@ pub async fn run_with(
 }
 
 async fn reconcile(bridge: Arc<Bridge>, ctx: Arc<Context>) -> Result<Action, ControllerError> {
+    let started = std::time::Instant::now();
+    let result = reconcile_bridge(bridge, &ctx).await;
+    let reason = result.as_ref().err().map(|e| match e {
+        ControllerError::Kube(_) => "kube",
+        ControllerError::Missing(_) => "missing",
+    });
+    ctx.metrics
+        .record_reconcile("Bridge", started.elapsed().as_secs_f64(), reason);
+    result
+}
+
+async fn reconcile_bridge(bridge: Arc<Bridge>, ctx: &Context) -> Result<Action, ControllerError> {
     let name = bridge
         .metadata
         .name

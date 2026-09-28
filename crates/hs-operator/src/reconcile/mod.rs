@@ -1,10 +1,9 @@
-//! Stub reconcile loops. Each `reconcile_*` function is what a `kube::runtime::Controller` for
-//! that kind would call on every watch event; today each one only computes a next
-//! [`OperatorStatus`] from the observed `spec` (no client calls, no owned-resource creation) and
-//! returns an [`Action`] telling the controller when to look again. Turning these into real
-//! controllers — actually creating/patching the `StatefulSet`/`ConfigMap`/`Service` a
-//! `Homeserver` owns, setting owner references, handling finalizers — is Phase 1/2 work tracked
-//! in `docs/status/12-platform-and-kubernetes.md`, not implemented here.
+//! Stub reconcile loops for `AppService`, `PushGateway` and `IdentityService` (and an unused
+//! `Bridge` stub; the real `Bridge` controller is [`crate::controller`], the real `Homeserver`
+//! one [`crate::homeserver`]). Each `reconcile_*` function is what a
+//! `kube::runtime::Controller` for that kind would call on every watch event; today each one only
+//! logs and returns an [`Action`] telling the controller when to look again. Turning these into
+//! real controllers is tracked in `docs/status/12-platform-and-kubernetes.md`.
 //!
 //! # Why stubs are still useful
 //!
@@ -12,17 +11,14 @@
 //! resource's `status` say, given its current `spec`" lives, and that logic is exactly what the
 //! unit tests below exercise — independent of `kube::Client`, `kind`, or any cluster at all. A
 //! real controller wires [`error_policy`] and these functions into
-//! `kube::runtime::Controller::new(...).run(reconcile_homeserver, error_policy, context)`.
+//! `kube::runtime::Controller::new(...).run(reconcile_appservice, error_policy, context)`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use kube::runtime::controller::Action;
 
-use crate::crds::{
-    AppService, Bridge, Homeserver, IdentityService, OperatorStatus, Phase, PushGateway,
-    StorageBackend,
-};
+use crate::crds::{AppService, Bridge, IdentityService, OperatorStatus, Phase, PushGateway};
 
 /// How long to wait before the next reconcile when nothing went wrong and there is nothing more
 /// to do right now.
@@ -47,35 +43,6 @@ pub enum ReconcileError {
 /// variant today.
 pub fn error_policy<K>(_object: Arc<K>, _error: &ReconcileError, _ctx: Arc<()>) -> Action {
     Action::requeue(REQUEUE_AFTER_ERROR)
-}
-
-/// Computes the next status for a `Homeserver` from its current spec. Real logic (create/patch
-/// the `StatefulSet`, `ConfigMap`, `Service`; read the `StatefulSet`'s `status.readyReplicas`)
-/// is not implemented; this only validates the spec is internally consistent and reports
-/// `Pending`.
-///
-/// # Errors
-/// Returns [`ReconcileError::MissingName`] if the resource has no name.
-pub async fn reconcile_homeserver(
-    hs: Arc<Homeserver>,
-    _ctx: Arc<()>,
-) -> Result<Action, ReconcileError> {
-    let name = hs
-        .metadata
-        .name
-        .as_deref()
-        .ok_or(ReconcileError::MissingName)?;
-    let effective_replicas = match hs.spec.storage.backend {
-        StorageBackend::Embedded => 1,
-        StorageBackend::Postgres | StorageBackend::Slatedb => hs.spec.replicas,
-    };
-    tracing::info!(
-        homeserver = name,
-        server_name = %hs.spec.server_name,
-        replicas = effective_replicas,
-        "reconcile_homeserver: stub, no cluster changes made"
-    );
-    Ok(Action::requeue(REQUEUE_STEADY_STATE))
 }
 
 /// Computes the next status for an `AppService`. Real logic (writing the registration into the
@@ -184,59 +151,6 @@ pub fn initial_status(observed_generation: Option<i64>) -> OperatorStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crds::{EmbeddedStorageSpec, HomeserverSpec, ImageSpec, SecretKeyRef, StorageSpec};
-    use kube::Resource as _;
-
-    fn sample_homeserver(name: &str) -> Homeserver {
-        let mut hs = Homeserver::new(
-            name,
-            HomeserverSpec {
-                server_name: "example.org".to_owned(),
-                public_base_url: None,
-                replicas: 3,
-                image: ImageSpec {
-                    repository: "ghcr.io/matrix-org/hs".to_owned(),
-                    tag: Some("0.0.1".to_owned()),
-                    digest: None,
-                    pull_policy: None,
-                },
-                storage: StorageSpec {
-                    backend: StorageBackend::Embedded,
-                    embedded: Some(EmbeddedStorageSpec {
-                        size: "10Gi".to_owned(),
-                        storage_class_name: None,
-                    }),
-                    postgres: None,
-                    slatedb: None,
-                },
-                signing_key_secret_ref: SecretKeyRef {
-                    name: "hs-signing-key".to_owned(),
-                    key: "signing.key".to_owned(),
-                },
-                registration_shared_secret_ref: None,
-                extra_config: serde_json::Map::new(),
-            },
-        );
-        hs.meta_mut().namespace = Some("default".to_owned());
-        hs
-    }
-
-    #[tokio::test]
-    async fn reconcile_homeserver_requeues_on_success() {
-        let hs = Arc::new(sample_homeserver("main"));
-        let action = reconcile_homeserver(hs, Arc::new(())).await.unwrap();
-        assert_eq!(action, Action::requeue(REQUEUE_STEADY_STATE));
-    }
-
-    #[tokio::test]
-    async fn reconcile_homeserver_rejects_a_nameless_resource() {
-        let mut hs = sample_homeserver("main");
-        hs.meta_mut().name = None;
-        let err = reconcile_homeserver(Arc::new(hs), Arc::new(()))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ReconcileError::MissingName));
-    }
 
     #[test]
     fn initial_status_is_pending_with_zero_ready_replicas() {
@@ -248,8 +162,7 @@ mod tests {
 
     #[test]
     fn error_policy_requeues_after_the_error_backoff() {
-        let hs = Arc::new(sample_homeserver("main"));
-        let action = error_policy(hs, &ReconcileError::MissingName, Arc::new(()));
+        let action = error_policy(Arc::new(()), &ReconcileError::MissingName, Arc::new(()));
         assert_eq!(action, Action::requeue(REQUEUE_AFTER_ERROR));
     }
 

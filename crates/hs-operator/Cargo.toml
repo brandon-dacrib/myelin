@@ -11,10 +11,6 @@ description = "kube-rs CRD schemas (Homeserver, AppService, Bridge, PushGateway,
 name = "gen-crds"
 path = "src/bin/gen_crds.rs"
 
-[[bin]]
-name = "live-smoke"
-path = "src/bin/live_smoke.rs"
-
 [dependencies]
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
@@ -37,10 +33,16 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 # `kube`'s `rustls-tls` feature needs a process-level `rustls::crypto::CryptoProvider` installed
 # before the first TLS connection, and a binary linking more than one provider has no default.
-# `connect()` in `src/lib.rs` (used by `hs operator` and the homeserver's bridge client) and the
-# `live-smoke` bin install `ring`. See `src/bin/live_smoke.rs`'s `main`, and
-# `crates/hs-cluster/src/mesh/tls.rs::provider` for the same `ring` choice made elsewhere in this
+# `connect()` in `src/lib.rs` (used by `hs operator` and the homeserver's bridge client) installs
+# `ring`. See `crates/hs-cluster/src/mesh/tls.rs::provider` for the same `ring` choice made elsewhere in this
 # workspace (matching the workspace's own `rustls` feature pin: `features = ["ring", ...]`).
 rustls = { workspace = true }
+# The `Homeserver` reconciler drains replicas through the server's admin API.
+reqwest = { workspace = true }
+# `hs_operator_*` metrics, in the project's registry and naming conventions, served on
+# `/metrics` by a small axum listener (`src/metrics.rs`).
+hs-telemetry = { path = "../hs-telemetry" }
+prometheus-client = { workspace = true }
+axum = { workspace = true }
 
 [dev-dependencies]

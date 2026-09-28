@@ -155,6 +155,18 @@ pub struct OperatorArgs {
     /// default when unset.
     #[arg(long = "default-storage-class")]
     pub default_storage_class: Option<String>,
+
+    /// Also run the `Homeserver` controller: each `Homeserver` resource in the namespace becomes
+    /// the chart's StatefulSet, Services and ConfigMap, and every replica that goes away is
+    /// drained through the admin API first. Needs the `Homeserver` CRD and the RBAC in
+    /// `deploy/operator/`.
+    #[arg(long = "homeservers")]
+    pub homeservers: bool,
+
+    /// Serve the operator's Prometheus metrics (`hs_operator_*`) on `/metrics` at this address,
+    /// for example `0.0.0.0:9090`.
+    #[arg(long = "metrics-address")]
+    pub metrics_address: Option<std::net::SocketAddr>,
 }
 
 /// `hs routes-manifest` arguments.
@@ -425,10 +437,14 @@ async fn run_operator(args: &OperatorArgs) -> i32 {
             return 1;
         }
     };
-    let options = hs_operator::controller::Options {
-        default_storage_class: args.default_storage_class.clone().filter(|c| !c.is_empty()),
+    let options = hs_operator::RunOptions {
+        bridges: hs_operator::controller::Options {
+            default_storage_class: args.default_storage_class.clone().filter(|c| !c.is_empty()),
+        },
+        homeservers: args.homeservers,
+        metrics_address: args.metrics_address,
     };
-    match hs_operator::controller::run_with(client, namespace, options).await {
+    match hs_operator::run(client, namespace, options).await {
         Ok(()) => 0,
         Err(e) => {
             tracing::error!(error = %e, "hs operator stopped with an error");

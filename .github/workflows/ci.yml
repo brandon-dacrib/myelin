@@ -65,7 +65,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test-${{ matrix.arch }}
+      # hs-operator compares the `Homeserver` reconciler's objects with `helm template` of
+      # deploy/helm/hs; HS_REQUIRE_HELM makes that test fail, rather than skip, without helm.
+      - uses: azure/setup-helm@v4
       - run: cargo test --workspace --all-targets
+        env:
+          HS_REQUIRE_HELM: "1"
       - run: cargo test --workspace --doc
 
   # cargo-audit rather than cargo-deny: it checks Cargo.lock against the RustSec advisory

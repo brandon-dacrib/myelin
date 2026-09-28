@@ -1,0 +1,19 @@
+# One replica on embedded storage, the chart's default install. The signing key Secret must
+# exist first: `hs generate-signing-key -o signing.key` and
+# `kubectl create secret generic hs-signing-key --from-file=signing.key`.
+apiVersion: hs.matrix.org/v1alpha1
+kind: Homeserver
+metadata:
+  name: hs
+spec:
+  serverName: example.org
+  image:
+    repository: ghcr.io/brandon-dacrib/myelin
+    tag: main
+  storage:
+    backend: embedded
+    embedded:
+      size: 10Gi
+  signingKeySecretRef:
+    name: hs-signing-key
+    key: signing.key

@@ -21,17 +21,143 @@ spec:
     - jsonPath: .spec.serverName
       name: ServerName
       type: string
+    - jsonPath: .spec.replicas
+      name: Replicas
+      type: integer
     - jsonPath: .status.readyReplicas
       name: Ready
       type: integer
+    - jsonPath: .status.drain.pod
+      name: Draining
+      type: string
     name: v1alpha1
     schema:
       openAPIV3Schema:
         description: Auto-generated derived type for HomeserverSpec via `CustomResource`
         properties:
           spec:
-            description: '`spec` of a `Homeserver`.'
+            description: |-
+              `spec` of a `Homeserver`.
+
+              Every field maps onto values of `deploy/helm/hs/values.yaml` ([`crate::homeserver::chart_values`] is that mapping, and a test renders the chart with it and compares the result with what the operator builds). There is no `mode` field: `storage.backend: embedded` is the chart's `singleNode` mode (one replica, whatever `replicas` says), and any other backend is `cluster` mode.
             properties:
+              adminApi:
+                description: How the operator reaches the server's admin API to drain replicas. Without it the operator scales down and rolls pods without draining them first, and each pod's own `SIGTERM` handoff (twenty seconds) is all there is; the `DrainAvailable` condition says so.
+                nullable: true
+                properties:
+                  tokenSecretRef:
+                    description: A bearer token with `admin:write` (an OAuth client-credentials token, or a server administrator's access token), from a Secret in the same namespace.
+                    properties:
+                      key:
+                        description: The key within that `Secret`'s `data`/`stringData`.
+                        type: string
+                      name:
+                        description: The `Secret` name.
+                        type: string
+                    required:
+                    - key
+                    - name
+                    type: object
+                  url:
+                    description: The server's base URL; `http://<name>.<namespace>.svc:8008` (the client Service) when omitted.
+                    nullable: true
+                    type: string
+                required:
+                - tokenSecretRef
+                type: object
+              cluster:
+                default:
+                  meshPort: 8449
+                  roomShards: 256
+                  userShards: 256
+                  heartbeatInterval: 2s
+                  leaseTtl: 10s
+                  clusterDomain: cluster.local
+                  terminationGracePeriodSeconds: 40
+                  antiAffinity: Soft
+                description: Cluster-mode settings (the chart's `cluster`). Ignored with embedded storage.
+                properties:
+                  antiAffinity:
+                    default: Soft
+                    description: How replicas are spread over nodes.
+                    enum:
+                    - Soft
+                    - Hard
+                    - None
+                    type: string
+                  clusterDomain:
+                    default: cluster.local
+                    description: The cluster's DNS domain, for the mesh names.
+                    type: string
+                  heartbeatInterval:
+                    default: 2s
+                    description: How often a replica heartbeats (`cluster.heartbeat_interval`).
+                    type: string
+                  leaseTtl:
+                    default: 10s
+                    description: How long a lease outlives its last heartbeat (`cluster.lease_ttl`).
+                    type: string
+                  meshPort:
+                    default: 8449
+                    description: The mesh port.
+                    format: int32
+                    type: integer
+                  meshSharedSecretRef:
+                    description: A shared secret authenticating the mesh instead of TLS, for a trusted pod network only (the chart's `cluster.mesh.sharedSecret`).
+                    nullable: true
+                    properties:
+                      key:
+                        description: The key within that `Secret`'s `data`/`stringData`.
+                        type: string
+                      name:
+                        description: The `Secret` name.
+                        type: string
+                    required:
+                    - key
+                    - name
+                    type: object
+                  meshTlsSecret:
+                    description: 'A `kubernetes.io/tls` Secret (`tls.crt`, `tls.key`, `ca.crt`) whose certificate covers `*.<name>-headless.<namespace>.svc.<clusterDomain>`: the mesh''s mutual TLS (the chart''s `cluster.mesh.tls.existingSecret`). This or `meshSharedSecretRef` is required.'
+                    nullable: true
+                    type: string
+                  roomShards:
+                    default: 256
+                    description: Room shards (`cluster.room_shards`).
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  terminationGracePeriodSeconds:
+                    default: 40
+                    description: The pods' grace period; must outlast the server's own twenty-second shutdown handoff.
+                    format: int64
+                    type: integer
+                  userShards:
+                    default: 256
+                    description: User shards (`cluster.user_shards`).
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                type: object
+              drain:
+                default:
+                  timeoutSeconds: 600
+                  onTimeout: Proceed
+                description: How the operator drains a replica before its pod goes away.
+                properties:
+                  onTimeout:
+                    default: Proceed
+                    description: What happens when a drain times out.
+                    enum:
+                    - Proceed
+                    - Hold
+                    type: string
+                  timeoutSeconds:
+                    default: 600
+                    description: How long a replica may take to hand off every shard before `onTimeout` applies.
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                type: object
               extraConfig:
                 additionalProperties: true
                 description: Extra native `hs-config` YAML, appended to the operator-generated `ConfigMap` the same way `deploy/helm/hs/values.yaml`'s `extraConfig` does.
@@ -57,6 +183,59 @@ spec:
                 required:
                 - repository
                 type: object
+              media:
+                default:
+                  backend: local
+                description: Where media is kept (the chart's `media.storage`).
+                properties:
+                  backend:
+                    default: local
+                    description: '`local` (the data volume, or `localClaim`) or `s3`.'
+                    enum:
+                    - local
+                    - s3
+                    type: string
+                  localClaim:
+                    description: A `ReadWriteMany` claim for local media shared by every replica. Required for local media in cluster mode.
+                    nullable: true
+                    type: string
+                  s3:
+                    description: 'The bucket, when `backend: s3`.'
+                    nullable: true
+                    properties:
+                      accessKeyId:
+                        description: The access key id.
+                        nullable: true
+                        type: string
+                      bucket:
+                        description: The bucket.
+                        type: string
+                      endpoint:
+                        description: The endpoint, for a store other than AWS.
+                        nullable: true
+                        type: string
+                      region:
+                        description: The region.
+                        nullable: true
+                        type: string
+                      secretAccessKeyRef:
+                        description: The secret access key, mounted from a Secret.
+                        nullable: true
+                        properties:
+                          key:
+                            description: The key within that `Secret`'s `data`/`stringData`.
+                            type: string
+                          name:
+                            description: The `Secret` name.
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
+                    required:
+                    - bucket
+                    type: object
+                type: object
               publicBaseUrl:
                 description: The externally reachable base URL, if different from `https://{serverName}`.
                 nullable: true
@@ -77,14 +256,65 @@ spec:
                 type: object
               replicas:
                 default: 1
-                description: Number of replicas. Forced to `1` by the reconciler when `storage` is `Embedded`.
+                description: Number of replicas. Forced to `1` by the reconciler when `storage` is `Embedded`. Scaling down drains each replica that goes away through the admin API first (`drain`, `adminApi`).
                 format: int32
                 type: integer
+              resources:
+                description: The server container's resources; the chart's defaults when omitted.
+                nullable: true
+                properties:
+                  claims:
+                    description: |-
+                      Claims lists the names of resources, defined in spec.resourceClaims, that are used by this container.
+
+                      This is an alpha field and requires enabling the DynamicResourceAllocation feature gate.
+
+                      This field is immutable. It can only be set for containers.
+                    items:
+                      description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                      properties:
+                        name:
+                          description: Name must match the name of one entry in pod.spec.resourceClaims of the Pod where this field is used. It makes that resource available inside a container.
+                          type: string
+                        request:
+                          description: Request is the name chosen for a request in the referenced claim. If empty, everything from the claim is made available, otherwise only the result of this request.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                  limits:
+                    additionalProperties:
+                      description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                      type: string
+                    description: 'Limits describes the maximum amount of compute resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                    type: object
+                  requests:
+                    additionalProperties:
+                      description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                      type: string
+                    description: 'Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                    type: object
+                type: object
               serverName:
                 description: The Matrix server name (`server.server_name`). Immutable after creation in practice (changing it after any room exists is not supported by any Matrix homeserver — see `hs_config::server::ServerConfig`'s doc comment); the reconciler does not enforce immutability itself (no Kubernetes CRD-level immutability marker for this yet), but the change would need a full new deployment in practice.
                 type: string
+              sessionSecretRef:
+                description: '`auth.session_secret`, from an existing `Secret` (the chart''s `secrets.sessionSecret`).'
+                nullable: true
+                properties:
+                  key:
+                    description: The key within that `Secret`'s `data`/`stringData`.
+                    type: string
+                  name:
+                    description: The `Secret` name.
+                    type: string
+                required:
+                - key
+                - name
+                type: object
               signingKeySecretRef:
-                description: The Ed25519 signing key (`hs generate-signing-key` format), from an existing `Secret`. Required — the operator never generates or stores a signing key itself, matching `deploy/helm/hs`'s same policy (a signing key must survive the CR being deleted and recreated).
+                description: The Ed25519 signing key (`hs generate-signing-key` format), from an existing `Secret`, mounted whole as a directory (the chart's `secrets.signingKey.existingSecret`; `key` is informational, the server reads every file in the directory). The operator never generates or stores a signing key itself, matching `deploy/helm/hs`'s same policy (a signing key must survive the CR being deleted and recreated).
                 properties:
                   key:
                     description: The key within that `Secret`'s `data`/`stringData`.
@@ -129,7 +359,7 @@ spec:
                         nullable: true
                         type: string
                       database:
-                        description: Database name.
+                        description: Database name; `hs` when omitted.
                         nullable: true
                         type: string
                       host:
@@ -150,8 +380,13 @@ spec:
                         - key
                         - name
                         type: object
+                      port:
+                        description: The port; 5432 when omitted.
+                        format: int32
+                        nullable: true
+                        type: integer
                       user:
-                        description: Connecting role.
+                        description: Connecting role; `hs` when omitted.
                         nullable: true
                         type: string
                     type: object
@@ -181,15 +416,12 @@ spec:
             - storage
             type: object
           status:
-            description: |-
-              The status sub-resource every kind in this operator uses. Identical shape across all five kinds by design: one dashboard query, one `kubectl get -o jsonpath='{.status.phase}'` habit, works against any of them.
-
-              camelCase on the wire (`observedGeneration`, `readyReplicas`), like every Kubernetes status; until 2026-09-26 it was snake_case, which the `Ready` print column (`.status.readyReplicas`) never matched. Nothing wrote a status before then, so nothing stored the old spelling.
+            description: '`status` of a `Homeserver`: the fields every kind reports ([`crate::crds::OperatorStatus`]''s shape) plus the drain the operator is following, if any.'
             nullable: true
             properties:
               conditions:
                 default: []
-                description: Standard Kubernetes conditions (`type`, `status`, `reason`, `message`, `lastTransitionTime`). Empty until the first reconcile.
+                description: '`Ready`, `Progressing`, `Draining`, `DrainAvailable` and `SpecValid`.'
                 items:
                   description: Condition contains details for one aspect of the current state of this API Resource.
                   properties:
@@ -221,11 +453,77 @@ spec:
                   - type
                   type: object
                 type: array
+              drain:
+                description: 'The drain in flight: the operator is waiting for this replica to own no shards before its pod goes.'
+                nullable: true
+                properties:
+                  pod:
+                    description: The pod.
+                    type: string
+                  reason:
+                    description: Why.
+                    enum:
+                    - ScaleDown
+                    - RollingUpdate
+                    type: string
+                  replicaId:
+                    description: The replica id the admin API knows it by (its mesh address).
+                    type: string
+                  shardsRemaining:
+                    description: Shards the replica still owned when last read.
+                    format: uint64
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  startedAt:
+                    description: When the operator asked (RFC 3339).
+                    type: string
+                  taskId:
+                    description: The admin API task following the drain.
+                    nullable: true
+                    type: string
+                  taskStatus:
+                    description: That task's status when last read (`running`, `succeeded`, `failed`, ...).
+                    nullable: true
+                    type: string
+                  timedOut:
+                    default: false
+                    description: 'Whether it outlived `drain.timeoutSeconds` (with `onTimeout: Hold`).'
+                    type: boolean
+                required:
+                - pod
+                - reason
+                - replicaId
+                - startedAt
+                type: object
               observedGeneration:
-                description: The `.metadata.generation` this status was computed from, for a caller to tell whether `status` reflects the current `spec` or a stale one the controller has not caught up to yet (the standard Kubernetes "observedGeneration" convention).
+                description: The `.metadata.generation` this status was computed from.
                 format: int64
                 nullable: true
                 type: integer
+              pendingUndrains:
+                description: 'Replicas the operator drained and will undrain: after their pod is gone (scale-down), or once their replacement is ready (rolling update), since a StatefulSet pod''s replacement has the same name and inherits the drain request (decision 0012).'
+                items:
+                  description: A replica the operator drained and will undrain.
+                  properties:
+                    pod:
+                      description: The pod.
+                      type: string
+                    replicaId:
+                      description: The replica id.
+                      type: string
+                    when:
+                      description: When.
+                      enum:
+                      - AfterRemoval
+                      - WhenReady
+                      type: string
+                  required:
+                  - pod
+                  - replicaId
+                  - when
+                  type: object
+                type: array
               phase:
                 default: Pending
                 description: Coarse lifecycle phase.
@@ -235,7 +533,17 @@ spec:
                 - Degraded
                 type: string
               readyReplicas:
-                description: How many replicas of the managed workload are currently ready.
+                description: Pods ready.
+                format: int32
+                nullable: true
+                type: integer
+              replicas:
+                description: Pods the StatefulSet has.
+                format: int32
+                nullable: true
+                type: integer
+              updatedReplicas:
+                description: Pods running the current pod template.
                 format: int32
                 nullable: true
                 type: integer
@@ -247,4 +555,7 @@ spec:
     served: true
     storage: true
     subresources:
+      scale:
+        specReplicasPath: .spec.replicas
+        statusReplicasPath: .status.replicas
       status: {}

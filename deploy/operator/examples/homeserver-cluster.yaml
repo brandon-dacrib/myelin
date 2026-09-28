@@ -1,0 +1,48 @@
+# Two replicas on PostgreSQL with media in S3, drained through the admin API before each pod
+# goes. The Secrets named here must exist first (docs/crds/homeserver.md, "Secrets"):
+#   hs-signing-key      `hs generate-signing-key -o signing.key`, key signing.key
+#   hs-mesh-tls         kubernetes.io/tls for *.chat-headless.<namespace>.svc.cluster.local, with ca.crt
+#   postgres-credentials  key password
+#   hs-media-s3         key secret-access-key
+#   hs-admin            key token: an admin:write token (see docs/crds/homeserver.md, "Draining")
+apiVersion: hs.matrix.org/v1alpha1
+kind: Homeserver
+metadata:
+  name: chat
+spec:
+  serverName: chat.example.org
+  replicas: 2
+  image:
+    repository: ghcr.io/brandon-dacrib/myelin
+    tag: main
+  storage:
+    backend: postgres
+    postgres:
+      host: postgres-rw.databases.svc.cluster.local
+      database: myelin
+      user: myelin
+      passwordSecretRef:
+        name: postgres-credentials
+        key: password
+  signingKeySecretRef:
+    name: hs-signing-key
+    key: signing.key
+  cluster:
+    meshTlsSecret: hs-mesh-tls
+  media:
+    backend: s3
+    s3:
+      bucket: myelin-media
+      endpoint: http://s3.storage.svc:9000
+      region: us-east-1
+      accessKeyId: myelin
+      secretAccessKeyRef:
+        name: hs-media-s3
+        key: secret-access-key
+  adminApi:
+    tokenSecretRef:
+      name: hs-admin
+      key: token
+  drain:
+    timeoutSeconds: 300
+    onTimeout: Proceed

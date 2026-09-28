@@ -2605,10 +2605,14 @@ dependencies = [
 name = "hs-operator"
 version = "0.0.1"
 dependencies = [
+ "axum",
  "futures",
  "hex",
+ "hs-telemetry",
  "k8s-openapi",
  "kube",
+ "prometheus-client",
+ "reqwest 0.12.28",
  "rustls",
  "schemars 0.8.22",
  "serde",

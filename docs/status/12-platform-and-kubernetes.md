@@ -1,5 +1,211 @@
 # 12. Platform and Kubernetes
 
+## The operator's `Homeserver` reconciler, with drain-before-evict (2026-09-28)
+
+Queue item 5 of `docs/next-steps.md`. Built and tested here against an in-memory cluster, a
+fake admin API server and `helm template`; **not run on a cluster** (the desktop steps are
+below; the cluster was in use by another agent and was not touched). The resource's reference
+is `docs/crds/homeserver.md`.
+
+### Done
+
+- **`Homeserver` CRD, filled out** (`crates/hs-operator/src/crds/homeserver.rs`,
+  `deploy/crds/homeserver.yaml` regenerated): every field now maps onto chart values:
+  `sessionSecretRef`, `cluster {meshTlsSecret | meshSharedSecretRef, meshPort, roomShards,
+  userShards, heartbeatInterval, leaseTtl, clusterDomain, terminationGracePeriodSeconds,
+  antiAffinity}`, `media {backend, localClaim, s3}`, `resources`, `storage.postgres.port`,
+  `drain {timeoutSeconds: 600, onTimeout: Proceed|Hold}`, `adminApi {tokenSecretRef, url}`. A
+  `HomeserverStatus` of its own (the common fields plus `replicas`, `updatedReplicas`,
+  `drain`, `pendingUndrains`), the `scale` subresource, print columns Replicas and Draining.
+  Storage `embedded` is the chart's `singleNode`, anything else `cluster`; there is no `mode`.
+- **Builders** (`src/homeserver/objects.rs`): ServiceAccount, ConfigMap (`homeserver.yaml` as
+  the chart's `configmap.yaml` renders it), client and headless Services, the StatefulSet (env,
+  mounts and volumes in the chart's order, probes, security contexts, anti-affinity, grace
+  period, claim template) and the PDB, all owned by the `Homeserver`; `validate` with the
+  chart's `hs.validate` checks; `chart_values`, the equivalent chart values.
+- **The same objects as the chart, checked**: `src/homeserver/helm_equivalence.rs` renders
+  `deploy/helm/hs` with `chart_values` for four resources (single node; cluster on PostgreSQL
+  with mesh TLS, S3 and a registration secret; CloudNativePG with a shared mesh secret, a RWX
+  media claim, a session secret, hard anti-affinity, custom resources and extra config; a
+  one-replica SlateDB cluster without anti-affinity) and compares every object field by field.
+  Tolerated differences, and only these: Helm's labels, the `checksum/config` value, owner
+  references, `helm.sh/resource-policy` on the claim template, the claim template's explicit
+  `apiVersion`/`kind`, and the StatefulSet's `updateStrategy` plus its template-hash
+  annotation. The test skips without `helm` unless `HS_REQUIRE_HELM` is set; CI's test job now
+  installs helm and sets it. The chart was not changed.
+- **The reconciler** (`src/homeserver/reconciler.rs`), over two seams (`HomeserverKube`,
+  `AdminApi`). The StatefulSet runs `RollingUpdate` with a `partition` the operator owns, held
+  at the replica count, so no pod is replaced by a template change on its own. For each pod
+  that must go, highest ordinal first: `POST /api/v1/cluster/replicas/{id}/drain` (id = the
+  pod's mesh address), recorded in `status.drain`; the replica is read back every 5 s (and the
+  drain task's status) until it owns no shards; then `replicas` (scale-down) or `partition`
+  (rolling update) is lowered by one; then the replica is undrained, after the pod is gone
+  (scale-down) or once the replacement runs the new template and is ready (rolling update,
+  since the replacement inherits the drain request). One drain at a time. Timeout per
+  `drain.onTimeout` (`Proceed` lets the pod go, `Hold` keeps it, phase `Degraded`); aborted
+  (undrained, pod kept) when the spec stops needing it; `409` reported and retried; a replica
+  undrained by hand is drained again; a finalizer `hs.matrix.org/undrain` undrains on
+  deletion. Scale-up sets replicas directly. Without `adminApi`, with one replica, or with
+  embedded storage, pods go undrained and `DrainAvailable` says why.
+- **Status conditions**: `Ready`, `Progressing`, `Draining`, `DrainAvailable`, `SpecValid`,
+  transition times kept while a status holds; phase `Pending`/`Ready`/`Degraded`.
+- **Events** on the `Homeserver` (`kube::runtime::events::Recorder`): `Created`, `ScalingUp`,
+  `Draining`, `Drained`, `Undrained`, `DrainAborted`; Warnings `InvalidSpec`, `DrainRefused`,
+  `DrainTimedOut`, `DrainReissued`, `ScaledDownWithoutDrain`, `UndrainSkipped`,
+  `DrainAbandoned`. Logs at info for each drain step, warn for timeouts and refusals.
+- **Metrics** (`src/metrics.rs`, into an `hs_telemetry::Metrics` registry):
+  `hs_operator_reconcile_duration_seconds{kind,result}`,
+  `hs_operator_reconcile_errors_total{kind,reason}`, `hs_operator_drains_in_flight{kind}`,
+  `hs_operator_drains_total{outcome}`; the `Bridge` controller now records the first two as
+  well. Served by `hs operator --metrics-address` on `/metrics` (and `/healthz`).
+- **Admin API client** (`src/homeserver/admin.rs`, `reqwest`): list replicas (paged), drain,
+  undrain, get task; `409` → refusal with the problem's `detail`, `401/403` → a message naming
+  the token Secret; the token never prints.
+- **`hs operator --homeservers --metrics-address <addr>`** (`crates/hs-cli/src/cli.rs`, a
+  two-flag change; `hs_operator::run` runs both controllers and the listener).
+  `deploy/operator/` (kustomization, SA, Role, RoleBinding, Deployment, metrics Service) and
+  `deploy/operator/examples/` (single-node and a two-replica cluster; a test parses and builds
+  both).
+- Removed: the `live-smoke` bin (it ran the old status-only `reconcile_homeserver` stub, now
+  gone; the real controller replaces it) and the stub itself.
+
+### Verified (here, no cluster)
+
+```
+cargo test -p hs-operator            88 passed (52 before), including:
+  homeserver::tests (16): create; scale-up; scale-down 3 -> 1 drains hs-2 then hs-1, each
+    undrained after its pod is gone, no pod removed while its replica owned shards; a drain
+    timing out with Proceed (the pod goes, one Warning) and with Hold (the pod stays, Degraded,
+    one Warning, completes once unstuck); raising replicas mid-drain aborts it; a rolling
+    update replaces hs-2, hs-1, hs-0 in that order, each drained to zero shards first and
+    undrained once its replacement is ready; reverting the template mid-rollout aborts the
+    drain; a refused drain is retried; no adminApi; missing token Secret; single-node roll;
+    invalid spec; deletion mid-drain; a hand-undrained replica is drained again.
+  homeserver::helm_equivalence (5): the four chart comparisons, with helm v4.3.0.
+  homeserver::admin: the reqwest client against an axum fake of the four admin routes.
+Mutation check: making the reconciler treat any shard count as drained fails 6 of the 16.
+helm lint / helm template: the chart is unchanged; the comparison test renders it.
+kubectl kustomize deploy/operator: renders; the RoleBinding subject gets the namespace.
+```
+
+### The first cluster run (desktop), exactly
+
+On a kind cluster first, then the desktop cluster once it is free. From a checkout with an
+image of this commit (`ghcr.io/brandon-dacrib/myelin:sha-<commit>`, or `main` after the push):
+
+```bash
+# 0. Operator and CRDs in namespace `myelin`.
+kubectl apply -f deploy/crds/homeserver.yaml -f deploy/crds/bridge.yaml
+kubectl create namespace myelin
+kubectl apply -k deploy/operator
+kubectl -n myelin rollout status deploy/myelin-operator
+kubectl -n myelin logs deploy/myelin-operator | grep -E "homeserver operator starting|bridge operator starting"
+
+# 1. Single node: create, Ready, the objects the chart would make.
+hs generate-signing-key -o /tmp/signing.key
+kubectl -n myelin create secret generic hs-signing-key --from-file=signing.key=/tmp/signing.key
+kubectl -n myelin apply -f deploy/operator/examples/homeserver-single-node.yaml
+kubectl -n myelin wait --for=condition=Ready homeserver/hs --timeout=5m
+kubectl -n myelin get homeserver hs -o yaml | sed -n '/^status:/,$p'
+kubectl -n myelin get sts,svc,cm,sa,pdb -l app.kubernetes.io/instance=hs
+kubectl -n myelin get events --field-selector involvedObject.kind=Homeserver
+kubectl -n myelin port-forward svc/myelin-operator-metrics 9090 & curl -s localhost:9090/metrics | grep hs_operator_
+
+# 2. Cluster mode (needs PostgreSQL, S3 or a RWX claim, and the Secrets named in
+#    deploy/operator/examples/homeserver-cluster.yaml; the mesh certificate as in
+#    deploy/helm/hs/values-two-replica-experiment.yaml). Create at 2 replicas, then an admin
+#    token: `kubectl exec chat-0 -- hs register http://localhost:8008 -u operator -p ... -a -k <shared secret>`,
+#    log in, `kubectl create secret generic hs-admin --from-literal=token=<access token>`.
+kubectl -n myelin apply -f deploy/operator/examples/homeserver-cluster.yaml
+kubectl -n myelin wait --for=condition=Ready homeserver/chat --timeout=10m
+
+# 3. Scale up, then down with drain: watch status.drain and the events.
+kubectl -n myelin scale homeserver/chat --replicas=3
+kubectl -n myelin wait --for=condition=Ready homeserver/chat --timeout=10m
+kubectl -n myelin scale homeserver/chat --replicas=2
+kubectl -n myelin get homeserver chat -w -o custom-columns=PHASE:.status.phase,DRAIN:.status.drain.pod,LEFT:.status.drain.shardsRemaining,REPLICAS:.status.replicas
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8008/api/v1/cluster/replicas | jq '.items[] | {id,status,shard_count}'   # via port-forward
+
+# 4. Rolling update: change the image tag, watch pods go 2, 1, 0 one at a time.
+kubectl -n myelin patch homeserver chat --type merge -p '{"spec":{"image":{"tag":"<another tag>"}}}'
+kubectl -n myelin get pods -l app.kubernetes.io/instance=chat -w
+```
+
+Record for each: the time from `drain` to `Drained` per pod, whether any request failed during
+it (run `deploy/two-pod/failover.py` against the Service meanwhile), and the events.
+
+### Watch for on that run
+
+- The admin API's replica id must be `<pod>.<name>-headless.<ns>.svc.cluster.local:8449`; the
+  operator matches a replica to its pod by the `<pod>.` prefix of its id, so a different
+  advertise address would leave every drain as "nothing to drain".
+- `409` on the second rollout step with two replicas: the replica just undrained may still
+  heartbeat as `Draining` for one interval; the operator retries every 10 s, which is expected,
+  but more than a few retries means the undrain did not take.
+- The token: a legacy admin access token expires only if the server expires tokens; an expired
+  token shows as `admin API: unauthorized (401)` in the operator log and reconcile errors with
+  `reason="admin_api"`.
+- The chart and the operator both label pods `app.kubernetes.io/name: hs`; do not run both for
+  the same name in one namespace.
+
+### The `Bridge` reconciler's first cluster run: what it needs (not run)
+
+Read from `src/bridge.rs` and `src/controller.rs`; nothing here was changed except that the
+controller now records reconcile metrics.
+
+1. **The CRD and RBAC**: the chart installs both (`crds/bridge.yaml`,
+   `templates/bridges-operator.yaml`), or `deploy/operator/` does. Helm never upgrades
+   `crds/`; after this commit, `kubectl apply -f deploy/helm/hs/crds/bridge.yaml` on an
+   existing install (the Bridge CRD did not change in this commit).
+2. **A files Secret before the `Bridge`**: `spec.filesSecret` must exist or the pod sits in
+   `ContainerCreating`; for heisenbridge a registration file is enough.
+3. **The init container runs `sh` from the bridge's own image** and copies from a Secret
+   mounted with mode 0600 and **no `fsGroup`**, so the copy works only if the image has a
+   shell and its user can read root-owned 0600 files (in practice: runs as root). Check
+   heisenbridge's user first; an image running as non-root would fail with `Permission
+   denied` reading `/files/*`. If so, the fix is an `fsGroup` (or the image's uid as
+   `runAsUser`) in `desired_deployment`, not a wider mode.
+4. **The claim**: 1Gi RWO in the default StorageClass (Longhorn on dacrib0; kind's
+   `standard`). With no default class it stays `Pending` and the `Bridge` reports it.
+5. **The pod has no service-account token and no service links**, and no `runAsNonRoot`, so a
+   namespace enforcing Pod Security `restricted` refuses it; the demo namespace does not.
+6. **Reaching the server**: the bridge's registration must point at
+   `http://<release>.<ns>.svc:8008`; the server pushes to the bridge's Service
+   `<bridge>.<ns>.svc:<port>`.
+7. The steps: `kubectl apply` a hand-written `Bridge` for heisenbridge
+   (`hif1/heisenbridge`, port 9898, `args: ["-c", "/data/registration.yaml",
+   "http://hs.myelin.svc:8008"]`), `kubectl wait --for=jsonpath='{.status.phase}'=Ready
+   bridge/heisenbridge`, then `kubectl delete bridge heisenbridge` and check the Deployment,
+   Service, claim and Secret go (owner references). Then offer heisenbridge from the interface
+   with the `cluster` runtime.
+
+### Decisions made
+
+- **The partition is the drain gate.** The operator owns `replicas` and the `RollingUpdate`
+  partition rather than switching to `OnDelete` and deleting pods itself, so the StatefulSet
+  controller still does all pod work and the chart and operator StatefulSets differ only in
+  `updateStrategy`.
+- **Undrain after**, not before: a scale-down's replica after its pod is gone, a rollout's
+  replacement once ready, one at a time, per decision 0012's note that a replacement inherits
+  the drain.
+- **Timeout default `Proceed`** (600 s): a stuck drain never blocks a rollout forever; the
+  pod's own `SIGTERM` handoff is the fallback. `Hold` is there for those who prefer a stuck
+  rollout to an unclean handoff.
+- **The admin API is reached through the client Service** by default, with a bearer token from
+  a Secret; the operator never mints credentials.
+- **No bridges from a `Homeserver`**: `chart_values` sets `bridges.enabled=false`; a bridge is
+  its own `Bridge` resource.
+
+### Interfaces used
+
+- `crates/hs-admin` as a client only: `cluster.replicas.list`, `.drain`, `.undrain`,
+  `tasks.get` (decision 0012). Nothing in `hs-admin` was changed.
+
+### Shared dependencies added
+
+- `hs-operator` now depends on `reqwest`, `axum`, `prometheus-client` (all already workspace
+  dependencies) and `hs-telemetry`. No new workspace dependency.
+
 ## 2026-09-27, late (shared with docs/status/03-cluster.md): two pods on the owner's cluster -- where this stopped
 
 Branch `agent/two-pod-cluster`. The task was `docs/next-steps.md` item 1's "cluster mode with

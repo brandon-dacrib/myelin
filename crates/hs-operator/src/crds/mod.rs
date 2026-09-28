@@ -14,8 +14,10 @@ pub use appservice::{AppService, AppServiceSpec};
 pub use bridge::{Bridge, BridgeSpec, BridgeStorage};
 pub use common::{ImageSpec, OperatorStatus, Phase, SecretKeyRef};
 pub use homeserver::{
-    EmbeddedStorageSpec, Homeserver, HomeserverSpec, PostgresStorageSpec, SlatedbStorageSpec,
-    StorageBackend, StorageSpec,
+    AdminApiSpec, AntiAffinity, ClusterSpec, DrainReason, DrainSpec, DrainStatus,
+    DrainTimeoutPolicy, EmbeddedStorageSpec, Homeserver, HomeserverSpec, HomeserverStatus,
+    MediaBackend, MediaSpec, PendingUndrain, PostgresStorageSpec, S3MediaSpec, SlatedbStorageSpec,
+    StorageBackend, StorageSpec, UndrainWhen,
 };
 pub use identityservice::{IdentityService, IdentityServiceSpec};
 pub use pushgateway::{PushGateway, PushGatewaySpec};

@@ -632,8 +632,15 @@ edit one is not. New settings and operations arrive with their interface control
    `TestKnocking`, `TestFederationRejectInvite`), a desktop item.
 4. ~~Receipts and presence durable across a restart~~ **done 2026-09-27** (`federation-edus`);
    `/search`.
-5. The operator's `Homeserver` reconciler (unit tests and `helm template` here; the cluster run
-   is a desktop item), and the `Bridge` reconciler's first cluster run (desktop).
+5. ~~The operator's `Homeserver` reconciler (unit tests and `helm template` here)~~ **built
+   2026-09-28** (`crates/hs-operator/src/homeserver/`, `docs/crds/homeserver.md`): the chart's
+   objects, checked field by field against `helm template`; scaling; every departing replica
+   drained through `cluster.replicas.drain` before its pod goes (scale-down and rolling update,
+   with timeout, abort and undrain); conditions, events and `hs_operator_*` metrics; `hs
+   operator --homeservers`, `deploy/operator/`. **Left (desktop):** its first cluster run,
+   step by step in `docs/status/12-platform-and-kubernetes.md` ("The first cluster run"), and
+   the `Bridge` reconciler's first cluster run, whose prerequisites and one likely failure (the
+   files copy has no `fsGroup`) are listed there too.
 6. Then the cluster items below that need the cluster (desktop): two pods with real traffic
    (`deploy/two-pod/verify.py` and `failover.py`, written and not yet run; resume steps at the
    top of `docs/status/03-cluster.md`; the cluster's etcd first), the demo's offering, the
@@ -729,10 +736,17 @@ would do it; each ends in a transcript in `docs/status/12-platform-and-kubernete
   `docs/status/12-platform-and-kubernetes.md`; then offer heisenbridge from the interface
   with the `cluster` runtime and let `hs-bridges` drive the same thing (the `elsewhere`
   runtime, the front door and a real heisenbridge are already verified against the real
-  binary); then WhatsApp on the demo, replacing the shared registration. `reconcile_homeserver` still computes a status and
-  creates no `StatefulSet`, `Service` or `ConfigMap`; phase 1 there is exactly what the chart
-  renders, owned by a `Homeserver` resource, with status from `/health/ready` and the shard
-  map.
+  binary); then WhatsApp on the demo, replacing the shared registration. **The `Homeserver`
+  half is built (2026-09-28), not yet run on a cluster:** a `Homeserver` becomes exactly what
+  the chart renders (a test compares them with `helm template`), owned by the resource, and
+  `replicas` and rollouts go through a StatefulSet partition the operator lowers one pod at a
+  time, after draining that pod's replica through the admin API to zero shards (decision
+  0012); status conditions, events and metrics included (`docs/crds/homeserver.md`). The
+  desktop run, in order, is in `docs/status/12-platform-and-kubernetes.md` ("The first
+  cluster run"): single node to Ready, a two-replica cluster, scale 2 -> 3 -> 2 watching the
+  drain, then an image change watching pods replaced 2, 1, 0 with `failover.py` counting
+  failed requests. That last step is also the first measurement for "a rolling update that
+  drops nothing" above.
 - ~~The chart install as a CD gate.~~ **Done 2026-09-26** (see "And gated"): `helm install` on
   a kind cluster in the amd64 image leg, to Ready, the setup link read from the log and used,
   before anything is tagged. First run on GitHub's runners pending the push.
