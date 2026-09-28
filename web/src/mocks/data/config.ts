@@ -1170,7 +1170,7 @@ export function sectionSource(name: string): string {
   return best;
 }
 
-/** Recorded config writes, surfaced by the page as the section's change history. */
+/** Recorded config writes, as the audit log shows them (the page reads `configHistory`). */
 export const configAuditEntries: AuditEntry[] = [
   {
     id: "audit-config-1",

@@ -120,6 +120,50 @@ test.describe("configuration", () => {
     domGuard.assertClean();
   });
 
+  test("a section's history says which setting changed, and a change is reverted from it", async ({
+    page,
+  }) => {
+    const domGuard = installDomNestingGuard(page);
+    await signInAsOperator(page);
+
+    await page.goto("/admin/configuration/rate_limits");
+    const history = page.getByRole("region", { name: "Change history" });
+    await expect(history.getByTitle("rate_limits.message.burst_count")).toContainText(
+      "Message · Burst count",
+    );
+    await expect(history.getByText("Earlier values not recorded")).toBeVisible();
+    await expectNoAxeViolations(page, "configuration section, change history");
+
+    await history.getByRole("button", { name: "Revert revision 7" }).click();
+    const dialog = page.getByRole("dialog", { name: "Revert revision 7?" });
+    await expect(dialog.getByTitle("rate_limits.login.burst_count")).toBeVisible();
+    await expectNoAxeViolations(page, "configuration revert dialog");
+    await dialog.getByRole("button", { name: "Revert", exact: true }).click();
+    await expect(page.getByText("Revision 7 reverted", { exact: true })).toBeVisible();
+    await expect(history.getByText("Reverts revision 7")).toBeVisible();
+
+    // A change a later save overwrote: the revert names it, and goes ahead only when asked.
+    await page.goto("/admin/configuration/federation");
+    const timeout = page.getByRole("textbox", { name: "Client timeout" });
+    await timeout.fill("90s");
+    await timeout.blur();
+    await page.getByRole("button", { name: "Review and save" }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Save changes" }).click();
+    await expect(page.getByText("Federation saved", { exact: true })).toBeVisible();
+
+    const federationHistory = page.getByRole("region", { name: "Change history" });
+    await federationHistory.getByRole("button", { name: "Revert revision 3" }).click();
+    const revert = page.getByRole("dialog", { name: "Revert revision 3?" });
+    await revert.getByRole("button", { name: "Revert", exact: true }).click();
+    await expect(revert.getByRole("alert")).toContainText("changed again in revision 4");
+    await expectNoAxeViolations(page, "configuration revert dialog, a later change in the way");
+    await revert.getByRole("button", { name: "Revert anyway" }).click();
+    await expect(page.getByText("Revision 3 reverted", { exact: true })).toBeVisible();
+    await expect(timeout).toHaveValue("30s");
+
+    domGuard.assertClean();
+  });
+
   test("the index and a section's form hold up at phone width", async ({ page }) => {
     const domGuard = installDomNestingGuard(page);
     await signInAsOperator(page);

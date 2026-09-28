@@ -5,7 +5,8 @@ import type { AuditEntry } from "@/lib/audit";
  * moderation, a rejected request, a replayed one, an entry written by the server itself. The
  * targets are the mock's own users, rooms and bridges so that every link on the audit page
  * lands somewhere. Configuration writes live beside these in `./config.ts`
- * (`configAuditEntries`), because the Configuration page reads its history from the same log.
+ * (`configAuditEntries`), next to the per-setting history the Configuration page reads
+ * (`configHistory`, `GET /config/{section}/history`).
  */
 
 const now = Date.now();
