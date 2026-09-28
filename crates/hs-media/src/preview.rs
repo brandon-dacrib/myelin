@@ -568,6 +568,7 @@ pub async fn preview_url<B: KvBackend>(
                     expires_at_ms: None,
                     quarantined_by: None,
                     safe_from_quarantine: false,
+                    last_accessed_ms: None,
                 };
                 if metadata.put_media(&record).is_ok() {
                     response.insert(

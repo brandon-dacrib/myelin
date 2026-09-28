@@ -3411,3 +3411,219 @@ async fn rooms_refuse_what_the_spec_says_they_must_and_spell_out_their_defaults(
 
     handle.shutdown().await;
 }
+
+/// The Media page's operations, against the real repository: what alice uploads is listed with
+/// her name, its size, its type and when it was last fetched; a quarantine stops it being
+/// served and lifting it serves it again; protected media survives a bulk deletion; a deletion
+/// takes the bytes with it; and every step is in the audit log.
+#[tokio::test]
+async fn an_administrator_can_find_quarantine_protect_and_delete_uploaded_media() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = hs_cli::serve::spawn_serve(
+        test_config(0, dir.path()),
+        hs_cli::serve::ServeOptions::default(),
+    )
+    .await
+    .expect("server should boot");
+    let base = handle.base_url();
+    let client = reqwest::Client::new();
+
+    let token = setup_token_of(handle.setup_link.as_deref().unwrap()).to_owned();
+    let admin: serde_json::Value = client
+        .post(format!("{base}/api/v1/setup"))
+        .json(&json!({"setup_token": token, "username": "ops", "password": "hunter2-first-admin"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let admin = admin["access_token"].as_str().unwrap().to_owned();
+
+    let alice: serde_json::Value = client
+        .post(format!("{base}/_matrix/client/v3/register"))
+        .json(&json!({"username": "alice", "password": "hunter2-alice", "auth": {"type": "m.login.dummy"}}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let alice = alice["access_token"].as_str().unwrap().to_owned();
+    let upload = |name: &'static str, body: &'static str| {
+        let (client, base, alice) = (client.clone(), base.clone(), alice.clone());
+        async move {
+            let response: serde_json::Value = client
+                .post(format!(
+                    "{base}/_matrix/client/v1/media/upload?filename={name}"
+                ))
+                .bearer_auth(alice)
+                .header("content-type", "text/plain")
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            response["content_uri"]
+                .as_str()
+                .unwrap()
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .to_owned()
+        }
+    };
+    let notes = upload("notes.txt", "twelve bytes").await;
+    let keep = upload("keep.txt", "keep me").await;
+    let download = |media_id: String| {
+        let (client, base, alice) = (client.clone(), base.clone(), alice.clone());
+        async move {
+            client
+                .get(format!(
+                    "{base}/_matrix/client/v1/media/download/example.org/{media_id}"
+                ))
+                .bearer_auth(alice)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    assert_eq!(download(notes.clone()).await, reqwest::StatusCode::OK);
+
+    let admin_call = |method: reqwest::Method, path: String, body: Option<serde_json::Value>| {
+        let (client, base, admin) = (client.clone(), base.clone(), admin.clone());
+        async move {
+            let mut request = client
+                .request(method, format!("{base}/api/v1{path}"))
+                .bearer_auth(admin);
+            if let Some(body) = body {
+                request = request.json(&body);
+            }
+            let response = request.send().await.unwrap();
+            let status = response.status();
+            let text = response.text().await.unwrap();
+            (
+                status,
+                serde_json::from_str::<serde_json::Value>(&text).unwrap_or_default(),
+            )
+        }
+    };
+
+    // Listed, searchable, with what the page shows.
+    let (status, page) = admin_call(
+        reqwest::Method::GET,
+        "/media?q=notes&include_total=true".into(),
+        None,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{page}");
+    assert_eq!(page["total"], 1, "{page}");
+    let item = &page["items"][0];
+    assert_eq!(item["media_id"], notes.as_str());
+    assert_eq!(item["origin"], "local");
+    assert_eq!(item["uploader"], "@alice:example.org");
+    assert_eq!(item["upload_name"], "notes.txt");
+    assert_eq!(item["content_type"], "text/plain");
+    assert_eq!(item["size_bytes"], 12);
+    assert!(
+        item["last_accessed_at"].is_string(),
+        "it was downloaded: {item}"
+    );
+    assert_eq!(item["quarantined"], false);
+
+    // Quarantined: not served. Lifted: served again.
+    let (status, item) = admin_call(
+        reqwest::Method::POST,
+        format!("/media/example.org/{notes}/quarantine"),
+        None,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{item}");
+    assert_eq!(item["quarantined"], true);
+    assert_eq!(
+        download(notes.clone()).await,
+        reqwest::StatusCode::NOT_FOUND
+    );
+    let (status, _) = admin_call(
+        reqwest::Method::POST,
+        format!("/media/example.org/{notes}/unquarantine"),
+        None,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(download(notes.clone()).await, reqwest::StatusCode::OK);
+
+    // Protected media cannot be quarantined, and a bulk deletion of everything spares it.
+    let (status, _) = admin_call(
+        reqwest::Method::POST,
+        format!("/media/example.org/{keep}/protect"),
+        None,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let (status, _) = admin_call(
+        reqwest::Method::POST,
+        format!("/media/example.org/{keep}/quarantine"),
+        None,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CONFLICT);
+    let (status, task) = admin_call(
+        reqwest::Method::POST,
+        "/media/delete".into(),
+        Some(json!({"before": "2999-01-01T00:00:00Z", "min_size_bytes": 10})),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::ACCEPTED, "{task}");
+    assert_eq!(task["status"], "succeeded");
+    assert_eq!(
+        task["result"]["deleted_count"], 1,
+        "notes, not keep: {task}"
+    );
+    assert_eq!(
+        download(notes.clone()).await,
+        reqwest::StatusCode::NOT_FOUND
+    );
+    assert_eq!(download(keep.clone()).await, reqwest::StatusCode::OK);
+
+    // Deleted one at a time, even protected; then it is gone from the list as well.
+    let (status, _) = admin_call(
+        reqwest::Method::DELETE,
+        format!("/media/example.org/{keep}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(download(keep.clone()).await, reqwest::StatusCode::NOT_FOUND);
+    let (_, page) = admin_call(reqwest::Method::GET, "/media".into(), None).await;
+    assert_eq!(page["items"], json!([]), "{page}");
+    let (status, _) = admin_call(
+        reqwest::Method::GET,
+        format!("/media/example.org/{keep}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+
+    let (_, audit) = admin_call(reqwest::Method::GET, "/audit-log?limit=50".into(), None).await;
+    let actions: Vec<&str> = audit["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["action"].as_str())
+        .collect();
+    for action in [
+        "media.quarantine",
+        "media.unquarantine",
+        "media.protect",
+        "media.delete_bulk",
+        "media.delete_one",
+    ] {
+        assert!(actions.contains(&action), "{action} in {actions:?}");
+    }
+
+    handle.shutdown().await;
+}

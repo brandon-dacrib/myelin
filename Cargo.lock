@@ -2537,6 +2537,7 @@ dependencies = [
  "bytes",
  "crc32fast",
  "criterion",
+ "hs-admin",
  "hs-auth",
  "hs-config",
  "hs-http",

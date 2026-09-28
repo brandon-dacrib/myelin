@@ -2,7 +2,7 @@
 
 Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-admin`, `hs-modules`, `hs-identity`, `hs-http` (shared with 07 and 14).
 
-Last updated: 2026-09-27 (registration tokens and server notices, below; before that the bridge
+Last updated: 2026-09-27 (media, registration tokens and server notices, reports, tasks and statistics, below; before that the bridge
 offering operations); before that 2026-09-26 (three public recovery operations); 2026-09-25 (additive schema change for the bridges wizard); the session log that follows is from 2026-09-19 (session 6).
 
 > **2026-09-27, served for real: RegistrationTokens 5/5 and ServerNotices 2/2.**
@@ -134,6 +134,32 @@ offering operations); before that 2026-09-26 (three public recovery operations);
 >   `docs/status/16-management-web-interface.md`.
 > - Not run: the full `cargo test -p hs-cli` (only the lib tests and the two e2e tests named
 >   above), and the web checks.
+
+> **2026-09-27, served for real: the Media area, 9 of 9.** `media.list`, `media.get`,
+> `media.delete_one`, `media.quarantine`/`unquarantine`, `media.protect`/`unprotect`,
+> `media.delete_bulk` and `media.purge_remote_cache` have real handlers in
+> `crates/hs-admin/src/media.rs`, over a new `media::MediaSource` trait (list, get, delete,
+> set_quarantined, set_protected; `InMemoryMediaSource` for tests) wired with
+> `AdminState::with_media`. The real source is `hs_media::admin_source::RepositoryMediaSource`,
+> wired in `hs serve`. Filtering, search (`q` over id, server, filename, uploader, type),
+> sorting (`created_at` default descending, `last_accessed_at`, `size_bytes`, `media_id`; a bad
+> value is a 400 naming `/sort`), the rule that protection and quarantine exclude each other
+> (409 either way), and bulk selection live in the handlers, once for every source. Each
+> mutation is audited under its operation id and published as `media.quarantined`,
+> `media.unquarantined`, `media.protected`, `media.unprotected` or `media.deleted` (with a
+> count and bytes for the bulk ones). The two Task operations run to completion in the request
+> and answer `202` with the Task already `succeeded` (result: `deleted_count`,
+> `deleted_bytes`, `skipped_protected`, `skipped_quarantined`, `failed`), a `Location` of
+> `/api/v1/tasks/{id}`, and a `task.succeeded` event; there is no task store yet, so that
+> `Location` does not resolve until the Tasks area lands. Contract changes, additive:
+> `MediaItem.last_accessed_at` (nullable), `MediaItem`'s fields marked required (the server
+> always sends all of them), `media.delete_bulk`'s `before` required (a bulk deletion never
+> means "everything"; a missing one is a 400 on `/before`), descriptions on both bulk bodies
+> and on `media.list`. `authorization_header`, `source_unavailable`, `parse_optional_json`,
+> `idempotency_key`, `replay_response` and `record_mutation` in `router.rs` are now
+> `pub(crate)` so an area can live in its own module. `tools/admin_api_coverage.py`: **80 of
+> 158**. Verify: `cargo test -p hs-admin --lib media::` (12 tests) and `cargo test -p hs-cli
+> --test e2e an_administrator_can_find_quarantine_protect_and_delete_uploaded_media`.
 
 > **2026-09-26, additive, served for real (RFC 0017).** Ten operations under the `Bridges` tag:
 > `bridge_deployments.target` (`GET /bridge-deployment-target`), `bridge_offerings.list/get/

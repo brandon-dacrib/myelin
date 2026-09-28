@@ -31,6 +31,23 @@ export function formatUptime(ms: number): string {
  * "bridges", "bridges or federation", "bridges, federation or reports": the things an all-clear
  * could not vouch for, as they read after "It can't check ...".
  */
+/**
+ * A size as people read one: bytes below a kilobyte, then KB, MB, GB, TB with one decimal
+ * under ten and none above (1000-based, as file managers and upload limits are quoted).
+ */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1000) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = -1;
+  while (value >= 1000 && unit < units.length - 1) {
+    value /= 1000;
+    unit += 1;
+  }
+  const rounded = value < 10 ? value.toFixed(1) : Math.round(value).toString();
+  return `${rounded} ${units[unit]}`;
+}
+
 export function joinWithOr(names: readonly string[]): string {
   if (names.length <= 1) return names.join("");
   return `${names.slice(0, -1).join(", ")} or ${names[names.length - 1]}`;

@@ -298,6 +298,7 @@ mod tests {
             expires_at_ms: None,
             quarantined_by: None,
             safe_from_quarantine: false,
+            last_accessed_ms: None,
         }
     }
 

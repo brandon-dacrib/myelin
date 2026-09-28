@@ -777,7 +777,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List media */
+        /**
+         * List media
+         * @description Local uploads and cached copies of remote media. q matches the media id, server name, filename, uploader and content type (case-insensitive substring); sort takes created_at (the default is -created_at), last_accessed_at, size_bytes or media_id.
+         */
         get: operations["media.list"];
         put?: never;
         post?: never;
@@ -2711,18 +2714,24 @@ export interface components {
             provider: string;
         };
         MediaItem: {
-            content_type?: string | null;
+            content_type: string | null;
             /** Format: date-time */
-            created_at?: string;
-            media_id?: string;
+            created_at: string;
+            /**
+             * Format: date-time
+             * @description When the content was last served (download or thumbnail), at an hour's resolution; null if it never has been. The bulk deletions count "unused since" from this, or from created_at when it is null.
+             */
+            last_accessed_at: string | null;
+            media_id: string;
             /** @enum {string} */
-            origin?: "local" | "remote";
-            protected?: boolean;
-            quarantined?: boolean;
-            server_name?: string;
-            size_bytes?: number;
-            upload_name?: string | null;
-            uploader?: string | null;
+            origin: "local" | "remote";
+            /** @description Exempt from quarantine and from the bulk deletions. Protection and quarantine exclude each other; setting one while the other is set answers 409. */
+            protected: boolean;
+            quarantined: boolean;
+            server_name: string;
+            size_bytes: number;
+            upload_name: string | null;
+            uploader: string | null;
         };
         MediaItemPage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["MediaItem"][];
@@ -5321,9 +5330,14 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": {
-                    /** Format: date-time */
-                    before?: string;
+                    /**
+                     * Format: date-time
+                     * @description Delete media unused since this time (last served, or created if never served).
+                     */
+                    before: string;
+                    /** @description Only media at least this large. */
                     min_size_bytes?: number;
+                    /** @description Only media from this server; this server's own uploads when omitted. */
                     server_name?: string;
                 };
             };
@@ -5365,8 +5379,12 @@ export interface operations {
         requestBody?: {
             content: {
                 "application/json": {
-                    /** Format: date-time */
+                    /**
+                     * Format: date-time
+                     * @description Purge cached copies unused since this time; now when omitted. Protected copies and quarantined copies are kept.
+                     */
                     before?: string;
+                    /** @description Only copies of this server's media. */
                     server_name?: string;
                 };
             };

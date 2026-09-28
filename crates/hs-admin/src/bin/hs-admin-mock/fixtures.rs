@@ -108,9 +108,9 @@ fn rooms() -> Vec<Value> {
 
 fn media() -> Vec<Value> {
     vec![
-        json!({"server_name": "example.org", "media_id": "abc123", "origin": "local", "uploader": "@alice:example.org", "upload_name": "vacation.jpg", "content_type": "image/jpeg", "size_bytes": 2_400_000, "created_at": "2026-08-01T10:00:00.000Z", "quarantined": false, "protected": false}),
-        json!({"server_name": "example.org", "media_id": "def456", "origin": "local", "uploader": "@mallory:example.org", "upload_name": "definitely-not-malware.exe", "content_type": "application/octet-stream", "size_bytes": 900_000, "created_at": "2026-09-10T02:00:00.000Z", "quarantined": true, "protected": false}),
-        json!({"server_name": "matrix.org", "media_id": "ghi789", "origin": "remote", "uploader": null, "upload_name": "avatar.png", "content_type": "image/png", "size_bytes": 40_000, "created_at": "2026-07-15T12:00:00.000Z", "quarantined": false, "protected": true}),
+        json!({"server_name": "example.org", "media_id": "abc123", "origin": "local", "uploader": "@alice:example.org", "upload_name": "vacation.jpg", "content_type": "image/jpeg", "size_bytes": 2_400_000, "created_at": "2026-08-01T10:00:00.000Z", "last_accessed_at": "2026-09-17T09:30:00.000Z", "quarantined": false, "protected": false}),
+        json!({"server_name": "example.org", "media_id": "def456", "origin": "local", "uploader": "@mallory:example.org", "upload_name": "definitely-not-malware.exe", "content_type": "application/octet-stream", "size_bytes": 900_000, "created_at": "2026-09-10T02:00:00.000Z", "last_accessed_at": null, "quarantined": true, "protected": false}),
+        json!({"server_name": "matrix.org", "media_id": "ghi789", "origin": "remote", "uploader": null, "upload_name": "avatar.png", "content_type": "image/png", "size_bytes": 40_000, "created_at": "2026-07-15T12:00:00.000Z", "last_accessed_at": "2026-08-02T00:00:00.000Z", "quarantined": false, "protected": true}),
         json!({"server_name": "example.org", "media_id": "jkl012", "origin": "local", "uploader": "@ops:example.org", "upload_name": "server-notice-banner.png", "content_type": "image/png", "size_bytes": 12_000, "created_at": "2026-01-06T09:00:00.000Z", "quarantined": false, "protected": true}),
     ]
 }

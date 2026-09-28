@@ -14,6 +14,8 @@
 //!   operations, `501` for the rest).
 //! - [`sources`]: consumer-defined data-source traits (`UserDirectory`, `ConfigSource`, ...) the
 //!   real handlers call, implemented elsewhere and wired onto [`router::AdminState`].
+//! - [`media`]: the Media area -- the `media.*` handlers and the [`media::MediaSource`] they
+//!   call, implemented for real by `hs-media`.
 //! - [`config_schema`]: which configuration settings are secrets, derived from the configuration
 //!   type's own JSON Schema, and the redaction the `/config*` handlers apply because of it.
 //! - [`reports`], [`tasks`], [`statistics`]: the Reports and Tasks areas and the statistics
@@ -36,6 +38,7 @@ pub mod config_schema;
 pub mod events;
 mod handler_kit;
 pub mod idempotency;
+pub mod media;
 pub mod model;
 pub mod openapi;
 pub mod operations;

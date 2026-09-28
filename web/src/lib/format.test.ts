@@ -1,5 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { formatCount, formatUptime, joinWithOr } from "./format";
+import { formatBytes, formatCount, formatUptime, joinWithOr } from "./format";
+
+describe("formatBytes", () => {
+  it("says bytes below a kilobyte and rounds sensibly above", () => {
+    expect(formatBytes(0)).toBe("0 B");
+    expect(formatBytes(999)).toBe("999 B");
+    expect(formatBytes(1000)).toBe("1.0 KB");
+    expect(formatBytes(2_400_000)).toBe("2.4 MB");
+    expect(formatBytes(45_600_000)).toBe("46 MB");
+    expect(formatBytes(3_000_000_000_000_000)).toBe("3000 TB");
+  });
+});
 
 describe("formatCount", () => {
   it("shows a real zero as zero, and a missing number as a dash", () => {

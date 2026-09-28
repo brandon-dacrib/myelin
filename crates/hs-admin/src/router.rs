@@ -108,6 +108,10 @@ pub struct AdminState {
     /// What `statistics.users_media` and `statistics.timeseries` read. `None` until wired with
     /// [`AdminState::with_statistics`].
     pub statistics: Option<Arc<dyn crate::statistics::StatisticsSource>>,
+    /// What the nine `media.*` operations read and change: the media repository (see
+    /// [`crate::media`]). `None` until wired with [`AdminState::with_media`]; until then they
+    /// answer `503 unavailable`.
+    pub media: Option<Arc<dyn crate::media::MediaSource>>,
     /// The `Idempotency-Key` cache every mutating handler that declares it consults (see
     /// [`crate::idempotency`]). Always present (never `None`): a client is never told its
     /// idempotency key was ignored.
@@ -141,6 +145,7 @@ impl AdminState {
             reports: None,
             tasks: None,
             statistics: None,
+            media: None,
             idempotency: Arc::new(IdempotencyStore::new()),
         }
     }
@@ -204,6 +209,13 @@ impl AdminState {
         notices: Arc<dyn crate::server_notices::ServerNoticeSource>,
     ) -> Self {
         self.server_notices = Some(notices);
+        self
+    }
+
+    /// Wires the media repository, making the `media.*` operations real.
+    #[must_use]
+    pub fn with_media(mut self, media: Arc<dyn crate::media::MediaSource>) -> Self {
+        self.media = Some(media);
         self
     }
 
@@ -366,6 +378,15 @@ const REAL_HANDLERS: &[&str] = &[
     "federation.destinations.list",
     "federation.destinations.get",
     "federation.destinations.reset",
+    "media.list",
+    "media.get",
+    "media.delete_one",
+    "media.quarantine",
+    "media.unquarantine",
+    "media.protect",
+    "media.unprotect",
+    "media.delete_bulk",
+    "media.purge_remote_cache",
     "config.list",
     "config.schema",
     "config.get",
@@ -4685,6 +4706,24 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         "federation.destinations.reset" => {
             builder.add(method, &full_path, federation_destinations_reset, meta)
         }
+        "media.list" => builder.add(method, &full_path, crate::media::media_list, meta),
+        "media.get" => builder.add(method, &full_path, crate::media::media_get, meta),
+        "media.delete_one" => builder.add(method, &full_path, crate::media::media_delete_one, meta),
+        "media.quarantine" => builder.add(method, &full_path, crate::media::media_quarantine, meta),
+        "media.unquarantine" => {
+            builder.add(method, &full_path, crate::media::media_unquarantine, meta)
+        }
+        "media.protect" => builder.add(method, &full_path, crate::media::media_protect, meta),
+        "media.unprotect" => builder.add(method, &full_path, crate::media::media_unprotect, meta),
+        "media.delete_bulk" => {
+            builder.add(method, &full_path, crate::media::media_delete_bulk, meta)
+        }
+        "media.purge_remote_cache" => builder.add(
+            method,
+            &full_path,
+            crate::media::media_purge_remote_cache,
+            meta,
+        ),
         "config.list" => builder.add(method, &full_path, config_list, meta),
         "config.schema" => builder.add(method, &full_path, config_schema, meta),
         "config.get" => builder.add(method, &full_path, config_get, meta),

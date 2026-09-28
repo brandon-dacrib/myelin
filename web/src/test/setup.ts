@@ -5,6 +5,7 @@ import { server } from "@/mocks/node";
 import { resetBridgeOfferings } from "@/mocks/data/bridge-offerings";
 import { resetRegistrationTokens } from "@/mocks/data/registration-tokens";
 import { resetServerNotices } from "@/mocks/data/server-notices";
+import { resetMedia } from "@/mocks/data/media";
 
 /**
  * Give the API client an absolute base URL before anything imports it.
@@ -72,5 +73,7 @@ afterEach(() => {
   // So are the registration tokens and the server-notice history.
   resetRegistrationTokens();
   resetServerNotices();
+  // So is its media (quarantine, protection and the deletions change it).
+  resetMedia();
 });
 afterAll(() => server.close());
