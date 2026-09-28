@@ -5,6 +5,39 @@ Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-a
 Last updated: 2026-09-28 (the admin API follow-ups: bulk media tasks, Federation 7/7, reports by person; `GET /` redirects to the interface; Users moderation and activity, 14 operations, Users 41/41; the Rooms area, 23/23; Users' devices-and-identity half; and the Cluster area, 6/6; all below); before that 2026-09-27 (media, registration tokens and server notices, reports, tasks and statistics, below; before that the bridge
 offering operations); before that 2026-09-26 (three public recovery operations); 2026-09-25 (additive schema change for the bridges wizard); the session log that follows is from 2026-09-19 (session 6).
 
+> **2026-09-28, served for real: a configuration section's per-setting history and a revert**
+> (branch `agent/config-history`; decision 0014). `tools/admin_api_coverage.py`: **142 of 160**.
+>
+> - **`GET /config/{section}/history`** (`config.history.list`, `admin:read`) lists the section's
+>   changes newest first, paged by revision (`cursor` is `r<revision>`, both directions, a bad
+>   one is `400 invalid-cursor`). Each `ConfigChange` now carries `settings[]`, one row per
+>   setting it touched: `pointer`, dotted `path`, `secret`, `from` (`{set, value}`; `set: false`
+>   means the file or the default; `null` for a record from before prior values were kept) and
+>   `to`. It also carries `reverts` and `revertible`. The same rows appear in `config.get`'s
+>   embedded history.
+> - **`POST /config/{section}/history/{revision}/revert`** (`config.history.revert`,
+>   `admin:write`, `If-Match` like `config.update`, optional body `{"force": bool}`) puts the
+>   settings back from the store's record as a new revision. It is `409` naming each setting and
+>   the later revision that wrote it, unless forced. It is `409` for a legacy record and `404` for
+>   no such change to that section. When the settings already hold their earlier values it
+>   answers `200` and writes nothing. A secret is restored server-side and never serialized: history, the
+>   revert's answer and the audit entry are redacted (`redacted_change` in `router.rs`).
+> - **Observability**: audit `config.history.revert` (from/to per setting, redacted), event
+>   `config.reverted` (`section`, `revision`, `reverted_revision`, `forced`), and a log line
+>   `reverted a configuration change` (or `nothing to revert`).
+> - **Where**: `hs_config::history` (pure: before-values, per-setting rows, revert target, merge
+>   patch diff, overlap), `ConfigStore::{history_page, change, revert_plan, apply_revert}` and
+>   `ChangeRecord::{before, reverts}` (`crates/hs-config/src/store.rs`). `ConfigSource` has two new
+>   methods, `history_page` and `revert` (default `503`), and `sources::config_change` builds the
+>   wire shape for both implementations. The real one is `crates/hs-cli/src/config_source.rs`,
+>   which replans up to three times when another writer moves the store and no `If-Match` was
+>   sent. `hs-admin-mock` serves both operations.
+> - **Tests**: `hs-config` 11 in `history.rs` and 8 in `store.rs`; `hs-admin` router 6 (paging,
+>   cursor, secrets never on the wire, revert with audit, event and ETag, conflict and force,
+>   412/404/400/403). End to end through the real `hs` binary, `crates/hs-cli/tests/config_history.rs`
+>   changes, lists, conflicts, reverts, forces, rotates and reverts a secret, and then reads the
+>   store after shutdown to see the old secret back.
+
 > **2026-09-28, Users: moderation and activity, 14 operations** (branch
 > `agent/user-moderation`). `tools/admin_api_coverage.py` now counts **154 of 158** with
 > Rooms 23/23 and Migration 8/8 (below); with the devices-and-identity half below, Users is 41/41.

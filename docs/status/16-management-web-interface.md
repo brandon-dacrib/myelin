@@ -1,6 +1,40 @@
 # 16. Management web interface: status
 
-## Current update: 2026-09-28 (a user's moderation and activity; branch `agent/user-moderation`)
+## Current update: 2026-09-28 (a configuration section's history, setting by setting, with revert)
+
+Branch `agent/config-history`. The section page's **Change history**
+(`src/pages/config/ConfigHistory.tsx`) used to read the audit log, which said only *that* a
+section changed. It now reads `GET /config/{section}/history`: one entry per revision (actor,
+relative time, revision, a "Reverts revision N" badge) and one line per setting, named the way
+the form names it (`lib/config-history.ts`, labels from the schema-built model), for example
+"Login · Per second: 0.1 → 0.17". A setting the database did not hold reads "file or default",
+a secret reads "set, hidden", and a change recorded before prior values were kept reads "not
+recorded" with no revert.
+
+- **Revert**: a button per revertible revision (not shown to a read-only token) opens a dialog
+  that lists what will change, run backwards. For a secret it says "its earlier value, hidden".
+  It also says whether the change applies now or at restart. A `409` (a later change wrote the
+  same settings) shows in the same dialog as an alert naming each setting and the revision in
+  the way, and the button becomes "Revert anyway" (`force`). A `412` closes the dialog with
+  "Someone else changed this section".
+- **URL-backed paging**: `?history=<cursor>` on `/configuration/$section` (the route's
+  `validateSearch`), with "Newer changes" and "Older changes" buttons.
+- **API**: `useConfigHistory(section, cursor)` and `useRevertConfigChange()` in
+  `src/api/config.ts`. `schema.d.ts` was regenerated.
+- **Mock**: `configHistory` in `src/mocks/data/config.ts`, seeded with a legacy record, a
+  rotated secret and changes that can be reverted. The `PATCH` handler records into it, and the
+  two new handlers list and revert it, including the conflict. `resetConfigHistory()` runs in
+  the test setup.
+- **Tests**: `src/lib/config-history.test.ts` (7) and `src/pages/config/ConfigHistory.test.tsx`
+  (8: rows, legacy, secret, revert, conflict then force, read-only, paging through the URL,
+  opening on a URL page). `e2e/configuration.spec.ts` has a new flow (history, revert dialog,
+  revert over a later save) with axe at each state. Against the real binary,
+  `e2e-real/configuration.spec.ts` has a new flow in which two API writes are reverted through
+  the page and checked through the API. Screenshots are `test-results/real-configuration-history|revert-dialog|reverted.png`.
+- **Checks**: `npm run check` (398 unit tests), `npm run test:e2e` 47/47,
+  `npm run test:e2e:real -- e2e-real/configuration.spec.ts` 4/4 against a fresh `hs serve`.
+
+## Earlier update: 2026-09-28 (a user's moderation and activity; branch `agent/user-moderation`)
 
 A user's page gained two cards on the fourteen operations track 15 made real the same day
 (`docs/status/15-admin-api-and-modules.md`):

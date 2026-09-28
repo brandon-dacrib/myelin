@@ -1145,9 +1145,17 @@ cannot do, in rough order of how often an operator will hit it:
   left without a control, `media.scanning.icap.preview`, has one since 2026-09-28 (queue item 2b).
 - **Switch a tagged-enum backend** — there is no "move from embedded to postgres" flow, only a
   view of whichever variant is live.
-- **See which *setting* changed.** `ConfigStore` records the merge patch per revision precisely so
-  the interface can show it, and no operation exposes it: `GET /config/{section}/history`
-  returning `ChangeRecord[]` would turn the section history into a per-setting one with a revert.
+- ~~**See which *setting* changed.**~~ **Done 2026-09-28** (branch `agent/config-history`,
+  decision 0014). `GET /config/{section}/history` lists each change setting by setting (before
+  and after, actor, time, secrets redacted). `POST /config/{section}/history/{revision}/revert`
+  undoes one as a new revision: it is `409` over a later change to the same setting unless
+  forced, a secret is restored server-side, and the revert is audited, published
+  (`config.reverted`) and logged. The section page shows the rows and a Revert dialog, with the
+  page of history in the URL. Verified through the real `hs` binary
+  (`crates/hs-cli/tests/config_history.rs`, `web/e2e-real/configuration.spec.ts`). **Left**:
+  changes recorded before this cannot be reverted, because their prior values were never
+  kept. History is never pruned. The mock's revisions are per section while the real server's
+  are global.
 - **Validate across sections.** `POST /config/validate` is sent one section at a time, so a
   constraint spanning two only fails at save.
 - **Reload anything.** `config.reload` reports honestly that nothing was hot-applied, because
