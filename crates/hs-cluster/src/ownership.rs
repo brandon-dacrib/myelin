@@ -383,6 +383,7 @@ impl<B: KvBackend> KvOwnership<B> {
     }
 
     async fn tick(&self) {
+        let started = Instant::now();
         self.read_drain_request().await;
         let state = if self.stepping_aside() {
             ReplicaState::Draining
@@ -459,10 +460,27 @@ impl<B: KvBackend> KvOwnership<B> {
             self.metrics.set_lease_age(age.elapsed());
         }
 
-        self.converge(&live, self_heartbeat_fresh).await;
+        self.converge(&live, self_heartbeat_fresh, started).await;
     }
 
-    async fn converge(&self, live: &[ReplicaId], self_heartbeat_fresh: bool) {
+    /// Moves this replica's holdings toward what rendezvous hashing over `live` wants, and
+    /// publishes the shard map.
+    ///
+    /// Two rules keep it honest (both found by two real replicas on one PostgreSQL, where one
+    /// store transaction per shard makes a full convergence of a 137-shard layout take far
+    /// longer than a lease):
+    ///
+    /// - **The store row is the truth.** A shard this replica holds in memory whose row no
+    ///   longer names it (at its generation and epoch) was taken by a peer that judged it dead;
+    ///   it is dropped as [`OwnershipEvent::Lost`] and, if still wanted, acquired again. Without
+    ///   this, a replica that lost a shard and saw it released later would believe it held it
+    ///   forever while the row stayed ownerless.
+    /// - **A tick is bounded.** Acquisitions and releases stop once the tick has run for one
+    ///   `heartbeat_interval` and resume on the next, which starts at once. The heartbeat and
+    ///   the peers' liveness are observed at the start of every tick, so a long convergence can
+    ///   neither let this replica's own lease lapse nor make a live peer look dead by comparing
+    ///   against an observation taken seconds ago.
+    async fn converge(&self, live: &[ReplicaId], self_heartbeat_fresh: bool, started: Instant) {
         let am_i_live = live.contains(&self.me);
         let store = self.store.clone();
         let rows = tokio::task::spawn_blocking(move || store.list_shards()).await;
@@ -471,6 +489,7 @@ impl<B: KvBackend> KvOwnership<B> {
 
         let draining = self.stepping_aside();
         let mut new_map = HashMap::new();
+        let mut work_left = false;
 
         for shard in self.config.layout.all_shards() {
             let row = rows_by_shard
@@ -480,6 +499,7 @@ impl<B: KvBackend> KvOwnership<B> {
             if let Some((owner, _)) = &row.owner {
                 new_map.insert(shard, owner.clone());
             }
+            self.reconcile_with_row(shard, &row);
 
             let desired = if draining || !am_i_live {
                 hash::desired_owner(shard, live.iter().filter(|id| **id != self.me)).cloned()
@@ -496,7 +516,10 @@ impl<B: KvBackend> KvOwnership<B> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains_key(&shard);
 
-            if i_want_it && !i_hold_it {
+            let change = i_want_it != i_hold_it;
+            if change && started.elapsed() >= self.config.heartbeat_interval {
+                work_left = true;
+            } else if i_want_it && !i_hold_it {
                 self.try_acquire(shard).await;
             } else if !i_want_it && i_hold_it {
                 self.release(shard).await;
@@ -506,6 +529,41 @@ impl<B: KvBackend> KvOwnership<B> {
         let _ = self
             .shard_map_tx
             .send(Arc::new(ShardMap { owners: new_map }));
+        if work_left {
+            tracing::debug!(
+                replica = %self.me,
+                "convergence continues next tick: this one used its time budget"
+            );
+            self.nudge();
+        }
+    }
+
+    /// Drops `shard` from what this replica holds if the store `row` says it is no longer
+    /// this replica's at the epoch it acquired (see [`Self::converge`]).
+    fn reconcile_with_row(&self, shard: ShardId, row: &ShardRecord) {
+        let held_epoch = self
+            .owned
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&shard)
+            .map(|o| o.epoch);
+        let Some(held_epoch) = held_epoch else { return };
+        let still_mine =
+            row.owner.as_ref().is_some_and(|(owner, generation)| {
+                *owner == self.me && *generation == self.generation
+            }) && row.epoch == held_epoch;
+        if still_mine {
+            return;
+        }
+        tracing::warn!(
+            replica = %self.me,
+            %shard,
+            held_epoch = held_epoch.0,
+            row_epoch = row.epoch.0,
+            row_owner = row.owner.as_ref().map(|(owner, _)| owner.as_str()).unwrap_or("none"),
+            "a shard this replica held was taken by a peer that judged it dead; dropping it"
+        );
+        self.drop_lost(shard, row.epoch);
     }
 
     /// Replicas this observer currently judges dead (RFC 0001 section 4), as an owned set: kept
@@ -567,13 +625,25 @@ impl<B: KvBackend> KvOwnership<B> {
     /// actor calls this after a [`crate::error::FenceError::Fenced`] so bookkeeping (owned set,
     /// metrics, the `Lost` event) stays consistent with what actually happened at the store.
     pub fn report_fenced(&self, shard: ShardId, epoch: Epoch) {
-        self.owned
+        self.metrics.record_fenced(shard.kind.as_str());
+        self.drop_lost(shard, epoch);
+    }
+
+    /// Forgets `shard` as lost: out of the held set, counted, and announced as
+    /// [`OwnershipEvent::Lost`] so actors drop their in-memory state. A shard not held is left
+    /// alone.
+    fn drop_lost(&self, shard: ShardId, epoch: Epoch) {
+        let was_held = self
+            .owned
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&shard);
+            .remove(&shard)
+            .is_some();
+        if !was_held {
+            return;
+        }
         self.metrics
             .record_ownership_change(shard.kind.as_str(), ChurnReason::Lost);
-        self.metrics.record_fenced(shard.kind.as_str());
         let _ = self.events.send(OwnershipEvent::Lost { shard, epoch });
     }
 
@@ -785,6 +855,57 @@ mod tests {
             assert!(mgr.is_mine(shard), "{shard} not owned");
             assert!(mgr.fence(shard).is_some());
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_shard_taken_while_held_is_dropped_and_taken_back_once_released() {
+        let backend = MemoryBackend::new();
+        let (mgr, _handle) = KvOwnership::start(config("hs-0"), backend.clone())
+            .await
+            .unwrap();
+        assert!(
+            settle_until(Duration::from_millis(60), 200, || {
+                mgr.layout().all_shards().all(|s| mgr.is_mine(s))
+            })
+            .await
+        );
+        let mut events = mgr.subscribe();
+        let shard = ShardId::new(crate::types::ShardKind::Room, 1);
+        let held = mgr.fence(shard).unwrap().epoch.unwrap();
+
+        // A peer that judged hs-0 dead takes the shard, then lets it go, all between two of
+        // hs-0's ticks: the row is ownerless at a later epoch.
+        let store = ClusterStore::open(backend).unwrap();
+        let thief = ReplicaId::new("hs-9");
+        let stolen = store
+            .acquire_shard(shard, &thief, Generation(1), |_| true)
+            .unwrap()
+            .unwrap();
+        store.release_shard(shard, &thief, Generation(1)).unwrap();
+        assert!(stolen.epoch > held);
+
+        // hs-0 notices, reports the loss, and owns the shard again at a newer epoch -- in the
+        // store, not only in its own memory.
+        assert!(
+            settle_until(Duration::from_millis(60), 200, || {
+                let row = store.get_shard(shard).unwrap();
+                row.owner
+                    .as_ref()
+                    .is_some_and(|(o, _)| o.as_str() == "hs-0")
+                    && mgr.fence(shard).is_some_and(|f| f.epoch == Some(row.epoch))
+            })
+            .await,
+            "hs-0 never took back the shard it lost"
+        );
+        let mut lost = false;
+        while let Ok(event) = events.try_recv() {
+            if let OwnershipEvent::Lost { shard: s, epoch } = event {
+                assert_eq!((s, epoch), (shard, stolen.epoch));
+                lost = true;
+            }
+        }
+        assert!(lost, "the loss was never announced");
+        assert!(mgr.fence(shard).unwrap().epoch.unwrap() > stolen.epoch);
     }
 
     #[tokio::test(start_paused = true)]

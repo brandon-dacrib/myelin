@@ -1,8 +1,8 @@
-## 2026-09-28: the two-replica admin test runs against PostgreSQL, not skipped
+## 2026-09-28: the two-replica admin test runs against PostgreSQL, and found two ownership bugs
 
 `crates/hs-cli/tests/cluster_admin.rs`'s two-process test needs a PostgreSQL whose user can
 create databases; without one it prints `SKIP` and reports `ok`, and the gate run before this
-merge did exactly that. It was then run for real against `postgres:17` (17.11) in Docker:
+merge did exactly that. Run for real against `postgres:17` (17.11) in Docker:
 
 ```
 docker run --rm -d --name hs-cluster-2pod-pg -e POSTGRES_PASSWORD=hspg \
@@ -11,12 +11,40 @@ HS_CLUSTER_TEST_POSTGRES_DSN=postgres://postgres:hspg@127.0.0.1:5461/postgres \
   cargo test -p hs-cli --test cluster_admin -- --nocapture
 ```
 
-Both tests passed twice with no `SKIP` line (the two-replica one takes 41 s: two real `hs serve`
-processes, a drain through the peer, every shard handed off, a restart that stays drained, the
-undrain), and each run dropped its database afterwards. `hs-cluster`'s `mesh_handoff` (5) and
-`chaos` (4) tests pass too. The container was removed. (`docker pull postgres:17` fails from an
-agent session because the Docker Hub credential helper needs the keychain; the ECR mirror of the
-official image needs no credentials.)
+(`docker pull postgres:17` fails from an agent session because the Docker Hub credential
+helper needs the keychain; the ECR mirror of the official image needs no credentials.)
+
+**It failed about one run in three**: after B was drained, A never took the shards B released,
+and 69 of 137 stayed ownerless for the whole 90 s wait. Instrumented, the cause was in
+`KvOwnership`, not in the admin API:
+
+1. **A tick could outlast the lease.** A tick heartbeats once, then runs one store transaction
+   per shard it acquires or releases. On PostgreSQL, B's first convergence of the 137-shard
+   layout took 19 s against a 3 s lease: its heartbeat stopped for all of it, and
+   `dead_peers()` compared against liveness observed at the tick's start, so each replica
+   judged a live peer dead and took its shards.
+2. **The held set never looked at the store again.** A held 137 shards in memory
+   (`hs_cluster_owned_shards` summed to 137) while the store named it on 68. `converge` did
+   nothing for a shard it wanted and believed it held, so when B, which had taken A's shards,
+   released them on its drain, the rows stayed ownerless for good.
+
+Fixed in `crates/hs-cluster/src/ownership.rs` (`converge`, `reconcile_with_row`, `drop_lost`):
+the store row is the truth (a held shard whose row no longer names this replica at its
+generation and epoch is dropped as `OwnershipEvent::Lost`, logged at `warn` ("a shard this
+replica held was taken by a peer that judged it dead"), counted as
+`hs_cluster_ownership_changes_total{reason="lost"}`, and acquired again if wanted), and a tick
+stops acquiring and releasing after one `heartbeat_interval` and resumes on the next, which
+starts at once. `report_fenced` keeps its meaning and still counts `hs_cluster_fenced`.
+
+Tests: `ownership::tests::a_shard_taken_while_held_is_dropped_and_taken_back_once_released`
+(fails without the reconciliation) and `tests/slow_store.rs` (two replicas on a store whose
+every commit takes 20 ms, so converging 17 shards is longer than the 150 ms lease; fails in 3 of
+3 runs without the budget, "hs-1 took a shard from hs-0 while hs-0 was alive"). After the fix the
+two-process test passed 10 of 10 runs against PostgreSQL 17 with no shard lost; `hs-cluster`'s
+`mesh_handoff` (5) and `chaos` (4) tests pass too.
+
+Noticed, not changed: a replica shutting down with no live peer still waits out its whole drain
+deadline (18 s in this test) for someone to claim its shards (`released_unclaimed=137`).
 
 **Still not done: the two-pod run on the cluster with the handoff fix.** It needs `kubectl` to
 `admin@dacrib0`, which agent sessions on this desktop cannot reach ("no route to host": macOS
