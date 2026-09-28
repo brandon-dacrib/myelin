@@ -1519,6 +1519,13 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
 
     overview.set_ownership(cluster_handles.cluster.ownership().clone());
 
+    // A report somebody files goes out on the admin event stream as `report.created`, which is
+    // what the Reports page and the sidebar count listen for instead of polling.
+    hs_admin::reports::forward_filed_reports(
+        rooms.reports().subscribe(),
+        mounts.admin.events.clone(),
+    );
+
     // The routing gate above stops two replicas both building a room actor, which is what closed
     // the silent split-brain. This is the belt-and-braces underneath it: the fence is read inside
     // the same transaction the write commits in, so a handoff that races the gate's ownership

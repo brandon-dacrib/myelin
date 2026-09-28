@@ -10,6 +10,7 @@
  */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, newIdempotencyKey } from "./client";
+import { useLiveEvents } from "./events";
 import { unwrap } from "./problem";
 import type { components, operations } from "./schema";
 import { hasScope } from "@/lib/auth";
@@ -32,7 +33,12 @@ export function taskIsActive(task: Pick<Task, "status">): boolean {
   return task.status === "running" || task.status === "scheduled";
 }
 
+/**
+ * A page of tasks. While the event stream is connected (`./events`), each `task.changed` event
+ * refetches it; otherwise it polls, faster while a listed task is still running.
+ */
 export function useTasks(filters: TaskFilters, options?: { enabled?: boolean }) {
+  const live = useLiveEvents();
   return useQuery({
     queryKey: ["tasks", filters],
     enabled: hasScope("admin:read") && (options?.enabled ?? true),
@@ -40,20 +46,26 @@ export function useTasks(filters: TaskFilters, options?: { enabled?: boolean }) 
       const result = await api.GET("/tasks", { params: { query: filters } });
       return unwrap(result);
     },
-    refetchInterval: (query) => (query.state.data?.items.some(taskIsActive) ? 3_000 : 30_000),
+    refetchInterval: (query) =>
+      live ? false : query.state.data?.items.some(taskIsActive) ? 3_000 : 30_000,
   });
 }
 
-export function useTask(id: string) {
+/**
+ * One task. While the event stream is connected, each `task.changed` event puts the task it
+ * carries straight into this query; otherwise it polls every 2 seconds until the task ends.
+ */
+export function useTask(id: string | undefined) {
+  const live = useLiveEvents();
   return useQuery({
     queryKey: ["task", id],
-    enabled: hasScope("admin:read"),
+    enabled: hasScope("admin:read") && Boolean(id),
     queryFn: async () => {
-      const result = await api.GET("/tasks/{id}", { params: { path: { id } } });
+      const result = await api.GET("/tasks/{id}", { params: { path: { id: id ?? "" } } });
       return unwrap(result);
     },
     refetchInterval: (query) =>
-      query.state.data && taskIsActive(query.state.data) ? 2_000 : false,
+      !live && query.state.data && taskIsActive(query.state.data) ? 2_000 : false,
   });
 }
 

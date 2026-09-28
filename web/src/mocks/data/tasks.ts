@@ -1,4 +1,5 @@
 import type { components } from "@/api/schema";
+import { publishMockEvent, registerMockTicker } from "./events";
 
 type Task = components["schemas"]["Task"];
 
@@ -135,7 +136,21 @@ export function recordFinishedTask(
 ): Task {
   const recorded: MockTask = { created_by: admin, ...task };
   tasks = [...tasks.filter((t) => t.id !== recorded.id), recorded];
-  return wire(recorded);
+  return changed(wire(recorded));
+}
+
+// A running clock-driven task reports its progress on the event stream once a second, as a
+// server task does each time it records progress.
+registerMockTicker(() => {
+  for (const task of tasks) {
+    if (task.clockStart !== undefined && task.status === "running") changed(wire(task));
+  }
+});
+
+/** Publishes a task's change on the mock event stream, as the server's registry does. */
+function changed(task: Task): Task {
+  publishMockEvent("task.changed", task, { type: "task", id: task.id });
+  return task;
 }
 
 /**
@@ -213,6 +228,7 @@ export function cancelTask(id: string): Task | undefined {
   if (task.status === "running" || task.status === "scheduled") {
     task.status = "cancelled";
     task.finished_at = new Date().toISOString();
+    return changed(wire(task));
   }
   return wire(task);
 }

@@ -9,7 +9,9 @@ import { Recover } from "./Recover";
 import { Register } from "./Register";
 import { Sheet, SheetContent } from "../ui/sheet/Sheet";
 import { Toaster } from "../ui/toast/Toaster";
-import { getSession, subscribeSession } from "@/lib/auth";
+import { useQueryClient } from "@tanstack/react-query";
+import { startLiveEvents } from "@/api/events";
+import { getSession, hasScope, subscribeSession } from "@/lib/auth";
 import { PRODUCT_NAME } from "@/lib/brand";
 
 const GO_TARGETS: Record<string, string> = {
@@ -29,6 +31,15 @@ export function AppShell() {
   const mainRef = useRef<HTMLDivElement>(null);
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const awaitingGRef = useRef(false);
+
+  // One event-stream connection per signed-in session (`api/events.ts`): reports and tasks
+  // change on the page as they happen, and the pages poll only while it is down.
+  const queryClient = useQueryClient();
+  const accessToken = session?.accessToken;
+  useEffect(() => {
+    if (!accessToken || !hasScope("admin:read")) return;
+    return startLiveEvents(queryClient);
+  }, [accessToken, queryClient]);
 
   // Focus moves to the main region after a route change (accessibility.md #2).
   useEffect(() => {

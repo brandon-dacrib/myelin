@@ -134,6 +134,30 @@ inline Sessions list was:
 - **Proved against the real binary**: `web/e2e-real/configuration.spec.ts` (3 flows), 3/3
   twice in a row against `hs serve`. Vitest 45 files, 349 tests; `npm run check` green.
 
+## Update: 2026-09-28 (later), the admin API follow-ups (track 15's work, pages included)
+
+- **Live pages.** `src/api/events.ts` reads the admin event stream with `fetch` (the bearer token
+  cannot go on an `EventSource`), one connection per signed-in session started by `AppShell`.
+  `report.*` refetches the report lists, that report and the Overview's counts (so the sidebar's
+  open-report count moves the moment a report is filed or decided); `task.changed` puts the task
+  straight into its query and refetches the task lists; `media.*` refetches the media list;
+  `stream.reset` refetches all of those. `useLiveEvents()` says whether it is connected:
+  `useReports`, `useTasks` and `useTask` do not poll while it is, `useStatisticsOverview` polls
+  every five minutes instead of 30 seconds, and all of them poll as before when it is not. It
+  reconnects with backoff and `Last-Event-ID`, and stops trying after 401/403/404/405/501. The
+  mock serves the same stream (`src/mocks/data/events.ts`): its tasks publish `task.changed`
+  (the clock-driven purge once a second while a stream is open), its reports publish
+  `report.resolved`/`report.deleted`, and `fileMockReport` files one as a client would.
+  Tests: `src/api/events.test.ts` (the parser, a connection applying events, giving up on a 501,
+  reconnecting with `Last-Event-ID`), a report appearing on the Reports page from the stream and
+  a task's progress following it on its page.
+- **A report page shows the reported person's other reports** (`GET /reports?reported_user_id=`),
+  open or closed with what was decided, and links to every report the reporter filed and every
+  report about the reported person. The queue takes `reported_user_id` and `reporter_id` in its
+  URL and shows each as a removable chip.
+- **The Cluster page's refused drain** reads the problem's `reason` (`single_node`,
+  `no_other_active_replica`) and says what it means, rather than showing the server's `detail`.
+
 ## Earlier update: 2026-09-28 (Users-page invite links and notices; branch `agent/users-page-dialogs`)
 
 The audit of the superseded `worktree-agent-aafb071194d2144c6` branch (registration tokens,

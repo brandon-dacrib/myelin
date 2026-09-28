@@ -181,6 +181,11 @@ pub struct ReportFilter {
     pub status: Option<ReportStatus>,
     /// Only reports about this room.
     pub room_id: Option<String>,
+    /// Only reports whose conduct is this user's: reports about them, and reports of events
+    /// they sent.
+    pub reported_user_id: Option<String>,
+    /// Only reports this user filed.
+    pub reporter_id: Option<String>,
 }
 
 impl ReportFilter {
@@ -193,6 +198,14 @@ impl ReportFilter {
                 .room_id
                 .as_deref()
                 .is_none_or(|r| report.room_id.as_deref() == Some(r))
+            && self
+                .reported_user_id
+                .as_deref()
+                .is_none_or(|u| report.reported_user_id.as_deref() == Some(u))
+            && self
+                .reporter_id
+                .as_deref()
+                .is_none_or(|u| report.reporter_id == u)
     }
 }
 
@@ -339,6 +352,53 @@ impl ReportSource for InMemoryReportSource {
     }
 }
 
+/// The event published when somebody files a report.
+pub const REPORT_CREATED: &str = "report.created";
+
+/// Publishes every report `filed` carries as a [`REPORT_CREATED`] event on `events` (resource
+/// `{type: report, id}`, data the report as `GET /reports` lists it), until `filed` closes.
+/// The owner of the reports store hands its subscription here (`hs-cli` does, with `hs-room`'s
+/// `ReportStore::subscribe`). Runs on the current Tokio runtime.
+pub fn forward_filed_reports(
+    mut filed: tokio::sync::broadcast::Receiver<AdminReport>,
+    events: std::sync::Arc<crate::events::EventBus>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match filed.recv().await {
+                Ok(report) => publish_filed(&events, report),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                    tracing::warn!(
+                        missed,
+                        "report.created: fell behind; some filed reports were not announced (they \
+                         are kept, and listed)"
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+/// Publishes one filed report as a [`REPORT_CREATED`] event.
+pub fn publish_filed(events: &crate::events::EventBus, mut report: AdminReport) {
+    report.event = None;
+    tracing::info!(
+        report = %report.id,
+        kind = ?report.kind,
+        reporter = %report.reporter_id,
+        "a report was filed"
+    );
+    let id = report.id.clone();
+    events.publish(
+        crate::model::Event::new(
+            REPORT_CREATED,
+            serde_json::to_value(&report).unwrap_or_default(),
+        )
+        .with_resource(ResourceRef::new("report", id)),
+    );
+}
+
 // -------------------------------------------------------------------------------------------
 // Handlers.
 // -------------------------------------------------------------------------------------------
@@ -353,6 +413,8 @@ pub(crate) struct ReportsQuery {
     kind: Option<String>,
     status: Option<String>,
     room_id: Option<String>,
+    reported_user_id: Option<String>,
+    reporter_id: Option<String>,
 }
 
 fn invalid_query(pointer: &str, detail: String, instance: &str) -> Response {
@@ -387,6 +449,8 @@ pub(crate) async fn reports_list(
     };
     let mut filter = ReportFilter {
         room_id: query.room_id.clone().filter(|r| !r.is_empty()),
+        reported_user_id: query.reported_user_id.clone().filter(|u| !u.is_empty()),
+        reporter_id: query.reporter_id.clone().filter(|u| !u.is_empty()),
         ..ReportFilter::default()
     };
     if let Some(kind) = query.kind.as_deref().filter(|k| !k.is_empty()) {
@@ -681,6 +745,31 @@ mod tests {
         assert_eq!(value["status"], "open");
     }
 
+    #[tokio::test]
+    async fn a_filed_report_is_published_as_report_created() {
+        let events = std::sync::Arc::new(crate::events::EventBus::new());
+        let mut live = events.subscribe();
+        let (filed, receiver) = tokio::sync::broadcast::channel(4);
+        let forwarder = forward_filed_reports(receiver, events.clone());
+        let mut with_event = report("01A", ReportKind::Event);
+        with_event.event = Some(serde_json::json!({"content": {"body": "x"}}));
+        filed.send(with_event).unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), live.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.r#type, REPORT_CREATED);
+        let resource = event.resource.clone().unwrap();
+        assert_eq!(
+            (resource.r#type.as_str(), resource.id.as_str()),
+            ("report", "01A")
+        );
+        assert_eq!(event.data["reporter_id"], "@alice:example.org");
+        assert_eq!(event.data["event"], serde_json::Value::Null);
+        drop(filed);
+        forwarder.await.unwrap();
+    }
+
     #[test]
     fn the_resolve_body_refuses_what_it_does_not_know() {
         assert!(serde_json::from_str::<ReportResolve>(r#"{"resolution":"banished"}"#).is_err());
@@ -780,6 +869,75 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             let (status, _, _) = call(&state, "GET", "/api/v1/reports", None, None, None).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn reports_filter_by_the_reported_user_and_by_the_reporter() {
+            let (state, _) = wired();
+            let source = Arc::new(InMemoryReportSource::new());
+            source.insert(report("01A", ReportKind::Event));
+            let mut other = report("01B", ReportKind::User);
+            other.reported_user_id = Some("@eve:example.org".to_owned());
+            source.insert(other);
+            let mut by_bob = report("01C", ReportKind::Room);
+            by_bob.reporter_id = "@bob:example.org".to_owned();
+            source.insert(by_bob);
+            let state = state.with_reports(source);
+
+            let ids = |page: &serde_json::Value| -> Vec<String> {
+                page["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r["id"].as_str().unwrap().to_owned())
+                    .collect()
+            };
+            let (status, _, page) = call(
+                &state,
+                "GET",
+                "/api/v1/reports?reported_user_id=%40mallory%3Aexample.org",
+                Some("mod-read"),
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{page}");
+            assert_eq!(ids(&page), ["01C", "01A"]);
+
+            let (_, _, page) = call(
+                &state,
+                "GET",
+                "/api/v1/reports?reporter_id=%40bob%3Aexample.org",
+                Some("mod-read"),
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(ids(&page), ["01C"]);
+
+            // Both at once narrow to reports matching both.
+            let (_, _, page) = call(
+                &state,
+                "GET",
+                "/api/v1/reports?reported_user_id=%40mallory%3Aexample.org&reporter_id=%40alice%3Aexample.org",
+                Some("mod-read"),
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(ids(&page), ["01A"]);
+
+            // An empty value is no filter, as for room_id.
+            let (_, _, page) = call(
+                &state,
+                "GET",
+                "/api/v1/reports?reporter_id=",
+                Some("mod-read"),
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(ids(&page).len(), 3);
         }
 
         #[tokio::test]

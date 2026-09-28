@@ -24,6 +24,9 @@ use crate::registry::RoomRegistry;
 pub struct ReportStore<B: KvBackend> {
     backend: B,
     reports: TypedKeyspace<B::Keyspace, (String,)>,
+    /// Every report this process files, once it is durable: what the admin API's
+    /// `report.created` event is published from (`hs-cli` forwards it onto the event bus).
+    filed: tokio::sync::broadcast::Sender<AdminReport>,
 }
 
 fn decode(bytes: &[u8]) -> Result<AdminReport, RoomError> {
@@ -37,7 +40,21 @@ impl<B: KvBackend> ReportStore<B> {
     /// The backend's, if the keyspace cannot be opened.
     pub fn open(backend: B) -> Result<Self, hs_kv::KvError> {
         let reports = TypedKeyspace::new(backend.keyspace("room_reports")?);
-        Ok(Self { backend, reports })
+        // A burst of reports larger than this before anybody reads is reported to the
+        // subscriber as `Lagged`; the reports themselves are durable either way.
+        let (filed, _) = tokio::sync::broadcast::channel(256);
+        Ok(Self {
+            backend,
+            reports,
+            filed,
+        })
+    }
+
+    /// Every report filed through this store from now on, sent once it is durable. A report
+    /// filed on another replica is not seen here.
+    #[must_use]
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AdminReport> {
+        self.filed.subscribe()
     }
 
     /// Keeps a newly filed report.
@@ -54,6 +71,8 @@ impl<B: KvBackend> ReportStore<B> {
                 .put(txn, &(stored.id.clone(),), &value)
                 .map_err(hs_kv::KvError::backend)
         })?;
+        // Nobody listening is not an error: the report is kept either way.
+        let _ = self.filed.send(stored);
         Ok(())
     }
 
@@ -282,6 +301,17 @@ mod tests {
             Some("rude")
         );
         assert!(store.get("01C").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_filed_report_is_sent_to_subscribers_without_its_rendered_event() {
+        let store = ReportStore::open(MemoryBackend::new()).unwrap();
+        let mut filed = store.subscribe();
+        store.file(&report("01A")).unwrap();
+        let sent = filed.try_recv().unwrap();
+        assert_eq!(sent.id, "01A");
+        assert_eq!(sent.event, None);
+        assert!(filed.try_recv().is_err(), "one report, one message");
     }
 
     #[test]

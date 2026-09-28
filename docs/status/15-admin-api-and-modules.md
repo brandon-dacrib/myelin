@@ -159,6 +159,42 @@ offering operations); before that 2026-09-26 (three public recovery operations);
 > `web/e2e-real/configuration.spec.ts`. The `openapi.yaml` description of `ConfigSettingInfo`
 > mentions it; no operation changed.
 
+> **2026-09-28 (later): the admin API follow-ups** (queue items 2a and 2g of
+> `docs/next-steps.md`, and fixes other agents flagged). Tested through the real server in
+> `crates/hs-cli/tests/admin_followups.rs` (`spawn_serve`, the code `hs serve` runs).
+>
+> - **Small fixes.** `registration_tokens.create`, `server_notices.send`, `users.create` and
+>   `appservices.create` record `outcome.status` 201 in the audit log, the status they answer
+>   (`router::record_mutation_with_status`; the old helper still records 200 for everything else).
+>   `cluster.get`'s `replica_count` is every registered replica still heartbeating, drained ones
+>   included, whenever the replica registry is wired (`cluster::serving_replica_count`); the
+>   overview's owner count is only the fallback. The drain `409` carries a machine-readable
+>   `reason`, `single_node` or `no_other_active_replica` (`cluster::DRAIN_REFUSED_*`): `Problem`
+>   (`hs-http`) gains an optional `reason` extension member, in the contract's `Problem` schema
+>   too, and the Cluster page's dialog branches on it instead of showing `detail`.
+>   `cluster.shards.list` documents its maximum page: 500 (a larger `limit` is clamped), against
+>   the default layout's 641 shards.
+> - **Reports by person.** `GET /reports` takes `reported_user_id` (reports about a person's
+>   conduct: about them, or of a message they sent) and `reporter_id` (reports they filed);
+>   `ReportFilter` gained both fields and `matches` checks them, so `hs-room`'s source needed no
+>   change. A report page lists the reported person's other reports, open or closed, with what was
+>   decided, and links to every report they filed and every report about them; the Reports queue
+>   shows each person filter as a removable chip.
+> - **`report.created` and `task.changed` over the event stream, and the pages listen.**
+>   `hs-room`'s `ReportStore::subscribe` sends each report once it is durable; `hs-cli` hands the
+>   subscription to `hs_admin::reports::forward_filed_reports`, which publishes
+>   `report.created` (resource `{type: report, id}`, data the report as listed, logged at info).
+>   `task.changed` was already published on every change of a task, progress included. The web
+>   interface (`web/src/api/events.ts`) reads `GET /api/v1/events?types=report.*&types=task.*&types=media.*`
+>   with `fetch` (an `EventSource` cannot send the bearer token), reconnects with backoff and
+>   `Last-Event-ID`, and applies each event to the query cache: a changed task is put straight
+>   into its query; reports, the Overview's counts (the sidebar's open-report count) and task lists
+>   are refetched. While the stream is connected the Reports and Tasks pages do not poll, and the
+>   Overview polls every five minutes instead of every 30 seconds; polling comes back whenever the
+>   stream is down, and stops being tried after a 401, 403, 404 or 501. The mock serves the same
+>   stream (`web/src/mocks/data/events.ts`). A report filed on another replica of a cluster is
+>   announced by that replica's bus only (the event bus is per process).
+
 > **2026-09-28, served for real: Cluster 6/6** (branch `agent/cluster-admin`, rebuilt on main
 > from the superseded `worktree-agent-ae592ed29bb65b973`, whose cluster pieces it replaces).
 > `tools/admin_api_coverage.py` now counts **102 of 158** operations with a real handler.

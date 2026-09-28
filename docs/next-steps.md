@@ -718,13 +718,15 @@ edit one is not. New settings and operations arrive with their interface control
    `bootstrap-only-config`). What the merge of 2026-09-28 left, in order:
    - ~~**2a.** The Reports, Tasks and Statistics pages, and the Overview sparklines~~
      **Done 2026-09-28, mock-tested only** (`agent/admin-web-pages`, merged): 41 Vitest files
-     and 38 Playwright flows are green on MSW. Left: an `e2e-real` run of the three pages
-     against `hs serve` (the real `Report.event.content` shape, a replay task's `resource`);
-     the reported user's other reports on a report page, which needs a contract change from
-     track 15 (**`GET /reports` filtered by `reported_user_id` / `reporter_id`**); acting
-     straight from a report (suspension and redacting a user's messages are real since 2h,
-     but the report page does not offer them yet);
-     `report.created`/`task.changed` over SSE instead of polling.
+     and 38 Playwright flows are green on MSW. ~~The reported user's other reports on a report
+     page (`GET /reports` filtered by `reported_user_id` / `reporter_id`);
+     `report.created`/`task.changed` over SSE instead of polling~~ **done 2026-09-28 (later)**:
+     the filters are in the contract, a report page lists the person's other reports, and the
+     Reports and Tasks pages and the sidebar count follow the event stream, polling only while
+     it is down (status 15 and 16). Left: an `e2e-real` run of the three pages against `hs
+     serve` (the real `Report.event.content` shape, a replay task's `resource`); acting straight
+     from a report (suspension and redacting a user's messages are real since 2h, but the
+     report page does not offer them yet).
    - ~~**2b.** `media.scanning.icap.preview` gets a real control; a Rust test pins the web's
      schema fixture to `schema_for!(Config)`; RFC 0020 (a hidden secret inside a list entry is
      lost on save).~~ **Done 2026-09-28** (track 13): `PreviewMode` reads `negotiate`, `off`,

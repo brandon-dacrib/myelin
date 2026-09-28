@@ -7,6 +7,10 @@ export interface ReportsSearch {
   status?: "open" | "resolved" | "dismissed" | "all";
   kind?: "event" | "room" | "user";
   room_id?: string;
+  /** Reports about this person's conduct. */
+  reported_user_id?: string;
+  /** Reports this person filed. */
+  reporter_id?: string;
   sort?: "-received_at" | "received_at" | "score" | "-score";
   cursor?: string;
 }
@@ -19,13 +23,19 @@ function oneOf<T extends string>(values: readonly T[], value: unknown): T | unde
   return values.includes(value as T) ? (value as T) : undefined;
 }
 
+function nonEmpty(value: unknown): string | undefined {
+  return typeof value === "string" && value ? value : undefined;
+}
+
 export function validateReportsSearch(search: Record<string, unknown>): ReportsSearch {
   return {
     status: oneOf(STATUSES, search.status),
     kind: oneOf(KINDS, search.kind),
-    room_id: typeof search.room_id === "string" && search.room_id ? search.room_id : undefined,
+    room_id: nonEmpty(search.room_id),
+    reported_user_id: nonEmpty(search.reported_user_id),
+    reporter_id: nonEmpty(search.reporter_id),
     sort: oneOf(SORTS, search.sort),
-    cursor: typeof search.cursor === "string" && search.cursor ? search.cursor : undefined,
+    cursor: nonEmpty(search.cursor),
   };
 }
 
@@ -36,6 +46,8 @@ export function reportsQuery(search: ReportsSearch) {
     status: status === "all" ? undefined : status,
     kind: search.kind,
     room_id: search.room_id,
+    reported_user_id: search.reported_user_id,
+    reporter_id: search.reporter_id,
     sort: search.sort,
     cursor: search.cursor,
     limit: 25,

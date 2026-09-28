@@ -4,6 +4,7 @@ import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router"
 import {
   useDeleteReport,
   useReport,
+  useReports,
   useResolveReport,
   type Report,
   type ReportResolution,
@@ -105,6 +106,13 @@ function ReportView({ report }: { report: Report }) {
       <dl className="grid gap-4 rounded-md border border-border bg-surface p-4 text-sm sm:grid-cols-2 [&_dd]:mt-1 [&_dd]:break-all [&_dd]:text-text [&_dt]:text-text-muted">
         <Fact label="Reported by">
           <ResourceLink target={{ type: "user", id: report.reporter_id }} />
+          <Link
+            to="/reports"
+            search={{ status: "all", reporter_id: report.reporter_id }}
+            className="mt-1 block text-accent hover:underline"
+          >
+            Every report they filed
+          </Link>
         </Fact>
         {report.reported_user_id && (
           <Fact label={report.kind === "user" ? "Reported user" : "Sender"}>
@@ -137,6 +145,10 @@ function ReportView({ report }: { report: Report }) {
         </Fact>
       </dl>
 
+      {report.reported_user_id && (
+        <OtherReports userId={report.reported_user_id} currentId={report.id} />
+      )}
+
       {report.status === "open" ? (
         canWrite ? (
           <ResolveForm report={report} />
@@ -150,6 +162,75 @@ function ReportView({ report }: { report: Report }) {
         <Decision report={report} />
       )}
     </>
+  );
+}
+
+/** How many of a person's other reports the report page lists before linking to the rest. */
+const OTHER_REPORTS_SHOWN = 10;
+
+/**
+ * The reported person's other reports (`GET /reports?reported_user_id=`), open or closed, newest
+ * first: whether this is a first report about them or the latest of many, and what was decided
+ * the times before.
+ */
+function OtherReports({ userId, currentId }: { userId: string; currentId: string }) {
+  const query = useReports({ reported_user_id: userId, limit: OTHER_REPORTS_SHOWN + 1 });
+  const others = (query.data?.items ?? []).filter((r) => r.id !== currentId);
+  const more = others.length > OTHER_REPORTS_SHOWN || Boolean(query.data?.next_cursor);
+  return (
+    <section aria-labelledby="other-reports-heading" className="space-y-2">
+      <h2 id="other-reports-heading" className="text-md font-medium text-text">
+        Other reports about <span className="break-all font-identifier">{userId}</span>
+      </h2>
+      {query.isLoading ? (
+        <SkeletonText lines={2} />
+      ) : query.isError ? (
+        <QueryProblemState
+          error={query.error}
+          resource="their other reports"
+          scope="moderation:read"
+          onRetry={() => query.refetch()}
+        />
+      ) : others.length === 0 ? (
+        <p className="text-sm text-text-muted">This is the only report about them.</p>
+      ) : (
+        <>
+          <ul className="divide-y divide-border rounded-md border border-border bg-surface">
+            {others.slice(0, OTHER_REPORTS_SHOWN).map((other) => (
+              <li
+                key={other.id}
+                className="flex flex-wrap items-center justify-between gap-3 p-3 text-sm"
+              >
+                <Link
+                  to="/reports/$reportId"
+                  params={{ reportId: other.id }}
+                  className="min-w-0 break-all font-medium text-text hover:text-accent hover:underline"
+                >
+                  {reportSubject(other)}
+                </Link>
+                <span className="flex items-center gap-3 text-text-muted">
+                  <RelativeTime at={other.received_at} />
+                  <Badge status={REPORT_STATUS_META[other.status].status}>
+                    {other.status === "open"
+                      ? REPORT_STATUS_META.open.label
+                      : `${REPORT_STATUS_META[other.status].label}: ${resolutionLabel(other.resolution)}`}
+                  </Badge>
+                </span>
+              </li>
+            ))}
+          </ul>
+          {more && (
+            <Link
+              to="/reports"
+              search={{ status: "all", reported_user_id: userId }}
+              className="inline-block text-sm text-accent hover:underline"
+            >
+              Every report about them
+            </Link>
+          )}
+        </>
+      )}
+    </section>
   );
 }
 

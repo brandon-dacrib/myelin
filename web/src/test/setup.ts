@@ -12,6 +12,7 @@ import { resetCluster } from "@/mocks/data/cluster";
 import { resetRoomContents } from "@/mocks/data/room-contents";
 import { resetMigration } from "@/mocks/data/migration";
 import { resetUserModeration } from "@/mocks/data/user-moderation";
+import { resetMockEvents } from "@/mocks/data/events";
 
 /**
  * Give the API client an absolute base URL before anything imports it.
@@ -91,5 +92,7 @@ afterEach(() => {
   resetMigration();
   // And users' moderation flags, rate limits and support sessions.
   resetUserModeration();
+  // And the event streams a test opened.
+  resetMockEvents();
 });
 afterAll(() => server.close());

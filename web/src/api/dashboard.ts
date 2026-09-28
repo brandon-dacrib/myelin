@@ -25,9 +25,16 @@
  */
 import { useQuery } from "@tanstack/react-query";
 import { api } from "./client";
+import { useLiveEvents } from "./events";
 import { unwrap } from "./problem";
 
+/**
+ * The Overview's counts, which the sidebar's open-report count reads too. While the event stream
+ * is connected, a `report.*` event refetches them at once, and the rest (users, rooms, media) are
+ * refreshed every five minutes; without it, every 30 seconds.
+ */
 export function useStatisticsOverview(options?: { enabled?: boolean }) {
+  const live = useLiveEvents();
   return useQuery({
     queryKey: ["statistics-overview"],
     enabled: options?.enabled ?? true,
@@ -35,7 +42,7 @@ export function useStatisticsOverview(options?: { enabled?: boolean }) {
       const result = await api.GET("/statistics/overview");
       return unwrap(result);
     },
-    refetchInterval: 30_000,
+    refetchInterval: live ? 5 * 60_000 : 30_000,
   });
 }
 

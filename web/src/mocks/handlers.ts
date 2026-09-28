@@ -68,7 +68,9 @@ import {
   openReportCount,
   resolveReport,
 } from "./data/reports";
-import { cancelTask, getTask, listTasks, recordFinishedTask } from "./data/tasks";import { roomStatistics, sortStatistics, timeseries, userMediaStatistics } from "./data/statistics";
+import { cancelTask, getTask, listTasks, recordFinishedTask } from "./data/tasks";
+import { mockEventStream } from "./data/events";
+import { roomStatistics, sortStatistics, timeseries, userMediaStatistics } from "./data/statistics";
 import type { ReportResolve } from "@/api/reports";
 import { succeeded } from "@/lib/audit";
 import { users, userDevices, findUser } from "./data/users";
@@ -275,6 +277,15 @@ export const handlers = [
       operator: { name: "Operator", subject: "@ops:example.org" },
     });
   }),
+
+  // ---- The event stream (crates/hs-admin/src/events.rs; `./data/events`) ----
+  http.get(`${API}/events`, ({ request }) => {
+    const types = new URL(request.url).searchParams.getAll("types");
+    return new HttpResponse(mockEventStream(types, request.signal), {
+      headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
+    });
+  }),
+
   // ---- First-run setup ----
   // Closed by default, like a server that already has its administrator, so every other flow is
   // unaffected. A test opens it by putting a token in `sessionStorage` before the app loads

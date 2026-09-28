@@ -89,7 +89,12 @@ export function ReportsPage() {
       </div>
     );
 
-  const filtered = status !== "open" || search.kind || search.room_id;
+  const filtered =
+    status !== "open" ||
+    search.kind ||
+    search.room_id ||
+    search.reported_user_id ||
+    search.reporter_id;
 
   return (
     <div className="mx-auto max-w-[90rem] space-y-5 p-6">
@@ -153,18 +158,28 @@ export function ReportsPage() {
           )}
         </Field>
         {search.room_id && (
-          <div className="flex items-center gap-2 text-sm text-text sm:col-span-3">
-            <span className="text-text-muted">Only reports about</span>
-            <span className="break-all font-identifier">{search.room_id}</span>
-            <Button
-              variant="ghost"
-              size="sm"
-              leadingIcon={<X size={14} aria-hidden="true" />}
-              onClick={() => setFilter({ room_id: undefined })}
-            >
-              Every room
-            </Button>
-          </div>
+          <FilterChip
+            label="Only reports about"
+            value={search.room_id}
+            clear="Every room"
+            onClear={() => setFilter({ room_id: undefined })}
+          />
+        )}
+        {search.reported_user_id && (
+          <FilterChip
+            label="Only reports about the conduct of"
+            value={search.reported_user_id}
+            clear="Everybody"
+            onClear={() => setFilter({ reported_user_id: undefined })}
+          />
+        )}
+        {search.reporter_id && (
+          <FilterChip
+            label="Only reports filed by"
+            value={search.reporter_id}
+            clear="Every reporter"
+            onClear={() => setFilter({ reporter_id: undefined })}
+          />
         )}
       </div>
 
@@ -207,6 +222,34 @@ export function ReportsPage() {
           }}
         />
       )}
+    </div>
+  );
+}
+
+/** One URL filter the selects do not show (a room, a person), with a way to drop it. */
+function FilterChip({
+  label,
+  value,
+  clear,
+  onClear,
+}: {
+  label: string;
+  value: string;
+  clear: string;
+  onClear: () => void;
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-2 text-sm text-text sm:col-span-3">
+      <span className="text-text-muted">{label}</span>
+      <span className="break-all font-identifier">{value}</span>
+      <Button
+        variant="ghost"
+        size="sm"
+        leadingIcon={<X size={14} aria-hidden="true" />}
+        onClick={onClear}
+      >
+        {clear}
+      </Button>
     </div>
   );
 }

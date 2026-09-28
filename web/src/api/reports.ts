@@ -10,6 +10,7 @@
  */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, newIdempotencyKey } from "./client";
+import { useLiveEvents } from "./events";
 import { unwrap } from "./problem";
 import type { components, operations } from "./schema";
 import { hasScope } from "@/lib/auth";
@@ -26,12 +27,21 @@ export interface ReportFilters {
   status?: ReportListQuery["status"];
   kind?: ReportListQuery["kind"];
   room_id?: string;
+  /** Only reports about this person's conduct (reports about them, and of messages they sent). */
+  reported_user_id?: string;
+  /** Only reports this person filed. */
+  reporter_id?: string;
   sort?: string;
   cursor?: string;
   limit?: number;
 }
 
+/**
+ * A page of reports. While the event stream is connected (`./events`), a `report.*` event
+ * refetches it; polling every 30 seconds is the fallback for when it is not.
+ */
 export function useReports(filters: ReportFilters) {
+  const live = useLiveEvents();
   return useQuery({
     queryKey: ["reports", filters],
     enabled: hasScope("moderation:read"),
@@ -39,7 +49,7 @@ export function useReports(filters: ReportFilters) {
       const result = await api.GET("/reports", { params: { query: filters } });
       return unwrap(result);
     },
-    refetchInterval: 30_000,
+    refetchInterval: live ? false : 30_000,
   });
 }
 

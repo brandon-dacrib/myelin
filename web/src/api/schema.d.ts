@@ -6166,6 +6166,10 @@ export interface operations {
                 kind?: "event" | "room" | "user";
                 /** @description Page size. Values above the resource's max are clamped, not rejected. */
                 limit?: components["parameters"]["Limit"];
+                /** @description Only reports whose conduct is this user's (`reported_user_id`): reports about them, and reports of events they sent. An empty value is no filter. */
+                reported_user_id?: string;
+                /** @description Only reports this user filed. An empty value is no filter. */
+                reporter_id?: string;
                 room_id?: string;
                 /** @description Sort field from the resource's allow-list. Prefix with - for descending. */
                 sort?: components["parameters"]["Sort"];

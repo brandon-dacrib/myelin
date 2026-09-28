@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { screen, within } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { server } from "@/mocks/node";
@@ -8,6 +8,8 @@ import { renderRoutes } from "@/test/render-route";
 import { TasksPage } from "./TasksPage";
 import { TaskDetailPage } from "./TaskDetailPage";
 import { validateTasksSearch } from "./tasks-search";
+import { isLive, startLiveEvents } from "@/api/events";
+import { getTask, putTask } from "@/mocks/data/tasks";
 
 const ROUTES = [
   { path: "/tasks", component: TasksPage, validateSearch: validateTasksSearch },
@@ -75,6 +77,31 @@ describe("A task", () => {
 
     expect(await screen.findByText("Cancelled")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Cancel task" })).not.toBeInTheDocument();
+  });
+
+  it("follows a task's progress from the event stream as it happens", async () => {
+    const { client } = open("/tasks/01J9ZT000000000000000000T6");
+    expect(await screen.findByRole("heading", { name: "Purge remote media cache" })).toBeVisible();
+    const stop = startLiveEvents(client);
+    try {
+      await waitFor(() => expect(isLive()).toBe(true));
+      const task = getTask("01J9ZT000000000000000000T6")!;
+      putTask({
+        ...task,
+        progress: { current: 3999, total: 4000, unit: "files", message: "Almost there" },
+      });
+      expect(await screen.findByText("Almost there")).toBeInTheDocument();
+      putTask({
+        ...task,
+        status: "succeeded",
+        finished_at: new Date().toISOString(),
+        progress: { current: 4000, total: 4000, unit: "files" },
+        result: { deleted_files: 4000 },
+      });
+      expect(await screen.findByText("Succeeded")).toBeInTheDocument();
+    } finally {
+      stop();
+    }
   });
 
   it("says a scheduled task will not run if cancelled", async () => {

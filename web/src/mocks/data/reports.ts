@@ -1,4 +1,5 @@
 import type { components } from "@/api/schema";
+import { publishMockEvent } from "./events";
 
 type Report = components["schemas"]["Report"];
 type ReportResolve = components["schemas"]["ReportResolve"];
@@ -146,12 +147,16 @@ export function listReports(query: URLSearchParams): Report[] | { error: string 
   const kind = query.get("kind");
   const status = query.get("status");
   const roomId = query.get("room_id");
+  const reportedUserId = query.get("reported_user_id");
+  const reporterId = query.get("reporter_id");
   const sort = query.get("sort") ?? "-received_at";
   const items = reports.filter(
     (r) =>
       (!kind || r.kind === kind) &&
       (!status || r.status === status) &&
-      (!roomId || r.room_id === roomId),
+      (!roomId || r.room_id === roomId) &&
+      (!reportedUserId || r.reported_user_id === reportedUserId) &&
+      (!reporterId || r.reporter_id === reporterId),
   );
   switch (sort) {
     case "-received_at":
@@ -204,6 +209,23 @@ export function deleteReport(id: string): boolean {
   const before = reports.length;
   reports = reports.filter((r) => r.id !== id);
   return reports.length < before;
+}
+
+/**
+ * Files a report as somebody would through the client-server API, and publishes it as
+ * `report.created` on the mock event stream, as the server does.
+ */
+export function fileMockReport(report: Omit<Report, "status" | "received_at" | "id">): Report {
+  const filed: MockReport = {
+    ...report,
+    id: `01J9ZQ${String(Date.now()).padStart(20, "0")}`,
+    status: "open",
+    received_at: new Date().toISOString(),
+  };
+  reports = [...reports, filed];
+  const wired = wire(filed, false);
+  publishMockEvent("report.created", wired, { type: "report", id: filed.id });
+  return wired;
 }
 
 export function openReportCount(): number {

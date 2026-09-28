@@ -24,7 +24,7 @@ export function renderRoutes(
   routes: TestRoute[],
   initialPath: string,
   known: string[] = [],
-): { router: AnyRouter } {
+): { router: AnyRouter; client: QueryClient } {
   const rootRoute = createRootRoute();
   const own = new Set(routes.map((r) => r.path));
   const router = createRouter({
@@ -55,5 +55,5 @@ export function renderRoutes(
       <RouterProvider router={router} />
     </QueryClientProvider>,
   );
-  return { router };
+  return { router, client };
 }

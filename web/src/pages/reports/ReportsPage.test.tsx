@@ -8,6 +8,8 @@ import { renderRoutes } from "@/test/render-route";
 import { ReportsPage } from "./ReportsPage";
 import { ReportDetailPage } from "./ReportDetailPage";
 import { validateReportsSearch } from "./reports-search";
+import { isLive, startLiveEvents } from "@/api/events";
+import { fileMockReport } from "@/mocks/data/reports";
 
 const ROUTES = [
   { path: "/reports", component: ReportsPage, validateSearch: validateReportsSearch },
@@ -58,6 +60,33 @@ describe("Reports queue", () => {
     expect(asked?.get("status")).toBeNull();
     expect(asked?.get("kind")).toBe("user");
     expect(asked?.get("sort")).toBe("score");
+  });
+
+  it("shows a report the moment it is filed, from the event stream, without polling", async () => {
+    const { client } = open("/reports");
+    const t = await table();
+    expect(t.getAllByRole("row").slice(1)).toHaveLength(4);
+    const stop = startLiveEvents(client);
+    try {
+      await waitFor(() => expect(isLive()).toBe(true));
+      fileMockReport({
+        kind: "user",
+        room_id: null,
+        event_id: null,
+        reporter_id: "@bob:example.org",
+        reported_user_id: "@spammer42:example.org",
+        reason: "Just filed",
+        score: null,
+        resolution: null,
+        resolution_note: null,
+        resolved_at: null,
+        resolved_by: null,
+        event: null,
+      });
+      expect(await t.findByText("Just filed")).toBeInTheDocument();
+    } finally {
+      stop();
+    }
   });
 
   it("says plainly when nothing is waiting", async () => {
@@ -129,6 +158,51 @@ describe("A report", () => {
     expect(screen.getByText("Redacted the content")).toBeInTheDocument();
     expect(screen.getByText("Redacted; warned them in DM.")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Resolve report" })).not.toBeInTheDocument();
+  });
+
+  it("lists the reported person's other reports, open and closed", async () => {
+    let asked: URLSearchParams | undefined;
+    server.use(
+      http.get("/api/v1/reports", ({ request }) => {
+        asked = new URL(request.url).searchParams;
+        return undefined;
+      }),
+    );
+    open("/reports/01J9ZQ0000000000000000R008");
+    const section = within(
+      (await screen.findByRole("heading", { name: /Other reports about @spammer42/ })).closest(
+        "section",
+      )!,
+    );
+    await waitFor(() => expect(section.getAllByRole("listitem")).toHaveLength(3));
+    expect(asked?.get("reported_user_id")).toBe("@spammer42:example.org");
+    expect(asked?.get("status")).toBeNull();
+    expect(section.getByText("Resolved: Redacted the content")).toBeInTheDocument();
+    expect(section.getByRole("link", { name: "User @spammer42:example.org" })).toHaveAttribute(
+      "href",
+      "/reports/01J9ZQ0000000000000000R007",
+    );
+    expect(screen.getByRole("link", { name: "Every report they filed" })).toHaveAttribute(
+      "href",
+      "/reports?status=all&reporter_id=%40alice%3Aexample.org",
+    );
+  });
+
+  it("says when a report is the only one about somebody", async () => {
+    open("/reports/01J9ZQ0000000000000000R003");
+    expect(await screen.findByText("This is the only report about them.")).toBeInTheDocument();
+  });
+
+  it("filters the queue by the reported person from the URL, and drops the filter", async () => {
+    const user = userEvent.setup();
+    open("/reports?status=all&reported_user_id=%40alice%3Aexample.org");
+    const rows = (await table()).getAllByRole("row").slice(1);
+    expect(rows).toHaveLength(1);
+    expect(within(rows[0]).getByText("She reported me")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Everybody" }));
+    await waitFor(async () =>
+      expect((await table()).getAllByRole("row").length).toBeGreaterThan(2),
+    );
   });
 
   it("dismisses with no action", async () => {
