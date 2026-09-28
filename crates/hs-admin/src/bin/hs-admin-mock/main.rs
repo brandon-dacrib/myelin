@@ -1426,7 +1426,7 @@ async fn create_registration_token(
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| hs_admin::model::new_id().to_lowercase());
-    let item = json!({"token": token, "uses_allowed": body.get("uses_allowed"), "pending": 0, "completed": 0, "expires_at": body.get("expires_at"), "created_at": hs_http::time::now_rfc3339()});
+    let item = json!({"token": token, "valid": true, "uses_allowed": body.get("uses_allowed"), "pending": 0, "completed": 0, "expires_at": body.get("expires_at"), "created_at": hs_http::time::now_rfc3339()});
     state
         .db
         .write()
@@ -1632,7 +1632,17 @@ async fn send_server_notice(
         Err(r) => return r,
     };
     let recipients = body.get("recipients").cloned().unwrap_or(json!([]));
-    let notice = json!({"event_ids": [format!("$notice{}", hs_admin::model::new_id())], "recipients": recipients, "sent_at": hs_http::time::now_rfc3339()});
+    let count = recipients.as_array().map_or(0, Vec::len);
+    let notice = json!({
+        "id": hs_admin::model::new_id(),
+        "sender": "@_server:example.org",
+        "type": body.get("type").cloned().unwrap_or(json!("m.room.message")),
+        "content": body.get("content").cloned().unwrap_or(json!({})),
+        "event_ids": (0..count).map(|_| format!("$notice{}", hs_admin::model::new_id())).collect::<Vec<_>>(),
+        "room_ids": (0..count).map(|i| format!("!notices{i}:example.org")).collect::<Vec<_>>(),
+        "recipients": recipients,
+        "sent_at": hs_http::time::now_rfc3339(),
+    });
     state
         .db
         .write()
@@ -1644,7 +1654,7 @@ async fn send_server_notice(
         &state,
         "server_notices.send",
         &actor,
-        ResourceRef::new("server_notice", notice["event_ids"][0].as_str().unwrap()),
+        ResourceRef::new("server_notice", notice["id"].as_str().unwrap()),
         notice.clone(),
     )
     .await;

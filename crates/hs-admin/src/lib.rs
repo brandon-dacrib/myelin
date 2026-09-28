@@ -17,6 +17,8 @@
 //! - [`config_schema`]: which configuration settings are secrets, derived from the configuration
 //!   type's own JSON Schema, and the redaction the `/config*` handlers apply because of it.
 //! - [`assets`]: serves the management interface's built assets at `/admin/`.
+//! - [`registration_tokens`]: the `registration_tokens.*` operations and the source they use.
+//! - [`server_notices`]: the `server_notices.*` operations and the source they use.
 //! - [`openapi`]: the embedded OpenAPI document.
 //!
 //! The `hs-admin-mock` binary (`src/bin/hs-admin-mock.rs`) is a separate, self-contained fixture
@@ -34,5 +36,7 @@ pub mod idempotency;
 pub mod model;
 pub mod openapi;
 pub mod operations;
+pub mod registration_tokens;
 pub mod router;
+pub mod server_notices;
 pub mod sources;

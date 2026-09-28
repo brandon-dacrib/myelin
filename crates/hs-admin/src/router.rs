@@ -93,6 +93,12 @@ pub struct AdminState {
     /// What the `bridge_deployments.*`, `bridge_offerings.*` and `bridge_instances.*` operations
     /// read and write (RFC 0017). `None` until wired with [`AdminState::with_bridge_offerings`].
     pub bridge_offerings: Option<Arc<dyn crate::bridge_offerings::BridgeOfferingSource>>,
+    /// What the `registration_tokens.*` operations read and write: the tokens client-server
+    /// registration accepts. `None` until wired with [`AdminState::with_registration_tokens`].
+    pub registration_tokens: Option<Arc<dyn crate::registration_tokens::RegistrationTokenSource>>,
+    /// What the `server_notices.*` operations send through and list. `None` until wired with
+    /// [`AdminState::with_server_notices`].
+    pub server_notices: Option<Arc<dyn crate::server_notices::ServerNoticeSource>>,
     /// The `Idempotency-Key` cache every mutating handler that declares it consults (see
     /// [`crate::idempotency`]). Always present (never `None`): a client is never told its
     /// idempotency key was ignored.
@@ -121,6 +127,8 @@ impl AdminState {
             appservices: None,
             federation: None,
             bridge_offerings: None,
+            registration_tokens: None,
+            server_notices: None,
             idempotency: Arc::new(IdempotencyStore::new()),
         }
     }
@@ -167,6 +175,26 @@ impl AdminState {
         self
     }
 
+    /// Wires the registration tokens, making the `registration_tokens.*` operations real.
+    #[must_use]
+    pub fn with_registration_tokens(
+        mut self,
+        tokens: Arc<dyn crate::registration_tokens::RegistrationTokenSource>,
+    ) -> Self {
+        self.registration_tokens = Some(tokens);
+        self
+    }
+
+    /// Wires server notices, making the `server_notices.*` operations real.
+    #[must_use]
+    pub fn with_server_notices(
+        mut self,
+        notices: Arc<dyn crate::server_notices::ServerNoticeSource>,
+    ) -> Self {
+        self.server_notices = Some(notices);
+        self
+    }
+
     /// Wires a real [`FederationSource`], making the `federation.destinations.*` operations
     /// serve the outbound sender's records instead of answering `503 unavailable`.
     #[must_use]
@@ -207,7 +235,7 @@ impl AdminState {
     }
 }
 
-fn authorization_header(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn authorization_header(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -309,12 +337,19 @@ const REAL_HANDLERS: &[&str] = &[
     "audit_log.get",
     "audit_log.export",
     "events.stream",
+    "registration_tokens.list",
+    "registration_tokens.get",
+    "registration_tokens.create",
+    "registration_tokens.update",
+    "registration_tokens.delete",
+    "server_notices.list",
+    "server_notices.send",
 ];
 
 /// The `503 unavailable` problem a handler answers when its backing [`crate::sources`] trait
 /// object hasn't been wired onto [`AdminState`] yet — never a silent `501` (which would say "this
 /// handler doesn't exist yet", which is false) and never a fake `200`.
-fn source_unavailable(source_name: &str, path: &str) -> Response {
+pub(crate) fn source_unavailable(source_name: &str, path: &str) -> Response {
     hs_http::Problem::unavailable()
         .with_detail(format!(
             "the {source_name} data source is not wired into this server"
@@ -791,7 +826,7 @@ impl ToggleField {
 // mean unwrapping a `Box<Problem>` at every one of this function's call sites for no real benefit
 // here (it is returned once per request, not in a hot loop).
 #[allow(clippy::result_large_err)]
-fn parse_optional_json<T: serde::de::DeserializeOwned + Default>(
+pub(crate) fn parse_optional_json<T: serde::de::DeserializeOwned + Default>(
     body: &[u8],
 ) -> Result<T, Problem> {
     if body.is_empty() {
@@ -802,13 +837,13 @@ fn parse_optional_json<T: serde::de::DeserializeOwned + Default>(
 }
 
 /// The `idempotency-key` header, if the client sent one.
-fn idempotency_key(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn idempotency_key(headers: &HeaderMap) -> Option<&str> {
     headers.get("idempotency-key").and_then(|v| v.to_str().ok())
 }
 
 /// Rebuilds an axum [`Response`] from a [`StoredResponse`], marking it as a replay so a client
 /// (or a test) can tell the mutation did not run again.
-fn replay_response(stored: StoredResponse) -> Response {
+pub(crate) fn replay_response(stored: StoredResponse) -> Response {
     axum::http::Response::builder()
         .status(stored.status)
         .header(axum::http::header::CONTENT_TYPE, stored.content_type)
@@ -824,7 +859,7 @@ fn replay_response(stored: StoredResponse) -> Response {
 // See the identical justification on `parse_optional_json` above: `Response` is returned once
 // per request here, not on a hot path, so boxing it would only add noise at every call site.
 #[allow(clippy::result_large_err)]
-async fn record_mutation(
+pub(crate) async fn record_mutation(
     state: &AdminState,
     principal: &Principal,
     action: &str,
@@ -4588,6 +4623,23 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         "audit_log.get" => builder.add(method, &full_path, audit_log_get, meta),
         "audit_log.export" => builder.add(method, &full_path, audit_log_export, meta),
         "events.stream" => builder.add(method, &full_path, events_stream, meta),
+        "registration_tokens.list" => {
+            builder.add(method, &full_path, crate::registration_tokens::list, meta)
+        }
+        "registration_tokens.get" => {
+            builder.add(method, &full_path, crate::registration_tokens::get, meta)
+        }
+        "registration_tokens.create" => {
+            builder.add(method, &full_path, crate::registration_tokens::create, meta)
+        }
+        "registration_tokens.update" => {
+            builder.add(method, &full_path, crate::registration_tokens::update, meta)
+        }
+        "registration_tokens.delete" => {
+            builder.add(method, &full_path, crate::registration_tokens::delete, meta)
+        }
+        "server_notices.list" => builder.add(method, &full_path, crate::server_notices::list, meta),
+        "server_notices.send" => builder.add(method, &full_path, crate::server_notices::send, meta),
         other => unreachable!(
             "{other} is listed in REAL_HANDLERS but register_real_operation doesn't know it"
         ),
@@ -4697,12 +4749,12 @@ mod tests {
 
     #[tokio::test]
     async fn authorized_request_to_undeclared_handler_is_501() {
-        // Registration tokens are not in REAL_HANDLERS, and exercise the generic seam.
+        // Reports are not in REAL_HANDLERS, and exercise the generic seam.
         let (router, _manifest) = build_router(test_state());
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/registration-tokens")
+                    .uri("/api/v1/reports")
                     .header("authorization", "Bearer admin-token")
                     .body(Body::empty())
                     .unwrap(),
