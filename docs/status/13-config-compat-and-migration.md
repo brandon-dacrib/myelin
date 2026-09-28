@@ -18,6 +18,14 @@ re-reads -- today `/rate_limits`, `/migration`, the three federation allow/block
 `hot_sections_changed` says which sections a running server has to re-read. This supersedes the
 "reload boundary is section-granular" decision below. See status 15 for the rest.
 
+Found on the way, through the interface against a real server: saving one field of a rate-limit
+bucket (`rate_limits.message.burst_count` alone, which is what the form sends) was refused
+"missing field `per_second`" unless the file spelled the whole bucket out. Each bucket is now
+read through its own `partial_<bucket>` function (`crates/hs-config/src/ratelimit.rs`) that fills
+a left-out field from that bucket's default, so a partial `HS__` override works too. This
+supersedes the "`RateLimitBucket`'s two fields are not individually `serde(default)`-ed" decision
+below.
+
 ## 2026-09-28: the Migration admin area and the online importer (8/8)
 
 Before this there was no importer, only its design (`docs/compat/synapse-importer-mapping.md`).

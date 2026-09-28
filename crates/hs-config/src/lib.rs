@@ -309,14 +309,10 @@ server:
     }
 
     #[test]
-    fn env_override_of_one_rate_limit_bucket_field_needs_the_bucket_already_present() {
-        // RateLimitBucket's two fields (`per_second`, `burst_count`) are not
-        // individually defaulted (see the doc comment on
-        // `ratelimit::RateLimitBucket`), because their defaults vary per
-        // named bucket and a per-field `serde(default = ...)` cannot see
-        // which bucket it is filling in. Overriding just one field of a
-        // bucket via `HS__` therefore requires the base config to already
-        // spell out that bucket in full.
+    fn env_override_of_one_rate_limit_bucket_field_keeps_the_other() {
+        // Each bucket is read through its own `partial_<bucket>` function
+        // (see `ratelimit::RateLimitBucket`), so one field set on its own
+        // keeps the file's value, or that bucket's default, for the other.
         let yaml = "server:\n  server_name: example.org\nrate_limits:\n  login:\n    per_second: 0.17\n    burst_count: 3\n";
         let cfg = Config::from_yaml_with_env(
             yaml,
@@ -329,17 +325,37 @@ server:
         assert_eq!(cfg.rate_limits.login.per_second, 0.5);
         assert_eq!(cfg.rate_limits.login.burst_count, 3);
 
-        // Without the base bucket present, the same override is a parse
-        // error (missing `burst_count`), not a silently-wrong bucket.
-        let err = Config::from_yaml_with_env(
+        // Without the bucket in the file, the other field is `login`'s own
+        // default -- not `message`'s, and not a parse error.
+        let cfg = Config::from_yaml_with_env(
             MINIMAL,
             [(
                 "HS__RATE_LIMITS__LOGIN__PER_SECOND".to_string(),
                 "0.5".to_string(),
             )],
         )
-        .unwrap_err();
-        assert!(matches!(err, ConfigError::Parse(_)));
+        .unwrap();
+        assert_eq!(cfg.rate_limits.login.per_second, 0.5);
+        assert_eq!(
+            cfg.rate_limits.login.burst_count,
+            RateLimitConfig::default().login.burst_count
+        );
+        let cfg = Config::from_yaml(
+            "server:\n  server_name: example.org\nrate_limits:\n  message:\n    burst_count: 4\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.rate_limits.message.burst_count, 4);
+        assert_eq!(
+            cfg.rate_limits.message.per_second,
+            RateLimitConfig::default().message.per_second
+        );
+        // A misspelt field is still refused.
+        assert!(
+            Config::from_yaml(
+                "server:\n  server_name: example.org\nrate_limits:\n  message:\n    burst: 4\n",
+            )
+            .is_err()
+        );
     }
 
     #[test]

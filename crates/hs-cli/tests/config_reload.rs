@@ -219,7 +219,9 @@ async fn lowering_the_send_limit_through_the_admin_api_limits_the_next_message_w
     }
 
     // Asked beforehand, the server says this change needs no restart...
-    let lower = json!({"message": {"per_second": 0.01, "burst_count": 1}});
+    // One field of the bucket, as the interface sends it when one field is edited: the other
+    // keeps `message`'s own default (0.2 per second).
+    let lower = json!({"message": {"burst_count": 1}});
     let report = ops
         .expect(
             Method::POST,
