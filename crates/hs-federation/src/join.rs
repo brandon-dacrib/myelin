@@ -410,10 +410,13 @@ pub async fn make_membership(
         .map_err(|_| JoinError::UnsupportedRoomVersion(room_version_str.clone()))?;
     let rules = hs_model::room_version::rules_for(&room_version)
         .ok_or_else(|| JoinError::UnsupportedRoomVersion(room_version_str.clone()))?;
+    // A room version without knocking is the room refusing knocks, not a version the knocking
+    // server lacks: `403 M_FORBIDDEN`, as the spec's `make_knock` describes a room "configured to
+    // prevent knocks" and as Synapse answers.
     if handshake == Handshake::Knock && !rules.knocking {
-        return Err(JoinError::IncompatibleRoomVersion {
-            room_version: room_version_str,
-        });
+        return Err(JoinError::NotAuthorized(format!(
+            "room version {room_version_str} does not support knocking"
+        )));
     }
 
     let user = UserId::parse(user_id).map_err(|e| JoinError::MalformedUserId(e.to_string()))?;
@@ -1062,6 +1065,31 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, JoinError::NotAuthorized(_)), "{err}");
+
+        // A room version without knocking refuses the knock (`403`), as Synapse does; it is not
+        // a version the knocking server lacks (`400 M_INCOMPATIBLE_ROOM_VERSION`).
+        let mut old = InMemoryRoomSource::new();
+        old.insert_room(
+            "!old:resident.example.org",
+            FakeRoom {
+                room_version: Some("6".to_owned()),
+                ..FakeRoom::default()
+            },
+        );
+        let err = make_membership(
+            &old,
+            "!old:resident.example.org",
+            "@bob:joiner.example.org",
+            &["6".to_owned(), "11".to_owned()],
+            Handshake::Knock,
+            "resident.example.org",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, JoinError::NotAuthorized(msg) if msg.contains("does not support knocking")),
+            "{err}"
+        );
     }
 
     /// A knock the resident accepts is stored and forwarded to the room's other servers, as a

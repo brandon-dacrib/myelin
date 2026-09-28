@@ -27,6 +27,20 @@ auth rules, `403`.
   join_authorised_via_users_server if not invited`).
 - `hs_room::actor::tests::a_restricted_join_names_the_first_local_member_who_may_invite`.
 
+**4. `make_knock` in a room version without knocking answers `403 M_FORBIDDEN`** (was `400
+M_INCOMPATIBLE_ROOM_VERSION`). Done. `hs_federation::join::make_membership` returns
+`JoinError::NotAuthorized("room version N does not support knocking")`; the version the knocking
+server supports (`ver`) is still checked first and is still a `400`. Synapse's
+`on_make_knock_request` answers the same, and the spec's `make_knock` `403` is the room refusing
+knocks; the `400` is for a version the knocking server lacks. The knocking server passes the
+`403` on to its client as a `403` (it was a `502`, "could not complete the request").
+
+- `crates/hs-cli/tests/federation_membership.rs::a_knock_on_a_room_version_without_knocking_is_forbidden`:
+  bob on B knocks on alice's version 6 room on A: `403 M_FORBIDDEN` naming knocking, and A holds
+  no membership for him. Fails with the old error (`502`, `M_INCOMPATIBLE_ROOM_VERSION` inside).
+- `hs_federation::join::tests::make_knock_needs_a_knock_room_in_a_version_with_knocking` gained
+  the version 6 case.
+
 ## Twelfth session (2026-09-28): to-device messages and `m.signing_key_update` over federation
 
 Scope: `docs/next-steps.md` section 3's "to-device over federation; `m.signing_key_update`; EDUs

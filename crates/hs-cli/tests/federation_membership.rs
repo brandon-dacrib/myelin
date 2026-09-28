@@ -974,3 +974,49 @@ async fn a_local_user_joins_a_restricted_room_without_naming_an_authoriser() {
     a.handle.shutdown().await;
     b.handle.shutdown().await;
 }
+
+/// A knock on a room whose version has no knocking (before 7) is the room refusing it: A
+/// answers `make_knock` with `403 M_FORBIDDEN`, as Synapse does, and bob's client on B is
+/// told `403` rather than that the other server could not be reached.
+#[tokio::test]
+async fn a_knock_on_a_room_version_without_knocking_is_forbidden() {
+    let (a, b) = (start().await, start().await);
+    let client = reqwest::Client::new();
+    let alice = register(&client, &a, "alice").await;
+    let bob = register(&client, &b, "bob").await;
+    let old = create_room(
+        &client,
+        &alice,
+        json!({
+            "preset": "private_chat",
+            "room_version": "6",
+            "initial_state": [{
+                "type": "m.room.join_rules",
+                "state_key": "",
+                "content": {"join_rule": "knock"},
+            }],
+        }),
+    )
+    .await;
+
+    let (status, body) = post(
+        &client,
+        &bob,
+        &format!("knock/{old}?server_name={}", a.name),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["errcode"], "M_FORBIDDEN", "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("does not support knocking"),
+        "{body}"
+    );
+    assert_eq!(membership_on(&client, &alice, &old, &bob.id).await, None);
+
+    a.handle.shutdown().await;
+    b.handle.shutdown().await;
+}
