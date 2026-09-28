@@ -17,12 +17,15 @@
 //!   `RoomState`/`RoomRequester`).
 //! - [`error`]: [`error::E2eError`], mapped to `hs-http`'s Matrix error shape.
 //! - [`routes`]: the client-server HTTP endpoints, as a router fragment.
+//! - [`federation`]: keys across servers -- [`federation::RemoteKeys`] for a local client's
+//!   query or claim of a remote user's keys, and the answers to another server's.
 //! - [`appservice_feed`]: functions that turn this crate's storage into the
 //!   `hs_appservice::transaction::Transaction` fields (MSC3202 one-time-key counts, unused
 //!   fallback key types, device-list changes) track 11's scheduler already has fields for.
 
 pub mod appservice_feed;
 pub mod error;
+pub mod federation;
 pub mod routes;
 pub mod state;
 pub mod store;

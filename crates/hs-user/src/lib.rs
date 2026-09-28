@@ -17,8 +17,13 @@
 //!   this user's durable feed.
 //! - [`filter`]: `/sync`'s `filter`/`filter_id` parsing (`crate::filter::SyncFilter`).
 //! - [`typing`]: [`typing::TypingRegistry`], in-memory `m.typing` state.
-//! - [`presence`]: [`presence::PresenceRegistry`], in-memory `m.presence` state.
-//! - [`receipts`]: [`receipts::ReceiptRegistry`], in-memory `m.receipt` state.
+//! - [`presence`]: [`presence::PresenceRegistry`], `m.presence` state, written through to the
+//!   store.
+//! - [`receipts`]: [`receipts::ReceiptRegistry`], `m.receipt` state, written through to the
+//!   store.
+//! - [`edu`]: typing, receipts and presence across servers -- [`edu::EduOutbox`] out,
+//!   [`edu::InboundEdu`] in.
+//! - [`stamp`]: [`stamp::Stamps`], the restart-safe change counter the three share.
 //! - [`cluster`]: [`cluster::SessionCluster`], what `/sync` needs from other replicas (the
 //!   wake and read-your-writes across replicas), and [`cluster::RoomMirror`], the read-only
 //!   snapshot a replica reads a room it does not own through.
@@ -35,6 +40,7 @@
 #![warn(missing_docs)]
 
 pub mod cluster;
+pub mod edu;
 pub mod error;
 pub mod filter;
 pub mod hub;
@@ -42,6 +48,7 @@ pub mod presence;
 pub mod receipts;
 pub mod room_source;
 pub mod routes;
+pub mod stamp;
 pub mod state;
 pub mod store;
 pub mod sync;

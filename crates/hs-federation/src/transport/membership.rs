@@ -407,6 +407,7 @@ mod tests {
             backfill_limits: crate::backfill::BackfillLimits::default(),
             sender: None,
             invites: None,
+            edu_sink: None,
         };
         let key_cache: Arc<DynRemoteKeyCache> = Arc::new(RemoteKeyCache::new(
             Box::new(EmptyFetcher) as Box<dyn KeyServerFetcher>,

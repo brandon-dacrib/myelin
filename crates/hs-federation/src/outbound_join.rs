@@ -747,6 +747,7 @@ mod tests {
             backfill_limits: crate::backfill::BackfillLimits::default(),
             sender: None,
             invites: None,
+            edu_sink: None,
         };
         let ctx = Arc::new(XMatrixContext {
             own_server_name: server_name.clone(),

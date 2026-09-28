@@ -1,10 +1,10 @@
 //! `POST /keys/query`.
 //!
-//! Local users only: a remote `user_id` (`user_id.server_name() != this server`) is silently
-//! skipped rather than reported in `failures`, since this server never attempts to reach it —
-//! federation key query is a documented seam (track 06's federation client exists; inbound
-//! transaction processing and an outbound `/user/keys/query` call do not). See
-//! `docs/status/08-e2ee.md`.
+//! A local user's keys come from this server's store. A remote user's come from their own
+//! server, asked through the installed [`crate::federation::RemoteKeys`] (one request per server,
+//! all at once); a server that cannot be reached is listed in `failures`, as the spec says. With
+//! no `RemoteKeys` installed (federation off) remote users are skipped, as before federation
+//! existed. See [`crate::federation`] for why nothing is cached.
 
 use axum::Json;
 use axum::extract::State;
@@ -34,12 +34,74 @@ pub(crate) async fn build_keys_query_response<B: KvBackend + 'static>(
     requesting_user: &UserId,
     device_keys_req: &Value,
 ) -> Result<Value, E2eError> {
+    let mut local = local_keys_query(state, Some(requesting_user), device_keys_req).await?;
+    let mut failures = Map::new();
+    if let (Some(remote), Some(requested)) = (state.remote_keys(), device_keys_req.as_object()) {
+        let by_server =
+            crate::federation::remote_part(requested, state.auth.server_name().as_str());
+        let asked = by_server.clone();
+        for (server, answer) in
+            crate::federation::ask_servers(remote, crate::federation::Ask::Query, by_server).await
+        {
+            let Some(asked) = asked.get(&server) else {
+                continue;
+            };
+            match answer {
+                Ok(answer) => {
+                    for (field, into) in [
+                        ("device_keys", &mut local.device_keys),
+                        ("master_keys", &mut local.master_keys),
+                        ("self_signing_keys", &mut local.self_signing_keys),
+                    ] {
+                        crate::federation::merge_for_server(into, &answer, field, &server, asked);
+                    }
+                }
+                Err(reason) => {
+                    tracing::info!(server, reason, "could not query a server for device keys");
+                    failures.insert(server, crate::federation::failure(&reason));
+                }
+            }
+        }
+    }
+
+    Ok(json!({
+        "device_keys": local.device_keys,
+        "master_keys": local.master_keys,
+        "self_signing_keys": local.self_signing_keys,
+        "user_signing_keys": local.user_signing_keys,
+        "failures": failures,
+    }))
+}
+
+/// This server's own users' part of a `/keys/query` answer.
+pub(crate) struct LocalKeys {
+    /// `device_keys`, by user.
+    pub(crate) device_keys: Map<String, Value>,
+    /// `master_keys`, by user.
+    pub(crate) master_keys: Map<String, Value>,
+    /// `self_signing_keys`, by user.
+    pub(crate) self_signing_keys: Map<String, Value>,
+    /// `user_signing_keys`: only ever `requesting_user`'s own.
+    pub(crate) user_signing_keys: Map<String, Value>,
+}
+
+/// The keys this server holds for its own users named in `device_keys_req`; users of other
+/// servers are skipped. `requesting_user` is who may see their own user-signing key (`None`: a
+/// remote server asking, which sees nobody's).
+///
+/// # Errors
+/// Returns [`E2eError::BadRequest`] if `device_keys_req` is not a JSON object or names a user's
+/// devices as anything but a list, or a storage error.
+pub(crate) async fn local_keys_query<B: KvBackend + 'static>(
+    state: &E2eState<B>,
+    requesting_user: Option<&UserId>,
+    device_keys_req: &Value,
+) -> Result<LocalKeys, E2eError> {
     let server_name = state.auth.server_name();
     let mut device_keys_out = Map::new();
     let mut master_keys = Map::new();
     let mut self_signing_keys = Map::new();
     let mut user_signing_keys = Map::new();
-    let failures = Map::new();
 
     let Some(requested) = device_keys_req.as_object() else {
         return Err(E2eError::BadRequest(
@@ -112,7 +174,7 @@ pub(crate) async fn build_keys_query_response<B: KvBackend + 'static>(
         {
             self_signing_keys.insert(user_id.to_string(), key);
         }
-        if user_id.as_str() == requesting_user.as_str()
+        if requesting_user.is_some_and(|r| r.as_str() == user_id.as_str())
             && let Some(key) = state
                 .store
                 .get_cross_signing_key(user_id, CrossSigningKeyType::UserSigning)
@@ -122,13 +184,12 @@ pub(crate) async fn build_keys_query_response<B: KvBackend + 'static>(
         }
     }
 
-    Ok(json!({
-        "device_keys": device_keys_out,
-        "master_keys": master_keys,
-        "self_signing_keys": self_signing_keys,
-        "user_signing_keys": user_signing_keys,
-        "failures": failures,
-    }))
+    Ok(LocalKeys {
+        device_keys: device_keys_out,
+        master_keys,
+        self_signing_keys,
+        user_signing_keys,
+    })
 }
 
 /// `POST /keys/query`.

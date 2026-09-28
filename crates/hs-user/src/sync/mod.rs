@@ -1204,6 +1204,7 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             let mut content = json!({
                 "presence": record.presence,
                 "last_active_ago": record.last_active_ago_ms(),
+                "currently_active": record.currently_active(),
             });
             if let Some(msg) = &record.status_msg {
                 content["status_msg"] = Value::String(msg.clone());
@@ -4289,6 +4290,254 @@ mod tests {
                 .get(invited_id.as_str())
                 .is_some(),
             "{response}"
+        );
+    }
+
+    // ---- typing, receipts and presence across servers and restarts (`crate::edu`) ----
+
+    /// Records what the hub hands its EDU outbox.
+    #[derive(Default)]
+    struct RecordingOutbox(std::sync::Mutex<Vec<(BTreeSet<String>, String, Value)>>);
+
+    impl crate::edu::EduOutbox for RecordingOutbox {
+        fn send_edu(
+            &self,
+            destinations: BTreeSet<String>,
+            edu_type: &str,
+            content: Value,
+            _coalesce_key: Option<String>,
+        ) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((destinations, edu_type.to_owned(), content));
+        }
+    }
+
+    /// A room alice created with bob joined, watched by `hub`.
+    async fn room_with_alice_and_bob(
+        hub: &Arc<TestHub>,
+        alice: &OwnedUserId,
+        bob: &OwnedUserId,
+    ) -> OwnedRoomId {
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+        handle
+            .membership(
+                bob.clone(),
+                Action::Join,
+                bob.clone(),
+                serde_json::json!({}),
+                2,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        handle.query(|a| a.room_id().to_owned()).await
+    }
+
+    /// Outbound: every change a local user makes is handed to the outbox addressed to the
+    /// servers of the people who should see it, in the spec's EDU shapes -- and a private receipt
+    /// is not handed over at all.
+    #[tokio::test]
+    async fn a_local_users_typing_receipt_and_presence_are_handed_to_the_outbox() {
+        let hub = hub();
+        let outbox = Arc::new(RecordingOutbox::default());
+        hub.install_edu_outbox(outbox.clone());
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let room_id = room_with_alice_and_bob(&hub, &alice, &bob).await;
+
+        hub.set_typing(&room_id, &alice, true, Duration::from_millis(100))
+            .await
+            .unwrap();
+        hub.set_receipt(
+            &room_id,
+            &alice,
+            crate::receipts::ReceiptKind::Read,
+            ruma::event_id!("$read").to_owned(),
+            5,
+        )
+        .await
+        .unwrap();
+        hub.set_receipt(
+            &room_id,
+            &alice,
+            crate::receipts::ReceiptKind::ReadPrivate,
+            ruma::event_id!("$private").to_owned(),
+            6,
+        )
+        .await
+        .unwrap();
+        hub.set_presence(&alice, "unavailable".to_owned(), Some("away".to_owned()))
+            .await
+            .unwrap();
+        // The typing lapses after 100ms; the other servers are told.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let sent = outbox.0.lock().unwrap().clone();
+        let here: BTreeSet<String> = ["sync.test".to_owned()].into();
+        let kinds: Vec<(&str, &Value)> = sent.iter().map(|(_, t, c)| (t.as_str(), c)).collect();
+        assert!(sent.iter().all(|(d, _, _)| *d == here), "{sent:?}");
+        assert_eq!(
+            kinds,
+            vec![
+                (
+                    "m.typing",
+                    &json!({"room_id": room_id, "user_id": alice, "typing": true})
+                ),
+                (
+                    "m.receipt",
+                    &json!({room_id.as_str(): {"m.read": {alice.as_str(): {
+                        "event_ids": ["$read"], "data": {"ts": 5}}}}})
+                ),
+                ("m.presence", &sent[2].2),
+                (
+                    "m.typing",
+                    &json!({"room_id": room_id, "user_id": alice, "typing": false})
+                ),
+            ]
+        );
+        assert_eq!(sent[2].2["push"][0]["presence"], "unavailable");
+        assert_eq!(sent[2].2["push"][0]["status_msg"], "away");
+        assert_eq!(sent[2].2["push"][0]["user_id"], alice.as_str());
+    }
+
+    /// Inbound: an EDU from a user's own server reaches the `/sync` of the people in the room;
+    /// one about a user of another server, or about somebody not in the room, does not.
+    #[tokio::test]
+    async fn an_edu_reaches_sync_only_from_its_users_own_server_and_only_for_members() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let room_id = room_with_alice_and_bob(&hub, &alice, &bob).await;
+        let (_, token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+
+        let typing = json!({"room_id": room_id, "user_id": bob, "typing": true});
+        assert_eq!(
+            hub.receive_edu("elsewhere.test", "m.typing", &typing).await,
+            0
+        );
+        let stranger = json!({"room_id": room_id, "user_id": "@carol:sync.test", "typing": true});
+        assert_eq!(hub.receive_edu("sync.test", "m.typing", &stranger).await, 0);
+        assert_eq!(hub.receive_edu("sync.test", "m.typing", &typing).await, 1);
+        let receipt = json!({room_id.as_str(): {"m.read": {bob.as_str(): {
+            "event_ids": ["$seen"], "data": {"ts": 9}}}}});
+        assert_eq!(hub.receive_edu("sync.test", "m.receipt", &receipt).await, 1);
+        let presence = json!({"push": [{"user_id": bob, "presence": "online",
+            "last_active_ago": 10, "currently_active": true}]});
+        assert_eq!(
+            hub.receive_edu("sync.test", "m.presence", &presence).await,
+            1
+        );
+
+        let (response, _) = build(&hub, &e2e, &alice, params(Some(token)))
+            .await
+            .unwrap();
+        let ephemeral = response["rooms"]["join"][room_id.as_str()]["ephemeral"]["events"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            ephemeral
+                .iter()
+                .any(|e| e["type"] == "m.typing" && e["content"]["user_ids"] == json!([bob])),
+            "{ephemeral:?}"
+        );
+        assert!(
+            ephemeral.iter().any(|e| e["type"] == "m.receipt"
+                && e["content"]["$seen"]["m.read"][bob.as_str()]["ts"] == 9),
+            "{ephemeral:?}"
+        );
+        let presence_events = response["presence"]["events"].as_array().unwrap();
+        assert!(
+            presence_events
+                .iter()
+                .any(|e| e["sender"] == bob.as_str() && e["content"]["currently_active"] == true),
+            "{presence_events:?}"
+        );
+    }
+
+    /// Durable: a hub built again over the same store -- what a restarted `hs serve` does --
+    /// gives a fresh initial sync the receipts and presence the first one recorded, and does not
+    /// hand them again to a client whose token already had them.
+    #[tokio::test]
+    async fn receipts_and_presence_are_in_sync_after_a_new_hub_over_the_same_store() {
+        let rooms = registry("sync.test");
+        let backend = MemoryBackend::new();
+        let open = || -> DynUserStore { Arc::new(TablesUserStore::open(backend.clone()).unwrap()) };
+        let first: Arc<TestHub> = Arc::new(SessionHub::new(open(), rooms.clone(), 500));
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let room_id = room_with_alice_and_bob(&first, &alice, &bob).await;
+        first
+            .set_receipt(
+                &room_id,
+                &bob,
+                crate::receipts::ReceiptKind::Read,
+                ruma::event_id!("$last").to_owned(),
+                42,
+            )
+            .await
+            .unwrap();
+        first
+            .set_presence(&bob, "unavailable".to_owned(), Some("back soon".to_owned()))
+            .await
+            .unwrap();
+        let (_, caught_up) = build(&first, &e2e, &alice, params(None)).await.unwrap();
+        drop(first);
+
+        let second: Arc<TestHub> = Arc::new(SessionHub::new(open(), rooms, 500));
+        let (response, _) = build(&second, &e2e, &alice, params(None)).await.unwrap();
+        let ephemeral = &response["rooms"]["join"][room_id.as_str()]["ephemeral"]["events"];
+        assert!(
+            ephemeral
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["type"] == "m.receipt"
+                    && e["content"]["$last"]["m.read"][bob.as_str()]["ts"] == 42),
+            "the receipt survived: {ephemeral}"
+        );
+        assert!(
+            response["presence"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["sender"] == bob.as_str()
+                    && e["content"]["presence"] == "unavailable"
+                    && e["content"]["status_msg"] == "back soon"),
+            "the presence survived: {}",
+            response["presence"]
+        );
+
+        let (again, _) = build(&second, &e2e, &alice, params(Some(caught_up)))
+            .await
+            .unwrap();
+        assert!(
+            again["rooms"]["join"][room_id.as_str()]["ephemeral"]["events"]
+                .as_array()
+                .is_none_or(|events| events.iter().all(|e| e["type"] != "m.receipt")),
+            "a receipt the client already had is not news after the restart: {again}"
+        );
+        assert!(
+            again["presence"]["events"]
+                .as_array()
+                .is_none_or(|events| events.iter().all(|e| e["sender"] != bob.as_str())),
+            "nor is a presence it already had: {again}"
         );
     }
 }

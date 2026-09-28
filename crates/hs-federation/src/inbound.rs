@@ -333,9 +333,9 @@ impl TransactionStore for InMemoryTransactionStore {
 /// its history" into "an event arrived, and now so did its history" whenever the gap is small
 /// enough and the peer cooperative enough to close within `backfill_limits`.
 ///
-/// EDUs are parsed for structural validity ([`crate::edu::parse_edu`]) and otherwise ignored: no
-/// EDU handler (presence, typing, receipts, device lists, to-device, signing-key updates) exists
-/// yet.
+/// EDUs are parsed for structural validity ([`crate::edu::parse_edu`]) and each valid one is
+/// handed to `edu_sink` after the PDUs, in order (`None`: they are dropped, as before any sink
+/// existed). A malformed EDU is logged and skipped; it never fails the transaction.
 ///
 /// # Errors
 /// Returns [`TransactionError::TooManyPdus`]/[`TransactionError::TooManyEdus`] if the transaction
@@ -352,6 +352,7 @@ pub async fn process_transaction(
     transactions: &dyn TransactionStore,
     ancestor_fetcher: Option<&dyn crate::backfill::AncestorFetcher>,
     backfill_limits: &crate::backfill::BackfillLimits,
+    edu_sink: Option<&dyn crate::edu::InboundEduSink>,
 ) -> Result<Value, TransactionError> {
     if let Some(cached) = transactions.get(origin, txn_id).await {
         return Ok(cached);
@@ -472,8 +473,16 @@ pub async fn process_transaction(
     }
 
     for edu in &edus {
-        // Structural validation only -- see the module and function docs.
-        let _ = crate::edu::parse_edu(edu);
+        match crate::edu::parse_edu(edu) {
+            Ok(edu) => {
+                if let Some(sink) = edu_sink {
+                    sink.receive_edu(origin, edu).await;
+                }
+            }
+            Err(error) => {
+                tracing::debug!(origin, %error, "dropping a malformed EDU");
+            }
+        }
     }
 
     let response = serde_json::json!({ "pdus": Value::Object(results) });
@@ -682,6 +691,7 @@ mod tests {
             &store,
             None,
             &crate::backfill::BackfillLimits::default(),
+            None,
         )
         .await
         .unwrap_err();
@@ -711,6 +721,7 @@ mod tests {
             &store,
             None,
             &crate::backfill::BackfillLimits::default(),
+            None,
         )
         .await
         .unwrap();
@@ -742,6 +753,7 @@ mod tests {
             &store,
             None,
             &crate::backfill::BackfillLimits::default(),
+            None,
         )
         .await
         .unwrap();
@@ -793,6 +805,7 @@ mod tests {
             &store,
             None,
             &crate::backfill::BackfillLimits::default(),
+            None,
         )
         .await
         .unwrap();
@@ -806,9 +819,67 @@ mod tests {
             &store,
             None,
             &crate::backfill::BackfillLimits::default(),
+            None,
         )
         .await
         .unwrap();
         assert_eq!(first, second);
+    }
+
+    /// Every well-formed EDU reaches the sink with the transaction's origin, after the PDUs; a
+    /// malformed one is skipped without failing the transaction; a replayed transaction does
+    /// not deliver them again.
+    #[tokio::test]
+    async fn edus_are_handed_to_the_sink_with_their_origin_once() {
+        #[derive(Default)]
+        struct Recording(Mutex<Vec<(String, crate::edu::Edu)>>);
+        #[async_trait]
+        impl crate::edu::InboundEduSink for Recording {
+            async fn receive_edu(&self, origin: &str, edu: crate::edu::Edu) {
+                self.0.lock().unwrap().push((origin.to_owned(), edu));
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let keys = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
+        let cache = key_cache(&keys, "origin.example.org");
+        let rooms = room_source("!r:origin.example.org");
+        let sink = StaticWriteSink::new(Vec::new(), "not supported");
+        let store = InMemoryTransactionStore::new();
+        let edus = Recording::default();
+        let body = serde_json::json!({"pdus": [], "edus": [
+            {"edu_type": "m.typing", "content": {"room_id": "!r:origin.example.org",
+                "user_id": "@alice:origin.example.org", "typing": true}},
+            "not an edu",
+            {"edu_type": "m.presence", "content": {"push": []}},
+        ]});
+        for _ in 0..2 {
+            process_transaction(
+                "origin.example.org",
+                "txn-edus",
+                &body,
+                &rooms,
+                &sink,
+                &cache,
+                &store,
+                None,
+                &crate::backfill::BackfillLimits::default(),
+                Some(&edus),
+            )
+            .await
+            .unwrap();
+        }
+        let received = edus.0.lock().unwrap().clone();
+        let types: Vec<(&str, &str)> = received
+            .iter()
+            .map(|(origin, edu)| (origin.as_str(), edu.edu_type.as_str()))
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                ("origin.example.org", "m.typing"),
+                ("origin.example.org", "m.presence"),
+            ]
+        );
     }
 }

@@ -1,21 +1,27 @@
-//! [`ReceiptRegistry`]: in-memory `m.read`/`m.read.private` read-receipt state, keyed by room.
+//! [`ReceiptRegistry`]: `m.read`/`m.read.private` read-receipt state, keyed by room, held in
+//! memory and written through to the store.
 //!
-//! Mirrors `crate::typing::TypingRegistry`'s shape and reasoning exactly, per this track's own
-//! status file (`docs/status/05-sync.md`, "the typing and presence pattern applies directly"): a
-//! global monotonic counter stamped onto whichever room's receipts changed, exposed to
-//! `crate::sync` through [`crate::token::SyncToken::receipts_seq`] (a field the token format has
-//! reserved since session 1, before this module existed).
+//! Mirrors `crate::typing::TypingRegistry`'s shape: a change counter (`crate::stamp`) stamped
+//! onto whichever room's receipts changed, exposed to `crate::sync` through
+//! [`crate::token::SyncToken::receipts_seq`].
 //!
-//! # Not persisted -- a deliberate, documented cut, same as presence
+//! # Durable across a restart
 //!
-//! Real read receipts are more durable in spirit than a typing indicator -- a user does not want
-//! "what have I read" to reset -- but this crate's `crate::presence::PresenceRegistry` already
-//! made the identical call for presence (in-memory, lost on restart, forever until reset) for the
-//! same reason: `crate::store::UserStore` is this crate's durable path, and folding receipts into
-//! it now would mean a schema/table addition this session was not scoped for. A restart loses
-//! read state exactly as it loses typing and presence; nothing about that regresses any test this
-//! crate runs today. Moving this into `store` later is a mechanical follow-up, not a redesign --
-//! see `docs/status/05-sync.md`'s "What's next".
+//! Read state is not ephemeral in the way typing is: a user does not expect "what have I read"
+//! to reset because the server restarted. Every receipt is written through to
+//! `crate::store::UserStore::put_receipt` together with its stamp, and a room's receipts are
+//! loaded from the store the first time this process is asked about that room. Stamps are
+//! restart-safe (`crate::stamp`'s module docs), so a receipt a client already saw before the
+//! restart is not news to it afterwards, and one set after the restart is.
+//!
+//! A store write that fails is logged and the receipt is kept in memory: the receipt still
+//! reaches every `/sync` this process answers, and only a restart would forget it.
+//!
+//! # Receipts from other servers
+//!
+//! A remote user's receipt (an `m.receipt` EDU, dispatched by `hs-cli`) goes through
+//! [`ReceiptRegistry::set`] exactly as a local one does; the registry does not care whose
+//! receipt it is.
 //!
 //! # `m.fully_read` is not handled here
 //!
@@ -35,11 +41,13 @@
 //! read receipt, matching Synapse's own behavior.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
+use ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
+
+use crate::stamp::Stamps;
+use crate::store::{DynUserStore, StoredReceipt};
 
 /// The receipt types `POST /rooms/{roomId}/receipt/{receiptType}/{eventId}` and
 /// `POST /rooms/{roomId}/read_markers` accept. `m.fully_read` is deliberately absent -- see the
@@ -90,25 +98,89 @@ struct RoomReceipts {
     seq: u64,
 }
 
-/// In-memory `m.receipt` state for every room this process has ever seen a receipt for. See the
-/// module docs.
+/// `m.receipt` state for every room this process has been asked about, loaded from and written
+/// through to the store when it has one. See the module docs.
 pub struct ReceiptRegistry {
+    /// A room present here has been loaded from the store (or had nothing there); one absent
+    /// has not been looked at yet.
     rooms: Mutex<HashMap<OwnedRoomId, RoomReceipts>>,
-    counter: AtomicU64,
+    counter: Stamps,
+    store: Option<DynUserStore>,
 }
 
 impl ReceiptRegistry {
-    /// An empty registry.
+    /// An empty registry that keeps nothing beyond this process.
     #[must_use]
     pub fn new() -> Self {
         Self {
             rooms: Mutex::new(HashMap::new()),
-            counter: AtomicU64::new(0),
+            counter: Stamps::new(),
+            store: None,
         }
     }
 
-    fn next_seq(&self) -> u64 {
-        self.counter.fetch_add(1, Ordering::SeqCst) + 1
+    /// A registry over `store`: receipts are written through to it and read back from it the
+    /// first time a room is asked about. What [`crate::hub::SessionHub`] uses.
+    #[must_use]
+    pub fn with_store(store: DynUserStore) -> Self {
+        Self {
+            store: Some(store),
+            ..Self::new()
+        }
+    }
+
+    /// Makes sure `room_id`'s receipts are in `rooms`, reading them from the store if this is
+    /// the first time the room is asked about. A store that cannot be read is logged, and the
+    /// room starts empty here (so the failure is not retried on every sync).
+    async fn load<'a>(
+        &self,
+        rooms: &'a mut HashMap<OwnedRoomId, RoomReceipts>,
+        room_id: &RoomId,
+    ) -> &'a mut RoomReceipts {
+        if !rooms.contains_key(room_id) {
+            let mut loaded = RoomReceipts {
+                by_user: HashMap::new(),
+                seq: 0,
+            };
+            if let Some(store) = &self.store {
+                match store.list_room_receipts(room_id).await {
+                    Ok(rows) => {
+                        for row in rows {
+                            let (Some(kind), Ok(user), Ok(event_id)) = (
+                                ReceiptKind::parse(&row.kind),
+                                UserId::parse(row.user_id.as_str()),
+                                EventId::parse(row.event_id.as_str()),
+                            ) else {
+                                continue;
+                            };
+                            self.counter.observe(row.seq);
+                            loaded.seq = loaded.seq.max(row.seq);
+                            loaded.by_user.insert(
+                                (user, kind),
+                                ReceiptEntry {
+                                    event_id,
+                                    ts: row.ts,
+                                },
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %room_id,
+                            %error,
+                            "could not read a room's stored receipts; starting from none"
+                        );
+                    }
+                }
+            }
+            rooms.insert(room_id.to_owned(), loaded);
+        }
+        rooms
+            .entry(room_id.to_owned())
+            .or_insert_with(|| RoomReceipts {
+                by_user: HashMap::new(),
+                seq: 0,
+            })
     }
 
     /// Records `user_id`'s `kind` receipt for `event_id` in `room_id`, bumping this room's
@@ -124,23 +196,42 @@ impl ReceiptRegistry {
         ts: u64,
     ) -> u64 {
         let mut rooms = self.rooms.lock().await;
-        let entry = rooms
-            .entry(room_id.to_owned())
-            .or_insert_with(|| RoomReceipts {
-                by_user: HashMap::new(),
-                seq: 0,
-            });
-        entry
-            .by_user
-            .insert((user_id.to_owned(), kind), ReceiptEntry { event_id, ts });
-        entry.seq = self.next_seq();
-        entry.seq
+        let entry = self.load(&mut rooms, room_id).await;
+        let seq = self.counter.next();
+        entry.by_user.insert(
+            (user_id.to_owned(), kind),
+            ReceiptEntry {
+                event_id: event_id.clone(),
+                ts,
+            },
+        );
+        entry.seq = seq;
+        drop(rooms);
+        if let Some(store) = &self.store {
+            let row = StoredReceipt {
+                user_id: user_id.to_string(),
+                kind: kind.as_str().to_owned(),
+                event_id: event_id.to_string(),
+                ts,
+                seq,
+            };
+            if let Err(error) = store.put_receipt(room_id, &row).await {
+                tracing::warn!(
+                    %room_id,
+                    %user_id,
+                    %error,
+                    "could not store a receipt; it is kept in memory until the next restart"
+                );
+            }
+        }
+        seq
     }
 
-    /// This room's current cursor (`0` if this process has never recorded a receipt here, which
-    /// is always `<=` any client's baseline -- see `crate::typing`'s identical convention).
+    /// This room's current cursor (`0` if this room has never had a receipt, which is always
+    /// `<=` any client's baseline -- see `crate::typing`'s identical convention).
     pub async fn seq(&self, room_id: &RoomId) -> u64 {
-        self.rooms.lock().await.get(room_id).map_or(0, |r| r.seq)
+        let mut rooms = self.rooms.lock().await;
+        self.load(&mut rooms, room_id).await.seq
     }
 
     /// Builds the `m.receipt` event content for `room_id` as `viewer` would see it: every
@@ -149,10 +240,8 @@ impl ReceiptRegistry {
     /// Returns the empty object (not `null`) and the room's current cursor when there is nothing
     /// to report or the room has never had a receipt.
     pub async fn content_for(&self, room_id: &RoomId, viewer: &UserId) -> (Value, u64) {
-        let rooms = self.rooms.lock().await;
-        let Some(entry) = rooms.get(room_id) else {
-            return (Value::Object(Map::new()), 0);
-        };
+        let mut rooms = self.rooms.lock().await;
+        let entry = self.load(&mut rooms, room_id).await;
         let mut by_event: HashMap<String, HashMap<&'static str, Map<String, Value>>> =
             HashMap::new();
         for ((user, kind), receipt) in &entry.by_user {
@@ -291,5 +380,68 @@ mod tests {
         );
         assert_eq!(ReceiptKind::parse("m.fully_read"), None);
         assert_eq!(ReceiptKind::parse("bogus"), None);
+    }
+
+    fn store_over(backend: &hs_kv::memory::MemoryBackend) -> DynUserStore {
+        std::sync::Arc::new(crate::store::tables::TablesUserStore::open(backend.clone()).unwrap())
+    }
+
+    /// The restart property: a second registry over the same store (a new process) reports the
+    /// receipts the first one recorded, with the same cursor, and a receipt set afterwards is
+    /// newer than every one of them.
+    #[tokio::test]
+    async fn receipts_outlive_the_registry_that_recorded_them() {
+        let backend = hs_kv::memory::MemoryBackend::new();
+        let room = room_id!("!r:example.org");
+        let before = ReceiptRegistry::with_store(store_over(&backend));
+        before
+            .set(
+                room,
+                user_id!("@alice:example.org"),
+                ReceiptKind::Read,
+                event_id!("$one").to_owned(),
+                11,
+            )
+            .await;
+        let old_seq = before
+            .set(
+                room,
+                user_id!("@alice:example.org"),
+                ReceiptKind::ReadPrivate,
+                event_id!("$two").to_owned(),
+                12,
+            )
+            .await;
+        drop(before);
+
+        let after = ReceiptRegistry::with_store(store_over(&backend));
+        let (content, seq) = after
+            .content_for(room, user_id!("@alice:example.org"))
+            .await;
+        assert_eq!(
+            content,
+            json!({
+                "$one": {"m.read": {"@alice:example.org": {"ts": 11}}},
+                "$two": {"m.read.private": {"@alice:example.org": {"ts": 12}}},
+            })
+        );
+        assert_eq!(seq, old_seq, "a restored room keeps the cursor it had");
+        let (for_bob, _) = after.content_for(room, user_id!("@bob:example.org")).await;
+        assert_eq!(
+            for_bob,
+            json!({"$one": {"m.read": {"@alice:example.org": {"ts": 11}}}}),
+            "a restored private receipt is still private"
+        );
+
+        let new_seq = after
+            .set(
+                room,
+                user_id!("@bob:example.org"),
+                ReceiptKind::Read,
+                event_id!("$two").to_owned(),
+                13,
+            )
+            .await;
+        assert!(new_seq > old_seq);
     }
 }

@@ -88,6 +88,7 @@ impl Harness {
             backfill_limits: hs_federation::backfill::BackfillLimits::default(),
             sender: None,
             invites: None,
+            edu_sink: None,
         };
 
         let remote_key = SigningKeyPair::generate("a_remote");

@@ -1,11 +1,10 @@
-//! [`PresenceRegistry`]: in-memory `m.presence` state, keyed by user.
+//! [`PresenceRegistry`]: `m.presence` state, keyed by user, held in memory and written through
+//! to the store.
 //!
-//! Deferred in this crate's first pass (`crate::sync`'s module docs used to say "the top-level
-//! `presence.events` is always `[]`" -- this module and `crate::routes::presence` are what
-//! replaces that). Presence shares typing's shape almost exactly (`crate::typing`'s module docs
-//! explain the general pattern this mirrors: a global counter stamped onto each user's record,
-//! compared against a cursor carried in [`crate::token::SyncToken`] -- here `presence_seq`, a
-//! field this token already reserved before either module existed), with two differences:
+//! Presence shares typing's shape almost exactly (`crate::typing`'s module docs explain the
+//! general pattern this mirrors: a change counter stamped onto each user's record, compared
+//! against a cursor carried in [`crate::token::SyncToken`] -- here `presence_seq`), with these
+//! differences:
 //!
 //! - Presence is keyed by the user *whose* presence it is, not by room -- a presence update wakes
 //!   every user who currently shares a joined room with that user (`crate::hub::SessionHub::set_presence`),
@@ -14,77 +13,209 @@
 //!   until they set it again (or, per the spec, until Synapse-style idle/logout heuristics mark
 //!   them offline automatically -- **not implemented here**; see this crate's status file for why
 //!   that is deferred rather than half-built).
+//! - **It survives a restart.** Every change is written through to
+//!   `crate::store::UserStore::put_presence` with its stamp, and a user's record is read back the
+//!   first time this process is asked about them (a user with no stored record is remembered as
+//!   having none, so the store is asked once). The stamps are restart-safe (`crate::stamp`), so a
+//!   record a client saw before the restart is not news to it afterwards. `last_active` is a
+//!   wall-clock time for the same reason: an `Instant` means nothing to the next process.
+//!   Polling `/sync` refreshes `last_active` without a change ([`PresenceRegistry::touch`]); that
+//!   refresh is written at most once a minute per user, not on every poll.
+//! - A remote user's presence (an `m.presence` EDU, dispatched by `hs-cli`) is recorded through
+//!   [`PresenceRegistry::set_remote`], which takes the remote server's `last_active_ago` and
+//!   `currently_active` as given.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
 use ruma::{OwnedUserId, UserId};
 use tokio::sync::Mutex;
 
-/// One user's current presence, as this registry has it. `last_active` is an [`Instant`]
-/// (process-local monotonic clock) rather than a wall-clock timestamp because the only thing any
-/// caller ever does with it is compute an elapsed duration (`last_active_ago`) -- see
-/// [`PresenceRecord::last_active_ago_ms`].
+use crate::stamp::{Stamps, now_ms};
+use crate::store::{DynUserStore, StoredPresence};
+
+/// How stale a stored `last_active` may get while a user keeps polling `/sync` without changing
+/// state. See the module docs.
+const LAST_ACTIVE_WRITE_INTERVAL_MS: u64 = 60_000;
+
+/// One user's current presence, as this registry has it.
 #[derive(Debug, Clone)]
 pub struct PresenceRecord {
     /// `"online"`, `"unavailable"` or `"offline"` -- validated at the HTTP layer
-    /// (`crate::routes::presence::put_status`), stored as-is here.
+    /// (`crate::routes::presence::put_status`) for a local user, and by the EDU dispatcher for a
+    /// remote one; stored as-is here.
     pub presence: String,
     /// The client-supplied free-text status message, if any.
     pub status_msg: Option<String>,
-    last_active: Instant,
-    /// This record's stamp on [`PresenceRegistry`]'s shared counter, for the same
+    /// When the user was last known active, in milliseconds since the Unix epoch.
+    pub last_active_ms: u64,
+    /// This record's stamp on [`PresenceRegistry`]'s change counter, for the same
     /// changed-since-a-cursor comparison `crate::typing::TypingRegistry` uses.
     pub seq: u64,
+    /// What the user's own server said about `currently_active` (remote users only).
+    pub remote_currently_active: Option<bool>,
+    /// The `last_active_ms` most recently written to the store.
+    persisted_active_ms: u64,
 }
 
 impl PresenceRecord {
-    /// Milliseconds since this user was last known active (last called `PUT .../presence/.../status`),
-    /// for the response's `last_active_ago` field.
+    /// Milliseconds since this user was last known active, for the response's `last_active_ago`
+    /// field.
     #[must_use]
     pub fn last_active_ago_ms(&self) -> u64 {
-        u64::try_from(self.last_active.elapsed().as_millis()).unwrap_or(u64::MAX)
+        now_ms().saturating_sub(self.last_active_ms)
+    }
+
+    /// The response's `currently_active`: what a remote user's server said, or for a local user
+    /// whether they are `online`.
+    #[must_use]
+    pub fn currently_active(&self) -> bool {
+        self.remote_currently_active
+            .unwrap_or(self.presence == "online")
+    }
+
+    fn stored(&self) -> StoredPresence {
+        StoredPresence {
+            presence: self.presence.clone(),
+            status_msg: self.status_msg.clone(),
+            last_active_ms: self.last_active_ms,
+            seq: self.seq,
+            currently_active: self.remote_currently_active,
+        }
+    }
+
+    fn from_stored(stored: StoredPresence) -> Self {
+        Self {
+            presence: stored.presence,
+            status_msg: stored.status_msg,
+            last_active_ms: stored.last_active_ms,
+            seq: stored.seq,
+            remote_currently_active: stored.currently_active,
+            persisted_active_ms: stored.last_active_ms,
+        }
     }
 }
 
-/// In-memory presence state for every local user this process has ever seen a presence call for.
-/// A user this process has never heard from simply has no record -- see
-/// [`crate::routes::presence::get_status`] for how the route distinguishes "never set" (defaults,
-/// per spec) from "no such user" (404, checked against `hs-auth`'s own user table, not this
-/// registry).
+/// Presence state for every user this process has been asked about. A user with no record
+/// simply has none -- see [`crate::routes::presence::get_status`] for how the route
+/// distinguishes "never set" (defaults, per spec) from "no such user" (404, checked against
+/// `hs-auth`'s own user table, not this registry).
 pub struct PresenceRegistry {
-    users: Mutex<HashMap<OwnedUserId, PresenceRecord>>,
-    counter: AtomicU64,
+    /// `Some` for a user with a record, `None` for one the store was asked about and had
+    /// nothing for; a user absent from the map has not been looked up yet.
+    users: Mutex<HashMap<OwnedUserId, Option<PresenceRecord>>>,
+    counter: Stamps,
+    store: Option<DynUserStore>,
 }
 
 impl PresenceRegistry {
-    /// An empty registry.
+    /// An empty registry that keeps nothing beyond this process.
     #[must_use]
     pub fn new() -> Self {
         Self {
             users: Mutex::new(HashMap::new()),
-            counter: AtomicU64::new(0),
+            counter: Stamps::new(),
+            store: None,
         }
     }
 
-    /// Records `user_id`'s new presence state, bumping the shared counter and refreshing
-    /// `last_active` to now (matches Synapse: any presence-setting call, not only transitioning to
-    /// `online`, counts as activity). Returns the new stamp, for a caller that wants it without a
-    /// second lookup (none currently do, but mirrors [`crate::typing::TypingRegistry::set`]'s
-    /// shape).
+    /// A registry over `store`: every change is written through to it, and a user's record is
+    /// read back from it the first time they are asked about. What
+    /// [`crate::hub::SessionHub`] uses.
+    #[must_use]
+    pub fn with_store(store: DynUserStore) -> Self {
+        Self {
+            store: Some(store),
+            ..Self::new()
+        }
+    }
+
+    /// `user_id`'s slot in `users`, read from the store if this is the first time they are asked
+    /// about. A store that cannot be read is logged and treated as holding nothing.
+    async fn slot<'a>(
+        &self,
+        users: &'a mut HashMap<OwnedUserId, Option<PresenceRecord>>,
+        user_id: &UserId,
+    ) -> &'a mut Option<PresenceRecord> {
+        if !users.contains_key(user_id) {
+            let loaded = match &self.store {
+                Some(store) => match store.get_presence(user_id).await {
+                    Ok(stored) => stored.map(|stored| {
+                        self.counter.observe(stored.seq);
+                        PresenceRecord::from_stored(stored)
+                    }),
+                    Err(error) => {
+                        tracing::warn!(
+                            %user_id,
+                            %error,
+                            "could not read a user's stored presence; starting from none"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            users.insert(user_id.to_owned(), loaded);
+        }
+        users.entry(user_id.to_owned()).or_insert(None)
+    }
+
+    /// Writes `record` through to the store, if there is one, and notes what was written.
+    async fn persist(&self, user_id: &UserId, record: &mut PresenceRecord) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        match store.put_presence(user_id, &record.stored()).await {
+            Ok(()) => record.persisted_active_ms = record.last_active_ms,
+            Err(error) => tracing::warn!(
+                %user_id,
+                %error,
+                "could not store a presence change; it is kept in memory until the next restart"
+            ),
+        }
+    }
+
+    /// Records `user_id`'s new presence state, stamping it and refreshing `last_active` to now
+    /// (matches Synapse: any presence-setting call, not only transitioning to `online`, counts
+    /// as activity). Returns the new stamp.
     pub async fn set(&self, user_id: &UserId, presence: String, status_msg: Option<String>) -> u64 {
-        let seq = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
         let mut users = self.users.lock().await;
-        users.insert(
-            user_id.to_owned(),
-            PresenceRecord {
-                presence,
-                status_msg,
-                last_active: Instant::now(),
-                seq,
-            },
-        );
+        let slot = self.slot(&mut users, user_id).await;
+        let seq = self.counter.next();
+        let record = slot.insert(PresenceRecord {
+            presence,
+            status_msg,
+            last_active_ms: now_ms(),
+            seq,
+            remote_currently_active: None,
+            persisted_active_ms: 0,
+        });
+        self.persist(user_id, record).await;
+        seq
+    }
+
+    /// Records a remote user's presence as their own server reported it (an `m.presence` EDU):
+    /// `last_active_ago` is relative to now, `currently_active` is kept as given. Always a
+    /// change -- the remote server only sends what changed. Returns the new stamp.
+    pub async fn set_remote(
+        &self,
+        user_id: &UserId,
+        presence: String,
+        status_msg: Option<String>,
+        last_active_ago_ms: Option<u64>,
+        currently_active: Option<bool>,
+    ) -> u64 {
+        let mut users = self.users.lock().await;
+        let slot = self.slot(&mut users, user_id).await;
+        let seq = self.counter.next();
+        let record = slot.insert(PresenceRecord {
+            presence,
+            status_msg,
+            last_active_ms: now_ms().saturating_sub(last_active_ago_ms.unwrap_or(0)),
+            seq,
+            remote_currently_active: currently_active,
+            persisted_active_ms: 0,
+        });
+        self.persist(user_id, record).await;
         seq
     }
 
@@ -103,28 +234,35 @@ impl PresenceRegistry {
     /// holiday until Monday" because their client polled would be wrong.
     pub async fn touch(&self, user_id: &UserId, presence: &str) -> bool {
         let mut users = self.users.lock().await;
-        match users.get_mut(user_id) {
+        let slot = self.slot(&mut users, user_id).await;
+        let now = now_ms();
+        match slot.as_mut() {
             Some(existing) if existing.presence == presence => {
-                existing.last_active = Instant::now();
+                existing.last_active_ms = now;
+                if now.saturating_sub(existing.persisted_active_ms) >= LAST_ACTIVE_WRITE_INTERVAL_MS
+                {
+                    self.persist(user_id, existing).await;
+                }
                 false
             }
             Some(existing) => {
                 existing.presence = presence.to_owned();
-                existing.last_active = Instant::now();
-                existing.seq = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+                existing.last_active_ms = now;
+                existing.remote_currently_active = None;
+                existing.seq = self.counter.next();
+                self.persist(user_id, existing).await;
                 true
             }
             None => {
-                let seq = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
-                users.insert(
-                    user_id.to_owned(),
-                    PresenceRecord {
-                        presence: presence.to_owned(),
-                        status_msg: None,
-                        last_active: Instant::now(),
-                        seq,
-                    },
-                );
+                let record = slot.insert(PresenceRecord {
+                    presence: presence.to_owned(),
+                    status_msg: None,
+                    last_active_ms: now,
+                    seq: self.counter.next(),
+                    remote_currently_active: None,
+                    persisted_active_ms: 0,
+                });
+                self.persist(user_id, record).await;
                 true
             }
         }
@@ -141,18 +279,20 @@ impl PresenceRegistry {
     /// be sent it. A join is news about who you can see; this makes it news in the stream too.
     pub async fn restamp(&self, user_id: &UserId) -> bool {
         let mut users = self.users.lock().await;
-        match users.get_mut(user_id) {
+        match self.slot(&mut users, user_id).await {
             Some(existing) => {
-                existing.seq = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+                existing.seq = self.counter.next();
+                self.persist(user_id, existing).await;
                 true
             }
             None => false,
         }
     }
 
-    /// This user's current record, if this process has ever recorded one.
+    /// This user's current record, if there is one.
     pub async fn get(&self, user_id: &UserId) -> Option<PresenceRecord> {
-        self.users.lock().await.get(user_id).cloned()
+        let mut users = self.users.lock().await;
+        self.slot(&mut users, user_id).await.clone()
     }
 }
 
@@ -255,5 +395,46 @@ mod tests {
         reg.set(uid, "online".to_owned(), None).await;
         let record = reg.get(uid).await.unwrap();
         assert!(record.last_active_ago_ms() < 5000);
+    }
+
+    fn store_over(backend: &hs_kv::memory::MemoryBackend) -> DynUserStore {
+        std::sync::Arc::new(crate::store::tables::TablesUserStore::open(backend.clone()).unwrap())
+    }
+
+    /// The restart property: a second registry over the same store (a new process) has the
+    /// record the first one set -- state, status message, stamp -- and knows a user who never
+    /// had one has none. A change after the restart is newer than anything before it.
+    #[tokio::test]
+    async fn presence_outlives_the_registry_that_recorded_it() {
+        let backend = hs_kv::memory::MemoryBackend::new();
+        let alice = user_id!("@alice:example.org");
+        let before = PresenceRegistry::with_store(store_over(&backend));
+        let old_seq = before
+            .set(alice, "unavailable".to_owned(), Some("lunch".to_owned()))
+            .await;
+        drop(before);
+
+        let after = PresenceRegistry::with_store(store_over(&backend));
+        let record = after.get(alice).await.expect("the record was restored");
+        assert_eq!(record.presence, "unavailable");
+        assert_eq!(record.status_msg.as_deref(), Some("lunch"));
+        assert_eq!(record.seq, old_seq);
+        assert!(record.last_active_ago_ms() < 5000);
+        assert!(after.get(user_id!("@nobody:example.org")).await.is_none());
+
+        assert!(after.touch(alice, "online").await);
+        assert!(after.get(alice).await.unwrap().seq > old_seq);
+    }
+
+    #[tokio::test]
+    async fn a_remote_record_keeps_what_its_server_said() {
+        let reg = PresenceRegistry::new();
+        let bob = user_id!("@bob:remote.example");
+        reg.set_remote(bob, "online".to_owned(), None, Some(60_000), Some(false))
+            .await;
+        let record = reg.get(bob).await.unwrap();
+        assert!(!record.currently_active());
+        assert!(record.last_active_ago_ms() >= 60_000);
+        assert!(record.last_active_ago_ms() < 65_000);
     }
 }

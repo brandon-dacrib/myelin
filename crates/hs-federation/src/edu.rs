@@ -1,11 +1,24 @@
-//! Minimal structural validation for EDUs (ephemeral data units) inside a `/send` transaction
-//! body. This crate does not implement `/send` yet (see `crate::transport::seams`), but the EDU
-//! *shape* is small, spec-stable, and independently fuzzable input from a hostile peer, so its
-//! parser exists now rather than being deferred alongside the handler — per this track's brief,
-//! every parser touching remote input needs a fuzz target, and there is no reason to wait on the
-//! handler to have something to fuzz.
+//! EDUs (ephemeral data units) inside a `/send` transaction body: structural validation
+//! ([`parse_edu`], fuzzed) and the seam every valid one is handed to ([`InboundEduSink`]).
+//!
+//! This crate interprets no EDU's content. `crate::inbound::process_transaction` validates each
+//! EDU's shape and hands it, with the transaction's authenticated `origin`, to the installed
+//! sink -- in `hs serve`, `hs-cli`'s dispatcher, which knows the session hub (typing, receipts,
+//! presence) and the device-key store (device-list and signing-key updates). The sink is where
+//! "an EDU speaks only for the origin's own users" is enforced, per EDU type, since only it knows
+//! where each type names its user.
 
 use hs_model::canonical::to_canonical_object;
+
+/// Where `crate::inbound::process_transaction` hands every structurally valid EDU. See the
+/// module docs.
+#[async_trait::async_trait]
+pub trait InboundEduSink: Send + Sync {
+    /// Applies one EDU that arrived from `origin` (the `X-Matrix`-authenticated sender of the
+    /// transaction). Never fails the transaction: an EDU that cannot be applied is logged and
+    /// dropped, as the spec expects of ephemeral data.
+    async fn receive_edu(&self, origin: &str, edu: Edu);
+}
 
 /// Max bytes for one EDU (threat model section 3, matching [`hs_model::event::MAX_PDU_BYTES`]'s
 /// figure — the spec gives PDUs and EDUs the same size ceiling).

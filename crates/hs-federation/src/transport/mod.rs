@@ -18,6 +18,7 @@
 
 mod join;
 mod membership;
+mod keys;
 mod queries;
 mod read_routes;
 mod seams;
@@ -66,6 +67,9 @@ pub struct FederationState {
     /// co-signs it with (`crate::invite`). `None` answers `501`: the manifest-only mount, and
     /// every handler test that does not care.
     pub invites: Option<crate::invite::InviteHandling>,
+    /// Where `/send`'s EDUs go once validated (`crate::edu::InboundEduSink`). `None` drops them,
+    /// which is what every handler test that does not care about EDUs wants.
+    pub edu_sink: Option<Arc<dyn crate::edu::InboundEduSink>>,
 }
 
 fn matrix_federation(operation_id: &str) -> RouteMeta {
@@ -94,6 +98,7 @@ pub fn router(
     let builder = send::add_routes(builder);
     let builder = join::add_routes(builder);
     let builder = membership::add_routes(builder);
+    let builder = keys::add_routes(builder);
     let (merged, manifest) = builder.build();
 
     (apply_x_matrix_layer(merged, state, x_matrix_ctx), manifest)
@@ -178,6 +183,7 @@ mod tests {
             backfill_limits: crate::backfill::BackfillLimits::default(),
             sender: None,
             invites: None,
+            edu_sink: None,
         }
     }
 

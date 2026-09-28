@@ -175,11 +175,22 @@ async fn user_devices(
     State(state): State<FederationState>,
     Path(user_id): Path<String>,
 ) -> Response {
-    if !state.allow_device_name_lookup_over_federation {
-        return MatrixError::forbidden("device lookup over federation is disabled").into_response();
-    }
+    // `allow_device_name_lookup_over_federation` governs the display names, not the answer:
+    // a server that shares a room with this user needs their device list to encrypt to them,
+    // and Synapse answers with the names left out when the option is off, as this does.
     match state.queries.devices(&user_id).await {
-        Some(v) => axum::Json(v).into_response(),
+        Some(mut v) => {
+            if !state.allow_device_name_lookup_over_federation
+                && let Some(devices) = v.get_mut("devices").and_then(|d| d.as_array_mut())
+            {
+                for device in devices {
+                    if let Some(device) = device.as_object_mut() {
+                        device.remove("device_display_name");
+                    }
+                }
+            }
+            axum::Json(v).into_response()
+        }
         None => MatrixError::not_found("unknown user").into_response(),
     }
 }
@@ -520,6 +531,7 @@ mod tests {
             backfill_limits: crate::backfill::BackfillLimits::default(),
             sender: None,
             invites: None,
+            edu_sink: None,
         };
         build().with_state(state)
     }
@@ -542,6 +554,7 @@ mod tests {
             backfill_limits: crate::backfill::BackfillLimits::default(),
             sender: None,
             invites: None,
+            edu_sink: None,
         };
         let response = router
             .with_state(state)
@@ -630,6 +643,7 @@ mod tests {
             backfill_limits: crate::backfill::BackfillLimits::default(),
             sender: None,
             invites: None,
+            edu_sink: None,
         };
         let router = build();
         let header = signed_header("anyone.example.org", "GET", "/publicRooms");

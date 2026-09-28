@@ -93,6 +93,43 @@ pub struct PublicRoomEntry {
     pub guest_can_join: bool,
 }
 
+/// One user's latest read receipt of one kind in one room, as [`UserStore::put_receipt`] keeps
+/// it. Written through by `crate::receipts::ReceiptRegistry` so read state survives a restart;
+/// the registry is the only reader.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredReceipt {
+    /// The user whose receipt this is (local or remote).
+    pub user_id: String,
+    /// The receipt type's wire spelling (`m.read` or `m.read.private`).
+    pub kind: String,
+    /// The event the receipt points at.
+    pub event_id: String,
+    /// When the receipt was sent, in milliseconds since the Unix epoch.
+    pub ts: u64,
+    /// The stamp the registry gave this receipt (`crate::stamp`), kept so that a restarted
+    /// process does not report an old receipt as news to a client that already saw it.
+    pub seq: u64,
+}
+
+/// One user's presence, as [`UserStore::put_presence`] keeps it. Written through by
+/// `crate::presence::PresenceRegistry` on every change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredPresence {
+    /// `"online"`, `"unavailable"` or `"offline"`.
+    pub presence: String,
+    /// The user's free-text status message, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_msg: Option<String>,
+    /// When the user was last known active, in milliseconds since the Unix epoch.
+    pub last_active_ms: u64,
+    /// The stamp the registry gave this record (`crate::stamp`).
+    pub seq: u64,
+    /// What a remote server said about `currently_active`, for a remote user; `None` for a
+    /// local user, whose value is derived from `presence`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currently_active: Option<bool>,
+}
+
 /// Errors from [`UserStore`]. Distinct from `crate::error::UserError` so this trait does not
 /// force every implementation to depend on `hs-http`'s error-mapping types; `crate::error`
 /// converts.
@@ -327,6 +364,45 @@ pub trait UserStore: Send + Sync {
     /// # Errors
     /// Returns [`StoreError`] on a storage failure.
     async fn list_public_rooms(&self) -> Result<Vec<PublicRoomEntry>, StoreError>;
+
+    /// Records `receipt` as the latest of its user and kind in `room_id`, replacing any earlier
+    /// one.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn put_receipt(
+        &self,
+        room_id: &ruma::RoomId,
+        receipt: &StoredReceipt,
+    ) -> Result<(), StoreError>;
+
+    /// Every receipt recorded in `room_id`, in no particular order.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn list_room_receipts(
+        &self,
+        room_id: &ruma::RoomId,
+    ) -> Result<Vec<StoredReceipt>, StoreError>;
+
+    /// Records `presence` as `user_id`'s current presence, replacing any earlier record.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn put_presence(
+        &self,
+        user_id: &ruma::UserId,
+        presence: &StoredPresence,
+    ) -> Result<(), StoreError>;
+
+    /// `user_id`'s recorded presence, if any was ever recorded.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn get_presence(
+        &self,
+        user_id: &ruma::UserId,
+    ) -> Result<Option<StoredPresence>, StoreError>;
 }
 
 /// Shorthand for the trait-object form every consumer (`crate::hub::SessionHub`,
