@@ -27,6 +27,48 @@ auth rules, `403`.
   join_authorised_via_users_server if not invited`).
 - `hs_room::actor::tests::a_restricted_join_names_the_first_local_member_who_may_invite`.
 
+**2. A restricted join nobody asked can authorise goes to the allowed rooms' servers.** Done.
+When every server the join was sent through refused it with `M_UNABLE_TO_AUTHORISE_JOIN` (or
+MSC3083's `M_UNABLE_TO_GRANT_JOIN`), `hs_cli::remote_join::FederationRemoteJoin` asks the
+servers of the rooms the join rules allow, as Synapse does: each allowed room's `via`, then the
+servers of its joined members if this server holds it, minus those already asked
+(`RoomActor::known_allowed_rooms`, new: from the room's own `m.room.join_rules`, or from the
+stripped state a local user's invite or knock arrived with). A `403` from any server is still the
+answer and stops the loop. `RoomActor::servers_to_join_through` now answers `Some(vec![])` for a
+room held only through out-of-band membership, so such a room is always joined remotely through
+the client's `via`, even when nobody can be named (a v12 room ID has no server name, and a knock
+by this server's own user has no remote sender).
+
+- `crates/hs-cli/tests/federation_membership.rs::a_restricted_join_nobody_asked_can_authorise_goes_to_the_allowed_rooms_servers`:
+  three servers, v12 rooms. C is in the restricted room but not the lobby; bob on B knocks
+  through C (which is how B learns the join rules), joins the lobby, then joins the room naming
+  only C: C refuses with `M_UNABLE_TO_AUTHORISE_JOIN`, B falls back to A (the lobby's `via`),
+  alice authorises, and carol on C sees bob's message. Fails with the fallback off (`M_UNKNOWN
+  ... M_UNABLE_TO_AUTHORISE_JOIN`).
+
+**Room version 12 over federation (found by the test above).** A v12 room could not cross
+servers at all: an invite's signed event and every event over `/send` were refused (`no
+m.room.create event in room state`), because from v12 (MSC4291) the create event is never
+cited in `auth_events` and the state they imply must include it anyway; and a remote join's
+snapshot was refused because the create event carries no `room_id` (`event $X is for room
+<none>`). `RoomActor::accept_remote_event` and the remote-join snapshot check now add the room's
+create event to the implied state under `room_create_event_id_as_room_id`, and accept a create
+event without `room_id` whose event ID is the room ID (`RoomActor::is_own_hashed_create`).
+
+- `crates/hs-cli/tests/federation_membership.rs::a_version_12_room_is_joined_and_used_across_servers`:
+  invite, join through A, a message each way. Fails with the fix off (the invite: `403
+  auth-events-implied state rejected event: no m.room.create event in room state`).
+
+**3. The stripped state an invite or knock arrived with stays out of the timeline.** Done.
+`hs_room::routes::render::client_event_json` drops `unsigned.invite_room_state` and
+`unsigned.knock_room_state` (`STRIPPED_STATE_KEYS`) from every rendered event; `/sync`'s
+`invite` and `knock` sections read them from the stored event instead
+(`hs_user::sync::stripped_state`), so the invitee still sees the room described before joining.
+
+- `crates/hs-cli/tests/federation_membership.rs::stripped_state_stays_out_of_the_timeline`:
+  bob's `/sync` invite and knock sections carry the stripped state; once he is in, his timeline,
+  `/messages` and `/event` show the invite and the knock without it. Fails with the fix off.
+
 **4. `make_knock` in a room version without knocking answers `403 M_FORBIDDEN`** (was `400
 M_INCOMPATIBLE_ROOM_VERSION`). Done. `hs_federation::join::make_membership` returns
 `JoinError::NotAuthorized("room version N does not support knocking")`; the version the knocking

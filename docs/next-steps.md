@@ -873,9 +873,12 @@ edit one is not. New settings and operations arrive with their interface control
    metrics `hs_federation_edus_{sent,received}_total`). Left, in order
    (`docs/status/06-federation.md`): ~~a local user's join to a restricted room on its own
    server still needs the client to name an authoriser~~ **done 2026-09-28**
-   (`RoomActor::restricted_join`; through another server when nobody here may invite); when every resident refuses with
-   `M_UNABLE_TO_AUTHORISE_JOIN`, fall back to the allowed rooms' servers; the invite and knock
-   stripped state kept in `unsigned` shows in the invitee's timeline rendering; EDUs in
+   (`RoomActor::restricted_join`; through another server when nobody here may invite); ~~when
+   every resident refuses with `M_UNABLE_TO_AUTHORISE_JOIN`, fall back to the allowed rooms'
+   servers; the invite and knock stripped state kept in `unsigned` shows in the invitee's
+   timeline rendering~~ **done 2026-09-28** (and version 12 rooms, which could not cross
+   servers at all, now do: status 06, thirteenth session); ~~`make_knock` in a version without
+   knocking answers 400~~ **done 2026-09-28** (403, as Synapse); EDUs in
    cluster mode only through the owning replica (today a non-owning replica drops typing,
    receipts, presence and to-device EDUs for destinations it does not send for; the design is
    in status 06's twelfth session, and it needs a two-replica mesh test and the cluster);
@@ -1311,7 +1314,7 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 
 | Gap | Where | Consequence |
 |---|---|---|
-| A local user's join to a restricted room is refused | `hs-room` | the local join names no `join_authorised_via_users_server` unless the client supplies one, so this server's own users cannot join a restricted room it hosts through the allow rule; over federation it works (the resident authorises and co-signs, ea990cb, `federation_membership.rs::a_restricted_room_is_joined_through_a_resident_that_authorises_it`); Complement's `TestRestrictedRooms*` not re-measured since run 7 |
+| ~~A local user's join to a restricted room is refused~~ | `hs-room` | **Closed** (cafb74d): `RoomActor::restricted_join` names the authoriser, and the join goes through another server when nobody here may invite; `federation_membership.rs::a_local_user_joins_a_restricted_room_without_naming_an_authoriser`. Complement's `TestRestrictedRooms*` not re-measured yet |
 | A rejoined room's gap is never filled | `hs-room` | history is fetched before the oldest held event; what happened between a leave and a rejoin stays on the resident |
 | The state at a backfilled event is walked, not asked for | `hs-room` | exact while the history is linear and the previous event for each reverted key is within reach; a key set before the fetched history reads as unset until that history arrives; no auth check runs on backfilled events |
 | A destination down for longer than its queue is not caught up from the room | `hs-federation` | what was queued survives a restart and is sent; what was never queued because the destination was already known failing is not re-derived (Synapse's `destination_rooms`) |

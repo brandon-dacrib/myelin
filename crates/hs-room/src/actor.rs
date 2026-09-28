@@ -135,6 +135,11 @@ pub enum RemoteEventOutcome {
     Stored(EventSn),
 }
 
+/// A canonical JSON value as plain JSON.
+fn canonical_to_value(value: &CanonicalJsonValue) -> serde_json::Value {
+    serde_json::from_slice(&value.to_canonical_bytes()).unwrap_or(serde_json::Value::Null)
+}
+
 /// What a join to a restricted room needs from whoever authorises it: see
 /// [`RoomActor::restricted_join`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1322,6 +1327,24 @@ impl<B: KvBackend> RoomActor<B> {
                 });
             }
 
+            // From room version 12 (MSC4291) the create event is never among `auth_events`:
+            // its ID is the room ID, and every event is authorised as if it cited it.
+            if self.rules.room_create_event_id_as_room_id
+                && let Some(create) = self.state_event("m.room.create", "")?
+            {
+                auth_flat.insert(
+                    create.header().event_type.clone(),
+                    String::new(),
+                    create.header().sender.clone(),
+                    create
+                        .json()
+                        .get("content")
+                        .and_then(CanonicalJsonValue::as_object)
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+            }
+
             let content_obj = event
                 .json()
                 .get("content")
@@ -2136,7 +2159,7 @@ impl<B: KvBackend> RoomActor<B> {
                 .json()
                 .get("room_id")
                 .and_then(CanonicalJsonValue::as_str);
-            if room_id != Some(self.room_id.as_str()) {
+            if room_id != Some(self.room_id.as_str()) && !self.is_own_hashed_create(event) {
                 return Err(shape(format!(
                     "event {} is for room {} not {}",
                     event.event_id(),
@@ -2263,7 +2286,17 @@ impl<B: KvBackend> RoomActor<B> {
             }
             flat
         };
-        let auth_flat = flat_from(&auth_events);
+        // From room version 12 (MSC4291) the create event is never among `auth_events`: its ID
+        // is the room ID, and every event is authorised as if it were cited.
+        let mut implied = auth_events.clone();
+        if self.rules.room_create_event_id_as_room_id
+            && let Some(create) = state
+                .iter()
+                .find(|e| e.header().event_type == "m.room.create")
+        {
+            implied.push(create);
+        }
+        let auth_flat = flat_from(&implied);
         let state_refs: Vec<&Event> = state.iter().collect();
         let state_flat = flat_from(&state_refs);
         let auth_event_refs: Vec<AuthEventRef<'_>> = auth_events
@@ -2647,6 +2680,78 @@ impl<B: KvBackend> RoomActor<B> {
             local_authoriser,
             inviting_servers: inviting_servers.into_iter().collect(),
         }))
+    }
+
+    /// Whether `event` is this room's `m.room.create` in a room version whose room ID is the
+    /// create event's ID (12 and later, MSC4291): such a create event carries no `room_id`, and
+    /// is this room's exactly when its event ID, sigil aside, is the room ID.
+    fn is_own_hashed_create(&self, event: &Event) -> bool {
+        self.rules.room_create_event_id_as_room_id
+            && event.header().event_type == "m.room.create"
+            && event.json().get("room_id").is_none()
+            && event.event_id().as_str().get(1..) == self.room_id.as_str().get(1..)
+    }
+
+    /// The rooms this server knows the join rules of this room to allow
+    /// (`m.room_membership` entries of `allow`), each with the servers its entry names in `via`
+    /// (MSC3083's hint; empty when it names none). Read from the room's own `m.room.join_rules`
+    /// when this server holds one; for a room held only through a local user's invite or knock,
+    /// from the stripped state that membership arrived with. Empty when neither says.
+    ///
+    /// What a joining server falls back to when every server it asked refused a restricted join
+    /// with `M_UNABLE_TO_AUTHORISE_JOIN`: the servers of the allowed rooms are the ones likely
+    /// to be able to vouch for it.
+    #[must_use]
+    pub fn known_allowed_rooms(&self) -> Vec<(OwnedRoomId, Vec<String>)> {
+        let own_rules = self
+            .state_event("m.room.join_rules", "")
+            .ok()
+            .flatten()
+            .and_then(|event| event.json().get("content").map(canonical_to_value));
+        let content = own_rules.or_else(|| {
+            let own = self.identity.server_name.as_str();
+            self.members()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|member| {
+                    member
+                        .header()
+                        .state_key
+                        .as_deref()
+                        .and_then(|key| UserId::parse(key).ok())
+                        .is_some_and(|user| user.server_name().as_str() == own)
+                })
+                .find_map(|member| {
+                    let unsigned = canonical_to_value(member.json().get("unsigned")?);
+                    ["invite_room_state", "knock_room_state"]
+                        .iter()
+                        .filter_map(|key| unsigned.get(*key)?.as_array().cloned())
+                        .flatten()
+                        .find(|entry| {
+                            entry["type"] == "m.room.join_rules" && entry["state_key"] == ""
+                        })
+                        .map(|entry| entry["content"].clone())
+                })
+        });
+        let Some(content) = content else {
+            return Vec::new();
+        };
+        content["allow"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry["type"] == "m.room_membership")
+            .filter_map(|entry| {
+                let room = RoomId::parse(entry["room_id"].as_str()?).ok()?;
+                let via = entry["via"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|server| server.as_str().map(str::to_owned))
+                    .collect();
+                Some((room, via))
+            })
+            .collect()
     }
 
     /// Whether `user`'s current membership is `join`. `false` if the state cannot be read.
@@ -4344,7 +4449,8 @@ impl<B: KvBackend> RoomActor<B> {
     /// resident -- never bring back what was missed. Synapse makes the same call
     /// (`is_host_in_room`). The servers are the room ID's own first, then every joined member's;
     /// when no member is joined at all (a room held only through an invite or a knock), the room
-    /// ID's server and those of whoever sent this server's users their memberships.
+    /// ID's server and those of whoever sent this server's users their memberships -- possibly
+    /// none, for such a room, which is still `Some`: it cannot be joined here.
     #[must_use]
     pub fn servers_to_join_through(&self) -> Option<Vec<String>> {
         let own = self.identity.server_name.as_str();
@@ -4394,7 +4500,12 @@ impl<B: KvBackend> RoomActor<B> {
             {
                 senders.insert(0, server.as_str().to_owned());
             }
-            return (!senders.is_empty()).then_some(senders);
+            // A room held only through out-of-band membership (no `m.room.create`) can never
+            // be joined here, even when there is nobody to name (a room ID without a server
+            // name, and a knock this server's own user sent): the join goes through whatever
+            // servers the client named.
+            let shell = matches!(self.state_event("m.room.create", ""), Ok(None));
+            return (shell || !senders.is_empty()).then_some(senders);
         }
         if let Some(server) = self.room_id.server_name()
             && server.as_str() != own

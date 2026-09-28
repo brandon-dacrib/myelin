@@ -101,6 +101,149 @@ impl<B: KvBackend + 'static> FederationRemoteJoin<B> {
     }
 }
 
+/// How one server's part in a join went, when it did not end in the join: a failure that is
+/// the answer (the room refusing), or one that is a reason to ask the next server.
+enum JoinAttempt {
+    /// The room refused the join; asking another server would not change that.
+    Fatal(RoomError),
+    /// This server could not complete the handshake. `unable` if it said
+    /// `M_UNABLE_TO_AUTHORISE_JOIN`.
+    Next { error: RoomError, unable: bool },
+}
+
+impl<B: KvBackend + 'static> FederationRemoteJoin<B> {
+    /// One `make_join`/`send_join` handshake through `destination`, and the room made (or kept)
+    /// resident from its answer.
+    async fn join_through(
+        &self,
+        destination: &str,
+        user_id: &UserId,
+        room_id: &RoomId,
+        content: &Value,
+    ) -> Result<OwnedRoomId, JoinAttempt> {
+        match hs_federation::outbound_join::join_room_with_content(
+            &self.client,
+            &self.key_cache,
+            destination,
+            room_id.as_str(),
+            user_id.as_str(),
+            &self.identity.server_name,
+            &self.identity.signing_key,
+            Some(content),
+        )
+        .await
+        {
+            Ok(outcome) => {
+                // A room this server is in already (a restricted join no user here could
+                // authorise): the join is one more event of a room held for real, placed
+                // after what it cites like any event over `/send`. Only if it cites what
+                // this copy has not seen yet is the resident's state taken over it.
+                if let Ok(handle) = self.rooms.get_or_load(room_id).await
+                    && handle.query(|actor| actor.local_user_joined()).await
+                {
+                    match handle.accept_remote_event(outcome.join_event.clone()).await {
+                        Ok(_) => {
+                            tracing::info!(%room_id, %user_id, destination, "joined a room this server is in through another server");
+                            return Ok(room_id.to_owned());
+                        }
+                        Err(RoomError::MissingAncestors(_)) => {}
+                        Err(error) => return Err(JoinAttempt::Fatal(error)),
+                    }
+                }
+                tracing::info!(
+                    %room_id,
+                    %user_id,
+                    destination,
+                    state_events = outcome.state.len(),
+                    "joined a room hosted elsewhere; making it resident"
+                );
+                self.rooms
+                    .bootstrap_from_remote_join(
+                        room_id,
+                        outcome.room_version,
+                        outcome.state,
+                        outcome.auth_chain,
+                        outcome.join_event,
+                    )
+                    .await
+                    .map_err(JoinAttempt::Fatal)?;
+                Ok(room_id.to_owned())
+            }
+            Err(error) => {
+                tracing::warn!(%room_id, %user_id, destination, %error, "a server could not sponsor the join");
+                let unable = is_unable_to_authorise(&error);
+                let mapped = match map_outbound_error(&error) {
+                    RoomError::RemoteJoinFailed(detail) => {
+                        RoomError::RemoteJoinFailed(format!("join: {detail}"))
+                    }
+                    other => other,
+                };
+                // The room itself saying no is the answer, whoever relays it; keep trying
+                // other servers only for failures that are about the server, not the room.
+                if matches!(mapped, RoomError::Forbidden(_)) {
+                    Err(JoinAttempt::Fatal(mapped))
+                } else {
+                    Err(JoinAttempt::Next {
+                        error: mapped,
+                        unable,
+                    })
+                }
+            }
+        }
+    }
+
+    /// The servers of the rooms `room_id`'s join rules allow, as far as this server knows them
+    /// (`hs_room::actor::RoomActor::known_allowed_rooms`): each allowed room's `via`, then the
+    /// servers of its joined members if this server holds it. Where a restricted join goes
+    /// when every server asked could not authorise it: a server in an allowed room can check
+    /// the joining user's membership there, and is often in the restricted room too.
+    async fn allowed_rooms_servers(&self, room_id: &RoomId) -> Vec<String> {
+        let Ok(handle) = self.rooms.get_or_load(room_id).await else {
+            return Vec::new();
+        };
+        let allowed = handle.query(|actor| actor.known_allowed_rooms()).await;
+        let mut servers: Vec<String> = Vec::new();
+        for (allowed_room, via) in allowed {
+            let mut candidates = via;
+            if let Ok(allowed_handle) = self.rooms.get_or_load(&allowed_room).await {
+                candidates.extend(
+                    allowed_handle
+                        .query(|actor| {
+                            actor
+                                .joined_members()
+                                .unwrap_or_default()
+                                .iter()
+                                .filter_map(|member| member.header().state_key.as_deref())
+                                .filter_map(|key| UserId::parse(key).ok())
+                                .map(|user| user.server_name().to_string())
+                                .collect::<Vec<_>>()
+                        })
+                        .await,
+                );
+            }
+            for server in candidates {
+                if !servers.contains(&server) {
+                    servers.push(server);
+                }
+            }
+        }
+        servers
+    }
+}
+
+/// Whether a server refused a join with `M_UNABLE_TO_AUTHORISE_JOIN` (or MSC3083's
+/// `M_UNABLE_TO_GRANT_JOIN`): it cannot vouch for a restricted join, and another might.
+fn is_unable_to_authorise(error: &OutboundJoinError) -> bool {
+    matches!(
+        error,
+        OutboundJoinError::Rejected { body, .. }
+            if matches!(
+                body.get("errcode").and_then(Value::as_str),
+                Some("M_UNABLE_TO_AUTHORISE_JOIN" | "M_UNABLE_TO_GRANT_JOIN")
+            )
+    )
+}
+
 /// What one sponsoring server's refusal means for the client: a `403` is the room refusing the
 /// join and worth reporting as such; a `404` is that server not knowing the room; anything else
 /// is a failure to complete the handshake.
@@ -151,68 +294,42 @@ impl<B: KvBackend + 'static> hs_room::remote_join::RemoteJoin for FederationRemo
         }
         let own_name = self.identity.server_name.as_str();
         let mut last_error: Option<RoomError> = None;
+        let mut tried: Vec<String> = Vec::new();
+        // Every server asked so far answered `M_UNABLE_TO_AUTHORISE_JOIN`: none of them is in a
+        // room the join rules allow, and a server that is might still vouch for the join.
+        let mut all_unable = true;
         for destination in via.iter().filter(|d| d.as_str() != own_name) {
-            match hs_federation::outbound_join::join_room_with_content(
-                &self.client,
-                &self.key_cache,
-                destination,
-                room_id.as_str(),
-                user_id.as_str(),
-                &self.identity.server_name,
-                &self.identity.signing_key,
-                Some(&content),
-            )
-            .await
+            tried.push(destination.clone());
+            match self
+                .join_through(destination, user_id, room_id, &content)
+                .await
             {
-                Ok(outcome) => {
-                    // A room this server is in already (a restricted join no user here could
-                    // authorise): the join is one more event of a room held for real, placed
-                    // after what it cites like any event over `/send`. Only if it cites what
-                    // this copy has not seen yet is the resident's state taken over it.
-                    if let Ok(handle) = self.rooms.get_or_load(room_id).await
-                        && handle.query(|actor| actor.local_user_joined()).await
-                    {
-                        match handle.accept_remote_event(outcome.join_event.clone()).await {
-                            Ok(_) => {
-                                tracing::info!(%room_id, %user_id, destination, "joined a room this server is in through another server");
-                                return Ok(room_id.to_owned());
-                            }
-                            Err(RoomError::MissingAncestors(_)) => {}
-                            Err(error) => return Err(error),
-                        }
-                    }
-                    tracing::info!(
-                        %room_id,
-                        %user_id,
-                        destination,
-                        state_events = outcome.state.len(),
-                        "joined a room hosted elsewhere; making it resident"
-                    );
-                    self.rooms
-                        .bootstrap_from_remote_join(
-                            room_id,
-                            outcome.room_version,
-                            outcome.state,
-                            outcome.auth_chain,
-                            outcome.join_event,
-                        )
-                        .await?;
-                    return Ok(room_id.to_owned());
+                Ok(joined) => return Ok(joined),
+                Err(JoinAttempt::Fatal(error)) => return Err(error),
+                Err(JoinAttempt::Next { error, unable }) => {
+                    all_unable &= unable;
+                    last_error = Some(error);
                 }
-                Err(error) => {
-                    tracing::warn!(%room_id, %user_id, destination, %error, "a server could not sponsor the join");
-                    let mapped = match map_outbound_error(&error) {
-                        RoomError::RemoteJoinFailed(detail) => {
-                            RoomError::RemoteJoinFailed(format!("join: {detail}"))
-                        }
-                        other => other,
-                    };
-                    // The room itself saying no is the answer, whoever relays it; keep trying
-                    // other servers only for failures that are about the server, not the room.
-                    if matches!(mapped, RoomError::Forbidden(_)) {
-                        return Err(mapped);
-                    }
-                    last_error = Some(mapped);
+            }
+        }
+        if all_unable && last_error.is_some() {
+            let fallback: Vec<String> = self
+                .allowed_rooms_servers(room_id)
+                .await
+                .into_iter()
+                .filter(|server| server != own_name && !tried.contains(server))
+                .collect();
+            if !fallback.is_empty() {
+                tracing::info!(%room_id, %user_id, servers = ?fallback, "no server asked could authorise the restricted join; asking the servers of the rooms its join rules allow");
+            }
+            for destination in &fallback {
+                match self
+                    .join_through(destination, user_id, room_id, &content)
+                    .await
+                {
+                    Ok(joined) => return Ok(joined),
+                    Err(JoinAttempt::Fatal(error)) => return Err(error),
+                    Err(JoinAttempt::Next { error, .. }) => last_error = Some(error),
                 }
             }
         }

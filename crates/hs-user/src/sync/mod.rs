@@ -481,11 +481,12 @@ fn stripped_state(
                 )
             })
             .collect();
-        let unsigned = client_event_json(own)
+        // The stored event, not its client rendering, which leaves the stripped state out.
+        let unsigned = hs_room::routes::render::canonical_to_json(own.json())
             .get("unsigned")
             .cloned()
             .unwrap_or(Value::Null);
-        for field in ["invite_room_state", "knock_room_state"] {
+        for field in hs_room::routes::render::STRIPPED_STATE_KEYS.iter().copied() {
             for entry in unsigned[field].as_array().into_iter().flatten() {
                 let key = (
                     entry["type"].as_str().unwrap_or("").to_owned(),

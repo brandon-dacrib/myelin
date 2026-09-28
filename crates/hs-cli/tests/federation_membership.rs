@@ -1020,3 +1020,325 @@ async fn a_knock_on_a_room_version_without_knocking_is_forbidden() {
     a.handle.shutdown().await;
     b.handle.shutdown().await;
 }
+
+/// Every event in `events` (an array of client events) that carries stripped state in its
+/// `unsigned`, by event ID.
+fn with_stripped_state(events: &Value) -> Vec<String> {
+    events
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["unsigned"].get("invite_room_state").is_some()
+                || e["unsigned"].get("knock_room_state").is_some()
+        })
+        .map(|e| e["event_id"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+/// The stripped state an invite or knock from another server arrived with is how B describes
+/// the room in bob's `/sync` `invite` and `knock` sections, and nothing else: once he is in the
+/// room, the invite and the knock in his timeline, `/messages` and `/event` are the events as
+/// they are, without it.
+#[tokio::test]
+async fn stripped_state_stays_out_of_the_timeline() {
+    let (a, b) = (start().await, start().await);
+    let client = reqwest::Client::new();
+    let alice = register(&client, &a, "alice").await;
+    let bob = register(&client, &b, "bob").await;
+
+    // An invite: its stripped state is in the invite section, then gone from the events.
+    let invited = create_room(
+        &client,
+        &alice,
+        json!({"preset": "private_chat", "name": "by invitation", "room_version": "11"}),
+    )
+    .await;
+    let (status, body) = post(
+        &client,
+        &alice,
+        &format!("rooms/{invited}/invite"),
+        json!({"user_id": bob.id}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let sync = sync_until(&client, &bob, |s| {
+        s["rooms"]["invite"].get(&invited).is_some()
+    })
+    .await;
+    let invite_state = &sync["rooms"]["invite"][&invited]["invite_state"]["events"];
+    assert_eq!(
+        stripped(invite_state, "m.room.name", "").map(|c| c["name"].clone()),
+        Some(json!("by invitation")),
+        "{invite_state}"
+    );
+
+    // A knock: the same for the knock section.
+    let knocked = create_room(
+        &client,
+        &alice,
+        json!({
+            "preset": "private_chat",
+            "name": "knock first",
+            "room_version": "11",
+            "initial_state": [{
+                "type": "m.room.join_rules",
+                "state_key": "",
+                "content": {"join_rule": "knock"},
+            }],
+        }),
+    )
+    .await;
+    let (status, body) = post(
+        &client,
+        &bob,
+        &format!("knock/{knocked}?server_name={}", a.name),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let sync = sync_until(&client, &bob, |s| {
+        s["rooms"]["knock"].get(&knocked).is_some()
+    })
+    .await;
+    let knock_state = &sync["rooms"]["knock"][&knocked]["knock_state"]["events"];
+    assert_eq!(
+        stripped(knock_state, "m.room.name", "").map(|c| c["name"].clone()),
+        Some(json!("knock first")),
+        "{knock_state}"
+    );
+    let (status, body) = post(
+        &client,
+        &alice,
+        &format!("rooms/{knocked}/invite"),
+        json!({"user_id": bob.id}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    sync_until(&client, &bob, |s| {
+        s["rooms"]["invite"].get(&knocked).is_some()
+    })
+    .await;
+
+    for room in [&invited, &knocked] {
+        let (status, body) = post(&client, &bob, &format!("join/{room}"), json!({})).await;
+        assert_eq!(status, 200, "{body}");
+    }
+    let sync = sync_until(&client, &bob, |s| {
+        s["rooms"]["join"].get(&invited).is_some() && s["rooms"]["join"].get(&knocked).is_some()
+    })
+    .await;
+    for room in [&invited, &knocked] {
+        let timeline = &sync["rooms"]["join"][room]["timeline"]["events"];
+        assert_eq!(
+            with_stripped_state(timeline),
+            Vec::<String>::new(),
+            "{timeline}"
+        );
+        let messages: Value = client
+            .get(format!(
+                "{}/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=50",
+                bob.base
+            ))
+            .bearer_auth(&bob.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let chunk = &messages["chunk"];
+        assert!(
+            chunk
+                .as_array()
+                .is_some_and(|c| c.iter().any(|e| e["content"]["membership"] == "invite")),
+            "the invite is in bob's history: {messages}"
+        );
+        assert_eq!(
+            with_stripped_state(chunk),
+            Vec::<String>::new(),
+            "{messages}"
+        );
+        for event in chunk.as_array().into_iter().flatten() {
+            let event_id = event["event_id"].as_str().unwrap_or_default();
+            let single: Value = client
+                .get(format!(
+                    "{}/_matrix/client/v3/rooms/{room}/event/{event_id}",
+                    bob.base
+                ))
+                .bearer_auth(&bob.token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(
+                with_stripped_state(&json!([single])),
+                Vec::<String>::new(),
+                "{single}"
+            );
+        }
+    }
+
+    a.handle.shutdown().await;
+    b.handle.shutdown().await;
+}
+
+/// Every server bob's client names refuses his restricted join with
+/// `M_UNABLE_TO_AUTHORISE_JOIN` (C is in the room but not in the lobby it allows); B then asks
+/// the servers of the lobby, which it knows from the stripped state bob's knock came back with,
+/// and A, which is in both, authorises the join. Three servers: with two, the only server to
+/// ask and the only one to fall back to would be the same.
+#[tokio::test]
+async fn a_restricted_join_nobody_asked_can_authorise_goes_to_the_allowed_rooms_servers() {
+    let (a, b, c) = (start().await, start().await, start().await);
+    let client = reqwest::Client::new();
+    let alice = register(&client, &a, "alice").await;
+    let bob = register(&client, &b, "bob").await;
+    let carol = register(&client, &c, "carol").await;
+
+    // Version 12: room IDs name no server, so nothing but the client's `via` says where to go.
+    let lobby = create_room(
+        &client,
+        &alice,
+        json!({"preset": "public_chat", "name": "lobby", "room_version": "12"}),
+    )
+    .await;
+    let room = create_room(
+        &client,
+        &alice,
+        json!({
+            "preset": "private_chat",
+            "name": "members only",
+            "room_version": "12",
+            "initial_state": [{
+                "type": "m.room.join_rules",
+                "state_key": "",
+                "content": {
+                    "join_rule": "knock_restricted",
+                    "allow": [{"type": "m.room_membership", "room_id": lobby, "via": [a.name]}],
+                },
+            }],
+        }),
+    )
+    .await;
+    // Carol (C) is invited in: C is in the room, and in no room its join rules allow.
+    let (status, body) = post(
+        &client,
+        &alice,
+        &format!("rooms/{room}/invite"),
+        json!({"user_id": carol.id}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    sync_until(&client, &carol, |s| {
+        s["rooms"]["invite"].get(&room).is_some()
+    })
+    .await;
+    let (status, body) = post(
+        &client,
+        &carol,
+        &format!("join/{room}?server_name={}", a.name),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    // Bob knocks through C, which is how B learns the room's join rules.
+    let (status, body) = post(
+        &client,
+        &bob,
+        &format!("knock/{room}?server_name={}", c.name),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "the knock through C failed: {body}");
+    let (status, body) = post(
+        &client,
+        &bob,
+        &format!("join/{lobby}?server_name={}", a.name),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    // Joining through C alone: C cannot vouch for him, the lobby's server can.
+    let (status, body) = post(
+        &client,
+        &bob,
+        &format!("join/{room}?server_name={}", c.name),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "the restricted join failed: {body}");
+    wait_for_membership(&client, &alice, &room, &bob.id, "join").await;
+    let content = member_content(&client, &alice, &room, &bob.id).await;
+    assert_eq!(
+        content["join_authorised_via_users_server"], alice.id,
+        "{content}"
+    );
+    wait_for_membership(&client, &carol, &room, &bob.id, "join").await;
+    send_message(&client, &bob, &room, "through the lobby's server").await;
+    sync_until(&client, &carol, |s| {
+        timeline_bodies(s, &room).contains(&"through the lobby's server".to_owned())
+    })
+    .await;
+
+    a.handle.shutdown().await;
+    b.handle.shutdown().await;
+    c.handle.shutdown().await;
+}
+
+/// A room version 12 room (MSC4291: the room ID is the create event's ID, the create event
+/// carries no `room_id` and no event cites it in `auth_events`) crosses servers: bob on B is
+/// invited, joins through A, and each side sees the other's messages. Without the implied
+/// create event, B refused the join's snapshot (a create event "for room <none>") and A refused
+/// B's events (no create event in the state their `auth_events` imply).
+#[tokio::test]
+async fn a_version_12_room_is_joined_and_used_across_servers() {
+    let (a, b) = (start().await, start().await);
+    let client = reqwest::Client::new();
+    let alice = register(&client, &a, "alice").await;
+    let bob = register(&client, &b, "bob").await;
+
+    let room_id = create_room(
+        &client,
+        &alice,
+        json!({"preset": "private_chat", "name": "hashed", "room_version": "12"}),
+    )
+    .await;
+    assert!(
+        !room_id.contains(':'),
+        "a version 12 room ID names no server: {room_id}"
+    );
+    let (status, body) = post(
+        &client,
+        &alice,
+        &format!("rooms/{room_id}/invite"),
+        json!({"user_id": bob.id}),
+    )
+    .await;
+    assert_eq!(status, 200, "the invite failed: {body}");
+    sync_until(&client, &bob, |s| {
+        s["rooms"]["invite"].get(&room_id).is_some()
+    })
+    .await;
+    let (status, body) = post(&client, &bob, &format!("join/{room_id}"), json!({})).await;
+    assert_eq!(status, 200, "the join failed: {body}");
+    wait_for_membership(&client, &alice, &room_id, &bob.id, "join").await;
+
+    send_message(&client, &bob, &room_id, "from B").await;
+    sync_until(&client, &alice, |s| {
+        timeline_bodies(s, &room_id).contains(&"from B".to_owned())
+    })
+    .await;
+    send_message(&client, &alice, &room_id, "from A").await;
+    sync_until(&client, &bob, |s| {
+        timeline_bodies(s, &room_id).contains(&"from A".to_owned())
+    })
+    .await;
+
+    a.handle.shutdown().await;
+    b.handle.shutdown().await;
+}

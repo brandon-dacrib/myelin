@@ -138,11 +138,28 @@ pub fn client_event_json(event: &Event) -> serde_json::Value {
             "event_id".to_owned(),
             serde_json::Value::String(event.event_id().to_string()),
         );
-        obj.entry("unsigned")
+        let unsigned = obj
+            .entry("unsigned")
             .or_insert_with(|| serde_json::json!({}));
+        // The stripped state an invite or knock from another server arrived with is kept on
+        // the membership event (`unsigned.invite_room_state`/`knock_room_state`) so `/sync`'s
+        // `invite`/`knock` section can describe a room this server holds nothing else of
+        // (`hs_user::sync`, which reads it from the stored event, not from here). It is not
+        // part of the event: the timeline, `/messages`, `/context` and `/event` show the event
+        // without it.
+        if let Some(unsigned) = unsigned.as_object_mut() {
+            for key in STRIPPED_STATE_KEYS {
+                unsigned.remove(*key);
+            }
+        }
     }
     value
 }
+
+/// The `unsigned` keys under which a membership event received from another server carries the
+/// room's stripped state; never shown to a client as part of the event. See
+/// [`client_event_json`].
+pub const STRIPPED_STATE_KEYS: &[&str] = &["invite_room_state", "knock_room_state"];
 
 /// Attaches `unsigned.transaction_id` if `txn_id` is `Some` -- the client-server API's local-echo
 /// field ("Transaction identifiers": a client matches an optimistic local copy of a message it
