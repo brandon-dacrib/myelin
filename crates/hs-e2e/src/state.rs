@@ -80,6 +80,10 @@ pub struct E2eState<B: KvBackend> {
     /// ([`crate::federation::RemoteKeys`]), once installed. Shared across clones like
     /// `sync_token_resolver`; unset means remote users are skipped.
     remote_keys: Arc<OnceLock<Arc<dyn crate::federation::RemoteKeys>>>,
+    /// Where `/sendToDevice` hands messages for users of other servers
+    /// ([`crate::federation::ToDeviceOutbox`]), once installed. Shared across clones like
+    /// `remote_keys`; unset means such messages are dropped (logged).
+    to_device_outbox: Arc<OnceLock<Arc<dyn crate::federation::ToDeviceOutbox>>>,
     /// Marker so `B` (the backend `E2eState` was constructed over) is nameable in code that
     /// otherwise only touches `store` through the trait object — kept even though `store` itself
     /// erases `B`, so `E2eState<B>: FromRequestParts` bounds line up the same way `RoomState<B>`'s
@@ -131,6 +135,7 @@ impl<B: KvBackend> E2eState<B> {
             store,
             sync_token_resolver: Arc::new(OnceLock::new()),
             remote_keys: Arc::new(OnceLock::new()),
+            to_device_outbox: Arc::new(OnceLock::new()),
             _backend: std::marker::PhantomData,
         }
     }
@@ -168,6 +173,21 @@ impl<B: KvBackend> E2eState<B> {
     #[must_use]
     pub fn remote_keys(&self) -> Option<&Arc<dyn crate::federation::RemoteKeys>> {
         self.remote_keys.get()
+    }
+
+    /// Installs where `/sendToDevice` hands messages addressed to users of other servers
+    /// ([`crate::federation::ToDeviceOutbox`]). Same idempotent-install convention as
+    /// [`E2eState::install_sync_token_resolver`].
+    pub fn install_to_device_outbox(&self, outbox: Arc<dyn crate::federation::ToDeviceOutbox>) {
+        if self.to_device_outbox.set(outbox).is_err() {
+            tracing::warn!("a to-device outbox was already installed on this e2e state; ignoring");
+        }
+    }
+
+    /// The installed [`crate::federation::ToDeviceOutbox`], if any.
+    #[must_use]
+    pub fn to_device_outbox(&self) -> Option<&Arc<dyn crate::federation::ToDeviceOutbox>> {
+        self.to_device_outbox.get()
     }
 }
 

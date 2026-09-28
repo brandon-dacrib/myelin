@@ -37,6 +37,8 @@ ed25519-dalek.workspace = true
 rand_core.workspace = true
 ruma.workspace = true
 ipnet.workspace = true
+# `crate::metrics` (the EDU counters), registered into `hs-telemetry`'s shared registry by hs-cli.
+prometheus-client.workspace = true
 hs-model = { path = "../hs-model" }
 hs-kv = { path = "../hs-kv" }
 hs-tables = { path = "../hs-tables" }

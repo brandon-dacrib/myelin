@@ -1,18 +1,18 @@
 //! `PUT /sendToDevice/{eventType}/{txnId}`.
 //!
-//! Delivery to remote users is a documented seam: track 06's federation client exists, but
-//! inbound transaction processing (and, symmetrically, this crate ever calling out over
-//! federation) does not, so a message addressed to a user on another server is silently dropped
-//! after being logged — the sender still gets a `200 OK` per the spec's fire-and-forget contract
-//! for this endpoint (a to-device message has no delivery receipt), matching what
-//! `PLAN.md`/`docs/workstreams/08-e2ee.md` calls the federation delivery seam. See
-//! `docs/status/08-e2ee.md`.
+//! Messages for this server's users are queued for their devices here. Messages for users of
+//! other servers are grouped by server and handed, as `m.direct_to_device` EDUs, to the installed
+//! [`crate::federation::ToDeviceOutbox`] (in `hs serve`, the federation sender); see
+//! `crate::federation`'s module docs. Without an outbox (federation off) they are dropped and
+//! logged. Either way the sender gets a `200 OK`: a to-device message has no delivery receipt.
 
 use axum::Json;
 use axum::extract::{Path, State};
 use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
-use serde_json::{Value, json};
+use rand::Rng;
+use rand::distr::Alphanumeric;
+use serde_json::{Map, Value, json};
 
 use crate::error::E2eError;
 use crate::state::{E2eRequester, E2eState};
@@ -46,16 +46,19 @@ pub async fn put_send_to_device<B: KvBackend + 'static>(
         .ok_or_else(|| E2eError::BadRequest("missing messages".to_string()))?;
 
     let server_name = state.auth.server_name();
+    // Messages for users of other servers, by server: `{server: {user_id: {device_id: content}}}`.
+    let mut remote: std::collections::BTreeMap<String, Map<String, Value>> =
+        std::collections::BTreeMap::new();
 
     for (user_id_str, per_device) in messages {
         let Ok(recipient) = ruma::UserId::parse(user_id_str.as_str()) else {
             continue;
         };
         if recipient.server_name() != server_name {
-            tracing::debug!(
-                user = %recipient,
-                "to-device message addressed to a remote user; federation delivery is not implemented yet"
-            );
+            remote
+                .entry(recipient.server_name().to_string())
+                .or_default()
+                .insert(user_id_str.clone(), per_device.clone());
             continue;
         }
         let Some(per_device_obj) = per_device.as_object() else {
@@ -102,5 +105,42 @@ pub async fn put_send_to_device<B: KvBackend + 'static>(
         }
     }
 
+    send_remote(&state, &requester.user_id, &event_type, remote);
     Ok(Json(json!({})))
+}
+
+/// Hands each server's share of the messages to the installed outbox, as `m.direct_to_device`
+/// EDUs with a fresh `message_id`, or drops them (logged) when there is no outbox.
+fn send_remote<B: KvBackend + 'static>(
+    state: &E2eState<B>,
+    sender: &ruma::UserId,
+    event_type: &str,
+    remote: std::collections::BTreeMap<String, Map<String, Value>>,
+) {
+    if remote.is_empty() {
+        return;
+    }
+    let Some(outbox) = state.to_device_outbox() else {
+        tracing::debug!(
+            %sender,
+            servers = remote.len(),
+            "to-device messages for users of other servers are dropped: federation is off"
+        );
+        return;
+    };
+    for (server, messages) in remote {
+        let message_id: String = rand::rng()
+            .sample_iter(&Alphanumeric)
+            .take(16)
+            .map(char::from)
+            .collect();
+        for content in crate::federation::direct_to_device_edus(
+            sender.as_str(),
+            event_type,
+            &message_id,
+            messages,
+        ) {
+            outbox.send_direct_to_device(&server, content);
+        }
+    }
 }

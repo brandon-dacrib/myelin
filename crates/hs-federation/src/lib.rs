@@ -17,6 +17,7 @@ pub mod inbound;
 pub mod invite;
 pub mod join;
 pub mod keys;
+pub mod metrics;
 pub mod outbound_join;
 pub mod outbound_membership;
 pub mod outbound_store;

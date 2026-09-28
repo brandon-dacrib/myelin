@@ -1164,15 +1164,18 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         // Ephemeral data across servers (`crate::edus`): EDUs that arrive go to the session hub
         // and the device-list stream; this server's own users' typing, receipts and presence go
         // out through the sender; a key query or claim for a remote user asks their server.
+        // A to-device message for a user of another server goes out through the same sender.
+        // Every EDU sent and received is counted (`hs_federation::metrics`).
+        let edu_metrics = metrics.with_registry(hs_federation::metrics::EduMetrics::register);
+        mount.sender.install_edu_metrics(edu_metrics.clone());
         mount.state.edu_sink = Some(Arc::new(crate::edus::EduDispatcher::new(
             user_state.hub.clone(),
-            e2e_state.store.clone(),
+            e2e_state.clone(),
+            edu_metrics,
         )));
-        user_state
-            .hub
-            .install_edu_outbox(Arc::new(crate::edus::SenderEduOutbox::new(
-                mount.sender.clone(),
-            )));
+        let edu_outbox = Arc::new(crate::edus::SenderEduOutbox::new(mount.sender.clone()));
+        user_state.hub.install_edu_outbox(edu_outbox.clone());
+        e2e_state.install_to_device_outbox(edu_outbox);
         e2e_state.install_remote_keys(Arc::new(crate::edus::ClientRemoteKeys::new(
             mount.client.clone(),
         )));

@@ -1,7 +1,10 @@
 //! Ephemeral data between two in-process servers (`federation_two_servers.rs` is the pattern):
 //! typing, read receipts and presence cross in both directions, a device added on either
 //! server is a device-list change for the other's users, and the other's `/keys/query` for that
-//! user returns the new device, asked of the server that holds it.
+//! user returns the new device, asked of the server that holds it. To-device messages cross in
+//! both directions and arrive once, and a cross-signing key change is an `m.signing_key_update`
+//! that makes the user a device-list change on the other server, whose `/keys/query` then returns
+//! the new master key. Each server's `/metrics` counts the EDUs it sent and received.
 
 use std::time::{Duration, Instant};
 
@@ -19,7 +22,7 @@ fn config(port: u16, data_dir: &std::path::Path) -> hs_config::Config {
     let media_dir = data_dir.join("media");
     let yaml = format!(
         "server:\n  server_name: \"127.0.0.1:{port}\"\n\
-         listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, federation, health]\n\
+         listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, federation, health, metrics]\n\
          storage:\n  backend: embedded\n  data_dir: {data_dir:?}\n\
          media:\n  storage:\n    backend: local\n    path: {media_dir:?}\n\
          auth:\n  enable_registration: true\n\
@@ -522,6 +525,289 @@ async fn a_device_added_on_one_server_is_a_device_list_change_on_the_other() {
     assert_eq!(
         keys["device_keys"][&alice.id][&alice.device]["keys"][format!("ed25519:{}", alice.device)],
         alice_key.as_str(),
+        "B's /keys/query for alice: {keys}"
+    );
+}
+
+/// The value of one sample line of `server`'s `/metrics`, `0` when it is not there.
+async fn metric(client: &reqwest::Client, server: &Server, sample: &str) -> u64 {
+    let text = client
+        .get(format!("{}/metrics", server.base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    text.lines()
+        .find_map(|line| line.strip_prefix(sample)?.trim().parse::<f64>().ok())
+        .map_or(0, |v| v as u64)
+}
+
+/// Waits until `sample` on `server`'s `/metrics` reaches `at_least`.
+async fn metric_reaches(client: &reqwest::Client, server: &Server, sample: &str, at_least: u64) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let value = metric(client, server, sample).await;
+        if value >= at_least {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{sample} on {} stayed at {value}, below {at_least}",
+            server.name
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Every to-device event in `sync` from `sender` of type `event_type`.
+fn to_device_from<'a>(sync: &'a Value, sender: &str, event_type: &str) -> Vec<&'a Value> {
+    sync["to_device"]["events"]
+        .as_array()
+        .map(|events| {
+            events
+                .iter()
+                .filter(|e| e["sender"] == sender && e["type"] == event_type)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Syncs `user` on `base` incrementally from `since` until `wanted` to-device events from
+/// `sender` of type `event_type` have arrived, then once more after a pause to make sure nothing
+/// arrives twice. Returns their contents in arrival order.
+async fn to_device_arrivals(
+    client: &reqwest::Client,
+    base: &str,
+    user: &User,
+    since: &str,
+    sender: &str,
+    event_type: &str,
+    wanted: usize,
+) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut since = since.to_owned();
+    let mut seen = Vec::new();
+    let mut settled = false;
+    loop {
+        let response: Value = client
+            .get(format!(
+                "{base}/_matrix/client/v3/sync?timeout=500&since={since}"
+            ))
+            .bearer_auth(&user.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        seen.extend(
+            to_device_from(&response, sender, event_type)
+                .into_iter()
+                .map(|e| e["content"].clone()),
+        );
+        since = response["next_batch"].as_str().unwrap().to_owned();
+        if seen.len() >= wanted {
+            if settled {
+                return seen;
+            }
+            // One more round after the arrivals: a duplicate would show up here.
+            settled = true;
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            continue;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "only {} of {wanted} to-device messages from {sender} reached {}: {seen:?}",
+            seen.len(),
+            user.id
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn to_device_messages_cross_between_servers_in_both_directions_once() {
+    let a = start(reserve_port()).await;
+    let b = start(reserve_port()).await;
+    let client = reqwest::Client::new();
+    let alice = register(&client, &a.base, "alice").await;
+    let bob = register(&client, &b.base, "bob").await;
+    // To-device messages need no shared room.
+    let alice_since =
+        sync_until(&client, &a.base, &alice.token, None, "a sync", |_| true).await["next_batch"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    let bob_since =
+        sync_until(&client, &b.base, &bob.token, None, "a sync", |_| true).await["next_batch"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+    // A to B: two messages to bob's device, in two requests.
+    for (txn, n) in [("t1", 1), ("t2", 2)] {
+        call(
+            &client,
+            reqwest::Method::PUT,
+            format!(
+                "{}/_matrix/client/v3/sendToDevice/m.test.ping/{txn}",
+                a.base
+            ),
+            &alice.token,
+            json!({"messages": {bob.id.clone(): {bob.device.clone(): {"n": n}}}}),
+        )
+        .await;
+    }
+    // A client retrying a request is not a third message.
+    call(
+        &client,
+        reqwest::Method::PUT,
+        format!("{}/_matrix/client/v3/sendToDevice/m.test.ping/t2", a.base),
+        &alice.token,
+        json!({"messages": {bob.id.clone(): {bob.device.clone(): {"n": 2}}}}),
+    )
+    .await;
+    let arrived = to_device_arrivals(
+        &client,
+        &b.base,
+        &bob,
+        &bob_since,
+        &alice.id,
+        "m.test.ping",
+        2,
+    )
+    .await;
+    assert_eq!(arrived, [json!({"n": 1}), json!({"n": 2})]);
+
+    // B to A: to every device of alice's (`*`), and a message for a user of B in the same
+    // request stays on B.
+    call(
+        &client,
+        reqwest::Method::PUT,
+        format!("{}/_matrix/client/v3/sendToDevice/m.test.pong/u1", b.base),
+        &bob.token,
+        json!({"messages": {
+            alice.id.clone(): {"*": {"from": "bob"}},
+            bob.id.clone(): {bob.device.clone(): {"from": "bob, to himself"}},
+        }}),
+    )
+    .await;
+    let arrived = to_device_arrivals(
+        &client,
+        &a.base,
+        &alice,
+        &alice_since,
+        &bob.id,
+        "m.test.pong",
+        1,
+    )
+    .await;
+    assert_eq!(arrived, [json!({"from": "bob"})]);
+
+    // Each server counted what it sent and what it received.
+    metric_reaches(
+        &client,
+        &a,
+        r#"hs_federation_edus_sent_total{edu_type="m.direct_to_device"}"#,
+        2,
+    )
+    .await;
+    metric_reaches(
+        &client,
+        &b,
+        r#"hs_federation_edus_received_total{edu_type="m.direct_to_device",outcome="applied"}"#,
+        2,
+    )
+    .await;
+    metric_reaches(
+        &client,
+        &a,
+        r#"hs_federation_edus_received_total{edu_type="m.direct_to_device",outcome="applied"}"#,
+        1,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_cross_signing_key_change_is_a_signing_key_update_on_the_other_server() {
+    let a = start(reserve_port()).await;
+    let b = start(reserve_port()).await;
+    let client = reqwest::Client::new();
+    let alice = register(&client, &a.base, "alice").await;
+    let bob = register(&client, &b.base, "bob").await;
+    shared_room(&client, &a, &b, &alice, &bob).await;
+
+    // Alice's device uploads its keys, as every client does first, and B hears of it: A has
+    // announced alice's devices, so what follows is a change to her cross-signing keys alone.
+    let since =
+        sync_until(&client, &b.base, &bob.token, None, "a sync", |_| true).await["next_batch"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    upload_keys(&client, &a.base, &alice, &alice.token, &alice.device).await;
+    let caught_up = sync_until(
+        &client,
+        &b.base,
+        &bob.token,
+        Some(&since),
+        "alice's device keys on B",
+        |s| device_list_changed(s, &alice.id),
+    )
+    .await;
+    let since = caught_up["next_batch"].as_str().unwrap().to_owned();
+
+    // Alice sets up cross-signing: a master key (the one key that needs no signature).
+    let master = json!({
+        "user_id": alice.id,
+        "usage": ["master"],
+        "keys": {"ed25519:alicemasterkey": "alicemasterkey"},
+    });
+    call(
+        &client,
+        reqwest::Method::POST,
+        format!("{}/_matrix/client/v3/keys/device_signing/upload", a.base),
+        &alice.token,
+        json!({"master_key": master}),
+    )
+    .await;
+
+    // Bob is told to look again, by an `m.signing_key_update` from A...
+    sync_until(
+        &client,
+        &b.base,
+        &bob.token,
+        Some(&since),
+        "alice's cross-signing change on B",
+        |s| device_list_changed(s, &alice.id),
+    )
+    .await;
+    metric_reaches(
+        &client,
+        &b,
+        r#"hs_federation_edus_received_total{edu_type="m.signing_key_update",outcome="applied"}"#,
+        1,
+    )
+    .await;
+    metric_reaches(
+        &client,
+        &a,
+        r#"hs_federation_edus_sent_total{edu_type="m.signing_key_update"}"#,
+        1,
+    )
+    .await;
+    // ...and, looking, finds the new master key, asked of A.
+    let keys = call(
+        &client,
+        reqwest::Method::POST,
+        format!("{}/_matrix/client/v3/keys/query", b.base),
+        &bob.token,
+        json!({"device_keys": {alice.id.clone(): []}}),
+    )
+    .await;
+    assert_eq!(
+        keys["master_keys"][&alice.id]["keys"]["ed25519:alicemasterkey"], "alicemasterkey",
         "B's /keys/query for alice: {keys}"
     );
 }

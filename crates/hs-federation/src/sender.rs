@@ -215,6 +215,8 @@ struct Shared {
     /// PDUs queued and not yet accepted or dropped, across every destination.
     pending_total: AtomicUsize,
     shut_down: AtomicBool,
+    /// Where accepted EDUs are counted, once installed ([`FederationSender::install_edu_metrics`]).
+    edu_metrics: std::sync::OnceLock<crate::metrics::EduMetrics>,
 }
 
 struct DestinationQueue {
@@ -344,8 +346,17 @@ impl FederationSender {
                 txn_counter: AtomicU64::new(0),
                 pending_total: AtomicUsize::new(0),
                 shut_down: AtomicBool::new(false),
+                edu_metrics: std::sync::OnceLock::new(),
             }),
             queues: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Counts every EDU in a transaction a destination accepts into `metrics`
+    /// (`hs_federation_edus_sent_total`). A second install is ignored.
+    pub fn install_edu_metrics(&self, metrics: crate::metrics::EduMetrics) {
+        if self.shared.edu_metrics.set(metrics).is_err() {
+            tracing::warn!("EDU metrics were already installed on this sender; ignoring");
         }
     }
 
@@ -1012,6 +1023,7 @@ impl Shared {
                         edus = edus.len(),
                         "federation transaction accepted"
                     );
+                    self.record_edus_sent(destination, txn_id, edus);
                     if let Err(error) = self.store.record_success(destination) {
                         tracing::error!(destination, %error, "cannot record an outbound success");
                     }
@@ -1090,6 +1102,20 @@ impl Shared {
             };
             if !keep_going {
                 return Delivery::ShutDown;
+            }
+        }
+    }
+
+    /// Logs (at debug) and counts each EDU of a transaction `destination` accepted.
+    fn record_edus_sent(&self, destination: &str, txn_id: &str, edus: &[Arc<Value>]) {
+        for edu in edus {
+            let edu_type = edu
+                .get("edu_type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            tracing::debug!(destination, txn_id, edu_type, "EDU sent");
+            if let Some(metrics) = self.edu_metrics.get() {
+                metrics.record_sent(edu_type);
             }
         }
     }
@@ -1573,6 +1599,7 @@ mod tests {
             txn_counter: AtomicU64::new(0),
             pending_total: AtomicUsize::new(0),
             shut_down: AtomicBool::new(false),
+            edu_metrics: std::sync::OnceLock::new(),
         };
         assert_eq!(shared.backoff(1), Duration::from_millis(100));
         assert_eq!(shared.backoff(2), Duration::from_millis(200));
@@ -1855,12 +1882,15 @@ mod tests {
     }
 
     /// An EDU goes out in the same transaction as the PDUs waiting with it, in the spec's
-    /// `{edu_type, content}` shape; one queued on its own gets a transaction of its own.
+    /// `{edu_type, content}` shape; one queued on its own gets a transaction of its own. Each is
+    /// counted as sent, by type, once the destination has accepted it.
     #[tokio::test]
     async fn an_edu_rides_with_waiting_pdus_and_goes_alone_when_nothing_waits() {
         let peer = FakeFederationPeer::new("peer.example.org");
         let (destination, _auth) = spawn_peer(&peer).await;
         let sender = FederationSender::with_config(client(), US, fast());
+        let metrics = crate::metrics::EduMetrics::default();
+        sender.install_edu_metrics(metrics.clone());
 
         // Nothing has yielded to the worker between these two, so it finds both.
         sender.enqueue_pdu([destination.clone()], pdu(0));
@@ -1894,6 +1924,11 @@ mod tests {
             requests[1].body["edus"],
             serde_json::json!([{"edu_type": "m.presence", "content": {"push": []}}])
         );
+        assert!(
+            wait_for(Duration::from_secs(10), || metrics.sent("m.presence") == 1).await,
+            "the accepted presence EDU is counted"
+        );
+        assert_eq!(metrics.sent("m.typing"), 1);
         assert_ne!(
             requests[0].path, requests[1].path,
             "each is its own transaction"
