@@ -408,6 +408,29 @@ What is *not* in those percentages, and should temper them: no security review, 
 beyond a loadgen harness, `cargo fuzz` never run, Sytest never run, and no bridge has yet
 carried a message through an encrypted room. Each of those has historically found things.
 
+## Admin session (2026-09-28, evening): merging the admin branches, then what is left
+
+The owner asked for the admin area only, documented, committed and pushed at every step. This
+section is the running log; the newest line is the last.
+
+**Admin coverage.** `main` has 140 of 158 operations. The other 18 are all on two finished
+branches: `agent/user-moderation` (14: suspend, shadow-ban, rate limit, login-as, redact,
+media, sessions, memberships, statistics) and `agent/admin-followups` (4: federation keys
+list/get/refresh, rooms shared with a destination). Merging both makes it **158 of 158**.
+
+**Order:** `agent/root-redirect` (docs-only conflict, resolved and pushed as `c4bd4fd`), then
+`agent/user-moderation`, then `agent/admin-followups` rebased onto that. After the merges, the
+next admin work is the list under "3. Make it fun to administer", starting with a per-setting
+configuration history and revert (`ConfigStore` already records the patch per revision).
+
+- 17:26 the queue refused `agent/user-moderation` on rebase conflicts (`hs-admin` router,
+  `hs-room` registry, `web/src/test/setup.ts`); a background agent is rebasing it in
+  `.claude/worktrees/agent-ae0d1e0ef71b2441f` and checking the mock `e2e/cluster.spec.ts:43`
+  failure from its last gate.
+- 17:40 `agent/root-redirect` rebased (conflict only in status 15) and handed to
+  `tools/merge-queue.sh`. Its previous gate failed only on `cluster_admin`'s drain test (the
+  ownership bug `agent/two-pod-cluster-2` fixes); if that recurs it waits for that branch.
+
 ## Handover (2026-09-28, 16:00 EDT): where the nine resumed agents stopped
 
 The owner stopped the session at 93% of weekly usage. The nine agents cut off by the usage limit
