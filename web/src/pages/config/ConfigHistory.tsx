@@ -1,24 +1,74 @@
 /**
- * Who changed this section, and when.
+ * Which setting changed, who changed it, when — and a way back.
  *
- * `crates/hs-config/src/store.rs` keeps a `history/<revision>` record per
- * write "so the web interface can show what changed and when", but no
- * operation in `crates/hs-admin/openapi/openapi.yaml` exposes it — there is
- * no `GET /config/{section}/history`. What the API does expose is the audit
- * log, which records configuration writes under the `config_section`
- * resource type, so that is what this reads. The trade is that the audit
- * entry says *that* the section changed and by whom, not *which settings*;
- * the per-setting diff would need the store's own history endpoint.
+ * Reads `GET /config/{section}/history` (`config.history.list`): every write
+ * to the section, newest first, one row per setting it touched with what the
+ * database held before and what the write left. Secrets arrive redacted on
+ * both sides, so a row for one says only that it changed.
+ *
+ * Revert is `POST /config/{section}/history/{revision}/revert`: the server
+ * puts the settings back from its own record — a secret included, which is
+ * why the interface never needs to hold one — as a new revision. The dialog
+ * says what will change before anything is sent; a `409` (a later change
+ * wrote the same settings) is shown in the same dialog with what it would
+ * also undo, and the operator may go ahead anyway.
+ *
+ * The page of history is in the URL (`?history=<cursor>`), so it survives a
+ * reload and can be linked to.
  */
-import { History } from "lucide-react";
-import { useConfigHistory } from "@/api/config";
+import { useMemo, useState } from "react";
+import { ArrowRight, History, RotateCcw, TriangleAlert } from "lucide-react";
+import {
+  useConfigHistory,
+  useRevertConfigChange,
+  type ConfigChange,
+  type ConfigSettingChange,
+} from "@/api/config";
+import { classifyError, type Problem } from "@/api/problem";
 import { QueryProblemState } from "@/components/QueryProblemState";
 import { RelativeTime } from "@/components/RelativeTime";
 import { Badge } from "@/components/ui/badge/Badge";
+import { Button } from "@/components/ui/button/Button";
+import { Dialog, DialogClose, DialogContent } from "@/components/ui/dialog/Dialog";
 import { SkeletonText } from "@/components/ui/skeleton/Skeleton";
+import { toast } from "@/components/ui/toast/toast-store";
+import {
+  describeChange,
+  describeRevert,
+  labelFor,
+  settingLabels,
+  type ChangeWords,
+} from "@/lib/config-history";
+import type { SettingGroup } from "@/lib/config-model";
 
-export function ConfigHistory({ section }: { section: string }) {
-  const { data, isLoading, isError, error, refetch } = useConfigHistory(section);
+export interface ConfigHistoryProps {
+  section: string;
+  /** The section's form model, for naming settings the way the form does. */
+  model: SettingGroup;
+  /** The section's current `ETag`, sent as `If-Match` with a revert. */
+  etag: string | null;
+  canWrite: boolean;
+  reloadable: boolean;
+  /** The page of history to show (`?history=`); newest when absent. */
+  cursor?: string;
+  onCursorChange: (cursor: string | undefined) => void;
+}
+
+export function ConfigHistory({
+  section,
+  model,
+  etag,
+  canWrite,
+  reloadable,
+  cursor,
+  onCursorChange,
+}: ConfigHistoryProps) {
+  const { data, isLoading, isError, error, refetch, isFetching } = useConfigHistory(
+    section,
+    cursor,
+  );
+  const labels = useMemo(() => settingLabels(model), [model]);
+  const [reverting, setReverting] = useState<ConfigChange | null>(null);
 
   return (
     <section aria-labelledby="config-history-heading">
@@ -43,29 +93,239 @@ export function ConfigHistory({ section }: { section: string }) {
         <div className="mt-3">
           <SkeletonText lines={3} />
         </div>
-      ) : (data?.length ?? 0) === 0 ? (
+      ) : (data?.items.length ?? 0) === 0 ? (
         <p className="mt-3 text-sm text-text-muted">
-          Nothing has changed this section since the audit log started.
+          {cursor ? "No older changes." : "Nothing has changed this section yet."}
         </p>
       ) : (
-        <ul className="mt-3 divide-y divide-border rounded-md border border-border">
-          {data?.map((entry) => {
-            const failed = (entry.outcome?.status ?? 200) >= 400;
-            return (
-              <li key={entry.id} className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-3">
+        <ol className="mt-3 divide-y divide-border rounded-md border border-border">
+          {data?.items.map((change) => (
+            <li key={change.revision} className="px-4 py-3">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
                 <span className="font-identifier text-sm text-text">
-                  {entry.actor?.display_name ?? entry.actor?.id ?? "unknown"}
+                  {change.actor ?? "unknown"}
                 </span>
-                <span className="text-sm text-text-muted">{entry.action}</span>
-                {failed && <Badge status="danger">Rejected</Badge>}
-                <span className="ml-auto text-xs text-text-muted">
-                  <RelativeTime at={entry.recorded_at} />
+                <span className="text-xs text-text-muted">
+                  <RelativeTime at={change.at} />
                 </span>
-              </li>
-            );
-          })}
-        </ul>
+                <span className="text-xs text-text-faint">revision {change.revision}</span>
+                {change.reverts !== null && (
+                  <Badge status="info" hideIcon>
+                    Reverts revision {change.reverts}
+                  </Badge>
+                )}
+                {canWrite && change.revertible && change.settings.length > 0 && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="ml-auto"
+                    aria-label={`Revert revision ${change.revision}`}
+                    onClick={() => setReverting(change)}
+                  >
+                    <RotateCcw size={14} aria-hidden="true" />
+                    Revert
+                  </Button>
+                )}
+                {!change.revertible && (
+                  <span className="ml-auto text-xs text-text-faint">
+                    Earlier values not recorded
+                  </span>
+                )}
+              </div>
+              <ul className="mt-1.5 flex flex-col gap-1">
+                {change.settings.map((row) => (
+                  <SettingLine
+                    key={row.pointer}
+                    label={labelFor(labels, row.path)}
+                    words={describeChange(row)}
+                    path={row.path}
+                  />
+                ))}
+              </ul>
+            </li>
+          ))}
+        </ol>
+      )}
+
+      {(cursor || data?.next_cursor) && (
+        <nav aria-label="Change history pages" className="mt-3 flex justify-between gap-2">
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={!cursor || isFetching}
+            onClick={() => onCursorChange(data?.prev_cursor ?? undefined)}
+          >
+            Newer changes
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={!data?.next_cursor || isFetching}
+            onClick={() => onCursorChange(data?.next_cursor ?? undefined)}
+          >
+            Older changes
+          </Button>
+        </nav>
+      )}
+
+      {reverting && (
+        <RevertDialog
+          change={reverting}
+          section={section}
+          sectionLabel={model.label}
+          labels={labels}
+          etag={etag}
+          reloadable={reloadable}
+          onClose={() => setReverting(null)}
+          onReverted={() => onCursorChange(undefined)}
+        />
       )}
     </section>
   );
+}
+
+function SettingLine({ label, words, path }: { label: string; words: ChangeWords; path: string }) {
+  return (
+    <li className="flex flex-wrap items-baseline gap-x-2 text-sm" title={path}>
+      <span className="text-text">{label}:</span>
+      <span className="font-identifier text-text-muted">{words.from}</span>
+      <ArrowRight size={12} aria-hidden="true" className="self-center text-text-faint" />
+      <span className="sr-only">to</span>
+      <span className="font-identifier text-text">{words.to}</span>
+    </li>
+  );
+}
+
+interface RevertDialogProps {
+  change: ConfigChange;
+  section: string;
+  sectionLabel: string;
+  labels: Map<string, string>;
+  etag: string | null;
+  reloadable: boolean;
+  onClose: () => void;
+  onReverted: () => void;
+}
+
+function RevertDialog({
+  change,
+  section,
+  sectionLabel,
+  labels,
+  etag,
+  reloadable,
+  onClose,
+  onReverted,
+}: RevertDialogProps) {
+  const revert = useRevertConfigChange();
+  // A 409 from the first attempt: later changes wrote the same settings.
+  const [conflict, setConflict] = useState<Problem | null>(null);
+
+  function submit() {
+    revert.mutate(
+      { section, revision: change.revision, etag, force: conflict !== null },
+      {
+        onSuccess: () => {
+          toast({
+            title: `Revision ${change.revision} reverted`,
+            description: reloadable
+              ? `${sectionLabel} is back as it was before it, on the running server.`
+              : `${sectionLabel} is back as it was before it. It takes effect the next time this server restarts.`,
+          });
+          onClose();
+          onReverted();
+        },
+        onError: (err) => {
+          const { kind, problem } = classifyError(err);
+          if (problem?.status === 409 && conflict === null && (problem.errors?.length ?? 0) > 0) {
+            setConflict(problem);
+            return;
+          }
+          onClose();
+          if (problem?.status === 412) {
+            toast({
+              title: "Someone else changed this section",
+              description: "The page now shows their change. Look again before reverting.",
+              variant: "danger",
+            });
+            return;
+          }
+          toast({
+            title:
+              kind === "forbidden"
+                ? "Not allowed to change this section"
+                : (problem?.title ?? "Could not revert"),
+            description: problem?.detail,
+            variant: "danger",
+          });
+        },
+      },
+    );
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent
+        size="form"
+        title={`Revert revision ${change.revision}?`}
+        description={
+          reloadable
+            ? "These settings go back to what they were before this change, on the running server straight away."
+            : "These settings go back to what they were before this change. It takes effect the next time the server restarts."
+        }
+        footer={
+          <>
+            <DialogClose asChild>
+              <Button variant="secondary">Keep as it is</Button>
+            </DialogClose>
+            <Button
+              variant={conflict ? "danger" : "primary"}
+              disabled={revert.isPending}
+              onClick={submit}
+            >
+              {revert.isPending ? "Reverting…" : conflict ? "Revert anyway" : "Revert"}
+            </Button>
+          </>
+        }
+      >
+        <ul className="flex flex-col gap-1 rounded-md border border-border px-3 py-2.5">
+          {change.settings.map((row: ConfigSettingChange) => (
+            <SettingLine
+              key={row.pointer}
+              label={labelFor(labels, row.path)}
+              words={describeRevert(row)}
+              path={row.path}
+            />
+          ))}
+        </ul>
+        {conflict && (
+          <div
+            role="alert"
+            className="mt-4 flex items-start gap-2 rounded-md border border-warning-border bg-warning-bg p-3 text-sm text-warning"
+          >
+            <TriangleAlert size={16} aria-hidden="true" className="mt-0.5 shrink-0" />
+            <div>
+              <p>Later changes wrote some of the same settings. Reverting undoes them too:</p>
+              <ul className="mt-1 list-disc pl-5">
+                {conflict.errors?.map((e, i) => (
+                  <li key={`${e.pointer}-${i}`}>
+                    {labelFor(labels, pointerToPath(e.pointer))} — {e.detail}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/** `/rate_limits/login/per_second` → `rate_limits.login.per_second`. */
+function pointerToPath(pointer: string): string {
+  return pointer
+    .split("/")
+    .slice(1)
+    .map((t) => t.replace(/~1/g, "/").replace(/~0/g, "~"))
+    .join(".");
 }

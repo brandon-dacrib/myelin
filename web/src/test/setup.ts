@@ -14,6 +14,7 @@ import { resetRoomContents } from "@/mocks/data/room-contents";
 import { resetMigration } from "@/mocks/data/migration";
 import { resetUserModeration } from "@/mocks/data/user-moderation";
 import { resetMockEvents } from "@/mocks/data/events";
+import { resetConfigHistory } from "@/mocks/data/config";
 
 /**
  * Give the API client an absolute base URL before anything imports it.
@@ -96,5 +97,7 @@ afterEach(() => {
   resetUserModeration();
   // And the event streams a test opened.
   resetMockEvents();
+  // And each configuration section's per-setting history (saves and reverts add to it).
+  resetConfigHistory();
 });
 afterAll(() => server.close());

@@ -285,6 +285,10 @@ const configurationRoute = createRoute({
 const configSectionRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/configuration/$section",
+  // `?history=` is the page of the section's change history on show (ConfigHistory).
+  validateSearch: (search: Record<string, unknown>): { history?: string } => ({
+    history: typeof search.history === "string" && search.history ? search.history : undefined,
+  }),
   component: ConfigSectionPage,
 });
 

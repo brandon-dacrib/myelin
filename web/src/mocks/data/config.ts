@@ -1637,3 +1637,207 @@ export function recordConfigChange(section: string, revision: number): void {
     outcome: { status: 200, problem: null },
   });
 }
+
+// ---------------------------------------------------------------------------
+// Per-setting history (`config.history.list`, `config.history.revert`)
+// ---------------------------------------------------------------------------
+
+/**
+ * One recorded write, the way `hs_config::store::ChangeRecord` keeps it: the
+ * patch, and what each setting it touched held before. `before` is `null` for
+ * a record from before the server kept prior values (it can be shown, not
+ * reverted); inside it, `undefined` means the setting was not set.
+ */
+export interface MockConfigRecord {
+  revision: number;
+  section: string;
+  patch: Record<string, JsonValue>;
+  actor: string;
+  at: string;
+  before: Record<string, JsonValue | undefined> | null;
+  reverts: number | null;
+}
+
+const minutesAgo = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
+
+/** Oldest first. Revisions are per section here, as the mock's `ETag`s are. */
+export const configHistory: MockConfigRecord[] = [
+  {
+    revision: 5,
+    section: "rate_limits",
+    patch: { enabled: true },
+    actor: "@deploy:example.org",
+    at: minutesAgo(40 * 60),
+    before: null,
+    reverts: null,
+  },
+  {
+    revision: 6,
+    section: "rate_limits",
+    patch: { login: { per_second: 0.17 } },
+    actor: "@admin:example.org",
+    at: minutesAgo(32 * 60),
+    before: { "/login/per_second": 0.1 },
+    reverts: null,
+  },
+  {
+    revision: 7,
+    section: "rate_limits",
+    patch: { message: { burst_count: 25 }, login: { burst_count: 5 } },
+    actor: "@admin:example.org",
+    at: minutesAgo(3 * 60),
+    before: { "/message/burst_count": 20, "/login/burst_count": 3 },
+    reverts: null,
+  },
+  {
+    revision: 3,
+    section: "auth",
+    patch: { enable_registration: true },
+    actor: "@admin:example.org",
+    at: minutesAgo(33 * 60),
+    before: { "/enable_registration": false },
+    reverts: null,
+  },
+  {
+    revision: 4,
+    section: "auth",
+    // The mock keeps the secrets themselves here, as the real store does; they are redacted on
+    // the way out (`configChangeBody`), never stored as the placeholder.
+    patch: { registration_shared_secret: "rotated-by-deploy" },
+    actor: "@deploy:example.org",
+    at: minutesAgo(31 * 60),
+    before: { "/registration_shared_secret": "the-first-one" },
+    reverts: null,
+  },
+  {
+    revision: 3,
+    section: "federation",
+    patch: { client_timeout: "45s" },
+    actor: "@admin:example.org",
+    at: minutesAgo(26),
+    before: { "/client_timeout": "30s" },
+    reverts: null,
+  },
+];
+
+const pristineHistory = structuredClone(configHistory);
+
+/** Puts the history back as seeded (the tests' `afterEach`). */
+export function resetConfigHistory(): void {
+  configHistory.splice(0, configHistory.length, ...structuredClone(pristineHistory));
+}
+
+function pointerTokens(pointer: string): string[] {
+  return pointer
+    .split("/")
+    .slice(1)
+    .map((t) => t.replace(/~1/g, "/").replace(/~0/g, "~"));
+}
+
+/** A merge patch that sets `pointer` to `value` (`null`: removes it). */
+function patchFor(pointer: string, value: JsonValue): Record<string, JsonValue> {
+  let patch: JsonValue = value;
+  for (const token of pointerTokens(pointer).reverse()) patch = { [token]: patch };
+  return patch as Record<string, JsonValue>;
+}
+
+/** What each setting `patch` touches holds in `values` now. */
+export function beforeValues(
+  values: Record<string, JsonValue>,
+  patch: JsonValue,
+): Record<string, JsonValue | undefined> {
+  return Object.fromEntries(patchPointers(patch).map((p) => [p, valueAt(values, p)]));
+}
+
+export function recordConfigHistory(
+  section: string,
+  revision: number,
+  patch: Record<string, JsonValue>,
+  before: Record<string, JsonValue | undefined>,
+  reverts: number | null = null,
+): void {
+  configHistory.push({
+    revision,
+    section,
+    patch,
+    actor: "@admin:example.org",
+    at: new Date().toISOString(),
+    before,
+    reverts,
+  });
+}
+
+/** A record as `GET /config/{section}/history` answers it: per setting, secrets redacted. */
+export function configChangeBody(record: MockConfigRecord) {
+  const side = (value: JsonValue | undefined, secret: boolean) =>
+    value === undefined || value === null
+      ? { set: false }
+      : { set: true, value: secret ? { $secret: true } : value };
+  let patch: JsonValue = record.patch;
+  for (const relative of patchPointers(record.patch)) {
+    if (SECRET_POINTERS.includes(`/${record.section}${relative}`)) {
+      patch = mergePatch(patch, patchFor(relative, { $secret: true }));
+    }
+  }
+  return {
+    revision: record.revision,
+    section: record.section,
+    patch,
+    actor: record.actor,
+    at: record.at,
+    reverts: record.reverts,
+    revertible: record.before !== null,
+    settings: patchPointers(record.patch).map((relative) => {
+      const pointer = `/${record.section}${relative}`;
+      const after = valueAt(record.patch, relative);
+      const before = record.before?.[relative];
+      const secret =
+        SECRET_POINTERS.includes(pointer) ||
+        isSecretMarker(after ?? null) ||
+        isSecretMarker(before ?? null);
+      return {
+        pointer,
+        path: pointerTokens(pointer).join("."),
+        secret,
+        from: record.before === null ? null : side(before, secret),
+        to: side(after, secret),
+      };
+    }),
+  };
+}
+
+/** Later records of the same section that wrote a setting `record` touched, as `errors[]`. */
+export function revertConflicts(record: MockConfigRecord): { pointer: string; detail: string }[] {
+  const touched = Object.keys(record.before ?? {});
+  const overlaps = (a: string, b: string) =>
+    a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+  return configHistory
+    .filter((later) => later.section === record.section && later.revision > record.revision)
+    .flatMap((later) =>
+      patchPointers(later.patch)
+        .filter((p) => touched.some((t) => overlaps(t, p)))
+        .map((p) => ({
+          pointer: `/${record.section}${p}`,
+          detail: `changed again in revision ${later.revision} by ${later.actor} at ${later.at}`,
+        })),
+    );
+}
+
+/** The merge patch that puts every setting `record` touched back as it was. */
+export function revertPatch(record: MockConfigRecord): Record<string, JsonValue> {
+  let patch: JsonValue = {};
+  for (const [pointer, value] of Object.entries(record.before ?? {})) {
+    patch = combinePatches(patch, patchFor(pointer, value === undefined ? null : value));
+  }
+  return patch as Record<string, JsonValue>;
+}
+
+/** Combines two merge patches, keeping their `null`s (removals) rather than applying them. */
+function combinePatches(target: JsonValue, patch: JsonValue): JsonValue {
+  if (!isObject(patch) || !isObject(target)) return patch;
+  const out: Record<string, JsonValue> = { ...target };
+  for (const [key, value] of Object.entries(patch)) {
+    out[key] = key in out ? combinePatches(out[key], value) : value;
+  }
+  return out;
+}

@@ -17,7 +17,7 @@
  *   restart.
  */
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
-import { Link, useParams, useRouterState } from "@tanstack/react-router";
+import { Link, useNavigate, useParams, useRouterState, useSearch } from "@tanstack/react-router";
 import { ChevronLeft, Lock, TriangleAlert } from "lucide-react";
 import {
   useConfigSchema,
@@ -115,6 +115,8 @@ interface SectionFormProps {
 
 function SectionForm({ section, data, schema, schemaSettled, onReread }: SectionFormProps) {
   const hash = useRouterState({ select: (s) => s.location.hash });
+  const search: { history?: string } = useSearch({ strict: false });
+  const navigate = useNavigate();
   const canWrite = hasScope("admin:write");
   const update = useUpdateConfigSection();
   const validate = useValidateConfig();
@@ -419,7 +421,20 @@ function SectionForm({ section, data, schema, schemaSettled, onReread }: Section
       )}
 
       <div className="mt-10">
-        <ConfigHistory section={section} />
+        <ConfigHistory
+          section={section}
+          model={model}
+          etag={data.etag}
+          canWrite={canWrite && !bootstrap}
+          reloadable={reloadable}
+          cursor={search.history}
+          onCursorChange={(history) =>
+            void navigate({
+              to: ".",
+              search: (previous: Record<string, unknown>) => ({ ...previous, history }),
+            })
+          }
+        />
       </div>
 
       {changes.length > 0 && (

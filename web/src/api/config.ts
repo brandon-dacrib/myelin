@@ -17,10 +17,13 @@
  *   `lib/config-model.ts`'s `buildMergePatch`.
  * - **Secrets are write-only.** They come back as `{"$secret": true}` and go
  *   out as a plain string; there is no endpoint that reveals one.
- * - **Change history is the audit log.** There is no `/config/history`
- *   operation in `crates/hs-admin/openapi/openapi.yaml`; the audit log is
- *   where a configuration write is recorded, and `config_section` is one of
- *   the resource types it names. {@link useConfigHistory} filters it.
+ * - **History is per setting, and revertible.** `GET /config/{section}/history`
+ *   (`config.history.list`) lists every write to the section, one row per
+ *   setting it touched with what the database held before and what the write
+ *   left, secrets redacted on both sides ({@link useConfigHistory}).
+ *   `POST /config/{section}/history/{revision}/revert` undoes one as a new
+ *   revision ({@link useRevertConfigChange}); the server restores a secret from
+ *   its own record, so the interface never holds one.
  *
  * `GET /config/schema` lives in `./config-schema.ts` — see that module's doc
  * comment for why it is a hand-rolled fetch rather than a typed call.
@@ -32,6 +35,66 @@ import { unwrap } from "./problem";
 import type { components } from "./schema";
 
 export type AuditEntry = components["schemas"]["AuditEntry"];
+
+/**
+ * One side of a setting's change. `set: false` means the database held
+ * nothing, so the setting read from the bootstrap file or the schema default.
+ */
+export interface ConfigSettingValue {
+  set: boolean;
+  /** When `set`. A secret is `{"$secret": true}`, never the secret. */
+  value?: JsonValue;
+}
+
+/** One setting one change touched (`components.schemas.ConfigSettingChange`). */
+export interface ConfigSettingChange {
+  /** Whole-configuration JSON Pointer: `/rate_limits/login/per_second`. */
+  pointer: string;
+  /** The same, dotted: `rate_limits.login.per_second`. */
+  path: string;
+  /** The value is, or holds, a secret: both sides are redacted. */
+  secret: boolean;
+  /** `null` when the change predates the server keeping prior values. */
+  from: ConfigSettingValue | null;
+  to: ConfigSettingValue;
+}
+
+/** One recorded write to a section (`components.schemas.ConfigChange`). */
+export interface ConfigChange {
+  revision: number;
+  section: string;
+  actor: string | null;
+  at: string;
+  settings: ConfigSettingChange[];
+  /** The revision this change reverted, when it was a revert. */
+  reverts: number | null;
+  /** Whether `config.history.revert` can undo it at all. */
+  revertible: boolean;
+}
+
+export interface ConfigHistoryPage {
+  items: ConfigChange[];
+  next_cursor: string | null;
+  prev_cursor: string | null;
+}
+
+function asConfigChange(raw: components["schemas"]["ConfigChange"]): ConfigChange {
+  return {
+    revision: raw.revision ?? 0,
+    section: raw.section ?? "",
+    actor: raw.actor ?? null,
+    at: raw.at ?? "",
+    settings: (raw.settings ?? []).map((row) => ({
+      pointer: row.pointer,
+      path: row.path,
+      secret: row.secret,
+      from: row.from ? { set: row.from.set, value: row.from.value as JsonValue | undefined } : null,
+      to: { set: row.to.set, value: row.to.value as JsonValue | undefined },
+    })),
+    reverts: raw.reverts ?? null,
+    revertible: raw.revertible ?? false,
+  };
+}
 
 /**
  * `components["schemas"]["ConfigSection"]` with a usable `values`: the
@@ -187,16 +250,62 @@ export function useReloadConfig() {
   });
 }
 
-/** Who changed this section, when — the audit log, filtered to one config section. */
-export function useConfigHistory(section: string | undefined, limit = 20) {
+/**
+ * One page of a section's history, newest first. `cursor` is the page's
+ * `next_cursor`/`prev_cursor` from the one before (the page keeps it in the
+ * URL, so a page of history is a link).
+ */
+export function useConfigHistory(section: string | undefined, cursor?: string, limit = 10) {
   return useQuery({
-    queryKey: ["config-history", section, limit],
+    queryKey: ["config-history", section, cursor ?? null, limit],
     enabled: Boolean(section),
-    queryFn: async () => {
-      const result = await api.GET("/audit-log", {
-        params: { query: { target_type: "config_section", target_id: section!, limit } },
+    queryFn: async (): Promise<ConfigHistoryPage> => {
+      const result = await api.GET("/config/{section}/history", {
+        params: { path: { section: section! }, query: { limit, cursor } },
       });
-      return unwrap(result).items as AuditEntry[];
+      const data = unwrap(result);
+      return {
+        items: (data.items ?? []).map(asConfigChange),
+        next_cursor: data.next_cursor ?? null,
+        prev_cursor: data.prev_cursor ?? null,
+      };
+    },
+  });
+}
+
+export interface RevertConfigChangeInput {
+  section: string;
+  revision: number;
+  /** The section's `ETag`, so a revert computed against a stale page is refused (`412`). */
+  etag: string | null;
+  /** Go ahead although later changes wrote the same settings (undoing them too). */
+  force?: boolean;
+}
+
+/**
+ * Undoes one change as a new revision. A `409` means later changes wrote some
+ * of the same settings — the problem's `errors[]` names them — and the caller
+ * may ask again with `force`.
+ */
+export function useRevertConfigChange() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ section, revision, etag, force }: RevertConfigChangeInput) => {
+      const result = await api.POST("/config/{section}/history/{revision}/revert", {
+        params: {
+          path: { section, revision },
+          header: etag ? { "If-Match": etag } : undefined,
+        },
+        body: { force: Boolean(force) },
+      });
+      const data = unwrap(result);
+      return { section: asConfigSection(data), etag: result.response.headers.get("ETag") };
+    },
+    onSettled: (_data, _error, { section }) => {
+      qc.invalidateQueries({ queryKey: ["config-sections"] });
+      qc.invalidateQueries({ queryKey: ["config-section", section] });
+      qc.invalidateQueries({ queryKey: ["config-schema"] });
+      qc.invalidateQueries({ queryKey: ["config-history", section] });
     },
   });
 }

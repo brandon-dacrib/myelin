@@ -552,6 +552,46 @@ export interface paths {
         patch: operations["config.update"];
         trace?: never;
     };
+    "/config/{section}/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List a configuration section's changes, setting by setting
+         * @description Every recorded change to the section, newest first, one row per setting each touched: what the database held before (or that it held nothing, so the value came from the bootstrap file or the schema default), what the change wrote, who made it and when. Secrets are {"$secret": true} on both sides; a secret is never readable back through history. Paged by revision, so a page does not shift while somebody else saves.
+         */
+        get: operations["config.history.list"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/config/{section}/history/{revision}/revert": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revert one configuration change
+         * @description Puts every setting the change touched back to what the database held before it, as a new revision whose history entry names the revision it reverted. A secret comes back from the server's own record and never crosses the wire. Validated, checked against HS__ environment pins, audited (config.history.revert) and published (config.reverted) exactly like config.update, and honours If-Match the same way. 409 when a later change wrote any of the same settings (errors[] names each setting and the revision that wrote it), unless the body says force; 409 also for a change recorded before prior values were kept. A change whose settings already hold their earlier values writes nothing and returns the section as it is.
+         */
+        post: operations["config.history.revert"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/config/reload": {
         parameters: {
             query?: never;
@@ -2655,8 +2695,17 @@ export interface components {
             at?: string;
             /** @description The RFC 7396 merge patch that was applied; null members are resets to the schema default. Secrets rendered as {"$secret": true}. */
             patch?: Record<string, never>;
+            /** @description Whether config.history.revert can undo it -- the server knows what it replaced (changes recorded before it kept that cannot be) and it wrote no bootstrap setting. Whether a later change stands in the way is only known when the revert is asked for. */
+            revertible?: boolean;
+            /** @description The revision this change reverted (config.history.revert). Absent when it was not a revert. */
+            reverts?: number | null;
             revision?: number;
             section?: string;
+            /** @description One row per setting the change touched, in the patch's order. */
+            settings?: components["schemas"]["ConfigSettingChange"][];
+        };
+        ConfigChangePage: components["schemas"]["PageEnvelope"] & {
+            items: components["schemas"]["ConfigChange"][];
         };
         ConfigReloadReport: {
             errors?: components["schemas"]["ValidationError"][];
@@ -2664,6 +2713,13 @@ export interface components {
             /** @description Sections that changed but could not be hot-applied. Reported rather than swallowed. */
             requires_restart?: string[];
             revision?: number;
+        };
+        ConfigRevertRequest: {
+            /**
+             * @description Revert even though later changes wrote some of the same settings, undoing them too.
+             * @default false
+             */
+            force: boolean;
         };
         ConfigSchema: {
             revision?: number;
@@ -2699,6 +2755,17 @@ export interface components {
             reloadable?: boolean;
             source?: string;
         };
+        ConfigSettingChange: {
+            /** @description What the database held before the change; null when the change was recorded before this server kept prior values. */
+            from: components["schemas"]["ConfigSettingValue"] | null;
+            /** @description The same setting as a dotted path (rate_limits.login.per_second). */
+            path: string;
+            /** @description Whole-configuration JSON Pointer (/rate_limits/login/per_second), as in ConfigSection.origins. */
+            pointer: string;
+            /** @description Whether the value is, or holds, a secret. Both sides are then {"$secret": true}, never the secret. */
+            secret: boolean;
+            to: components["schemas"]["ConfigSettingValue"];
+        };
         ConfigSettingInfo: {
             /** @description Whether this is a bootstrap setting (decision 0010) -- where the database is, a listener, this replica's cluster identity, a local path, the server name, or registration files imported once. Set at install in the bootstrap file, an HS__ environment variable or the Helm values, and never stored in the database; the reason editable is false, when it is. */
             bootstrap?: boolean;
@@ -2712,6 +2779,12 @@ export interface components {
             /** @description Whether this setting's value is served redacted. */
             secret?: boolean;
             section?: string;
+        };
+        ConfigSettingValue: {
+            /** @description Whether the database held a value. False means the setting read from the bootstrap file or the schema default (which is not recorded, since the file can change underneath the history). */
+            set: boolean;
+            /** @description The value, when set. Secrets as {"$secret": true}. */
+            value?: unknown;
         };
         ConfigValidateReport: {
             errors?: components["schemas"]["ValidationError"][];
@@ -4886,6 +4959,84 @@ export interface operations {
             413: components["responses"]["PayloadTooLarge"];
             415: components["responses"]["UnsupportedMediaType"];
             422: components["responses"]["Unprocessable"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "config.history.list": {
+        parameters: {
+            query?: {
+                /** @description Opaque keyset cursor from a previous page's next_cursor or prev_cursor. */
+                cursor?: components["parameters"]["Cursor"];
+                /** @description Page size. Values above the resource's max are clamped, not rejected. */
+                limit?: components["parameters"]["Limit"];
+            };
+            header?: never;
+            path: {
+                /** @description A configuration section name. */
+                section: components["parameters"]["SectionName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of changes, newest first. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConfigChangePage"];
+                };
+            };
+            400: components["responses"]["InvalidCursor"];
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "config.history.revert": {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Compare-and-set precondition against the resource's current ETag. */
+                "If-Match"?: components["parameters"]["IfMatch"];
+            };
+            path: {
+                /** @description The revision of the change to revert (ConfigChange.revision). */
+                revision: number;
+                /** @description A configuration section name. */
+                section: components["parameters"]["SectionName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ConfigRevertRequest"];
+            };
+        };
+        responses: {
+            /** @description Reverted (or already as it was before the change); the section as it now reads, with its new ETag. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConfigSection"];
+                };
+            };
+            400: components["responses"]["ValidationFailed"];
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            412: components["responses"]["PreconditionFailed"];
+            413: components["responses"]["PayloadTooLarge"];
+            415: components["responses"]["UnsupportedMediaType"];
             429: components["responses"]["RateLimited"];
             500: components["responses"]["Internal"];
             503: components["responses"]["Unavailable"];

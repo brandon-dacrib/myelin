@@ -22,8 +22,11 @@ import {
   putOffering,
 } from "./data/bridge-offerings";
 import {
+  beforeValues,
   configAuditEntries,
+  configChangeBody,
   configEtag,
+  configHistory,
   configLastReloaded,
   configRevisions,
   configSchemaDocument,
@@ -32,6 +35,9 @@ import {
   mergePatch,
   patchPointers,
   recordConfigChange,
+  recordConfigHistory,
+  revertConflicts,
+  revertPatch,
   sectionSource,
   restoreEchoedSecrets,
   stripEchoedSecrets,
@@ -1721,11 +1727,79 @@ export const handlers = [
       });
     }
 
+    const before = beforeValues(configValues[name], patch);
     configValues[name] = candidate;
     configRevisions[name] = (configRevisions[name] ?? 0) + 1;
     if (meta?.reloadable) configLastReloaded[name] = new Date().toISOString();
     recordConfigChange(name, configRevisions[name]);
+    recordConfigHistory(name, configRevisions[name], patch as Record<string, JsonValue>, before);
 
+    return HttpResponse.json(configSectionBody(name), {
+      headers: { ETag: configEtag(name) },
+    });
+  }),
+
+  // `config.history.list`: newest first, one row per setting, paged by revision (`r<revision>`).
+  http.get(`${API}/config/:section/history`, ({ params, request }) => {
+    const name = String(params.section);
+    if (!(name in configValues)) return configNotFound(name);
+    const url = new URL(request.url);
+    const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 20), 1), 100);
+    const cursor = url.searchParams.get("cursor");
+    const before = cursor ? Number(cursor.replace(/^r/, "")) : Infinity;
+    if (Number.isNaN(before)) {
+      return problem(400, "invalid-cursor", "Invalid cursor", {
+        detail: `"${cursor}" is not a cursor this listing handed out`,
+      });
+    }
+    const matching = configHistory
+      .filter((record) => record.section === name)
+      .sort((a, b) => b.revision - a.revision);
+    const start = matching.findIndex((record) => record.revision < before);
+    const from = start === -1 ? matching.length : start;
+    const page = matching.slice(from, from + limit);
+    const next_cursor =
+      from + limit < matching.length ? `r${page[page.length - 1].revision}` : null;
+    const newer = from > 0 ? matching[Math.max(from - limit, 0)] : undefined;
+    const prev_cursor = cursor && newer ? `r${newer.revision + 1}` : null;
+    return HttpResponse.json({ items: page.map(configChangeBody), next_cursor, prev_cursor });
+  }),
+
+  // `config.history.revert`: the settings a change touched go back as they were, as a new revision.
+  http.post(`${API}/config/:section/history/:revision/revert`, async ({ params, request }) => {
+    const name = String(params.section);
+    if (!(name in configValues)) return configNotFound(name);
+    const revision = Number(params.revision);
+    const record = configHistory.find((r) => r.section === name && r.revision === revision);
+    if (!record) {
+      return problem(404, "not-found", "Not found", {
+        detail: `no change to "${name}" was recorded at revision ${String(params.revision)}`,
+      });
+    }
+    if (record.before === null) {
+      return problem(409, "conflict", "Conflict", {
+        detail: `revision ${revision} cannot be reverted: it was recorded before this server kept the values a change replaced`,
+      });
+    }
+    const ifMatch = request.headers.get("If-Match");
+    if (ifMatch && ifMatch !== configEtag(name)) {
+      return problem(412, "precondition-failed", "Someone else changed this section", {
+        detail: `Your copy was revision ${ifMatch}; the server is now at ${configEtag(name)}.`,
+      });
+    }
+    const body = (await request.json().catch(() => ({}))) as { force?: boolean };
+    const conflicts = revertConflicts(record);
+    if (conflicts.length > 0 && !body.force) {
+      return problem(409, "conflict", "Conflict", {
+        detail: `later changes wrote some of the same settings; reverting revision ${revision} would undo them too. Send {"force": true} to revert anyway.`,
+        errors: conflicts,
+      });
+    }
+    const patch = revertPatch(record);
+    const before = beforeValues(configValues[name], patch);
+    configValues[name] = mergePatch(configValues[name], patch) as Record<string, JsonValue>;
+    configRevisions[name] = (configRevisions[name] ?? 0) + 1;
+    recordConfigHistory(name, configRevisions[name], patch, before, revision);
     return HttpResponse.json(configSectionBody(name), {
       headers: { ETag: configEtag(name) },
     });
