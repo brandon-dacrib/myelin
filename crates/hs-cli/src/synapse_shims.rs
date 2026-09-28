@@ -48,6 +48,20 @@ pub fn routes() -> Vec<Route> {
         route("/_synapse/admin/v2/users/{user_id}", "synapseAdminUsersGet"),
         route("/_synapse/admin/v1/rooms", "synapseAdminRoomsList"),
         route("/_synapse/admin/v1/rooms/{room_id}", "synapseAdminRoomsGet"),
+        Route {
+            method: "POST".to_owned(),
+            ..route(
+                "/_synapse/admin/v1/send_server_notice",
+                "synapseAdminSendServerNotice",
+            )
+        },
+        Route {
+            method: "PUT".to_owned(),
+            ..route(
+                "/_synapse/admin/v1/send_server_notice/{txn_id}",
+                "synapseAdminSendServerNoticeTxn",
+            )
+        },
     ]
 }
 
@@ -58,8 +72,8 @@ mod tests {
     #[test]
     fn mirrors_every_shimmed_route_on_the_compat_surface() {
         let routes = routes();
-        assert_eq!(routes.len(), 5);
-        assert!(routes.iter().all(|r| r.method == "GET"));
+        assert_eq!(routes.len(), 7);
+        assert_eq!(routes.iter().filter(|r| r.method == "GET").count(), 5);
         assert!(
             routes
                 .iter()

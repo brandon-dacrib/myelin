@@ -9,6 +9,7 @@ use crate::appservice::{AppserviceRegistry, InMemoryAppserviceRegistry};
 use crate::clock::{Clock, SystemClock};
 use crate::config::AuthConfig;
 use crate::ratelimit::{InMemoryRateLimiter, RateLimiter};
+use crate::registration_tokens::{InMemoryRegistrationTokens, RegistrationTokenStore};
 use crate::store::AuthStore;
 use crate::store::memory::InMemoryAuthStore;
 
@@ -65,6 +66,11 @@ pub struct AuthState {
     pub config: Arc<AuthConfig>,
     /// The time source, overridden in tests.
     pub clock: Arc<dyn Clock>,
+    /// The registration tokens `/register`'s `m.login.registration_token` stage accepts, and the
+    /// admin API's `registration_tokens.*` operations manage (see
+    /// [`crate::registration_tokens`]). In memory unless replaced with
+    /// [`AuthState::with_registration_tokens`].
+    pub registration_tokens: Arc<dyn RegistrationTokenStore>,
     /// See [`DeviceListChangeNotifier`] and [`AuthState::install_device_list_notifier`].
     /// `Arc`-wrapped around the `OnceLock` (not a bare `OnceLock` field) so every clone of this
     /// state produced by axum's per-request `Clone` -- and every clone taken before installation,
@@ -95,6 +101,7 @@ impl AuthState {
             rate_limiter: Arc::new(InMemoryRateLimiter::unlimited()),
             config: Arc::new(AuthConfig::default()),
             clock: Arc::new(SystemClock),
+            registration_tokens: Arc::new(InMemoryRegistrationTokens::new()),
             device_list_notifier: Arc::new(OnceLock::new()),
             user_directory_visibility: Arc::new(OnceLock::new()),
         }
@@ -140,6 +147,15 @@ impl AuthState {
     #[must_use]
     pub fn with_appservices(mut self, appservices: Arc<dyn AppserviceRegistry>) -> Self {
         self.appservices = appservices;
+        self
+    }
+
+    /// Replaces the registration-token store (a real server's durable one:
+    /// [`crate::registration_tokens::TablesRegistrationTokens`]), returning the state so this
+    /// reads as a builder. For the same reason as [`AuthState::with_appservices`].
+    #[must_use]
+    pub fn with_registration_tokens(mut self, tokens: Arc<dyn RegistrationTokenStore>) -> Self {
+        self.registration_tokens = tokens;
         self
     }
 

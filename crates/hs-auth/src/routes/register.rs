@@ -35,9 +35,12 @@ use crate::store::UserRecord;
 use crate::uia;
 use hs_http::body::PermissiveJson;
 
-fn registration_flows(state: &AuthState) -> Vec<AuthFlow> {
+/// The flows `/register` offers. `token_only` is a server with open registration off, where a
+/// registration token is the one way in: that is what makes an invite link work on a server that
+/// is otherwise closed.
+fn registration_flows(state: &AuthState, token_only: bool) -> Vec<AuthFlow> {
     let mut required = Vec::new();
-    if state.config.registration_requires_token {
+    if state.config.registration_requires_token || token_only {
         required.push(AuthType::RegistrationToken);
     }
     if state.config.terms_enabled {
@@ -60,13 +63,87 @@ fn stage_is_supported(auth_type: &AuthType) -> bool {
     )
 }
 
-async fn verify_stage(state: &AuthState, data: &AuthData) -> bool {
-    match data {
+/// Whether a submitted stage succeeded. A registration token is checked against the tokens in
+/// the configuration file (which have no limits) and then the token store, where passing the
+/// stage takes one of the token's places for `session_id` until the registration finishes or
+/// the session expires -- see [`crate::registration_tokens`].
+async fn verify_stage(
+    state: &AuthState,
+    data: &AuthData,
+    session_id: Option<&str>,
+) -> Result<bool, MatrixError> {
+    Ok(match data {
         AuthData::Dummy(_) => true,
         AuthData::Terms(_) => true,
-        AuthData::RegistrationToken(t) => state.config.valid_registration_tokens.contains(&t.token),
+        AuthData::RegistrationToken(t) => {
+            if state.config.valid_registration_tokens.contains(&t.token) {
+                true
+            } else if let Some(session_id) = session_id {
+                let reserved = state
+                    .registration_tokens
+                    .reserve(
+                        &t.token,
+                        session_id,
+                        state.now_ms(),
+                        state.config.uia_session_timeout_ms,
+                    )
+                    .await?;
+                if reserved {
+                    state
+                        .store
+                        .set_session_data(session_id, REGISTRATION_TOKEN_KEY, json!(t.token))
+                        .await?;
+                }
+                reserved
+            } else {
+                false
+            }
+        }
         _ => false,
+    })
+}
+
+/// Where a registration's UIA session remembers the token it presented, so that creating the
+/// account can count the use.
+const REGISTRATION_TOKEN_KEY: &str = "registration_token";
+
+/// Whether any stored token would admit a registration now. On a server with open registration
+/// off, a registration that presents nothing is refused outright unless this holds, so a closed
+/// server with no invitations out looks exactly as closed as it did before tokens existed.
+async fn any_token_usable(state: &AuthState) -> Result<bool, MatrixError> {
+    if !state.config.valid_registration_tokens.is_empty() {
+        return Ok(true);
     }
+    let now = state.now_ms();
+    let timeout = state.config.uia_session_timeout_ms;
+    Ok(state
+        .registration_tokens
+        .list()
+        .await?
+        .iter()
+        .any(|t| t.usable(now, timeout)))
+}
+
+/// `GET /_matrix/client/v1/register/m.login.registration_token/validity?token=...`: whether the
+/// token would let someone register right now. Checking does not use it. Answers the same with
+/// open registration on or off, since a token is exactly what works while it is off.
+pub async fn get_registration_token_validity(
+    State(state): State<AuthState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, MatrixError> {
+    let token = query
+        .get("token")
+        .ok_or_else(|| MatrixError::missing_param("Missing token"))?;
+    let valid = if state.config.valid_registration_tokens.contains(token) {
+        true
+    } else {
+        state
+            .registration_tokens
+            .get(token)
+            .await?
+            .is_some_and(|t| t.usable(state.now_ms(), state.config.uia_session_timeout_ms))
+    };
+    Ok(Json(json!({ "valid": valid })))
 }
 
 /// `GET /register/available?username=...`.
@@ -248,8 +325,27 @@ async fn register_guest(state: &AuthState, body: &Value) -> Result<Response, Mat
 }
 
 async fn register_user(state: &AuthState, body: &Value) -> Result<Response, MatrixError> {
-    if !state.config.registration_enabled {
-        return Err(MatrixError::forbidden("Registration is disabled"));
+    let auth: Option<AuthData> = match body.get("auth") {
+        Some(v) if !v.is_null() => Some(
+            serde_json::from_value(v.clone())
+                .map_err(|_| MatrixError::invalid_param("invalid auth data"))?,
+        ),
+        _ => None,
+    };
+    let session_id_param = auth.as_ref().and_then(AuthData::session);
+    let submitted_type = auth.as_ref().and_then(AuthData::auth_type);
+
+    // With open registration off, a registration token is the only way in. A request that
+    // presents one, or continues a session that may already hold one, goes on to the token
+    // flow; anything else is refused as before, unless a token is out there to be used, in
+    // which case the flows are offered so that a client can ask its user for it.
+    let token_only = !state.config.registration_enabled;
+    if token_only {
+        let presenting =
+            submitted_type == Some(AuthType::RegistrationToken) || session_id_param.is_some();
+        if !presenting && !any_token_usable(state).await? {
+            return Err(MatrixError::forbidden("Registration is disabled"));
+        }
     }
 
     let password_raw = body.get("password").and_then(Value::as_str);
@@ -280,17 +376,7 @@ async fn register_user(state: &AuthState, body: &Value) -> Result<Response, Matr
         }
     }
 
-    let flows = registration_flows(state);
-    let auth: Option<AuthData> = match body.get("auth") {
-        Some(v) if !v.is_null() => Some(
-            serde_json::from_value(v.clone())
-                .map_err(|_| MatrixError::invalid_param("invalid auth data"))?,
-        ),
-        _ => None,
-    };
-
-    let session_id_param = auth.as_ref().and_then(AuthData::session);
-    let submitted_type = auth.as_ref().and_then(AuthData::auth_type);
+    let flows = registration_flows(state, token_only);
 
     if let Some(auth_type) = &submitted_type
         && !stage_is_supported(auth_type)
@@ -305,15 +391,32 @@ async fn register_user(state: &AuthState, body: &Value) -> Result<Response, Matr
         ));
     }
 
+    // A registration token takes a place on the token for this session, so the session has to
+    // exist before the stage is checked: resolve (or create) it first, exactly as `advance`
+    // would, and hand `advance` the id.
+    let session_id: Option<String> = if submitted_type == Some(AuthType::RegistrationToken) {
+        Some(
+            uia::session_id_for(
+                state.store.as_ref(),
+                session_id_param,
+                state.now_ms(),
+                state.config.uia_session_timeout_ms,
+            )
+            .await?,
+        )
+    } else {
+        session_id_param.map(str::to_owned)
+    };
+
     let stage_ok = match &auth {
-        Some(data) => verify_stage(state, data).await,
+        Some(data) => verify_stage(state, data, session_id.as_deref()).await?,
         None => true,
     };
 
     let outcome = uia::advance(
         state.store.as_ref(),
         &flows,
-        session_id_param,
+        session_id.as_deref(),
         submitted_type,
         stage_ok,
         state.now_ms(),
@@ -353,6 +456,20 @@ async fn register_user(state: &AuthState, body: &Value) -> Result<Response, Matr
             r
         })
         .await?;
+
+    // The account exists: the token this registration presented has been used. A failure to
+    // count it is logged rather than failing a registration that has already succeeded.
+    if let Ok(Some(Value::String(token))) = state
+        .store
+        .get_session_data(&outcome.session_id, REGISTRATION_TOKEN_KEY)
+        .await
+        && let Err(error) = state
+            .registration_tokens
+            .complete(&token, &outcome.session_id)
+            .await
+    {
+        tracing::warn!(%error, %user_id, "could not count a registration token's use");
+    }
 
     let inhibit_login = body
         .get("inhibit_login")
@@ -536,6 +653,216 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    fn closed_server() -> AuthState {
+        AuthState::in_memory_with_config(AuthConfig {
+            registration_enabled: false,
+            ..AuthConfig::default()
+        })
+    }
+
+    async fn register(state: &AuthState, body: Value) -> Result<Response, MatrixError> {
+        post_register(
+            State(state.clone()),
+            Query(HashMap::new()),
+            axum::http::HeaderMap::new(),
+            PermissiveJson(body),
+        )
+        .await
+    }
+
+    async fn add_token(state: &AuthState, token: &str, uses: Option<u64>, expires: Option<i64>) {
+        state
+            .registration_tokens
+            .create(crate::registration_tokens::RegistrationTokenRecord::new(
+                token.into(),
+                uses,
+                expires,
+                0,
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn validity(state: &AuthState, token: &str) -> bool {
+        let mut q = HashMap::new();
+        q.insert("token".to_owned(), token.to_owned());
+        let Json(v) = get_registration_token_validity(State(state.clone()), Query(q))
+            .await
+            .unwrap();
+        v["valid"].as_bool().unwrap()
+    }
+
+    async fn json_body(response: Response) -> Value {
+        serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_closed_server_with_no_tokens_stays_closed() {
+        let state = closed_server();
+        let err = register(&state, json!({"username": "x", "password": "hunter22"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_token_registers_on_a_closed_server_once_and_is_then_used_up() {
+        let state = closed_server();
+        add_token(&state, "invite", Some(1), None).await;
+        assert!(validity(&state, "invite").await);
+        assert!(!validity(&state, "unknown").await);
+
+        // Presenting nothing is offered the token flow, since a token is out there.
+        let response = register(&state, json!({"username": "first", "password": "hunter22"}))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["flows"][0]["stages"],
+            json!(["m.login.registration_token"])
+        );
+        // A dummy stage does not satisfy it.
+        let response = register(
+            &state,
+            json!({"username": "first", "password": "hunter22", "auth": {"type": "m.login.dummy"}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // The token does, in one request.
+        let response = register(
+            &state,
+            json!({
+                "username": "first",
+                "password": "hunter22",
+                "auth": {"type": "m.login.registration_token", "token": "invite"}
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let row = state
+            .registration_tokens
+            .get("invite")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.completed, 1);
+        assert!(row.pending.is_empty());
+        assert!(!validity(&state, "invite").await);
+
+        // Used up: a second person is refused at the stage.
+        let err = register(
+            &state,
+            json!({
+                "username": "second",
+                "password": "hunter22",
+                "auth": {"type": "m.login.registration_token", "token": "invite"}
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(err.errcode(), crate::error::ErrCode::Forbidden);
+        // And with no usable token left, the server is closed again.
+        let err = register(&state, json!({"username": "third", "password": "hunter22"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_presented_token_holds_its_place_until_the_registration_finishes() {
+        let state = AuthState::in_memory_with_config(AuthConfig {
+            registration_enabled: false,
+            terms_enabled: true,
+            ..AuthConfig::default()
+        });
+        add_token(&state, "one-place", Some(1), None).await;
+
+        // Stage one: the token. Terms are still owed, so the account does not exist yet, but the
+        // token's one place is taken.
+        let response = register(
+            &state,
+            json!({
+                "username": "alice",
+                "password": "hunter22",
+                "auth": {"type": "m.login.registration_token", "token": "one-place"}
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = json_body(response).await;
+        let session = body["session"].as_str().unwrap().to_owned();
+        assert!(!validity(&state, "one-place").await);
+        let err = register(
+            &state,
+            json!({
+                "username": "mallory",
+                "password": "hunter22",
+                "auth": {"type": "m.login.registration_token", "token": "one-place"}
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+
+        // Stage two finishes the registration and counts the use.
+        let response = register(
+            &state,
+            json!({
+                "username": "alice",
+                "password": "hunter22",
+                "auth": {"type": "m.login.terms", "session": session}
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let row = state
+            .registration_tokens
+            .get("one-place")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.completed, 1);
+        assert!(row.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_expired_token_is_invalid_and_refused() {
+        let state = closed_server();
+        add_token(&state, "old", None, Some(1)).await;
+        assert!(!validity(&state, "old").await);
+        let err = register(
+            &state,
+            json!({
+                "username": "late",
+                "password": "hunter22",
+                "auth": {"type": "m.login.registration_token", "token": "old"}
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn validity_needs_the_token_parameter() {
+        let err = get_registration_token_validity(State(closed_server()), Query(HashMap::new()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

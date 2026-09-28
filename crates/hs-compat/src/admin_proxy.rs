@@ -88,6 +88,14 @@ pub fn router(state: AdminProxyState) -> Router {
         .route("/_synapse/admin/v2/users/{user_id}", get(users_get))
         .route("/_synapse/admin/v1/rooms", get(rooms_list))
         .route("/_synapse/admin/v1/rooms/{room_id}", get(rooms_get))
+        .route(
+            "/_synapse/admin/v1/send_server_notice",
+            axum::routing::post(send_server_notice),
+        )
+        .route(
+            "/_synapse/admin/v1/send_server_notice/{txn_id}",
+            axum::routing::put(send_server_notice_txn),
+        )
         .with_state(state)
 }
 
@@ -158,6 +166,136 @@ fn translate_error_body(status: StatusCode, native_body: &[u8]) -> Response {
         axum::Json(json!({"errcode": errcode, "error": detail})),
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------------------------------------
+// POST /_synapse/admin/v1/send_server_notice[/{txnId}]  ->  POST /api/v1/server-notices
+// ---------------------------------------------------------------------------------------------
+
+/// `POST /_synapse/admin/v1/send_server_notice`: `{user_id, content, type?, state_key?}` to one
+/// local user, answered `200 {"event_id"}`. The native operation takes a list of recipients and
+/// answers with the notice as sent; this sends to the one and returns its event.
+async fn send_server_notice(
+    State(state): State<AdminProxyState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    forward_server_notice(&state.native, &headers, &body, None).await
+}
+
+/// `PUT /_synapse/admin/v1/send_server_notice/{txnId}`: the same, idempotent on the transaction
+/// id -- a retry with the same id and body gets the first send's event back rather than sending
+/// the notice twice (the native `Idempotency-Key`, scoped to the caller's token the way Synapse
+/// scopes a transaction id to its requester).
+async fn send_server_notice_txn(
+    State(state): State<AdminProxyState>,
+    Path(txn_id): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    forward_server_notice(&state.native, &headers, &body, Some(&txn_id)).await
+}
+
+/// A short, stable fingerprint of the caller's credential, so that two callers' transaction ids
+/// never collide in the native idempotency cache. Not a secret and not stored anywhere: the
+/// cache is in memory, keyed by operation and key.
+fn caller_fingerprint(authorization: Option<&axum::http::HeaderValue>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    authorization.map(|v| v.as_bytes()).hash(&mut hasher);
+    hasher.finish()
+}
+
+async fn forward_server_notice(
+    native: &Router,
+    headers: &HeaderMap,
+    body: &[u8],
+    txn_id: Option<&str>,
+) -> Response {
+    let authorization = headers.get(header::AUTHORIZATION).cloned();
+    // Synapse checks the caller before the body, so a non-administrator is refused however
+    // malformed their request. The native router does the same, so an empty or unparseable
+    // body is still forwarded (as `{}`) for it to refuse on the credential first.
+    let request: Value = serde_json::from_slice(body).unwrap_or_else(|_| json!({}));
+    let mut native_body = json!({
+        "recipients": request
+            .get("user_id")
+            .and_then(Value::as_str)
+            .map(|u| vec![u.to_owned()])
+            .unwrap_or_default(),
+        "content": request.get("content").cloned().unwrap_or(Value::Null),
+    });
+    if let Some(event_type) = request.get("type").and_then(Value::as_str) {
+        native_body["type"] = json!(event_type);
+    }
+    if let Some(state_key) = request.get("state_key").and_then(Value::as_str) {
+        native_body["state_key"] = json!(state_key);
+    }
+
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/server-notices")
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(value) = &authorization {
+        builder = builder.header(header::AUTHORIZATION, value.clone());
+    }
+    if let Some(txn_id) = txn_id {
+        builder = builder.header(
+            "idempotency-key",
+            format!(
+                "synapse-send-server-notice:{:016x}:{txn_id}",
+                caller_fingerprint(authorization.as_ref())
+            ),
+        );
+    }
+    let Ok(request) = builder.body(Body::from(native_body.to_string())) else {
+        return translate_error_body(StatusCode::BAD_REQUEST, b"{}");
+    };
+    let response = native
+        .clone()
+        .oneshot(request)
+        .await
+        .unwrap_or_else(|infallible: std::convert::Infallible| match infallible {});
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), MAX_NATIVE_RESPONSE_BYTES)
+        .await
+        .unwrap_or_default();
+    if status.is_success() {
+        let sent: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        let event_id = sent
+            .get("event_ids")
+            .and_then(|ids| ids.get(0))
+            .cloned()
+            .unwrap_or(Value::Null);
+        return (StatusCode::OK, axum::Json(json!({ "event_id": event_id }))).into_response();
+    }
+    // The native API cannot tell "not an administrator" from "not a credential at all": both
+    // are a `401` there, since only an administrator's access token is a credential for it.
+    // Synapse answers the first with `403 M_FORBIDDEN`, which is what its clients (and
+    // Complement's `TestServerNotices`) expect of a signed-in user who is not an administrator;
+    // a request that presents nothing stays a `401`.
+    if status == StatusCode::UNAUTHORIZED {
+        return if authorization.is_some() {
+            (
+                StatusCode::FORBIDDEN,
+                axum::Json(json!({
+                    "errcode": "M_FORBIDDEN",
+                    "error": "You are not a server admin",
+                })),
+            )
+                .into_response()
+        } else {
+            (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(json!({
+                    "errcode": "M_MISSING_TOKEN",
+                    "error": "Missing access token",
+                })),
+            )
+                .into_response()
+        };
+    }
+    translate_error_body(status, &bytes)
 }
 
 /// Parses an RFC 3339 timestamp (the shape `hs_admin::model::AdminUser::created_at`/
@@ -740,6 +878,136 @@ mod tests {
                 "/api/v1/users",
                 post(|| async { StatusCode::NOT_IMPLEMENTED }),
             )
+    }
+
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<(Option<String>, Value)>>>;
+
+    /// A native `/api/v1/server-notices` that knows one administrator credential and records the
+    /// idempotency key and body it was sent, answering with the notice as sent.
+    fn fake_notices_router(seen: Seen) -> Router {
+        Router::new().route(
+            "/api/v1/server-notices",
+            post(move |headers: HeaderMap, body: axum::body::Bytes| {
+                let seen = seen.clone();
+                async move {
+                    let is_admin = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        == Some("Bearer admin");
+                    if !is_admin {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            axum::Json(json!({"title": "unauthenticated"})),
+                        )
+                            .into_response();
+                    }
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    let key = headers
+                        .get("idempotency-key")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    seen.lock().unwrap().push((key, body.clone()));
+                    (
+                        StatusCode::CREATED,
+                        axum::Json(json!({
+                            "id": "n1",
+                            "recipients": body["recipients"],
+                            "room_ids": ["!r:example.org"],
+                            "event_ids": ["$sent"],
+                        })),
+                    )
+                        .into_response()
+                }
+            }),
+        )
+    }
+
+    async fn send(
+        app: Router,
+        method: Method,
+        uri: &str,
+        credential: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(credential) = credential {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {credential}"));
+        }
+        let response = app
+            .oneshot(builder.body(Body::from(body.to_owned())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), MAX_NATIVE_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn send_server_notice_forwards_one_recipient_and_answers_with_its_event() {
+        let seen: Seen = Default::default();
+        let app = router(AdminProxyState::new(fake_notices_router(seen.clone())));
+        let body = r#"{"user_id":"@alice:example.org","content":{"msgtype":"m.text","body":"hi"}}"#;
+        let (status, value) = send(
+            app.clone(),
+            Method::POST,
+            "/_synapse/admin/v1/send_server_notice",
+            Some("admin"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value, json!({"event_id": "$sent"}));
+        let (key, forwarded) = seen.lock().unwrap()[0].clone();
+        assert_eq!(key, None);
+        assert_eq!(forwarded["recipients"], json!(["@alice:example.org"]));
+        assert_eq!(forwarded["content"]["body"], "hi");
+
+        // A transaction id becomes an idempotency key, the same one each time.
+        for _ in 0..2 {
+            let (status, _) = send(
+                app.clone(),
+                Method::PUT,
+                "/_synapse/admin/v1/send_server_notice/txn1",
+                Some("admin"),
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let seen = seen.lock().unwrap();
+        let k1 = seen[1].0.clone().unwrap();
+        assert!(k1.ends_with(":txn1"), "{k1}");
+        assert_eq!(seen[2].0.as_deref(), Some(k1.as_str()));
+    }
+
+    #[tokio::test]
+    async fn send_server_notice_is_forbidden_to_a_non_administrator_even_with_no_body() {
+        let app = router(AdminProxyState::new(fake_notices_router(Seen::default())));
+        let (status, value) = send(
+            app.clone(),
+            Method::POST,
+            "/_synapse/admin/v1/send_server_notice",
+            Some("alice"),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(value["errcode"], "M_FORBIDDEN");
+        let (status, value) = send(
+            app,
+            Method::POST,
+            "/_synapse/admin/v1/send_server_notice",
+            None,
+            "{}",
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(value["errcode"], "M_MISSING_TOKEN");
     }
 
     async fn call(app: Router, uri: &str) -> (StatusCode, Value) {
