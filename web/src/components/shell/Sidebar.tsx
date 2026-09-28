@@ -4,6 +4,7 @@ import { hasScope } from "@/lib/auth";
 import { cn } from "@/lib/cn";
 import { useAppservices } from "@/api/bridges";
 import { useClusterStatus, useStatisticsOverview } from "@/api/dashboard";
+import { useMigration } from "@/api/migration";
 
 export interface SidebarProps {
   /** "rail" = icon-only (1024-1279px), "full" = icon + label (>=1280px). */
@@ -20,13 +21,19 @@ export function Sidebar({ variant, onNavigate }: SidebarProps) {
     enabled: hasScope("admin:read") && hasScope("moderation:read"),
   });
   const openReports = overview?.pending_reports_count ?? 0;
+  const { data: migration } = useMigration();
+  // Migration shows when a migration exists, or on a server so new that one is what an operator
+  // is likely to do next (information-architecture.md #3; flows.md flow 5, "Discover").
+  const showMigration =
+    (migration?.status != null && migration.status !== "idle") ||
+    (overview?.users_count != null && overview.users_count <= 1);
   const bridgesInError = appservicePage?.items.filter((b) => b.health === "down").length ?? 0;
   // No explicit single-node/cluster boolean on ClusterStatus; replica_count
   // <= 1 is this track's heuristic (api/dashboard.ts's doc comment).
   const singleNode = (cluster?.replica_count ?? 1) <= 1;
 
   const items = navItems.filter((item) => {
-    if (item.id === "migration") return false; // shown only when an import exists (information-architecture.md #3)
+    if (item.id === "migration" && !showMigration) return false;
     if (item.id === "cluster" && singleNode) return false;
     if (item.scope) return hasScope(item.scope);
     return true;

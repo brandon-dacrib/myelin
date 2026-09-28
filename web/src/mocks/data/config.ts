@@ -362,6 +362,37 @@ const defs: Record<string, JsonSchemaNode> = {
       },
     },
   },
+  SynapseSourceConfig: {
+    type: "object",
+    description:
+      "A Synapse deployment to copy: its PostgreSQL database and, optionally, its media store. The database is only ever read; Synapse keeps working until cutover.",
+    required: ["database"],
+    properties: {
+      database: { $ref: "#/$defs/SynapseDatabaseConfig" },
+      media_store_path: {
+        anyOf: [{ type: "string" }, { type: "null" }],
+        description:
+          "Synapse's media_store_path, as this server sees it (the same volume, mounted).",
+      },
+      batch_size: {
+        type: "integer",
+        default: 500,
+        description: "Rows read from Synapse per batch.",
+      },
+    },
+  },
+  SynapseDatabaseConfig: {
+    type: "object",
+    description: "A connection to Synapse's PostgreSQL database.",
+    required: ["host", "database", "user"],
+    properties: {
+      host: { type: "string", description: "Database host." },
+      port: { type: "integer", default: 5432, description: "Database port." },
+      database: { type: "string", description: "Database name." },
+      user: { type: "string", description: "Connecting role. A read-only role is enough." },
+      password: { $ref: "#/$defs/SecretString", description: "The role's password." },
+    },
+  },
   SentryConfig: {
     type: "object",
     description: "Sentry error reporting; absent disables it.",
@@ -849,6 +880,16 @@ const properties: Record<string, JsonSchemaNode> = {
       },
     },
   },
+  migration: {
+    type: "object",
+    description: "The Synapse deployment to migrate from (the admin API's Migration area).",
+    properties: {
+      synapse: {
+        anyOf: [{ $ref: "#/$defs/SynapseSourceConfig" }, { type: "null" }],
+        description: "The Synapse deployment to migrate from. Unset: there is nothing to migrate.",
+      },
+    },
+  },
 };
 
 /**
@@ -888,9 +929,10 @@ const SECRET_POINTERS = [
   "/auth/password/pepper",
   "/telemetry/sentry/dsn",
   "/storage/password",
+  "/migration/synapse/database/password",
 ];
 
-const RELOADABLE = new Set(["rate_limits", "federation", "telemetry", "appservices"]);
+const RELOADABLE = new Set(["rate_limits", "federation", "telemetry", "appservices", "migration"]);
 /** `hs_config::store::BOOTSTRAP_SECTIONS`: bootstrap as a whole (decision 0010). */
 const BOOTSTRAP = new Set(["storage", "listeners"]);
 
@@ -925,6 +967,7 @@ const sectionInfos = [
   "appservices",
   "telemetry",
   "cluster",
+  "migration",
 ].map((name) => ({
   name,
   reloadable: RELOADABLE.has(name),
@@ -1092,6 +1135,7 @@ export const configValues: Record<string, Record<string, JsonValue>> = {
     heartbeat_interval: "5s",
     lease_ttl: "30s",
   },
+  migration: { synapse: null },
 };
 
 /** Revision per section — what `ETag` carries and `If-Match` is checked against. */

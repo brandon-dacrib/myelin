@@ -70,10 +70,6 @@ const ConfigSectionPage = lazyRouteComponent(
   () => import("@/pages/config/ConfigSectionPage"),
   "ConfigSectionPage",
 );
-const PlaceholderPage = lazyRouteComponent(
-  () => import("@/pages/PlaceholderPage"),
-  "PlaceholderPage",
-);
 const RegistrationTokensPage = lazyRouteComponent(
   () => import("@/pages/settings/RegistrationTokensPage"),
   "RegistrationTokensPage",
@@ -99,6 +95,10 @@ const TaskDetailPage = lazyRouteComponent(
   "TaskDetailPage",
 );
 const ClusterPage = lazyRouteComponent(() => import("@/pages/cluster/ClusterPage"), "ClusterPage");
+const MigrationPage = lazyRouteComponent(
+  () => import("@/pages/migration/MigrationPage"),
+  "MigrationPage",
+);
 const StatisticsPage = lazyRouteComponent(
   () => import("@/pages/statistics/StatisticsPage"),
   "StatisticsPage",
@@ -278,13 +278,6 @@ const configSectionRoute = createRoute({
   component: ConfigSectionPage,
 });
 
-// Sections on the information architecture (docs/design/information-architecture.md
-// #3) that this task did not build pages for; the route exists so navigation,
-// the sidebar and deep links match the full IA. See docs/status/16-management-web-interface.md.
-function placeholderRoute<T extends string>(path: T) {
-  return createRoute({ getParentRoute: () => rootRoute, path, component: PlaceholderPage });
-}
-
 const reportsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/reports",
@@ -327,7 +320,11 @@ const clusterRoute = createRoute({
   validateSearch: validateClusterSearch,
   component: ClusterPage,
 });
-const migrationRoute = placeholderRoute("/migration");
+const migrationRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/migration",
+  component: MigrationPage,
+});
 const auditRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/audit",

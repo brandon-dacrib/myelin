@@ -10,6 +10,7 @@ import { resetReports } from "@/mocks/data/reports";
 import { resetTasks } from "@/mocks/data/tasks";
 import { resetCluster } from "@/mocks/data/cluster";
 import { resetRoomContents } from "@/mocks/data/room-contents";
+import { resetMigration } from "@/mocks/data/migration";
 
 /**
  * Give the API client an absolute base URL before anything imports it.
@@ -85,5 +86,7 @@ afterEach(() => {
   resetCluster();
   // And its rooms: purge, delete, aliases and joins change them.
   resetRoomContents();
+  // And its migration from Synapse, and the source the configuration names.
+  resetMigration();
 });
 afterAll(() => server.close());

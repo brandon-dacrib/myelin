@@ -77,6 +77,7 @@ export const KNOWN_RELOADABLE_SECTIONS: readonly string[] = [
   "federation",
   "telemetry",
   "appservices",
+  "migration",
 ];
 
 /** Mirrors `hs_config::store::BOOTSTRAP_SECTIONS` (decision 0010): set at install, never stored. */
@@ -94,6 +95,7 @@ export const KNOWN_SECTION_ORDER: readonly string[] = [
   "appservices",
   "telemetry",
   "cluster",
+  "migration",
 ];
 
 /** The JSON Schema keywords this interface renders from. Anything else is ignored, not rejected. */

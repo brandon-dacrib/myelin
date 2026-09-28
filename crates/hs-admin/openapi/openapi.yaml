@@ -7948,6 +7948,15 @@ components:
                 - 'null'
               rate_per_second:
                 type: number
+              skipped_count:
+                type: integer
+                description: Rows deliberately not copied (hidden devices, rooms joined over federation, ...); each is in the log with why.
+              failed_count:
+                type: integer
+                description: Rows that could not be copied; each is in the log with the error.
+              done:
+                type: boolean
+                description: Every row of this stream has been read.
         estimated_remaining_ms:
           type:
           - integer
@@ -7956,6 +7965,71 @@ components:
           type: array
           items:
             type: string
+        task_id:
+          type:
+          - string
+          - 'null'
+          description: The task running the current step (copy, verification or cutover), if any.
+        started_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        started_by:
+          type:
+          - string
+          - 'null'
+        updated_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        completed_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When the cutover finished.
+        cutover_by:
+          type:
+          - string
+          - 'null'
+        verification:
+          description: The last verification's findings. Null until one has run.
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/MigrationVerification'
+    MigrationVerification:
+      type: object
+      properties:
+        passed:
+          type: boolean
+          description: Every count matches and no sample differs.
+        checked_at:
+          type: string
+          format: date-time
+        streams:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              source_count:
+                type: integer
+                description: Rows in Synapse that are meant to be copied.
+              target_count:
+                type: integer
+                description: Of those, how many are here.
+              skipped_count:
+                type: integer
+              sampled:
+                type: integer
+                description: Rows compared field by field.
+              mismatches:
+                type: array
+                items:
+                  type: string
     MigrationLogEntry:
       type: object
       properties:
@@ -7977,7 +8051,7 @@ components:
       properties:
         source_secret_ref:
           type: string
-          description: A reference to a configured secret; the connection string itself is never in the API.
+          description: A reference to a configured secret; the connection string itself is never in the API. It is a JSON Pointer into the configuration holding a Synapse source (the `migration` section, set with config.update); `/migration/synapse` when absent.
     ConfigSection:
       type: object
       properties:

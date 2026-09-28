@@ -83,7 +83,7 @@ const allFields = schema.sections.flatMap((section) => {
 });
 
 describe("the real server's configuration schema", () => {
-  it("has the ten sections the page lists", () => {
+  it("has the eleven sections the page lists", () => {
     expect(schema.sections.map((s) => s.name)).toEqual([
       "server",
       "listeners",
@@ -95,6 +95,7 @@ describe("the real server's configuration schema", () => {
       "appservices",
       "telemetry",
       "cluster",
+      "migration",
     ]);
   });
 

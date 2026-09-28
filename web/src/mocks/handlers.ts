@@ -49,6 +49,17 @@ import {
   undrainReplica,
   type ReplicaOutcome,
 } from "./data/cluster";
+import {
+  abortMigration,
+  cutoverMigration,
+  migrationLog,
+  migrationStatus,
+  pauseMigration,
+  resumeMigration,
+  startMigration,
+  verifyMigration,
+  type MigrationOutcome,
+} from "./data/migration";
 import { auditEntries } from "./data/audit";
 import {
   deleteReport,
@@ -98,6 +109,7 @@ import type { MediaItem } from "@/api/media";
 import { ALL_SCOPES, type Scope } from "@/lib/auth";
 import type { AppService, BridgeOfferingRequest } from "@/api/bridges";
 import type { JsonValue } from "@/api/config-schema";
+import type { components } from "@/api/schema";
 
 const API = "/api/v1";
 
@@ -485,6 +497,29 @@ export const handlers = [
       ...(url.searchParams.get("include_total") === "true" ? { total: all.length } : {}),
     });
   }),
+  // ---- Migration (the clock-driven migration in ./data/migration) ----
+  http.get(`${API}/migration`, () => HttpResponse.json(migrationStatus())),
+  http.get(`${API}/migration/log`, ({ request }) => {
+    const url = new URL(request.url);
+    const all = migrationLog();
+    return HttpResponse.json({
+      ...paginate(all, url),
+      ...(url.searchParams.get("include_total") === "true" ? { total: all.length } : {}),
+    });
+  }),
+  http.post(`${API}/migration/start`, () => {
+    const synapse = configValues.migration?.synapse as Record<string, JsonValue> | null;
+    const database = synapse?.database as Record<string, JsonValue> | undefined;
+    const source = database
+      ? `postgresql://${String(database.user)}@${String(database.host)}:${String(database.port ?? 5432)}/${String(database.database)}`
+      : null;
+    return migrationAnswer(startMigration(source));
+  }),
+  http.post(`${API}/migration/pause`, () => migrationAnswer(pauseMigration())),
+  http.post(`${API}/migration/resume`, () => migrationAnswer(resumeMigration())),
+  http.post(`${API}/migration/abort`, () => migrationAnswer(abortMigration())),
+  http.post(`${API}/migration/verify`, () => migrationTask(verifyMigration())),
+  http.post(`${API}/migration/cutover`, () => migrationTask(cutoverMigration())),
   http.get(`${API}/federation/destinations`, ({ request }) => {
     const url = new URL(request.url);
     const { items, next_cursor, prev_cursor } = paginate(federationDestinations, url);
@@ -1685,6 +1720,26 @@ function replicaAnswer(outcome: ReplicaOutcome) {
   return outcome.problem === "not-found"
     ? problem(404, "not-found", "Not found", { detail: outcome.detail })
     : problem(409, "conflict", "Conflict", { detail: outcome.detail });
+}
+
+/** A migration control's answer: the new status, the status unchanged, or the refusal. */
+function migrationAnswer(outcome: MigrationOutcome | null) {
+  if (outcome === null) return HttpResponse.json(migrationStatus());
+  if (outcome.ok) return HttpResponse.json(outcome.status);
+  return outcome.status === 400
+    ? problem(400, "validation-failed", "Validation failed", { detail: outcome.detail })
+    : problem(409, "conflict", "Conflict", { detail: outcome.detail });
+}
+
+/** A verification or cutover: `202` with its task, or the refusal. */
+function migrationTask(
+  outcome: { ok: true; task: components["schemas"]["Task"] } | { ok: false; detail: string },
+) {
+  if (!outcome.ok) return problem(409, "conflict", "Conflict", { detail: outcome.detail });
+  return HttpResponse.json(outcome.task, {
+    status: 202,
+    headers: { Location: `/api/v1/tasks/${outcome.task.id}` },
+  });
 }
 
 function mediaNotFound() {

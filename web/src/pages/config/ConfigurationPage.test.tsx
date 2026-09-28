@@ -62,7 +62,7 @@ describe("ConfigurationPage", () => {
     await screen.findByRole("link", { name: "Rate limits" });
 
     // The four reloadable sections, plus `storage` and `listeners`, which are set at install.
-    expect(screen.getAllByText("Reloadable")).toHaveLength(4);
+    expect(screen.getAllByText("Reloadable")).toHaveLength(5);
     expect(screen.getAllByText("Bootstrap only")).toHaveLength(2);
     expect(screen.getAllByText("Restart required").length).toBeGreaterThan(0);
   });
@@ -109,7 +109,7 @@ describe("ConfigurationPage", () => {
     ).toBeInTheDocument();
     await user.click(dialog.getByRole("button", { name: "Re-read files" }));
 
-    expect(await screen.findByText("Reloaded 4 sections")).toBeInTheDocument();
+    expect(await screen.findByText("Reloaded 5 sections")).toBeInTheDocument();
     await waitFor(() => expect(configLastReloaded.appservices).not.toBeNull());
   });
 });

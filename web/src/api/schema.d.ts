@@ -2799,20 +2799,58 @@ export interface components {
             items: components["schemas"]["MigrationLogEntry"][];
         };
         MigrationStartRequest: {
-            /** @description A reference to a configured secret; the connection string itself is never in the API. */
+            /** @description A reference to a configured secret; the connection string itself is never in the API. It is a JSON Pointer into the configuration holding a Synapse source (the `migration` section, set with config.update); `/migration/synapse` when absent. */
             source_secret_ref?: string;
         };
         MigrationStatus: {
+            /**
+             * Format: date-time
+             * @description When the cutover finished.
+             */
+            completed_at?: string | null;
+            cutover_by?: string | null;
             errors?: string[];
             estimated_remaining_ms?: number | null;
             source?: string | null;
+            /** Format: date-time */
+            started_at?: string | null;
+            started_by?: string | null;
             /** @enum {string} */
             status?: "idle" | "copying" | "paused" | "ready_for_cutover" | "cutting_over" | "verifying" | "completed" | "failed" | "aborted";
             streams?: {
                 copied_count?: number;
+                /** @description Every row of this stream has been read. */
+                done?: boolean;
+                /** @description Rows that could not be copied; each is in the log with the error. */
+                failed_count?: number;
                 name?: string;
                 rate_per_second?: number;
+                /** @description Rows deliberately not copied (hidden devices, rooms joined over federation, ...); each is in the log with why. */
+                skipped_count?: number;
                 total_count?: number | null;
+            }[];
+            /** @description The task running the current step (copy, verification or cutover), if any. */
+            task_id?: string | null;
+            /** Format: date-time */
+            updated_at?: string | null;
+            /** @description The last verification's findings. Null until one has run. */
+            verification?: null | components["schemas"]["MigrationVerification"];
+        };
+        MigrationVerification: {
+            /** Format: date-time */
+            checked_at?: string;
+            /** @description Every count matches and no sample differs. */
+            passed?: boolean;
+            streams?: {
+                mismatches?: string[];
+                name?: string;
+                /** @description Rows compared field by field. */
+                sampled?: number;
+                skipped_count?: number;
+                /** @description Rows in Synapse that are meant to be copied. */
+                source_count?: number;
+                /** @description Of those, how many are here. */
+                target_count?: number;
             }[];
         };
         PageEnvelope: {
