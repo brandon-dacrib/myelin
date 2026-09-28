@@ -159,6 +159,15 @@ offering operations); before that 2026-09-26 (three public recovery operations);
 > `web/e2e-real/configuration.spec.ts`. The `openapi.yaml` description of `ConfigSettingInfo`
 > mentions it; no operation changed.
 
+> **Branch state (2026-09-28, handed back unmerged):** `agent/admin-followups`, rebased on
+> `origin/main` at 8cc6b92. Done: everything below (bulk media tasks, Federation 7/7, reports by
+> person, SSE-driven pages, the small fixes, the e2e-real Reports/Tasks/Statistics run). Gate:
+> fmt and workspace clippy clean; `cargo test -p hs-admin`, `-p hs-federation`, and the
+> real-server tests `admin_followups` (3) and `reports_tasks_statistics` pass; `npm run test:e2e`
+> 41/41; `npm run check` green except load-related timeouts that pass when rerun alone; the full
+> `cargo test --workspace` was not run after the rebase (stopped for the merge queue). Left: the
+> full workspace test run and the merge.
+
 > **2026-09-28 (later): the admin API follow-ups** (queue items 2a and 2g of
 > `docs/next-steps.md`, and fixes other agents flagged). Tested through the real server in
 > `crates/hs-cli/tests/admin_followups.rs` (`spawn_serve`, the code `hs serve` runs).
