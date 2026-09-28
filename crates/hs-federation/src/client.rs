@@ -210,6 +210,24 @@ pub struct FederationResponse {
     pub body: serde_json::Value,
 }
 
+/// A raw media response ([`FederationClient::get_media`]): the status, the headers a media
+/// answer is read by, and the body as bytes.
+#[derive(Debug, Clone)]
+pub struct MediaResponse {
+    /// The HTTP status.
+    pub status: u16,
+    /// `Content-Type`: `multipart/mixed; boundary=...` from the federation media API, the
+    /// media's own type from the legacy path.
+    pub content_type: Option<String>,
+    /// `Content-Disposition`, from the legacy path (the federation API carries it inside the
+    /// multipart body instead).
+    pub content_disposition: Option<String>,
+    /// `Location`, on a redirect.
+    pub location: Option<String>,
+    /// The body, capped at the `max_bytes` the caller gave.
+    pub body: bytes::Bytes,
+}
+
 /// The outbound federation HTTP client.
 pub struct FederationClient {
     own_server_name: String,
@@ -353,13 +371,17 @@ impl FederationClient {
         result
     }
 
-    async fn send_inner(
+    /// Resolves `destination`, applies the IP policy, and builds the request for `method` and
+    /// `path` against it: `X-Matrix` signed when `signed` is true (every federation call), bare
+    /// when it is not (the legacy media fallback, [`FederationClient::get_media`]).
+    async fn build_request(
         &self,
         destination: &str,
         method: &str,
         path: &str,
         body: Option<&serde_json::Value>,
-    ) -> Result<FederationResponse, ClientError> {
+        signed: bool,
+    ) -> Result<reqwest::RequestBuilder, ClientError> {
         let outcome = discovery::resolve(
             destination,
             self.well_known.as_ref(),
@@ -398,27 +420,41 @@ impl FederationClient {
             self.config.scheme, outcome.server.tls_server_name, outcome.server.connect_port, path
         );
 
-        let content = body.cloned();
-        let auth_header = xmatrix::sign_request(
-            method,
-            path,
-            &self.own_server_name,
-            destination,
-            content.as_ref(),
-            &self.signing_key,
-        )
-        .map_err(|e| ClientError::Request(destination.to_string(), e.to_string()))?;
-
         let mut request = client.request(
             method
                 .parse()
                 .map_err(|_| ClientError::Request(destination.to_string(), "bad method".into()))?,
             &url,
         );
-        request = request.header(reqwest::header::AUTHORIZATION, auth_header);
+        if signed {
+            let content = body.cloned();
+            let auth_header = xmatrix::sign_request(
+                method,
+                path,
+                &self.own_server_name,
+                destination,
+                content.as_ref(),
+                &self.signing_key,
+            )
+            .map_err(|e| ClientError::Request(destination.to_string(), e.to_string()))?;
+            request = request.header(reqwest::header::AUTHORIZATION, auth_header);
+        }
         if let Some(b) = body {
             request = request.json(b);
         }
+        Ok(request)
+    }
+
+    async fn send_inner(
+        &self,
+        destination: &str,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<FederationResponse, ClientError> {
+        let request = self
+            .build_request(destination, method, path, body, true)
+            .await?;
 
         let response = request
             .send()
@@ -523,6 +559,113 @@ impl FederationClient {
             .unwrap_or_default())
     }
 
+    /// A raw `GET` for media: `X-Matrix` signed for the federation media API
+    /// (`/_matrix/federation/v1/media/{download,thumbnail}/...`, `signed: true`), or bare for the
+    /// legacy `/_matrix/media/v3/download/...` fallback a server older than spec v1.11 answers
+    /// (`signed: false`). The body is handed back as bytes with the headers `hs-media` needs to
+    /// read a `multipart/mixed` answer or follow a redirect -- it is never parsed as JSON here.
+    ///
+    /// The same enabled, domain, backoff and IP-range checks as [`FederationClient::send`] run
+    /// first, and a transport failure counts towards the destination's backoff. Unlike `send`,
+    /// this does not take the per-destination concurrency permit: a download of a large file
+    /// must not hold up the destination's transactions, and `hs-media` already makes one fetch
+    /// per item at a time. Redirects are not followed (no federation request follows one); a
+    /// `3xx` comes back as it is, `Location` included, for the caller to follow through its own
+    /// SSRF guard.
+    ///
+    /// # Errors
+    /// See [`ClientError`]; [`ClientError::ResponseTooLarge`] when the body exceeds `max_bytes`.
+    pub async fn get_media(
+        &self,
+        destination: &str,
+        path: &str,
+        signed: bool,
+        max_bytes: usize,
+    ) -> Result<MediaResponse, ClientError> {
+        if !self.config.enabled {
+            return Err(ClientError::Disabled);
+        }
+        if !self.config.domain_policy.allows(destination) {
+            return Err(ClientError::DomainDenied(destination.to_string()));
+        }
+        let now = now_ms();
+        let state = self.destinations.get(destination).await;
+        if !state.is_ready(now) {
+            return Err(ClientError::Backoff {
+                destination: destination.to_string(),
+                retry_at_ms: state.retry_at_ms.unwrap_or(now),
+            });
+        }
+
+        let result = self
+            .get_media_inner(destination, path, signed, max_bytes)
+            .await;
+        match &result {
+            Ok(_) => self.destinations.record_success(destination).await,
+            Err(ClientError::Request(..)) => {
+                self.destinations
+                    .record_failure(
+                        destination,
+                        self.config.max_retry_backoff.as_millis() as u64,
+                    )
+                    .await;
+            }
+            _ => {}
+        }
+        result
+    }
+
+    async fn get_media_inner(
+        &self,
+        destination: &str,
+        path: &str,
+        signed: bool,
+        max_bytes: usize,
+    ) -> Result<MediaResponse, ClientError> {
+        let request = self
+            .build_request(destination, "GET", path, None, signed)
+            .await?;
+        let mut response = request
+            .send()
+            .await
+            .map_err(|e| ClientError::Request(destination.to_string(), error_chain(&e)))?;
+        let status = response.status().as_u16();
+        let header = |name: reqwest::header::HeaderName| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let content_type = header(reqwest::header::CONTENT_TYPE);
+        let content_disposition = header(reqwest::header::CONTENT_DISPOSITION);
+        let location = header(reqwest::header::LOCATION);
+        if response
+            .content_length()
+            .is_some_and(|len| len > max_bytes as u64)
+        {
+            return Err(ClientError::ResponseTooLarge(destination.to_string()));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| ClientError::Request(destination.to_string(), error_chain(&e)))?
+        {
+            if body.len() + chunk.len() > max_bytes {
+                return Err(ClientError::ResponseTooLarge(destination.to_string()));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(MediaResponse {
+            status,
+            content_type,
+            content_disposition,
+            location,
+            body: bytes::Bytes::from(body),
+        })
+    }
+
     /// Returns a pooled `reqwest::Client` pinned (via `.resolve()`) so that connecting to
     /// `outcome.server.tls_server_name` actually opens a TCP connection to
     /// `outcome.server.connect_host`'s resolved address, while TLS SNI / the HTTP `Host` header
@@ -550,6 +693,10 @@ impl FederationClient {
             // see `hs-config::FederationConfig::trust_os_root_store`'s doc comment for why the
             // default is `false`.
             .tls_built_in_native_certs(self.config.trust_os_root_store)
+            // No federation request is answered by a redirect except a media download, and that
+            // one must be followed through `hs-media`'s SSRF guard, not here: following it here
+            // would connect wherever a peer pointed, past the IP-range policy above.
+            .redirect(reqwest::redirect::Policy::none())
             .http1_only(); // HTTP/1.1-only to peers, per the recorded decision.
 
         for cert in &self.custom_roots {
@@ -990,6 +1137,155 @@ mod tests {
         let p = DomainPolicy::new(Some(vec!["a.example.org".to_string()]));
         assert!(p.allows("a.example.org"));
         assert!(!p.allows("b.example.org"));
+    }
+
+    /// A peer with the two media paths: the federation one answers only a signed request, the
+    /// legacy one answers anyone, and a third path redirects.
+    async fn spawn_media_peer() -> u16 {
+        use axum::http::{HeaderMap, StatusCode, header};
+        async fn federation(headers: HeaderMap) -> (StatusCode, HeaderMap, &'static str) {
+            let mut out = HeaderMap::new();
+            if !headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.starts_with("X-Matrix "))
+            {
+                return (StatusCode::UNAUTHORIZED, out, "unsigned");
+            }
+            out.insert(
+                header::CONTENT_TYPE,
+                "multipart/mixed; boundary=b".parse().unwrap(),
+            );
+            (
+                StatusCode::OK,
+                out,
+                "--b\r\n\r\n{}\r\n--b\r\n\r\nhi\r\n--b--",
+            )
+        }
+        async fn legacy() -> ([(header::HeaderName, &'static str); 2], &'static str) {
+            (
+                [
+                    (header::CONTENT_TYPE, "text/plain"),
+                    (header::CONTENT_DISPOSITION, "inline; filename=a.txt"),
+                ],
+                "legacy bytes",
+            )
+        }
+        async fn moved() -> (StatusCode, [(header::HeaderName, &'static str); 1]) {
+            (
+                StatusCode::TEMPORARY_REDIRECT,
+                [(header::LOCATION, "http://169.254.169.254/latest")],
+            )
+        }
+        let app = axum::Router::new()
+            .route(
+                "/_matrix/federation/v1/media/download/abc",
+                axum::routing::get(federation),
+            )
+            .route(
+                "/_matrix/media/v3/download/{server}/abc",
+                axum::routing::get(legacy),
+            )
+            .route("/moved", axum::routing::get(moved));
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        port
+    }
+
+    fn media_client(port: u16) -> FederationClient {
+        client_for_port(
+            port,
+            ClientConfig {
+                scheme: "http",
+                ..ClientConfig::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn a_media_get_is_signed_for_the_federation_api_and_bare_for_the_legacy_one() {
+        let port = spawn_media_peer().await;
+        let client = media_client(port);
+        let destination = format!("localhost:{port}");
+
+        let signed = client
+            .get_media(
+                &destination,
+                "/_matrix/federation/v1/media/download/abc",
+                true,
+                1024,
+            )
+            .await
+            .unwrap();
+        assert_eq!(signed.status, 200);
+        assert_eq!(
+            signed.content_type.as_deref(),
+            Some("multipart/mixed; boundary=b")
+        );
+        assert!(signed.body.starts_with(b"--b"));
+
+        let unsigned = client
+            .get_media(
+                &destination,
+                "/_matrix/federation/v1/media/download/abc",
+                false,
+                1024,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            unsigned.status, 401,
+            "the fake only answers a signed request"
+        );
+
+        let legacy = client
+            .get_media(
+                &destination,
+                &format!("/_matrix/media/v3/download/{destination}/abc"),
+                false,
+                1024,
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy.status, 200);
+        assert_eq!(&legacy.body[..], b"legacy bytes");
+        assert_eq!(legacy.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(
+            legacy.content_disposition.as_deref(),
+            Some("inline; filename=a.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_media_get_caps_the_body_and_never_follows_a_redirect() {
+        let port = spawn_media_peer().await;
+        let client = media_client(port);
+        let destination = format!("localhost:{port}");
+
+        let err = client
+            .get_media(
+                &destination,
+                &format!("/_matrix/media/v3/download/{destination}/abc"),
+                false,
+                4,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ClientError::ResponseTooLarge(_)), "{err}");
+
+        // Following this would connect to a link-local address the IP policy never saw.
+        let moved = client
+            .get_media(&destination, "/moved", true, 1024)
+            .await
+            .unwrap();
+        assert_eq!(moved.status, 307);
+        assert_eq!(
+            moved.location.as_deref(),
+            Some("http://169.254.169.254/latest")
+        );
     }
 
     // Suppress "unused" on the unused helper import when compiled without networking pieces used

@@ -132,6 +132,17 @@ pub fn router_v2(
     (apply_x_matrix_layer(merged, state, x_matrix_ctx), manifest)
 }
 
+/// Puts a federation router built outside this crate behind the same `X-Matrix` verification
+/// layer [`router`] applies to its own: today, `hs-media`'s
+/// `/_matrix/federation/v1/media/{download,thumbnail}` routes, whose handlers authenticate
+/// nothing themselves. The layer runs before any handler, exactly as it does here, and verifies
+/// against the full request path even when the router is nested under a prefix.
+pub fn behind_x_matrix(router: axum::Router, x_matrix_ctx: Arc<XMatrixContext>) -> axum::Router {
+    router
+        .layer(axum::middleware::from_fn(xmatrix::verify_x_matrix))
+        .layer(axum::Extension(x_matrix_ctx))
+}
+
 fn apply_x_matrix_layer(
     merged: axum::Router<FederationState>,
     state: FederationState,
