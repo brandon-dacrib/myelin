@@ -739,9 +739,24 @@ impl<B: KvBackend + 'static> hs_federation::inbound::RoomWriteSink for RegistryW
             ))
         })?;
 
+        let out_of_room = event.clone();
         match handle.accept_remote_event(event).await {
             Ok(hs_room::actor::RemoteEventOutcome::Stored(_)) => Ok(WriteOutcome::Stored),
             Ok(hs_room::actor::RemoteEventOutcome::AlreadyKnown) => Ok(WriteOutcome::AlreadyKnown),
+            // The end of an invite or a knock, sent here by a server in a room this server is
+            // not in: nothing it cites is held, and nothing ever will be. See
+            // `out_of_room_ending`.
+            Err(hs_room::RoomError::MissingAncestors(_))
+                if out_of_room_ending(&handle, &out_of_room).await =>
+            {
+                match handle.accept_out_of_room_membership(out_of_room).await {
+                    Ok(hs_room::actor::RemoteEventOutcome::Stored(_)) => Ok(WriteOutcome::Stored),
+                    Ok(hs_room::actor::RemoteEventOutcome::AlreadyKnown) => {
+                        Ok(WriteOutcome::AlreadyKnown)
+                    }
+                    Err(e) => Err(WriteRejected::other(e.to_string())),
+                }
+            }
             // A missing ancestor is not a rejection of this event: it means this server has a hole
             // in the DAG and must backfill before the event can be authorized at all. The IDs are
             // carried structurally (not just interpolated into the message) so
@@ -760,6 +775,107 @@ impl<B: KvBackend + 'static> hs_federation::inbound::RoomWriteSink for RegistryW
             }
             Err(e) => Err(WriteRejected::other(e.to_string())),
         }
+    }
+}
+
+/// Whether `event`, received over `/send` for a room nobody of this server is joined to, ends a
+/// local user's invite or knock: a `leave` or `ban` about a user of this server, whose previous
+/// membership here is `invite` or `knock`, sent by a user of a server this server knows to be in
+/// the room (`RoomActor::servers_to_join_through`: the inviter's, or the room's own). The
+/// inviter rescinding an invite and a resident refusing a knock both arrive this way, since the
+/// target's server is sent membership changes about its own users; neither can be placed in a
+/// room this server does not hold, so they are recorded out of band
+/// (`RoomActor::accept_out_of_room_membership`). An invite never comes this way -- that is
+/// `PUT /invite`'s job -- and a server nobody here has heard of cannot end one.
+async fn out_of_room_ending<B: KvBackend + 'static>(
+    handle: &hs_room::actor::RoomActorHandle<B>,
+    event: &hs_model::Event,
+) -> bool {
+    let header = event.header();
+    if header.event_type != "m.room.member" {
+        return false;
+    }
+    let membership = event
+        .json()
+        .get("content")
+        .and_then(hs_model::canonical::CanonicalJsonValue::as_object)
+        .and_then(|content| content.get("membership"))
+        .and_then(hs_model::canonical::CanonicalJsonValue::as_str);
+    if !matches!(membership, Some("leave" | "ban")) {
+        return false;
+    }
+    let Some(target) = header.state_key.clone() else {
+        return false;
+    };
+    let sender_server = header.sender.server_name().to_string();
+    handle
+        .query(move |actor| {
+            if actor.local_user_joined() {
+                return false;
+            }
+            let prior = actor
+                .state_event("m.room.member", &target)
+                .ok()
+                .flatten()
+                .and_then(|e| content_str(e, "membership").map(str::to_owned));
+            matches!(prior.as_deref(), Some("invite" | "knock"))
+                && actor
+                    .servers_to_join_through()
+                    .is_some_and(|servers| servers.contains(&sender_server))
+        })
+        .await
+}
+
+/// [`hs_federation::invite::InviteSink`] over `hs-room`'s [`RoomRegistry`]: an invite from
+/// another server for one of this server's users is recorded in the room here
+/// (`RoomRegistry::accept_out_of_room_membership`), with the stripped state the inviting server
+/// sent kept on it as `unsigned.invite_room_state`, which is what the invitee's `/sync` shows.
+///
+/// If a user of this server is already in the room, nothing is recorded: the invite arrives
+/// through the room itself, over `/send`, once the inviting server has put it in, the same as
+/// any other event of a room this server is in.
+pub struct RegistryInviteSink<B: KvBackend> {
+    rooms: Arc<RoomRegistry<B>>,
+}
+
+impl<B: KvBackend + 'static> RegistryInviteSink<B> {
+    /// Wraps an already-open registry.
+    #[must_use]
+    pub fn new(rooms: Arc<RoomRegistry<B>>) -> Self {
+        Self { rooms }
+    }
+}
+
+#[async_trait]
+impl<B: KvBackend + 'static> hs_federation::invite::InviteSink for RegistryInviteSink<B> {
+    async fn accept_invite(
+        &self,
+        room_version: &ruma::RoomVersionId,
+        event: &hs_model::Event,
+        invite_room_state: &[Value],
+    ) -> Result<(), hs_federation::invite::InviteRejected> {
+        use hs_federation::invite::InviteRejected;
+
+        let room_id = event
+            .json()
+            .get("room_id")
+            .and_then(hs_model::canonical::CanonicalJsonValue::as_str)
+            .and_then(|id| ruma::RoomId::parse(id).ok())
+            .ok_or_else(|| InviteRejected("the invite names no room".to_owned()))?;
+        if let Ok(handle) = self.rooms.get_or_load(&room_id).await
+            && handle.query(|actor| actor.local_user_joined()).await
+        {
+            return Ok(());
+        }
+        let mut json = hs_federation::inbound::event_json(event);
+        json["unsigned"]["invite_room_state"] = Value::Array(invite_room_state.to_vec());
+        let event = hs_model::Event::parse(&json, room_version.clone())
+            .map_err(|e| InviteRejected(format!("the invite does not parse: {e}")))?;
+        self.rooms
+            .accept_out_of_room_membership(&room_id, room_version.clone(), event)
+            .await
+            .map(|_| ())
+            .map_err(|e| InviteRejected(e.to_string()))
     }
 }
 
@@ -1019,7 +1135,7 @@ pub fn build_mount<B: KvBackend + 'static>(
         allow_device_name_lookup_over_federation: config
             .federation
             .allow_device_name_lookup_over_federation,
-        write_sink: Arc::new(RegistryWriteSink::new(rooms)),
+        write_sink: Arc::new(RegistryWriteSink::new(rooms.clone())),
         transactions: Arc::new(hs_federation::inbound::InMemoryTransactionStore::new()),
         // The same client this mount uses for every other outbound call: `FederationClient`
         // implements `AncestorFetcher` directly (`crate::backfill`'s doc), so a missing-ancestor
@@ -1028,6 +1144,12 @@ pub fn build_mount<B: KvBackend + 'static>(
         ancestor_fetcher: Some(client.clone() as Arc<dyn hs_federation::backfill::AncestorFetcher>),
         backfill_limits: hs_federation::backfill::BackfillLimits::default(),
         sender: Some(sender.clone() as Arc<dyn hs_federation::sender::OutboundPduSink>),
+        // An invite from another server is co-signed with this server's event key and recorded
+        // in the room here (`RegistryInviteSink`).
+        invites: Some(hs_federation::invite::InviteHandling {
+            sink: Arc::new(RegistryInviteSink::new(rooms)),
+            signing_key: identity.signing_key.clone(),
+        }),
     };
 
     let x_matrix = Arc::new(hs_federation::xmatrix::XMatrixContext {
@@ -1192,6 +1314,7 @@ pub fn manifest_only_mount() -> (
         ancestor_fetcher: None,
         backfill_limits: hs_federation::backfill::BackfillLimits::default(),
         sender: None,
+        invites: None,
     };
     let key_cache: Arc<hs_federation::keys::DynRemoteKeyCache> =
         Arc::new(hs_federation::keys::RemoteKeyCache::new(

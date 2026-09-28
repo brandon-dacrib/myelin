@@ -46,7 +46,9 @@ pub(super) fn add_routes_v2(builder: Builder<FederationState>) -> Builder<Federa
     )
 }
 
-fn requesting_server(headers: &axum::http::HeaderMap) -> Result<String, Box<MatrixError>> {
+pub(super) fn requesting_server(
+    headers: &axum::http::HeaderMap,
+) -> Result<String, Box<MatrixError>> {
     xmatrix::parse_x_matrix_header(headers)
         .map(|auth| auth.origin)
         .map_err(|_| {
@@ -151,7 +153,7 @@ async fn send_join(
     }
 }
 
-fn join_error_response(e: &JoinError) -> Response {
+pub(super) fn join_error_response(e: &JoinError) -> Response {
     match e {
         JoinError::RoomNotFound => MatrixError::not_found("unknown room").into_response(),
         JoinError::IncompatibleRoomVersion { room_version } => MatrixError::custom(
@@ -265,6 +267,7 @@ mod tests {
             ancestor_fetcher: None,
             backfill_limits: crate::backfill::BackfillLimits::default(),
             sender: None,
+            invites: None,
         }
     }
 

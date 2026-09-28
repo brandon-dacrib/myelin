@@ -1,5 +1,4 @@
-//! The join/leave/knock/invite handshakes, `/send`, and every other federation endpoint this
-//! track has not built real logic for yet. Per
+//! Every federation endpoint this track has not built real logic for yet. Per
 //! `docs/design/06-federation-threat-model.md` section 2.5: each of these routes sits behind the
 //! same `X-Matrix` verification layer as every other route in this router (see
 //! `crate::transport::router`), and its handler does nothing beyond that — no partial logic that
@@ -34,41 +33,8 @@ pub(super) fn add_routes(builder: Builder<FederationState>) -> Builder<Federatio
     }
 
     let mut builder = builder;
-    // `/send`, `make_join` and the v1 `send_join` are real now — see `crate::transport::send` and
-    // `crate::transport::join`. The v2 `send_join`/`send_leave`/`invite` spellings are registered
-    // by `add_routes_v2` below, for a router mounted separately at `/_matrix/federation/v2` (they
-    // used to sit here, wrongly, under a literal `/v2/` path segment — see this crate's status
-    // file).
-    builder = seam!(
-        builder,
-        Method::GET,
-        "/make_leave/{roomId}/{userId}",
-        "federationMakeLeave"
-    );
-    builder = seam!(
-        builder,
-        Method::PUT,
-        "/send_leave/{roomId}/{eventId}",
-        "federationSendLeaveV1"
-    );
-    builder = seam!(
-        builder,
-        Method::GET,
-        "/make_knock/{roomId}/{userId}",
-        "federationMakeKnock"
-    );
-    builder = seam!(
-        builder,
-        Method::PUT,
-        "/send_knock/{roomId}/{eventId}",
-        "federationSendKnock"
-    );
-    builder = seam!(
-        builder,
-        Method::PUT,
-        "/invite/{roomId}/{eventId}",
-        "federationInviteV1"
-    );
+    // `/send`, the join, leave and knock handshakes and `/invite` are real now -- see
+    // `crate::transport::{send, join, membership}`.
     builder = seam!(
         builder,
         Method::PUT,
@@ -117,30 +83,6 @@ pub(super) fn add_routes(builder: Builder<FederationState>) -> Builder<Federatio
     builder
 }
 
-/// The v2-mount seams: `send_leave` and `invite`'s v2 spellings, registered as
-/// `/send_leave/{roomId}/{eventId}` and `/invite/{roomId}/{eventId}` for a router mounted
-/// separately at `/_matrix/federation/v2` (see `crate::transport::router_v2`'s doc — the path
-/// string is identical to the v1 seams above; only the mount prefix differs, which is exactly why
-/// these could not previously share one `Builder` with the v1 spellings without colliding).
-pub(super) fn add_routes_v2(builder: Builder<FederationState>) -> Builder<FederationState> {
-    fn meta(op: &str) -> hs_http::router::RouteMeta {
-        super::matrix_federation(op)
-    }
-    builder
-        .add(
-            Method::PUT,
-            "/send_leave/{roomId}/{eventId}",
-            not_implemented,
-            meta("federationSendLeaveV2"),
-        )
-        .add(
-            Method::PUT,
-            "/invite/{roomId}/{eventId}",
-            not_implemented,
-            meta("federationInviteV2"),
-        )
-}
-
 /// The shared seam handler: bounded (by the `X-Matrix` layer's own body cap) body is accepted and
 /// discarded; the response is always a clear, typed "not implemented" error. Reused across every
 /// route registered above rather than one function per route, since they all do exactly this.
@@ -178,16 +120,12 @@ mod tests {
             ancestor_fetcher: None,
             backfill_limits: crate::backfill::BackfillLimits::default(),
             sender: None,
+            invites: None,
         }
     }
 
     fn build() -> (axum::Router<FederationState>, Vec<hs_http::router::Route>) {
         let (router, manifest) = add_routes(Builder::<FederationState>::new()).build();
-        (router, manifest.routes)
-    }
-
-    fn build_v2() -> (axum::Router<FederationState>, Vec<hs_http::router::Route>) {
-        let (router, manifest) = add_routes_v2(Builder::<FederationState>::new()).build();
         (router, manifest.routes)
     }
 
@@ -230,13 +168,6 @@ mod tests {
         assert_every_route_is_a_clean_seam(router, routes).await;
     }
 
-    #[tokio::test]
-    async fn every_v2_seam_route_responds_not_implemented() {
-        let (router, routes) = build_v2();
-        assert!(!routes.is_empty());
-        assert_every_route_is_a_clean_seam(router, routes).await;
-    }
-
     /// `/send`, `make_join` and the v1 `send_join` used to be seams registered by this module;
     /// this proves they are gone from here (they now live in `crate::transport::send` and
     /// `crate::transport::join`), so nobody accidentally re-adds a seam for a route this crate now
@@ -248,5 +179,10 @@ mod tests {
         assert!(!paths.contains(&"/send/{txnId}"));
         assert!(!paths.contains(&"/make_join/{roomId}/{userId}"));
         assert!(!paths.contains(&"/send_join/{roomId}/{eventId}"));
+        assert!(!paths.contains(&"/make_leave/{roomId}/{userId}"));
+        assert!(!paths.contains(&"/send_leave/{roomId}/{eventId}"));
+        assert!(!paths.contains(&"/make_knock/{roomId}/{userId}"));
+        assert!(!paths.contains(&"/send_knock/{roomId}/{eventId}"));
+        assert!(!paths.contains(&"/invite/{roomId}/{eventId}"));
     }
 }

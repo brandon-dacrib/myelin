@@ -1,5 +1,7 @@
 //! [`RemoteJoin`]: the seam through which a join of a room this server does not hold reaches
-//! federation.
+//! federation -- and the rest of membership that has to go through another server: leaving or
+//! knocking on a room this server is not in, and inviting a user of another server, whose
+//! server co-signs the invite before it goes into the room.
 //!
 //! `POST /join/{roomIdOrAlias}` and `POST /rooms/{roomId}/join` (`crate::routes::membership`)
 //! are served by this crate, which knows nothing about federation: `hs-federation` and `hs-room`
@@ -54,4 +56,73 @@ pub trait RemoteJoin: Send + Sync {
         &self,
         alias: &RoomAliasId,
     ) -> Result<(OwnedRoomId, Vec<String>), RoomError>;
+
+    /// Leaves `room_id` as `user_id` through one of `via` (`make_leave`/`send_leave`) -- a
+    /// room this server is not in, so the leave cannot be made here: rejecting an invite from
+    /// another server, or withdrawing a knock -- and records the accepted leave here so the
+    /// user's `/sync` moves the room to `leave`. `content` is the rest of the leave's content
+    /// (`reason`).
+    ///
+    /// The default refuses: an implementation that only joins cannot leave this way.
+    ///
+    /// # Errors
+    /// As [`RemoteJoin::join`].
+    async fn leave(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+        via: &[String],
+        content: Value,
+    ) -> Result<(), RoomError> {
+        let _ = (user_id, via, content);
+        Err(RoomError::RemoteJoinFailed(format!(
+            "cannot leave {room_id} through another server"
+        )))
+    }
+
+    /// Knocks on `room_id` as `user_id` through one of `via` (`make_knock`/`send_knock`), and
+    /// records the accepted knock here, with the room's stripped state the resident answered
+    /// with, so the user's `/sync` shows it under `knock`. `content` is the rest of the knock's
+    /// content (`reason`, the user's profile).
+    ///
+    /// The default refuses.
+    ///
+    /// # Errors
+    /// As [`RemoteJoin::join`].
+    async fn knock(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+        via: &[String],
+        content: Value,
+    ) -> Result<OwnedRoomId, RoomError> {
+        let _ = (user_id, via, content);
+        Err(RoomError::RemoteJoinFailed(format!(
+            "cannot knock on {room_id} through another server"
+        )))
+    }
+
+    /// Sends `event` -- an invite built and signed here, not yet in the room
+    /// (`RoomActor::build_membership_event`), for a user of another server -- to that server
+    /// with the room's stripped state (`PUT /invite`), and returns the event as it came back,
+    /// co-signed by the invitee's server and verified. The caller puts that into the room.
+    ///
+    /// The default refuses.
+    ///
+    /// # Errors
+    /// [`RoomError::Forbidden`] if the invitee's server refused the invite,
+    /// [`RoomError::RemoteJoinFailed`] if it could not be asked or answered with something that
+    /// is not the invite.
+    async fn invite(
+        &self,
+        room_version: &ruma::RoomVersionId,
+        event: &hs_model::Event,
+        invite_room_state: Vec<Value>,
+    ) -> Result<hs_model::Event, RoomError> {
+        let _ = (room_version, invite_room_state);
+        Err(RoomError::RemoteJoinFailed(format!(
+            "cannot send the invite {} to another server",
+            event.event_id()
+        )))
+    }
 }

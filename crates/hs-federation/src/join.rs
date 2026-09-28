@@ -1,5 +1,10 @@
 //! `make_join`/`send_join`: the join handshake for a room this server hosts, called by the server
-//! of a user who wants to join it.
+//! of a user who wants to join it -- and its two siblings, `make_leave`/`send_leave` and
+//! `make_knock`/`send_knock`, which are the same handshake with a different `membership`
+//! ([`Handshake`]). A leave comes this way when the leaving server is not in the room (a user
+//! rejecting an invite, or withdrawing a knock, on a server that holds no copy of the room it
+//! could author the leave against); a knock always does. Everything below about `make_join` and
+//! `send_join` holds for all three, except that only a join's response carries the room's state.
 //!
 //! # Scope
 //!
@@ -91,6 +96,31 @@ impl std::fmt::Display for JoinError {
             ),
             Self::NotAuthorized(e) => write!(f, "join not authorized: {e}"),
             Self::Store(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Which membership handshake a `make_*`/`send_*` pair is: the three the server-server API
+/// defines, each an `m.room.member` event the remote server signs for its own user after the
+/// resident hands it a template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handshake {
+    /// `make_join`/`send_join`.
+    Join,
+    /// `make_leave`/`send_leave`.
+    Leave,
+    /// `make_knock`/`send_knock`.
+    Knock,
+}
+
+impl Handshake {
+    /// The `membership` value the handshake's event carries.
+    #[must_use]
+    pub fn membership(self) -> &'static str {
+        match self {
+            Self::Join => "join",
+            Self::Leave => "leave",
+            Self::Knock => "knock",
         }
     }
 }
@@ -202,6 +232,23 @@ pub async fn make_join(
     user_id: &str,
     supported_versions: &[String],
 ) -> Result<JoinTemplate, JoinError> {
+    make_membership(rooms, room_id, user_id, supported_versions, Handshake::Join).await
+}
+
+/// [`make_join`] for any [`Handshake`]: an unsigned `m.room.member` template with `handshake`'s
+/// membership, checked against current state the same way. A knock is refused up front in a room
+/// version without knocking; a leave is authorized like any other (a user who is not in the
+/// room, not invited and not knocking has nothing to leave).
+///
+/// # Errors
+/// See [`JoinError`].
+pub async fn make_membership(
+    rooms: &dyn RoomDataSource,
+    room_id: &str,
+    user_id: &str,
+    supported_versions: &[String],
+    handshake: Handshake,
+) -> Result<JoinTemplate, JoinError> {
     let Some(room_version_str) = rooms.room_version(room_id).await else {
         return Err(JoinError::RoomNotFound);
     };
@@ -215,6 +262,11 @@ pub async fn make_join(
         .map_err(|_| JoinError::UnsupportedRoomVersion(room_version_str.clone()))?;
     let rules = hs_model::room_version::rules_for(&room_version)
         .ok_or_else(|| JoinError::UnsupportedRoomVersion(room_version_str.clone()))?;
+    if handshake == Handshake::Knock && !rules.knocking {
+        return Err(JoinError::IncompatibleRoomVersion {
+            room_version: room_version_str,
+        });
+    }
 
     let user = UserId::parse(user_id).map_err(|e| JoinError::MalformedUserId(e.to_string()))?;
     let parsed_room_id = RoomId::parse(room_id).map_err(|_| JoinError::RoomNotFound)?;
@@ -237,7 +289,7 @@ pub async fn make_join(
     let state = rooms.state_for_join(room_id).await.map_err(source_err)?;
     let flat = FlatState::build(&state.state);
 
-    let content = serde_json::json!({ "membership": "join" });
+    let content = serde_json::json!({ "membership": handshake.membership() });
     let content_canonical = to_canonical_object(&content, rules.strict_canonical_json)
         .map_err(|e| JoinError::MalformedEvent(e.to_string()))?;
     let incoming = IncomingEvent {
@@ -324,6 +376,42 @@ pub async fn send_join(
     own_server_name: &str,
     forward: Option<&dyn OutboundPduSink>,
 ) -> Result<SendJoinResult, JoinError> {
+    send_membership(
+        rooms,
+        sink,
+        key_cache,
+        room_id,
+        event_id,
+        signed_event,
+        origin,
+        own_server_name,
+        forward,
+        Handshake::Join,
+    )
+    .await
+}
+
+/// [`send_join`] for any [`Handshake`]: the submitted event must carry `handshake`'s membership
+/// and be about its own sender, and is verified, authorized, stored and forwarded to the room's
+/// other servers exactly as a join is. The result carries the room's state for every handshake;
+/// `send_leave` answers with none of it and `send_knock` with its stripped form
+/// (`crate::stripped`), which is the transport's business.
+///
+/// # Errors
+/// See [`JoinError`].
+#[allow(clippy::too_many_arguments)]
+pub async fn send_membership(
+    rooms: &dyn RoomDataSource,
+    sink: &dyn RoomWriteSink,
+    key_cache: &DynRemoteKeyCache,
+    room_id: &str,
+    event_id: &str,
+    signed_event: &Value,
+    origin: &str,
+    own_server_name: &str,
+    forward: Option<&dyn OutboundPduSink>,
+    handshake: Handshake,
+) -> Result<SendJoinResult, JoinError> {
     let Some(room_version_str) = rooms.room_version(room_id).await else {
         return Err(JoinError::RoomNotFound);
     };
@@ -352,9 +440,15 @@ pub async fn send_join(
         .and_then(CanonicalJsonValue::as_object)
         .and_then(|c| c.get("membership"))
         .and_then(CanonicalJsonValue::as_str);
-    if membership != Some("join") {
+    if membership != Some(handshake.membership()) {
+        return Err(JoinError::MalformedEvent(format!(
+            "content.membership is not \"{}\"",
+            handshake.membership()
+        )));
+    }
+    if event.header().state_key.as_deref() != Some(event.header().sender.as_str()) {
         return Err(JoinError::MalformedEvent(
-            "content.membership is not \"join\"".to_owned(),
+            "a membership handshake's event must be about its own sender".to_owned(),
         ));
     }
     let event_room_id = event
@@ -401,7 +495,13 @@ pub async fn send_join(
         .accept_verified_event(room_id, event.event_id().as_str(), &value)
         .await
         .map_err(|e| JoinError::Store(e.error))?;
-    tracing::info!(room_id, event_id, ?outcome, "send_join: event accepted");
+    tracing::info!(
+        room_id,
+        event_id,
+        ?outcome,
+        membership = handshake.membership(),
+        "membership handshake: event accepted"
+    );
 
     // Stored vs. AlreadyKnown does not change the response shape, only whether the room's other
     // servers still need telling. Member servers are read after the store, so a room whose only
@@ -418,7 +518,7 @@ pub async fn send_join(
                 room_id,
                 event_id,
                 servers = destinations.len(),
-                "send_join: forwarding the accepted join to the room's other servers"
+                "membership handshake: forwarding the accepted event to the room's other servers"
             );
             forward.enqueue_pdu(destinations, value.clone());
         }
@@ -466,6 +566,15 @@ mod tests {
     fn room_with_creator_and_servers(
         joined_servers: Vec<String>,
     ) -> (InMemoryRoomSource, String, String) {
+        room_fixture("public", Vec::new(), joined_servers)
+    }
+
+    /// The same room with `join_rule` and `extra_state` (member events, say) added to its state.
+    fn room_fixture(
+        join_rule: &str,
+        extra_state: Vec<Value>,
+        joined_servers: Vec<String>,
+    ) -> (InMemoryRoomSource, String, String) {
         let room_id = "!r:resident.example.org".to_string();
         let create = serde_json::json!({
             "event_id": "$create",
@@ -494,7 +603,7 @@ mod tests {
             "room_id": room_id,
             "sender": "@creator:resident.example.org",
             "state_key": "",
-            "content": {"join_rule": "public"},
+            "content": {"join_rule": join_rule},
         });
         let creator_join = serde_json::json!({
             "event_id": "$creatorjoin",
@@ -510,12 +619,15 @@ mod tests {
             FakeRoom {
                 room_version: Some("11".to_owned()),
                 extremities: vec![("$creatorjoin".to_owned(), 4)],
-                state: vec![
+                state: [
                     create.clone(),
                     power_levels.clone(),
                     join_rules.clone(),
                     creator_join.clone(),
-                ],
+                ]
+                .into_iter()
+                .chain(extra_state)
+                .collect(),
                 join_auth_chain: vec![create, power_levels, join_rules],
                 joined_servers,
                 ..FakeRoom::default()
@@ -646,6 +758,200 @@ mod tests {
         assert!(forward.0.lock().unwrap().is_empty());
     }
 
+    fn bobs_invite() -> Value {
+        serde_json::json!({
+            "event_id": "$bobinvite",
+            "type": "m.room.member",
+            "room_id": "!r:resident.example.org",
+            "sender": "@creator:resident.example.org",
+            "state_key": "@bob:joiner.example.org",
+            "content": {"membership": "invite"},
+        })
+    }
+
+    #[tokio::test]
+    async fn make_leave_hands_an_invited_user_a_leave_template_and_a_stranger_nothing() {
+        let (rooms, room_id, _) = room_fixture("invite", vec![bobs_invite()], Vec::new());
+        let template = make_membership(
+            &rooms,
+            &room_id,
+            "@bob:joiner.example.org",
+            &[],
+            Handshake::Leave,
+        )
+        .await
+        .unwrap();
+        assert_eq!(template.event["content"]["membership"], "leave");
+        assert_eq!(template.event["state_key"], "@bob:joiner.example.org");
+        let auth_events = template.event["auth_events"].as_array().unwrap();
+        assert!(auth_events.contains(&serde_json::json!("$bobinvite")));
+
+        let err = make_membership(
+            &rooms,
+            &room_id,
+            "@stranger:joiner.example.org",
+            &[],
+            Handshake::Leave,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, JoinError::NotAuthorized(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn make_knock_needs_a_knock_room_in_a_version_with_knocking() {
+        let (rooms, room_id, _) = room_fixture("knock", Vec::new(), Vec::new());
+        let template = make_membership(
+            &rooms,
+            &room_id,
+            "@bob:joiner.example.org",
+            &["11".to_owned()],
+            Handshake::Knock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(template.event["content"]["membership"], "knock");
+
+        let (public, room_id, _) = room_fixture("public", Vec::new(), Vec::new());
+        let err = make_membership(
+            &public,
+            &room_id,
+            "@bob:joiner.example.org",
+            &["11".to_owned()],
+            Handshake::Knock,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, JoinError::NotAuthorized(_)), "{err}");
+    }
+
+    /// A knock the resident accepts is stored and forwarded to the room's other servers, as a
+    /// join is; one whose membership is not "knock" is refused before anything is stored.
+    #[tokio::test]
+    async fn send_knock_stores_and_forwards_a_knock_and_refuses_anything_else() {
+        let (rooms, room_id, _) = room_fixture(
+            "knock",
+            Vec::new(),
+            vec![
+                "resident.example.org".to_owned(),
+                "other.example.org".to_owned(),
+            ],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let keys = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
+        let doc = build_server_key_response("joiner.example.org", &keys, &[], 3600).unwrap();
+        let cache = RemoteKeyCache::new(Box::new(FixedFetcher(doc)) as Box<dyn KeyServerFetcher>);
+        let auth = vec![
+            Value::String("$create".to_owned()),
+            Value::String("$power".to_owned()),
+            Value::String("$joinrules".to_owned()),
+        ];
+        let knock = sign_membership_event(
+            &keys,
+            &room_id,
+            "@bob:joiner.example.org",
+            "knock",
+            vec![Value::String("$creatorjoin".to_owned())],
+            auth.clone(),
+            5,
+        );
+        let knock_id = hs_model::Event::parse(&knock, RoomVersionId::V11)
+            .unwrap()
+            .event_id()
+            .to_string();
+        let forward = RecordingSink::default();
+        let result = send_membership(
+            &rooms,
+            &StoringSink,
+            &cache,
+            &room_id,
+            &knock_id,
+            &knock,
+            "joiner.example.org",
+            "resident.example.org",
+            Some(&forward),
+            Handshake::Knock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.event["content"]["membership"], "knock");
+        let forwarded = forward.0.lock().unwrap().clone();
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded[0].0, vec!["other.example.org".to_owned()]);
+
+        let join = sign_membership_event(
+            &keys,
+            &room_id,
+            "@bob:joiner.example.org",
+            "join",
+            vec![Value::String("$creatorjoin".to_owned())],
+            auth,
+            5,
+        );
+        let join_id = hs_model::Event::parse(&join, RoomVersionId::V11)
+            .unwrap()
+            .event_id()
+            .to_string();
+        let err = send_membership(
+            &rooms,
+            &StoringSink,
+            &cache,
+            &room_id,
+            &join_id,
+            &join,
+            "joiner.example.org",
+            "resident.example.org",
+            None,
+            Handshake::Knock,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, JoinError::MalformedEvent(_)), "{err}");
+    }
+
+    /// Rejecting an invite from a server that is not in the room: the invited user's server
+    /// signs the leave template and the resident stores it.
+    #[tokio::test]
+    async fn send_leave_accepts_an_invited_users_own_leave() {
+        let (rooms, room_id, _) = room_fixture("invite", vec![bobs_invite()], Vec::new());
+        let dir = tempfile::tempdir().unwrap();
+        let keys = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
+        let doc = build_server_key_response("joiner.example.org", &keys, &[], 3600).unwrap();
+        let cache = RemoteKeyCache::new(Box::new(FixedFetcher(doc)) as Box<dyn KeyServerFetcher>);
+        let leave = sign_membership_event(
+            &keys,
+            &room_id,
+            "@bob:joiner.example.org",
+            "leave",
+            vec![Value::String("$creatorjoin".to_owned())],
+            vec![
+                Value::String("$create".to_owned()),
+                Value::String("$power".to_owned()),
+                Value::String("$bobinvite".to_owned()),
+            ],
+            5,
+        );
+        let leave_id = hs_model::Event::parse(&leave, RoomVersionId::V11)
+            .unwrap()
+            .event_id()
+            .to_string();
+        let result = send_membership(
+            &rooms,
+            &StoringSink,
+            &cache,
+            &room_id,
+            &leave_id,
+            &leave,
+            "joiner.example.org",
+            "resident.example.org",
+            None,
+            Handshake::Leave,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.event["content"]["membership"], "leave");
+    }
+
     #[tokio::test]
     async fn make_join_builds_a_real_template_against_current_state() {
         let (rooms, room_id, room_version) = room_with_creator();
@@ -698,6 +1004,26 @@ mod tests {
         auth_events: Vec<Value>,
         depth: i64,
     ) -> Value {
+        sign_membership_event(
+            keys,
+            room_id,
+            sender,
+            "join",
+            prev_events,
+            auth_events,
+            depth,
+        )
+    }
+
+    fn sign_membership_event(
+        keys: &OwnSigningKeys,
+        room_id: &str,
+        sender: &str,
+        membership: &str,
+        prev_events: Vec<Value>,
+        auth_events: Vec<Value>,
+        depth: i64,
+    ) -> Value {
         let mut object = to_canonical_object(
             &serde_json::json!({
                 "type": "m.room.member",
@@ -706,7 +1032,7 @@ mod tests {
                 "state_key": sender,
                 "origin_server_ts": 1,
                 "depth": depth,
-                "content": {"membership": "join"},
+                "content": {"membership": membership},
                 "prev_events": prev_events,
                 "auth_events": auth_events,
             }),

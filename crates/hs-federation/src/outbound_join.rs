@@ -173,13 +173,111 @@ pub async fn join_room_with_content(
     signing_key: &SigningKeyPair,
     content: Option<&Value>,
 ) -> Result<RemoteJoinOutcome, OutboundJoinError> {
-    let supported_versions: Vec<String> = hs_model::room_version::known_room_version_ids()
-        .map(|v| format!("ver={v}"))
-        .collect();
-    let template_path = format!(
-        "/_matrix/federation/v1/make_join/{room_id}/{user_id}?{}",
-        supported_versions.join("&")
-    );
+    let SignedTemplate {
+        value: signed_value,
+        event: join_event,
+        room_version,
+    } = make_and_sign(
+        client,
+        destination,
+        "make_join",
+        true,
+        room_id,
+        user_id,
+        own_server_name,
+        signing_key,
+        content,
+    )
+    .await?;
+    let event_id = join_event.event_id().to_string();
+
+    let send_join_path = format!("/_matrix/federation/v2/send_join/{room_id}/{event_id}");
+    let send_join_response = client
+        .send(destination, "PUT", &send_join_path, Some(&signed_value))
+        .await
+        .map_err(|source| OutboundJoinError::Client {
+            destination: destination.to_owned(),
+            source,
+        })?;
+    if send_join_response.status / 100 != 2 {
+        return Err(OutboundJoinError::Rejected {
+            destination: destination.to_owned(),
+            step: "send_join",
+            status: send_join_response.status,
+            body: send_join_response.body,
+        });
+    }
+
+    let state = verify_array(
+        &send_join_response.body,
+        "state",
+        &room_version,
+        key_cache,
+        destination,
+    )
+    .await?;
+    let auth_chain = verify_array(
+        &send_join_response.body,
+        "auth_chain",
+        &room_version,
+        key_cache,
+        destination,
+    )
+    .await?;
+    let members_omitted = send_join_response
+        .body
+        .get("members_omitted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    Ok(RemoteJoinOutcome {
+        room_id: room_id.to_owned(),
+        room_version,
+        join_event,
+        state,
+        auth_chain,
+        members_omitted,
+    })
+}
+
+/// A membership template a resident handed out, signed by this server: the JSON to submit, the
+/// parsed event and the room version it was parsed under.
+pub(crate) struct SignedTemplate {
+    pub(crate) value: Value,
+    pub(crate) event: Event,
+    pub(crate) room_version: RoomVersionId,
+}
+
+/// The first half of every membership handshake this server initiates: `GET {step}` from
+/// `destination` (`make_join`, `make_leave` or `make_knock`, asked with every supported room
+/// version when `with_versions`), `content` merged into the template (never its `membership`),
+/// and the result hashed, redacted and signed as this server's event.
+///
+/// # Errors
+/// See [`OutboundJoinError`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn make_and_sign(
+    client: &FederationClient,
+    destination: &str,
+    step: &'static str,
+    with_versions: bool,
+    room_id: &str,
+    user_id: &str,
+    own_server_name: &ServerName,
+    signing_key: &SigningKeyPair,
+    content: Option<&Value>,
+) -> Result<SignedTemplate, OutboundJoinError> {
+    let template_path = if with_versions {
+        let supported_versions: Vec<String> = hs_model::room_version::known_room_version_ids()
+            .map(|v| format!("ver={v}"))
+            .collect();
+        format!(
+            "/_matrix/federation/v1/{step}/{room_id}/{user_id}?{}",
+            supported_versions.join("&")
+        )
+    } else {
+        format!("/_matrix/federation/v1/{step}/{room_id}/{user_id}")
+    };
     let make_join_response = client
         .send(destination, "GET", &template_path, None)
         .await
@@ -190,12 +288,11 @@ pub async fn join_room_with_content(
     if make_join_response.status / 100 != 2 {
         return Err(OutboundJoinError::Rejected {
             destination: destination.to_owned(),
-            step: "make_join",
+            step,
             status: make_join_response.status,
             body: make_join_response.body,
         });
     }
-
     let mut template = make_join_response
         .body
         .get("event")
@@ -251,57 +348,13 @@ pub async fn join_room_with_content(
 
     let signed_value = sign_join_template(&template, &rules, own_server_name, signing_key)
         .map_err(OutboundJoinError::Signing)?;
-    let join_event = Event::parse(&signed_value, room_version.clone()).map_err(|e| {
-        OutboundJoinError::Signing(format!("signed join event does not parse: {e}"))
+    let event = Event::parse(&signed_value, room_version.clone()).map_err(|e| {
+        OutboundJoinError::Signing(format!("signed {step} event does not parse: {e}"))
     })?;
-    let event_id = join_event.event_id().to_string();
-
-    let send_join_path = format!("/_matrix/federation/v2/send_join/{room_id}/{event_id}");
-    let send_join_response = client
-        .send(destination, "PUT", &send_join_path, Some(&signed_value))
-        .await
-        .map_err(|source| OutboundJoinError::Client {
-            destination: destination.to_owned(),
-            source,
-        })?;
-    if send_join_response.status / 100 != 2 {
-        return Err(OutboundJoinError::Rejected {
-            destination: destination.to_owned(),
-            step: "send_join",
-            status: send_join_response.status,
-            body: send_join_response.body,
-        });
-    }
-
-    let state = verify_array(
-        &send_join_response.body,
-        "state",
-        &room_version,
-        key_cache,
-        destination,
-    )
-    .await?;
-    let auth_chain = verify_array(
-        &send_join_response.body,
-        "auth_chain",
-        &room_version,
-        key_cache,
-        destination,
-    )
-    .await?;
-    let members_omitted = send_join_response
-        .body
-        .get("members_omitted")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
-    Ok(RemoteJoinOutcome {
-        room_id: room_id.to_owned(),
+    Ok(SignedTemplate {
+        value: signed_value,
+        event,
         room_version,
-        join_event,
-        state,
-        auth_chain,
-        members_omitted,
     })
 }
 
@@ -693,6 +746,7 @@ mod tests {
             ancestor_fetcher: None,
             backfill_limits: crate::backfill::BackfillLimits::default(),
             sender: None,
+            invites: None,
         };
         let ctx = Arc::new(XMatrixContext {
             own_server_name: server_name.clone(),

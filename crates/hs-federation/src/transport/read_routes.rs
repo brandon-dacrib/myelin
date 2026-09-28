@@ -519,6 +519,7 @@ mod tests {
             ancestor_fetcher: None,
             backfill_limits: crate::backfill::BackfillLimits::default(),
             sender: None,
+            invites: None,
         };
         build().with_state(state)
     }
@@ -540,6 +541,7 @@ mod tests {
             ancestor_fetcher: None,
             backfill_limits: crate::backfill::BackfillLimits::default(),
             sender: None,
+            invites: None,
         };
         let response = router
             .with_state(state)
@@ -627,6 +629,7 @@ mod tests {
             ancestor_fetcher: None,
             backfill_limits: crate::backfill::BackfillLimits::default(),
             sender: None,
+            invites: None,
         };
         let router = build();
         let header = signed_header("anyone.example.org", "GET", "/publicRooms");

@@ -121,36 +121,45 @@ pub async fn verify_pdu(
     // `send_join` was rejecting a genuinely, correctly signed join event with `M_BAD_JSON:
     // signature ... does not verify` because it checked the full event instead of the redacted
     // one.
+    let sender_server = event.header().sender.server_name().as_str().to_owned();
+    verify_server_signature(&event, &sender_server, key_cache).await?;
+    Ok(event)
+}
+
+/// Checks that `event` carries a valid signature from `server` over its redacted form -- the
+/// signature half of [`verify_pdu`], for a server other than the sender's: the invitee's server
+/// co-signing an invite (`crate::invite`) is the case that needs it.
+///
+/// # Errors
+/// Returns [`PduError`] if the event cannot be redacted, carries no signature from `server`,
+/// `server`'s key cannot be resolved, or the signature does not verify.
+pub async fn verify_server_signature(
+    event: &Event,
+    server: &str,
+    key_cache: &DynRemoteKeyCache,
+) -> Result<(), PduError> {
     let redacted = event.redacted_json().map_err(|e| {
         reject(format!(
             "cannot redact event for signature verification: {e}"
         ))
     })?;
 
-    let sender_server = event.header().sender.server_name().as_str();
-    let key_id = signature_key_id(&redacted, sender_server)
-        .ok_or_else(|| reject(format!("no signature from sender's server {sender_server}")))?;
+    let key_id = signature_key_id(&redacted, server)
+        .ok_or_else(|| reject(format!("no signature from {server}")))?;
 
     let signed_at = u64::try_from(event.header().origin_server_ts).unwrap_or(0);
     let verifying_key = key_cache
-        .get_valid_at(sender_server, &key_id, signed_at)
+        .get_valid_at(server, &key_id, signed_at)
         .await
         .map_err(|e| {
             reject(format!(
-                "key lookup for {sender_server}/{key_id} failed: {}",
+                "key lookup for {server}/{key_id} failed: {}",
                 key_lookup_reason(&e)
             ))
         })?;
 
-    hs_model::signing::verify_object(&redacted, sender_server, &key_id, &verifying_key).map_err(
-        |_| {
-            reject(format!(
-                "signature from {sender_server}/{key_id} does not verify"
-            ))
-        },
-    )?;
-
-    Ok(event)
+    hs_model::signing::verify_object(&redacted, server, &key_id, &verifying_key)
+        .map_err(|_| reject(format!("signature from {server}/{key_id} does not verify")))
 }
 
 fn key_lookup_reason(e: &KeyLookupError) -> String {

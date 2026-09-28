@@ -174,6 +174,7 @@ impl Harness {
             ancestor_fetcher,
             backfill_limits: hs_federation::backfill::BackfillLimits::default(),
             sender: None,
+            invites: None,
         };
 
         let fetcher = TwoServerKeys {
