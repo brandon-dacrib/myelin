@@ -458,9 +458,13 @@ while the owner deletes `pod/hs-1`. Target 0 failures.
 
 **The demo's `/` is a 404** (<https://myelin.dacrib.net/>): the ingress routes only `/_matrix`,
 `/.well-known/matrix`, `/admin`, `/api/v1` and `/_synapse`, and the server has no `/` handler,
-so the ingress controller answers. `/admin` works. The fix (`/` redirects to `/admin/`, the
-chart routes an exact `/`) is `agent/root-redirect`; rolling it out needs a `helm upgrade` from
-the owner's terminal.
+so the ingress controller answers. `/admin` works. The fix is `agent/root-redirect` (`d41a7ad`): `GET /` answers 307 to `/admin/` (or an "It
+works" page without the interface), and the Ingress and HTTPRoute route an exact `/`. Its gate
+failed only on `cluster_admin`'s drain test, the ownership bug `agent/two-pod-cluster-2` fixes,
+so merge that branch first. To roll out (the demo is Helm release `myelin` in namespace `myelin`,
+values in my-infra's `talos-clusters/dacrib0/apps/myelin/values.yaml`), once CD has published:
+`helm upgrade myelin oci://ghcr.io/brandon-dacrib/charts/hs --devel -n myelin -f <values> --wait`
+(the first time may need `kubectl -n myelin delete statefulset myelin-hs --cascade=orphan`).
 
 **New known gaps:** a debug build's cold boot takes 28-60 s under load because about 62 storage
 keyspaces are created one after another, each flushed; a clustered replica shutting down with
