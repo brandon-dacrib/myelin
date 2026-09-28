@@ -29,7 +29,11 @@
 //!   nothing and everything in it falls through to the file or the schema default.
 //! - `meta` — [`ConfigMeta`]: the revision counter, who last wrote and when.
 //! - `history/<revision>` — [`ChangeRecord`], one per write, so the web interface can show what
-//!   changed and when without a separate audit store.
+//!   changed and when without a separate audit store. Since the per-setting history each record
+//!   also carries what the database held at every setting it touched ([`ChangeRecord::before`]),
+//!   which is what [`ConfigStore::revert_plan`] undoes it with. That includes a secret's earlier
+//!   value: restoring a rotated secret is what a revert is for, and it never leaves the server --
+//!   the admin API redacts history exactly as it redacts values.
 //! - `import/<kind>/<key>` — [`ImportRecord`], one per bootstrap-file item imported into the
 //!   database once (an appservice registration file, today), so that a file still listed after
 //!   the import is not imported again over what an operator has since changed.
@@ -39,6 +43,7 @@
 //! through `hs-tables`.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 
 use hs_kv::{KvBackend, KvError, KvRead, KvWrite, RangeSpec, TransactConfig};
 use schemars::JsonSchema;
@@ -77,6 +82,12 @@ fn section_key(name: &str) -> Vec<u8> {
 
 fn import_key(kind: &str, key: &str) -> Vec<u8> {
     format!("{IMPORT_PREFIX}{kind}/{key}").into_bytes()
+}
+
+/// One past every `history/<revision>` key: the exclusive upper bound of a history scan.
+fn history_upper_bound() -> Vec<u8> {
+    // `0` is the successor of `/` in ASCII, so `history0` sorts after every `history/...`.
+    b"history0".to_vec()
 }
 
 fn history_key(revision: u64) -> Vec<u8> {
@@ -140,6 +151,22 @@ pub enum StoreError {
         pointers: Vec<String>,
         /// Why the first of them is bootstrap ([`crate::bootstrap::BootstrapReason`]).
         explanation: &'static str,
+    },
+    /// No change with this revision was recorded against this section.
+    #[error("no change to {section:?} was recorded at revision {revision}")]
+    NoSuchChange {
+        /// The section asked about.
+        section: String,
+        /// The revision asked for.
+        revision: u64,
+    },
+    /// The change exists but cannot be undone automatically.
+    #[error("revision {revision} cannot be reverted: {reason}")]
+    NotRevertible {
+        /// The revision asked for.
+        revision: u64,
+        /// Why not.
+        reason: String,
     },
 }
 
@@ -216,6 +243,56 @@ pub struct ChangeRecord {
     pub actor: Option<String>,
     /// When, in milliseconds since the Unix epoch.
     pub at_ms: i64,
+    /// What the database held at each setting the patch touched, just before it was applied
+    /// ([`crate::history::before_values`]): section-relative JSON Pointer to value, `null` where
+    /// it held nothing. `None` for a record written before this was kept, which can be shown
+    /// but not reverted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<BTreeMap<String, Value>>,
+    /// The revision this change undid, when it was a revert ([`ConfigStore::apply_revert`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverts: Option<u64>,
+}
+
+/// A later change to the same settings as the one being reverted: reverting over it would undo
+/// it too, so [`ConfigStore::revert_plan`] reports it and the caller decides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaterChange {
+    /// The later change's revision.
+    pub revision: u64,
+    /// Who made it.
+    pub actor: Option<String>,
+    /// When, in milliseconds since the Unix epoch.
+    pub at_ms: i64,
+    /// The section-relative pointers it wrote that overlap the change being reverted.
+    pub pointers: Vec<String>,
+}
+
+/// How to undo one recorded change, computed against what is stored now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevertPlan {
+    /// The change being undone.
+    pub record: ChangeRecord,
+    /// The merge patch that undoes it against the section as it is stored now. An empty object
+    /// when the settings already hold their earlier values.
+    pub patch: Value,
+    /// Later changes to the same settings, oldest first. Empty means the revert undoes only this
+    /// change.
+    pub conflicts: Vec<LaterChange>,
+    /// The store's revision this plan was computed at. [`ConfigStore::apply_revert`] refuses to
+    /// write it over any other.
+    pub revision: u64,
+}
+
+/// One page of history, newest first ([`ConfigStore::history_page`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryPage {
+    /// The changes on this page, newest first.
+    pub records: Vec<ChangeRecord>,
+    /// Pass as `before` for the next, older page; `None` on the oldest page.
+    pub older: Option<u64>,
+    /// Pass as `before` for the previous, newer page; `None` on the newest page.
+    pub newer: Option<u64>,
 }
 
 /// The stored configuration: every section merged into one sparse document, plus its metadata.
@@ -384,6 +461,44 @@ impl<B: KvBackend> ConfigStore<B> {
         now_ms: i64,
         expected_revision: Option<u64>,
     ) -> Result<Stored, StoreError> {
+        self.write_change(section, patch, actor, now_ms, expected_revision, None)
+    }
+
+    /// Writes a [`RevertPlan`] computed by [`ConfigStore::revert_plan`]: its patch, as a new
+    /// revision whose history entry says which revision it reverted.
+    ///
+    /// The plan was computed against [`RevertPlan::revision`], and it is written only over that
+    /// revision -- a store that moved on in between answers [`StoreError::RevisionMismatch`],
+    /// and the caller plans again. As with [`ConfigStore::patch_section`], validating the
+    /// configuration the revert would produce is the caller's job.
+    ///
+    /// # Errors
+    /// As [`ConfigStore::patch_section`].
+    pub fn apply_revert(
+        &self,
+        plan: &RevertPlan,
+        actor: Option<&str>,
+        now_ms: i64,
+    ) -> Result<Stored, StoreError> {
+        self.write_change(
+            &plan.record.section,
+            &plan.patch,
+            actor,
+            now_ms,
+            Some(plan.revision),
+            Some(plan.record.revision),
+        )
+    }
+
+    fn write_change(
+        &self,
+        section: &str,
+        patch: &Value,
+        actor: Option<&str>,
+        now_ms: i64,
+        expected_revision: Option<u64>,
+        reverts: Option<u64>,
+    ) -> Result<Stored, StoreError> {
         check_section_name(section)?;
         let touched = bootstrap::bootstrap_pointers_in_patch(section, patch);
         if is_bootstrap_section(section) || !touched.is_empty() {
@@ -415,6 +530,7 @@ impl<B: KvBackend> ConfigStore<B> {
                 },
                 None => Value::Object(Map::new()),
             };
+            let before = crate::history::before_values(&current, patch);
             merge_patch(&mut current, patch);
 
             let revision = meta.revision.saturating_add(1);
@@ -431,6 +547,8 @@ impl<B: KvBackend> ConfigStore<B> {
                 patch: patch.clone(),
                 actor: actor.map(str::to_owned),
                 at_ms: now_ms,
+                before: Some(before),
+                reverts,
             };
             txn.put(&self.keyspace, &history_key(revision), &to_bytes(&record))?;
             txn.put(
@@ -492,7 +610,8 @@ impl<B: KvBackend> ConfigStore<B> {
                     meta.server_name = Some(server_name.to_owned());
                     identity_changed = true;
                 }
-                let mut document = Value::Object(Map::from_iter([(name.to_owned(), stored)]));
+                let mut document =
+                    Value::Object(Map::from_iter([(name.to_owned(), stored.clone())]));
                 let gone = strip_bootstrap(&mut document);
                 if gone.is_empty() {
                     continue;
@@ -502,12 +621,15 @@ impl<B: KvBackend> ConfigStore<B> {
                     None => txn.delete(&self.keyspace, &key)?,
                 }
                 meta.revision = meta.revision.saturating_add(1);
+                let patch = null_patch(name, &gone);
                 let record = ChangeRecord {
                     revision: meta.revision,
                     section: name.to_owned(),
-                    patch: null_patch(name, &gone),
+                    before: Some(crate::history::before_values(&stored, &patch)),
+                    patch,
                     actor: Some(PURGE_ACTOR.to_owned()),
                     at_ms: now_ms,
+                    reverts: None,
                 };
                 txn.put(
                     &self.keyspace,
@@ -594,6 +716,193 @@ impl<B: KvBackend> ConfigStore<B> {
             out.push(parse(&String::from_utf8_lossy(&key), &value)?);
         }
         Ok(out)
+    }
+
+    /// One page of history, newest first: at most `limit` changes older than revision `before`
+    /// (from the newest when `None`), only `section`'s when it is set.
+    ///
+    /// Filtering by section happens before the limit, so a busy neighbouring section cannot
+    /// crowd a quiet one's history off the page. Configuration writes are rare -- an operator
+    /// saving a form -- so the scan walks the history keys rather than keeping a per-section
+    /// index.
+    ///
+    /// # Errors
+    /// As [`ConfigStore::load`].
+    pub fn history_page(
+        &self,
+        section: Option<&str>,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<HistoryPage, StoreError> {
+        let limit = limit.max(1);
+        let snapshot = self.backend.snapshot();
+        let matches = |record: &ChangeRecord| section.is_none_or(|name| record.section == name);
+
+        let upper = match before {
+            Some(revision) => history_key(revision),
+            None => history_upper_bound(),
+        };
+        let mut records = Vec::new();
+        let mut more = false;
+        for entry in snapshot.range(
+            &self.keyspace,
+            RangeSpec::new(
+                Bound::Included(HISTORY_PREFIX.as_bytes().to_vec().into()),
+                Bound::Excluded(upper.into()),
+            )
+            .reverse(),
+        ) {
+            let (key, value) = entry?;
+            let record: ChangeRecord = parse(&String::from_utf8_lossy(&key), &value)?;
+            if !matches(&record) {
+                continue;
+            }
+            if records.len() == limit {
+                more = true;
+                break;
+            }
+            records.push(record);
+        }
+        let older = if more {
+            records.last().map(|r| r.revision)
+        } else {
+            None
+        };
+
+        // The previous page is the `limit` matching changes just newer than this page's newest.
+        // Its cursor is one past the newest of those, which reads as the newest page when there
+        // are fewer than `limit` of them.
+        let newer = match before {
+            None => None,
+            Some(before) => {
+                let from = records
+                    .first()
+                    .map_or(before, |record| record.revision.saturating_add(1));
+                let mut newest = None;
+                let mut seen = 0;
+                for entry in snapshot.range(
+                    &self.keyspace,
+                    RangeSpec::new(
+                        Bound::Included(history_key(from).into()),
+                        Bound::Excluded(history_upper_bound().into()),
+                    ),
+                ) {
+                    let (key, value) = entry?;
+                    let record: ChangeRecord = parse(&String::from_utf8_lossy(&key), &value)?;
+                    if !matches(&record) {
+                        continue;
+                    }
+                    newest = Some(record.revision);
+                    seen += 1;
+                    if seen == limit {
+                        break;
+                    }
+                }
+                newest.map(|revision| revision.saturating_add(1))
+            }
+        };
+        Ok(HistoryPage {
+            records,
+            older,
+            newer,
+        })
+    }
+
+    /// The change recorded at `revision`, if there is one.
+    ///
+    /// # Errors
+    /// As [`ConfigStore::load`].
+    pub fn change(&self, revision: u64) -> Result<Option<ChangeRecord>, StoreError> {
+        let snapshot = self.backend.snapshot();
+        match snapshot.get(&self.keyspace, &history_key(revision))? {
+            Some(bytes) => Ok(Some(parse(&format!("history/{revision}"), &bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// How to undo the change to `section` recorded at `revision`, against what is stored now:
+    /// the merge patch that puts every setting it touched back to what the database held before
+    /// it ([`crate::history::revert_target`]), and the later changes to any of the same settings,
+    /// which the revert would undo as well.
+    ///
+    /// Nothing is written. [`ConfigStore::apply_revert`] writes the plan once the caller has
+    /// validated what it would produce and decided about the conflicts.
+    ///
+    /// # Errors
+    /// [`StoreError::UnknownSection`]; [`StoreError::NoSuchChange`] when no change to `section`
+    /// was recorded at `revision`; [`StoreError::NotRevertible`] for a change recorded before
+    /// prior values were kept; otherwise as [`ConfigStore::load`].
+    pub fn revert_plan(&self, section: &str, revision: u64) -> Result<RevertPlan, StoreError> {
+        check_section_name(section)?;
+        let snapshot = self.backend.snapshot();
+        let no_such = || StoreError::NoSuchChange {
+            section: section.to_owned(),
+            revision,
+        };
+        let record: ChangeRecord = match snapshot.get(&self.keyspace, &history_key(revision))? {
+            Some(bytes) => parse(&format!("history/{revision}"), &bytes)?,
+            None => return Err(no_such()),
+        };
+        if record.section != section {
+            return Err(no_such());
+        }
+        let Some(before) = record.before.as_ref() else {
+            return Err(StoreError::NotRevertible {
+                revision,
+                reason: "it was recorded before this server kept the values a change replaced, \
+                         so what to put back is not known -- set the settings by hand instead"
+                    .to_owned(),
+            });
+        };
+
+        let meta: ConfigMeta = match snapshot.get(&self.keyspace, META_KEY)? {
+            Some(bytes) => parse("meta", &bytes)?,
+            None => ConfigMeta::default(),
+        };
+        let current = match snapshot.get(&self.keyspace, &section_key(section))? {
+            Some(bytes) => parse(section, &bytes)?,
+            None => Value::Object(Map::new()),
+        };
+
+        let mut conflicts = Vec::new();
+        for entry in snapshot.range(
+            &self.keyspace,
+            RangeSpec::new(
+                Bound::Excluded(history_key(revision).into()),
+                Bound::Excluded(history_upper_bound().into()),
+            ),
+        ) {
+            let (key, value) = entry?;
+            let later: ChangeRecord = parse(&String::from_utf8_lossy(&key), &value)?;
+            if later.section != section {
+                continue;
+            }
+            let shared: Vec<String> = crate::document::leaf_pointers(&later.patch)
+                .into_iter()
+                .filter(|p| {
+                    before
+                        .keys()
+                        .any(|t| crate::history::pointers_overlap(t, p))
+                })
+                .collect();
+            if !shared.is_empty() {
+                conflicts.push(LaterChange {
+                    revision: later.revision,
+                    actor: later.actor,
+                    at_ms: later.at_ms,
+                    pointers: shared,
+                });
+            }
+        }
+
+        let target = crate::history::revert_target(&current, before);
+        let patch = crate::history::diff_merge_patch(&current, &target);
+        Ok(RevertPlan {
+            record,
+            patch,
+            conflicts,
+            revision: meta.revision,
+        })
     }
 }
 
@@ -1029,6 +1338,240 @@ mod tests {
         assert_eq!(history[0].revision, 2);
         assert_eq!(history[0].patch, json!({"client_timeout": "45s"}));
         assert_eq!(history[1].section, "auth");
+    }
+
+    fn set(store: &ConfigStore<MemoryBackend>, section: &str, patch: Value, actor: &str) -> u64 {
+        store
+            .patch_section(section, &patch, Some(actor), 1, None)
+            .unwrap()
+            .meta
+            .revision
+    }
+
+    #[test]
+    fn a_change_records_what_each_setting_held_before() {
+        let store = store();
+        set(
+            &store,
+            "rate_limits",
+            json!({"login": {"per_second": 5.0}}),
+            "a",
+        );
+        set(
+            &store,
+            "rate_limits",
+            json!({"login": {"per_second": 10.0, "burst_count": 3}}),
+            "b",
+        );
+        let latest = &store.history(1).unwrap()[0];
+        assert_eq!(
+            latest.before,
+            Some(BTreeMap::from([
+                ("/login/burst_count".to_owned(), Value::Null),
+                ("/login/per_second".to_owned(), json!(5.0)),
+            ]))
+        );
+        assert_eq!(latest.reverts, None);
+    }
+
+    /// A record written before `before` existed still reads, and is refused for a revert with a
+    /// reason rather than reverted with a guess.
+    #[test]
+    fn a_legacy_record_reads_but_is_not_revertible() {
+        let backend = MemoryBackend::new();
+        let store = ConfigStore::open(backend.clone()).unwrap();
+        let keyspace = backend.keyspace(KEYSPACE).unwrap();
+        let legacy = json!({
+            "revision": 1, "section": "auth", "patch": {"enable_registration": true},
+            "actor": "@old:example.org", "at_ms": 5
+        });
+        hs_kv::transact(&backend, TransactConfig::default(), |txn| {
+            txn.put(&keyspace, &history_key(1), &to_bytes(&legacy))?;
+            Ok(())
+        })
+        .unwrap();
+        let record = store.change(1).unwrap().unwrap();
+        assert_eq!(record.before, None);
+        assert!(matches!(
+            store.revert_plan("auth", 1),
+            Err(StoreError::NotRevertible { revision: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn history_pages_newest_first_per_section_with_cursors_both_ways() {
+        let store = store();
+        // auth at 1, 3, 5, 7, 9; federation in between.
+        for i in 0..5 {
+            set(
+                &store,
+                "auth",
+                json!({"enable_registration": i % 2 == 0}),
+                "a",
+            );
+            set(
+                &store,
+                "federation",
+                json!({"client_timeout": format!("{i}s")}),
+                "b",
+            );
+        }
+        let first = store.history_page(Some("auth"), None, 2).unwrap();
+        let revisions =
+            |page: &HistoryPage| page.records.iter().map(|r| r.revision).collect::<Vec<_>>();
+        assert_eq!(revisions(&first), vec![9, 7]);
+        assert_eq!(first.newer, None);
+        assert_eq!(first.older, Some(7));
+
+        let second = store.history_page(Some("auth"), first.older, 2).unwrap();
+        assert_eq!(revisions(&second), vec![5, 3]);
+        assert_eq!(second.older, Some(3));
+        let back = store.history_page(Some("auth"), second.newer, 2).unwrap();
+        assert_eq!(
+            revisions(&back),
+            vec![9, 7],
+            "newer leads back to the first page"
+        );
+
+        let last = store.history_page(Some("auth"), second.older, 2).unwrap();
+        assert_eq!(revisions(&last), vec![1]);
+        assert_eq!(last.older, None);
+        assert!(last.newer.is_some());
+
+        let everything = store.history_page(None, None, 3).unwrap();
+        assert_eq!(revisions(&everything), vec![10, 9, 8]);
+    }
+
+    #[test]
+    fn a_revert_puts_back_what_the_change_replaced_as_a_new_revision() {
+        let store = store();
+        set(
+            &store,
+            "rate_limits",
+            json!({"login": {"per_second": 5.0}}),
+            "a",
+        );
+        let changed = set(
+            &store,
+            "rate_limits",
+            json!({"login": {"per_second": 10.0}, "message": {"per_second": 1.0}}),
+            "b",
+        );
+        let plan = store.revert_plan("rate_limits", changed).unwrap();
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(
+            plan.patch,
+            json!({"login": {"per_second": 5.0}, "message": null})
+        );
+        let stored = store.apply_revert(&plan, Some("c"), 9).unwrap();
+        assert_eq!(stored.meta.revision, changed + 1);
+        assert_eq!(
+            store.section("rate_limits").unwrap(),
+            Some(json!({"login": {"per_second": 5.0}}))
+        );
+        let record = store.change(changed + 1).unwrap().unwrap();
+        assert_eq!(record.reverts, Some(changed));
+        assert_eq!(record.actor.as_deref(), Some("c"));
+
+        // Reverting the revert redoes the change.
+        let redo = store.revert_plan("rate_limits", changed + 1).unwrap();
+        assert!(redo.conflicts.is_empty());
+        store.apply_revert(&redo, Some("c"), 10).unwrap();
+        assert_eq!(
+            store.section("rate_limits").unwrap(),
+            Some(json!({"login": {"per_second": 10.0}, "message": {"per_second": 1.0}}))
+        );
+    }
+
+    #[test]
+    fn a_later_change_to_the_same_setting_is_reported_and_a_neighbour_is_not() {
+        let store = store();
+        let first = set(
+            &store,
+            "rate_limits",
+            json!({"login": {"per_second": 10.0}}),
+            "a",
+        );
+        set(
+            &store,
+            "rate_limits",
+            json!({"login": {"burst_count": 7}}),
+            "b",
+        );
+        set(&store, "auth", json!({"enable_registration": true}), "b");
+        let clean = store.revert_plan("rate_limits", first).unwrap();
+        assert!(clean.conflicts.is_empty(), "burst_count is a neighbour");
+
+        let later = set(
+            &store,
+            "rate_limits",
+            json!({"login": null}),
+            "@ops:example.org",
+        );
+        let plan = store.revert_plan("rate_limits", first).unwrap();
+        assert_eq!(
+            plan.conflicts,
+            vec![LaterChange {
+                revision: later,
+                actor: Some("@ops:example.org".to_owned()),
+                at_ms: 1,
+                pointers: vec!["/login".to_owned()],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_revert_planned_against_a_store_that_moved_on_is_refused() {
+        let store = store();
+        let first = set(&store, "auth", json!({"enable_registration": true}), "a");
+        let plan = store.revert_plan("auth", first).unwrap();
+        set(&store, "federation", json!({"client_timeout": "9s"}), "b");
+        assert!(matches!(
+            store.apply_revert(&plan, None, 2),
+            Err(StoreError::RevisionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn reverting_a_change_to_another_section_or_nowhere_is_no_such_change() {
+        let store = store();
+        let first = set(&store, "auth", json!({"enable_registration": true}), "a");
+        assert!(matches!(
+            store.revert_plan("federation", first),
+            Err(StoreError::NoSuchChange { .. })
+        ));
+        assert!(matches!(
+            store.revert_plan("auth", 99),
+            Err(StoreError::NoSuchChange { .. })
+        ));
+    }
+
+    /// Rotating a secret and reverting restores the old secret from the store's own record.
+    #[test]
+    fn a_revert_restores_a_rotated_secret() {
+        let store = store();
+        set(
+            &store,
+            "migration",
+            json!({"synapse": {"database_url": "postgres://old"}}),
+            "a",
+        );
+        let rotated = set(
+            &store,
+            "migration",
+            json!({"synapse": {"database_url": "postgres://new"}}),
+            "a",
+        );
+        let plan = store.revert_plan("migration", rotated).unwrap();
+        store.apply_revert(&plan, Some("b"), 3).unwrap();
+        assert_eq!(
+            store
+                .load()
+                .unwrap()
+                .document
+                .pointer("/migration/synapse/database_url"),
+            Some(&json!("postgres://old"))
+        );
     }
 
     #[test]

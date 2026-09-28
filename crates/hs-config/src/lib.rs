@@ -34,6 +34,7 @@ pub mod duration;
 pub mod env;
 pub mod error;
 pub mod federation;
+pub mod history;
 pub mod layered;
 pub mod listeners;
 pub mod media;
