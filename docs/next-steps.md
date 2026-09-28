@@ -436,6 +436,12 @@ configuration history and revert (`ConfigStore` already records the patch per re
   `tools/merge-queue.sh`. Its previous gate failed only on `cluster_admin`'s drain test (the
   ownership bug `agent/two-pod-cluster-2` fixes); if that recurs it waits for that branch.
 - 17:45 started `agent/config-history` (background agent, own worktree): `GET /config/{section}/history` with the changed settings per revision, and a revert, in the API and on the section page.
+- 17:42 **merged `agent/root-redirect`** as `06db4ef` through the full gate: `GET /` is a 307 to
+  `/admin/`. Rolling it out to the demo is still the owner's Helm step in the handover below.
+- 18:00 `agent/user-moderation` rebased onto `main` (`d480d90`; the moderation decision is now
+  0014, since Rooms took 0013), per-crate checks and web checks 49/49 green; the mock
+  `cluster.spec.ts` failure was a race in the Cluster page (the shard map was not re-read when a
+  drain settled), fixed in the page. In the merge queue now.
 
 ## Handover (2026-09-28, 16:00 EDT): where the nine resumed agents stopped
 
