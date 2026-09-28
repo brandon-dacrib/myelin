@@ -96,14 +96,45 @@ pub struct E2eState<B: KvBackend> {
 /// (`crates/hs-auth/src/routes/devices.rs`) can bump this crate's device-list stream without
 /// `hs-auth` depending on this crate at all. Installed once per [`E2eState::new`] call -- see
 /// that constructor's doc comment.
+///
+/// `hs-auth` says only *whose* list changed. A device it deleted would otherwise keep its keys
+/// here, and `/keys/query` (local or over federation) would go on serving them, so the notifier
+/// compares `hs-auth`'s devices with the keys held and removes the keys of every device that is
+/// gone (each removal is itself a device-list change, and the federation announcer tells other
+/// servers the device was deleted); when nothing is gone (a rename), it records one change.
 struct AuthDeviceListNotifier {
+    auth: Arc<dyn hs_auth::store::AuthStore>,
     store: Arc<dyn E2eStore>,
+}
+
+impl AuthDeviceListNotifier {
+    async fn apply(&self, user_id: &UserId) -> Result<(), crate::store::StoreError> {
+        let alive: std::collections::BTreeSet<ruma::OwnedDeviceId> = self
+            .auth
+            .list_devices(user_id)
+            .await
+            .map_err(|e| crate::store::StoreError::Backend(e.to_string()))?
+            .into_iter()
+            .map(|device| device.device_id)
+            .collect();
+        let mut removed = 0;
+        for (device_id, _) in self.store.list_device_keys(user_id).await? {
+            if !alive.contains(&device_id) {
+                self.store.delete_device_keys(user_id, &device_id).await?;
+                removed += 1;
+            }
+        }
+        if removed == 0 {
+            self.store.record_device_list_change(user_id).await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
 impl hs_auth::state::DeviceListChangeNotifier for AuthDeviceListNotifier {
     async fn notify_device_list_changed(&self, user_id: &UserId) {
-        if let Err(error) = self.store.record_device_list_change(user_id).await {
+        if let Err(error) = self.apply(user_id).await {
             tracing::warn!(
                 %user_id,
                 %error,
@@ -128,6 +159,7 @@ impl<B: KvBackend> E2eState<B> {
     #[must_use]
     pub fn new(auth: AuthState, store: Arc<dyn E2eStore>) -> Self {
         auth.install_device_list_notifier(Arc::new(AuthDeviceListNotifier {
+            auth: auth.store.clone(),
             store: store.clone(),
         }));
         Self {
@@ -265,6 +297,54 @@ mod tests {
         assert!(store.current_stream_pos().await.unwrap() > 0);
         let changed = store.changed_users_since(0, None).await.unwrap();
         assert!(changed.contains(user));
+    }
+
+    /// A device `hs-auth` deleted loses its keys here too, so nobody is handed them again; the
+    /// devices that remain keep theirs.
+    #[tokio::test]
+    async fn a_device_deleted_in_hs_auth_has_its_keys_removed() {
+        let backend = MemoryBackend::new();
+        let store = Arc::new(crate::store::tables::TablesE2eStore::open(backend).unwrap());
+        let auth = AuthState::in_memory();
+        let _state: E2eState<MemoryBackend> = E2eState::new(auth.clone(), store.clone());
+        let user = user_id!("@alice:example.org");
+        for device in ["PHONE", "LAPTOP"] {
+            auth.store
+                .upsert_device(hs_auth::store::DeviceRecord {
+                    user_id: user.to_owned(),
+                    device_id: device.into(),
+                    display_name: None,
+                    last_seen_ms: None,
+                    last_seen_ip: None,
+                })
+                .await
+                .unwrap();
+            store
+                .upload_device_keys(
+                    user,
+                    device.into(),
+                    serde_json::json!({"device_id": device}),
+                )
+                .await
+                .unwrap();
+        }
+        let before = store.current_stream_pos().await.unwrap();
+
+        auth.store
+            .delete_device(user, "LAPTOP".into())
+            .await
+            .unwrap();
+        auth.notify_device_list_changed(user).await;
+
+        let left: Vec<String> = store
+            .list_device_keys(user)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(device, _)| device.to_string())
+            .collect();
+        assert_eq!(left, ["PHONE"]);
+        assert!(store.current_stream_pos().await.unwrap() > before);
     }
 
     /// Without any `E2eState` ever having been constructed, `notify_device_list_changed` is a
