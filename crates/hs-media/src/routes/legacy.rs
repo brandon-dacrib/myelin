@@ -30,7 +30,7 @@ use crate::error::MediaError;
 use crate::metadata::MediaRecord;
 use crate::state::MediaState;
 
-use super::download::build_response as build_download_response;
+use super::download::{DownloadQuery, build_response as build_download_response};
 use super::thumbnail::{ThumbnailQuery, build_response as build_thumbnail_response};
 
 fn range_header(headers: &HeaderMap) -> Option<String> {
@@ -59,9 +59,13 @@ fn check_not_frozen<B: KvBackend>(
 pub(crate) async fn legacy_download<B: KvBackend>(
     State(state): State<MediaState<B>>,
     Path((server_name, media_id)): Path<(String, String)>,
+    Query(query): Query<DownloadQuery>,
     headers: HeaderMap,
 ) -> Result<Response, MediaError> {
-    let record = state.repository.get_record(&server_name, &media_id)?;
+    let record = state
+        .repository
+        .resolve_record(&server_name, &media_id, query.allow_remote())
+        .await?;
     check_not_frozen(&state, &record)?;
     build_download_response(
         &state.repository,
@@ -76,9 +80,13 @@ pub(crate) async fn legacy_download<B: KvBackend>(
 pub(crate) async fn legacy_download_with_filename<B: KvBackend>(
     State(state): State<MediaState<B>>,
     Path((server_name, media_id, file_name)): Path<(String, String, String)>,
+    Query(query): Query<DownloadQuery>,
     headers: HeaderMap,
 ) -> Result<Response, MediaError> {
-    let record = state.repository.get_record(&server_name, &media_id)?;
+    let record = state
+        .repository
+        .resolve_record(&server_name, &media_id, query.allow_remote())
+        .await?;
     check_not_frozen(&state, &record)?;
     build_download_response(
         &state.repository,
@@ -95,7 +103,10 @@ pub(crate) async fn legacy_thumbnail<B: KvBackend>(
     Path((server_name, media_id)): Path<(String, String)>,
     Query(query): Query<ThumbnailQuery>,
 ) -> Result<Response, MediaError> {
-    let record = state.repository.get_record(&server_name, &media_id)?;
+    let record = state
+        .repository
+        .resolve_record(&server_name, &media_id, query.allow_remote())
+        .await?;
     check_not_frozen(&state, &record)?;
     build_thumbnail_response(&state.repository, &record, &query).await
 }

@@ -4,8 +4,8 @@
 //! async-upload reservation, a download and a thumbnail request each work end to end; the HTTP
 //! layer only translates requests into calls here and results into responses.
 
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use hs_kv::KvBackend;
@@ -18,6 +18,11 @@ use crate::error::MediaError;
 use crate::id::MediaId;
 use crate::metadata::{MediaRecord, MetadataStore, PendingScan, ThumbnailRecord};
 use crate::policy::{UploadContext, UploadPolicy};
+use crate::preview::PreviewIpPolicy;
+use crate::remote::{
+    RemoteFetchError, RemoteFetchLimits, RemoteMedia, RemoteMediaMetrics, RemoteMediaTransport,
+    fetch_remote,
+};
 use crate::scanning::config::ScanMode;
 use crate::scanning::{EngineDecision, ScanContext, ScanEngine, ScanSourceKind};
 use crate::security::{ByteRange, RangeOutcome, parse_range};
@@ -109,6 +114,11 @@ pub struct MediaRepository<B: KvBackend> {
     /// `MediaRepository::new`'s existing callers (this crate's own tests, `crate::test_support`)
     /// keep compiling unchanged. See [`MediaRepository::with_scanning`].
     scanning: Option<Arc<ScanEngine<B>>>,
+    /// Fetching other servers' media (`crate::remote`), once installed with
+    /// [`MediaRepository::install_remote_media`]. Shared by every clone, because the repository
+    /// is built (and cloned into the routes' state) before the federation client it needs
+    /// exists. Empty means another server's media is served only if a copy is already held.
+    remote: Arc<OnceLock<Arc<RemoteMedia>>>,
 }
 
 impl<B: KvBackend> MediaRepository<B> {
@@ -134,6 +144,7 @@ impl<B: KvBackend> MediaRepository<B> {
             server_name,
             clock: Arc::new(now_ms),
             scanning: None,
+            remote: Arc::new(OnceLock::new()),
         }
     }
 
@@ -653,6 +664,143 @@ impl<B: KvBackend> MediaRepository<B> {
             }
             return Err(MediaError::NotYetUploaded);
         }
+        Ok(record)
+    }
+
+    /// Installs the transport this repository fetches other servers' media through, and the
+    /// metrics it counts into. Returns `false` (and changes nothing) if one is already
+    /// installed. See [`crate::remote`].
+    pub fn install_remote_media(
+        &self,
+        transport: Arc<dyn RemoteMediaTransport>,
+        metrics: RemoteMediaMetrics,
+    ) -> bool {
+        self.remote
+            .set(Arc::new(RemoteMedia::new(transport, metrics)))
+            .is_ok()
+    }
+
+    /// The row to serve for `mxc://{server_name}/{media_id}`, fetching it from `server_name`
+    /// first if it is another server's and no copy is held (and `allow_remote` is true, the
+    /// spec's default for the query parameter of the same name).
+    ///
+    /// This server's own media, and a held copy of another's, are looked up exactly as
+    /// [`MediaRepository::get_record`] does: a quarantined copy is not-found and is never
+    /// fetched again. See [`crate::remote`] for the fetch itself.
+    ///
+    /// # Errors
+    /// As [`MediaRepository::get_record`]; [`MediaError::NotFound`] if the origin has no such
+    /// item or remote fetching is not installed or not allowed; [`MediaError::TooLarge`] if the
+    /// item exceeds `media.max_upload_size`; [`MediaError::RemoteFetchFailed`] if the origin
+    /// could not be asked or gave an unusable answer; [`MediaError::InvalidInput`] for a server
+    /// name or media ID that is not well formed.
+    pub async fn resolve_record(
+        &self,
+        server_name: &str,
+        media_id: &str,
+        allow_remote: bool,
+    ) -> Result<MediaRecord, MediaError> {
+        if server_name == self.server_name {
+            return self.get_record(server_name, media_id);
+        }
+        let remote = self.remote.get();
+        if self.metadata.get_media(server_name, media_id)?.is_some() {
+            if let Some(remote) = remote {
+                remote.metrics.hit();
+            }
+            return self.get_record(server_name, media_id);
+        }
+        let Some(remote) = remote else {
+            return Err(MediaError::NotFound);
+        };
+        if !allow_remote {
+            return Err(MediaError::NotFound);
+        }
+        let origin = ruma::ServerName::parse(server_name)
+            .map_err(|e| MediaError::InvalidInput(format!("server name: {e}")))?;
+        let id = MediaId::parse(media_id)
+            .map_err(|e| MediaError::InvalidInput(format!("media ID: {e}")))?;
+
+        // One fetch per item: whoever gets the gate first fetches, everyone else waits and then
+        // finds the copy.
+        let gate = remote.gate(origin.as_str(), id.as_str());
+        let _held = gate.lock().await;
+        if self.metadata.get_media(server_name, media_id)?.is_some() {
+            remote.metrics.hit();
+            return self.get_record(server_name, media_id);
+        }
+        remote.metrics.miss();
+        let outcome = self.fetch_and_store(remote, origin.as_str(), &id).await;
+        remote.release(origin.as_str(), id.as_str());
+        outcome
+    }
+
+    async fn fetch_and_store(
+        &self,
+        remote: &RemoteMedia,
+        origin: &str,
+        media_id: &MediaId,
+    ) -> Result<MediaRecord, MediaError> {
+        let limits = RemoteFetchLimits {
+            max_bytes: self.config.max_upload_size.as_u64(),
+            redirect_policy: PreviewIpPolicy::from_cidrs(
+                &self.config.url_preview_ip_range_blocklist,
+            ),
+            redirect_timeout: Duration::from_secs(60),
+        };
+        let started = Instant::now();
+        let fetched = fetch_remote(remote.transport.as_ref(), origin, media_id, &limits).await;
+        remote.metrics.fetched(&fetched);
+        let fetched = match fetched {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                match &error {
+                    RemoteFetchError::NotFound => {
+                        tracing::info!(origin, media_id = %media_id, "remote media not found at its origin");
+                    }
+                    _ => {
+                        tracing::warn!(origin, media_id = %media_id, %error, "could not fetch remote media");
+                    }
+                }
+                return Err(match error {
+                    RemoteFetchError::NotFound => MediaError::NotFound,
+                    RemoteFetchError::TooLarge(limit) => MediaError::TooLarge { limit },
+                    RemoteFetchError::Failed(message) => MediaError::RemoteFetchFailed(message),
+                });
+            }
+        };
+        tracing::info!(
+            origin,
+            media_id = %media_id,
+            via = fetched.via.as_str(),
+            bytes = fetched.bytes.len(),
+            content_type = %fetched.content_type,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "fetched remote media"
+        );
+
+        // Bytes first, then the row: a row is only ever written for bytes that are there.
+        let key = crate::store::content_key(origin, media_id);
+        let byte_length = fetched.bytes.len() as u64;
+        self.object_store
+            .put(&key, fetched.bytes.into())
+            .await
+            .map_err(MediaError::from)?;
+        let record = MediaRecord {
+            server_name: origin.to_owned(),
+            media_id: media_id.as_str().to_owned(),
+            content_type: fetched.content_type,
+            upload_name: fetched.upload_name,
+            byte_length: Some(byte_length),
+            created_ms: self.now_ms(),
+            uploader: None,
+            completed: true,
+            expires_at_ms: None,
+            quarantined_by: None,
+            safe_from_quarantine: false,
+            last_accessed_ms: None,
+        };
+        self.metadata.put_media(&record)?;
         Ok(record)
     }
 

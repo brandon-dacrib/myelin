@@ -1,6 +1,8 @@
 # RFC 0007. Remote media fetching over federation: multipart responses, redirects, and the remote cache
 
-Status: proposed, design only — blocked on track 06's federation client existing. Owner: track 09
+Status: implemented 2026-09-28 (`crates/hs-media/src/remote.rs`, `routes/federation.rs`; see
+`docs/status/09-media.md` session 6 for where it differs from this design: the trait is a raw
+`RemoteMediaTransport::get`, and remote thumbnails are made locally). Owner: track 09
 (media). Consumers: track 06 (the client this design's `RemoteMediaFetcher` trait is written
 against), track 13 (Synapse remote-media-cache import), track 14 (bridge direct-media
 conformance, `hs-bridge-conformance`).

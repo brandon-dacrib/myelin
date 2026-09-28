@@ -67,6 +67,32 @@ pub fn authenticated_router<B: KvBackend>() -> (axum::Router<MediaState<B>>, Rou
         .build()
 }
 
+/// The federation media routes this server answers other servers on
+/// (`crate::routes::federation`): `GET /download/{mediaId}` and `GET /thumbnail/{mediaId}`, to be
+/// mounted at `/_matrix/federation/v1/media`.
+///
+/// **The caller must put these behind the `X-Matrix` verification layer**
+/// (`hs_federation::transport::behind_x_matrix`); the handlers authenticate nothing themselves,
+/// because a federation request's authentication is a signature over the whole request that
+/// this crate has no business verifying twice.
+pub fn federation_router<B: KvBackend>() -> (axum::Router<MediaState<B>>, RouteManifest) {
+    fn meta(operation_id: &str) -> RouteMeta {
+        RouteMeta::new(Surface::MatrixFederation, AuthKind::Matrix).with_operation_id(operation_id)
+    }
+    Builder::new()
+        .get(
+            "/download/{mediaId}",
+            routes::federation::federation_download::<B>,
+            meta("federationDownloadMedia"),
+        )
+        .get(
+            "/thumbnail/{mediaId}",
+            routes::federation::federation_thumbnail::<B>,
+            meta("federationThumbnailMedia"),
+        )
+        .build()
+}
+
 /// The genuine MSC2246 async-upload `create` step, at the exact `/_matrix/media/v1/create` path
 /// the spec and Synapse use (not `/_matrix/media/v3/...` — an odd but real quirk of Matrix's
 /// per-endpoint versioning: this one endpoint was assigned its own `v1` the day it was added,

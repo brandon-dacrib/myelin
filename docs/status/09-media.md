@@ -2,10 +2,156 @@
 
 Track brief: `docs/workstreams/09-media.md`. Owner crate: `hs-media`.
 
-Last updated: 2026-09-27 (session 5: the admin API's Media area, below). Session 4 (2026-09-19)
+Last updated: 2026-09-28 (session 6: media across servers, below). Session 5 (2026-09-27) built
+the admin API's Media area. Session 4 (2026-09-19)
 closed the two Complement gaps — MSC2246 async upload's real `/_matrix/media/v1/create` path and
 `GET .../preview_url` — plus the content-scanning durability gap session 3 flagged. Sessions 1-4's
 records are unchanged below.
+
+## Session 6 (2026-09-28): media across servers
+
+Closes the known gap "Federation media fetch broken: remote avatars and attachments fail"
+(`docs/next-steps.md`). Before this, a client asking this server for `mxc://other.server/...`
+got a 404 every time, and another server asking this one for its media over the federation
+API got a 404 too: neither direction existed.
+
+### Done
+
+- **Fetching another server's media** (`crates/hs-media/src/remote.rs`, new). The authenticated
+  and legacy download and thumbnail routes resolve a request through
+  `MediaRepository::resolve_record`. This server's own media is looked up as before. Another
+  server's media is served from the held copy if there is one. If there is not, it is fetched:
+  1. First from `GET /_matrix/federation/v1/media/download/{mediaId}`, `X-Matrix` signed.
+     The `multipart/mixed` answer is parsed with the existing `crate::multipart::parse`.
+  2. If the content part carries only a `Location` (the redirect form), or the answer is a
+     `3xx`, the redirect is followed through `crate::preview::guarded_fetch`. That applies the
+     URL-preview SSRF guard: `media.url_preview_ip_range_blocklist` is checked on every hop,
+     and the connection is pinned to the checked address.
+  3. If the origin predates the API (`404`/`400 M_UNRECOGNIZED`, a bare `404`, `405`, `501`),
+     `GET /_matrix/media/v3/download/{origin}/{mediaId}?allow_remote=false` is asked instead,
+     unsigned. A `404 M_NOT_FOUND` from the federation API is final.
+
+  Every path is capped at `media.max_upload_size`. The bytes are stored under
+  `(origin, mediaId)` first, then the row, with `uploader: None`. `allow_remote=false` on
+  any download or thumbnail route serves only a held copy.
+- **The cache.**
+  - A held copy is served even with its origin down.
+  - A quarantined copy is not-found and is never fetched again.
+  - `delete_media` (and so the admin API's `media.delete`, `media.delete_bulk` and
+    `media.purge_remote_cache`) removes the copy; the next request fetches it afresh.
+  - Concurrent requests for one uncached item make one fetch (a per-item gate in
+    `RemoteMedia`).
+  - A failure is not cached. `hs-federation`'s per-destination backoff makes the next request
+    to a dead origin fail fast instead.
+  - A thumbnail of remote media is generated here from the fetched original, as Synapse does.
+    This server never asks an origin for a thumbnail.
+- **Serving this server's media to other servers** (`crates/hs-media/src/routes/federation.rs`,
+  new, and `router::federation_router`). `GET /_matrix/federation/v1/media/download/{mediaId}`
+  and `/thumbnail/{mediaId}` answer `multipart/mixed`: first a `{}` JSON part, then the content
+  with the same `Content-Type`/`Content-Disposition` the client routes send. The response is
+  built by `crate::multipart::build_media_response` (new), which uses a random 32-character
+  boundary and drops any header value containing a line break. Only this server's own media is
+  served. Quarantined media is 404.
+- **Errors.** `MediaError::RemoteFetchFailed` is new: `502`, "Failed to fetch remote media", as
+  Synapse answers. An oversized remote item is `413 M_TOO_LARGE`.
+- **Metrics** (`remote::RemoteMediaMetrics`, registered in `hs serve`):
+  - `hs_media_remote_requests_total{result="hit"|"miss"}`
+  - `hs_media_remote_fetches_total{outcome="success"|"not_found"|"failure",via="federation"|"redirect"|"legacy"|"none"}`
+  - `hs_media_remote_fetch_bytes_total{via}`
+- **Logs.** Each fetch logs `info` "fetched remote media" (origin, id, via, bytes, content
+  type, elapsed). A not-found logs `info`, a failure logs `warn` with the reason, and falling
+  back to the legacy path logs `debug`.
+- **In `hs-federation`** (additive except for one line):
+  - `FederationClient::get_media(destination, path, signed, max_bytes)` returns a
+    `MediaResponse` (status, content type, disposition, location, body bytes). It is signed for
+    the federation API and bare for the legacy path. It runs the same enabled, domain, backoff
+    and IP checks, counts failures towards backoff, and does not take the per-destination
+    concurrency permit, so a large download does not hold up transactions.
+  - `send_inner`'s request building moved into `build_request`, which is shared.
+  - `transport::behind_x_matrix(router, ctx)` puts a router built elsewhere behind the same
+    `X-Matrix` layer.
+  - The one non-additive line: the federation client no longer follows redirects on any
+    request (`redirect::Policy::none()`). No federation endpoint answers with one except a media
+    download, and following one inside the client would connect wherever a peer pointed, past
+    the IP-range policy.
+- **In `hs-cli`:**
+  - `media::FederationMediaTransport` implements `RemoteMediaTransport` over the federation
+    mount's client.
+  - `media::install_remote_media` is called in `serve.rs` once the federation mount exists.
+  - `hs_media::router::federation_router` is mounted at `/_matrix/federation/v1/media` behind
+    `behind_x_matrix`.
+  - Nothing changes with federation disabled: nothing is installed or mounted, and remote media
+    is 404 as before.
+
+### Verification
+
+- `crates/hs-cli/tests/federation_media.rs` (new) runs two real `hs serve` instances in one
+  process, plus a third stand-in origin (a small axum server), and has three tests.
+  - `a_user_on_b_gets_an_avatar_and_an_attachment_from_a_and_still_does_with_a_down`: alice
+    uploads a PNG and a PDF on A. Bob, on B, downloads both through B's
+    `/_matrix/client/v1/media/download/A/...` and thumbnails the PNG through `.../thumbnail`.
+    The bytes, `Content-Type` and filename match. A is then shut down; bob gets both again,
+    plus a thumbnail size never made before, and an item never fetched is `502`. B's
+    `/metrics` shows 3 misses, 2 federation successes, 1 failure, and the exact byte count.
+  - `b_fetches_from_an_older_server_and_from_one_that_redirects`: the legacy fallback
+    (`404 M_UNRECOGNIZED` on the federation path) and the redirect form (a `Location`-only
+    content part pointing at the stand-in's `/cdn/blob`).
+  - `a_serves_its_own_media_to_a_signed_request_and_to_nothing_else`: an unsigned request to
+    A's federation download is `401`. A request signed as the stand-in, whose key A fetches
+    over HTTP, gets the two-part body with the uploaded bytes, and a thumbnail. An unknown id
+    is `404`.
+- **Each fails without the fix**, checked one piece at a time. With the `install_remote_media`
+  call taken out of `serve.rs`, the first two tests fail (`404` where `200` is expected). With
+  the `/_matrix/federation/v1/media` mount taken out, the third fails (`404` where `401` is
+  expected), and so does the first: B still gets A's media, but over A's legacy
+  `/_matrix/media/v3/download`, so its `via="federation"` count is 0, not 2. That second
+  failure is also a live check of the legacy fallback against this server's own legacy route.
+- **`hs-media` unit tests.**
+  - `remote::tests` (9): the federation API is asked first, signed. An old server is asked on
+    the legacy path, unsigned, with `allow_remote=false`. `M_NOT_FOUND` is final. The size cap.
+    A redirect to a blocked address is refused. An unreachable origin is a failure, not a
+    fallback. `Content-Disposition` filenames (`filename*=` wins). A hostile origin name cannot
+    reshape the legacy path. Metric names.
+  - `routes::download::remote_tests` (8): fetched once, then served with the origin down
+    (hits and misses counted); a remote thumbnail comes from the fetched original;
+    `allow_remote=false` asks nothing; a quarantined copy is 404 and not refetched; a purged
+    copy is refetched; an unreachable origin is `502` and caches nothing; 8 concurrent
+    requests make 1 fetch; a malformed server name is `400` before anything is asked.
+  - `routes::federation::tests` (3) and `multipart` builder tests (2).
+- `hs-federation` `client::tests`: `a_media_get_is_signed_for_the_federation_api_and_bare_for_the_legacy_one`
+  and `a_media_get_caps_the_body_and_never_follows_a_redirect`. The second test's redirect
+  points at `169.254.169.254`; the client returns the `307` and its `Location` without
+  following it.
+- **Not checked against Synapse.** Docker is running here, but no Synapse image is present, and
+  federating with one needs TLS both ways (a terminating proxy and a trusted certificate) that
+  the in-process harness does not have. The stand-in origin covers the two answer shapes
+  Synapse produces (multipart, and `M_UNRECOGNIZED` from a pre-1.11 Synapse).
+
+### Decisions made
+
+- **Thumbnails of remote media are made here**, from the fetched original, never fetched from
+  the origin's thumbnail endpoint. This is Synapse's behavior. It keeps one cache row per
+  item, so quarantine and purge cover thumbnails too. The cost is that a thumbnail of a large
+  remote file downloads the whole file.
+- **Redirects from a peer are followed through the URL-preview SSRF guard**
+  (`media.url_preview_ip_range_blocklist`), not the federation IP policy. A redirect target is
+  an arbitrary URL a peer chose, which is the preview guard's threat model (RFC 0007 section 2).
+- **Fallback to the legacy path only on "endpoint unknown"** answers. A `404 M_NOT_FOUND` is
+  final. A transport failure is not a reason to try the legacy path, because the same host
+  would be asked.
+- **The federation client never follows redirects**; see "Done". This is recorded in
+  `crates/hs-federation/src/client.rs` at the `redirect(...)` call.
+- **Remote media is not content-scanned yet**: `ScanSourceKind::Federation` exists, and the
+  scan hook is the next step if an operator wants remote media scanned.
+
+### Next
+
+- A retention sweep over `media.remote_media_retention`: the admin purge is the only way to
+  drop copies today.
+- Scanning fetched media (`ScanSourceKind::Federation`).
+- A differential check against a real Synapse over TLS, both directions.
+- Line-anchored multipart delimiter search (`crate::multipart`'s known limitation). This server
+  now parses other servers' bodies for real.
 
 ## Session 5 (2026-09-27): the admin API's Media area, over this repository
 
@@ -67,8 +213,8 @@ reads and acts on them (`docs/status/15-...` and `16-...` have those halves).
 - Quarantine by room (`rooms.media.quarantine`) and by user (`users.media.delete`,
   `users.media.list`), and `statistics.users_media`: the first needs a room's `mxc://`
   references, which this crate does not index; the others are a filter over `list_media`.
-- Remote media is never fetched over federation yet, so `origin: remote` rows exist only by
-  import; the purge is ready for when they do.
+- ~~Remote media is never fetched over federation yet, so `origin: remote` rows exist only by
+  import.~~ Done in session 6; the purge removes fetched copies.
 - `list_media` is a full scan; paging it in the store is the next step if media counts grow.
 
 ## Session 4: the `/_matrix/media/v1/create` path, URL previews, and scan-verdict durability
@@ -1030,9 +1176,7 @@ In the brief's stated priority order:
   `Cargo.toml` (already an `[workspace.dependencies]` entry, added by track 15 — no workspace
   change needed) plus a DNS resolver capable of returning individual IPs before connecting
   (not yet in the workspace).
-- **Remote media fetching over federation** (RFC 0007 exists; no code) — blocked on track 06's
-  federation client existing, per this track's own brief and the dependency graph in
-  `docs/workstreams/README.md`.
+- ~~**Remote media fetching over federation**~~ — done in session 6 (`crate::remote`).
 - **Quarantine and retention as admin operations**: `MediaRepository::set_quarantined` exists and
   is tested; no admin HTTP endpoint calls it yet (track 15's admin API surface). A
   `remote_media_retention`-driven eviction sweep is unimplemented (the config field exists; no
@@ -1042,9 +1186,8 @@ In the brief's stated priority order:
   `AppserviceRegistry` (today only `hs_auth::appservice::InMemoryAppserviceRegistry` exists) and,
   per `PLAN.md` 8.4, an embedded mini federation server for `hs-bridge-conformance` to test
   against, which itself depends on RFC 0007.
-- **Federation media endpoints this server serves** (as opposed to fetches) — not implemented;
-  needs X-Matrix request verification from track 06/07 and the multipart *builder* noted in RFC
-  0007 section 3.5.
+- ~~**Federation media endpoints this server serves**~~ — done in session 6
+  (`crate::routes::federation`, `crate::multipart::build_media_response`).
 - **Admin media endpoints** (list, delete, purge, quarantine by room/user) — not started, track 15
   collaboration.
 - **Metrics** — not started; would use `hs-telemetry` once this crate's HTTP surface is actually
@@ -1060,10 +1203,17 @@ In the brief's stated priority order:
 
 ## Blockers
 
-None for this session's delivered scope. Remote media fetching (RFC 0007) is blocked on track 06
-existing, as the brief itself anticipates.
+None. (Remote media fetching was blocked on track 06 until session 6, which built it over
+`hs_federation::client::FederationClient::get_media`.)
 
 ## Interfaces provided
+
+- **`hs_media::remote`** (session 6): `RemoteMediaTransport` (what a federation client
+  implements), `RemoteMediaMetrics::register`, `fetch_remote`, `filename_from_disposition`;
+  `MediaRepository::install_remote_media` and `MediaRepository::resolve_record`.
+- **`hs_media::router::federation_router`** (session 6): the `/_matrix/federation/v1/media`
+  routes; the caller puts them behind `hs_federation::transport::behind_x_matrix`.
+- **`hs_media::multipart::build_media_response`** (session 6).
 
 - **`hs_media::security`**: `is_inline_safe`, `disposition_kind`, `content_disposition`,
   `response_headers`, `parse_range`/`ByteRange`/`RangeOutcome`, `CSP_HEADER_VALUE`,
@@ -1094,8 +1244,9 @@ existing, as the brief itself anticipates.
 
 ## Interfaces needed
 
-- **06 (federation)**: the `FederationMediaClient` trait RFC 0007 section 3.1 proposes — needed
-  before remote media fetching can be implemented at all.
+- **06 (federation)**: ~~the `FederationMediaClient` trait RFC 0007 section 3.1 proposes~~ —
+  settled in session 6 as `hs_media::remote::RemoteMediaTransport` (a raw signed or unsigned
+  `GET`), implemented in `hs-cli` over `FederationClient::get_media`.
 - **07 (auth)**: consumed today via `hs_auth::{state::AuthState, requester::Requester,
   middleware}` — no changes needed, but see "Decisions made" for the `MediaRequester` bridge this
   crate had to add because `Requester: FromRequestParts<AuthState>` is not generic over caller

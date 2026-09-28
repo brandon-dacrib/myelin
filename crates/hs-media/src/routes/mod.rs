@@ -1,9 +1,11 @@
-//! HTTP handlers: the authenticated `client/v1/media` routes and the legacy `media/v3` routes
-//! (mounted behind a config flag by [`crate::router`], with freeze semantics — see
-//! [`legacy`]'s module doc).
+//! HTTP handlers: the authenticated `client/v1/media` routes, the legacy `media/v3` routes, and
+//! the federation media routes this server answers other servers on ([`federation`]). The legacy
+//! ones are mounted behind a config flag by [`crate::router`], with freeze semantics — see
+//! [`legacy`]'s module doc.
 
 pub mod config;
 pub mod download;
+pub mod federation;
 pub mod legacy;
 pub mod preview;
 pub mod thumbnail;

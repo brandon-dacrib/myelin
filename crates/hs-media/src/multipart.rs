@@ -3,10 +3,11 @@
 //! `GET /_matrix/federation/v1/media/{download,thumbnail}/{mediaId}` (spec since v1.11, formerly
 //! MSC3916) replies with `multipart/mixed`: a first part carrying a small JSON metadata object
 //! (currently always `{}`), and a second part carrying the actual media bytes with their own
-//! `Content-Type`. This module parses that shape. It has no caller yet — track 06's federation
-//! client, which this module is written ahead of (`docs/rfcs/0007-federation-media.md`) — but it
-//! is complete, fuzzed (`fuzz/fuzz_targets/multipart_parse.rs`) and tested on its own here, since
-//! it is one of this crate's two classic attack surfaces (`docs/workstreams/09-media.md`'s
+//! `Content-Type`. This module parses that shape ([`parse`], used by [`crate::remote`] on what
+//! another server answers) and builds it ([`build_media_response`], used by
+//! `crate::routes::federation` to answer another server). The parser is fuzzed
+//! (`fuzz/fuzz_targets/multipart_parse.rs`) and tested on its own here, since it is one of this
+//! crate's two classic attack surfaces (`docs/workstreams/09-media.md`'s
 //! "Risks": a malicious or compromised remote homeserver is exactly the attacker this parser must
 //! survive intact).
 //!
@@ -26,8 +27,7 @@
 //! anchoring (confirming the delimiter is preceded by a line break). A real MSC3916 boundary is
 //! server-generated with enough entropy that an accidental collision inside binary media content
 //! is not a practical concern, but a part's content *could* still be truncated early if it
-//! happens to contain the exact delimiter bytes. Full line-anchored parsing is a follow-up once
-//! track 06's federation client is the actual caller and can be tested against real servers; see
+//! happens to contain the exact delimiter bytes. Full line-anchored parsing is a follow-up; see
 //! `docs/rfcs/0007-federation-media.md`.
 
 use crate::error::MediaError;
@@ -207,9 +207,85 @@ pub fn parse<'a>(boundary: &str, body: &'a [u8]) -> Result<MultipartMixed<'a>, M
     Ok(MultipartMixed { parts })
 }
 
+/// Builds the body this server answers `GET /_matrix/federation/v1/media/{download,thumbnail}`
+/// with: `multipart/mixed`, a first part holding the JSON metadata object (`{}`, all the spec
+/// defines today) and a second part holding `content` under `content_headers` (its
+/// `Content-Type` and `Content-Disposition`, or a lone `Location` for the redirect form).
+///
+/// The boundary is 32 random alphanumerics, so the chance of it occurring inside the content
+/// (which a substring-searching parser such as [`parse`] would cut at) is negligible. Header
+/// values containing a line break are dropped rather than written, so a stored filename can
+/// never inject a header or end the part early.
+///
+/// Returns the `Content-Type` header value for the whole response and the body.
+#[must_use]
+pub fn build_media_response(
+    content_headers: &[(&str, &str)],
+    content: &[u8],
+) -> (String, bytes::Bytes) {
+    use rand::Rng;
+    use rand::distr::Alphanumeric;
+    let boundary: String = rand::rng()
+        .sample_iter(Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect();
+    let mut body = Vec::with_capacity(content.len() + 256);
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(b"Content-Type: application/json\r\n\r\n{}\r\n");
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    for (name, value) in content_headers {
+        if value.contains(['\r', '\n']) || name.contains(['\r', '\n', ':']) {
+            continue;
+        }
+        body.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(content);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    (
+        format!("multipart/mixed; boundary={boundary}"),
+        bytes::Bytes::from(body),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_built_response_parses_back_to_its_two_parts() {
+        let content = [0u8, 13, 10, 45, 45, 255];
+        let (content_type, body) = build_media_response(
+            &[
+                ("Content-Type", "image/png"),
+                ("Content-Disposition", "inline; filename=\"a.png\""),
+                ("X-Evil", "a\r\nLocation: http://x"),
+            ],
+            &content,
+        );
+        let boundary = boundary_from_content_type(&content_type).unwrap();
+        let parsed = parse(&boundary, &body).unwrap();
+        assert_eq!(parsed.parts.len(), 2);
+        assert_eq!(
+            parsed.parts[0].header("Content-Type"),
+            Some("application/json")
+        );
+        assert_eq!(parsed.parts[0].body, b"{}");
+        assert_eq!(parsed.parts[1].header("Content-Type"), Some("image/png"));
+        assert_eq!(parsed.parts[1].body, &content[..]);
+        assert_eq!(parsed.parts[1].header("Location"), None);
+        assert_eq!(parsed.parts[1].header("X-Evil"), None);
+    }
+
+    #[test]
+    fn a_built_redirect_has_a_location_and_no_content() {
+        let (content_type, body) = build_media_response(&[("Location", "https://cdn/x")], b"");
+        let boundary = boundary_from_content_type(&content_type).unwrap();
+        let parsed = parse(&boundary, &body).unwrap();
+        assert_eq!(parsed.parts[1].header("Location"), Some("https://cdn/x"));
+        assert!(parsed.parts[1].body.is_empty());
+    }
 
     fn crlf_body() -> Vec<u8> {
         let mut b = Vec::new();

@@ -65,6 +65,34 @@ pub(crate) fn legacy_router(freeze_ms: Option<u64>) -> (axum::Router, MediaState
     (router.with_state(state.clone()), state)
 }
 
+/// Builds [`crate::router::federation_router`] over a fresh in-memory state, with no `X-Matrix`
+/// layer (these tests are about the handlers; the layer is `hs-federation`'s).
+pub(crate) fn federation_router() -> (axum::Router, MediaState<MemoryBackend>) {
+    let state = build_state(None);
+    let (router, _manifest) = crate::router::federation_router::<MemoryBackend>();
+    (router.with_state(state.clone()), state)
+}
+
+/// Builds the authenticated router over a fresh in-memory state whose repository fetches other
+/// servers' media through `transport`.
+pub(crate) fn router_with_remote(
+    transport: Arc<dyn crate::remote::RemoteMediaTransport>,
+) -> (
+    axum::Router,
+    MediaState<MemoryBackend>,
+    crate::remote::RemoteMediaMetrics,
+) {
+    let state = build_state(None);
+    let metrics = crate::remote::RemoteMediaMetrics::default();
+    assert!(
+        state
+            .repository
+            .install_remote_media(transport, metrics.clone())
+    );
+    let (router, _manifest) = crate::router::authenticated_router::<MemoryBackend>();
+    (router.with_state(state.clone()), state, metrics)
+}
+
 /// Builds [`crate::router::v1_router`] over a fresh in-memory state — the not-yet-mounted
 /// `/_matrix/media/v1/create` router (see that function's doc for why `hs-cli` still needs to
 /// mount it; this helper lets this crate's own tests exercise the router it builds regardless).

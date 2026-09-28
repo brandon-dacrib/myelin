@@ -1099,7 +1099,7 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 
 ## Known gaps, honestly held
 
-Refreshed 2026-09-28 against the code: closed rows are struck through with the commit that closed them, and partly closed ones say what is left. The gaps are being closed one at a time. Federation media fetch is the one in hand; the next is the local restricted join, which is ten Complement tests and a common room type, and whose federated half already works.
+Refreshed 2026-09-28 against the code: closed rows are struck through with the commit that closed them, and partly closed ones say what is left. The gaps are being closed one at a time. Federation media fetch was the first, closed 2026-09-28. The next is the local restricted join: it is ten Complement tests and a common room type, and its federated half already works.
 
 | Gap | Where | Consequence |
 |---|---|---|
@@ -1109,7 +1109,7 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | A destination down for longer than its queue is not caught up from the room | `hs-federation` | what was queued survives a restart and is sent; what was never queued because the destination was already known failing is not re-derived (Synapse's `destination_rooms`) |
 | EDUs are dropped for a destination another replica sends for | `hs-federation`, `hs-cli` | single-node is complete: typing, receipts, presence, device lists, signing-key updates and to-device cross servers both ways (e4543e4, 649302e, `hs-cli/tests/federation_edus.rs`); in cluster mode `FederationSender::enqueue_edu` drops an EDU whose destination shard another replica owns, so it needs a mesh forward to the owner (status 06, twelfth session) |
 | ~~Invites, leaves and knocks over federation are seams~~ | `hs-federation` | **Closed** (e6d4a71, 249fcee, ea990cb): `transport/membership.rs` serves make/send leave, make/send knock and invite v1/v2, and `hs-cli/tests/federation_membership.rs` drives each between two servers. Not yet measured against Complement |
-| Federation media fetch broken | `hs-media` | remote avatars and attachments fail |
+| ~~Federation media fetch broken~~ | `hs-media` | **Closed** 2026-09-28 (status 09, session 6). Both directions work. A client's download or thumbnail of another server's media is fetched over the signed `/_matrix/federation/v1/media/download`, with the redirect form and the legacy `/_matrix/media/v3/download` fallback. It is then served from the held copy, even with the origin down; the copy honors quarantine and the admin purge. This server's own media is served to other servers as `multipart/mixed`. `hs-cli/tests/federation_media.rs` covers this with two servers and a stand-in origin. Not yet checked against a real Synapse |
 | `/search` unimplemented | `hs-room` | needs a cross-room index the actor model has no place for |
 | Nothing hot-applies a config change | all | every change needs a restart, and says so |
 | One `/api/v1` fetch fails under the full `e2e-real` suite | `web` (dev proxy) | two tests fail together, pass alone |

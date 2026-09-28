@@ -135,6 +135,62 @@ fn build_scan_engine<B: KvBackend>(
         .map_err(MediaSetupError::ScanEngine)
 }
 
+/// How `hs-media` fetches another server's media: over the federation mount's own client, so a
+/// media fetch is discovered, signed, IP-checked and backed off exactly like every other
+/// federation request, and a destination that is down is known to be down by both.
+pub struct FederationMediaTransport {
+    client: Arc<hs_federation::client::FederationClient>,
+}
+
+impl FederationMediaTransport {
+    /// Wraps the federation client.
+    #[must_use]
+    pub fn new(client: Arc<hs_federation::client::FederationClient>) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait::async_trait]
+impl hs_media::remote::RemoteMediaTransport for FederationMediaTransport {
+    async fn get(
+        &self,
+        origin: &str,
+        path: &str,
+        signed: bool,
+        max_bytes: usize,
+    ) -> Result<hs_media::remote::RemoteResponse, hs_media::remote::TransportError> {
+        use hs_federation::client::ClientError;
+        match self.client.get_media(origin, path, signed, max_bytes).await {
+            Ok(response) => Ok(hs_media::remote::RemoteResponse {
+                status: response.status,
+                content_type: response.content_type,
+                content_disposition: response.content_disposition,
+                location: response.location,
+                body: response.body,
+            }),
+            Err(ClientError::ResponseTooLarge(_)) => {
+                Err(hs_media::remote::TransportError::TooLarge)
+            }
+            Err(other) => Err(hs_media::remote::TransportError::Failed(other.to_string())),
+        }
+    }
+}
+
+/// Lets `repository` fetch other servers' media through `client`, counting into `metrics`.
+pub fn install_remote_media<B: KvBackend>(
+    repository: &MediaRepository<B>,
+    client: Arc<hs_federation::client::FederationClient>,
+    metrics: &hs_telemetry::metrics::Metrics,
+) {
+    let installed = repository.install_remote_media(
+        Arc::new(FederationMediaTransport::new(client)),
+        hs_media::remote::RemoteMediaMetrics::register(metrics),
+    );
+    if !installed {
+        tracing::warn!("remote media fetching was already installed; keeping the first");
+    }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

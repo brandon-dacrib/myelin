@@ -19,6 +19,27 @@ pub(crate) struct ThumbnailQuery {
     height: u32,
     #[serde(default = "default_method")]
     method: String,
+    /// As for a download: `false` serves another server's media only from a held copy.
+    #[serde(default)]
+    allow_remote: Option<bool>,
+}
+
+impl ThumbnailQuery {
+    pub(crate) fn allow_remote(&self) -> bool {
+        self.allow_remote.unwrap_or(true)
+    }
+
+    pub(crate) fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub(crate) fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub(crate) fn method(&self) -> &str {
+        &self.method
+    }
 }
 
 fn default_method() -> String {
@@ -38,14 +59,18 @@ pub(crate) async fn build_response<B: KvBackend>(
     Ok((StatusCode::OK, headers, bytes).into_response())
 }
 
-/// `GET .../thumbnail/{serverName}/{mediaId}` (authenticated).
+/// `GET .../thumbnail/{serverName}/{mediaId}` (authenticated). For another server's media the
+/// original is fetched (`crate::remote`) and the thumbnail generated here, as Synapse does.
 pub(crate) async fn thumbnail<B: KvBackend>(
     State(state): State<MediaState<B>>,
     _requester: MediaRequester,
     Path((server_name, media_id)): Path<(String, String)>,
     Query(query): Query<ThumbnailQuery>,
 ) -> Result<Response, MediaError> {
-    let record = state.repository.get_record(&server_name, &media_id)?;
+    let record = state
+        .repository
+        .resolve_record(&server_name, &media_id, query.allow_remote())
+        .await?;
     build_response(&state.repository, &record, &query).await
 }
 

@@ -22,10 +22,14 @@
 //! - [`repository`]: ties storage, metadata, policy and thumbnailing together into the upload,
 //!   download and thumbnail operations the HTTP layer calls.
 //! - [`state`]: the axum shared state (`MediaState`) and the `Requester` extractor bridge.
-//! - [`routes`]: the authenticated `client/v1/media` handlers and the legacy `media/v3` handlers.
+//! - [`routes`]: the authenticated `client/v1/media` handlers, the legacy `media/v3` handlers,
+//!   and the `federation/v1/media` handlers other servers fetch this server's media through.
 //! - [`router`]: wires [`routes`] into an `hs_http::router::Builder`.
-//! - [`multipart`]: a `multipart/mixed` parser for MSC3916 federation media responses (used by
-//!   track 06's federation client once it exists; see `docs/rfcs/0007-federation-media.md`).
+//! - [`multipart`]: the `multipart/mixed` shape of MSC3916 federation media responses: the
+//!   parser for what another server answers, the builder for what this one answers.
+//! - [`remote`]: another server's media -- fetched over federation (with the legacy and redirect
+//!   forms), held in the same store as local media, and counted. Read its module doc for the order
+//!   a fetch tries things in and what the cache does with quarantine and purges.
 //! - [`synapse_layout`]: a read-only adapter over Synapse's on-disk media-directory layout, for
 //!   track 13's importer.
 //! - [`preview`]: `GET .../preview_url` — OpenGraph extraction, the SSRF guard, and the response
@@ -43,6 +47,7 @@ pub mod metadata;
 pub mod multipart;
 pub mod policy;
 pub mod preview;
+pub mod remote;
 pub mod repository;
 pub mod router;
 pub mod routes;

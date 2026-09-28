@@ -351,6 +351,14 @@ fn build_router<B: KvBackend>(
         // which nothing noticed while they were seams and every remote would have noticed the
         // moment they were not. Both routers share one `FederationState` (it is `Clone` over
         // `Arc`s) so a join handled by either sees the same rooms and the same key cache.
+        // This server's own media, served to other servers (`hs_media::routes::federation`),
+        // behind the same `X-Matrix` layer as every other federation route.
+        let (media_federation_router, media_federation_manifest) =
+            hs_media::router::federation_router::<B>();
+        let media_federation_router = hs_federation::transport::behind_x_matrix(
+            media_federation_router.with_state(mounts.media.clone()),
+            x_matrix.clone(),
+        );
         let (federation_router_v2, federation_manifest_v2) =
             hs_federation::transport::router_v2(state, x_matrix);
         // `/_matrix/key/v2/server` is deliberately *outside* that router: it is the one federation
@@ -390,6 +398,11 @@ fn build_router<B: KvBackend>(
                 "/_matrix/federation/v2",
                 federation_router_v2,
                 federation_manifest_v2.routes,
+            )
+            .merge_router(
+                "/_matrix/federation/v1/media",
+                media_federation_router,
+                media_federation_manifest.routes,
             );
     }
 
@@ -1190,6 +1203,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         e2e_state.install_remote_keys(Arc::new(crate::edus::ClientRemoteKeys::new(
             mount.client.clone(),
         )));
+        // Another server's avatars and attachments: fetched over the same client, cached in
+        // the media repository (`hs_media::remote`).
+        crate::media::install_remote_media(&media_state.repository, mount.client.clone(), &metrics);
         federation_source = Arc::new(
             hs_federation::admin_source::DestinationStoreSource::new(mount.destinations.clone())
                 .with_sender(mount.sender.clone()),

@@ -110,6 +110,12 @@ pub enum MediaError {
     /// failure, timeout, non-2xx response, oversized response, too many redirects).
     #[error("could not preview URL: {0}")]
     PreviewFetchFailed(String),
+
+    /// Another server's media could not be fetched: its server unreachable or backing off, a
+    /// refusal, a malformed answer, a redirect the SSRF guard refused (see [`crate::remote`]).
+    /// `502`, as Synapse answers.
+    #[error("could not fetch remote media: {0}")]
+    RemoteFetchFailed(String),
 }
 
 impl From<object_store::Error> for MediaError {
@@ -217,6 +223,11 @@ impl MediaError {
                 axum::http::StatusCode::BAD_GATEWAY,
                 MatrixErrorCode::Unknown,
                 msg.clone(),
+            ),
+            MediaError::RemoteFetchFailed(_) => MatrixError::custom(
+                axum::http::StatusCode::BAD_GATEWAY,
+                MatrixErrorCode::Unknown,
+                "Failed to fetch remote media",
             ),
         }
     }
