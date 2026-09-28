@@ -643,6 +643,28 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
         };
         handle.query(|actor| joined_servers(actor)).await
     }
+
+    async fn membership_of(&self, room_id: &str, user_id: &str) -> Option<String> {
+        let handle = self.handle(room_id).await.ok()?;
+        let user_id = user_id.to_owned();
+        handle
+            .query(move |actor| {
+                actor.full_state().ok()?.iter().find_map(|event| {
+                    let header = event.header();
+                    (header.event_type == "m.room.member"
+                        && header.state_key.as_deref() == Some(user_id.as_str()))
+                    .then(|| {
+                        full_pdu(event)
+                            .get("content")
+                            .and_then(|content| content.get("membership"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .flatten()
+                })
+            })
+            .await
+    }
 }
 
 /// The server of every currently joined member, deduplicated and sorted. Empty if the state

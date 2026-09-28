@@ -174,11 +174,31 @@ pub async fn post_create_room<B: KvBackend + 'static>(
         member_content.insert(user.clone(), content);
     }
 
+    // An invitation of a user of another server has to be co-signed by that server before it
+    // goes into the room (`PUT /invite`), so those are sent here once the room exists, the same
+    // way `POST /invite` sends them, rather than written by the actor while it builds the room.
+    // Without a federation hook they are written as before.
+    let remote_invites: Vec<(OwnedUserId, Value)> = match &state.remote_join {
+        Some(_) => invite
+            .iter()
+            .filter(|user| user.server_name() != &*state.identity.server_name)
+            .map(|user| {
+                let content = member_content
+                    .get(user)
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                (user.clone(), content)
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+
     let request = CreateRoomRequest {
         room_version,
         preset,
         name: body.get("name").and_then(Value::as_str).map(str::to_owned),
         topic: body.get("topic").and_then(Value::as_str).map(str::to_owned),
+        local_invites_only: state.remote_join.is_some(),
         invite,
         member_content,
         initial_state: parse_initial_state(&body)?,
@@ -203,6 +223,25 @@ pub async fn post_create_room<B: KvBackend + 'static>(
         .await?;
 
     let room_id = handle.query(|actor| actor.room_id().to_owned()).await;
+
+    // The room exists whatever an invitee's server says, and the client needs its ID, so an
+    // invitation that fails is logged and the others are still sent (as Synapse and conduwuit
+    // do); the inviter can try `POST /invite` again.
+    if let Some(remote) = &state.remote_join {
+        for (user, content) in remote_invites {
+            if let Err(error) = crate::routes::membership::invite_remote(
+                remote.as_ref(),
+                &handle,
+                requester.user_id.clone(),
+                user.clone(),
+                content,
+            )
+            .await
+            {
+                tracing::warn!(%room_id, invitee = %user, %error, "createRoom could not invite a user of another server");
+            }
+        }
+    }
 
     // `visibility` controls only the published room directory (`GET /publicRooms`), orthogonal to
     // `preset`'s join-rule/history-visibility/guest-access defaults -- see this crate's status

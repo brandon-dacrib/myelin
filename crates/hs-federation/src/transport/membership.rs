@@ -90,7 +90,16 @@ async fn make_template(
     if user_id.split_once(':').map(|(_, server)| server) != Some(origin.as_str()) {
         return MatrixError::forbidden("the user is not on the requesting server").into_response();
     }
-    match join::make_membership(state.rooms.as_ref(), room_id, user_id, versions, handshake).await {
+    match join::make_membership(
+        state.rooms.as_ref(),
+        room_id,
+        user_id,
+        versions,
+        handshake,
+        &state.own_server_name,
+    )
+    .await
+    {
         Ok(template) => axum::Json(json!({
             "event": template.event,
             "room_version": template.room_version,
@@ -168,6 +177,7 @@ async fn submit(
         &state.own_server_name,
         state.sender.as_deref(),
         handshake,
+        None,
     )
     .await
     .map_err(|e| Box::new(join_error_response(&e)))

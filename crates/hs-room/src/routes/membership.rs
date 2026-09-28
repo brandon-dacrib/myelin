@@ -141,7 +141,8 @@ pub(crate) async fn fill_in_profile<B: hs_kv::KvBackend + 'static>(
 /// - A user's own **leave** of a room no user of this server is joined to
 ///   (`RoomActor::servers_to_join_through`) -- rejecting an invite from another server, or
 ///   withdrawing a knock. This server holds nothing current to author the leave against, so it
-///   asks a server in the room for a template (`make_leave`/`send_leave`).
+///   asks a server in the room for a template (`make_leave`/`send_leave`). If none will, an
+///   invite or knock is rejected here alone (`RoomActorHandle::reject_out_of_band`).
 /// - An **invite** of a user of another server: the event is built and signed here but not
 ///   persisted, sent to the invitee's server with the room's stripped state (`PUT /invite`),
 ///   and the event that comes back co-signed is what goes into the room. An invitee's server
@@ -162,24 +163,26 @@ async fn act<B: KvBackend + 'static>(
             && sender == target
             && let Some(servers) = handle.query(|actor| actor.servers_to_join_through()).await
         {
-            remote.leave(&sender, &room_id, &servers, content).await?;
+            if let Err(error) = remote
+                .leave(&sender, &room_id, &servers, content.clone())
+                .await
+            {
+                // No server in the room took the leave. An invite or knock is still rejected
+                // here, as Synapse does: the leave goes nowhere, but the user's clients can put
+                // the room behind them. Anything else (nothing to reject) keeps the error.
+                tracing::info!(%room_id, user = %sender, %error, "no server in the room took the leave; rejecting locally");
+                if handle
+                    .reject_out_of_band(sender, content, now_ms())
+                    .await
+                    .is_err()
+                {
+                    return Err(error);
+                }
+            }
             return Ok(Json(json!({})).into_response());
         }
         if action == Action::Invite && target.server_name() != &*state.identity.server_name {
-            let inviter = sender.to_string();
-            let event = handle
-                .build_membership_event(sender, action, target, content, now_ms())
-                .await?;
-            let (room_version, stripped) = handle
-                .query(move |actor| {
-                    (
-                        actor.room_version().clone(),
-                        actor.stripped_state(&[inviter.as_str()]),
-                    )
-                })
-                .await;
-            let cosigned = remote.invite(&room_version, &event, stripped?).await?;
-            handle.accept_remote_event(cosigned).await?;
+            invite_remote(remote.as_ref(), &handle, sender, target, content).await?;
             return Ok(Json(json!({})).into_response());
         }
     }
@@ -187,6 +190,37 @@ async fn act<B: KvBackend + 'static>(
         .membership(sender, action, target, content, now_ms())
         .await?;
     Ok(Json(json!({})).into_response())
+}
+
+/// Invites `target`, a user of another server, to the room `handle` is for: the invite is built
+/// and signed here but not persisted, sent to the invitee's server with the room's stripped
+/// state (`PUT /invite`), and the event that comes back co-signed is what goes into the room.
+/// An invitee's server that refuses means no invite.
+///
+/// Also how `crate::routes::create_room` sends the invitations of its `invite` list that are
+/// for users of other servers, once the room exists.
+pub(crate) async fn invite_remote<B: KvBackend + 'static>(
+    remote: &dyn crate::remote_join::RemoteJoin,
+    handle: &crate::actor::RoomActorHandle<B>,
+    sender: ruma::OwnedUserId,
+    target: ruma::OwnedUserId,
+    content: Value,
+) -> Result<(), RoomError> {
+    let inviter = sender.to_string();
+    let event = handle
+        .build_membership_event(sender, Action::Invite, target, content, now_ms())
+        .await?;
+    let (room_version, stripped) = handle
+        .query(move |actor| {
+            (
+                actor.room_version().clone(),
+                actor.stripped_state(&[inviter.as_str()]),
+            )
+        })
+        .await;
+    let cosigned = remote.invite(&room_version, &event, stripped?).await?;
+    handle.accept_remote_event(cosigned).await?;
+    Ok(())
 }
 
 /// The servers a client named as candidates to sponsor a join it asked for: every `server_name`

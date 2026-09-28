@@ -73,7 +73,15 @@ async fn make_join(
         .map(|(_, v)| v)
         .collect();
 
-    match join::make_join(state.rooms.as_ref(), &room_id, &user_id, &versions).await {
+    match join::make_join(
+        state.rooms.as_ref(),
+        &room_id,
+        &user_id,
+        &versions,
+        &state.own_server_name,
+    )
+    .await
+    {
         Ok(template) => axum::Json(serde_json::json!({
             "event": template.event,
             "room_version": template.room_version,
@@ -130,6 +138,12 @@ async fn send_join(
         &origin,
         &state.own_server_name,
         state.sender.as_deref(),
+        // The key this server co-signs a restricted join it authorises with: the event-signing
+        // key, carried with the invite handling that co-signs invites the same way.
+        state
+            .invites
+            .as_ref()
+            .map(|invites| invites.signing_key.as_ref()),
     )
     .await
     {
@@ -184,6 +198,12 @@ pub(super) fn join_error_response(e: &JoinError) -> Response {
             MatrixError::forbidden(e.to_string()).into_response()
         }
         JoinError::NotAuthorized(msg) => MatrixError::forbidden(msg.clone()).into_response(),
+        JoinError::UnableToAuthorise(msg) => MatrixError::custom(
+            StatusCode::BAD_REQUEST,
+            MatrixErrorCode::Other("M_UNABLE_TO_AUTHORISE_JOIN".to_owned()),
+            msg.clone(),
+        )
+        .into_response(),
         JoinError::Store(msg) => MatrixError::custom(
             StatusCode::NOT_IMPLEMENTED,
             MatrixErrorCode::Other("M_HS_INBOUND_INGESTION_UNSUPPORTED".to_owned()),

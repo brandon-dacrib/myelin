@@ -1,5 +1,122 @@
 # 06 Federation: status
 
+## Eleventh session (2026-09-27): createRoom invites, restricted joins, local rejection
+
+Scope: what the tenth session left (its "Not done" items 1, 2, 3 and 5). Branch
+`agent/federation-membership-2`, cut from `agent/federation-membership`. Touched `hs-room`
+(create-room route, the out-of-band leave, the error text), `hs-cli` (adapter error text, the
+cheap `membership_of`, the tests) and this crate. `FederationState` is unchanged (no constructor
+edits, so the `agent/federation-edus` merge stays mechanical).
+
+### Where this stopped
+
+**Done and verified by running** (Rust 1.98.1, `CARGO_PROFILE_DEV_DEBUG=0`, all green):
+
+```
+cargo fmt --all --check                                                         # clean
+cargo clippy -p hs-federation -p hs-room -p hs-cli --all-targets -- -D warnings # clean
+cargo test -p hs-federation      # 167/167 (was 165)
+cargo test -p hs-room            # lib 79, backfill 4, out_of_room_membership 4, remote_join 8, scenario 12
+cargo test -p hs-user            # lib 123, sync_scenario 6
+cargo test -p hs-cli             # lib 137, bridge_offerings 3, e2e 25, federation_membership 6/6 (was 3),
+                                 # federation_reads 9, federation_restart 1, federation_sender 3,
+                                 # federation_two_servers 2, federation_writes 8
+```
+
+New tests in `crates/hs-cli/tests/federation_membership.rs` (two in-process servers):
+
+- `a_create_room_invite_list_invites_a_user_of_another_server`: `createRoom` with
+  `invite: [bob@B, carol@A]`, `trusted_private_chat`, `is_direct`: A holds both invites when the
+  request returns, bob's `/sync` on B has the invite with `is_direct` and the room name, bob
+  joins through A and speaks. Mutation-checked: with the actor inviting everyone itself (the
+  old path) bob's `/sync` never shows the invite.
+- `an_invite_is_rejected_locally_when_no_server_in_the_room_answers`: A invites bob, then A
+  shuts down; bob's `POST /leave` answers 200, his `/sync` moves the room to `leave` with his own
+  leave (reason kept) in the timeline; a second leave is refused (nothing left to reject); a knock
+  through the dead A answers `502` whose text names the knock and not a join. Mutation-checked:
+  without the fallback the leave is a `502`; with the old error text the knock message says
+  "could not join the room through federation".
+- `a_restricted_room_is_joined_through_a_resident_that_authorises_it`: alice's `restricted`
+  room (v11) allowing her public lobby. Bob (B) is refused (`403`) before joining the lobby,
+  then joins it and the restricted room through A; A's copy of his join names alice in
+  `join_authorised_via_users_server`; he speaks. Alice leaves and rejoins **through B**, which
+  authorises her with bob (so B keeps and serves the co-signed copy of bob's join, which A checks
+  for its own signature). The same the other way round with bob's rooms on B. A room allowing
+  only a room A is not in answers bob's join with `M_UNABLE_TO_AUTHORISE_JOIN` (a `502` to the
+  client). Mutation-checked three ways: the resident never authorising (`403 cannot join
+  restricted room without join_authorised_via_users_server`), the resident not co-signing
+  (`no signature from A` on the joiner), the joiner dropping the co-signed copy (A's rejoin
+  through B fails on bob's join).
+- Unit tests in `hs_federation::join`: `make_join_names_a_local_authoriser_for_a_restricted_room`,
+  `make_join_refuses_a_restricted_join_it_cannot_vouch_for` (`NotAuthorized` when this server is
+  in the lobby and the user is not; `UnableToAuthorise` when it is not in the lobby).
+
+**What was built:**
+
+- `hs_room::routes::create_room`: with a federation hook, remote invitees are left out of the
+  actor's create (`CreateRoomRequest::local_invites_only`, new, defaults to `false`) and invited
+  after the room exists through `routes::membership::invite_remote` (the build / `PUT /invite`
+  / accept path `POST /invite` uses, now a shared function). They still count as invitees for
+  `trusted_private_chat`'s power levels. An invite that fails is logged and the rest are sent;
+  `createRoom` still answers with the room ID.
+- Local rejection: `RoomActor::build_out_of_band_leave` + `RoomActorHandle::reject_out_of_band`,
+  over a new `pipeline::build_out_of_band_leave` (the hash-and-sign half of
+  `build_and_authorize` is now `pipeline::hash_sign_and_parse`, shared). The leave is sent by the
+  user, cites only their invite/knock as `prev_events` and `auth_events`, depth + 1, and is
+  recorded with `accept_out_of_room_membership`; it goes nowhere (Synapse's out-of-band leave).
+  `routes::membership::act` falls back to it when `remote.leave` fails for any reason and the
+  user's membership is `invite` or `knock`; otherwise the original error stands.
+- Neutral text: `RoomError::RemoteJoinFailed` renders "could not complete the request through
+  another server: {detail}"; `hs-cli`'s adapter prefixes the detail with the handshake (`join:`,
+  `leave:`, `knock:`, `invite:`); `OutboundJoinError`'s messages name no handshake.
+- Restricted joins, resident side (`hs_federation::join`): `make_join` (now takes
+  `own_server_name`) tries the plain template first; if that is refused and the room is
+  `restricted` (v8+) or `knock_restricted` (v10+), it checks the allow list
+  (`check_allow_list`: only rooms this server has a member in count; none of them is
+  `UnableToAuthorise` -> `400 M_UNABLE_TO_AUTHORISE_JOIN`, user in none is `403`) and names the
+  first local joined member for whom the template authorizes. `send_join` (new parameter
+  `authorise_with: Option<&SigningKeyPair>`, the transport passes the key `InviteHandling`
+  already carries) re-checks the allow list for a join naming one of its users, co-signs it
+  (`invite::cosign`), and stores, forwards and answers (`event`, v2) with the co-signed copy.
+- Restricted joins, joining side (`hs_federation::outbound_join`): the template's
+  `join_authorised_via_users_server` is never overwritten by the client's content; when the
+  join names an authoriser on another server, the `event` in the `send_join` answer is required,
+  verified (both signatures) and must have the same event ID; that copy is what is kept.
+- `hs_federation::inbound::verify_pdu` now requires the authorising server's signature on a
+  restricted join (room versions 8+), as the spec's signature rules say
+  (`join_authoriser_server`); `verify_pdu_to_authorise` skips it for the one server about to add
+  it. This applies to `/send`, backfill and `send_join` state as well.
+- `RoomDataSource::membership_of` (new, with a default that reads `state_for_join`); `hs-cli`'s
+  `RegistryRoomSource` overrides it with a current-state lookup.
+
+**Not done / next steps, in order:**
+
+1. A local user joining a restricted room on its own server is still refused unless the client
+   names an authoriser itself: `hs-room`'s local join does not pick one. Same logic as
+   `make_join` (check the allow list against local rooms, name a local member who may invite);
+   belongs in `hs_room::actor::membership_action`.
+2. A joining server that is refused `M_UNABLE_TO_AUTHORISE_JOIN` by every resident could ask the
+   allow list's rooms' servers; Synapse tries the servers it knows in the allowed rooms. Today the
+   candidates are only the client's `via` and the room ID's server.
+3. The invite and knock stripped state stored in `unsigned` shows up in B's timeline rendering
+   of those events (tenth session's item 4).
+4. Measure against Complement (`TestRestrictedRoomsRemoteJoin*`, `TestFederationRoomsInvite`,
+   `TestKnocking`, `TestFederationRejectInvite`); nothing here has met another implementation.
+5. Update `docs/next-steps.md` section 4 and the known-gaps table once this branch and
+   `agent/federation-membership` are merged.
+
+**Decisions made:**
+
+- `createRoom` does not fail when a remote invite fails: the room exists and the client needs its
+  ID. Logged at `warn`.
+- A local rejection happens on any failure of the remote leave (including a `403`), as Synapse
+  does, but only for a user whose membership is `invite` or `knock`.
+- The authoriser is the first (sorted) local joined member for whom the template passes the auth
+  rules, rather than a power-level computation of our own: `hs_state::auth` stays the one
+  authority.
+- The co-signing key for restricted joins comes from `FederationState::invites` rather than a new
+  field, to keep the `FederationState` constructor untouched.
+
 ## Tenth session (2026-09-27): invites, leaves and knocks over federation
 
 Scope: `docs/next-steps.md` section 4, "Invites, leaves and knocks over federation are seams".
@@ -99,7 +216,8 @@ Mutation-checked: with `invites: None` in `build_mount` all three fail (A's invi
 - A local user's invite is built, co-signed remotely and only then persisted, so a refusing
   invitee server means no invite (Synapse's order).
 
-**Not done / next steps, in order:**
+**Not done / next steps, in order** (items 1, 2, 3 and 5 were done in the eleventh session,
+above):
 
 1. `createRoom`'s `invite` list still persists invites for remote users without `PUT /invite`
    (`hs_room::actor::RoomActor::create_room` calls `membership_action` directly). Fix: in

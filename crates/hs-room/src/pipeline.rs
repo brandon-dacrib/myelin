@@ -224,6 +224,98 @@ pub struct NewEvent {
     pub redacts: Option<OwnedEventId>,
 }
 
+/// Hashes and signs a new event's JSON (everything but `hashes` and `signatures`) the way the
+/// spec says to, and parses the result. Shared by [`build_and_authorize`] and
+/// [`build_out_of_band_leave`].
+fn hash_sign_and_parse(
+    object: serde_json::Map<String, serde_json::Value>,
+    room_version: &RoomVersionId,
+    rules: &RoomVersionRules,
+    server_name: &ServerName,
+    signing_key: &SigningKeyPair,
+) -> Result<Event, RoomError> {
+    let mut canonical = to_canonical_object(
+        &serde_json::Value::Object(object),
+        rules.strict_canonical_json,
+    )
+    .map_err(hs_model::EventError::from)?;
+    let content_hash = hash::content_hash_base64(&canonical);
+    canonical.insert(
+        "hashes".to_owned(),
+        CanonicalJsonValue::Object(CanonicalJsonObject::from([(
+            "sha256".to_owned(),
+            CanonicalJsonValue::String(content_hash),
+        )])),
+    );
+    // Sign the *redacted* form, not the full event -- the spec's algorithm
+    // (`refs/matrix-spec/content/server-server-api.md`, "Adding hashes and signatures to outgoing
+    // events"): hash the full event (above), redact, sign the redacted object, then copy the
+    // resulting signature back onto the original, unredacted object this function returns and
+    // persists. A spec-compliant verifier always redacts *before* checking a signature (the
+    // matching "Validating hashes and signatures on received events" text), so signing the full
+    // object instead -- what this line used to do -- produces a signature that verifies only
+    // against this server's own unredacted copy, and mismatches for any event type whose content
+    // redaction does not fully retain (an ordinary `m.room.message`'s `content` most of all: see
+    // `hs_model::redaction::redact_content`). See `docs/rfcs/0014-event-signing-must-sign-the-redacted-form.md`
+    // for the full writeup (discovered by track 06 fixing the symmetric bug on the verification
+    // side, `hs_federation::inbound::verify_pdu`).
+    let mut redacted =
+        redaction::redact(&canonical, &rules.redaction).map_err(hs_model::EventError::from)?;
+    signing::sign_object(&mut redacted, server_name, signing_key)?;
+    let signatures = redacted
+        .remove("signatures")
+        .ok_or_else(|| RoomError::Internal("signing added no signatures".to_owned()))?;
+    canonical.insert("signatures".to_owned(), signatures);
+
+    let final_bytes = CanonicalJsonValue::Object(canonical).to_canonical_bytes();
+    let final_value: serde_json::Value =
+        serde_json::from_slice(&final_bytes).map_err(|e| RoomError::Internal(e.to_string()))?;
+    Ok(Event::parse(&final_value, room_version.clone())?)
+}
+
+/// Builds and signs the leave that ends `membership`, one of this server's users' invite or
+/// knock in a room this server is not in, **without authorizing it**: the rejection of an
+/// invite (or withdrawal of a knock) when no server in the room would take the user's leave
+/// (`make_leave` failed everywhere -- the inviter rescinded the invite and this server never
+/// heard, or the inviting server is gone). Synapse's "locally generated out-of-band leave":
+/// the leave cites the membership it ends as its only `prev_events` and `auth_events`, is sent
+/// by the user it is about, and goes nowhere; it exists so the user's clients can put the room
+/// behind them.
+///
+/// # Errors
+/// As [`build_and_authorize`]'s hashing, signing and parsing.
+#[allow(clippy::too_many_arguments)]
+pub fn build_out_of_band_leave(
+    room_version: &RoomVersionId,
+    rules: &RoomVersionRules,
+    room_id: &RoomId,
+    server_name: &ServerName,
+    signing_key: &SigningKeyPair,
+    now_ms: i64,
+    membership: &EventRef,
+    user: &UserId,
+    content: serde_json::Value,
+) -> Result<Event, RoomError> {
+    let mut object = serde_json::Map::new();
+    object.insert("type".into(), "m.room.member".into());
+    object.insert("sender".into(), user.as_str().into());
+    object.insert("state_key".into(), user.as_str().into());
+    object.insert("room_id".into(), room_id.as_str().into());
+    object.insert("origin_server_ts".into(), now_ms.into());
+    object.insert("depth".into(), (membership.depth + 1).into());
+    object.insert("content".into(), content);
+    let cited = serde_json::Value::Array(vec![encode_ref(membership, rules)]);
+    object.insert("prev_events".into(), cited.clone());
+    object.insert("auth_events".into(), cited);
+    if rules.event_format_requires_event_id {
+        object.insert(
+            "event_id".into(),
+            EventId::new_v1(server_name).to_string().into(),
+        );
+    }
+    hash_sign_and_parse(object, room_version, rules, server_name, signing_key)
+}
+
 /// Builds, hashes, signs and authorizes a new locally-originated event against the room's current
 /// state. Does not persist it -- see `crate::actor::RoomActor`.
 ///
@@ -361,47 +453,7 @@ pub fn build_and_authorize<S: StateStore>(
         );
     }
 
-    // --- hash and sign ---
-    let mut canonical = to_canonical_object(
-        &serde_json::Value::Object(object),
-        rules.strict_canonical_json,
-    )
-    .map_err(hs_model::EventError::from)?;
-    let content_hash = hash::content_hash_base64(&canonical);
-    canonical.insert(
-        "hashes".to_owned(),
-        CanonicalJsonValue::Object(CanonicalJsonObject::from([(
-            "sha256".to_owned(),
-            CanonicalJsonValue::String(content_hash),
-        )])),
-    );
-    // Sign the *redacted* form, not the full event -- the spec's algorithm
-    // (`refs/matrix-spec/content/server-server-api.md`, "Adding hashes and signatures to outgoing
-    // events"): hash the full event (above), redact, sign the redacted object, then copy the
-    // resulting signature back onto the original, unredacted object this function returns and
-    // persists. A spec-compliant verifier always redacts *before* checking a signature (the
-    // matching "Validating hashes and signatures on received events" text), so signing the full
-    // object instead -- what this line used to do -- produces a signature that verifies only
-    // against this server's own unredacted copy, and mismatches for any event type whose content
-    // redaction does not fully retain (an ordinary `m.room.message`'s `content` most of all: see
-    // `hs_model::redaction::redact_content`). See `docs/rfcs/0014-event-signing-must-sign-the-redacted-form.md`
-    // for the full writeup (discovered by track 06 fixing the symmetric bug on the verification
-    // side, `hs_federation::inbound::verify_pdu`).
-    let mut redacted =
-        redaction::redact(&canonical, &rules.redaction).map_err(hs_model::EventError::from)?;
-    signing::sign_object(&mut redacted, server_name, signing_key)?;
-    canonical.insert(
-        "signatures".to_owned(),
-        redacted
-            .remove("signatures")
-            .expect("sign_object always inserts a signature"),
-    );
-
-    let final_bytes = CanonicalJsonValue::Object(canonical).to_canonical_bytes();
-    let final_value: serde_json::Value =
-        serde_json::from_slice(&final_bytes).map_err(|e| RoomError::Internal(e.to_string()))?;
-
-    let event = Event::parse(&final_value, room_version.clone())?;
+    let event = hash_sign_and_parse(object, room_version, rules, server_name, signing_key)?;
 
     // --- authorize ---
     let auth_event_refs: Vec<AuthEventRef<'_>> = auth_refs

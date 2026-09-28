@@ -48,7 +48,9 @@ use crate::client::{ClientError, FederationClient};
 use crate::inbound::{PduError, verify_pdu};
 use crate::keys::DynRemoteKeyCache;
 
-/// Why [`join_room`] could not complete.
+/// Why a membership handshake this server started ([`join_room`], and the leave, knock and
+/// invite in `crate::outbound_membership`) could not complete. The messages name no handshake;
+/// `Rejected::step` does.
 #[derive(Debug, thiserror::Error)]
 pub enum OutboundJoinError {
     /// The outbound request itself failed (network, TLS, discovery, backoff, ...).
@@ -58,7 +60,7 @@ pub enum OutboundJoinError {
         #[source]
         source: ClientError,
     },
-    /// The resident server answered `make_join` or `send_join` with a non-2xx status.
+    /// The other server answered one step of the handshake with a non-2xx status.
     #[error("{destination} rejected {step} with HTTP {status}: {body}")]
     Rejected {
         destination: String,
@@ -66,19 +68,19 @@ pub enum OutboundJoinError {
         status: u16,
         body: Value,
     },
-    /// `make_join`'s response body was not shaped the way the spec requires.
-    #[error("make_join response from {0} was malformed: {1}")]
+    /// The template (`make_join`, `make_leave`, `make_knock`) was not shaped as the spec requires.
+    #[error("the membership template from {0} was malformed: {1}")]
     MalformedTemplate(String, String),
-    /// The join template could not be hashed, redacted or signed.
-    #[error("could not sign the join event: {0}")]
+    /// The membership event could not be hashed, redacted or signed.
+    #[error("could not sign the membership event: {0}")]
     Signing(String),
-    /// `send_join`'s response body was not shaped the way the spec requires.
-    #[error("send_join response from {0} was malformed: {1}")]
+    /// The answer to the second step (`send_*`, `invite`) was not shaped as the spec requires.
+    #[error("the answer from {0} was malformed: {1}")]
     MalformedResponse(String, String),
     /// An event in the returned `state` or `auth_chain` failed the same verification any inbound
     /// PDU gets -- content hash or signature. Carries the failing event's raw JSON for logging;
     /// never trusted further than that.
-    #[error("send_join from {destination} included an event that failed verification: {source}")]
+    #[error("the answer from {destination} included an event that failed verification: {source}")]
     UnverifiedEvent {
         destination: String,
         #[source]
@@ -230,6 +232,37 @@ pub async fn join_room_with_content(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
+    // A restricted join authorised by a user of another server (the resident, whose template
+    // named them) is only valid with that server's signature as well as this one's; the
+    // resident adds it at `send_join` and answers with the co-signed event, which is the one
+    // this server keeps.
+    let join_event = match crate::inbound::join_authoriser_server(&join_event) {
+        Some(authoriser) if authoriser != own_server_name.as_str() => {
+            let returned = send_join_response.body.get("event").ok_or_else(|| {
+                OutboundJoinError::MalformedResponse(
+                    destination.to_owned(),
+                    format!(
+                        "the join names an authoriser on {authoriser} but no co-signed `event` came back"
+                    ),
+                )
+            })?;
+            let cosigned = verify_pdu(returned, &room_version, key_cache)
+                .await
+                .map_err(|source| OutboundJoinError::UnverifiedEvent {
+                    destination: destination.to_owned(),
+                    source,
+                })?;
+            if cosigned.event_id() != join_event.event_id() {
+                return Err(OutboundJoinError::MalformedResponse(
+                    destination.to_owned(),
+                    "the co-signed join is not the join this server sent".to_owned(),
+                ));
+            }
+            cosigned
+        }
+        _ => join_event,
+    };
+
     Ok(RemoteJoinOutcome {
         room_id: room_id.to_owned(),
         room_version,
@@ -316,7 +349,11 @@ pub(crate) async fn make_and_sign(
             .or_insert_with(|| Value::Object(serde_json::Map::new()));
         if let Some(map) = template_content.as_object_mut() {
             for (key, value) in overlay {
-                if key != "membership" {
+                // The resident's choice of who authorises a restricted join is the resident's:
+                // it is the one it will co-sign.
+                if key != "membership"
+                    && !(key == "join_authorised_via_users_server" && map.contains_key(key))
+                {
                     map.insert(key.clone(), value.clone());
                 }
             }
