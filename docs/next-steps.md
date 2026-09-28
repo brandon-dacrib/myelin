@@ -455,6 +455,12 @@ configuration history and revert (`ConfigStore` already records the patch per re
   `e2e-real` (9/9) green; it also fixed a real race (a task's final `task.changed` arriving
   before the `202` that started it left a finished redaction at "0 of 2"; `web/src/api/task-cache.ts`
   keeps whichever state is further along). In the merge queue now.
+- 19:00 `agent/config-history` finished (`73d1e4b`): `config.history.list` and
+  `config.history.revert` (per-setting rows with before and after, secrets never served, 409
+  when a later change touched the same setting unless forced), the section page's history with
+  Revert, verified against the real binary (`crates/hs-cli/tests/config_history.rs`,
+  `e2e-real/configuration.spec.ts` 4/4). Being rebased onto the follow-ups and its decision
+  renumbered (0014 is moderation's) before it goes to the queue.
 
 ## Handover (2026-09-28, 16:00 EDT): where the nine resumed agents stopped
 
