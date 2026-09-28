@@ -182,4 +182,38 @@ test.describe("configuration against the real server", () => {
     // Tidy up: the server answers this test's providers on its login page otherwise.
     expect((await api("PATCH", "/config/auth", { oidc_providers: null })).status).toBe(200);
   });
+
+  test("a section's history names the setting that changed, and a revert puts it back", async ({
+    page,
+  }) => {
+    expect((await api("PATCH", "/config/federation", { client_timeout: "61s" })).status).toBe(200);
+    const changed = await api("PATCH", "/config/federation", { client_timeout: "62s" });
+    expect(changed.status).toBe(200);
+    const revision: number = changed.json.revision;
+
+    await signIn(page);
+    await page.goto("/admin/configuration/federation");
+    const history = page.getByRole("region", { name: "Change history" });
+    const latest = history.getByRole("listitem").filter({ hasText: `revision ${revision}` });
+    await expect(latest.getByTitle("federation.client_timeout")).toContainText(
+      /Client timeout:\s*61s\s*to\s*62s/,
+    );
+    await shot(page, "history");
+
+    await latest.getByRole("button", { name: `Revert revision ${revision}` }).click();
+    const dialog = page.getByRole("dialog", { name: `Revert revision ${revision}?` });
+    await expect(dialog.getByTitle("federation.client_timeout")).toContainText(/62s\s*to\s*61s/);
+    await shot(page, "revert-dialog");
+    await dialog.getByRole("button", { name: "Revert", exact: true }).click();
+    await expect(page.getByText(`Revision ${revision} reverted`, { exact: true })).toBeVisible();
+    await expect(history.getByText(`Reverts revision ${revision}`)).toBeVisible();
+    await shot(page, "reverted");
+
+    const federation = await api("GET", "/config/federation");
+    expect(federation.json.values.client_timeout).toBe("61s");
+    expect(federation.json.history[0].reverts).toBe(revision);
+
+    // Tidy up: back to the default.
+    expect((await api("PATCH", "/config/federation", { client_timeout: null })).status).toBe(200);
+  });
 });
