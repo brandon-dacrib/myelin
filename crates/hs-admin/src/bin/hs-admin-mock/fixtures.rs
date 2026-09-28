@@ -139,8 +139,8 @@ fn reports() -> Vec<Value> {
 
 fn registration_tokens() -> Vec<Value> {
     vec![
-        json!({"token": "welcome-2026", "uses_allowed": 100, "pending": 4, "completed": 61, "expires_at": "2026-12-31T23:59:59.000Z", "created_at": "2026-01-01T00:00:00.000Z"}),
-        json!({"token": "eng-team-onboarding", "uses_allowed": 10, "pending": 0, "completed": 10, "expires_at": null, "created_at": "2026-05-01T00:00:00.000Z"}),
+        json!({"token": "welcome-2026", "valid": true, "uses_allowed": 100, "pending": 4, "completed": 61, "expires_at": "2026-12-31T23:59:59.000Z", "created_at": "2026-01-01T00:00:00.000Z"}),
+        json!({"token": "eng-team-onboarding", "valid": false, "uses_allowed": 10, "pending": 0, "completed": 10, "expires_at": null, "created_at": "2026-05-01T00:00:00.000Z"}),
     ]
 }
 
@@ -196,7 +196,7 @@ fn shards() -> Vec<Value> {
 
 fn server_notices() -> Vec<Value> {
     vec![
-        json!({"event_ids": ["$notice1"], "recipients": ["@alice:example.org", "@bob:example.org"], "sent_at": "2026-09-01T09:00:00.000Z"}),
+        json!({"id": "01J8RNOTICE0000000000001", "sender": "@_server:example.org", "type": "m.room.message", "content": {"msgtype": "m.text", "body": "Scheduled maintenance tonight at 22:00 UTC."}, "event_ids": ["$notice1", "$notice2"], "room_ids": ["!notices-alice:example.org", "!notices-bob:example.org"], "recipients": ["@alice:example.org", "@bob:example.org"], "sent_at": "2026-09-01T09:00:00.000Z"}),
     ]
 }
 

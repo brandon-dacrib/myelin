@@ -32,6 +32,7 @@ pub mod recover;
 pub mod register;
 pub mod remote_join;
 pub mod serve;
+pub mod server_notices;
 pub mod signing_key;
 pub mod storage;
 pub mod synapse_serve;

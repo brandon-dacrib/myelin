@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate, useSearch, Link } from "@tanstack/react-router";
-import { UserPlus, Users as UsersIcon } from "lucide-react";
+import { Link2, UserPlus, Users as UsersIcon } from "lucide-react";
 import { useUsers, type User } from "@/api/users";
 import { Button } from "@/components/ui/button/Button";
 import { Badge } from "@/components/ui/badge/Badge";
@@ -12,6 +12,7 @@ import { QueryProblemState } from "@/components/QueryProblemState";
 import { RelativeTime } from "@/components/RelativeTime";
 import { hasScope } from "@/lib/auth";
 import { AddUserDialog } from "./users/AddUserDialog";
+import { CreateTokenDialog } from "./settings/CreateTokenDialog";
 
 /** `/users` — flows.md flow 2: find and deal with a user. */
 export function UsersPage() {
@@ -21,6 +22,9 @@ export function UsersPage() {
   const canRead = hasScope("admin:read");
   const canWrite = hasScope("admin:write");
   const [addOpen, setAddOpen] = useState(false);
+  // An invite link lets the person choose their own username and password, where Add user has
+  // the administrator choose them and hand them over.
+  const [inviteOpen, setInviteOpen] = useState(false);
 
   const { data, isLoading, isError, error, refetch } = useUsers({
     q: search.q,
@@ -114,15 +118,25 @@ export function UsersPage() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h1 className="text-xl text-text">Users</h1>
         {canWrite && (
-          <Button
-            leadingIcon={<UserPlus size={16} aria-hidden="true" />}
-            onClick={() => setAddOpen(true)}
-          >
-            Add user
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              variant="secondary"
+              leadingIcon={<Link2 size={16} aria-hidden="true" />}
+              onClick={() => setInviteOpen(true)}
+            >
+              Invite by link
+            </Button>
+            <Button
+              leadingIcon={<UserPlus size={16} aria-hidden="true" />}
+              onClick={() => setAddOpen(true)}
+            >
+              Add user
+            </Button>
+          </div>
         )}
       </div>
       <AddUserDialog open={addOpen} onOpenChange={setAddOpen} />
+      <CreateTokenDialog open={inviteOpen} onOpenChange={setInviteOpen} />
 
       <form
         className="mt-4 flex max-w-md gap-2"

@@ -201,6 +201,10 @@ fn build_router<B: KvBackend>(
 ) -> (Router, RouteManifest) {
     let auth_router = hs_auth::routes::router().with_state(auth.clone());
     let auth_routes = crate::auth_manifest::routes();
+    // The registration-token validity check, which the spec puts under `v1` only: what an
+    // invite link's sign-up page asks before showing its form.
+    let auth_v1_router = hs_auth::routes::v1_router().with_state(auth.clone());
+    let auth_v1_routes = crate::auth_manifest::v1_routes();
 
     // `hs-auth`'s shared-secret registration fragment spells its own absolute path
     // (`/_synapse/admin/v1/register`), so unlike the fragment above it is merged at the root
@@ -336,7 +340,8 @@ fn build_router<B: KvBackend>(
         )
         .merge_router("/_matrix/client/r0", push_router, push_routes)
         .merge_router("/_matrix/client/v1/media", media_router, media_routes)
-        .merge_router("/_matrix/client/v1", ping_router, ping_routes);
+        .merge_router("/_matrix/client/v1", ping_router, ping_routes)
+        .merge_router("/_matrix/client/v1", auth_v1_router, auth_v1_routes);
 
     if let Some((state, x_matrix, own_keys, server_name)) = federation {
         let (federation_router, federation_manifest) =
@@ -619,6 +624,11 @@ fn admin_state<B: KvBackend + 'static>(
     .with_bridge_offerings(sources.bridge_offerings)
     // The Federation page and the Overview's last 501 panel.
     .with_federation(sources.federation)
+    // Invite links: the tokens `/register` accepts while open registration is off.
+    .with_registration_tokens(Arc::new(
+        hs_auth::registration_tokens::AdminRegistrationTokens::from_auth_state(auth),
+    ))
+    .with_server_notices(sources.server_notices)
     .with_server_info(hs_admin::model::ServerInfo {
         name: server_name.to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -652,6 +662,7 @@ struct AdminSources {
     overview: Arc<dyn hs_admin::sources::OverviewSource>,
     appservices: Arc<dyn hs_admin::sources::AppserviceDirectory>,
     federation: Arc<dyn hs_admin::sources::FederationSource>,
+    server_notices: Arc<dyn hs_admin::server_notices::ServerNoticeSource>,
 }
 
 /// The `/api/v1` state for [`route_manifest`]'s throwaway router: routes are registered the same
@@ -978,7 +989,10 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     let auth_store: Arc<dyn hs_auth::store::AuthStore> = Arc::new(
         hs_auth::store::tables::TablesAuthStore::open(backend.clone())?,
     );
-    let mut auth_state = AuthState::with_store(auth_store, auth_config);
+    // Registration tokens are durable too: an invite link has to survive a restart.
+    let mut auth_state = AuthState::with_store(auth_store, auth_config).with_registration_tokens(
+        Arc::new(hs_auth::registration_tokens::TablesRegistrationTokens::open(backend.clone())?),
+    );
 
     let identity = crate::identity::load_or_generate(&config)?;
     // Kept for the recovery source below, which needs the key's public half after `identity`
@@ -1212,6 +1226,20 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     )
     .map_err(|e| ServeError::Sessions(Box::new(e)))?;
 
+    // Server notices, sent as `@_server:<server name>` into each recipient's own room. Opened
+    // here, after the appservice registry has replaced `auth_state`'s and before the room
+    // routes are served: opening it is also what tells the room registry which rooms are
+    // server-notices rooms.
+    let server_notices = Arc::new(
+        crate::server_notices::ServerNotices::open(
+            backend.clone(),
+            auth_state.clone(),
+            rooms.clone(),
+            user_state.hub.store().clone(),
+        )
+        .map_err(ServeError::Sessions)?,
+    );
+
     let setup = Arc::new(hs_auth::setup::FirstRunSetup::from_auth_state(&auth_state));
     let recovery = Arc::new(hs_auth::recovery::AdministratorRecovery::new(
         &auth_state,
@@ -1247,6 +1275,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
                 overview: overview.clone(),
                 appservices: appservice_delivery.admin_directory(),
                 federation: federation_source.clone(),
+                server_notices: server_notices.clone(),
             },
         ),
     };

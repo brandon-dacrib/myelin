@@ -8,7 +8,6 @@ const TITLES: Record<string, string> = {
   cluster: "Cluster",
   migration: "Migration",
   audit: "Audit log",
-  settings: "Settings",
 };
 
 /**

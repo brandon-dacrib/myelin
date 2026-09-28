@@ -54,6 +54,13 @@ import {
   useMockRecoveryLink,
 } from "./data/recovery";
 import { rooms, roomMembers, findRoom } from "./data/rooms";
+import {
+  findRegistrationToken,
+  generateMockToken,
+  refreshValidity,
+  registrationTokens,
+} from "./data/registration-tokens";
+import { serverNotices, SERVER_NOTICES_USER } from "./data/server-notices";
 import { ALL_SCOPES, type Scope } from "@/lib/auth";
 import type { AppService, BridgeOfferingRequest } from "@/api/bridges";
 import type { JsonValue } from "@/api/config-schema";
@@ -132,6 +139,24 @@ function problem(
   extra?: { detail?: string; errors?: { pointer: string; detail: string }[] },
 ) {
   return HttpResponse.json({ type: `urn:hs:problem:${slug}`, title, status, ...extra }, { status });
+}
+
+/** The characters a Matrix username may contain (the historical user ID grammar, lowercased). */
+const MATRIX_LOCALPART = /^[a-z0-9._=\-/]+$/;
+
+/** A Matrix-style refusal (`{errcode, error}`), as the client-server API answers. */
+function invalidUsername() {
+  return HttpResponse.json(
+    { errcode: "M_INVALID_USERNAME", error: "User ID can only contain a-z, 0-9, . _ = - /" },
+    { status: 400 },
+  );
+}
+
+function userInUse() {
+  return HttpResponse.json(
+    { errcode: "M_USER_IN_USE", error: "User ID already taken." },
+    { status: 400 },
+  );
 }
 
 function configNotFound(name: string) {
@@ -855,6 +880,194 @@ export const handlers = [
       );
     user.deactivated = true;
     return HttpResponse.json(user);
+  }),
+
+  // ---- Registration tokens (Settings; the Users page's "Invite by link") ----
+  http.get(`${API}/registration-tokens`, ({ request }) => {
+    const all = registrationTokens.map((t) => refreshValidity(t));
+    return HttpResponse.json(paginate(all, new URL(request.url)));
+  }),
+
+  http.post(`${API}/registration-tokens`, async ({ request }) => {
+    const body = (await request.json().catch(() => ({}))) as {
+      token?: string;
+      uses_allowed?: number | null;
+      expires_at?: string | null;
+      length?: number;
+    };
+    if (body.token !== undefined && !/^[A-Za-z0-9._~-]{1,64}$/.test(body.token)) {
+      const detail = "a token is 1 to 64 characters from A-Z a-z 0-9 . _ ~ -";
+      return problem(400, "validation-failed", "Validation failed", {
+        detail,
+        errors: [{ pointer: "/token", detail }],
+      });
+    }
+    if (body.uses_allowed != null && body.uses_allowed < 0) {
+      const detail = "uses_allowed cannot be negative";
+      return problem(400, "validation-failed", "Validation failed", {
+        detail,
+        errors: [{ pointer: "/uses_allowed", detail }],
+      });
+    }
+    const token = body.token ?? generateMockToken(Math.min(Math.max(body.length ?? 16, 1), 64));
+    if (findRegistrationToken(token)) {
+      return problem(409, "conflict", "Conflict", {
+        detail: `a registration token "${token}" already exists`,
+      });
+    }
+    const created = refreshValidity({
+      token,
+      valid: true,
+      uses_allowed: body.uses_allowed ?? null,
+      pending: 0,
+      completed: 0,
+      expires_at: body.expires_at ?? null,
+      created_at: new Date().toISOString(),
+    });
+    registrationTokens.unshift(created);
+    return HttpResponse.json(created, { status: 201 });
+  }),
+
+  http.get(`${API}/registration-tokens/:token`, ({ params }) => {
+    const found = findRegistrationToken(decodeURIComponent(String(params.token)));
+    if (!found) return problem(404, "not-found", "Not found");
+    return HttpResponse.json(refreshValidity(found));
+  }),
+
+  http.patch(`${API}/registration-tokens/:token`, async ({ params, request }) => {
+    const found = findRegistrationToken(decodeURIComponent(String(params.token)));
+    if (!found) return problem(404, "not-found", "Not found");
+    const body = (await request.json().catch(() => ({}))) as {
+      uses_allowed?: number | null;
+      expires_at?: string | null;
+    };
+    if (body.uses_allowed != null && body.uses_allowed < 0) {
+      const detail = "uses_allowed cannot be negative";
+      return problem(400, "validation-failed", "Validation failed", {
+        detail,
+        errors: [{ pointer: "/uses_allowed", detail }],
+      });
+    }
+    if ("uses_allowed" in body) found.uses_allowed = body.uses_allowed ?? null;
+    if ("expires_at" in body) found.expires_at = body.expires_at ?? null;
+    return HttpResponse.json(refreshValidity(found));
+  }),
+
+  http.delete(`${API}/registration-tokens/:token`, ({ params }) => {
+    const index = registrationTokens.findIndex(
+      (t) => t.token === decodeURIComponent(String(params.token)),
+    );
+    if (index < 0) return problem(404, "not-found", "Not found");
+    registrationTokens.splice(index, 1);
+    return new HttpResponse(null, { status: 204 });
+  }),
+
+  // ---- Server notices (Settings; a user's "Send notice") ----
+  http.get(`${API}/server-notices`, ({ request }) =>
+    HttpResponse.json(paginate(serverNotices, new URL(request.url))),
+  ),
+
+  http.post(`${API}/server-notices`, async ({ request }) => {
+    const body = (await request.json().catch(() => ({}))) as {
+      recipients?: string[];
+      content?: Record<string, unknown>;
+      type?: string;
+    };
+    const recipients = body.recipients ?? [];
+    if (recipients.length === 0) {
+      const detail = "at least one recipient is required";
+      return problem(400, "validation-failed", "Validation failed", {
+        detail,
+        errors: [{ pointer: "/recipients", detail }],
+      });
+    }
+    const missing = recipients.find((r) => !findUser(r));
+    if (missing) {
+      // What the server says: a field error on the recipients, and nothing sent.
+      const detail = `${missing} does not exist`;
+      return problem(400, "validation-failed", "Validation failed", {
+        detail,
+        errors: [{ pointer: "/recipients", detail }],
+      });
+    }
+    const id = `notice-${crypto.randomUUID().slice(0, 8)}`;
+    const localpart = (userId: string) => userId.slice(1).split(":")[0];
+    const sent = {
+      id,
+      sender: SERVER_NOTICES_USER,
+      type: body.type ?? "m.room.message",
+      content: (body.content ?? {}) as Record<string, never>,
+      recipients,
+      room_ids: recipients.map((r) => `!notices-${localpart(r)}:example.org`),
+      event_ids: recipients.map((r) => `$${id}-${localpart(r)}`),
+      sent_at: new Date().toISOString(),
+    };
+    serverNotices.unshift(sent);
+    return HttpResponse.json(sent, { status: 201 });
+  }),
+
+  // ---- Matrix client-server registration with a token (the public /admin/register page) ----
+  // Not the admin API: the three calls any Matrix client makes to register with an invite.
+  http.get("/_matrix/client/v1/register/m.login.registration_token/validity", ({ request }) => {
+    const token = new URL(request.url).searchParams.get("token") ?? "";
+    const found = findRegistrationToken(token);
+    return HttpResponse.json({ valid: found ? refreshValidity(found).valid === true : false });
+  }),
+
+  http.get("/_matrix/client/v3/register/available", ({ request }) => {
+    const username = (new URL(request.url).searchParams.get("username") ?? "").toLowerCase();
+    if (!MATRIX_LOCALPART.test(username)) return invalidUsername();
+    if (findUser(`@${username}:example.org`)) return userInUse();
+    return HttpResponse.json({ available: true });
+  }),
+
+  http.post("/_matrix/client/v3/register", async ({ request }) => {
+    const body = (await request.json().catch(() => ({}))) as {
+      username?: string;
+      password?: string;
+      auth?: { type?: string; token?: string; session?: string };
+    };
+    const username = (body.username ?? "").toLowerCase();
+    if (!MATRIX_LOCALPART.test(username)) return invalidUsername();
+    const userId = `@${username}:example.org`;
+    if (findUser(userId)) return userInUse();
+    if ((body.password ?? "").length < 8) {
+      return HttpResponse.json(
+        { errcode: "M_WEAK_PASSWORD", error: "Password too short (minimum 8 characters)." },
+        { status: 400 },
+      );
+    }
+    const flows = [{ stages: ["m.login.registration_token"] }];
+    if (body.auth?.type !== "m.login.registration_token") {
+      return HttpResponse.json({ session: "mock-uia", flows, params: {} }, { status: 401 });
+    }
+    const found = findRegistrationToken(body.auth.token ?? "");
+    if (!found || !refreshValidity(found).valid) {
+      return HttpResponse.json(
+        {
+          errcode: "M_UNAUTHORIZED",
+          error: "Invalid registration token",
+          session: "mock-uia",
+          flows,
+          params: {},
+        },
+        { status: 401 },
+      );
+    }
+    found.completed = (found.completed ?? 0) + 1;
+    refreshValidity(found);
+    users.push({
+      ...users[1]!,
+      user_id: userId,
+      display_name: username,
+      admin: false,
+      created_at: new Date().toISOString(),
+      last_seen_at: null,
+      device_count: 0,
+      room_count: 0,
+      media_count: 0,
+    });
+    return HttpResponse.json({ user_id: userId, home_server: "example.org" });
   }),
 
   // ---- Rooms (flows.md flow 3) ----

@@ -79,6 +79,15 @@ pub fn router() -> Router<AuthState> {
         .route("/profile/{userId}/avatar_url", get(profile::get_avatar_url))
 }
 
+/// The auth endpoints the spec defines under `/_matrix/client/v1` rather than `v3`: today, the
+/// registration-token validity check. Mount under `/_matrix/client/v1` only.
+pub fn v1_router() -> Router<AuthState> {
+    Router::new().route(
+        "/register/m.login.registration_token/validity",
+        get(register::get_registration_token_validity),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

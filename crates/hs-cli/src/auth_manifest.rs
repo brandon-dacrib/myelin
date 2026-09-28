@@ -94,6 +94,18 @@ pub fn routes() -> Vec<Route> {
     ]
 }
 
+/// The entries for `hs_auth::routes::v1_router()`, the auth endpoints the spec defines under
+/// `/_matrix/client/v1`; spec-relative like [`routes`], and mounted under that one prefix.
+#[must_use]
+pub fn v1_routes() -> Vec<Route> {
+    vec![route(
+        "GET",
+        "/register/m.login.registration_token/validity",
+        AuthKind::None,
+        "registrationTokenValidity",
+    )]
+}
+
 /// The two `/_synapse/admin/v1/register` entries for `hs_auth::synapse_admin_router()`
 /// (`crates/hs-auth/src/routes/synapse_admin.rs`), mirrored by hand for the same reason as
 /// [`routes`] above. Unlike that list these paths are **absolute**: `crate::serve` merges this

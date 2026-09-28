@@ -7057,9 +7057,24 @@ components:
           type: string
     RegistrationToken:
       type: object
+      description: A token that lets someone register an account, even while open registration
+        is off. `pending` counts registrations that have presented the token and not finished
+        yet; `completed` counts accounts created with it. A token is `valid` while it has not
+        expired and `pending + completed` is below `uses_allowed` (no limit when null).
+      required:
+      - token
+      - valid
+      - uses_allowed
+      - pending
+      - completed
+      - expires_at
+      - created_at
       properties:
         token:
           type: string
+        valid:
+          type: boolean
+          description: Whether the token would admit a new registration right now.
         uses_allowed:
           type:
           - integer
@@ -7081,13 +7096,28 @@ components:
       properties:
         token:
           type: string
+          description: The token to create. Omit it to have the server generate one of
+            `length` characters. At most 64 characters from `A-Z a-z 0-9 . _ ~ -`.
+          maxLength: 64
+          pattern: ^[A-Za-z0-9._~-]+$
         uses_allowed:
-          type: integer
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+          description: How many accounts the token may create; null or absent for no limit.
         expires_at:
-          type: string
+          type:
+          - string
+          - 'null'
           format: date-time
+          description: When the token stops working; null or absent for never.
         length:
           type: integer
+          minimum: 1
+          maximum: 64
+          description: The length of a generated token, 16 when absent. Ignored when `token` is
+            given.
     RegistrationTokenUpdate:
       type: object
       properties:
@@ -7828,7 +7858,36 @@ components:
             $ref: '#/components/schemas/TimeseriesPoint'
     ServerNotice:
       type: object
+      description: One notice sent to one or more local users. Each recipient gets it in their
+        own server-notices room (tagged `m.server_notice`), sent by the server-notices user.
+      required:
+      - id
+      - sender
+      - type
+      - content
+      - recipients
+      - room_ids
+      - event_ids
+      - sent_at
       properties:
+        id:
+          type: string
+          description: The notice's identifier in the history.
+        sender:
+          type: string
+          description: The server-notices user the notice was sent as.
+        type:
+          type: string
+          description: The event type that was sent.
+        content:
+          type: object
+          additionalProperties: true
+          description: The event content that was sent.
+        room_ids:
+          type: array
+          description: Each recipient's server-notices room, in the order of `recipients`.
+          items:
+            type: string
         event_ids:
           type: array
           items:
@@ -7848,10 +7907,15 @@ components:
       properties:
         recipients:
           type: array
+          minItems: 1
+          description: Local user IDs to send the notice to. Every one must exist; nothing is
+            sent if any does not.
           items:
             type: string
         content:
           type: object
+          additionalProperties: true
+          description: The event content, for example `{"msgtype":"m.text","body":"..."}`.
         type:
           type: string
           default: m.room.message

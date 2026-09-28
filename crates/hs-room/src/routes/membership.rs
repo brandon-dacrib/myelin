@@ -327,7 +327,57 @@ pub async fn post_leave<B: KvBackend + 'static>(
     PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
     let user = requester.user_id.clone();
+    refuse_rejecting_server_notices(&state, &room_id, &user).await?;
     act(&state, &room_id, user.clone(), Action::Leave, user, &body).await
+}
+
+/// A server-notices room's recipient may leave it once they have joined, but not reject the
+/// invitation to it: the notice would go unseen, and the next one would re-invite them to the
+/// same room anyway. The room is recognised by who created it, so no other room can claim to be
+/// one by what it says about itself.
+async fn refuse_rejecting_server_notices<B: KvBackend + 'static>(
+    state: &RoomState<B>,
+    room_id: &str,
+    user: &ruma::UserId,
+) -> Result<(), RoomError> {
+    let Some(notices_user) = state.rooms.server_notices_user().map(ToOwned::to_owned) else {
+        return Ok(());
+    };
+    let Ok(room_id) = ruma::RoomId::parse(room_id) else {
+        return Ok(());
+    };
+    let Ok(handle) = state.rooms.get_or_load(&room_id).await else {
+        return Ok(());
+    };
+    let user = user.to_owned();
+    let refused = handle
+        .query(move |actor| {
+            let created_by_notices = actor
+                .state_event("m.room.create", "")
+                .ok()
+                .flatten()
+                .is_some_and(|e| e.header().sender == notices_user);
+            let invited = actor
+                .state_event("m.room.member", user.as_str())
+                .ok()
+                .flatten()
+                .and_then(|e| {
+                    e.json()
+                        .get("content")
+                        .and_then(|c| c.as_object())
+                        .and_then(|c| c.get("membership"))
+                        .and_then(|m| m.as_str())
+                        .map(str::to_owned)
+                })
+                .as_deref()
+                == Some("invite");
+            created_by_notices && invited
+        })
+        .await;
+    if refused {
+        return Err(RoomError::CannotLeaveServerNoticeRoom);
+    }
+    Ok(())
 }
 
 /// `POST /rooms/{roomId}/forget`. Per the spec
@@ -752,5 +802,85 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, RoomError::RoomNotFound(_)), "{err}");
         assert!(remote.resolved.lock().unwrap().is_empty());
+    }
+
+    /// A server-notices room's recipient cannot reject the invitation, can leave once joined,
+    /// and a room anyone else created that merely invites them is theirs to reject as usual.
+    #[tokio::test]
+    async fn a_server_notices_invitation_cannot_be_rejected_but_the_room_can_be_left() {
+        let state = state(None);
+        let notices = UserId::parse("@_server:hs1").unwrap().to_owned();
+        let alice_id = UserId::parse("@alice:hs1").unwrap().to_owned();
+        let carol_id = UserId::parse("@carol:hs1").unwrap().to_owned();
+        state.rooms.install_server_notices_user(notices.clone());
+
+        let mut rooms = Vec::new();
+        for creator in [notices, carol_id] {
+            let handle = state
+                .rooms
+                .create_room(
+                    creator,
+                    crate::actor::CreateRoomRequest {
+                        preset: Some("private_chat".to_owned()),
+                        invite: vec![alice_id.clone()],
+                        ..Default::default()
+                    },
+                    1,
+                )
+                .await
+                .unwrap();
+            rooms.push(handle.query(|actor| actor.room_id().to_owned()).await);
+        }
+        let (notice_room, other_room) = (rooms[0].clone(), rooms[1].clone());
+
+        let err = post_leave::<MemoryBackend>(
+            State(state.clone()),
+            Path(notice_room.to_string()),
+            alice(),
+            PermissiveJson(json!({})),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, RoomError::CannotLeaveServerNoticeRoom),
+            "{err}"
+        );
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            body_json(response).await["errcode"],
+            "M_CANNOT_LEAVE_SERVER_NOTICE_ROOM"
+        );
+
+        // Any other room's invitation is rejected as usual.
+        let response = post_leave::<MemoryBackend>(
+            State(state.clone()),
+            Path(other_room.to_string()),
+            alice(),
+            PermissiveJson(json!({})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Joined, alice may leave the notices room.
+        post_join::<MemoryBackend>(
+            State(state.clone()),
+            Path(notice_room.to_string()),
+            RawQuery(None),
+            alice(),
+            PermissiveJson(json!({})),
+        )
+        .await
+        .unwrap();
+        let response = post_leave::<MemoryBackend>(
+            State(state.clone()),
+            Path(notice_room.to_string()),
+            alice(),
+            PermissiveJson(json!({})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

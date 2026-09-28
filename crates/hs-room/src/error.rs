@@ -127,6 +127,12 @@ pub enum RoomError {
     /// is logged.
     #[error("could not fetch the room's earlier history through federation: {0}")]
     BackfillFailed(String),
+    /// A user tried to reject their invitation to their server-notices room
+    /// ([`crate::registry::RoomRegistry::install_server_notices_user`]). `403
+    /// M_CANNOT_LEAVE_SERVER_NOTICE_ROOM`, Synapse's code for the same refusal, which clients and
+    /// Complement's `TestServerNotices` look for. Leaving after joining is allowed.
+    #[error("you cannot reject the invitation to your server notices room")]
+    CannotLeaveServerNoticeRoom,
 }
 
 impl RoomError {
@@ -168,6 +174,11 @@ impl RoomError {
             ),
             Self::Forbidden(msg) => MatrixError::forbidden(msg.clone()),
             Self::RoomBlocked(_) => MatrixError::forbidden(self.to_string()),
+            Self::CannotLeaveServerNoticeRoom => MatrixError::custom(
+                axum::http::StatusCode::FORBIDDEN,
+                MatrixErrorCode::Other("M_CANNOT_LEAVE_SERVER_NOTICE_ROOM".to_owned()),
+                self.to_string(),
+            ),
             Self::Fenced(_) => MatrixError::custom(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 MatrixErrorCode::Unknown,

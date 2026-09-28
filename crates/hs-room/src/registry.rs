@@ -124,6 +124,9 @@ pub struct RoomRegistry<B: KvBackend> {
     /// loads runs with no cluster-fencing check at all -- `RoomActor::persist` behaves exactly as
     /// it did before this hook existed.
     fencing: OnceLock<Arc<crate::fencing::RoomFencing<B>>>,
+    /// See [`RoomRegistry::install_server_notices_user`]. Unset means this server sends no
+    /// server notices, and no room is one.
+    server_notices_user: OnceLock<ruma::OwnedUserId>,
 }
 
 impl<B: KvBackend + 'static> RoomRegistry<B> {
@@ -154,6 +157,7 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             global_token_resolver: OnceLock::new(),
             backfill: OnceLock::new(),
             fencing: OnceLock::new(),
+            server_notices_user: OnceLock::new(),
         })
     }
 
@@ -196,6 +200,25 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     #[must_use]
     pub fn backfill_hook(&self) -> Option<&Arc<dyn crate::backfill::Backfill>> {
         self.backfill.get()
+    }
+
+    /// Names the user server notices are sent as (the Matrix specification's "Server Notices"
+    /// module). A room that user created is a server-notices room, and its recipient cannot
+    /// reject the invitation to it (`crate::routes::membership::post_leave`): the notice has to
+    /// be seen. Idempotent past the first call, like the other installs here.
+    pub fn install_server_notices_user(&self, user_id: ruma::OwnedUserId) {
+        if self.server_notices_user.set(user_id).is_err() {
+            tracing::warn!(
+                "a server-notices user was already installed on this room registry; ignoring \
+                 the second install"
+            );
+        }
+    }
+
+    /// The user server notices are sent as, if this server sends them.
+    #[must_use]
+    pub fn server_notices_user(&self) -> Option<&ruma::UserId> {
+        self.server_notices_user.get().map(|u| u.as_ref())
     }
 
     /// Installs the cluster-fencing hook every actor this registry constructs or loads from now

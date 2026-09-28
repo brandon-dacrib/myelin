@@ -2,7 +2,72 @@
 
 Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-admin`, `hs-modules`, `hs-identity`, `hs-http` (shared with 07 and 14).
 
-Last updated: 2026-09-27 (the bridge offering operations, below); before that 2026-09-26 (three public recovery operations); 2026-09-25 (additive schema change for the bridges wizard); the session log that follows is from 2026-09-19 (session 6).
+Last updated: 2026-09-27 (registration tokens and server notices, below; before that the bridge
+offering operations); before that 2026-09-26 (three public recovery operations); 2026-09-25 (additive schema change for the bridges wizard); the session log that follows is from 2026-09-19 (session 6).
+
+> **2026-09-27, served for real: RegistrationTokens 5/5 and ServerNotices 2/2.**
+> `tools/admin_api_coverage.py` now counts **78 of 158** operations with a real handler.
+>
+> - **Registration tokens** (`crates/hs-admin/src/registration_tokens.rs`): the five handlers
+>   (`admin:read` / `admin:write`), `RegistrationTokenSource`, `InMemoryRegistrationTokens`,
+>   `AdminState::with_registration_tokens`. Create validates the token (1-64 of
+>   `A-Za-z0-9._~-`, `/token`), generates one of `length` (default 16; ignored beside a given
+>   token), refuses a past `expires_at` and a negative `uses_allowed` (each with its pointer),
+>   `409` on a duplicate, honours `Idempotency-Key`. `PATCH` tells absent from `null` (null
+>   removes a limit). Every write is audited (`registration_tokens.create/update/delete`, with
+>   the before/after of each changed limit) and published (`registration_token.*`). The real
+>   source is `hs_auth::registration_tokens::AdminRegistrationTokens` over the durable
+>   `TablesRegistrationTokens` (`hs_auth.registration_tokens` keyspace), the same store `/register`
+>   checks. Client-server side (track 07's crate, edited here with the work): with open
+>   registration off, a registration token is the one way in -- `/register` offers
+>   `[m.login.registration_token]` while any token is usable and stays `403` when none is;
+>   passing the stage reserves one of the token's places for that UIA session (`pending`) until
+>   the account is created (`completed`) or the session expires, so a one-use token cannot be
+>   presented by two people at once; `GET /_matrix/client/v1/register/m.login.registration_token/validity`
+>   is mounted (new `hs_auth::routes::v1_router`). This is invite-by-link user creation.
+> - **Server notices** (`crates/hs-admin/src/server_notices.rs`): `server_notices.send`
+>   (`moderation:write`, idempotent, recipients checked before anything is sent) and
+>   `server_notices.list` (`moderation:read`, newest first), `ServerNoticeSource`,
+>   `InMemoryServerNotices`, `AdminState::with_server_notices`; audited as
+>   `server_notices.send`, published as `server_notice.sent`. The real source is
+>   `crates/hs-cli/src/server_notices.rs`: sent as `@_server:<server name>` (created on first
+>   use, no password; an account of that name this code did not create is never sent as), one
+>   room per recipient (private, named "Server Notices", `users_default: -10`, recipient
+>   invited, `m.server_notice` added to their `m.tag`), reused and re-invited to after a leave,
+>   history and the recipient-to-room map in `hs_admin.server_notice*` keyspaces. `hs-room`
+>   refuses a recipient's rejection of that invitation with `403
+>   M_CANNOT_LEAVE_SERVER_NOTICE_ROOM` (`RoomRegistry::install_server_notices_user`; the room is
+>   recognised by its creator). `hs-compat` shims `POST /_synapse/admin/v1/send_server_notice`
+>   and `PUT .../send_server_notice/{txnId}` (a transaction id becomes the idempotency key; a
+>   non-administrator's token is `403 M_FORBIDDEN`), which is what Complement calls.
+> - **Contract** (`openapi.yaml`, additive): `RegistrationToken` gained `valid` and a
+>   `required` list; `RegistrationTokenCreate` documents the alphabet and lost the `default`
+>   on `length` (the generator made a defaulted field required); `ServerNotice` gained `id`,
+>   `sender`, `type`, `content`, `room_ids` and a `required` list; both `content` objects are
+>   `additionalProperties: true`. `web/src/api/schema.d.ts` regenerated. `hs-admin-mock`'s
+>   fixtures follow the new shapes.
+> - **Verified**: `cargo test -p hs-admin` (new `tests/tokens_and_notices.rs`, 7 tests),
+>   `cargo test -p hs-auth` (store and registration tests, 229 in the lib),
+>   `cargo test -p hs-room` (the leave refusal), `cargo test -p hs-compat` (the shim),
+>   `cargo test -p hs-cli --test invites_and_notices` (2 end-to-end tests through the real
+>   server: a one-use invite token registering one person on a closed server, then a second
+>   after the limit is raised; and `TestServerNotices` step for step -- 403 for a
+>   non-administrator, the invite from `@_server`, the refused rejection, join with the notice
+>   in the timeline and the `m.server_notice` tag, leave, re-invite to the same room, the
+>   transaction id idempotent). Clippy clean with `-D warnings` on all five crates.
+>   `cargo test -p hs-cli` in full: every suite green (141 lib tests plus every integration
+>   test binary).
+> - **Where this stopped** (branch `agent/registration-tokens-server-notices`, not merged):
+>   done and verified as above, web included (`npm run check` green, 224 Vitest tests;
+>   `npm run test:e2e` 31 passed on mocks). Not run: the web pages against a real `hs serve`
+>   through Playwright (`web/e2e-real/` has no spec for them yet; next step is one modelled on
+>   `bridge-offerings.spec.ts`: create a token, open the invite link signed out, register,
+>   send a notice), and Complement's `TestServerNotices` itself (run it on the laptop and
+>   update `docs/status/complement-csapi-results.txt`). Nothing is partly written.
+> - **Not done**: the server-notices localpart is fixed (`_server`), not a setting; notices to
+>   "everyone" or to a room (the IA's wish) are not an operation; a durability-across-restart
+>   test of the token keyspace goes through the store (reopen over the same backend), not a
+>   restarted process; not yet measured under Complement itself.
 
 > **2026-09-26, additive, served for real (RFC 0017).** Ten operations under the `Bridges` tag:
 > `bridge_deployments.target` (`GET /bridge-deployment-target`), `bridge_offerings.list/get/

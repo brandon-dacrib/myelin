@@ -3,6 +3,8 @@ import { afterEach, afterAll } from "vitest";
 import { cleanup } from "@testing-library/react";
 import { server } from "@/mocks/node";
 import { resetBridgeOfferings } from "@/mocks/data/bridge-offerings";
+import { resetRegistrationTokens } from "@/mocks/data/registration-tokens";
+import { resetServerNotices } from "@/mocks/data/server-notices";
 
 /**
  * Give the API client an absolute base URL before anything imports it.
@@ -67,5 +69,8 @@ afterEach(() => {
   server.resetHandlers();
   // The mock's bridge offerings are mutable module state (PUT and DELETE change them).
   resetBridgeOfferings();
+  // So are the registration tokens and the server-notice history.
+  resetRegistrationTokens();
+  resetServerNotices();
 });
 afterAll(() => server.close());
