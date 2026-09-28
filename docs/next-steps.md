@@ -396,7 +396,7 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 | Client-server API | ~75% | 317/384 csapi assertions, 78/106 top-level (run 11); two real Element sessions sign in, create an encrypted room, invite, accept, and read each other's encrypted messages. The number understates the day: four of the fixes behind it were `/sync` silently losing events, which no percentage shows |
 | Storage, rooms, state resolution | ~85% | the engine underneath; 1600+ tests, two backends through one conformance suite, state bake-off done |
 | Configuration and first run | ~90% | database-backed, editable in the UI, one command from nothing to a working server |
-| Admin API | ~97% | 154 of 158 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Bridges 26/26, Media 9/9, Cluster 6/6, Config 6/6, RegistrationTokens 5/5, Server 5/5, Reports 4/4, Statistics 4/4, AuditLog 3/3, Recovery 3/3, Tasks 3/3, ServerNotices 2/2, Setup 2/2, Events 1/1, Rooms 23/23, Users 41/41, Federation 3/7, and Migration 8/8 (2026-09-28: the importer from Synapse, `docs/compat/synapse-migration-runbook.md`) |
+| Admin API | ~100% | 158 of 158 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); none answers 501. By area: Bridges 26/26, Media 9/9, Cluster 6/6, Config 6/6, RegistrationTokens 5/5, Server 5/5, Reports 4/4, Statistics 4/4, AuditLog 3/3, Recovery 3/3, Tasks 3/3, ServerNotices 2/2, Setup 2/2, Events 1/1, Rooms 23/23, Users 41/41, Federation 7/7, and Migration 8/8 (2026-09-28: the importer from Synapse, `docs/compat/synapse-migration-runbook.md`) |
 | Management web interface | ~80% | users (with devices, sign-out and password reset, and suspension, shadow-bans, rate limits, redaction, support sessions and activity), rooms (members, state, timeline, aliases, media, extremities, join, purge and delete), bridges (the catalogue, the wizard with the bridge's own config, the runbook, sign-in guides), federation destinations, media (previews, quarantine, protection, deletion, cache purge), registration tokens and invite links, server notices, configuration (lists, variants and maps as forms, decision 0010), the Cluster page (replicas, the shard map, drain and undrain) and the audit log are real against the real server; the Reports, Tasks and Statistics pages and the Overview sparklines are not built on their (now real) operations |
 | **Federation** | **~30%** | 75/250 assertions, 14/88 top-level (run 7); a user here joins a room hosted elsewhere through the client API, messages flow both ways between two real servers, and the room's history from before the join is fetched as the client scrolls back; the outbound queue survives a restart and is shard-gated; invites, leaves, knocks and restricted joins cross servers; typing, receipts, presence, device lists, cross-signing keys (`m.signing_key_update`) and to-device messages cross in both directions, with EDU metrics; in cluster mode a non-owning replica drops request-born EDUs instead of forwarding them |
 | Bridges | ~75% | heisenbridge works end to end both directions (`docs/bridges/heisenbridge.md`); mautrix-whatsapp, added through the wizard, connects and starts in appservice-mode encryption (`docs/bridges/mautrix.md`); all 26 bridge operations are real; offerings and per-user instances (RFC 0017) run end to end against the real binary with the `elsewhere` runtime, a real heisenbridge reaching `ready` from the rendered files and the interface's flow passing as Playwright against the real server; no mautrix bridge has carried a message yet, because signing in needs a phone; the `cluster` runtime and the operator have not run against Kubernetes |
@@ -764,9 +764,16 @@ edit one is not. New settings and operations arrive with their interface control
      `docs/status/15-admin-api-and-modules.md`). Left: an `e2e-real` run of the page against two
      replicas, the operator draining a pod through the API before evicting it, and the page on
      the real cluster (desktop). Then the long tails of Users (41/41 after 2h and 2i) and Rooms (23/23).
-   - **2g.** Bulk media operations as spawned tasks (`state.tasks.spawn`, cancellable, with
+   - ~~**2g.** Bulk media operations as spawned tasks (`state.tasks.spawn`, cancellable, with
      progress), with the Media page following the task instead of reading the immediate
-     answer. Today they run inline and are recorded as finished tasks.
+     answer.~~ **Done 2026-09-28** (admin follow-ups): both bulk deletions answer `202` with the
+     task running, record progress and stop midway when cancelled; the Media page follows the
+     task (a progress row with Stop) and announces the outcome; tasks are counted on `/metrics`
+     (`hs_admin_tasks_total`, `hs_admin_task_duration_seconds`, `hs_admin_tasks_running`).
+     Tested through the real server in `crates/hs-cli/tests/admin_followups.rs`. Also done
+     there: ~~Federation 3/7~~ **7/7**: `federation.destinations.rooms` and
+     `federation.keys.list/get/refresh` (the key cache, a refresh as a task; a two-server test
+     fetches the other server's key), on the Federation and destination pages.
    - **2h.** Users' long tail, the devices-and-identity half: **done 2026-09-28**
      (`users-devices-identity`). Thirteen operations, each with a control on a user's page:
      `users.devices.get/update/bulk_delete` (rename a device, pick several and sign them out;

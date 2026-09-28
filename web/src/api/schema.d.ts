@@ -757,7 +757,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Refresh cached remote keys (Task) */
+        /**
+         * Refresh cached remote keys (Task)
+         * @description Fetches the server's signing keys again, whatever is cached. The task (action federation.refetch_keys, resource {type server, id server_name}) ends succeeded with the RemoteServerKeys the cache then holds as its result, or failed when the server could not be reached or its answer did not verify.
+         */
         post: operations["federation.keys.refresh"];
         delete?: never;
         options?: never;
@@ -897,7 +900,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Bulk-delete media by age and size (Task) */
+        /**
+         * Bulk-delete media by age and size (Task)
+         * @description Selects the items now (answered 400 for a bad criterion) and answers 202 with the task (action media.delete) still running. The task deletes one item at a time, records its progress (items done of items selected), and ends succeeded with deleted_count, deleted_bytes, skipped_protected, skipped_quarantined and failed in its result. Cancelling it stops it between two items; what it deleted by then stays deleted.
+         */
         post: operations["media.delete_bulk"];
         delete?: never;
         options?: never;
@@ -914,7 +920,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Purge cached remote media (Task) */
+        /**
+         * Purge cached remote media (Task)
+         * @description Runs like media.delete_bulk, as a task with action media.purge_remote_cache.
+         */
         post: operations["media.purge_remote_cache"];
         delete?: never;
         options?: never;
@@ -2725,9 +2734,15 @@ export interface components {
         DestinationPage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["Destination"][];
         };
+        /** @description One room this server shares with a destination (at least one of its users is joined). */
         DestinationRoom: {
-            joined_members_count?: number;
-            room_id?: string;
+            canonical_alias?: string | null;
+            /** @description How many of the joined members are the destination's users. */
+            destination_members_count: number;
+            /** @description Everyone joined to the room, from every server. */
+            joined_members_count: number;
+            name?: string | null;
+            room_id: string;
         };
         DestinationRoomPage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["DestinationRoom"][];
@@ -2997,11 +3012,16 @@ export interface components {
             expires_at?: string | null;
             uses_allowed?: number | null;
         };
+        /** @description What this server's key cache holds for another server. */
         RemoteServerKeys: {
-            /** Format: date-time */
-            cached_at?: string;
-            keys?: components["schemas"]["ServerSigningKey"][];
-            server_name?: string;
+            /**
+             * Format: date-time
+             * @description When a key response from (or about) the server was last accepted.
+             */
+            cached_at?: string | null;
+            /** @description Current keys first, then old ones. */
+            keys: components["schemas"]["ServerSigningKey"][];
+            server_name: string;
         };
         /** @description One replica of the cluster, as the replica answering the request sees it. A server not running as a cluster is a cluster of one (`role` is `single-node`). */
         Replica: {
@@ -3239,11 +3259,17 @@ export interface components {
             items: components["schemas"]["ServerNotice"][];
         };
         ServerSigningKey: {
-            algorithm?: string;
-            key_id?: string;
-            old?: boolean;
-            public_key?: string;
-            /** Format: date-time */
+            algorithm: string;
+            /** @description ed25519:<version>. */
+            key_id: string;
+            /** @description An old key (old_verify_keys), usable only for what was signed before valid_until_at. */
+            old: boolean;
+            /** @description Base64 (standard alphabet, unpadded), as published. */
+            public_key: string;
+            /**
+             * Format: date-time
+             * @description Until when the key may be used (a cached current key's valid_until_ts, an old key's expired_ts); null for this server's own keys, which are valid until rotated.
+             */
             valid_until_at?: string | null;
         };
         Session: {

@@ -10,6 +10,7 @@ import { ForbiddenState } from "@/components/ui/error-state/ErrorState";
 import { QueryProblemState } from "@/components/QueryProblemState";
 import { RelativeTime } from "@/components/RelativeTime";
 import { hasScope } from "@/lib/auth";
+import { OwnKeysPanel } from "./federation/FederationPanels";
 
 function destinationStatus(d: Destination): {
   status: "success" | "warning" | "danger";
@@ -124,6 +125,8 @@ export function FederationPage() {
           />
         </div>
       )}
+
+      <OwnKeysPanel />
     </div>
   );
 }

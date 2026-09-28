@@ -1,12 +1,15 @@
 import { useState } from "react";
 import { Eraser, Trash2 } from "lucide-react";
-import { purgeResult, useBulkDeleteMedia, usePurgeRemoteMediaCache, type Task } from "@/api/media";
+import { useBulkDeleteMedia, usePurgeRemoteMediaCache, type Task } from "@/api/media";
+import { taskIsActive } from "@/api/tasks";
 import { ApiProblemError } from "@/api/problem";
 import { Button } from "@/components/ui/button/Button";
 import { Dialog, DialogClose, DialogContent, DialogTrigger } from "@/components/ui/dialog/Dialog";
 import { Field, Input } from "@/components/ui/input/Input";
 import { toast } from "@/components/ui/toast/toast-store";
 import { formatBytes } from "@/lib/format";
+import { describeTaskAction } from "@/lib/tasks";
+import { announceBulkTask } from "./bulk-tasks";
 
 /** `YYYY-MM-DD`, `days` before today. */
 function daysAgo(days: number): string {
@@ -23,31 +26,21 @@ function readable(date: string): string {
   });
 }
 
-function plural(n: number, one: string, many: string): string {
-  return `${n.toLocaleString()} ${n === 1 ? one : many}`;
-}
-
-/** The toast a finished bulk deletion earns: what went, and what was kept on purpose. */
-function announce(task: Task) {
-  const r = purgeResult(task);
-  const kept = [
-    r.skipped_protected > 0 &&
-      `${plural(r.skipped_protected, "protected item", "protected items")}`,
-    r.skipped_quarantined > 0 &&
-      `${plural(r.skipped_quarantined, "quarantined copy", "quarantined copies")}`,
-  ].filter(Boolean);
-  const notes = [
-    kept.length > 0 && `Kept ${kept.join(" and ")}.`,
-    r.failed.length > 0 && `${plural(r.failed.length, "item", "items")} could not be deleted.`,
-  ].filter(Boolean);
-  toast({
-    title:
-      r.deleted_count === 0
-        ? "Nothing matched"
-        : `Deleted ${plural(r.deleted_count, "item", "items")} (${formatBytes(r.deleted_bytes)})`,
-    description: notes.length > 0 ? notes.join(" ") : undefined,
-    variant: task.status === "failed" ? "danger" : "default",
-  });
+/**
+ * What a started bulk deletion does next: one that has already ended (a server with no task
+ * registry answers it finished) is announced at once; a running one is handed to the page,
+ * which follows it.
+ */
+function started(task: Task, onStarted: (task: Task) => void) {
+  if (taskIsActive(task)) {
+    toast({
+      title: `${describeTaskAction(task.action)} started`,
+      description: "Its progress is shown on this page.",
+    });
+    onStarted(task);
+  } else {
+    announceBulkTask(task);
+  }
 }
 
 function problemToast(title: string) {
@@ -63,7 +56,14 @@ function problemToast(title: string) {
  * "Delete old media": this server's own uploads nobody has fetched since a date, optionally
  * only the large ones. States exactly what it will delete, and what it keeps, before it does.
  */
-export function BulkDeleteDialog({ disabled }: { disabled: boolean }) {
+export function BulkDeleteDialog({
+  disabled,
+  onStarted,
+}: {
+  disabled: boolean;
+  /** Called with the task a deletion that is still running is answered with. */
+  onStarted: (task: Task) => void;
+}) {
   const [open, setOpen] = useState(false);
   const [before, setBefore] = useState(() => daysAgo(90));
   const [minMb, setMinMb] = useState("");
@@ -104,7 +104,7 @@ export function BulkDeleteDialog({ disabled }: { disabled: boolean }) {
                   {
                     onSuccess: (task) => {
                       setOpen(false);
-                      announce(task);
+                      started(task, onStarted);
                     },
                     onError: problemToast("Couldn't delete media"),
                   },
@@ -162,7 +162,14 @@ export function BulkDeleteDialog({ disabled }: { disabled: boolean }) {
  * again from their origin the next time somebody here looks at them, so this frees space rather
  * than removing anything anyone loses.
  */
-export function PurgeRemoteCacheDialog({ disabled }: { disabled: boolean }) {
+export function PurgeRemoteCacheDialog({
+  disabled,
+  onStarted,
+}: {
+  disabled: boolean;
+  /** Called with the task a purge that is still running is answered with. */
+  onStarted: (task: Task) => void;
+}) {
   const [open, setOpen] = useState(false);
   const [before, setBefore] = useState(() => daysAgo(30));
   const [serverName, setServerName] = useState("");
@@ -202,7 +209,7 @@ export function PurgeRemoteCacheDialog({ disabled }: { disabled: boolean }) {
                   {
                     onSuccess: (task) => {
                       setOpen(false);
-                      announce(task);
+                      started(task, onStarted);
                     },
                     onError: problemToast("Couldn't purge the cache"),
                   },

@@ -11,6 +11,7 @@ import { CopyableId } from "@/components/CopyableId";
 import { RelativeTime } from "@/components/RelativeTime";
 import { toast } from "@/components/ui/toast/toast-store";
 import { hasScope } from "@/lib/auth";
+import { DestinationRoomsPanel, RemoteKeysPanel } from "./federation/FederationPanels";
 
 /** `/federation/:serverName` — flows.md flow 4 step 3. */
 export function FederationDestinationPage() {
@@ -110,6 +111,9 @@ export function FederationDestinationPage() {
         <Fact label="Pending PDUs" value={String(destination.pending_pdu_count ?? 0)} />
         <Fact label="Pending EDUs" value={String(destination.pending_edu_count ?? 0)} />
       </dl>
+
+      <DestinationRoomsPanel serverName={destination.server_name ?? serverName} />
+      <RemoteKeysPanel serverName={destination.server_name ?? serverName} />
     </div>
   );
 }

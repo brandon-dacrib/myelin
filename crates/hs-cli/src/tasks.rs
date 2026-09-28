@@ -5,12 +5,112 @@
 //! [`hs_admin::tasks::TaskRecord`]. Listing reads them all and the registry sorts them: there are
 //! few (long-running admin work is rare, and finished tasks are pruned after thirty days by
 //! `TaskRegistry::recover_interrupted` at startup), so an index would cost more than it saves.
+//!
+//! [`TaskMetrics`] counts tasks into the shared Prometheus registry:
+//! `hs_admin_tasks_total{action,status}` (each task that ended here, by how),
+//! `hs_admin_task_duration_seconds{action}` (from start to end) and `hs_admin_tasks_running` (how
+//! many this process is running now).
 
 use async_trait::async_trait;
 use hs_admin::sources::SourceError;
 use hs_admin::tasks::{TaskRecord, TaskStore};
 use hs_kv::{KvBackend, RangeSpec, TransactConfig, transact};
 use hs_tables::keyspace::TypedKeyspace;
+use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
+
+/// The task metric families (see the module docs), fed by the registry as a
+/// [`hs_admin::tasks::TaskObserver`].
+#[derive(Clone)]
+pub struct TaskMetrics {
+    ended: Family<EndedLabels, Counter>,
+    duration: Family<ActionLabels, Histogram>,
+    running: Gauge,
+}
+
+/// The labels of `hs_admin_tasks_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+struct EndedLabels {
+    action: String,
+    status: String,
+}
+
+/// The label of `hs_admin_task_duration_seconds`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+struct ActionLabels {
+    action: String,
+}
+
+impl TaskMetrics {
+    /// Registers the families into `metrics`'s shared registry.
+    #[must_use]
+    pub fn register(metrics: &hs_telemetry::metrics::Metrics) -> Self {
+        let ended = Family::<EndedLabels, Counter>::default();
+        // From a tenth of a second (a small purge) to about a day (a large backlog replay).
+        let duration = Family::<ActionLabels, Histogram>::new_with_constructor(|| {
+            Histogram::new(exponential_buckets(0.1, 2.0, 20))
+        });
+        let running = Gauge::default();
+        metrics.with_registry(|registry| {
+            // Registered without `_total`: the text encoder appends it.
+            registry.register(
+                "hs_admin_tasks",
+                "Admin tasks that ended in this process, by action and status: succeeded, \
+                 failed or cancelled",
+                ended.clone(),
+            );
+            registry.register(
+                "hs_admin_task_duration_seconds",
+                "How long an admin task ran, from start to end, by action",
+                duration.clone(),
+            );
+            registry.register(
+                "hs_admin_tasks_running",
+                "Admin tasks this process is running now",
+                running.clone(),
+            );
+        });
+        Self {
+            ended,
+            duration,
+            running,
+        }
+    }
+}
+
+impl hs_admin::tasks::TaskObserver for TaskMetrics {
+    fn changed(&self, task: &hs_admin::model::Task, running_here: usize) {
+        self.running
+            .set(i64::try_from(running_here).unwrap_or(i64::MAX));
+        if !hs_admin::tasks::is_terminal(task.status) {
+            return;
+        }
+        let status = serde_json::to_value(task.status)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        self.ended
+            .get_or_create(&EndedLabels {
+                action: task.action.clone(),
+                status,
+            })
+            .inc();
+        let parse = |t: &Option<String>| {
+            t.as_deref()
+                .and_then(|t| hs_http::time::parse_rfc3339(t).ok())
+        };
+        if let (Some(started), Some(finished)) = (parse(&task.started_at), parse(&task.finished_at))
+        {
+            self.duration
+                .get_or_create(&ActionLabels {
+                    action: task.action.clone(),
+                })
+                .observe((finished - started).as_seconds_f64().max(0.0));
+        }
+    }
+}
 
 /// A durable task store over any `hs-kv` backend.
 pub struct TablesTaskStore<B: KvBackend> {

@@ -68,7 +68,8 @@ export function useMediaItem(item: Pick<MediaItem, "server_name" | "media_id"> |
   });
 }
 
-function invalidateMedia(qc: ReturnType<typeof useQueryClient>) {
+/** Refetches every media query (the list, one item, the statistics built on them). */
+export function invalidateMedia(qc: ReturnType<typeof useQueryClient>) {
   qc.invalidateQueries({ queryKey: ["media"] });
   qc.invalidateQueries({ queryKey: ["media-item"] });
 }
@@ -129,7 +130,10 @@ export function purgeResult(task: Task): PurgeResult {
   };
 }
 
-/** `POST /media/delete`: this server's uploads unused since `before`. */
+/**
+ * `POST /media/delete`: this server's uploads unused since `before`. Answered with the task that
+ * does it, normally still `running`: follow it with `useTask` (`./tasks`).
+ */
 export function useBulkDeleteMedia() {
   const qc = useQueryClient();
   return useMutation({
@@ -140,11 +144,18 @@ export function useBulkDeleteMedia() {
       });
       return unwrap(result);
     },
-    onSuccess: () => invalidateMedia(qc),
+    onSuccess: (task) => {
+      qc.setQueryData(["task", task.id], task);
+      void qc.invalidateQueries({ queryKey: ["tasks"] });
+      invalidateMedia(qc);
+    },
   });
 }
 
-/** `POST /media/purge-remote-cache`: cached copies of other servers' media unused since `before`. */
+/**
+ * `POST /media/purge-remote-cache`: cached copies of other servers' media unused since `before`.
+ * Answered with the task that does it, like {@link useBulkDeleteMedia}.
+ */
 export function usePurgeRemoteMediaCache() {
   const qc = useQueryClient();
   return useMutation({
@@ -155,7 +166,11 @@ export function usePurgeRemoteMediaCache() {
       });
       return unwrap(result);
     },
-    onSuccess: () => invalidateMedia(qc),
+    onSuccess: (task) => {
+      qc.setQueryData(["task", task.id], task);
+      void qc.invalidateQueries({ queryKey: ["tasks"] });
+      invalidateMedia(qc);
+    },
   });
 }
 

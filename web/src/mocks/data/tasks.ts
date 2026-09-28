@@ -128,7 +128,7 @@ export function resetTasks(): void {
 }
 
 /**
- * Records a task that has already ended, as the server does for a bulk media deletion
+ * Records a task that has already ended, as the server does for an appservice replay
  * (`TaskRegistry::record_finished`), so the `Location` it answered with leads somewhere.
  */
 export function recordFinishedTask(

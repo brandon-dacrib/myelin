@@ -2,7 +2,7 @@
 
 Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-admin`, `hs-modules`, `hs-identity`, `hs-http` (shared with 07 and 14).
 
-Last updated: 2026-09-28 (`GET /` redirects to the interface; Users moderation and activity, 14 operations, Users 41/41; the Rooms area, 23/23; Users' devices-and-identity half; and the Cluster area, 6/6; all below); before that 2026-09-27 (media, registration tokens and server notices, reports, tasks and statistics, below; before that the bridge
+Last updated: 2026-09-28 (the admin API follow-ups: bulk media tasks, Federation 7/7, reports by person; `GET /` redirects to the interface; Users moderation and activity, 14 operations, Users 41/41; the Rooms area, 23/23; Users' devices-and-identity half; and the Cluster area, 6/6; all below); before that 2026-09-27 (media, registration tokens and server notices, reports, tasks and statistics, below; before that the bridge
 offering operations); before that 2026-09-26 (three public recovery operations); 2026-09-25 (additive schema change for the bridges wizard); the session log that follows is from 2026-09-19 (session 6).
 
 > **2026-09-28, Users: moderation and activity, 14 operations** (branch
@@ -163,6 +163,43 @@ offering operations); before that 2026-09-26 (three public recovery operations);
 > `docs/next-steps.md`, and fixes other agents flagged). Tested through the real server in
 > `crates/hs-cli/tests/admin_followups.rs` (`spawn_serve`, the code `hs serve` runs).
 >
+> - **Bulk media deletions are spawned tasks (2g).** `media.delete_bulk` and
+>   `media.purge_remote_cache` select their items in the request (a bad criterion is still a
+>   `400`), audit the request as the `202` it is answered with (with what was selected), publish
+>   `media.deletion_started`, and answer the task `running`. The deletion runs under
+>   `TaskRegistry::spawn` (`media::BulkDeletion`): progress (items done of selected) at most
+>   every 250 ms, each a `task.changed` event; `succeeded` with the counts in `result` and a
+>   `media.deleted` event, or `failed` when not one item could be deleted; cancelling stops it
+>   between two items and what was deleted stays deleted. `AdminState::media_bulk_pause` paces
+>   it (zero in `hs serve`; `ServeOptions::media_bulk_pause` lets a test cancel midway). With no
+>   task registry it still runs inside the request. Logs: started, finished, stopped by a
+>   cancel; `a task was cancelled` from the registry.
+> - **Task metrics.** `TaskRegistry::attach_observer` takes a `TaskObserver` told about every
+>   change; `hs-cli`'s `tasks::TaskMetrics` exports `hs_admin_tasks_total{action,status}`,
+>   `hs_admin_task_duration_seconds{action}` and `hs_admin_tasks_running`.
+> - **Federation 7/7.** `federation.destinations.rooms` (`crate::federation`, composed from the
+>   room directory: every room with a joined member of the destination, with the room's joined
+>   count and the destination's; `404` for a server never reached that shares nothing) and
+>   `federation.keys.list` (this server's own keys), `.get` (what the key cache holds for a
+>   server, current and old, and when it was fetched; `404` when nothing) and `.refresh` (a
+>   `federation.refetch_keys` task, resource `{type: server, id}`: fetches again whatever is
+>   cached, ends with the cache's keys as `result` or failed with why; audited, published as
+>   `federation.keys_refresh_started` and `federation.keys_refreshed`). `FederationSource`
+>   gained `own_keys`, `remote_keys` and `refresh_remote_keys` (default: unavailable);
+>   `hs_federation::admin_source::DestinationStoreSource::with_keys` serves them over
+>   `OwnSigningKeys` and the `RemoteKeyCache` `X-Matrix` verification reads, which gained
+>   `cached_keys`, `refetch` and a fetched-at record (track 06's crate, edited with the work).
+>   Contract (additive): `DestinationRoom` gained `name`, `canonical_alias`,
+>   `destination_members_count` and a `required` list; `ServerSigningKey` and
+>   `RemoteServerKeys` gained descriptions and `required`, `cached_at` is nullable; the bulk
+>   operations and the refresh describe their tasks. `tools/admin_api_coverage.py`: **106 of
+>   158**.
+> - **Verified through the real server** (`crates/hs-cli/tests/admin_followups.rs`, 3 tests):
+>   a bulk deletion of 24 uploads reporting progress on the event stream and cancelled midway
+>   (the rest stay; a second run deletes them; both audited as `202`; the task counters on
+>   `/metrics`); two servers, where A's refresh fetches B's key as B lists it, an unreachable
+>   server's refresh fails, and after Bob on B joins Alice's room on A, A lists that room as
+>   shared with B.
 > - **Small fixes.** `registration_tokens.create`, `server_notices.send`, `users.create` and
 >   `appservices.create` record `outcome.status` 201 in the audit log, the status they answer
 >   (`router::record_mutation_with_status`; the old helper still records 200 for everything else).
@@ -243,8 +280,7 @@ offering operations); before that 2026-09-26 (three public recovery operations);
 >   `postgres://postgres:hspg@127.0.0.1:5439/postgres`; the command is in the file's docs).
 > - **Left**: a drain started by `SIGTERM` still deregisters and stops (that is shutdown); the
 >   operator (track 12) does not yet drain a pod through the API before evicting it;
->   `cluster.get`'s `replica_count` counts owning replicas, so a drained replica is not in it
->   (the Cluster page counts from the replica list); the two-pod run on the real cluster is a
+>   the two-pod run on the real cluster is a
 >   desktop item (`docs/status/03-cluster.md`).
 
 > **2026-09-27, served for real: RegistrationTokens 5/5 and ServerNotices 2/2.**

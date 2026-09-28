@@ -10,12 +10,17 @@
 //!
 //! # The bulk deletions
 //!
-//! Both are declared as Tasks (RFC 0004 section 3.7) and answer `202` with one. They run to
-//! completion inside the request -- a deletion is a metadata transaction and an object-store
-//! delete per item -- so the Task comes back already `succeeded`, with what was deleted in its
-//! `result`. There is no task store yet (the Tasks area is its own item), so `GET
-//! /tasks/{id}` cannot look it up afterwards; the audit log and the `media.deleted` and
-//! `task.succeeded` events are the durable record.
+//! Both are Tasks (RFC 0004 section 3.7). The request selects the items (so a bad criterion is
+//! a `400` and the selection is known), records the request in the audit log
+//! (`media.delete_bulk` / `media.purge_remote_cache`, with what was selected) and publishes
+//! `media.deletion_started`, then answers `202` with the task `running` and a `Location` naming
+//! it. The deletion itself runs as a spawned task ([`crate::tasks::TaskRegistry::spawn`]): it
+//! records its progress (items done of items selected) at most every 250 ms, each record a
+//! `task.changed` event, and ends `succeeded` with what was deleted in its `result` (and a
+//! `media.deleted` event with the same counts), or `failed` when not one item could be deleted.
+//! Cancelling the task (`POST /tasks/{id}/cancel`) stops it between two items; what was deleted
+//! by then stays deleted. [`AdminState::media_bulk_pause`] paces it. A state with no task
+//! registry runs the deletion inside the request and answers the task already finished.
 //!
 //! "Before" means *unused since*: an item's last access if it has been served, its creation
 //! otherwise (Synapse's `last_access_ts` semantics). Protected items are never selected. Cached
@@ -24,6 +29,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::extract::{Path, Query, State};
@@ -41,9 +47,10 @@ use crate::model::{
 };
 use crate::router::{
     AdminState, authorization_header, idempotency_key, parse_optional_json, record_mutation,
-    replay_response, source_unavailable,
+    record_mutation_with_status, replay_response, source_unavailable,
 };
 use crate::sources::SourceError;
+use crate::tasks::TaskContext;
 
 /// The OpenAPI `MediaItem` schema: one piece of content this server holds, uploaded here
 /// (`origin: local`) or a cached copy of another server's (`origin: remote`).
@@ -439,91 +446,70 @@ impl PurgeRun<'_> {
             Ok(items) => items,
             Err(e) => return e.to_problem().with_instance(instance).into_response(),
         };
-        let mut task = Task::scheduled(task_action, None, principal.to_actor());
-        task.started_at = Some(hs_http::time::now_rfc3339());
         let selection = select_for_purge(items, &criteria);
-        let mut deleted_count = 0u64;
-        let mut deleted_bytes = 0u64;
-        let mut failed = Vec::new();
-        for item in &selection.selected {
-            match media.delete(&item.server_name, &item.media_id).await {
-                Ok(gone) => {
-                    deleted_count += 1;
-                    deleted_bytes += gone.size_bytes;
-                }
-                // Deleted by someone else in the meantime: what was asked for is true.
-                Err(SourceError::NotFound) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        media_id = %item.media_id,
-                        "bulk media deletion: could not delete an item"
-                    );
-                    failed.push(format!("mxc://{}/{}", item.server_name, item.media_id));
-                }
-            }
-        }
-        let total = selection.selected.len() as u64;
-        task.status = if failed.is_empty() || deleted_count > 0 {
-            TaskStatus::Succeeded
-        } else {
-            TaskStatus::Failed
+        let selected = selection.selected.len() as u64;
+        let actor = principal.to_actor();
+        let deletion = BulkDeletion {
+            action: task_action.to_owned(),
+            media,
+            selected: selection.selected,
+            pause: state.media_bulk_pause,
+            events: Arc::clone(&state.events),
+            actor: actor.clone(),
+            skipped_protected: selection.skipped_protected,
+            skipped_quarantined: selection.skipped_quarantined,
         };
-        task.progress = Some(TaskProgress {
-            current: total,
-            total: Some(total),
-            unit: Some("items".to_owned()),
-            message: None,
-        });
-        task.result = Some(json!({
-            "deleted_count": deleted_count,
-            "deleted_bytes": deleted_bytes,
-            "skipped_protected": selection.skipped_protected,
-            "skipped_quarantined": selection.skipped_quarantined,
-            "failed": failed,
-        }));
-        if task.status == TaskStatus::Failed {
-            task.error = Some(Problem::unavailable().with_detail(format!(
-                "none of the {total} selected items could be deleted"
-            )));
-        }
-        task.finished_at = Some(hs_http::time::now_rfc3339());
+        let task = match &state.tasks {
+            Some(tasks) => match tasks
+                .spawn(task_action, None, actor.clone(), move |context| {
+                    deletion.run(Some(context))
+                })
+                .await
+            {
+                Ok(task) => task,
+                Err(e) => return e.to_problem().with_instance(instance).into_response(),
+            },
+            // No task registry (a test or tool that wires none): the deletion runs inside the
+            // request and the task comes back already finished.
+            None => deletion.run_inline(task_action).await,
+        };
+        tracing::info!(
+            task = %task.id,
+            action = task_action,
+            selected,
+            skipped_protected = selection.skipped_protected,
+            skipped_quarantined = selection.skipped_quarantined,
+            "bulk media deletion started"
+        );
 
         let target = ResourceRef::new("task", task.id.clone());
-        if let Err(resp) = record_mutation(
+        if let Err(resp) = record_mutation_with_status(
             state,
             &principal,
             operation_id,
-            "media.deleted",
-            target.clone(),
+            "media.deletion_started",
+            target,
             Vec::new(),
             json!({
-                "count": deleted_count,
-                "bytes": deleted_bytes,
+                "task_id": task.id,
+                "selected": selected,
+                "skipped_protected": selection.skipped_protected,
+                "skipped_quarantined": selection.skipped_quarantined,
                 "server_name": criteria.server_name,
                 "before": hs_http::time::format_rfc3339(criteria.unused_since),
+                "min_size_bytes": criteria.min_size_bytes,
             }),
+            StatusCode::ACCEPTED.as_u16(),
         )
         .await
         {
+            // Nothing goes on unaudited: stop the deletion where it has got to.
+            if let Some(tasks) = &state.tasks
+                && let Err(error) = tasks.cancel(&task.id).await
+            {
+                tracing::error!(%error, task = %task.id, "could not stop an unaudited bulk media deletion");
+            }
             return resp;
-        }
-        let task_event = if task.status == TaskStatus::Succeeded {
-            "task.succeeded"
-        } else {
-            "task.failed"
-        };
-        state.events.publish(
-            Event::new(task_event, serde_json::to_value(&task).unwrap_or_default())
-                .with_resource(target)
-                .with_actor(principal.to_actor()),
-        );
-        // The answer's `Location` names this task, so it goes where `tasks.get` looks. The
-        // deletions have happened either way, so a store failure is logged, not answered.
-        if let Some(tasks) = &state.tasks
-            && let Err(error) = tasks.record_finished(task.clone()).await
-        {
-            tracing::warn!(%error, task = %task.id, "bulk media deletion: could not record its task");
         }
 
         let body = serde_json::to_vec(&task).unwrap_or_default();
@@ -554,6 +540,140 @@ impl PurgeRun<'_> {
             body,
         )
             .into_response()
+    }
+}
+
+/// How often, at most, a running bulk deletion records its progress on its task (each record
+/// is a store write and a `task.changed` event).
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+
+/// A bulk deletion's work, once its items are selected: what [`TaskRegistry::spawn`] runs.
+///
+/// [`TaskRegistry::spawn`]: crate::tasks::TaskRegistry::spawn
+struct BulkDeletion {
+    /// The task's action, for the logs.
+    action: String,
+    media: Arc<dyn MediaSource>,
+    selected: Vec<AdminMediaItem>,
+    pause: Duration,
+    events: Arc<crate::events::EventBus>,
+    actor: crate::model::Actor,
+    skipped_protected: u64,
+    skipped_quarantined: u64,
+}
+
+impl BulkDeletion {
+    /// Deletes the selected items one at a time, recording progress on `context`'s task at most
+    /// every [`PROGRESS_INTERVAL`], and answers the task's `result`. An item that cannot be
+    /// deleted is counted and the rest carry on: a purge that stops at the first stubborn
+    /// object would leave everything after it. Cancelling the task stops it between items
+    /// (or during the pause after one); what was deleted by then stays deleted.
+    // The shape `TaskRegistry::spawn` runs: its problem becomes the task's `error`.
+    #[allow(clippy::result_large_err)]
+    async fn run(self, context: Option<TaskContext>) -> Result<serde_json::Value, Problem> {
+        let total = self.selected.len() as u64;
+        let mut deleted_count = 0u64;
+        let mut deleted_bytes = 0u64;
+        let mut failed = Vec::new();
+        let mut last_report = Instant::now();
+        if let Some(context) = &context {
+            context.progress(0, Some(total), Some("items"), None).await;
+        }
+        for (done, item) in (1u64..).zip(&self.selected) {
+            if context.as_ref().is_some_and(TaskContext::is_cancelled) {
+                break;
+            }
+            match self.media.delete(&item.server_name, &item.media_id).await {
+                Ok(gone) => {
+                    deleted_count += 1;
+                    deleted_bytes += gone.size_bytes;
+                }
+                // Deleted by someone else in the meantime: what was asked for is true.
+                Err(SourceError::NotFound) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        media_id = %item.media_id,
+                        "bulk media deletion: could not delete an item"
+                    );
+                    failed.push(format!("mxc://{}/{}", item.server_name, item.media_id));
+                }
+            }
+            if !self.pause.is_zero() {
+                tokio::time::sleep(self.pause).await;
+            }
+            if let Some(context) = &context
+                && (last_report.elapsed() >= PROGRESS_INTERVAL || done == total)
+            {
+                let message = format!("{deleted_count} deleted, {deleted_bytes} bytes freed");
+                context
+                    .progress(done, Some(total), Some("items"), Some(&message))
+                    .await;
+                last_report = Instant::now();
+            }
+        }
+        if context.as_ref().is_some_and(TaskContext::is_cancelled) {
+            tracing::info!(
+                action = %self.action,
+                task = context.as_ref().map(TaskContext::id),
+                deleted_count,
+                deleted_bytes,
+                "bulk media deletion stopped: its task was cancelled"
+            );
+        } else {
+            tracing::info!(
+                action = %self.action,
+                task = context.as_ref().map(TaskContext::id),
+                deleted_count,
+                deleted_bytes,
+                failed = failed.len(),
+                "bulk media deletion finished"
+            );
+        }
+        let result = json!({
+            "deleted_count": deleted_count,
+            "deleted_bytes": deleted_bytes,
+            "skipped_protected": self.skipped_protected,
+            "skipped_quarantined": self.skipped_quarantined,
+            "failed": failed,
+        });
+        let mut event = Event::new("media.deleted", result.clone()).with_actor(self.actor);
+        if let Some(context) = &context {
+            event = event.with_resource(ResourceRef::new("task", context.id().to_owned()));
+        }
+        self.events.publish(event);
+        if deleted_count == 0 && !failed.is_empty() {
+            return Err(Problem::unavailable().with_detail(format!(
+                "none of the {total} selected items could be deleted"
+            )));
+        }
+        Ok(result)
+    }
+
+    /// [`BulkDeletion::run`] inside the request, for a state with no task registry: the task
+    /// answered is already finished.
+    async fn run_inline(self, action: &str) -> Task {
+        let mut task = Task::scheduled(action, None, self.actor.clone());
+        task.started_at = Some(hs_http::time::now_rfc3339());
+        let total = self.selected.len() as u64;
+        match self.run(None).await {
+            Ok(result) => {
+                task.status = TaskStatus::Succeeded;
+                task.result = Some(result);
+            }
+            Err(problem) => {
+                task.status = TaskStatus::Failed;
+                task.error = Some(problem);
+            }
+        }
+        task.progress = Some(TaskProgress {
+            current: total,
+            total: Some(total),
+            unit: Some("items".to_owned()),
+            message: None,
+        });
+        task.finished_at = Some(hs_http::time::now_rfc3339());
+        task
     }
 }
 
@@ -1067,6 +1187,16 @@ mod tests {
     }
 
     fn harness(media: Option<InMemoryMediaSource>) -> Harness {
+        harness_with(media, true, Duration::ZERO)
+    }
+
+    /// [`harness`] with or without a task registry, and with a pause after each item a bulk
+    /// deletion deletes.
+    fn harness_with(
+        media: Option<InMemoryMediaSource>,
+        with_tasks: bool,
+        pause: Duration,
+    ) -> Harness {
         let verifier = StaticVerifier::new()
             .with_token(
                 "admin-token",
@@ -1085,9 +1215,26 @@ mod tests {
         if let Some(media) = media {
             state = state.with_media(Arc::new(media));
         }
-        let state = state.with_tasks(crate::tasks::TaskRegistry::in_memory());
+        if with_tasks {
+            state = state.with_tasks(crate::tasks::TaskRegistry::in_memory());
+        }
+        let state = state.with_media_bulk_pause(pause);
         let (router, _manifest) = build_router(state);
         Harness { router, events }
+    }
+
+    /// The task `task` names, once it has ended (polled; panics after five seconds).
+    async fn settled(h: &Harness, task: &serde_json::Value) -> serde_json::Value {
+        let uri = format!("/api/v1/tasks/{}", task["id"].as_str().unwrap());
+        for _ in 0..500 {
+            let (status, _, fetched) = call(h, "admin-token", "GET", &uri, None, &[]).await;
+            assert_eq!(status, StatusCode::OK, "{fetched}");
+            if !matches!(fetched["status"].as_str(), Some("running" | "scheduled")) {
+                return fetched;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("task {uri} did not end within five seconds");
     }
 
     async fn call(
@@ -1490,20 +1637,39 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED, "{task}");
-        assert_eq!(task["status"], "succeeded");
+        assert_eq!(
+            task["status"], "running",
+            "answered before the deletion ends"
+        );
         assert_eq!(task["action"], "media.delete");
         assert_eq!(
             headers.get("location").unwrap(),
             &format!("/api/v1/tasks/{}", task["id"].as_str().unwrap())
         );
+        let task = settled(&h, &task).await;
+        assert_eq!(task["status"], "succeeded", "{task}");
         // `old` only: `old_but_used` was served in September, `new` is new, `protected` is
         // protected, and the remote copies are not this server's uploads.
         assert_eq!(task["result"]["deleted_count"], 1);
         assert_eq!(task["result"]["deleted_bytes"], 100);
         assert_eq!(task["result"]["skipped_protected"], 1);
-        assert_eq!(rx.recv().await.unwrap().r#type, "media.deleted");
-        assert_eq!(rx.recv().await.unwrap().r#type, "task.succeeded");
-        assert_eq!(audit(&h, "media.delete_bulk").await.len(), 1);
+        assert_eq!(task["progress"]["current"], 1);
+        assert_eq!(task["progress"]["total"], 1);
+        let mut types = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            types.push(event.r#type);
+        }
+        assert_eq!(types.first().map(String::as_str), Some("task.changed"));
+        assert!(
+            types.contains(&"media.deletion_started".to_owned()),
+            "{types:?}"
+        );
+        let deleted = types.iter().position(|t| t == "media.deleted").unwrap();
+        assert_eq!(types.last().map(String::as_str), Some("task.changed"));
+        assert!(deleted < types.len() - 1, "{types:?}");
+        let entries = audit(&h, "media.delete_bulk").await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].outcome.status, 202);
         // The `Location` answers: the finished task is in the registry the Tasks page reads.
         let (status, _, fetched) = call(
             &h,
@@ -1536,6 +1702,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
+        let task = settled(&h, &task).await;
         assert_eq!(
             task["result"]["deleted_count"], 1,
             "only `new` is 150 or more"
@@ -1579,6 +1746,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::ACCEPTED, "{task}");
         assert_eq!(task["action"], "media.purge_remote_cache");
+        let task = settled(&h, &task).await;
         assert_eq!(task["result"]["deleted_count"], 1);
         assert_eq!(task["result"]["skipped_quarantined"], 1);
 
@@ -1593,6 +1761,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
+        let task = settled(&h, &task).await;
         assert_eq!(task["result"]["deleted_count"], 1, "other.org's copy");
         let (_, _, page) = call(
             &h,
@@ -1619,5 +1788,80 @@ mod tests {
             "local untouched"
         );
         assert_eq!(audit(&h, "media.purge_remote_cache").await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_bulk_deletion_cancelled_midway_stops_there() {
+        let mut media = InMemoryMediaSource::new();
+        for n in 0..20 {
+            media = media.with_item(item(
+                "example.org",
+                &format!("m{n:02}"),
+                "2026-01-01T00:00:00.000Z",
+                10,
+            ));
+        }
+        let h = harness_with(Some(media), true, Duration::from_millis(40));
+        let (status, _, task) = call(
+            &h,
+            "admin-token",
+            "POST",
+            "/api/v1/media/delete",
+            Some(json!({"before": "2026-06-01T00:00:00Z"})),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+        let uri = format!("/api/v1/tasks/{}", task["id"].as_str().unwrap());
+        // Wait for some progress, then cancel.
+        let mut progressed = false;
+        for _ in 0..200 {
+            let (_, _, fetched) = call(&h, "admin-token", "GET", &uri, None, &[]).await;
+            if fetched["progress"]["current"].as_u64().unwrap_or(0) >= 1 {
+                assert_eq!(fetched["progress"]["total"], 20, "{fetched}");
+                progressed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(progressed, "the deletion reports progress while it runs");
+        let (status, _, cancelled) = call(
+            &h,
+            "admin-token",
+            "POST",
+            &format!("{uri}/cancel"),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{cancelled}");
+        assert_eq!(cancelled["status"], "cancelled");
+        let remaining = |page: &serde_json::Value| page["items"].as_array().unwrap().len();
+        let (_, _, page) = call(&h, "admin-token", "GET", "/api/v1/media", None, &[]).await;
+        let left = remaining(&page);
+        assert!(left > 0 && left < 20, "stopped midway: {left} left");
+        // It stays stopped, and stays cancelled.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (_, _, page) = call(&h, "admin-token", "GET", "/api/v1/media", None, &[]).await;
+        assert_eq!(remaining(&page), left);
+        let (_, _, fetched) = call(&h, "admin-token", "GET", &uri, None, &[]).await;
+        assert_eq!(fetched["status"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn without_a_task_registry_the_deletion_runs_in_the_request() {
+        let h = harness_with(Some(source()), false, Duration::ZERO);
+        let (status, _, task) = call(
+            &h,
+            "admin-token",
+            "POST",
+            "/api/v1/media/delete",
+            Some(json!({"before": "2026-06-01T00:00:00Z"})),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+        assert_eq!(task["status"], "succeeded");
+        assert_eq!(task["result"]["deleted_count"], 1);
     }
 }

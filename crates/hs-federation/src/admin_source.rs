@@ -13,15 +13,22 @@
 //! knows; and a reset clears both. Without a sender the pending counts are zero, which is then
 //! the truth: nothing is queued anywhere. EDUs are never sent yet (see `crate::sender`), so the
 //! pending EDU count is always zero.
+//!
+//! With [`DestinationStoreSource::with_keys`] it also serves the `federation.keys.*`
+//! operations: this server's own signing keys ([`crate::keys::OwnSigningKeys`]) and what the
+//! key cache ([`crate::keys::RemoteKeyCache`], the one `X-Matrix` verification reads) holds for
+//! another server, which a refresh fetches again.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use hs_admin::federation::{AdminRemoteServerKeys, AdminSigningKey};
 use hs_admin::model::AdminDestination;
 use hs_admin::sources::{FederationSource, SourceError};
 
 use crate::destination_store::{DestinationState, DestinationStore};
+use crate::keys::{CachedServerKeys, DynRemoteKeyCache, OwnSigningKeys};
 use crate::outbound_store::OutboundDestinationState;
 use crate::sender::FederationSender;
 
@@ -29,6 +36,7 @@ use crate::sender::FederationSender;
 pub struct DestinationStoreSource {
     destinations: Arc<dyn DestinationStore>,
     sender: Option<Arc<FederationSender>>,
+    keys: Option<(Arc<OwnSigningKeys>, Arc<DynRemoteKeyCache>)>,
 }
 
 impl DestinationStoreSource {
@@ -37,7 +45,22 @@ impl DestinationStoreSource {
         Self {
             destinations,
             sender: None,
+            keys: None,
         }
+    }
+
+    /// Serves `own` and `cache` for the `federation.keys.*` operations (see the module docs).
+    #[must_use]
+    pub fn with_keys(mut self, own: Arc<OwnSigningKeys>, cache: Arc<DynRemoteKeyCache>) -> Self {
+        self.keys = Some((own, cache));
+        self
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn keys(&self) -> Result<&(Arc<OwnSigningKeys>, Arc<DynRemoteKeyCache>), SourceError> {
+        self.keys.as_ref().ok_or_else(|| {
+            SourceError::Unavailable("the signing keys are not wired into this source".to_owned())
+        })
     }
 
     /// Reports `sender`'s per-destination pending PDU counts alongside the backoff records. A
@@ -158,8 +181,67 @@ fn view(
     }
 }
 
+/// The admin view of what the cache holds for one server.
+fn remote_view(cached: CachedServerKeys) -> AdminRemoteServerKeys {
+    AdminRemoteServerKeys {
+        server_name: cached.server_name,
+        keys: cached
+            .keys
+            .into_iter()
+            .map(|key| AdminSigningKey {
+                algorithm: key
+                    .key_id
+                    .split_once(':')
+                    .map_or_else(|| key.key_id.clone(), |(algorithm, _)| algorithm.to_owned()),
+                key_id: key.key_id,
+                public_key: key.public_key,
+                valid_until_at: rfc3339(Some(key.valid_until_ts)),
+                old: key.old,
+            })
+            .collect(),
+        cached_at: rfc3339(cached.fetched_at_ms),
+    }
+}
+
 #[async_trait]
 impl FederationSource for DestinationStoreSource {
+    async fn own_keys(&self) -> Result<Vec<AdminSigningKey>, SourceError> {
+        let (own, _) = self.keys()?;
+        let mut keys: Vec<AdminSigningKey> = own
+            .all()
+            .iter()
+            .map(|key| AdminSigningKey {
+                key_id: key.key_id(),
+                algorithm: hs_model::signing::ALGORITHM.to_owned(),
+                public_key: key.verifying_key_base64(),
+                valid_until_at: None,
+                old: false,
+            })
+            .collect();
+        keys.sort_by(|a, b| a.key_id.cmp(&b.key_id));
+        Ok(keys)
+    }
+
+    async fn remote_keys(
+        &self,
+        server_name: &str,
+    ) -> Result<Option<AdminRemoteServerKeys>, SourceError> {
+        let (_, cache) = self.keys()?;
+        Ok(cache.cached_keys(server_name).map(remote_view))
+    }
+
+    async fn refresh_remote_keys(
+        &self,
+        server_name: &str,
+    ) -> Result<AdminRemoteServerKeys, SourceError> {
+        let (_, cache) = self.keys()?;
+        cache
+            .refetch(server_name)
+            .await
+            .map(remote_view)
+            .map_err(|error| SourceError::Unavailable(error.to_string()))
+    }
+
     async fn list_destinations(&self) -> Result<Vec<AdminDestination>, SourceError> {
         Ok(self.all().await)
     }

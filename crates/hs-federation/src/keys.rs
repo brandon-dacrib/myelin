@@ -339,6 +339,34 @@ pub struct RemoteKeyCache<F: KeyServerFetcher> {
     current: std::sync::Mutex<HashMap<(String, String), CachedCurrent>>,
     old: std::sync::Mutex<HashMap<(String, String), CachedOld>>,
     in_flight: std::sync::Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    /// When a response was last accepted for each server (ms since the epoch), for the admin
+    /// API's view of the cache.
+    fetched_at: std::sync::Mutex<HashMap<String, u64>>,
+}
+
+/// One key [`RemoteKeyCache`] holds for a server, as the admin API shows it
+/// (`federation.keys.get`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedKeyView {
+    /// `ed25519:<version>`.
+    pub key_id: String,
+    /// The public key, base64 (standard alphabet, unpadded), as the server published it.
+    pub public_key: String,
+    /// Until when (ms since the epoch) it may be used: the response's `valid_until_ts` for a
+    /// current key, its `expired_ts` for an old one.
+    pub valid_until_ts: u64,
+    /// Whether it came from `old_verify_keys` (usable only for what was signed before then).
+    pub old: bool,
+}
+
+/// Everything [`RemoteKeyCache`] holds for one server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedServerKeys {
+    pub server_name: String,
+    /// Sorted by key id, current keys before old ones.
+    pub keys: Vec<CachedKeyView>,
+    /// When a response from (or about) the server was last accepted, ms since the epoch.
+    pub fetched_at_ms: Option<u64>,
 }
 
 impl<F: KeyServerFetcher> RemoteKeyCache<F> {
@@ -349,7 +377,73 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
             current: std::sync::Mutex::new(HashMap::new()),
             old: std::sync::Mutex::new(HashMap::new()),
             in_flight: std::sync::Mutex::new(HashMap::new()),
+            fetched_at: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// What the cache holds for `server_name` (expired entries included: they are what an
+    /// operator looking at a verification failure needs to see), or `None` when it holds
+    /// nothing for it.
+    #[must_use]
+    pub fn cached_keys(&self, server_name: &str) -> Option<CachedServerKeys> {
+        use base64::Engine as _;
+        let encode = |vk: &VerifyingKey| {
+            base64::engine::general_purpose::STANDARD_NO_PAD.encode(vk.to_bytes())
+        };
+        let mut keys: Vec<CachedKeyView> = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|((server, _), _)| server == server_name)
+            .map(|((_, key_id), cached)| CachedKeyView {
+                key_id: key_id.clone(),
+                public_key: encode(&cached.verifying_key),
+                valid_until_ts: cached.valid_until_ts,
+                old: false,
+            })
+            .collect();
+        keys.extend(
+            self.old
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|((server, _), _)| server == server_name)
+                .map(|((_, key_id), cached)| CachedKeyView {
+                    key_id: key_id.clone(),
+                    public_key: encode(&cached.verifying_key),
+                    valid_until_ts: cached.expired_ts,
+                    old: true,
+                }),
+        );
+        let fetched_at_ms = self
+            .fetched_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(server_name)
+            .copied();
+        if keys.is_empty() && fetched_at_ms.is_none() {
+            return None;
+        }
+        keys.sort_by(|a, b| a.old.cmp(&b.old).then_with(|| a.key_id.cmp(&b.key_id)));
+        Some(CachedServerKeys {
+            server_name: server_name.to_owned(),
+            keys,
+            fetched_at_ms,
+        })
+    }
+
+    /// Fetches `server_name`'s keys again now, whatever is cached (an administrator's
+    /// `federation.keys.refresh`), and answers what the cache then holds for it.
+    ///
+    /// # Errors
+    /// [`KeyLookupError::FetchFailed`] when the server could not be reached, and
+    /// [`KeyLookupError::InvalidResponse`] when what it answered was not a validly self-signed
+    /// key response for it; the cache is unchanged either way.
+    pub async fn refetch(&self, server_name: &str) -> Result<CachedServerKeys, KeyLookupError> {
+        self.refresh(server_name).await?;
+        self.cached_keys(server_name)
+            .ok_or_else(|| KeyLookupError::InvalidResponse(server_name.to_owned()))
     }
 
     /// Returns a verifying key usable *right now* for `server_name`/`key_id`, fetching (with
@@ -584,6 +678,10 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
             }
         }
 
+        self.fetched_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(expected_server_name.to_string(), now);
         Ok(())
     }
 }
@@ -748,6 +846,43 @@ mod tests {
         let keys = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
         let response = build_server_key_response(server_name, &keys, &[], valid_for_secs).unwrap();
         (response, keys)
+    }
+
+    #[tokio::test]
+    async fn the_cache_shows_what_it_holds_and_refetches_on_demand() {
+        let fetcher = Arc::new(FixedFetcher::new());
+        let (doc, keys) = signed_response("remote.example.org", 3600);
+        fetcher.set("remote.example.org", doc);
+        struct Shared(Arc<FixedFetcher>);
+        #[async_trait]
+        impl KeyServerFetcher for Shared {
+            async fn fetch_server_key(&self, server_name: &str) -> Option<serde_json::Value> {
+                self.0.fetch_server_key(server_name).await
+            }
+        }
+        let cache = RemoteKeyCache::new(Shared(fetcher.clone()));
+        assert_eq!(cache.cached_keys("remote.example.org"), None);
+
+        let first = cache.refetch("remote.example.org").await.unwrap();
+        assert_eq!(first.keys.len(), 1);
+        assert_eq!(first.keys[0].key_id, keys.primary().key_id());
+        assert_eq!(
+            first.keys[0].public_key,
+            keys.primary().verifying_key_base64()
+        );
+        assert!(!first.keys[0].old);
+        assert!(first.fetched_at_ms.is_some());
+        assert_eq!(cache.cached_keys("remote.example.org"), Some(first));
+
+        // A refetch asks again even though the cached key is still good.
+        cache.refetch("remote.example.org").await.unwrap();
+        assert_eq!(fetcher.count_for("remote.example.org"), 2);
+        // A server that cannot be reached is an error, and caches nothing.
+        assert_eq!(
+            cache.refetch("gone.example.org").await.unwrap_err(),
+            KeyLookupError::FetchFailed("gone.example.org".to_owned())
+        );
+        assert_eq!(cache.cached_keys("gone.example.org"), None);
     }
 
     #[tokio::test]

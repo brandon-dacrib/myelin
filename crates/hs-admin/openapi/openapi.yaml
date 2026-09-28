@@ -1767,6 +1767,7 @@ paths:
   /federation/keys/{server_name}/refresh:
     post:
       summary: Refresh cached remote keys (Task)
+      description: Fetches the server's signing keys again, whatever is cached. The task (action federation.refetch_keys, resource {type server, id server_name}) ends succeeded with the RemoteServerKeys the cache then holds as its result, or failed when the server could not be reached or its answer did not verify.
       operationId: federation.keys.refresh
       tags:
       - Federation
@@ -1886,6 +1887,7 @@ paths:
   /media/delete:
     post:
       summary: Bulk-delete media by age and size (Task)
+      description: Selects the items now (answered 400 for a bad criterion) and answers 202 with the task (action media.delete) still running. The task deletes one item at a time, records its progress (items done of items selected), and ends succeeded with deleted_count, deleted_bytes, skipped_protected, skipped_quarantined and failed in its result. Cancelling it stops it between two items; what it deleted by then stays deleted.
       operationId: media.delete_bulk
       tags:
       - Media
@@ -1949,6 +1951,7 @@ paths:
   /media/purge-remote-cache:
     post:
       summary: Purge cached remote media (Task)
+      description: Runs like media.delete_bulk, as a task with action media.purge_remote_cache.
       operationId: media.purge_remote_cache
       tags:
       - Media
@@ -7242,39 +7245,73 @@ components:
           type: integer
     DestinationRoom:
       type: object
+      description: One room this server shares with a destination (at least one of its users is joined).
+      required:
+      - room_id
+      - joined_members_count
+      - destination_members_count
       properties:
         room_id:
           type: string
+        name:
+          type:
+          - string
+          - 'null'
+        canonical_alias:
+          type:
+          - string
+          - 'null'
         joined_members_count:
           type: integer
+          description: Everyone joined to the room, from every server.
+        destination_members_count:
+          type: integer
+          description: How many of the joined members are the destination's users.
     ServerSigningKey:
       type: object
+      required:
+      - key_id
+      - algorithm
+      - public_key
+      - old
       properties:
         key_id:
           type: string
+          description: ed25519:<version>.
         algorithm:
           type: string
         public_key:
           type: string
+          description: Base64 (standard alphabet, unpadded), as published.
         valid_until_at:
           type:
           - string
           - 'null'
           format: date-time
+          description: Until when the key may be used (a cached current key's valid_until_ts, an old key's expired_ts); null for this server's own keys, which are valid until rotated.
         old:
           type: boolean
+          description: An old key (old_verify_keys), usable only for what was signed before valid_until_at.
     RemoteServerKeys:
       type: object
+      description: What this server's key cache holds for another server.
+      required:
+      - server_name
+      - keys
       properties:
         server_name:
           type: string
         keys:
           type: array
+          description: Current keys first, then old ones.
           items:
             $ref: '#/components/schemas/ServerSigningKey'
         cached_at:
-          type: string
+          type:
+          - string
+          - 'null'
           format: date-time
+          description: When a key response from (or about) the server was last accepted.
     Report:
       type: object
       description: A report filed through the client-server API (POST /rooms/{roomId}/report/{eventId}, POST /rooms/{roomId}/report, POST /users/{userId}/report). Resolving with no_action dismisses it; any other resolution resolves it. Either closes it for good.

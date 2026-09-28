@@ -157,6 +157,22 @@ inline Sessions list was:
   URL and shows each as a removable chip.
 - **The Cluster page's refused drain** reads the problem's `reason` (`single_node`,
   `no_other_active_replica`) and says what it means, rather than showing the server's `detail`.
+- **The Media page follows its bulk deletions.** "Delete old media" and "Purge remote cache"
+  are answered with the task still running; the page shows a row per running deletion
+  (`src/pages/media/BulkTaskBanner.tsx`: what it is, a progress bar of items checked, a link to
+  the task, and Stop for `admin:write`), follows it with `useTask` (the event stream, or polling
+  while it is down), and when it ends refetches the list and says what went, what was kept, or
+  where it stopped (`src/pages/media/bulk-tasks.ts`). A deletion started elsewhere, or before a
+  reload, is listed too (the running `media.*` tasks). The mock runs a deletion one item every
+  150 ms (`setMockBulkStepMs`) and stops it when cancelled. Tests: the bulk delete showing its
+  row and then its outcome, and a deletion stopped midway leaving the rest.
+- **Federation keys and shared rooms.** The Federation page lists this server's own signing
+  keys; a destination's page lists the rooms shared with it (theirs and all members, linking to
+  the room) and the keys this server's cache holds for it, with when they were fetched and
+  "Fetch keys again", a `federation.refetch_keys` task followed until it ends
+  (`src/pages/federation/FederationPanels.tsx`, hooks in `src/api/federation.ts`, mocks in
+  `src/mocks/data/federation.ts`: a failing destination's refetch fails).
+  Tests: `src/pages/federation/FederationPanels.test.tsx` (5).
 
 ## Earlier update: 2026-09-28 (Users-page invite links and notices; branch `agent/users-page-dialogs`)
 

@@ -42,6 +42,7 @@ pub mod bridge_types;
 pub mod cluster;
 pub mod config_schema;
 pub mod events;
+pub mod federation;
 mod handler_kit;
 pub mod idempotency;
 pub mod media;

@@ -28,6 +28,13 @@
 //! replica is recorded `cancelled`; that replica notices at the task's next progress report and
 //! stops it, and never overwrites the `cancelled` with its own outcome. A task that has already
 //! ended is answered as it is: cancelling it is not an error, and changes nothing.
+//!
+//! # Watching
+//!
+//! A [`TaskObserver`] attached with [`TaskRegistry::attach_observer`] is told about every
+//! change this registry records; `hs-cli` counts them into Prometheus
+//! (`hs_admin_tasks_total{action,status}`, `hs_admin_task_duration_seconds{action}`,
+//! `hs_admin_tasks_running`).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -173,11 +180,19 @@ fn parse_status(s: &str) -> Option<TaskStatus> {
     }
 }
 
+/// Told about every change of a task a [`TaskRegistry`] records: a new task, its progress, and
+/// how it ended. Called inline, so it must be quick.
+pub trait TaskObserver: Send + Sync + 'static {
+    /// `task` as just recorded; `running_here` is how many tasks this process is running now.
+    fn changed(&self, task: &Task, running_here: usize);
+}
+
 /// The registry every long-running job reports into. See the module docs.
 pub struct TaskRegistry {
     store: Arc<dyn TaskStore>,
     runner: String,
     events: OnceLock<Arc<EventBus>>,
+    observer: OnceLock<Arc<dyn TaskObserver>>,
     /// Tasks running in this process, and how to stop each.
     live: Mutex<HashMap<String, watch::Sender<bool>>>,
     retention: Duration,
@@ -192,6 +207,7 @@ impl TaskRegistry {
             store,
             runner: runner.into(),
             events: OnceLock::new(),
+            observer: OnceLock::new(),
             live: Mutex::new(HashMap::new()),
             retention: DEFAULT_RETENTION,
         })
@@ -209,6 +225,17 @@ impl TaskRegistry {
         let _ = self.events.set(events);
     }
 
+    /// Who is told about every change (see [`TaskObserver`]). Later calls are ignored.
+    pub fn attach_observer(&self, observer: Arc<dyn TaskObserver>) {
+        let _ = self.observer.set(observer);
+    }
+
+    /// How many tasks this process is running now.
+    #[must_use]
+    pub fn running_here(&self) -> usize {
+        self.live().len()
+    }
+
     fn live(&self) -> std::sync::MutexGuard<'_, HashMap<String, watch::Sender<bool>>> {
         self.live
             .lock()
@@ -222,6 +249,9 @@ impl TaskRegistry {
                 runner,
             })
             .await?;
+        if let Some(observer) = self.observer.get() {
+            observer.changed(task, self.running_here());
+        }
         if let Some(events) = self.events.get() {
             events.publish(
                 Event::new(
@@ -342,6 +372,7 @@ impl TaskRegistry {
         task.status = TaskStatus::Cancelled;
         task.finished_at = Some(hs_http::time::now_rfc3339());
         self.save(&task, record.runner).await?;
+        tracing::info!(task = id, action = %task.action, "a task was cancelled");
         Ok((task, true))
     }
 
@@ -964,5 +995,37 @@ mod tests {
         assert_eq!(first.data["status"], "running");
         let second = events.recv().await.unwrap();
         assert_eq!(second.data["status"], "succeeded");
+    }
+
+    #[tokio::test]
+    async fn an_observer_sees_every_change_and_how_many_are_running_here() {
+        #[derive(Default)]
+        struct Seen(Mutex<Vec<(TaskStatus, usize)>>);
+        impl TaskObserver for Seen {
+            fn changed(&self, task: &Task, running_here: usize) {
+                self.0.lock().unwrap().push((task.status, running_here));
+            }
+        }
+        let registry = TaskRegistry::in_memory();
+        let seen = Arc::new(Seen::default());
+        registry.attach_observer(seen.clone());
+        let task = registry
+            .spawn("test.observed", None, actor(), |context| async move {
+                context.progress(1, Some(2), None, None).await;
+                Ok(json!({}))
+            })
+            .await
+            .unwrap();
+        settled(&registry, &task.id).await;
+        let seen = seen.0.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            [
+                (TaskStatus::Running, 1),
+                (TaskStatus::Running, 1),
+                (TaskStatus::Succeeded, 0)
+            ]
+        );
+        assert_eq!(registry.running_here(), 0);
     }
 }

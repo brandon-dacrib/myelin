@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { Image } from "lucide-react";
 import {
@@ -8,6 +8,7 @@ import {
   type MediaItem,
   type MediaListFilters,
   type MediaSort,
+  type Task,
 } from "@/api/media";
 import type { MediaSearch } from "./media-search";
 import { Badge } from "@/components/ui/badge/Badge";
@@ -22,6 +23,7 @@ import { RelativeTime } from "@/components/RelativeTime";
 import { hasScope } from "@/lib/auth";
 import { formatBytes, formatCount } from "@/lib/format";
 import { BulkDeleteDialog, PurgeRemoteCacheDialog } from "./BulkMediaDialogs";
+import { BulkTaskBanner } from "./BulkTaskBanner";
 import { MediaDetailSheet } from "./MediaDetailSheet";
 import { MediaThumbnail } from "./MediaThumbnail";
 
@@ -49,6 +51,13 @@ export function MediaPage() {
   const navigate = useNavigate({ from: "/media" });
   const [queryInput, setQueryInput] = useState(search.q ?? "");
   const [selected, setSelected] = useState<MediaItem | null>(null);
+  // Bulk deletions started from this page, followed until they end.
+  const [followed, setFollowed] = useState<string[]>([]);
+  const follow = useCallback((task: Task) => setFollowed((ids) => [...ids, task.id]), []);
+  const unfollow = useCallback(
+    (id: string) => setFollowed((ids) => ids.filter((i) => i !== id)),
+    [],
+  );
   const canRead = hasScope("admin:read");
 
   const filters: MediaListFilters = {
@@ -177,10 +186,12 @@ export function MediaPage() {
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
-          <BulkDeleteDialog disabled={!hasScope("moderation:write")} />
-          <PurgeRemoteCacheDialog disabled={!hasScope("admin:write")} />
+          <BulkDeleteDialog disabled={!hasScope("moderation:write")} onStarted={follow} />
+          <PurgeRemoteCacheDialog disabled={!hasScope("admin:write")} onStarted={follow} />
         </div>
       </div>
+
+      <BulkTaskBanner followed={followed} onEnded={unfollow} />
 
       <div className="mt-4 flex flex-wrap items-end gap-2">
         <form

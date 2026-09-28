@@ -150,6 +150,10 @@ pub struct ServeOptions {
     /// a moment ago is the one used. `None` reads it from the configuration this process booted
     /// on, which is what the in-process tests want.
     pub migration_configs: Option<Arc<dyn hs_compat::migration::SourceConfigs>>,
+    /// A pause after each item a bulk media deletion (`POST /api/v1/media/delete`, `POST
+    /// /api/v1/media/purge-remote-cache`) deletes. Zero (the default) is what `hs serve` runs
+    /// with; a test that cancels a deletion midway sets one so there is a midway to cancel at.
+    pub media_bulk_pause: std::time::Duration,
 }
 
 impl std::fmt::Debug for ServeOptions {
@@ -159,6 +163,8 @@ impl std::fmt::Debug for ServeOptions {
             .field("routes_manifest_path", &self.routes_manifest_path)
             .field("media_scanning_config", &self.media_scanning_config)
             .field("config_source", &self.config_source.is_some())
+            .field("federation_scheme", &self.federation_scheme)
+            .field("media_bulk_pause", &self.media_bulk_pause)
             .finish()
     }
 }
@@ -1126,6 +1132,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         ),
         crate::cluster::task_runner_name(&config),
     );
+    tasks.attach_observer(Arc::new(crate::tasks::TaskMetrics::register(&metrics)));
     match tasks.recover_interrupted().await {
         Ok(0) => {}
         Ok(count) => tracing::warn!(
@@ -1229,7 +1236,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         crate::media::install_remote_media(&media_state.repository, mount.client.clone(), &metrics);
         federation_source = Arc::new(
             hs_federation::admin_source::DestinationStoreSource::new(mount.destinations.clone())
-                .with_sender(mount.sender.clone()),
+                .with_sender(mount.sender.clone())
+                // The Federation page's keys: ours, and the cache `X-Matrix` checks against.
+                .with_keys(mount.own_keys.clone(), mount.x_matrix.key_cache.clone()),
         );
         federation_sender = Some(mount.sender.clone());
         remote_join = Some(Arc::new(crate::remote_join::FederationRemoteJoin::new(
@@ -1493,7 +1502,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             .unwrap_or_else(|| Arc::new(crate::migration::BootedSourceConfigs(config.clone()))),
     })
     .map_err(|e| ServeError::Sessions(Box::new(e)))?;
-    admin = admin.with_migration(migrator.clone());
+    admin = admin
+        .with_migration(migrator.clone())
+        .with_media_bulk_pause(options.media_bulk_pause);
     tokio::spawn(async move {
         match migrator.recover().await {
             Ok(Some(phase)) => tracing::warn!(

@@ -68,8 +68,9 @@ import {
   openReportCount,
   resolveReport,
 } from "./data/reports";
-import { cancelTask, getTask, listTasks, recordFinishedTask } from "./data/tasks";
-import { mockEventStream } from "./data/events";
+import { cancelTask, getTask, listTasks, putTask } from "./data/tasks";
+import { mockEventStream, publishMockEvent } from "./data/events";
+import { cachedKeys, destinationRooms, ownKeys, startKeyRefresh } from "./data/federation";
 import { roomStatistics, sortStatistics, timeseries, userMediaStatistics } from "./data/statistics";
 import type { ReportResolve } from "@/api/reports";
 import { succeeded } from "@/lib/audit";
@@ -1761,6 +1762,37 @@ export const handlers = [
     return HttpResponse.json(destination);
   }),
 
+  http.get(`${API}/federation/destinations/:server_name/rooms`, ({ params, request }) => {
+    const server = decodeURIComponent(String(params.server_name));
+    const rows = destinationRooms(server);
+    if (!rows)
+      return problem(404, "not-found", "Not found", {
+        detail: `this server has never tried to reach ${server} and shares no room with it`,
+      });
+    const url = new URL(request.url);
+    return HttpResponse.json({ ...paginate(rows, url), total: rows.length });
+  }),
+
+  http.get(`${API}/federation/keys`, () => HttpResponse.json(ownKeys)),
+
+  http.get(`${API}/federation/keys/:server_name`, ({ params }) => {
+    const server = decodeURIComponent(String(params.server_name));
+    const keys = cachedKeys(server);
+    return keys
+      ? HttpResponse.json(keys)
+      : problem(404, "not-found", "Not found", {
+          detail: `this server holds no keys for ${server}`,
+        });
+  }),
+
+  http.post(`${API}/federation/keys/:server_name/refresh`, ({ params }) => {
+    const task = startKeyRefresh(decodeURIComponent(String(params.server_name)));
+    return HttpResponse.json(task, {
+      status: 202,
+      headers: { Location: `/api/v1/tasks/${task.id}` },
+    });
+  }),
+
   http.post(`${API}/federation/destinations/:server_name/reset`, ({ params }) => {
     const destination = federationDestinations.find(
       (d) => d.server_name === decodeURIComponent(String(params.server_name)),
@@ -1905,40 +1937,81 @@ function mediaNotFound() {
  * since `before`, except protected items and quarantined remote copies, answered as a Task that
  * has already finished.
  */
+/** How long the mock takes over each item of a bulk deletion, so its progress can be seen. */
+let bulkStepMs = 150;
+
+/** Sets how long the mock takes over each item of a bulk deletion; returns the old value. */
+export function setMockBulkStepMs(ms: number): number {
+  const old = bulkStepMs;
+  bulkStepMs = ms;
+  return old;
+}
+
+/**
+ * A bulk media deletion as the server runs it: the items are selected now, the answer is the
+ * task `running`, and the deletion goes on one item every {@link setMockBulkStepMs} (150 ms by default), recording
+ * its progress on the task (a `task.changed` event each time) until it ends `succeeded` with a
+ * `media.deleted` event, or stops where it is when the task is cancelled.
+ */
 function purgeMedia(action: string, inScope: (m: MediaItem) => boolean, before: string) {
-  let deleted = 0;
-  let bytes = 0;
+  const selected: MediaItem[] = [];
   let skippedProtected = 0;
   let skippedQuarantined = 0;
-  for (const item of [...mediaItems]) {
+  for (const item of mediaItems) {
     if (!inScope(item) || !(lastUsed(item) < before)) continue;
     if (item.protected) skippedProtected += 1;
     else if (item.origin === "remote" && item.quarantined) skippedQuarantined += 1;
-    else {
-      removeMedia(item);
-      deleted += 1;
-      bytes += item.size_bytes;
-    }
+    else selected.push(item);
   }
   const now = new Date().toISOString();
   const id = `task_${Math.random().toString(36).slice(2, 10)}`;
-  // Recorded where the Tasks page looks, as the server records it, so the Location answers.
-  const task = recordFinishedTask({
+  const total = selected.length;
+  let done = 0;
+  let deleted = 0;
+  let bytes = 0;
+  const result = () => ({
+    deleted_count: deleted,
+    deleted_bytes: bytes,
+    skipped_protected: skippedProtected,
+    skipped_quarantined: skippedQuarantined,
+    failed: [],
+  });
+  const task = putTask({
     id,
     action,
-    status: "succeeded",
-    progress: { current: deleted, total: deleted, unit: "items" },
-    result: {
-      deleted_count: deleted,
-      deleted_bytes: bytes,
-      skipped_protected: skippedProtected,
-      skipped_quarantined: skippedQuarantined,
-      failed: [],
-    },
+    status: "running",
+    progress: { current: 0, total, unit: "items" },
+    result: null,
+    error: null,
     created_at: now,
     started_at: now,
-    finished_at: now,
+    finished_at: null,
   });
+  const step = () => {
+    const current = getTask(id);
+    // Cancelled (or the mock was reset under it): it stops where it is.
+    if (!current || current.status !== "running") return;
+    if (done < total) {
+      const item = selected[done];
+      done += 1;
+      if (item && findMedia(item.server_name, item.media_id)) {
+        removeMedia(item);
+        deleted += 1;
+        bytes += item.size_bytes;
+      }
+      putTask({ ...current, progress: { current: done, total, unit: "items" } });
+      setTimeout(step, bulkStepMs);
+      return;
+    }
+    publishMockEvent("media.deleted", result(), { type: "task", id });
+    putTask({
+      ...current,
+      status: "succeeded",
+      finished_at: new Date().toISOString(),
+      result: result(),
+    });
+  };
+  setTimeout(step, bulkStepMs);
   return HttpResponse.json(task, {
     status: 202,
     headers: { Location: `/api/v1/tasks/${id}` },

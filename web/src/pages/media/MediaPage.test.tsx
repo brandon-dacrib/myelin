@@ -13,6 +13,8 @@ import {
   type AnyRouter,
 } from "@tanstack/react-router";
 import { server } from "@/mocks/node";
+import { setMockBulkStepMs } from "@/mocks/handlers";
+import { Toaster } from "@/components/ui/toast/Toaster";
 import { findMedia } from "@/mocks/data/media";
 import { signIn, signOut, type Scope } from "@/lib/auth";
 import { MediaPage } from "./MediaPage";
@@ -35,6 +37,7 @@ function renderMedia(initialPath = "/media") {
   render(
     <QueryClientProvider client={client}>
       <RouterProvider router={router} />
+      <Toaster />
     </QueryClientProvider>,
   );
   return { router };
@@ -189,8 +192,16 @@ describe("Media", () => {
     expect(dialog.getByText(/unused since June 1, 2026/)).toBeInTheDocument();
     await user.click(dialog.getByRole("button", { name: "Delete media" }));
 
+    // The deletion runs as a task: the page shows it running, then says what it did.
+    const banner = within(
+      await screen.findByRole("region", { name: "Bulk deletions in progress" }),
+    );
+    const running = within(banner.getByRole("listitem", { name: "Delete media" }));
+    expect(running.getByRole("link", { name: "View task" })).toBeInTheDocument();
     await waitFor(() => expect(findMedia("example.org", "oldReportJkl012")).toBeUndefined());
     expect(sent).toEqual({ before: "2026-06-01T00:00:00Z" });
+    expect(await screen.findByText(/Deleted 1 item/, {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(screen.queryByRole("listitem", { name: "Delete media" })).toBeNull();
     // Protected, and last used before June too: kept.
     expect(findMedia("example.org", "teamLogoGhi789")).toBeDefined();
     expect(findMedia("matrix.org", "avatarMno345")).toBeDefined();
@@ -204,6 +215,48 @@ describe("Media", () => {
     server.events.removeAllListeners();
   });
 
+  it("stops a bulk deletion midway, and what it deleted stays deleted", async () => {
+    const step = setMockBulkStepMs(1_000);
+    try {
+      renderMedia();
+      await rowOf("q1-report.pdf");
+      const user = userEvent.setup();
+      await user.click(screen.getByRole("button", { name: "Delete old media" }));
+      const dialog = within(await screen.findByRole("dialog", { name: "Delete old media" }));
+      // Three of this server's uploads have gone unused since then.
+      fireEvent.change(dialog.getByLabelText(/Not used since/), {
+        target: { value: "2026-09-20" },
+      });
+      await user.click(dialog.getByRole("button", { name: "Delete media" }));
+      const banner = within(
+        await screen.findByRole("region", { name: "Bulk deletions in progress" }),
+      );
+      const running = within(banner.getByRole("listitem", { name: "Delete media" }));
+      expect(running.getByRole("progressbar")).toBeInTheDocument();
+      await user.click(running.getByRole("button", { name: "Stop delete media" }));
+      expect(
+        await screen.findByText("Delete media stopped", {}, { timeout: 5000 }),
+      ).toBeInTheDocument();
+      const [task] = listTasks(new URLSearchParams("action=media.delete&status=cancelled")).filter(
+        (t) => t.id.startsWith("task_"),
+      );
+      expect(task?.progress?.total).toBe(3);
+      const left = ["vacationPhotoAbc123", "notMalwareDef456", "oldReportJkl012"].filter((id) =>
+        findMedia("example.org", id),
+      );
+      expect(left.length).toBeGreaterThan(0);
+      // It stays stopped.
+      await new Promise((r) => setTimeout(r, 1_200));
+      expect(
+        ["vacationPhotoAbc123", "notMalwareDef456", "oldReportJkl012"].filter((id) =>
+          findMedia("example.org", id),
+        ),
+      ).toEqual(left);
+    } finally {
+      setMockBulkStepMs(step);
+    }
+  }, 15_000);
+
   it("purges cached copies from one server", async () => {
     renderMedia();
     await rowOf("avatar.png");
@@ -214,7 +267,9 @@ describe("Media", () => {
     await user.type(dialog.getByLabelText(/Only from server/), "matrix.org");
     expect(dialog.getByText(/Cached copies from matrix.org unused since/)).toBeInTheDocument();
     await user.click(dialog.getByRole("button", { name: "Purge cache" }));
-    await waitFor(() => expect(findMedia("matrix.org", "avatarMno345")).toBeUndefined());
+    await waitFor(() => expect(findMedia("matrix.org", "avatarMno345")).toBeUndefined(), {
+      timeout: 3000,
+    });
     expect(findMedia("remote.example", "memePqr678")).toBeDefined();
   });
 

@@ -113,6 +113,10 @@ pub struct AdminState {
     /// [`crate::media`]). `None` until wired with [`AdminState::with_media`]; until then they
     /// answer `503 unavailable`.
     pub media: Option<Arc<dyn crate::media::MediaSource>>,
+    /// How long a bulk media deletion (`media.delete_bulk`, `media.purge_remote_cache`) pauses
+    /// after each item, to go easy on the object store. Zero (the default) deletes as fast as
+    /// the store answers; set with [`AdminState::with_media_bulk_pause`].
+    pub media_bulk_pause: std::time::Duration,
     /// What the `cluster.replicas.*` and `cluster.shards.list` operations read and act through:
     /// the replica registry and the shard rows (see [`crate::cluster`]). `None` until wired with
     /// [`AdminState::with_cluster`]; until then they answer `503 unavailable`.
@@ -174,6 +178,7 @@ impl AdminState {
             tasks: None,
             statistics: None,
             media: None,
+            media_bulk_pause: std::time::Duration::ZERO,
             cluster: None,
             user_identity: None,
             user_data: None,
@@ -275,6 +280,14 @@ impl AdminState {
     #[must_use]
     pub fn with_migration(mut self, migration: Arc<dyn crate::migration::MigrationSource>) -> Self {
         self.migration = Some(migration);
+        self
+    }
+
+    /// Sets [`AdminState::media_bulk_pause`]: a pause after each item a bulk media deletion
+    /// deletes.
+    #[must_use]
+    pub fn with_media_bulk_pause(mut self, pause: std::time::Duration) -> Self {
+        self.media_bulk_pause = pause;
         self
     }
 
@@ -533,6 +546,10 @@ const REAL_HANDLERS: &[&str] = &[
     "federation.destinations.list",
     "federation.destinations.get",
     "federation.destinations.reset",
+    "federation.destinations.rooms",
+    "federation.keys.list",
+    "federation.keys.get",
+    "federation.keys.refresh",
     "media.list",
     "media.get",
     "media.delete_one",
@@ -5072,6 +5089,19 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         }
         "federation.destinations.reset" => {
             builder.add(method, &full_path, federation_destinations_reset, meta)
+        }
+        "federation.destinations.rooms" => builder.add(
+            method,
+            &full_path,
+            crate::federation::destination_rooms,
+            meta,
+        ),
+        "federation.keys.list" => {
+            builder.add(method, &full_path, crate::federation::keys_list, meta)
+        }
+        "federation.keys.get" => builder.add(method, &full_path, crate::federation::keys_get, meta),
+        "federation.keys.refresh" => {
+            builder.add(method, &full_path, crate::federation::keys_refresh, meta)
         }
         "media.list" => builder.add(method, &full_path, crate::media::media_list, meta),
         "media.get" => builder.add(method, &full_path, crate::media::media_get, meta),

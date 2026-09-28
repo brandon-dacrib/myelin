@@ -1830,12 +1830,46 @@ pub trait FederationSource: Send + Sync + 'static {
     /// Clears the backoff, so the next request is attempted at once. `SourceError::NotFound`
     /// for a server there is no record of.
     async fn reset_destination(&self, server_name: &str) -> Result<AdminDestination, SourceError>;
+
+    /// This server's own signing keys (`federation.keys.list`). Unavailable unless the source
+    /// knows them.
+    async fn own_keys(&self) -> Result<Vec<crate::federation::AdminSigningKey>, SourceError> {
+        Err(SourceError::Unavailable(
+            "this federation source does not know the signing keys".to_owned(),
+        ))
+    }
+
+    /// What the key cache holds for `server_name` (`federation.keys.get`); `Ok(None)` when it
+    /// holds nothing.
+    async fn remote_keys(
+        &self,
+        server_name: &str,
+    ) -> Result<Option<crate::federation::AdminRemoteServerKeys>, SourceError> {
+        let _ = server_name;
+        Err(SourceError::Unavailable(
+            "this federation source has no key cache".to_owned(),
+        ))
+    }
+
+    /// Fetches `server_name`'s keys again whatever is cached (`federation.keys.refresh`), and
+    /// answers what the cache then holds. [`SourceError::Unavailable`] when the server could not
+    /// be reached or its answer did not verify.
+    async fn refresh_remote_keys(
+        &self,
+        server_name: &str,
+    ) -> Result<crate::federation::AdminRemoteServerKeys, SourceError> {
+        let _ = server_name;
+        Err(SourceError::Unavailable(
+            "this federation source has no key cache".to_owned(),
+        ))
+    }
 }
 
 /// A [`FederationSource`] over a list held in memory.
 #[derive(Debug, Default)]
 pub struct InMemoryFederationSource {
     destinations: RwLock<BTreeMap<String, AdminDestination>>,
+    keys: RwLock<crate::federation::InMemoryKeys>,
 }
 
 impl InMemoryFederationSource {
@@ -1851,10 +1885,57 @@ impl InMemoryFederationSource {
             .insert(destination.server_name.clone(), destination);
         self
     }
+
+    /// Serves `keys` for the `federation.keys.*` operations.
+    #[must_use]
+    pub fn with_keys(self, keys: crate::federation::InMemoryKeys) -> Self {
+        *self
+            .keys
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = keys;
+        self
+    }
 }
 
 #[async_trait]
 impl FederationSource for InMemoryFederationSource {
+    async fn own_keys(&self) -> Result<Vec<crate::federation::AdminSigningKey>, SourceError> {
+        Ok(self
+            .keys
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .own
+            .clone())
+    }
+
+    async fn remote_keys(
+        &self,
+        server_name: &str,
+    ) -> Result<Option<crate::federation::AdminRemoteServerKeys>, SourceError> {
+        Ok(self
+            .keys
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cached
+            .get(server_name)
+            .cloned())
+    }
+
+    async fn refresh_remote_keys(
+        &self,
+        server_name: &str,
+    ) -> Result<crate::federation::AdminRemoteServerKeys, SourceError> {
+        let mut keys = self
+            .keys
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fetched = keys.reachable.get(server_name).cloned().ok_or_else(|| {
+            SourceError::Unavailable(format!("could not fetch the keys of {server_name}"))
+        })?;
+        keys.cached.insert(server_name.to_owned(), fetched.clone());
+        Ok(fetched)
+    }
+
     async fn list_destinations(&self) -> Result<Vec<AdminDestination>, SourceError> {
         Ok(self
             .destinations
