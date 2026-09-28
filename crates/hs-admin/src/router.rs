@@ -5284,19 +5284,33 @@ mod tests {
 
     #[tokio::test]
     async fn authorized_request_to_undeclared_handler_is_501() {
-        // `federation.keys.list` is not in REAL_HANDLERS, and exercises the generic seam.
-        let (router, _manifest) = build_router(test_state());
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/federation/keys")
-                    .header("authorization", "Bearer admin-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        // Every operation in the contract has a real handler now (158 of 158), so no path reaches
+        // the generic seam through the router; call it the way `register_operation` wires it for
+        // the next operation that is declared before it is implemented.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer admin-token".parse().unwrap(),
+        );
+        let response = not_implemented(
+            test_state(),
+            headers,
+            Some(Scope::AdminRead),
+            "example.declared".into(),
+            "/api/v1/example".into(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+
+        let unauthenticated = not_implemented(
+            test_state(),
+            HeaderMap::new(),
+            Some(Scope::AdminRead),
+            "example.declared".into(),
+            "/api/v1/example".into(),
+        )
+        .await;
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
