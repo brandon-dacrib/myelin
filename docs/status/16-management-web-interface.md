@@ -31,7 +31,7 @@ recorded" with no revert.
   revert over a later save) with axe at each state. Against the real binary,
   `e2e-real/configuration.spec.ts` has a new flow in which two API writes are reverted through
   the page and checked through the API. Screenshots are `test-results/real-configuration-history|revert-dialog|reverted.png`.
-- **Checks**: `npm run check` (398 unit tests), `npm run test:e2e` 47/47,
+- **Checks**: after the rebase onto `agent/admin-followups`, `npm run check` (441 unit tests) and `npm run test:e2e` 50/50;
   `npm run test:e2e:real -- e2e-real/configuration.spec.ts` 4/4 against a fresh `hs serve`.
 
 ## Earlier update: 2026-09-28 (a user's moderation and activity; branch `agent/user-moderation`)
