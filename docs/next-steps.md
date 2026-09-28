@@ -60,7 +60,11 @@ untouched):
 - `s3` (SeaweedFS 3.97) Ready, claim `s3` 20Gi, bucket `hs-media` made by the completed Job
   `s3-make-bucket`. Users `alice` and `bob` and 24 test rooms.
 
-**Next, in order:**
+**Next, in order** (items 1 and 3 need `kubectl` to `admin@dacrib0`, which agent sessions on
+this desktop cannot reach, "no route to host" from macOS Local Network permission; they are
+desktop items for a session that has it. What an agent session can run is done: the two-process
+test in `crates/hs-cli/tests/cluster_admin.rs` ran against PostgreSQL 17 in Docker and passed,
+not skipped; see the top of `docs/status/03-cluster.md` for the command):
 
 1. Let CD build the image for this `main` (`sha-<commit>` on ghcr), then, with port-forwards to
    both pods that re-open themselves and `rooms.json` from a fresh `verify.py`, run
@@ -1399,7 +1403,7 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | The release binaries job's web build has never run | `.github` | it only runs on a `v*` tag; the image path is verified, this one is not |
 | The `main` chart needs `--devel`, and a first tag hides it until Chart.yaml's version moves on | `.github`, `deploy/helm` | pre-releases sort below the release they precede; bump `version` in Chart.yaml right after tagging |
 | An install from a chart before 2026-09-26's label fix cannot be upgraded in place | `deploy/helm` | one `kubectl delete statefulset --cascade=orphan` before the next `helm upgrade`; only the demo existed |
-| Cluster mode between two pods has not been run | `deploy/helm`, desktop | the chart renders in cluster mode and CD checks it (4a010ee), and two `hs serve` processes on one PostgreSQL are tested (`hs-cli/tests/cluster_admin.rs`, ccfb6e8); the pod run stopped at the desktop's etcd health gate, and `deploy/two-pod/verify.py` and `failover.py` are written but have never run (status 03, 2026-09-27) |
+| Two pods on the cluster have not run with the handoff fix | `deploy/helm`, desktop | two pods ran on 2026-09-28 with an image from before decision 0013 (a request mid-handoff got a `503`); the fixed image, `rolling.py` during its upgrade and `failover.py` need `kubectl`, which agent sessions cannot reach; "Where this stopped" at the top has the steps |
 | A room alias in `/join/{alias}` or `/knock/{alias}` is not shard-gated | `hs-cli` | the alias resolves inside the handler; ids in `/join/{roomId}`, `/knock/{roomId}` and `/rooms/{roomId}/...` are gated |
 | A v12 room's id cannot be pre-assigned | `hs-room` | the id derives from the create event's hash; RFC 0019 describes the retry the handler should do and it is not implemented |
 | ~~Per-replica settings are seeded into the shared database~~ | `hs-config`, `hs-cli` | **Closed** (a3126df): `hs_config::bootstrap::BOOTSTRAP_SETTINGS` (storage, listeners, server name, signing key path, cluster mesh, ...) stay in each replica's file and environment; seeding strips them, boot purges old copies, and the admin API refuses writes to them |

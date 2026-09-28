@@ -1,3 +1,28 @@
+## 2026-09-28: the two-replica admin test runs against PostgreSQL, not skipped
+
+`crates/hs-cli/tests/cluster_admin.rs`'s two-process test needs a PostgreSQL whose user can
+create databases; without one it prints `SKIP` and reports `ok`, and the gate run before this
+merge did exactly that. It was then run for real against `postgres:17` (17.11) in Docker:
+
+```
+docker run --rm -d --name hs-cluster-2pod-pg -e POSTGRES_PASSWORD=hspg \
+  -p 127.0.0.1:5461:5432 public.ecr.aws/docker/library/postgres:17
+HS_CLUSTER_TEST_POSTGRES_DSN=postgres://postgres:hspg@127.0.0.1:5461/postgres \
+  cargo test -p hs-cli --test cluster_admin -- --nocapture
+```
+
+Both tests passed twice with no `SKIP` line (the two-replica one takes 41 s: two real `hs serve`
+processes, a drain through the peer, every shard handed off, a restart that stays drained, the
+undrain), and each run dropped its database afterwards. `hs-cluster`'s `mesh_handoff` (5) and
+`chaos` (4) tests pass too. The container was removed. (`docker pull postgres:17` fails from an
+agent session because the Docker Hub credential helper needs the keychain; the ECR mirror of the
+official image needs no credentials.)
+
+**Still not done: the two-pod run on the cluster with the handoff fix.** It needs `kubectl` to
+`admin@dacrib0`, which agent sessions on this desktop cannot reach ("no route to host": macOS
+Local Network permission), so it is a desktop item for a session that has it; the steps are
+"Next, in order" below.
+
 ## 2026-09-28: an administrator can drain and undrain any replica (edited by track 15)
 
 The admin API's `cluster.replicas.drain`/`undrain` needed what this crate did not have: draining a
@@ -15,7 +40,7 @@ Tests: `ownership::tests::an_administrators_drain_hands_every_shard_to_the_peer_
 
 ## 2026-09-28: two pods on the owner's cluster -- where this stopped
 
-Branch `agent/two-pod-cluster-2`, merged into `main` the same day. Two replicas as two pods on `dacrib0` (context
+Branch `agent/two-pod-cluster-2`, merged into `main` on 2026-09-28 (after the test above ran). Two replicas as two pods on `dacrib0` (context
 `admin@dacrib0`, Talos v1.10.5, Kubernetes v1.33.2), namespace `myelin-cluster`, database the
 CloudNativePG `Database` `dacrib/myelin-cluster` on the shared `postgres-cluster`, media on
 SeaweedFS in the namespace. **The mesh between two pods carried real traffic for the first
@@ -182,6 +207,8 @@ through a port-forward. The two scripts' passwords are in the session's scratchp
 new users with `hs register` if needed.
 
 ### Next, in order
+
+Items 1 and 3 need `kubectl` to the cluster, so they are desktop items (see the top).
 
 1. Get the image CD builds for `main`, `helm upgrade --set image.tag=sha-<commit>` **while
    `rolling.py` runs** (that upgrade is itself the rolling update to measure), then
