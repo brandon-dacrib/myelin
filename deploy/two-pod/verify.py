@@ -2,8 +2,8 @@
 """Two-pod verification against port-forwards: A = hs-0 on :18008, B = hs-1 on :18009.
 
 Written 2026-09-27 for the two-pod experiment on the owner's cluster (docs/status/03-cluster.md,
-"Where this stopped"); NOT YET RUN against pods -- the cluster's etcd was unhealthy and nothing
-was installed. Expects users `alice` and `bob` (made with `hs register`) and:
+"Where this stopped"); first run against two pods 2026-09-28, passing (transcript there).
+Expects users `alice` and `bob` (made with `hs register`) and:
 
   kubectl -n myelin-cluster port-forward pod/hs-0 18008:8008 &
   kubectl -n myelin-cluster port-forward pod/hs-1 18009:8008 &

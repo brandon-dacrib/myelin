@@ -110,12 +110,24 @@ impl Forwarder {
         }
 
         let mut attempts = 0u32;
+        // Lookups that found no owner at all: the shard was released and nobody has acquired it
+        // yet, which during a rolling update lasts about a second (measured 2026-09-28). Waited
+        // out on the same backoff and deadline as a `421`.
+        let mut ownerless = 0u32;
         loop {
             if Instant::now() >= deadline_at {
                 return Err(ForwardError::DeadlineExceeded(env.shard));
             }
             let Some(owner) = self.ownership.owner_of(env.shard) else {
-                return Err(ForwardError::NoOwner(env.shard));
+                ownerless += 1;
+                let wait = self.backoff(ownerless);
+                if self.out_of_retries(ownerless, wait, deadline_at) {
+                    return Err(ForwardError::NoOwner(env.shard));
+                }
+                self.metrics.record_forward_retry("no_owner");
+                tracing::debug!(shard = %env.shard, lookup = ownerless, "no owner known for the shard yet, waiting");
+                tokio::time::sleep(wait).await;
+                continue;
             };
             attempts += 1;
             let attempt_start = Instant::now();

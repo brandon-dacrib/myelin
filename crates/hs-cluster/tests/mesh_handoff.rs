@@ -161,3 +161,67 @@ async fn a_forward_that_never_settles_gives_up_by_its_deadline() {
         "it should stop when the next attempt could not beat the deadline: took {took:?}"
     );
 }
+
+/// Knows no owner for any shard until `known_after` has passed since it was built, then names
+/// `owner`: a shard released by a draining replica and not yet acquired by the other.
+struct OwnerlessFor {
+    me: ReplicaId,
+    owner: ReplicaId,
+    since: Instant,
+    known_after: Duration,
+}
+
+impl hs_cluster::Ownership for OwnerlessFor {
+    fn me(&self) -> &ReplicaId {
+        &self.me
+    }
+    fn owner_of(&self, _shard: ShardId) -> Option<ReplicaId> {
+        (self.since.elapsed() >= self.known_after).then(|| self.owner.clone())
+    }
+    fn is_mine(&self, _shard: ShardId) -> bool {
+        false
+    }
+    fn fence(&self, _shard: ShardId) -> Option<hs_cluster::Fence> {
+        None
+    }
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<hs_cluster::OwnershipEvent> {
+        tokio::sync::broadcast::channel(1).1
+    }
+    fn shard_map(&self) -> tokio::sync::watch::Receiver<Arc<hs_cluster::ShardMap>> {
+        tokio::sync::watch::channel(Arc::new(hs_cluster::ShardMap::default())).1
+    }
+}
+
+#[tokio::test]
+async fn a_forward_waits_while_no_owner_is_known() {
+    // Seen in the rolling update: about a second in which the shard had no owner at all.
+    let (addr, seen) = spawn_peer_mid_handoff(421, Duration::ZERO).await;
+    let defaults = MeshConfig::default();
+    let forwarder = Forwarder::new(
+        AuthMode::SharedSecret {
+            secret: "test-only-secret".into(),
+        },
+        None,
+        defaults.max_hops,
+        defaults.max_attempts,
+        defaults.retry_base_backoff,
+        Arc::new(OwnerlessFor {
+            me: ReplicaId::new("hs-edge"),
+            owner: ReplicaId::new(addr),
+            since: Instant::now(),
+            known_after: Duration::from_millis(1_200),
+        }),
+        Arc::new(ClusterMetrics::new()),
+    )
+    .expect("forwarder");
+    let reply = forwarder
+        .forward(envelope(defaults.default_deadline))
+        .await
+        .expect("the owner turns up before the deadline");
+    assert_eq!(reply.status, 200);
+    assert_eq!(
+        seen.load(Ordering::SeqCst),
+        1,
+        "nothing is sent until an owner is known"
+    );
+}

@@ -9,7 +9,8 @@ Usage (after verify.py, from the same directory, hs-0 port-forwarded on :18008):
 Round-robins a send to each room from rooms.json, one at a time, and prints one line per send
 that failed or took over a second, plus a per-5-second summary. Some of the six rooms are owned
 by hs-1's shards, so their writes are forwarded over the mesh until hs-1 drains (graceful
-delete) and hs-0 takes the shards. NOT YET RUN (2026-09-27; see verify.py).
+delete) and hs-0 takes the shards. First run 2026-09-28: 7 of 240 sends failed, all in the
+handoff windows (docs/status/03-cluster.md); decision 0013 is the fix.
 """
 import json
 import os
