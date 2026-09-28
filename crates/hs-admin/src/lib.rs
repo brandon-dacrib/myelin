@@ -16,6 +16,8 @@
 //!   real handlers call, implemented elsewhere and wired onto [`router::AdminState`].
 //! - [`config_schema`]: which configuration settings are secrets, derived from the configuration
 //!   type's own JSON Schema, and the redaction the `/config*` handlers apply because of it.
+//! - [`reports`], [`tasks`], [`statistics`]: the Reports and Tasks areas and the statistics
+//!   beyond the Overview: their wire shapes, source traits and handlers.
 //! - [`assets`]: serves the management interface's built assets at `/admin/`.
 //! - [`registration_tokens`]: the `registration_tokens.*` operations and the source they use.
 //! - [`server_notices`]: the `server_notices.*` operations and the source they use.
@@ -32,11 +34,15 @@ pub mod bridge_offerings;
 pub mod bridge_types;
 pub mod config_schema;
 pub mod events;
+mod handler_kit;
 pub mod idempotency;
 pub mod model;
 pub mod openapi;
 pub mod operations;
 pub mod registration_tokens;
+pub mod reports;
 pub mod router;
 pub mod server_notices;
 pub mod sources;
+pub mod statistics;
+pub mod tasks;

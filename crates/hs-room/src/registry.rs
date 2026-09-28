@@ -127,6 +127,9 @@ pub struct RoomRegistry<B: KvBackend> {
     /// See [`RoomRegistry::install_server_notices_user`]. Unset means this server sends no
     /// server notices, and no room is one.
     server_notices_user: OnceLock<ruma::OwnedUserId>,
+
+    /// Reports users have filed about events, rooms and other users (`crate::reports`).
+    reports: crate::reports::ReportStore<B>,
 }
 
 impl<B: KvBackend + 'static> RoomRegistry<B> {
@@ -136,6 +139,7 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     /// Returns [`hs_kv::KvError`] if opening the shared keyspaces fails.
     pub fn open(backend: B, identity: HomeserverIdentity) -> Result<Self, hs_kv::KvError> {
         let tables = Tables::open(&backend)?;
+        let reports = crate::reports::ReportStore::open(backend.clone())?;
         // Sized to absorb a burst from many rooms at once without stalling any room actor: a
         // `broadcast` send never blocks, it drops the oldest item and reports `Lagged` to the
         // slow receiver, which the consumer must handle (`hs_user::hub`'s watcher does).
@@ -158,7 +162,15 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             backfill: OnceLock::new(),
             fencing: OnceLock::new(),
             server_notices_user: OnceLock::new(),
+            reports,
         })
+    }
+
+    /// The reports users have filed (`crate::routes::report` writes them, the admin API reads
+    /// them through [`crate::reports::RoomReports`]).
+    #[must_use]
+    pub fn reports(&self) -> &crate::reports::ReportStore<B> {
+        &self.reports
     }
 
     /// Installs the [`GlobalTokenResolver`] this registry's `GET /messages` handler consults for

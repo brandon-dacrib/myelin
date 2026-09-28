@@ -1211,6 +1211,12 @@ impl ConfigSource for InMemoryConfigSource {
 pub trait OverviewSource: Send + Sync + 'static {
     async fn statistics(&self) -> Result<StatisticsOverview, SourceError>;
     async fn cluster(&self) -> Result<ClusterStatus, SourceError>;
+    /// The same numbers counted now, past any cache [`OverviewSource::statistics`] keeps, and
+    /// without refreshing it: what the statistics sampler records
+    /// (`crate::statistics`). Defaults to [`OverviewSource::statistics`].
+    async fn statistics_now(&self) -> Result<StatisticsOverview, SourceError> {
+        self.statistics().await
+    }
 }
 
 /// A fixed [`OverviewSource`], for this crate's tests.

@@ -1716,9 +1716,11 @@ async fn the_overview_counts_real_accounts_and_rooms_and_omits_what_nobody_count
         "{first}"
     );
     // Nothing here can count these yet, so they are absent -- not 0, not null.
-    for unknown in ["media_count", "media_bytes", "pending_reports_count"] {
+    for unknown in ["media_count", "media_bytes"] {
         assert!(first.get(unknown).is_none(), "{unknown} in {first}");
     }
+    // Reports are counted: nobody has filed one.
+    assert_eq!(first["pending_reports_count"], 0, "{first}");
     // Failing federation destinations *are* counted now: none, because this server has tried
     // to reach nobody. Zero, not absent: the difference between "nothing is failing" and
     // "could not check" is the whole point of the Overview's all-clear.

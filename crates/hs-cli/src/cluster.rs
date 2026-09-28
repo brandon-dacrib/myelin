@@ -408,6 +408,18 @@ fn single_node_replica_id() -> String {
 /// empty value falling back to `127.0.0.1` -- right only when every replica shares one host, as
 /// in the two-process experiment in `docs/status/03-cluster.md`; [`start`] logs a warning in
 /// that case.
+/// The name this process runs admin tasks under (`hs_admin::tasks::TaskRegistry`): a fixed
+/// `single-node` when there is one process, so a restart recognises the tasks it left behind;
+/// in cluster mode, this replica's identity, so one replica's restart never touches another's.
+#[must_use]
+pub fn task_runner_name(config: &hs_config::Config) -> String {
+    if config.cluster.single_node {
+        "single-node".to_owned()
+    } else {
+        advertise_addr(config)
+    }
+}
+
 fn advertise_addr(config: &hs_config::Config) -> String {
     let port = config.cluster.mesh.port;
     if let Some(configured) = config

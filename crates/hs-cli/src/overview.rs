@@ -16,9 +16,10 @@
 //!   seen in the last 24 hours / 30 days. "Seen" is `DeviceRecord::last_seen_ms`, which every
 //!   authenticated request refreshes.
 //! - `rooms_count`: rooms this server has state for.
-//! - Media, failing federation destinations and pending reports are **left out**, not zero:
-//!   nothing here can count them yet, and the contract makes every field optional so that "not
-//!   known" does not have to be dressed up as a number.
+//! - `federation_destinations_failing_count` and `pending_reports_count` (open reports), once
+//!   their sources are set.
+//! - Media is **left out**, not zero: nothing here counts it yet, and the contract makes every
+//!   field optional so that "not known" does not have to be dressed up as a number.
 //!
 //! # Cost
 //!
@@ -53,6 +54,9 @@ pub struct ServerOverview<B: KvBackend> {
     /// Where the count of failing federation destinations comes from. Absent until set, and
     /// the count is then absent too rather than zero.
     federation: OnceLock<Arc<dyn hs_admin::sources::FederationSource>>,
+    /// Where the count of open reports comes from. Absent until set, and the count is then
+    /// absent too.
+    reports: OnceLock<Arc<dyn hs_admin::reports::ReportSource>>,
     cached: tokio::sync::Mutex<Option<(Instant, StatisticsOverview)>>,
     ttl: Duration,
 }
@@ -67,6 +71,7 @@ impl<B: KvBackend + 'static> ServerOverview<B> {
             single_node,
             ownership: OnceLock::new(),
             federation: OnceLock::new(),
+            reports: OnceLock::new(),
             cached: tokio::sync::Mutex::new(None),
             ttl: STATISTICS_TTL,
         }
@@ -87,6 +92,11 @@ impl<B: KvBackend + 'static> ServerOverview<B> {
     /// Hands over the federation source, so the overview can count failing destinations.
     pub fn set_federation(&self, federation: Arc<dyn hs_admin::sources::FederationSource>) {
         let _ = self.federation.set(federation);
+    }
+
+    /// Hands over the reports, so the overview can count the ones awaiting action.
+    pub fn set_reports(&self, reports: Arc<dyn hs_admin::reports::ReportSource>) {
+        let _ = self.reports.set(reports);
     }
 
     async fn count(&self) -> Result<StatisticsOverview, SourceError> {
@@ -133,12 +143,17 @@ impl<B: KvBackend + 'static> ServerOverview<B> {
             ),
             None => None,
         };
+        let pending_reports_count = match self.reports.get() {
+            Some(reports) => Some(reports.open_count().await?),
+            None => None,
+        };
         Ok(StatisticsOverview {
             users_count: Some(users),
             rooms_count: Some(rooms),
             daily_active_users: Some(daily),
             monthly_active_users: Some(monthly),
             federation_destinations_failing_count: failing,
+            pending_reports_count,
             ..StatisticsOverview::default()
         })
     }
@@ -158,6 +173,10 @@ impl<B: KvBackend + 'static> OverviewSource for ServerOverview<B> {
         let statistics = self.count().await?;
         *cached = Some((Instant::now(), statistics.clone()));
         Ok(statistics)
+    }
+
+    async fn statistics_now(&self) -> Result<StatisticsOverview, SourceError> {
+        self.count().await
     }
 
     async fn cluster(&self) -> Result<ClusterStatus, SourceError> {
