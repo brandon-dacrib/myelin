@@ -44,6 +44,16 @@ import {
   federationDestinations,
 } from "./data/dashboard";
 import { auditEntries } from "./data/audit";
+import {
+  deleteReport,
+  getReport,
+  listReports,
+  openReportCount,
+  resolveReport,
+} from "./data/reports";
+import { cancelTask, getTask, listTasks } from "./data/tasks";
+import { roomStatistics, sortStatistics, timeseries, userMediaStatistics } from "./data/statistics";
+import type { ReportResolve } from "@/api/reports";
 import { succeeded } from "@/lib/audit";
 import { users, userDevices, findUser } from "./data/users";
 import {
@@ -75,6 +85,16 @@ import type { AppService, BridgeOfferingRequest } from "@/api/bridges";
 import type { JsonValue } from "@/api/config-schema";
 
 const API = "/api/v1";
+
+const RESOLUTION_VALUES: readonly ReportResolve["resolution"][] = [
+  "no_action",
+  "warned",
+  "redacted",
+  "suspended",
+  "deactivated",
+  "room_blocked",
+  "other",
+];
 
 const NO_STORE = { "Cache-Control": "no-store" };
 
@@ -328,7 +348,94 @@ export const handlers = [
   }),
 
   // ---- Dashboard ----
-  http.get(`${API}/statistics/overview`, () => HttpResponse.json(statisticsOverview)),
+  http.get(`${API}/statistics/overview`, () =>
+    HttpResponse.json({ ...statisticsOverview, pending_reports_count: openReportCount() }),
+  ),
+
+  // ---- Statistics (crates/hs-admin/src/statistics.rs) ----
+  http.get(`${API}/statistics/rooms`, ({ request }) => {
+    const url = new URL(request.url);
+    const sorted = sortStatistics(
+      roomStatistics,
+      url.searchParams.get("sort") ?? "-joined_members_count",
+      ["joined_members_count", "state_events_count"],
+    );
+    if ("error" in sorted)
+      return problem(400, "validation-failed", "Validation failed", {
+        errors: [{ pointer: "/sort", detail: sorted.error }],
+      });
+    return HttpResponse.json(paginate(sorted, url));
+  }),
+  http.get(`${API}/statistics/users/media`, ({ request }) => {
+    const url = new URL(request.url);
+    const sorted = sortStatistics(
+      userMediaStatistics,
+      url.searchParams.get("sort") ?? "-media_bytes",
+      ["media_bytes", "media_count"],
+    );
+    if ("error" in sorted)
+      return problem(400, "validation-failed", "Validation failed", {
+        errors: [{ pointer: "/sort", detail: sorted.error }],
+      });
+    return HttpResponse.json(paginate(sorted, url));
+  }),
+  http.get(`${API}/statistics/timeseries`, ({ request }) => {
+    const series = timeseries(new URL(request.url).searchParams);
+    if ("error" in series)
+      return problem(400, "validation-failed", "Validation failed", {
+        errors: [{ pointer: series.pointer, detail: series.error }],
+      });
+    return HttpResponse.json(series);
+  }),
+
+  // ---- Reports (crates/hs-admin/src/reports.rs) ----
+  http.get(`${API}/reports`, ({ request }) => {
+    const url = new URL(request.url);
+    const items = listReports(url.searchParams);
+    if ("error" in items)
+      return problem(400, "validation-failed", "Validation failed", {
+        errors: [{ pointer: "/sort", detail: items.error }],
+      });
+    return HttpResponse.json(paginate(items, url));
+  }),
+  http.get(`${API}/reports/:id`, ({ params }) => {
+    const report = getReport(String(params.id));
+    return report ? HttpResponse.json(report) : problem(404, "not-found", "Report not found");
+  }),
+  http.post(`${API}/reports/:id/resolve`, async ({ params, request }) => {
+    const body = (await request.json()) as ReportResolve;
+    if (!RESOLUTION_VALUES.includes(body?.resolution)) {
+      return problem(400, "validation-failed", "Validation failed", {
+        errors: [{ pointer: "/resolution", detail: "resolution is not one the contract allows" }],
+      });
+    }
+    const result = resolveReport(String(params.id), body, "@ops:example.org");
+    if (result === undefined) return problem(404, "not-found", "Report not found");
+    if (result === "closed")
+      return problem(409, "conflict", "Conflict", {
+        detail: "this report is already closed",
+      });
+    return HttpResponse.json(result);
+  }),
+  http.delete(`${API}/reports/:id`, ({ params }) =>
+    deleteReport(String(params.id))
+      ? new HttpResponse(null, { status: 204 })
+      : problem(404, "not-found", "Report not found"),
+  ),
+
+  // ---- Tasks (crates/hs-admin/src/tasks.rs) ----
+  http.get(`${API}/tasks`, ({ request }) => {
+    const url = new URL(request.url);
+    return HttpResponse.json(paginate(listTasks(url.searchParams), url));
+  }),
+  http.get(`${API}/tasks/:id`, ({ params }) => {
+    const task = getTask(String(params.id));
+    return task ? HttpResponse.json(task) : problem(404, "not-found", "Task not found");
+  }),
+  http.post(`${API}/tasks/:id/cancel`, ({ params }) => {
+    const task = cancelTask(String(params.id));
+    return task ? HttpResponse.json(task) : problem(404, "not-found", "Task not found");
+  }),
   http.get(`${API}/server`, () => HttpResponse.json(serverInfo)),
   http.get(`${API}/server/health`, () =>
     HttpResponse.json({ status: "ok", checks: { storage: "ok", federation: "ok" } }),

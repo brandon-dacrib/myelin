@@ -18,19 +18,19 @@
  *   an hour" attention rows.
  * - `GET /audit-log` — the five most recent entries.
  *
- * The richer "Activity" sparklines (`GET /statistics/timeseries?metric=...`)
- * are deliberately not wired in yet: the metric-name vocabulary isn't
- * documented in the schema, so a real fixture/backend is needed to know
- * what to ask for. Left for the next session; see
- * docs/status/16-management-web-interface.md.
+ * - `GET /statistics/timeseries?metric=...` — the "Activity" sparklines, through
+ *   `useTimeseries` in `./statistics` (the metric vocabulary is the contract's
+ *   `metric` enum).
+ * - `GET /tasks?status=failed` — the "task failed" attention rows.
  */
 import { useQuery } from "@tanstack/react-query";
 import { api } from "./client";
 import { unwrap } from "./problem";
 
-export function useStatisticsOverview() {
+export function useStatisticsOverview(options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: ["statistics-overview"],
+    enabled: options?.enabled ?? true,
     queryFn: async () => {
       const result = await api.GET("/statistics/overview");
       return unwrap(result);

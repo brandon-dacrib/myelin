@@ -71,8 +71,11 @@ function serveLikeTheRealServer() {
     ),
     http.get("/api/v1/appservices", notImplemented),
     http.get("/api/v1/federation/destinations", notImplemented),
+    http.get("/api/v1/tasks", () => HttpResponse.json(emptyPage)),
   );
 }
+
+const emptyPage = { items: [], next_cursor: null, prev_cursor: null };
 
 describe("Overview", () => {
   it("shows a new server's numbers, a real zero included", async () => {
@@ -110,11 +113,57 @@ describe("Overview", () => {
       http.get("/api/v1/federation/destinations", () =>
         HttpResponse.json({ items: [], next_cursor: null, prev_cursor: null }),
       ),
+      http.get("/api/v1/tasks", () => HttpResponse.json(emptyPage)),
     );
     renderDashboard();
 
     expect(await screen.findByText("Nothing needs your attention.")).toBeInTheDocument();
     expect(screen.queryByText(/can.t check/)).not.toBeInTheDocument();
+  });
+
+  it("says so when a task failed in the last day, and links to it", async () => {
+    renderDashboard();
+
+    const row = await screen.findByText(/Task "Delete room" failed: the room's owner replica/);
+    expect(row).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "Open task" })).toHaveLength(1);
+  });
+
+  it("gives the last seven days as sparklines, each with its number", async () => {
+    server.use(
+      http.get("/api/v1/statistics/timeseries", ({ request }) => {
+        const metric = new URL(request.url).searchParams.get("metric");
+        const values = metric === "daily_active_users" ? [180, 190, 214] : [1, 0, 2];
+        return HttpResponse.json({
+          metric,
+          step_ms: 21_600_000,
+          points: values.map((value, i) => ({
+            at: new Date(Date.UTC(2026, 8, 20, i * 6)).toISOString(),
+            value,
+          })),
+        });
+      }),
+    );
+    renderDashboard();
+
+    // A gauge shows its latest sample; a counter the total over the week.
+    expect(await (await tile("Daily active, 7-day trend")).findByText("214")).toBeInTheDocument();
+    expect(await (await tile("New accounts, 7 days")).findByText("3")).toBeInTheDocument();
+    expect(await (await tile("Media uploaded, 7 days")).findByText("3 B")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "All statistics" })).toHaveAttribute(
+      "href",
+      "/statistics",
+    );
+  });
+
+  it("marks an activity tile the server cannot answer, and keeps the rest", async () => {
+    server.use(http.get("/api/v1/statistics/timeseries", notImplemented));
+    renderDashboard();
+
+    expect(
+      await (await tile("New accounts, 7 days")).findByText("Not implemented"),
+    ).toBeInTheDocument();
+    expect((await tile("Users")).getByText("642")).toBeInTheDocument();
   });
 
   it("shows a dash, not a zero, for a count the server did not send", async () => {

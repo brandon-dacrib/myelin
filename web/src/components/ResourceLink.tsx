@@ -46,5 +46,17 @@ export function ResourceLink({ target, className }: { target: AuditTarget; class
           {target.id}
         </Link>
       );
+    case "/reports/$reportId":
+      return (
+        <Link to={route.to} params={route.params} className={linkClasses}>
+          {target.id}
+        </Link>
+      );
+    case "/tasks/$taskId":
+      return (
+        <Link to={route.to} params={route.params} className={linkClasses}>
+          {target.id}
+        </Link>
+      );
   }
 }

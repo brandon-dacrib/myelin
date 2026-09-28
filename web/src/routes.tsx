@@ -11,6 +11,9 @@ import { WIZARD_STEPS, type WizardStep } from "@/pages/bridges/wizard/wizard-sta
 import { OFFER_STEPS, type OfferStep } from "@/pages/bridges/wizard/offer-state";
 import { validateAuditSearch } from "@/pages/audit/audit-search";
 import { validateMediaSearch } from "@/pages/media/media-search";
+import { validateReportsSearch } from "@/pages/reports/reports-search";
+import { validateTasksSearch } from "@/pages/tasks/tasks-search";
+import { validateStatisticsSearch } from "@/pages/statistics/statistics-search";
 
 // Route-level code splitting: each page (and its own dependency graph —
 // react-query hooks, mock-independent UI, etc.) lands in its own chunk,
@@ -82,6 +85,20 @@ const AuditPage = lazyRouteComponent(() => import("@/pages/audit/AuditPage"), "A
 const AuditEntryPage = lazyRouteComponent(
   () => import("@/pages/audit/AuditEntryPage"),
   "AuditEntryPage",
+);
+const ReportsPage = lazyRouteComponent(() => import("@/pages/reports/ReportsPage"), "ReportsPage");
+const ReportDetailPage = lazyRouteComponent(
+  () => import("@/pages/reports/ReportDetailPage"),
+  "ReportDetailPage",
+);
+const TasksPage = lazyRouteComponent(() => import("@/pages/tasks/TasksPage"), "TasksPage");
+const TaskDetailPage = lazyRouteComponent(
+  () => import("@/pages/tasks/TaskDetailPage"),
+  "TaskDetailPage",
+);
+const StatisticsPage = lazyRouteComponent(
+  () => import("@/pages/statistics/StatisticsPage"),
+  "StatisticsPage",
 );
 
 function NotFoundPage() {
@@ -264,7 +281,36 @@ function placeholderRoute<T extends string>(path: T) {
   return createRoute({ getParentRoute: () => rootRoute, path, component: PlaceholderPage });
 }
 
-const reportsRoute = placeholderRoute("/reports");
+const reportsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/reports",
+  validateSearch: validateReportsSearch,
+  component: ReportsPage,
+});
+const reportDetailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/reports/$reportId",
+  validateSearch: validateReportsSearch,
+  component: ReportDetailPage,
+});
+const tasksRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/tasks",
+  validateSearch: validateTasksSearch,
+  component: TasksPage,
+});
+const taskDetailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/tasks/$taskId",
+  validateSearch: validateTasksSearch,
+  component: TaskDetailPage,
+});
+const statisticsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/statistics",
+  validateSearch: validateStatisticsSearch,
+  component: StatisticsPage,
+});
 const mediaRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/media",
@@ -335,6 +381,10 @@ const routeTree = rootRoute.addChildren([
   roomsRoute,
   roomDetailRoute,
   reportsRoute,
+  reportDetailRoute,
+  tasksRoute,
+  taskDetailRoute,
+  statisticsRoute,
   federationRoute,
   federationDestinationRoute,
   configurationRoute,

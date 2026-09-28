@@ -6,6 +6,8 @@ import { resetBridgeOfferings } from "@/mocks/data/bridge-offerings";
 import { resetRegistrationTokens } from "@/mocks/data/registration-tokens";
 import { resetServerNotices } from "@/mocks/data/server-notices";
 import { resetMedia } from "@/mocks/data/media";
+import { resetReports } from "@/mocks/data/reports";
+import { resetTasks } from "@/mocks/data/tasks";
 
 /**
  * Give the API client an absolute base URL before anything imports it.
@@ -75,5 +77,7 @@ afterEach(() => {
   resetServerNotices();
   // So is its media (quarantine, protection and the deletions change it).
   resetMedia();
+  resetReports();
+  resetTasks();
 });
 afterAll(() => server.close());

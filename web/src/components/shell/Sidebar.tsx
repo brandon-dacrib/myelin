@@ -3,7 +3,7 @@ import { navItems } from "./nav";
 import { hasScope } from "@/lib/auth";
 import { cn } from "@/lib/cn";
 import { useAppservices } from "@/api/bridges";
-import { useClusterStatus } from "@/api/dashboard";
+import { useClusterStatus, useStatisticsOverview } from "@/api/dashboard";
 
 export interface SidebarProps {
   /** "rail" = icon-only (1024-1279px), "full" = icon + label (>=1280px). */
@@ -14,6 +14,12 @@ export interface SidebarProps {
 export function Sidebar({ variant, onNavigate }: SidebarProps) {
   const { data: appservicePage } = useAppservices({ limit: 50 });
   const { data: cluster } = useClusterStatus();
+  // Open reports, from the Overview's own counts (information-architecture.md #6: the sidebar
+  // counts what needs attention). Only asked for by someone who could read them.
+  const { data: overview } = useStatisticsOverview({
+    enabled: hasScope("admin:read") && hasScope("moderation:read"),
+  });
+  const openReports = overview?.pending_reports_count ?? 0;
   const bridgesInError = appservicePage?.items.filter((b) => b.health === "down").length ?? 0;
   // No explicit single-node/cluster boolean on ClusterStatus; replica_count
   // <= 1 is this track's heuristic (api/dashboard.ts's doc comment).
@@ -30,7 +36,8 @@ export function Sidebar({ variant, onNavigate }: SidebarProps) {
     <nav aria-label="Primary" className="flex h-full flex-col gap-1 overflow-y-auto p-2">
       {items.map((item) => {
         const Icon = item.icon;
-        const count = item.id === "bridges" ? bridgesInError : 0;
+        const count =
+          item.id === "bridges" ? bridgesInError : item.id === "reports" ? openReports : 0;
         return (
           <Link
             key={item.id}
