@@ -309,11 +309,33 @@ async fn act_join<B: KvBackend + 'static>(
     match state.rooms.get_or_load(&room_id).await {
         Ok(handle) => {
             if let Some(remote) = &state.remote_join
-                && let Some(servers) = handle.query(|actor| actor.servers_to_join_through()).await
+                && let Some((servers, shell)) = handle
+                    .query(|actor| {
+                        actor.servers_to_join_through().map(|servers| {
+                            let shell = matches!(actor.state_event("m.room.create", ""), Ok(None));
+                            (servers, shell)
+                        })
+                    })
+                    .await
             {
-                for server in servers {
-                    if !via.contains(&server) {
-                        via.push(server);
+                // The servers the client named are the ones asked, as Synapse does (Complement's
+                // `TestRestrictedRoomsRemoteJoinFailOver`: a join naming only a server that
+                // cannot authorise it fails). Only for a room held through an invite or a knock
+                // are the servers it came through added (Synapse adds the inviter's); only when
+                // the client named nobody is this server's own guess used.
+                let client_named = !via.is_empty();
+                if shell || !client_named {
+                    for server in servers {
+                        if !via.contains(&server) {
+                            via.push(server);
+                        }
+                    }
+                }
+                if !client_named {
+                    for server in allowed_rooms_servers(state, &handle).await {
+                        if !via.contains(&server) && server != state.identity.server_name.as_str() {
+                            via.push(server);
+                        }
                     }
                 }
                 let joined = remote.join(&sender, &room_id, &via, content).await?;
@@ -368,9 +390,11 @@ async fn act_join<B: KvBackend + 'static>(
                 .remote_join
                 .as_ref()
                 .expect("checked by the match guard");
-            if let Some(server) = room_id.server_name()
+            // A room ID's server is asked only when the client named nobody (Synapse asks only
+            // the servers named; a version 12 room ID names none).
+            if via.is_empty()
+                && let Some(server) = room_id.server_name()
                 && server != &*state.identity.server_name
-                && !via.iter().any(|v| v == server.as_str())
             {
                 via.push(server.to_string());
             }
@@ -386,6 +410,45 @@ async fn act_join<B: KvBackend + 'static>(
 
 /// Whether `user` is joined to any of `rooms`, as this server holds them. A room this server
 /// does not hold has no member of this server, so it cannot be one `user` is in.
+/// The servers of the rooms `handle`'s join rules allow, as far as this server knows them
+/// (`RoomActor::known_allowed_rooms`: from the room's own join rules, or from the stripped state
+/// a local user's invite or knock arrived with): each allowed room's `via`, then the servers of
+/// its joined members if this server holds it. A server in an allowed room can check the joining
+/// user's membership there, and is often in the restricted room too: where a restricted join
+/// the client named no server for is sent, after the servers the room itself suggests.
+async fn allowed_rooms_servers<B: KvBackend + 'static>(
+    state: &RoomState<B>,
+    handle: &crate::actor::RoomActorHandle<B>,
+) -> Vec<String> {
+    let allowed = handle.query(|actor| actor.known_allowed_rooms()).await;
+    let mut servers: Vec<String> = Vec::new();
+    for (allowed_room, hints) in allowed {
+        let mut candidates = hints;
+        if let Ok(allowed_handle) = state.rooms.get_or_load(&allowed_room).await {
+            candidates.extend(
+                allowed_handle
+                    .query(|actor| {
+                        actor
+                            .joined_members()
+                            .unwrap_or_default()
+                            .iter()
+                            .filter_map(|member| member.header().state_key.as_deref())
+                            .filter_map(|key| ruma::UserId::parse(key).ok())
+                            .map(|user| user.server_name().to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .await,
+            );
+        }
+        for server in candidates {
+            if !servers.contains(&server) {
+                servers.push(server);
+            }
+        }
+    }
+    servers
+}
+
 async fn joined_to_any<B: KvBackend + 'static>(
     state: &RoomState<B>,
     rooms: &[ruma::OwnedRoomId],

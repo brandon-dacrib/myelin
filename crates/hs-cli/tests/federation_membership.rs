@@ -1226,13 +1226,15 @@ async fn stripped_state_stays_out_of_the_timeline() {
     b.handle.shutdown().await;
 }
 
-/// Every server bob's client names refuses his restricted join with
-/// `M_UNABLE_TO_AUTHORISE_JOIN` (C is in the room but not in the lobby it allows); B then asks
-/// the servers of the lobby, which it knows from the stripped state bob's knock came back with,
-/// and A, which is in both, authorises the join. Three servers: with two, the only server to
-/// ask and the only one to fall back to would be the same.
+/// The servers a client names for a restricted join are the ones asked, and only those
+/// (Synapse's rule; Complement's `TestRestrictedRoomsRemoteJoinFailOver`): naming only C, which is
+/// in the room but not in the lobby it allows, bob's join fails with C's
+/// `M_UNABLE_TO_AUTHORISE_JOIN`. Naming nobody, B sends it to the servers of the lobby, which it
+/// knows from the stripped state bob's knock came back with (a version 12 room ID names no
+/// server), and A, which is in both, authorises it. Three servers: with two, the server named and
+/// the lobby's would be the same.
 #[tokio::test]
-async fn a_restricted_join_nobody_asked_can_authorise_goes_to_the_allowed_rooms_servers() {
+async fn a_restricted_join_goes_through_the_servers_named_or_else_the_allowed_rooms_servers() {
     let (a, b, c) = (start().await, start().await, start().await);
     let client = reqwest::Client::new();
     let alice = register(&client, &a, "alice").await;
@@ -1304,7 +1306,7 @@ async fn a_restricted_join_nobody_asked_can_authorise_goes_to_the_allowed_rooms_
     .await;
     assert_eq!(status, 200, "{body}");
 
-    // Joining through C alone: C cannot vouch for him, the lobby's server can.
+    // Joining through C alone: C cannot vouch for him, and nobody else is asked.
     let (status, body) = post(
         &client,
         &bob,
@@ -1312,6 +1314,16 @@ async fn a_restricted_join_nobody_asked_can_authorise_goes_to_the_allowed_rooms_
         json!({}),
     )
     .await;
+    assert_ne!(
+        status, 200,
+        "a join naming only C is not sent elsewhere: {body}"
+    );
+    assert!(
+        body.to_string().contains("M_UNABLE_TO_AUTHORISE_JOIN"),
+        "C's answer is passed on: {body}"
+    );
+    // Naming nobody: the lobby's server can.
+    let (status, body) = post(&client, &bob, &format!("join/{room}"), json!({})).await;
     assert_eq!(status, 200, "the restricted join failed: {body}");
     wait_for_membership(&client, &alice, &room, &bob.id, "join").await;
     let content = member_content(&client, &alice, &room, &bob.id).await;

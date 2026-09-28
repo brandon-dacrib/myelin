@@ -2,6 +2,22 @@
 
 ## Thirteenth session (2026-09-28): what was left after the join
 
+**Branch state (2026-09-28, wrap-up):** branch `agent/federation-leftovers`, not merged. Items 1-5
+below are done, plus Complement-driven fixes (knock after knock; a client's
+`join_authorised_via_users_server` dropped; only the inviter rescinds an invite over federation;
+`make_join` answers 403 when it is in every allowed room; a join asks only the servers the client
+named, and the allowed rooms' servers only when it named none, which replaces item 2's
+"fall back after `M_UNABLE_TO_AUTHORISE_JOIN`", since Synapse does not and Complement tests that
+it must not). Gate: `cargo clippy -p hs-cli -p hs-room -p hs-federation`, `cargo test -p hs-room -p
+hs-user`, `federation_membership` (12/12) and `cluster_edus` (on PostgreSQL) pass; the full
+workspace gate last ran green before the Complement fixes, except `hs-loadgen`'s `real_client`
+(boot timeout under disk load, since fixed on main by 8cc6b92), and has not run on the tip.
+Complement (`TestRestrictedRooms*`, `TestFederationRoomsInvite`, `TestKnocking*`,
+`TestKnockRooms*`, `TestFederationRejectInvite`): run 1 5/18 top-level, 76/98 subtests; run 2
+(before the via change) 14/18, 94/98. Left failing: `TestRestrictedRoomsSpacesSummary{Local,Federation}`
+(`/hierarchy` is not implemented) and `TestRestrictedRoomsRemoteJoinFailOver*` (fixed by the via
+change, not re-run). Left: merge (rebase, full gate), re-run Complement, cluster run of item 5.
+
 Scope: `docs/next-steps.md` queue item 3's remainder, in order. Each item merged to main on its
 own. Touched `hs-room`, `hs-cli` and this crate.
 
