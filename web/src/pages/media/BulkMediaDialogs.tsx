@@ -68,7 +68,7 @@ export function BulkDeleteDialog({ disabled }: { disabled: boolean }) {
   const [before, setBefore] = useState(() => daysAgo(90));
   const [minMb, setMinMb] = useState("");
   const bulkDelete = useBulkDeleteMedia();
-  const minBytes = minMb.trim() === "" ? undefined : Math.round(Number(minMb) * 1_000_000);
+  const minBytes = minMb.trim() === "" ? undefined : Math.round(Number(minMb) * 1024 * 1024);
   const minInvalid = minBytes !== undefined && (!Number.isFinite(minBytes) || minBytes < 0);
 
   return (
@@ -129,7 +129,7 @@ export function BulkDeleteDialog({ disabled }: { disabled: boolean }) {
             )}
           </Field>
           <Field
-            label="Only files at least this large (MB)"
+            label="Only files at least this large (MiB)"
             hint="Leave empty to include every size."
             error={minInvalid ? "Enter a size of zero or more." : undefined}
           >

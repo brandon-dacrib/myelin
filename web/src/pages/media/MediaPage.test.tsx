@@ -64,7 +64,7 @@ describe("Media", () => {
     renderMedia();
     const vacation = await rowOf("vacation.jpg");
     expect(vacation.getByText("@alice:example.org")).toBeInTheDocument();
-    expect(vacation.getByText("2.4 MB")).toBeInTheDocument();
+    expect(vacation.getByText("2.3 MiB")).toBeInTheDocument();
     expect(vacation.getByText("mxc://example.org/vacationPhotoAbc123")).toBeInTheDocument();
 
     const exe = await rowOf("definitely-not-malware.exe");
