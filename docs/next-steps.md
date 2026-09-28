@@ -461,6 +461,18 @@ configuration history and revert (`ConfigStore` already records the patch per re
   Revert, verified against the real binary (`crates/hs-cli/tests/config_history.rs`,
   `e2e-real/configuration.spec.ts` 4/4). Being rebased onto the follow-ups and its decision
   renumbered (0014 is moderation's) before it goes to the queue.
+- 19:15 **the gate refused `agent/admin-followups` (`b9dcc82`)** on two workspace tests, both
+  in `hs-cli` real-server suites the per-crate run did not cover:
+  `an_administrator_can_find_quarantine_protect_and_delete_uploaded_media` and
+  `the_overview_counts_real_accounts_and_rooms_and_omits_what_nobody_counts` (log:
+  `.claude/worktrees/merge-queue/target/merge-gate-agent-admin-followups.log`). Likely the
+  branch's shared `media_source` / `overview.set_media` rewiring in `serve.rs`. Fix, then
+  `tools/merge-queue.sh agent/admin-followups`.
+- **Session ended at the usage limit (19:15).** Still open, in order: fix and merge
+  `agent/admin-followups` (brings 158 of 158); merge `agent/config-history` (its agent was
+  rebasing it onto the follow-ups and renumbering its decision to 0015 — check the branch tip
+  and its status 15 entry); `agent/config-reload` (hot reload of rate limits, federation
+  policy, log filter) was still being built — check how far its pushed branch got.
 
 ## Handover (2026-09-28, 16:00 EDT): where the nine resumed agents stopped
 
