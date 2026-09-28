@@ -396,8 +396,8 @@ but the number is only meaningful broken up, because the parts are nowhere near 
 | Client-server API | ~75% | 317/384 csapi assertions, 78/106 top-level (run 11); two real Element sessions sign in, create an encrypted room, invite, accept, and read each other's encrypted messages. The number understates the day: four of the fixes behind it were `/sync` silently losing events, which no percentage shows |
 | Storage, rooms, state resolution | ~85% | the engine underneath; 1600+ tests, two backends through one conformance suite, state bake-off done |
 | Configuration and first run | ~90% | database-backed, editable in the UI, one command from nothing to a working server |
-| Admin API | ~89% | 140 of 158 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Bridges 26/26, Media 9/9, Cluster 6/6, Config 6/6, RegistrationTokens 5/5, Server 5/5, Reports 4/4, Statistics 4/4, AuditLog 3/3, Recovery 3/3, Tasks 3/3, ServerNotices 2/2, Setup 2/2, Events 1/1, Rooms 23/23, Users 27/41, Federation 3/7, and Migration 8/8 (2026-09-28: the importer from Synapse, `docs/compat/synapse-migration-runbook.md`) |
-| Management web interface | ~80% | users (with devices, sign-out and password reset), rooms (members, state, timeline, aliases, media, extremities, join, purge and delete), bridges (the catalogue, the wizard with the bridge's own config, the runbook, sign-in guides), federation destinations, media (previews, quarantine, protection, deletion, cache purge), registration tokens and invite links, server notices, configuration (lists, variants and maps as forms, decision 0010), the Cluster page (replicas, the shard map, drain and undrain) and the audit log are real against the real server; the Reports, Tasks and Statistics pages and the Overview sparklines are not built on their (now real) operations |
+| Admin API | ~97% | 154 of 158 operations have a real handler (`python3 tools/admin_api_coverage.py`, which counts them from source); the rest answer an honest 501. By area: Bridges 26/26, Media 9/9, Cluster 6/6, Config 6/6, RegistrationTokens 5/5, Server 5/5, Reports 4/4, Statistics 4/4, AuditLog 3/3, Recovery 3/3, Tasks 3/3, ServerNotices 2/2, Setup 2/2, Events 1/1, Rooms 23/23, Users 41/41, Federation 3/7, and Migration 8/8 (2026-09-28: the importer from Synapse, `docs/compat/synapse-migration-runbook.md`) |
+| Management web interface | ~80% | users (with devices, sign-out and password reset, and suspension, shadow-bans, rate limits, redaction, support sessions and activity), rooms (members, state, timeline, aliases, media, extremities, join, purge and delete), bridges (the catalogue, the wizard with the bridge's own config, the runbook, sign-in guides), federation destinations, media (previews, quarantine, protection, deletion, cache purge), registration tokens and invite links, server notices, configuration (lists, variants and maps as forms, decision 0010), the Cluster page (replicas, the shard map, drain and undrain) and the audit log are real against the real server; the Reports, Tasks and Statistics pages and the Overview sparklines are not built on their (now real) operations |
 | **Federation** | **~30%** | 75/250 assertions, 14/88 top-level (run 7); a user here joins a room hosted elsewhere through the client API, messages flow both ways between two real servers, and the room's history from before the join is fetched as the client scrolls back; the outbound queue survives a restart and is shard-gated; invites, leaves, knocks and restricted joins cross servers; typing, receipts, presence, device lists, cross-signing keys (`m.signing_key_update`) and to-device messages cross in both directions, with EDU metrics; in cluster mode a non-owning replica drops request-born EDUs instead of forwarding them |
 | Bridges | ~75% | heisenbridge works end to end both directions (`docs/bridges/heisenbridge.md`); mautrix-whatsapp, added through the wizard, connects and starts in appservice-mode encryption (`docs/bridges/mautrix.md`); all 26 bridge operations are real; offerings and per-user instances (RFC 0017) run end to end against the real binary with the `elsewhere` runtime, a real heisenbridge reaching `ready` from the rendered files and the interface's flow passing as Playwright against the real server; no mautrix bridge has carried a message yet, because signing in needs a phone; the `cluster` runtime and the operator have not run against Kubernetes |
 | Operations (HA, scale-out) | ~50% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; the chart is published from `main` and installs from the registry in one sentence; a standing demo behind a Traefik Ingress with a Let's Encrypt certificate, scraped by Prometheus, its setup page opened in a browser at the public hostname; a locked-out administrator gets back in with `hs recover` run where the key is; readiness withdrawn the moment a shutdown begins; two replicas share a room on one PostgreSQL and a client's `/sync` works from either, woken over the mesh, with read-your-writes across them; the outbound federation sender is shard-gated; an administrator drains any replica from the Cluster page and undrains it, and the drain survives a restart (decision 0012; two real processes on one PostgreSQL in `crates/hs-cli/tests/cluster_admin.rs`); the cluster path has never carried real traffic on a cluster; the operator reconciles a `Bridge` into a pod, a Service and a volume in unit tests and has never been run against an API server, and `Homeserver` is still status-only |
@@ -581,7 +581,7 @@ Semantic conflicts the compiler found: two `MediaRecord` test initializers witho
 | `bootstrap-only-config` | ~~Docs sweep; the web shows the per-setting `bootstrap` flag and `listeners` as a bootstrap section; PostgreSQL not exercised~~ (done 2026-09-28) | 2c |
 | `registration-tokens-server-notices` | ~~`e2e-real` spec for the Users-page entry points~~ (done 2026-09-28); `e2e-real` for the Settings pages; Complement `TestServerNotices` (desktop); notices to everyone or to a room | 2d |
 | `reports-tasks-stats` | The Reports, Tasks and Statistics pages and the Overview sparklines (built by `admin-web-pages`, merged in the second round below) | 2a |
-| `media-admin` | ~~`rooms.media.*`~~ (done 2026-09-28, `rooms-admin`), `users.media.*`; paging the media listing; bulk operations on `state.tasks.spawn` (see above); ~~RFC 0004 against the document on moderator read scope~~ (decision 0013) | 2e, 2g |
+| `media-admin` | ~~`rooms.media.*`~~ (done 2026-09-28, `rooms-admin`), ~~`users.media.*`~~ (2i); paging the media listing; bulk operations on `state.tasks.spawn` (see above); ~~RFC 0004 against the document on moderator read scope~~ (decision 0013) | 2e, 2g |
 | `rooms-admin` | `GET /api/v1/events/{id}` (no room in its path) reads the room on whichever replica gets it, not the owner; a purge keeps a redacted skeleton row per purged event instead of deleting rows; the hierarchy reads only rooms this server holds (no federation `/hierarchy`); deleting a room leaves remote members and other servers alone, as Synapse does | 2 |
 | `federation-membership` | `createRoom`'s `invite` list for remote users; a reject fallback when no resident server helps; neutral error text; restricted joins; Complement | 3 |
 | `federation-edus` | ~~To-device over federation; `m.signing_key_update`~~ (done 2026-09-28, `federation-to-device`); in cluster mode, EDUs only through the owning replica. Its unrun `clippy`/`test -p hs-cli` are now run and green | 3 |
@@ -667,7 +667,7 @@ edit one is not. New settings and operations arrive with their interface control
    Synapse 1.161 database; `docs/compat/synapse-migration-runbook.md` lists what does not move
    yet: E2EE keys and backups, push rules, receipts, rooms joined over federation),
    ~~Rooms 6/23~~ **23/23, 2026-09-28** (and the room page; decision 0013), then the long tail
-   of Users 14/41 (**27/41 since 2026-09-28**, item 2h). `python3 tools/admin_api_coverage.py
+   of ~~Users 14/41~~ **Users 41/41, 2026-09-28** (items 2h and 2i). `python3 tools/admin_api_coverage.py
    --list` is the checklist. ~~Alongside it, decision 0010: the Configuration page's JSON
    textarea becomes structured editors, and `appservices.registration_files` becomes an
    importer-only migration path.~~ **Done 2026-09-27** (`config-structured-editors`,
@@ -678,7 +678,8 @@ edit one is not. New settings and operations arrive with their interface control
      against `hs serve` (the real `Report.event.content` shape, a replay task's `resource`);
      the reported user's other reports on a report page, which needs a contract change from
      track 15 (**`GET /reports` filtered by `reported_user_id` / `reporter_id`**); acting
-     straight from a report (suspend is 501, redaction has no admin operation);
+     straight from a report (suspension and redacting a user's messages are real since 2h,
+     but the report page does not offer them yet);
      `report.created`/`task.changed` over SSE instead of polling.
    - ~~**2b.** `media.scanning.icap.preview` gets a real control; a Rust test pins the web's
      schema fixture to `schema_for!(Config)`; RFC 0020 (a hidden secret inside a list entry is
@@ -710,13 +711,13 @@ edit one is not. New settings and operations arrive with their interface control
      (`rooms.media.quarantine` is a task); ~~settle RFC 0004 against the document on moderator
      read scope~~ **done: decision 0013** (`admin:read` satisfies every `*:read`, room and media
      metadata is `moderation:read`, message content stays `admin:read` and every read of it is
-     audited as `rooms.content.read`). Left: `users.media.*`, paging the media listing.
+     audited as `rooms.content.read`). ~~`users.media.*`~~ (done in 2i). Left: paging the media listing.
    - **2f.** ~~Cluster 1/6~~ **done 2026-09-28** (`agent/cluster-admin`: the five operations,
      drain as a request in the shared store with a task, audit, events and metrics, the Cluster
      page, tested through the real binary single-node and as two processes on one PostgreSQL;
      `docs/status/15-admin-api-and-modules.md`). Left: an `e2e-real` run of the page against two
      replicas, the operator draining a pod through the API before evicting it, and the page on
-     the real cluster (desktop). Then the long tail of Users 14/41 (Rooms is 23/23).
+     the real cluster (desktop). Then the long tails of Users (41/41 after 2h and 2i) and Rooms (23/23).
    - **2g.** Bulk media operations as spawned tasks (`state.tasks.spawn`, cancellable, with
      progress), with the Media page following the task instead of reading the immediate
      answer. Today they run inline and are recorded as finished tasks.
@@ -732,12 +733,24 @@ edit one is not. New settings and operations arrive with their interface control
      refusing them, and `users.lookup` works against the real directory (it answered 503).
      Proved through the real binary (`crates/hs-cli/tests/admin_user_identity.rs`, restart
      included) and the page against `hs serve`
-     (`web/e2e-real/users-devices-and-identity.spec.ts`). Users is 27/41; the other half
-     (suspend, shadow-ban, redact, rate limits, `login_as`, sessions, memberships, statistics,
-     media) is a parallel branch. Left here: no upstream OIDC/SAML/LDAP login exists yet, so
+     (`web/e2e-real/users-devices-and-identity.spec.ts`). The other half (suspend, shadow-ban,
+     redact, rate limits, `login_as`, sessions, memberships, statistics, media) is 2i; Users
+     is 41/41. Left here: no upstream OIDC/SAML/LDAP login exists yet, so
      an external id is a lookup key and not yet a way in; no experimental feature changes
      behaviour yet (none of the three is gated per user); account data is global only (room
      account data needs the user's rooms).
+   - **2i.** ~~Users: moderation and activity~~ **done 2026-09-28**: suspend and unsuspend
+     (MSC3823, `403 M_USER_SUSPENDED` from every room, profile and media write), shadow-ban
+     and lift it (writes answered as done and dropped), per-user rate-limit overrides (`429
+     M_LIMIT_EXCEEDED`), login-as (a support session, audited loudly, `admin:write` held
+     directly), sessions, memberships, statistics, the user's media and deleting it, and
+     redacting everything a user sent, both as tasks; decision 0013; the Moderation and
+     Activity cards on a user's page; `hs_room_moderated_writes_total{outcome}`. Proved in
+     `crates/hs-cli/tests/user_moderation.rs` and `web/e2e-real/user-moderation.spec.ts`
+     against `hs serve`. Left: the server-wide `rate_limits.message` bucket is still not
+     enforced (a separate decision, since it changes every client's pace); the override
+     bucket is per replica in cluster mode; deleting a user's media from the interface is not
+     in the `e2e-real` flow yet. With 2h, Users is 41/41.
 3. Federation completeness: ~~invites, leaves and knocks over federation; EDUs (typing,
    receipts, presence, device lists)~~ **done 2026-09-27** (`federation-membership`,
    `federation-edus`); ~~`createRoom`'s `invite` list for remote users, restricted joins over

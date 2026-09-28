@@ -2,8 +2,51 @@
 
 Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-admin`, `hs-modules`, `hs-identity`, `hs-http` (shared with 07 and 14).
 
-Last updated: 2026-09-28 (`GET /` redirects to the interface; the Rooms area, 23/23; Users' devices-and-identity half; and the Cluster area, 6/6; all below); before that 2026-09-27 (media, registration tokens and server notices, reports, tasks and statistics, below; before that the bridge
+Last updated: 2026-09-28 (`GET /` redirects to the interface; Users moderation and activity, 14 operations, Users 41/41; the Rooms area, 23/23; Users' devices-and-identity half; and the Cluster area, 6/6; all below); before that 2026-09-27 (media, registration tokens and server notices, reports, tasks and statistics, below; before that the bridge
 offering operations); before that 2026-09-26 (three public recovery operations); 2026-09-25 (additive schema change for the bridges wizard); the session log that follows is from 2026-09-19 (session 6).
+
+> **2026-09-28, Users: moderation and activity, 14 operations** (branch
+> `agent/user-moderation`). `tools/admin_api_coverage.py` now counts **154 of 158** with
+> Rooms 23/23 and Migration 8/8 (below); with the devices-and-identity half below, Users is 41/41.
+>
+> - **Handlers** (`crates/hs-admin/src/user_moderation.rs`, tests in `user_moderation/tests.rs`):
+>   `users.suspend` / `.unsuspend` and `users.shadow_ban` / `.unshadow_ban` (`moderation:write`,
+>   RFC 0004 section 8, like lock), `users.rate_limit.get` / `.put` / `.delete`
+>   (`admin:read` / `admin:write`), `users.login_as` (`admin:write` held directly, never through
+>   another scope; `WARN`-level log, audit entry and `user.impersonated` event, none of which carry
+>   the token), `users.sessions.list`, `users.memberships.list`, `users.statistics.get`,
+>   `users.media.list`, and `users.redact_events` and `users.media.delete` as tasks on
+>   `TaskRegistry::spawn` with progress and cancellation. Every write is audited and publishes
+>   an event only when it changes something; `Idempotency-Key` is honoured.
+> - **Sources**: two new traits, `UserModerationSource` (account side;
+>   `hs_auth::admin_moderation::AuthStoreUserModeration`) and `UserActivitySource` (room side;
+>   `hs_room::admin_users::RoomRegistryUserActivity`), wired in `hs-cli/src/serve.rs`;
+>   `InMemoryUserModeration` / `InMemoryUserActivity` for tests. Media listing and deletion go
+>   through the existing `MediaSource`.
+> - **Enforcement** (decision 0013,
+>   `docs/decisions/0013-moderation-flags-are-enforced-where-the-writes-happen.md`), in the
+>   owning crates: `hs-auth` (`UserRecord.rate_limit_override`,
+>   `UserStore::{set_suspended, set_shadow_banned, set_rate_limit_override}`, profile writes
+>   refused while suspended), `hs-room` (`crate::moderation`: `403 M_USER_SUSPENDED` on every
+>   write that shows something to others; shadow-banned sends, state, redactions and invites
+>   answered as done and dropped; `SendLimiter` token buckets for overrides, `429
+>   M_LIMIT_EXCEEDED`), `hs-media` (uploads refused while suspended).
+> - **Observability**: `hs_room_moderated_writes_total{outcome}` (`suspended`,
+>   `shadow_banned`, `rate_limited`) on `/metrics`; `INFO` logs for each flag change and for a
+>   finished redaction task, `WARN` for a support session; the audit entries and events above.
+> - **Contract** (`openapi.yaml`): suspend and unsuspend moved from `admin:write` to
+>   `moderation:write`; `users.login_as` gained its request and response schemas and a `409` for a deactivated account or the caller's own; additive fields on the
+>   session, membership and statistics schemas. `web/src/api/schema.d.ts` regenerated.
+> - **Proved through the real binary**: `crates/hs-cli/tests/user_moderation.rs` (6 tests: a
+>   suspended user's send and profile write are refused and reads work, and unsuspended the send
+>   arrives; a shadow-banned message reaches nobody; an override throttles until cleared;
+>   login-as acts as the user and the token is in no audit entry; redaction is a task and the
+>   other member sees the events redacted; memberships, statistics and media, and deleting the
+>   media). The interface side (status 16) passed `web/e2e-real/user-moderation.spec.ts` against
+>   `hs serve`.
+> - **Left**: the server-wide `rate_limits.message` bucket is still not enforced (decision
+>   0013); in cluster mode the override bucket is per replica; suspension of profile and media
+>   writes is logged but not counted in the metric (those crates do not depend on `hs-room`).
 
 > **2026-09-28, the server's bare root lands somewhere useful.** Typing the demo's address
 > into a browser gave the ingress controller's 404, and the server had no handler for `/`

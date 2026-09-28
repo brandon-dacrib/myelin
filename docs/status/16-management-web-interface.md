@@ -1,6 +1,42 @@
 # 16. Management web interface: status
 
-## Current update: 2026-09-28 (the room page's long tail)
+## Current update: 2026-09-28 (a user's moderation and activity; branch `agent/user-moderation`)
+
+A user's page gained two cards on the fourteen operations track 15 made real the same day
+(`docs/status/15-admin-api-and-modules.md`):
+
+- **Moderation** (`src/pages/users/ModerationCard.tsx`): Suspend / Unsuspend and Shadow-ban /
+  Lift shadow-ban (a reason dialog, `ReasonConfirmDialog.tsx`; disabled with "Needs
+  moderation:write" without that scope), a rate-limit override (`RateLimitSection.tsx`:
+  messages per second and burst, save, clear, "The server's own limits apply." when none),
+  "Redact messages…" (`RedactEventsDialog.tsx`: optionally one room and a limit, then the task
+  followed in place by `FollowTask.tsx`), "Delete all media…" (`DeleteUserMediaDialog.tsx`,
+  protected items skipped, also a followed task), and "Sign in as user…" (`LoginAsDialog.tsx`: a
+  required reason and a validity, the token shown once with a copy button and gone when the
+  dialog closes).
+- **Activity** (`src/pages/users/ActivityCard.tsx`): tabs for Sessions (support sessions
+  marked), Rooms (membership filter, each row linking to the room), Statistics, and Media (the
+  user's uploads, quarantined and protected ones marked).
+- **The users list** shows a Suspended badge and filters to suspended accounts
+  (`?suspended=true`).
+- **Mock layer**: `src/api/user-moderation.ts` (hooks), `src/mocks/data/user-moderation.ts` and
+  the handlers; `schema.d.ts` regenerated from `openapi.yaml`.
+- **Tests**: Vitest `ModerationCard` (8), `RateLimitSection` (6), `ActivityCard` (5),
+  `LoginAsDialog` (3), `UsersSuspendedFilter` (1); `npm run check` 366 passed. Playwright on MSW
+  `e2e/user-moderation.spec.ts` (3); `npm run test:e2e` 44 passed.
+- **Against the real binary**: `web/e2e-real/user-moderation.spec.ts` passed against `hs serve`
+  (one flow: suspend and see the user's send refused `M_USER_SUSPENDED`, unsuspend and it goes
+  through, shadow-ban and lift, set, read back and clear a rate limit, sessions, rooms and
+  statistics, redact and follow the task to "Succeeded", sign in as the user and use the token
+  for `/account/whoami`, then see the support session listed). Screenshots
+  `docs/design/screenshots/user-moderation-*-real.png` (12).
+- `playwright.real.config.ts` reads `HS_REAL_UI_PORT` (default 4180), so the real suite can run
+  in two checkouts at once; with `reuseExistingServer` a second run on 4180 silently drove the
+  other checkout's dev server and its backend.
+- **Left**: deleting a user's media is proved through the real binary in Rust
+  (`crates/hs-cli/tests/user_moderation.rs`) but not yet in the `e2e-real` flow.
+
+## Earlier update: 2026-09-28 (the room page's long tail)
 
 A room's page (`src/pages/RoomDetailPage.tsx`, tabs in `src/pages/rooms/`) now covers every
 Rooms operation: **Overview**, **State** (`RoomStateTab`), **Timeline** (`RoomTimelineTab`:
