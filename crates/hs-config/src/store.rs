@@ -864,7 +864,7 @@ impl<B: KvBackend> ConfigStore<B> {
             None => Value::Object(Map::new()),
         };
 
-        let mut conflicts = Vec::new();
+        let mut later = Vec::new();
         for entry in snapshot.range(
             &self.keyspace,
             RangeSpec::new(
@@ -873,27 +873,12 @@ impl<B: KvBackend> ConfigStore<B> {
             ),
         ) {
             let (key, value) = entry?;
-            let later: ChangeRecord = parse(&String::from_utf8_lossy(&key), &value)?;
-            if later.section != section {
-                continue;
-            }
-            let shared: Vec<String> = crate::document::leaf_pointers(&later.patch)
-                .into_iter()
-                .filter(|p| {
-                    before
-                        .keys()
-                        .any(|t| crate::history::pointers_overlap(t, p))
-                })
-                .collect();
-            if !shared.is_empty() {
-                conflicts.push(LaterChange {
-                    revision: later.revision,
-                    actor: later.actor,
-                    at_ms: later.at_ms,
-                    pointers: shared,
-                });
+            let record: ChangeRecord = parse(&String::from_utf8_lossy(&key), &value)?;
+            if record.section == section {
+                later.push(record);
             }
         }
+        let conflicts = crate::history::later_conflicts(before, &later);
 
         let target = crate::history::revert_target(&current, before);
         let patch = crate::history::diff_merge_patch(&current, &target);

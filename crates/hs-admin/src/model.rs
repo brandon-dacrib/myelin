@@ -1210,6 +1210,69 @@ pub struct ConfigChange {
     pub actor: Option<String>,
     /// RFC 3339 millisecond-precision UTC (RFC 0004 D15.2).
     pub at: String,
+    /// One row per setting the change touched, in the patch's order: what the database held
+    /// before and what the change wrote. Redacted like `patch`.
+    #[serde(default)]
+    pub settings: Vec<ConfigSettingChange>,
+    /// The revision this change reverted (`config.history.revert`), if it was a revert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverts: Option<u64>,
+    /// Whether `config.history.revert` can undo this change: the store knows what it replaced
+    /// (changes recorded before it kept that cannot be), and it wrote no bootstrap setting.
+    /// Whether a *later* change to the same settings stands in the way is only known when the
+    /// revert is asked for.
+    #[serde(default)]
+    pub revertible: bool,
+}
+
+/// One setting one [`ConfigChange`] touched.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigSettingChange {
+    /// Whole-configuration JSON Pointer (`/rate_limits/login/per_second`), the same vocabulary
+    /// as [`ConfigSection::origins`].
+    pub pointer: String,
+    /// The same setting as a dotted path (`rate_limits.login.per_second`).
+    pub path: String,
+    /// Whether the value is, or holds, a secret -- in which case both sides are
+    /// `{"$secret": true}` and never the secret itself.
+    pub secret: bool,
+    /// What the database held before the change; `None` (JSON `null`) when the change was
+    /// recorded before this server kept prior values, so nobody can say.
+    pub from: Option<ConfigSettingValue>,
+    /// What the change left in the database.
+    pub to: ConfigSettingValue,
+}
+
+/// One side of a [`ConfigSettingChange`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigSettingValue {
+    /// Whether the database held a value. `false` means the setting read from the bootstrap
+    /// file or the schema default -- which of the two is not recorded, because the file can
+    /// change underneath the history.
+    pub set: bool,
+    /// The value, when `set`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+}
+
+impl ConfigSettingValue {
+    /// The database held nothing here.
+    #[must_use]
+    pub fn unset() -> Self {
+        Self {
+            set: false,
+            value: None,
+        }
+    }
+
+    /// The database held `value`.
+    #[must_use]
+    pub fn of(value: serde_json::Value) -> Self {
+        Self {
+            set: true,
+            value: Some(value),
+        }
+    }
 }
 
 /// The OpenAPI `ConfigValidateReport` schema: the answer to "would this configuration be

@@ -278,6 +278,11 @@ fn router(state: MockState) -> Router {
         .route("/api/v1/config", get(list_config))
         .route("/api/v1/config/{section}", get(get_config_section).patch(patch_config_section))
         .route("/api/v1/config/reload", post(config_reload))
+        .route("/api/v1/config/{section}/history", get(config_history_list))
+        .route(
+            "/api/v1/config/{section}/history/{revision}/revert",
+            post(config_history_revert),
+        )
         // audit log
         .route("/api/v1/audit-log", get(list_audit_log))
         .route("/api/v1/audit-log/{id}", get(get_audit_entry))
@@ -2118,16 +2123,7 @@ async fn patch_config_section(
     let Some(idx) = find_index(&db, "config_sections", "name", &section) else {
         return not_found("config_section", &section);
     };
-    if let (Some(values), Some(patch_obj)) = (
-        db.get_mut("config_sections").unwrap()[idx]
-            .get_mut("values")
-            .and_then(|v| v.as_object_mut()),
-        patch.as_object(),
-    ) {
-        for (k, v) in patch_obj {
-            values.insert(k.clone(), v.clone());
-        }
-    }
+    write_config_change(&mut db, idx, &section, &patch, &actor.id, None);
     let updated = db["config_sections"][idx].clone();
     drop(db);
     emit_and_audit(
@@ -2136,6 +2132,191 @@ async fn patch_config_section(
         &actor,
         ResourceRef::new("config_section", section),
         updated.clone(),
+    )
+    .await;
+    Json(updated).into_response()
+}
+
+/// Applies `patch` to a fixture section as an RFC 7396 merge patch and records it in
+/// `config_history` the way the real store does (`hs_config::store::ChangeRecord`, with what each
+/// setting held before), so `config.history.list` and `config.history.revert` have something real
+/// to show and undo.
+fn write_config_change(
+    db: &mut HashMap<String, Vec<Value>>,
+    idx: usize,
+    section: &str,
+    patch: &Value,
+    actor: &str,
+    reverts: Option<u64>,
+) {
+    let Some(entry) = db.get_mut("config_sections").and_then(|s| s.get_mut(idx)) else {
+        return;
+    };
+    let values = entry.get("values").cloned().unwrap_or_else(|| json!({}));
+    let before = hs_config::history::before_values(&values, patch);
+    let mut merged = values;
+    hs_config::merge_patch(&mut merged, patch);
+    entry["values"] = merged;
+    let history = db.entry("config_history".to_owned()).or_default();
+    let record = hs_config::store::ChangeRecord {
+        revision: history.len() as u64 + 1,
+        section: section.to_owned(),
+        patch: patch.clone(),
+        actor: Some(actor.to_owned()),
+        at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64),
+        before: Some(before),
+        reverts,
+    };
+    history.push(serde_json::to_value(record).unwrap_or_default());
+}
+
+fn config_records(db: &HashMap<String, Vec<Value>>) -> Vec<hs_config::store::ChangeRecord> {
+    db.get("config_history")
+        .map(|h| {
+            h.iter()
+                .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn config_history_list(
+    State(state): State<MockState>,
+    Path(section): Path<String>,
+    Query(q): Query<PageQuery>,
+) -> Response {
+    let db = state.db.read().await;
+    if find_index(&db, "config_sections", "name", &section).is_none() {
+        return not_found("config_section", &section);
+    }
+    let before = match q.cursor.as_deref().filter(|c| !c.is_empty()) {
+        None => u64::MAX,
+        Some(c) => match c.strip_prefix('r').and_then(|r| r.parse::<u64>().ok()) {
+            Some(r) => r,
+            None => {
+                return problem(
+                    StatusCode::BAD_REQUEST,
+                    "invalid-cursor",
+                    "not a cursor this listing handed out",
+                );
+            }
+        },
+    };
+    let limit = q.limit.unwrap_or(20).clamp(1, 100);
+    let matching: Vec<_> = config_records(&db)
+        .into_iter()
+        .rev()
+        .filter(|r| r.section == section)
+        .collect();
+    let start = matching
+        .iter()
+        .position(|r| r.revision < before)
+        .unwrap_or(matching.len());
+    let page: Vec<_> = matching.iter().skip(start).take(limit).collect();
+    let next = (start + limit < matching.len())
+        .then(|| page.last().map(|r| format!("r{}", r.revision)))
+        .flatten();
+    let prev = (start > 0)
+        .then(|| {
+            matching
+                .get(start.saturating_sub(limit))
+                .map(|r| format!("r{}", r.revision + 1))
+        })
+        .flatten();
+    let items: Vec<Value> = page
+        .into_iter()
+        .map(|r| serde_json::to_value(hs_admin::sources::config_change(r)).unwrap_or_default())
+        .collect();
+    Json(json!({"items": items, "next_cursor": next, "prev_cursor": prev})).into_response()
+}
+
+async fn config_history_revert(
+    State(state): State<MockState>,
+    Path((section, revision)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let actor = match require_auth(&state, &headers) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let force = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|b| b.get("force").and_then(Value::as_bool))
+        .unwrap_or(false);
+    let mut db = state.db.write().await;
+    let Some(idx) = find_index(&db, "config_sections", "name", &section) else {
+        return not_found("config_section", &section);
+    };
+    let records = config_records(&db);
+    let Some(position) = revision.parse::<u64>().ok().and_then(|rev| {
+        records
+            .iter()
+            .position(|r| r.revision == rev && r.section == section)
+    }) else {
+        return not_found("configuration change", &revision);
+    };
+    let record = &records[position];
+    let Some(before) = record.before.as_ref() else {
+        return problem(
+            StatusCode::CONFLICT,
+            "conflict",
+            "recorded before prior values were kept",
+        );
+    };
+    let conflicts = hs_config::history::later_conflicts(
+        before,
+        records[position + 1..]
+            .iter()
+            .filter(|r| r.section == section),
+    );
+    if !conflicts.is_empty() && !force {
+        let section = section.as_str();
+        let errors = conflicts
+            .iter()
+            .flat_map(|c| {
+                c.pointers.iter().map(move |p| {
+                    hs_http::ValidationError::new(
+                        format!("/{section}{p}"),
+                        format!(
+                            "changed again in revision {} by {}",
+                            c.revision,
+                            c.actor.clone().unwrap_or_default()
+                        ),
+                    )
+                })
+            })
+            .collect();
+        return hs_http::Problem::conflict()
+            .with_detail(format!(
+                "later changes wrote some of the same settings; reverting revision {} would undo them too. Send {{\"force\": true}} to revert anyway.",
+                record.revision
+            ))
+            .with_errors(errors)
+            .into_response();
+    }
+    let current = db["config_sections"][idx]
+        .get("values")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let patch = hs_config::history::diff_merge_patch(
+        &current,
+        &hs_config::history::revert_target(&current, before),
+    );
+    let reverted = record.revision;
+    if patch.as_object().is_some_and(|p| !p.is_empty()) {
+        write_config_change(&mut db, idx, &section, &patch, &actor.id, Some(reverted));
+    }
+    let updated = db["config_sections"][idx].clone();
+    drop(db);
+    emit_and_audit(
+        &state,
+        "config.history.revert",
+        &actor,
+        ResourceRef::new("config_section", section),
+        json!({"reverted_revision": reverted}),
     )
     .await;
     Json(updated).into_response()

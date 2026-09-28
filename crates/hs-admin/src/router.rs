@@ -31,15 +31,15 @@ use crate::events::{EventBus, ReplayOutcome};
 use crate::idempotency::{IdempotencyStore, Replay, StoredResponse};
 use crate::model::{
     Actor, ActorKind, AdminAppserviceCreate, AdminAppserviceReplay, AuditChange, AuditEntry,
-    AuditOutcome, ConfigSchema, ConfigSection, ConfigSectionInfo, ConfigSettingInfo, Event, Page,
-    Principal, RecoveryInspectRequest, RecoveryLinkRequest, RecoveryResetRequest, ResourceRef,
-    Scope, ServerHealth, ServerInfo, SetupRequest, SetupStatus,
+    AuditOutcome, ConfigChange, ConfigSchema, ConfigSection, ConfigSectionInfo, ConfigSettingInfo,
+    Event, Page, Principal, RecoveryInspectRequest, RecoveryLinkRequest, RecoveryResetRequest,
+    ResourceRef, Scope, ServerHealth, ServerInfo, SetupRequest, SetupStatus,
 };
 use crate::operations::{OperationDef, load as load_operations};
 use crate::sources::{
-    AppserviceDirectory, ConfigPatch, ConfigSource, FederationSource, OverviewSource,
-    RecoverySource, RoomDirectory, RoomFilter, SetupSource, SourceError, UserCreateRequest,
-    UserDirectory, UserFilter, UserLookupQuery,
+    AppserviceDirectory, ConfigPatch, ConfigRevert, ConfigRevertOutcome, ConfigSource,
+    FederationSource, OverviewSource, RecoverySource, RoomDirectory, RoomFilter, SetupSource,
+    SourceError, UserCreateRequest, UserDirectory, UserFilter, UserLookupQuery,
 };
 use crate::user_moderation as um;
 
@@ -565,6 +565,8 @@ const REAL_HANDLERS: &[&str] = &[
     "config.update",
     "config.validate",
     "config.reload",
+    "config.history.list",
+    "config.history.revert",
     "audit_log.list",
     "audit_log.get",
     "audit_log.export",
@@ -2037,10 +2039,54 @@ fn config_expected_revision(headers: &HeaderMap) -> Result<Option<u64>, Problem>
 fn redacted_section(mut section: ConfigSection) -> ConfigSection {
     let secrets = crate::config_schema::secret_paths();
     secrets.redact(&mut section.values, &format!("/{}", section.name));
-    for change in &mut section.history {
-        secrets.redact(&mut change.patch, &format!("/{}", change.section));
-    }
+    section.history = std::mem::take(&mut section.history)
+        .into_iter()
+        .map(redacted_change)
+        .collect();
     section
+}
+
+/// Renders one recorded change for the wire: every secret in its patch, and on both sides of
+/// every setting row, replaced by `{"$secret": true}`. A row whose value was, or held, a secret
+/// is marked `secret` so an interface can say "changed" without pretending to show a value.
+///
+/// History is the one place a rotated-away secret still lives (the store keeps it so a revert can
+/// restore it), which is exactly why nothing in it reaches a response unredacted.
+fn redacted_change(mut change: ConfigChange) -> ConfigChange {
+    let secrets = crate::config_schema::secret_paths();
+    secrets.redact(&mut change.patch, &format!("/{}", change.section));
+    for row in &mut change.settings {
+        let mut hidden = row.secret;
+        for side in [row.from.as_mut(), Some(&mut row.to)].into_iter().flatten() {
+            if let Some(value) = side.value.as_mut() {
+                let shown = value.clone();
+                secrets.redact(value, &row.pointer);
+                hidden |= *value != shown;
+            }
+        }
+        row.secret = hidden;
+    }
+    change
+}
+
+/// A history page's cursor: the revision the next page starts below, as `r<revision>`.
+fn config_history_cursor(revision: u64) -> String {
+    format!("r{revision}")
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigHistoryQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+/// `config.history.revert`'s optional body.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigRevertBody {
+    /// Revert even though later changes wrote some of the same settings, undoing them too.
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4094,6 +4140,235 @@ async fn config_reload(
     }
 }
 
+/// `GET /api/v1/config/{section}/history` (`admin:read`): the section's changes, newest first,
+/// one row per setting each touched with what the database held before and what the change
+/// wrote -- secrets redacted on both sides. Paged by revision (`cursor` is `r<revision>`), so a
+/// page does not shift under an operator while somebody else saves.
+async fn config_history_list(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(section): Path<String>,
+    Query(query): Query<ConfigHistoryQuery>,
+) -> Response {
+    let instance = format!("/api/v1/config/{section}/history");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let Some(config) = &state.config else {
+                return source_unavailable("configuration", &instance);
+            };
+            let before = match query.cursor.as_deref().filter(|c| !c.is_empty()) {
+                None => None,
+                Some(cursor) => {
+                    match cursor.strip_prefix('r').and_then(|r| r.parse::<u64>().ok()) {
+                        Some(revision) => Some(revision),
+                        None => {
+                            let detail =
+                                format!("{cursor:?} is not a cursor this listing handed out");
+                            return Problem::invalid_cursor()
+                                .with_detail(detail.clone())
+                                .with_errors(vec![ValidationError::new("/cursor", detail)])
+                                .with_instance(instance)
+                                .into_response();
+                        }
+                    }
+                }
+            };
+            let limit = query.limit.unwrap_or(20).clamp(1, 100);
+            match config.history_page(&section, before, limit).await {
+                Ok(page) => axum::Json(Page {
+                    items: page.changes.into_iter().map(redacted_change).collect(),
+                    next_cursor: page.older.map(config_history_cursor),
+                    prev_cursor: page.newer.map(config_history_cursor),
+                    total: None,
+                })
+                .into_response(),
+                Err(SourceError::NotFound) => Problem::not_found()
+                    .with_detail(format!("no such configuration section: {section}"))
+                    .with_instance(instance)
+                    .into_response(),
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `POST /api/v1/config/{section}/history/{revision}/revert` (`admin:write`): undo one recorded
+/// change as a new revision.
+///
+/// The settings it touched go back to what the database held before it -- a secret included,
+/// from the store's own record, so a rotated secret comes back without the old value crossing
+/// the wire in either direction. It is refused with `409` when a later change wrote any of the
+/// same settings, naming them, unless the body says `{"force": true}`; honours `If-Match` like
+/// `config.update`; and is validated, environment-checked, audited (`config.history.revert`)
+/// and published (`config.reverted`) exactly like one.
+async fn config_history_revert(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path((section, revision)): Path<(String, String)>,
+    body: axum::body::Bytes,
+) -> Response {
+    let instance = format!("/api/v1/config/{section}/history/{revision}/revert");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::AdminWrite),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(principal) => {
+            let Some(config) = &state.config else {
+                return source_unavailable("configuration", &instance);
+            };
+            let no_such_change = |instance: String| {
+                Problem::not_found()
+                    .with_detail(format!(
+                        "no change to {section:?} was recorded at revision {revision}"
+                    ))
+                    .with_instance(instance)
+                    .into_response()
+            };
+            let Ok(reverted_revision) = revision.parse::<u64>() else {
+                return no_such_change(instance);
+            };
+            let request: ConfigRevertBody = match parse_optional_json(&body) {
+                Ok(v) => v,
+                Err(p) => return p.with_instance(instance).into_response(),
+            };
+            let expected_revision = match config_expected_revision(&headers) {
+                Ok(v) => v,
+                Err(p) => return p.with_instance(instance).into_response(),
+            };
+            let current = match config.get_section(&section).await {
+                Ok(Some(found)) => found,
+                Ok(None) => {
+                    return Problem::not_found()
+                        .with_detail(format!("no such configuration section: {section}"))
+                        .with_instance(instance)
+                        .into_response();
+                }
+                Err(e) => return e.to_problem().with_instance(instance).into_response(),
+            };
+
+            let outcome = match config
+                .revert(ConfigRevert {
+                    section: section.clone(),
+                    revision: reverted_revision,
+                    actor: Some(principal.id.clone()),
+                    expected_revision,
+                    force: request.force,
+                })
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(SourceError::NotFound) => return no_such_change(instance),
+                Err(e) => return e.to_problem().with_instance(instance).into_response(),
+            };
+
+            match outcome {
+                ConfigRevertOutcome::Reverted {
+                    section: updated,
+                    patch,
+                } => {
+                    tracing::info!(
+                        section = %section,
+                        reverted_revision,
+                        revision = updated.revision,
+                        actor = %principal.id,
+                        forced = request.force,
+                        "reverted a configuration change"
+                    );
+                    if let Err(resp) = record_mutation(
+                        &state,
+                        &principal,
+                        "config.history.revert",
+                        "config.reverted",
+                        ResourceRef::new("config_section", section.clone()),
+                        config_audit_changes(&current, &updated, &patch),
+                        json!({
+                            "section": section,
+                            "revision": updated.revision,
+                            "reverted_revision": reverted_revision,
+                            "forced": request.force,
+                        }),
+                    )
+                    .await
+                    {
+                        return resp;
+                    }
+                    (
+                        StatusCode::OK,
+                        [(axum::http::header::ETAG, config_etag(updated.revision))],
+                        axum::Json(redacted_section(updated)),
+                    )
+                        .into_response()
+                }
+                ConfigRevertOutcome::Unchanged(now) => {
+                    tracing::info!(
+                        section = %section,
+                        reverted_revision,
+                        actor = %principal.id,
+                        "nothing to revert: the settings already hold their earlier values"
+                    );
+                    (
+                        StatusCode::OK,
+                        [(axum::http::header::ETAG, config_etag(now.revision))],
+                        axum::Json(redacted_section(now)),
+                    )
+                        .into_response()
+                }
+                ConfigRevertOutcome::Conflicts(conflicts) => {
+                    let who = |actor: &Option<String>| {
+                        actor
+                            .clone()
+                            .unwrap_or_else(|| "an unrecorded actor".to_owned())
+                    };
+                    let revisions: Vec<String> = conflicts
+                        .iter()
+                        .map(|c| format!("revision {} by {}", c.revision, who(&c.actor)))
+                        .collect();
+                    Problem::conflict()
+                        .with_detail(format!(
+                            "later changes wrote some of the same settings ({}); reverting \
+                             revision {reverted_revision} would undo them too. Nothing was \
+                             written -- send {{\"force\": true}} to revert anyway.",
+                            revisions.join(", ")
+                        ))
+                        .with_errors(
+                            conflicts
+                                .iter()
+                                .flat_map(|c| {
+                                    c.pointers.iter().map(move |pointer| {
+                                        ValidationError::new(
+                                            pointer,
+                                            format!(
+                                                "changed again in revision {} by {} at {}",
+                                                c.revision,
+                                                who(&c.actor),
+                                                c.at
+                                            ),
+                                        )
+                                    })
+                                })
+                                .collect(),
+                        )
+                        .with_instance(instance)
+                        .into_response()
+                }
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
 // -------------------------------------------------------------------------------------------
 // audit log (RFC 0004 section 9, brief deliverable 3)
 // -------------------------------------------------------------------------------------------
@@ -5129,6 +5404,8 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         "config.update" => builder.add(method, &full_path, config_update, meta),
         "config.validate" => builder.add(method, &full_path, config_validate, meta),
         "config.reload" => builder.add(method, &full_path, config_reload, meta),
+        "config.history.list" => builder.add(method, &full_path, config_history_list, meta),
+        "config.history.revert" => builder.add(method, &full_path, config_history_revert, meta),
         "audit_log.list" => builder.add(method, &full_path, audit_log_list, meta),
         "audit_log.get" => builder.add(method, &full_path, audit_log_get, meta),
         "audit_log.export" => builder.add(method, &full_path, audit_log_export, meta),
@@ -7372,6 +7649,379 @@ mod tests {
                     .header("authorization", "Bearer read-only")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"enable_registration":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ---- config.history.list and config.history.revert ----
+
+    /// `config_state`, with the source kept so a test can read what is stored unredacted.
+    fn config_state_with_source() -> (AdminState, Arc<crate::sources::InMemoryConfigSource>) {
+        use crate::sources::InMemoryConfigSource;
+        let source = Arc::new(
+            InMemoryConfigSource::new()
+                .with_file(
+                    "/etc/myelin/homeserver.yaml",
+                    json!({"server": {"server_name": "example.org"}}),
+                )
+                .with_database(json!({
+                    "auth": {"enable_registration": true, "session_secret": "s3kr1t"},
+                })),
+        );
+        (test_state().with_config(source.clone()), source)
+    }
+
+    async fn send(
+        router: &axum::Router,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (StatusCode, axum::http::HeaderMap, serde_json::Value, String) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", "Bearer admin-token");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        if !body.is_empty() {
+            request = request.header("content-type", "application/json");
+        }
+        let response = router
+            .clone()
+            .oneshot(request.body(Body::from(body.to_owned())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = body_bytes(response).await;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, headers, json, text)
+    }
+
+    #[tokio::test]
+    async fn config_history_lists_each_setting_before_and_after_newest_first_in_pages() {
+        let (state, _source) = config_state_with_source();
+        let (router, _manifest) = build_router(state);
+        let r = patch_section(&router, "auth", r#"{"enable_registration":false}"#).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let r = patch_section(&router, "federation", r#"{"client_timeout":"45s"}"#).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let r = patch_section(&router, "auth", r#"{"enable_registration":null}"#).await;
+        assert_eq!(r.status(), StatusCode::OK);
+
+        let (status, _, first, _) = send(
+            &router,
+            "GET",
+            "/api/v1/config/auth/history?limit=1",
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(first["items"].as_array().unwrap().len(), 1);
+        let newest = &first["items"][0];
+        assert_eq!(
+            newest["revision"], 4,
+            "federation's change is not in auth's history"
+        );
+        assert_eq!(newest["actor"], "@ops:example.org");
+        assert_eq!(newest["revertible"], true);
+        let row = &newest["settings"][0];
+        assert_eq!(row["pointer"], "/auth/enable_registration");
+        assert_eq!(row["path"], "auth.enable_registration");
+        assert_eq!(row["from"], json!({"set": true, "value": false}));
+        assert_eq!(
+            row["to"],
+            json!({"set": false}),
+            "a reset leaves the setting to the file or the default"
+        );
+        assert_eq!(first["prev_cursor"], serde_json::Value::Null);
+        let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+
+        let (status, _, second, _) = send(
+            &router,
+            "GET",
+            &format!("/api/v1/config/auth/history?limit=1&cursor={cursor}"),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let older = &second["items"][0];
+        assert_eq!(older["revision"], 2);
+        assert_eq!(
+            older["settings"][0]["from"],
+            json!({"set": true, "value": true})
+        );
+        assert_eq!(
+            older["settings"][0]["to"],
+            json!({"set": true, "value": false})
+        );
+        assert_eq!(second["next_cursor"], serde_json::Value::Null);
+        assert!(second["prev_cursor"].is_string());
+    }
+
+    #[tokio::test]
+    async fn config_history_rejects_a_cursor_it_did_not_hand_out_and_an_unknown_section() {
+        let (state, _source) = config_state_with_source();
+        let (router, _manifest) = build_router(state);
+        let (status, _, body, _) = send(
+            &router,
+            "GET",
+            "/api/v1/config/auth/history?cursor=bogus",
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["type"], "urn:hs:problem:invalid-cursor");
+        let (status, _, _, _) = send(&router, "GET", "/api/v1/config/nope/history", &[], "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A secret set, rotated and reverted is never readable back: not in the history, not in the
+    /// revert's response, not in the section's embedded history -- and the revert still restores
+    /// the real old value, from the store's own record.
+    #[tokio::test]
+    async fn config_history_and_revert_never_put_a_secret_on_the_wire() {
+        let (state, source) = config_state_with_source();
+        let (router, _manifest) = build_router(state);
+        let r = patch_section(&router, "auth", r#"{"session_secret":"rotated-value"}"#).await;
+        assert_eq!(r.status(), StatusCode::OK);
+
+        let (status, _, history, text) =
+            send(&router, "GET", "/api/v1/config/auth/history", &[], "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !text.contains("s3kr1t") && !text.contains("rotated-value"),
+            "{text}"
+        );
+        let row = &history["items"][0]["settings"][0];
+        assert_eq!(row["secret"], true);
+        assert_eq!(
+            row["from"],
+            json!({"set": true, "value": {"$secret": true}})
+        );
+        assert_eq!(row["to"], json!({"set": true, "value": {"$secret": true}}));
+
+        let (status, _, _, text) = send(
+            &router,
+            "POST",
+            "/api/v1/config/auth/history/2/revert",
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !text.contains("s3kr1t") && !text.contains("rotated-value"),
+            "{text}"
+        );
+
+        let stored = source.get_section("auth").await.unwrap().unwrap();
+        assert_eq!(
+            stored.values["session_secret"], "s3kr1t",
+            "the revert put the old secret back without anyone sending it"
+        );
+        let (_, _, _, text) = send(&router, "GET", "/api/v1/config/auth", &[], "").await;
+        assert!(
+            !text.contains("s3kr1t") && !text.contains("rotated-value"),
+            "{text}"
+        );
+        let entries = audit_entries_for_action(&router, "config.history.revert").await;
+        let audit = serde_json::to_string(&entries).unwrap();
+        assert!(
+            !audit.contains("s3kr1t") && !audit.contains("rotated-value"),
+            "{audit}"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_revert_restores_the_old_value_audits_and_publishes() {
+        let (state, _source) = config_state_with_source();
+        let mut rx = state.events.subscribe();
+        let (router, _manifest) = build_router(state);
+        let r = patch_section(&router, "auth", r#"{"enable_registration":false}"#).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        // Drain config.updated.
+        let _ = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+
+        let (status, headers, section, _) = send(
+            &router,
+            "POST",
+            "/api/v1/config/auth/history/2/revert",
+            &[("if-match", "\"2\"")],
+            "{}",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(section["values"]["enable_registration"], true);
+        assert_eq!(
+            headers
+                .get(axum::http::header::ETAG)
+                .and_then(|v| v.to_str().ok()),
+            Some("\"3\"")
+        );
+        assert_eq!(section["history"][0]["reverts"], 2);
+
+        let event = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("an event should be published")
+            .unwrap();
+        assert_eq!(event.r#type, "config.reverted");
+        assert_eq!(event.data["reverted_revision"], 2);
+        assert_eq!(event.data["revision"], 3);
+
+        let entries = audit_entries_for_action(&router, "config.history.revert").await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].changes[0].pointer, "/auth/enable_registration");
+        assert_eq!(entries[0].changes[0].from, Some(json!(false)));
+        assert_eq!(entries[0].changes[0].to, Some(json!(true)));
+
+        // Reverting it again finds the settings already as they were: nothing is written.
+        let (status, headers, _, _) = send(
+            &router,
+            "POST",
+            "/api/v1/config/auth/history/3/revert",
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "reverting the revert redoes the change"
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::ETAG)
+                .and_then(|v| v.to_str().ok()),
+            Some("\"4\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn config_revert_over_a_later_change_is_409_naming_it_unless_forced() {
+        let (state, source) = config_state_with_source();
+        let (router, _manifest) = build_router(state);
+        let default_timeout =
+            get_section(&router, "federation").await.values["client_timeout"].clone();
+        patch_section(&router, "federation", r#"{"client_timeout":"60s"}"#).await;
+        patch_section(&router, "federation", r#"{"client_timeout":"90s"}"#).await;
+
+        let (status, _, problem, _) = send(
+            &router,
+            "POST",
+            "/api/v1/config/federation/history/2/revert",
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            problem["detail"]
+                .as_str()
+                .unwrap()
+                .contains("revision 3 by @ops:example.org"),
+            "{problem}"
+        );
+        assert_eq!(
+            problem["errors"][0]["pointer"],
+            "/federation/client_timeout"
+        );
+        assert_eq!(
+            source
+                .get_section("federation")
+                .await
+                .unwrap()
+                .unwrap()
+                .values["client_timeout"],
+            "90s",
+            "nothing was written"
+        );
+
+        let (status, _, section, _) = send(
+            &router,
+            "POST",
+            "/api/v1/config/federation/history/2/revert",
+            &[],
+            r#"{"force":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            section["values"]["client_timeout"], default_timeout,
+            "the database held nothing before revision 2, so the setting falls back to its default"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_revert_refuses_a_stale_if_match_an_unknown_revision_and_a_read_token() {
+        let (state, _source) = config_state_with_source();
+        let (router, _manifest) = build_router(state.clone());
+        patch_section(&router, "auth", r#"{"enable_registration":false}"#).await;
+
+        let (status, _, _, _) = send(
+            &router,
+            "POST",
+            "/api/v1/config/auth/history/2/revert",
+            &[("if-match", "\"1\"")],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+
+        for uri in [
+            "/api/v1/config/auth/history/99/revert",
+            "/api/v1/config/federation/history/2/revert",
+            "/api/v1/config/auth/history/two/revert",
+        ] {
+            let (status, _, _, _) = send(&router, "POST", uri, &[], "").await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        }
+        let (status, _, _, _) = send(
+            &router,
+            "POST",
+            "/api/v1/config/auth/history/2/revert",
+            &[],
+            r#"{"forse":true}"#,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a misspelt force is not ignored"
+        );
+
+        let read_only = AdminState {
+            verifier: Arc::new(StaticVerifier::new().with_token(
+                "read-only",
+                Principal {
+                    kind: PrincipalKind::User,
+                    id: "@ro:example.org".into(),
+                    display_name: None,
+                    scopes: vec![Scope::AdminRead],
+                    token_id: None,
+                    expires_at: None,
+                    issued_by: None,
+                },
+            )),
+            ..state
+        };
+        let (router, _manifest) = build_router(read_only);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/config/auth/history/2/revert")
+                    .header("authorization", "Bearer read-only")
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await

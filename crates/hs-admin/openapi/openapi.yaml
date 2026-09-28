@@ -1484,6 +1484,96 @@ paths:
           $ref: '#/components/responses/PayloadTooLarge'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+  /config/{section}/history:
+    get:
+      summary: List a configuration section's changes, setting by setting
+      description: 'Every recorded change to the section, newest first, one row per setting each touched: what the database held before (or that it held nothing, so the value came from the bootstrap file or the schema default), what the change wrote, who made it and when. Secrets are {"$secret": true} on both sides; a secret is never readable back through history. Paged by revision, so a page does not shift while somebody else saves.'
+      operationId: config.history.list
+      tags:
+      - Config
+      security:
+      - OAuth2:
+        - admin:read
+      parameters:
+      - $ref: '#/components/parameters/SectionName'
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of changes, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfigChangePage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '400':
+          $ref: '#/components/responses/InvalidCursor'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /config/{section}/history/{revision}/revert:
+    post:
+      summary: Revert one configuration change
+      description: 'Puts every setting the change touched back to what the database held before it, as a new revision whose history entry names the revision it reverted. A secret comes back from the server''s own record and never crosses the wire. Validated, checked against HS__ environment pins, audited (config.history.revert) and published (config.reverted) exactly like config.update, and honours If-Match the same way. 409 when a later change wrote any of the same settings (errors[] names each setting and the revision that wrote it), unless the body says force; 409 also for a change recorded before prior values were kept. A change whose settings already hold their earlier values writes nothing and returns the section as it is.'
+      operationId: config.history.revert
+      tags:
+      - Config
+      security:
+      - OAuth2:
+        - admin:write
+      parameters:
+      - $ref: '#/components/parameters/SectionName'
+      - name: revision
+        in: path
+        required: true
+        description: The revision of the change to revert (ConfigChange.revision).
+        schema:
+          type: integer
+          minimum: 1
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfigRevertRequest'
+      responses:
+        '200':
+          description: Reverted (or already as it was before the change); the section as it now reads, with its new ETag.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfigSection'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
   /events:
     get:
       summary: 'Server-sent events: a live feed of server events'
@@ -8233,6 +8323,72 @@ components:
         at:
           type: string
           format: date-time
+        settings:
+          type: array
+          description: One row per setting the change touched, in the patch's order.
+          items:
+            $ref: '#/components/schemas/ConfigSettingChange'
+        reverts:
+          type:
+          - integer
+          - 'null'
+          description: The revision this change reverted (config.history.revert). Absent when it was not a revert.
+        revertible:
+          type: boolean
+          description: Whether config.history.revert can undo it -- the server knows what it replaced (changes recorded before it kept that cannot be) and it wrote no bootstrap setting. Whether a later change stands in the way is only known when the revert is asked for.
+    ConfigSettingChange:
+      type: object
+      required:
+      - pointer
+      - path
+      - secret
+      - from
+      - to
+      properties:
+        pointer:
+          type: string
+          description: Whole-configuration JSON Pointer (/rate_limits/login/per_second), as in ConfigSection.origins.
+        path:
+          type: string
+          description: The same setting as a dotted path (rate_limits.login.per_second).
+        secret:
+          type: boolean
+          description: 'Whether the value is, or holds, a secret. Both sides are then {"$secret": true}, never the secret.'
+        from:
+          description: What the database held before the change; null when the change was recorded before this server kept prior values.
+          oneOf:
+          - $ref: '#/components/schemas/ConfigSettingValue'
+          - type: 'null'
+        to:
+          $ref: '#/components/schemas/ConfigSettingValue'
+    ConfigSettingValue:
+      type: object
+      required:
+      - set
+      properties:
+        set:
+          type: boolean
+          description: Whether the database held a value. False means the setting read from the bootstrap file or the schema default (which is not recorded, since the file can change underneath the history).
+        value:
+          description: 'The value, when set. Secrets as {"$secret": true}.'
+    ConfigChangePage:
+      allOf:
+      - $ref: '#/components/schemas/PageEnvelope'
+      - type: object
+        required:
+        - items
+        properties:
+          items:
+            type: array
+            items:
+              $ref: '#/components/schemas/ConfigChange'
+    ConfigRevertRequest:
+      type: object
+      properties:
+        force:
+          type: boolean
+          default: false
+          description: Revert even though later changes wrote some of the same settings, undoing them too.
     ConfigSchema:
       type: object
       properties:

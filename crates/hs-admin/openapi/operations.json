@@ -281,6 +281,24 @@
     },
     {
       "method": "GET",
+      "path": "/config/{section}/history",
+      "operation_id": "config.history.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "Config",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/config/{section}/history/{revision}/revert",
+      "operation_id": "config.history.revert",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Config",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
       "path": "/events",
       "operation_id": "events.stream",
       "scope": "admin:read",

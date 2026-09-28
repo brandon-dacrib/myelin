@@ -22,9 +22,10 @@ use crate::model::{
     AdminAppservice, AdminAppserviceBacklogEntry, AdminAppserviceCreate, AdminAppserviceHealth,
     AdminAppserviceLinks, AdminAppserviceReplay, AdminAppserviceTokens, AdminDestination,
     AdminDevice, AdminPasswordReset, AdminRoom, AdminRoomMember, AdminUser, ClusterStatus,
-    ConfigChange, ConfigReloadReport, ConfigSection, ConfigValidateReport, ExternalId,
-    RecoveryAdministrator, RecoveryInspection, RecoveryLink, RecoveryLinkKind, RecoveryLinkRequest,
-    RecoveryResetRequest, SetupRequest, SetupSession, StatisticsOverview, ThreePid,
+    ConfigChange, ConfigReloadReport, ConfigSection, ConfigSettingChange, ConfigSettingValue,
+    ConfigValidateReport, ExternalId, RecoveryAdministrator, RecoveryInspection, RecoveryLink,
+    RecoveryLinkKind, RecoveryLinkRequest, RecoveryResetRequest, SetupRequest, SetupSession,
+    StatisticsOverview, ThreePid,
 };
 
 /// Why a data-source call failed. Mirrors [`crate::auth::AuthError`]'s "only unavailable escapes
@@ -783,6 +784,144 @@ pub trait ConfigSource: Send + Sync + 'static {
         section: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ConfigChange>, SourceError>;
+
+    /// One page of `section`'s history, newest first: at most `limit` changes older than
+    /// revision `before` (from the newest when `None`). Unredacted, like everything else here.
+    ///
+    /// The default answers `503 unavailable`, so an implementation that predates the
+    /// per-setting history says so rather than pretending a section has none.
+    async fn history_page(
+        &self,
+        section: &str,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<ConfigHistoryPage, SourceError> {
+        let _ = (section, before, limit);
+        Err(SourceError::Unavailable(
+            "this configuration source keeps no per-setting history".to_owned(),
+        ))
+    }
+
+    /// Undoes one recorded change as a new revision (`config.history.revert`).
+    ///
+    /// Contract, the same as [`ConfigSource::patch_section`]'s plus: the revert is computed from
+    /// what the store recorded the change replaced -- secrets included, which is how a rotated
+    /// secret comes back without ever crossing the wire -- against what is stored now; a later
+    /// change to any of the same settings comes back as [`ConfigRevertOutcome::Conflicts`]
+    /// unless [`ConfigRevert::force`] is set; a change whose settings already hold their earlier
+    /// values is [`ConfigRevertOutcome::Unchanged`] and writes nothing; a change the store
+    /// cannot revert (recorded before it kept prior values) is [`SourceError::Conflict`] with
+    /// the reason; no such change to this section is [`SourceError::NotFound`].
+    async fn revert(&self, request: ConfigRevert) -> Result<ConfigRevertOutcome, SourceError> {
+        let _ = request;
+        Err(SourceError::Unavailable(
+            "this configuration source cannot revert a change".to_owned(),
+        ))
+    }
+}
+
+/// One page of a section's history ([`ConfigSource::history_page`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConfigHistoryPage {
+    /// Newest first.
+    pub changes: Vec<ConfigChange>,
+    /// The `before` for the next, older page; `None` on the oldest.
+    pub older: Option<u64>,
+    /// The `before` for the previous, newer page; `None` on the newest.
+    pub newer: Option<u64>,
+}
+
+/// One `config.history.revert` request, already parsed and authorized.
+#[derive(Debug, Clone)]
+pub struct ConfigRevert {
+    /// The section the change was made to.
+    pub section: String,
+    /// The revision of the change to undo.
+    pub revision: u64,
+    /// The admin API principal to record against the revert.
+    pub actor: Option<String>,
+    /// From `If-Match`, as for [`ConfigPatch::expected_revision`].
+    pub expected_revision: Option<u64>,
+    /// Revert even though later changes wrote some of the same settings, undoing those too.
+    pub force: bool,
+}
+
+/// A later change that stands in the way of a revert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigRevertConflict {
+    /// Its revision.
+    pub revision: u64,
+    /// Who made it.
+    pub actor: Option<String>,
+    /// When, RFC 3339.
+    pub at: String,
+    /// The whole-configuration pointers it wrote that the revert would put back.
+    pub pointers: Vec<String>,
+}
+
+/// What [`ConfigSource::revert`] did.
+#[derive(Debug, Clone)]
+pub enum ConfigRevertOutcome {
+    /// Written as a new revision.
+    Reverted {
+        /// The section as it now reads.
+        section: ConfigSection,
+        /// The merge patch the revert applied (unredacted; the audit entry is built from it).
+        patch: Value,
+    },
+    /// Every setting already holds its earlier value; nothing was written.
+    Unchanged(ConfigSection),
+    /// Later changes wrote some of the same settings and the request did not say to go ahead.
+    /// Nothing was written.
+    Conflicts(Vec<ConfigRevertConflict>),
+}
+
+/// A stored [`hs_config::store::ChangeRecord`] as the admin API serves it, unredacted: one row
+/// per setting it touched ([`hs_config::history::setting_changes`]), with whole-configuration
+/// pointers, and whether it can be reverted.
+///
+/// Public for the same reason as [`config_section`]: the store-backed source in the binary and
+/// this crate's in-memory one must put exactly the same thing on the wire.
+#[must_use]
+pub fn config_change(record: &hs_config::store::ChangeRecord) -> ConfigChange {
+    use hs_config::history::Prior;
+    let secrets = crate::config_schema::secret_paths();
+    let settings = hs_config::history::setting_changes(&record.patch, record.before.as_ref())
+        .into_iter()
+        .map(|row| {
+            let pointer = format!("/{}{}", record.section, row.pointer);
+            ConfigSettingChange {
+                path: pointer_to_dotted(&pointer),
+                secret: secrets.is_secret(&pointer),
+                from: match row.before {
+                    Prior::Unknown => None,
+                    Prior::Unset => Some(ConfigSettingValue::unset()),
+                    Prior::Set(value) => Some(ConfigSettingValue::of(value)),
+                },
+                to: row
+                    .after
+                    .map_or_else(ConfigSettingValue::unset, ConfigSettingValue::of),
+                pointer,
+            }
+        })
+        .collect();
+    let writes_bootstrap = hs_config::store::is_bootstrap_section(&record.section)
+        || !Layers::bootstrap_in_patch(&record.section, &record.patch).is_empty();
+    ConfigChange {
+        revision: record.revision,
+        section: record.section.clone(),
+        patch: record.patch.clone(),
+        actor: record.actor.clone(),
+        at: hs_http::time::rfc3339_from_millis(record.at_ms),
+        settings,
+        reverts: record.reverts,
+        revertible: record.before.is_some() && !writes_bootstrap,
+    }
+}
+
+/// `/rate_limits/login/per_second` becomes `rate_limits.login.per_second`.
+fn pointer_to_dotted(pointer: &str) -> String {
+    hs_config::history::pointer_tokens(pointer).join(".")
 }
 
 /// Renders `error` as the admin API's field-level validation errors, so a rejected configuration
@@ -866,7 +1005,8 @@ pub struct InMemoryConfigSource {
 struct ConfigState {
     layers: Layers,
     revision: u64,
-    history: Vec<ConfigChange>,
+    /// Oldest first, exactly as the real store records them.
+    history: Vec<hs_config::store::ChangeRecord>,
     reloaded_at: BTreeMap<String, String>,
 }
 
@@ -954,6 +1094,55 @@ impl ConfigState {
         self.layers.resolve().map_err(|e| {
             SourceError::Unavailable(format!("the current configuration does not resolve: {e}"))
         })
+    }
+
+    /// Applies one section's patch to the database layer and records it, as the store does:
+    /// with what the database held at each setting before, and the revision it reverts.
+    fn write(&mut self, section: &str, patch: &Value, actor: Option<&str>, reverts: Option<u64>) {
+        let current = self
+            .layers
+            .database
+            .get(section)
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Map::new()));
+        let before = hs_config::history::before_values(&current, patch);
+        let mut database = self.layers.database.clone();
+        hs_config::merge_patch(
+            &mut database,
+            &Value::Object(
+                [(section.to_owned(), patch.clone())]
+                    .into_iter()
+                    .collect::<Map<String, Value>>(),
+            ),
+        );
+        self.layers.database = database;
+        self.revision += 1;
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+        self.history.push(hs_config::store::ChangeRecord {
+            revision: self.revision,
+            section: section.to_owned(),
+            patch: patch.clone(),
+            actor: actor.map(str::to_owned),
+            at_ms,
+            before: Some(before),
+            reverts,
+        });
+    }
+
+    /// [`ConfigState::section`] with its 20 most recent changes, as `config.get` serves it.
+    fn section_with_history(&self, resolved: &Resolved, name: &str) -> ConfigSection {
+        let mut section = self.section(resolved, name);
+        section.history = self
+            .history
+            .iter()
+            .rev()
+            .filter(|change| change.section == name)
+            .take(20)
+            .map(config_change)
+            .collect();
+        section
     }
 
     fn section(&self, resolved: &Resolved, name: &str) -> ConfigSection {
@@ -1045,16 +1234,7 @@ impl ConfigSource for InMemoryConfigSource {
         }
         let state = self.state();
         let resolved = state.resolve()?;
-        let mut section = state.section(&resolved, name);
-        section.history = state
-            .history
-            .iter()
-            .rev()
-            .filter(|change| change.section == name)
-            .take(20)
-            .cloned()
-            .collect();
-        Ok(Some(section))
+        Ok(Some(state.section_with_history(&resolved, name)))
     }
 
     async fn environment_pinned(
@@ -1130,28 +1310,15 @@ impl ConfigSource for InMemoryConfigSource {
             .resolve_with_patch(&request.section, &request.patch)
             .map_err(|e| SourceError::Invalid(e.to_string()))?;
 
-        let mut database = state.layers.database.clone();
-        hs_config::merge_patch(
-            &mut database,
-            &Value::Object(
-                [(request.section.clone(), request.patch.clone())]
-                    .into_iter()
-                    .collect::<Map<String, Value>>(),
-            ),
+        state.write(
+            &request.section,
+            &request.patch,
+            request.actor.as_deref(),
+            None,
         );
-        state.layers.database = database;
-        state.revision += 1;
-        let change = ConfigChange {
-            revision: state.revision,
-            section: request.section.clone(),
-            patch: request.patch,
-            actor: request.actor,
-            at: hs_http::time::now_rfc3339(),
-        };
-        state.history.push(change);
 
         let resolved = state.resolve()?;
-        Ok(state.section(&resolved, &request.section))
+        Ok(state.section_with_history(&resolved, &request.section))
     }
 
     async fn reload(&self) -> Result<ConfigReloadReport, SourceError> {
@@ -1188,9 +1355,157 @@ impl ConfigSource for InMemoryConfigSource {
             .rev()
             .filter(|change| section.is_none_or(|name| change.section == name))
             .take(limit)
-            .cloned()
+            .map(config_change)
             .collect())
     }
+
+    async fn history_page(
+        &self,
+        section: &str,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<ConfigHistoryPage, SourceError> {
+        if !hs_config::reload::SECTION_NAMES.contains(&section) {
+            return Err(SourceError::NotFound);
+        }
+        let limit = limit.max(1);
+        let state = self.state();
+        let matching: Vec<&hs_config::store::ChangeRecord> = state
+            .history
+            .iter()
+            .rev()
+            .filter(|change| change.section == section)
+            .collect();
+        let start = before.map_or(0, |before| {
+            matching
+                .iter()
+                .position(|change| change.revision < before)
+                .unwrap_or(matching.len())
+        });
+        let page: Vec<&hs_config::store::ChangeRecord> =
+            matching.iter().skip(start).take(limit).copied().collect();
+        let older = if start + limit < matching.len() {
+            page.last().map(|change| change.revision)
+        } else {
+            None
+        };
+        let newer = if before.is_some() && start > 0 {
+            matching
+                .get(start.saturating_sub(limit))
+                .map(|change| change.revision + 1)
+        } else {
+            None
+        };
+        Ok(ConfigHistoryPage {
+            changes: page.into_iter().map(config_change).collect(),
+            older,
+            newer,
+        })
+    }
+
+    async fn revert(&self, request: ConfigRevert) -> Result<ConfigRevertOutcome, SourceError> {
+        let mut state = self.state_mut();
+        if !hs_config::reload::SECTION_NAMES.contains(&request.section.as_str()) {
+            return Err(SourceError::NotFound);
+        }
+        let Some(index) = state.history.iter().position(|change| {
+            change.revision == request.revision && change.section == request.section
+        }) else {
+            return Err(SourceError::NotFound);
+        };
+        let record = state.history[index].clone();
+        let Some(before) = record.before.as_ref() else {
+            return Err(SourceError::Conflict(format!(
+                "revision {} was recorded before this server kept the values a change \
+                 replaced, so what to put back is not known",
+                request.revision
+            )));
+        };
+        if let Some(expected) = request.expected_revision
+            && expected != state.revision
+        {
+            return Err(SourceError::PreconditionFailed(format!(
+                "the configuration has changed since revision {expected} (it is now at {})",
+                state.revision
+            )));
+        }
+        let conflicts = hs_config::history::later_conflicts(
+            before,
+            state.history[index + 1..]
+                .iter()
+                .filter(|change| change.section == request.section),
+        );
+        if !conflicts.is_empty() && !request.force {
+            return Ok(ConfigRevertOutcome::Conflicts(revert_conflicts(
+                &request.section,
+                conflicts,
+            )));
+        }
+        let current = state
+            .layers
+            .database
+            .get(&request.section)
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Map::new()));
+        let target = hs_config::history::revert_target(&current, before);
+        let patch = hs_config::history::diff_merge_patch(&current, &target);
+        if patch.as_object().is_some_and(Map::is_empty) {
+            let resolved = state.resolve()?;
+            return Ok(ConfigRevertOutcome::Unchanged(
+                state.section_with_history(&resolved, &request.section),
+            ));
+        }
+        let bootstrap = Layers::bootstrap_in_patch(&request.section, &patch);
+        if hs_config::store::is_bootstrap_section(&request.section) || !bootstrap.is_empty() {
+            return Err(SourceError::Conflict(
+                hs_config::store::StoreError::bootstrap(&request.section, bootstrap).to_string(),
+            ));
+        }
+        let pinned = state.layers.pinned_by_environment(&request.section, &patch);
+        if !pinned.is_empty() {
+            return Err(SourceError::Conflict(format!(
+                "pinned by the environment: {}",
+                pinned.join(", ")
+            )));
+        }
+        state
+            .layers
+            .resolve_with_patch(&request.section, &patch)
+            .map_err(|e| SourceError::Invalid(e.to_string()))?;
+        state.write(
+            &request.section,
+            &patch,
+            request.actor.as_deref(),
+            Some(request.revision),
+        );
+        let resolved = state.resolve()?;
+        Ok(ConfigRevertOutcome::Reverted {
+            section: state.section_with_history(&resolved, &request.section),
+            patch,
+        })
+    }
+}
+
+/// The store's [`hs_config::store::LaterChange`]s as the admin API reports them, with
+/// whole-configuration pointers.
+#[must_use]
+pub fn revert_conflicts(
+    section: &str,
+    conflicts: Vec<hs_config::store::LaterChange>,
+) -> Vec<ConfigRevertConflict> {
+    conflicts
+        .into_iter()
+        .map(|later| ConfigRevertConflict {
+            revision: later.revision,
+            actor: later.actor,
+            at: hs_http::time::rfc3339_from_millis(later.at_ms),
+            pointers: later
+                .pointers
+                .into_iter()
+                .map(|pointer| format!("/{section}{pointer}"))
+                .collect(),
+        })
+        .collect()
 }
 
 // -------------------------------------------------------------------------------------------

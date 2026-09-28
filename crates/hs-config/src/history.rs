@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 
 use crate::document::leaf_pointers;
+use crate::store::{ChangeRecord, LaterChange};
 
 /// What the database held at each setting `patch` touches, before it is applied to `current`
 /// (the section's stored document; an empty object when it stores nothing).
@@ -179,6 +180,31 @@ pub fn diff_merge_patch(from: &Value, to: &Value) -> Value {
         }
     }
     Value::Object(patch)
+}
+
+/// The changes in `later` -- newer changes to the same section, oldest first -- that wrote any of
+/// the settings a change's `before` names, each with the pointers it shares. Reverting that
+/// change would undo those writes too.
+#[must_use]
+pub fn later_conflicts<'a>(
+    before: &BTreeMap<String, Value>,
+    later: impl IntoIterator<Item = &'a ChangeRecord>,
+) -> Vec<LaterChange> {
+    later
+        .into_iter()
+        .filter_map(|record| {
+            let shared: Vec<String> = leaf_pointers(&record.patch)
+                .into_iter()
+                .filter(|p| before.keys().any(|t| pointers_overlap(t, p)))
+                .collect();
+            (!shared.is_empty()).then(|| LaterChange {
+                revision: record.revision,
+                actor: record.actor.clone(),
+                at_ms: record.at_ms,
+                pointers: shared,
+            })
+        })
+        .collect()
 }
 
 /// Whether two section-relative pointers name the same setting or one contains the other.
