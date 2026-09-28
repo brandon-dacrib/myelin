@@ -871,9 +871,9 @@ edit one is not. New settings and operations arrive with their interface control
    `message_id` dedupe), `m.signing_key_update`~~ **done 2026-09-28**
    (`federation-to-device`: two-server tests in `crates/hs-cli/tests/federation_edus.rs`, EDU
    metrics `hs_federation_edus_{sent,received}_total`). Left, in order
-   (`docs/status/06-federation.md`): a local user's join to a restricted room on its own
-   server still needs the client to name an authoriser (`hs_room::actor::membership_action`
-   should pick one as `make_join` does); when every resident refuses with
+   (`docs/status/06-federation.md`): ~~a local user's join to a restricted room on its own
+   server still needs the client to name an authoriser~~ **done 2026-09-28**
+   (`RoomActor::restricted_join`; through another server when nobody here may invite); when every resident refuses with
    `M_UNABLE_TO_AUTHORISE_JOIN`, fall back to the allowed rooms' servers; the invite and knock
    stripped state kept in `unsigned` shows in the invitee's timeline rendering; EDUs in
    cluster mode only through the owning replica (today a non-owning replica drops typing,

@@ -135,6 +135,22 @@ pub enum RemoteEventOutcome {
     Stored(EventSn),
 }
 
+/// What a join to a restricted room needs from whoever authorises it: see
+/// [`RoomActor::restricted_join`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestrictedJoin {
+    /// The rooms (`m.room_membership` entries of the join rules' `allow`) whose members may
+    /// join without an invite.
+    pub allowed_rooms: Vec<OwnedRoomId>,
+    /// The user of this server to name in `join_authorised_via_users_server`: the first, by
+    /// user ID, joined to the room with the power to invite. `None` if this server has nobody
+    /// who may, and the join has to be authorised by another server.
+    pub local_authoriser: Option<OwnedUserId>,
+    /// Every other server with a joined member who may invite, sorted: where a join goes when
+    /// this server cannot authorise it.
+    pub inviting_servers: Vec<String>,
+}
+
 /// One page of [`RoomActor::paginate_page`].
 #[derive(Debug)]
 pub struct Page<'a> {
@@ -2531,6 +2547,112 @@ impl<B: KvBackend> RoomActor<B> {
             user,
             membership::content_for(Action::Leave, extra),
         )
+    }
+
+    /// What a join by `user` needs when the room's join rule is `restricted` (room version 8
+    /// and up) or `knock_restricted` (10 and up) and `user` is neither joined nor invited: the
+    /// rooms whose members may join ([`RestrictedJoin::allowed_rooms`]), and who could vouch
+    /// for the join by being named in `join_authorised_via_users_server` -- a user joined to
+    /// this room with the power to invite. `None` when the join needs none of this (any other
+    /// join rule, or a user already joined or invited).
+    ///
+    /// The same choice `hs_federation::join::make_join` makes for a user of another server,
+    /// made here for a user of this one, whose client names no authoriser: the first local
+    /// member (by user ID) who may invite. Whether `user` is in one of the allowed rooms is for
+    /// the caller to find out, since that is other rooms' state.
+    ///
+    /// # Errors
+    /// [`RoomError::State`] if the state cannot be read; [`RoomError::Internal`] if the room's
+    /// power levels do not parse.
+    pub fn restricted_join(&self, user: &UserId) -> Result<Option<RestrictedJoin>, RoomError> {
+        if matches!(
+            self.prior_membership(user)?,
+            PriorState::Join | PriorState::Invite
+        ) {
+            return Ok(None);
+        }
+        let Some(join_rules) = self.state_event("m.room.join_rules", "")? else {
+            return Ok(None);
+        };
+        let content = join_rules
+            .json()
+            .get("content")
+            .and_then(CanonicalJsonValue::as_object);
+        let rule = content
+            .and_then(|c| c.get("join_rule"))
+            .and_then(CanonicalJsonValue::as_str);
+        let restricted = (self.rules.restricted_join_rule && rule == Some("restricted"))
+            || (self.rules.knock_restricted_join_rule && rule == Some("knock_restricted"));
+        if !restricted {
+            return Ok(None);
+        }
+        let allowed_rooms = match content.and_then(|c| c.get("allow")) {
+            Some(CanonicalJsonValue::Array(entries)) => entries
+                .iter()
+                .filter_map(CanonicalJsonValue::as_object)
+                .filter(|entry| {
+                    entry.get("type").and_then(CanonicalJsonValue::as_str)
+                        == Some("m.room_membership")
+                })
+                .filter_map(|entry| entry.get("room_id").and_then(CanonicalJsonValue::as_str))
+                .filter_map(|room| RoomId::parse(room).ok())
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        let creators = self.room_creators(&self.rules)?;
+        let levels = match self.state_event("m.room.power_levels", "")? {
+            Some(event) => {
+                let content = event
+                    .json()
+                    .get("content")
+                    .and_then(CanonicalJsonValue::as_object)
+                    .ok_or_else(|| RoomError::Internal("power levels have no content".into()))?;
+                Some(
+                    hs_model::power_levels::PowerLevels::parse(content, &self.rules)
+                        .map_err(|e| RoomError::Internal(e.to_string()))?,
+                )
+            }
+            None => None,
+        };
+        let effective = levels.as_ref().map(|levels| {
+            hs_model::power_levels::EffectivePowerLevels::new(levels, &self.rules, creators)
+        });
+        let may_invite = |member: &UserId| match &effective {
+            Some(effective) => effective.user_power(member) >= effective.levels().invite,
+            // No power levels yet: the spec's defaults, an invite level of 0 that every member
+            // has.
+            None => true,
+        };
+        let mut inviters: Vec<OwnedUserId> = self
+            .joined_members()?
+            .iter()
+            .filter_map(|member| member.header().state_key.as_deref())
+            .filter_map(|key| UserId::parse(key).ok())
+            .filter(|member| may_invite(member))
+            .collect();
+        inviters.sort();
+        let own = self.identity.server_name.as_str();
+        let local_authoriser = inviters
+            .iter()
+            .find(|member| member.server_name().as_str() == own)
+            .cloned();
+        let inviting_servers: BTreeSet<String> = inviters
+            .iter()
+            .map(|member| member.server_name().to_string())
+            .filter(|server| server != own)
+            .collect();
+        Ok(Some(RestrictedJoin {
+            allowed_rooms,
+            local_authoriser,
+            inviting_servers: inviting_servers.into_iter().collect(),
+        }))
+    }
+
+    /// Whether `user`'s current membership is `join`. `false` if the state cannot be read.
+    #[must_use]
+    pub fn is_joined(&self, user: &UserId) -> bool {
+        matches!(self.prior_membership(user), Ok(PriorState::Join))
     }
 
     /// Whether any user of this server is currently joined to the room.
@@ -6091,6 +6213,54 @@ mod tests {
             first.event_id(),
             second.event_id(),
             "rejoining with unchanged content must not create a second join event"
+        );
+    }
+
+    #[test]
+    fn a_restricted_join_names_the_first_local_member_who_may_invite() {
+        let mut actor = room("private_chat");
+        let alice = user_id!("@alice:hs1").to_owned();
+        let bob = user_id!("@bob:hs1").to_owned();
+        assert_eq!(
+            actor.restricted_join(&bob).unwrap(),
+            None,
+            "an invite-only room"
+        );
+        actor
+            .send_event(
+                alice.clone(),
+                "m.room.join_rules".to_owned(),
+                Some(String::new()),
+                serde_json::json!({
+                    "join_rule": "restricted",
+                    "allow": [
+                        {"type": "m.room_membership", "room_id": "!lobby:hs1"},
+                        {"type": "something.else", "room_id": "!ignored:hs1"},
+                    ],
+                }),
+                None,
+                2,
+            )
+            .unwrap();
+        let plan = actor.restricted_join(&bob).unwrap().expect("restricted");
+        assert_eq!(plan.allowed_rooms, vec![ruma::owned_room_id!("!lobby:hs1")]);
+        assert_eq!(plan.local_authoriser, Some(alice.clone()));
+        assert!(plan.inviting_servers.is_empty());
+
+        // Once invited, bob joins like anybody invited.
+        actor
+            .membership_action(
+                alice.clone(),
+                Action::Invite,
+                bob.clone(),
+                serde_json::json!({}),
+                3,
+            )
+            .unwrap();
+        assert_eq!(
+            actor.restricted_join(&bob).unwrap(),
+            None,
+            "an invited user needs no authoriser"
         );
     }
 

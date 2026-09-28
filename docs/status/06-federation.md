@@ -1,5 +1,32 @@
 # 06 Federation: status
 
+## Thirteenth session (2026-09-28): what was left after the join
+
+Scope: `docs/next-steps.md` queue item 3's remainder, in order. Each item merged to main on its
+own. Touched `hs-room`, `hs-cli` and this crate.
+
+**1. A local user's join to a restricted room names its authoriser itself.** Done.
+`hs_room::actor::RoomActor::restricted_join` (new) says what a join by a user who is neither
+joined nor invited needs in a `restricted` (v8+) or `knock_restricted` (v10+) room: the allowed
+rooms, the first local joined member (by user ID) with the power to invite, and every other
+server with such a member. `hs_room::routes::membership::act_join` uses it when the client named
+no `join_authorised_via_users_server`: if the user is joined to one of the allowed rooms held
+here, the local member is named and the join is made here (what `make_join` does for a user of
+another server); if no user of this server may invite, the join goes through the servers whose
+users may, then the client's `via` (Synapse's `_should_perform_remote_join`), and the resident's
+answer is accepted as an ordinary event of a room held for real
+(`hs_cli::remote_join`, `accept_remote_event`, falling back to the resident's state only if the
+join cites what this copy has not seen). A user in none of the allowed rooms is refused by the
+auth rules, `403`.
+
+- `crates/hs-cli/tests/federation_membership.rs::a_local_user_joins_a_restricted_room_without_naming_an_authoriser`:
+  carol on A is refused, joins the lobby, joins the restricted room with alice named, rejoins
+  (profile change), leaves both and is refused again; then in a room where only alice may invite
+  and bob on B is joined, dave on B is refused, joins the lobby, and his join goes through A,
+  which names alice; he speaks. Fails with the fix off (`403 cannot join restricted room without
+  join_authorised_via_users_server if not invited`).
+- `hs_room::actor::tests::a_restricted_join_names_the_first_local_member_who_may_invite`.
+
 ## Twelfth session (2026-09-28): to-device messages and `m.signing_key_update` over federation
 
 Scope: `docs/next-steps.md` section 3's "to-device over federation; `m.signing_key_update`; EDUs

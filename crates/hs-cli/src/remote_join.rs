@@ -165,6 +165,22 @@ impl<B: KvBackend + 'static> hs_room::remote_join::RemoteJoin for FederationRemo
             .await
             {
                 Ok(outcome) => {
+                    // A room this server is in already (a restricted join no user here could
+                    // authorise): the join is one more event of a room held for real, placed
+                    // after what it cites like any event over `/send`. Only if it cites what
+                    // this copy has not seen yet is the resident's state taken over it.
+                    if let Ok(handle) = self.rooms.get_or_load(room_id).await
+                        && handle.query(|actor| actor.local_user_joined()).await
+                    {
+                        match handle.accept_remote_event(outcome.join_event.clone()).await {
+                            Ok(_) => {
+                                tracing::info!(%room_id, %user_id, destination, "joined a room this server is in through another server");
+                                return Ok(room_id.to_owned());
+                            }
+                            Err(RoomError::MissingAncestors(_)) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
                     tracing::info!(
                         %room_id,
                         %user_id,

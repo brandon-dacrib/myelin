@@ -863,3 +863,114 @@ async fn an_invite_is_rejected_locally_when_no_server_in_the_room_answers() {
 
     b.handle.shutdown().await;
 }
+
+/// A user of the server that holds a restricted room joins it without naming an authoriser,
+/// as a client does: the server picks one the way `make_join` does for a user of another
+/// server. On A alone, carol is let in once she is in the lobby, with alice named; out of the
+/// lobby, she is refused again. In a restricted room where no user of B may invite, a join by
+/// dave on B -- whose server is in the room -- goes through A instead, and A names alice.
+#[tokio::test]
+async fn a_local_user_joins_a_restricted_room_without_naming_an_authoriser() {
+    let (a, b) = (start().await, start().await);
+    let client = reqwest::Client::new();
+    let alice = register(&client, &a, "alice").await;
+    let carol = register(&client, &a, "carol").await;
+    let bob = register(&client, &b, "bob").await;
+    let dave = register(&client, &b, "dave").await;
+
+    // A local join, authorised locally.
+    let (lobby, restricted) = restricted_room_and_lobby(&client, &alice).await;
+    let (status, body) = post(&client, &carol, &format!("join/{restricted}"), json!({})).await;
+    assert_eq!(
+        status, 403,
+        "carol is in no room the join rules allow: {body}"
+    );
+    let (status, body) = post(&client, &carol, &format!("join/{lobby}"), json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post(&client, &carol, &format!("join/{restricted}"), json!({})).await;
+    assert_eq!(status, 200, "the local restricted join failed: {body}");
+    let content = member_content(&client, &alice, &restricted, &carol.id).await;
+    assert_eq!(content["membership"], "join", "{content}");
+    assert_eq!(
+        content["join_authorised_via_users_server"], alice.id,
+        "A named its own user who may invite: {content}"
+    );
+    // Joining again (a profile change) needs no authoriser.
+    let (status, body) = post(
+        &client,
+        &carol,
+        &format!("rooms/{restricted}/join"),
+        json!({"displayname": "Carol"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    for room in [&restricted, &lobby] {
+        let (status, body) = post(&client, &carol, &format!("rooms/{room}/leave"), json!({})).await;
+        assert_eq!(status, 200, "{body}");
+    }
+    let (status, body) = post(&client, &carol, &format!("join/{restricted}"), json!({})).await;
+    assert_eq!(
+        status, 403,
+        "out of the lobby, carol is refused again: {body}"
+    );
+
+    // A restricted room on A in which only alice may invite; bob (B) is invited in, so B is
+    // in the room but cannot vouch for anybody.
+    let guarded = create_room(
+        &client,
+        &alice,
+        json!({
+            "preset": "private_chat",
+            "room_version": "11",
+            "power_level_content_override": {"invite": 50},
+            "initial_state": [{
+                "type": "m.room.join_rules",
+                "state_key": "",
+                "content": {
+                    "join_rule": "restricted",
+                    "allow": [{"type": "m.room_membership", "room_id": lobby}],
+                },
+            }],
+        }),
+    )
+    .await;
+    let (status, body) = post(
+        &client,
+        &alice,
+        &format!("rooms/{guarded}/invite"),
+        json!({"user_id": bob.id}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    sync_until(&client, &bob, |s| {
+        s["rooms"]["invite"].get(&guarded).is_some()
+    })
+    .await;
+    let (status, body) = post(&client, &bob, &format!("join/{guarded}"), json!({})).await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body) = post(&client, &dave, &format!("rooms/{guarded}/join"), json!({})).await;
+    assert_eq!(
+        status, 403,
+        "dave is in no room the join rules allow: {body}"
+    );
+    let (status, body) = post(&client, &dave, &format!("join/{lobby}"), json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post(&client, &dave, &format!("rooms/{guarded}/join"), json!({})).await;
+    assert_eq!(status, 200, "the join through A failed: {body}");
+    wait_for_membership(&client, &alice, &guarded, &dave.id, "join").await;
+    let content = member_content(&client, &alice, &guarded, &dave.id).await;
+    assert_eq!(
+        content["join_authorised_via_users_server"], alice.id,
+        "{content}"
+    );
+    wait_for_membership(&client, &bob, &guarded, &dave.id, "join").await;
+    send_message(&client, &dave, &guarded, "in through A").await;
+    sync_until(&client, &alice, |s| {
+        timeline_bodies(s, &guarded).contains(&"in through A".to_owned())
+    })
+    .await;
+
+    a.handle.shutdown().await;
+    b.handle.shutdown().await;
+}

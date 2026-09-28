@@ -316,6 +316,45 @@ async fn act_join<B: KvBackend + 'static>(
                 let joined = remote.join(&sender, &room_id, &via, content).await?;
                 return Ok(Json(json!({ "room_id": joined })).into_response());
             }
+            let mut content = content;
+            if content.get("join_authorised_via_users_server").is_none() {
+                let user = sender.clone();
+                let plan = handle
+                    .query(move |actor| actor.restricted_join(&user))
+                    .await?;
+                if let Some(plan) = plan {
+                    match plan.local_authoriser {
+                        Some(authoriser) => {
+                            // Named only when the user is in an allowed room: otherwise the
+                            // join is refused by the auth rules, as it should be.
+                            if joined_to_any(state, &plan.allowed_rooms, &sender).await {
+                                tracing::debug!(%room_id, user = %sender, %authoriser, "authorising a restricted join locally");
+                                content["join_authorised_via_users_server"] =
+                                    Value::String(authoriser.to_string());
+                            }
+                        }
+                        None => {
+                            // Nobody here may invite, so this server cannot vouch for the join:
+                            // a server whose users can has to (Synapse's
+                            // `_should_perform_remote_join`), and the client's `via` after them.
+                            if let Some(remote) = &state.remote_join
+                                && !plan.inviting_servers.is_empty()
+                            {
+                                let mut through = plan.inviting_servers;
+                                for server in via {
+                                    if !through.contains(&server) {
+                                        through.push(server);
+                                    }
+                                }
+                                tracing::info!(%room_id, user = %sender, "no user of this server may authorise the restricted join; joining through another server");
+                                let joined =
+                                    remote.join(&sender, &room_id, &through, content).await?;
+                                return Ok(Json(json!({ "room_id": joined })).into_response());
+                            }
+                        }
+                    }
+                }
+            }
             handle
                 .membership(sender.clone(), Action::Join, sender, content, now_ms())
                 .await?;
@@ -340,6 +379,25 @@ async fn act_join<B: KvBackend + 'static>(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Whether `user` is joined to any of `rooms`, as this server holds them. A room this server
+/// does not hold has no member of this server, so it cannot be one `user` is in.
+async fn joined_to_any<B: KvBackend + 'static>(
+    state: &RoomState<B>,
+    rooms: &[ruma::OwnedRoomId],
+    user: &ruma::UserId,
+) -> bool {
+    for room in rooms {
+        let Ok(handle) = state.rooms.get_or_load(room).await else {
+            continue;
+        };
+        let who = user.to_owned();
+        if handle.query(move |actor| actor.is_joined(&who)).await {
+            return true;
+        }
+    }
+    false
 }
 
 /// `POST /rooms/{roomId}/join`.
