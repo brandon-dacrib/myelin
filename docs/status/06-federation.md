@@ -83,6 +83,44 @@ knocks; the `400` is for a version the knocking server lacks. The knocking serve
 - `hs_federation::join::tests::make_knock_needs_a_knock_room_in_a_version_with_knocking` gained
   the version 6 case.
 
+**5. EDUs in cluster mode go through the replica that sends for their destination.** Done.
+A replica that takes a user's typing, receipt, presence or to-device request no longer drops the
+EDU for a destination whose federation shard another replica owns; it hands it to that replica
+over the mesh, which queues and sends it.
+
+- `hs-federation`: `sender::EduForwarder` (new trait), installed with
+  `FederationSender::install_edu_forwarder`; `enqueue_edu` calls it for a destination another
+  replica sends for (and without one drops and counts the EDU, as before).
+  `FederationSender::enqueue_edu_local` (new) skips such a destination instead: for the
+  device-list announcer, which every replica runs on the same stream, and for EDUs a peer
+  forwarded, which must not be forwarded again.
+- `hs-cli`: `cluster::PeerRoutes`, a route-prefix multiplexer, is now the one mesh
+  `PeerHandler`; `ClusterHandles::add_peer_handler(prefix, handler)` replaces
+  `install_peer_handler` (sync's `SessionPeerHandler` is added for `user.`).
+  `edu_forward::MeshEduForwarder` looks up `ownership.owner_of(layout.federation_shard(dest))`
+  and sends batches on `federation.edu` through `Forwarder::send_to_peer` (one ordered queue
+  and pump task per owner, so to-device messages keep their order; 2 s deadline per batch);
+  `edu_forward::EduPeerHandler` queues each with `enqueue_edu_local`. `edu_forward::install`
+  wires both in `serve.rs` before `spawn_mesh`; single-node mode installs nothing.
+- Observability: `hs_federation_edus_forwarded_total{edu_type,outcome}`, `outcome` one of
+  `forwarded`, `failed` (owner unreachable, refused, or no other owner during a handoff) and
+  `dropped` (no forwarder) on the replica that took the request, `received` on the owner.
+  Debug logs per batch, warn on a failure.
+- Delivery is best effort, like any EDU: a batch that fails is counted and not retried.
+
+Tests:
+- `crates/hs-cli/tests/cluster_edus.rs::a_to_device_message_sent_through_a_replica_that_does_not_send_for_its_destination_arrives`:
+  server A is two `hs serve` replicas (in process, real mesh) on one PostgreSQL, B one embedded
+  server. It waits for both replicas to own shards and B's federation shard to settle, then
+  alice sends one to-device message through each replica: bob on B gets both, the non-owner's
+  `/metrics` says `forwarded` 1 and the owner's `received` 1. Fails with forwarding off (only
+  the owner's message arrives). Needs PostgreSQL (`HS_CLUSTER_TEST_POSTGRES_DSN`, default
+  `postgres://postgres:hspg@127.0.0.1:5439/postgres`), and prints SKIP without one.
+- `hs_federation::sender::tests::an_edu_for_a_destination_sent_from_elsewhere_is_forwarded_unless_local_only`,
+  `hs_cli::edu_forward::tests::a_forwarded_edu_round_trips_through_json`.
+
+Not yet run on the Kubernetes cluster (a desktop item, `kubectl` unreachable from this session).
+
 ## Twelfth session (2026-09-28): to-device messages and `m.signing_key_update` over federation
 
 Scope: `docs/next-steps.md` section 3's "to-device over federation; `m.signing_key_update`; EDUs
@@ -155,7 +193,7 @@ Tests (all fail with the fix turned off, checked by editing the code and running
   `sender::tests::an_edu_rides_with_waiting_pdus_and_goes_alone_when_nothing_waits` now also
   checks the sent counter.
 
-**Not done: EDUs in cluster mode only through the owning replica.** It does not fit cleanly in
+**Not done (done since: thirteenth session, item 5): EDUs in cluster mode only through the owning replica.** It does not fit cleanly in
 this change, and could not be verified here (no cluster). Today the sender *drops* an EDU for a
 destination whose federation shard another replica owns (`FederationSender::enqueue_edu`). That
 is right for the device-list announcer (every replica follows the shared stream, so the owner

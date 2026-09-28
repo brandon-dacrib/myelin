@@ -21,6 +21,7 @@ pub mod cluster_admin;
 pub mod config_bridge;
 pub mod config_cmd;
 pub mod config_source;
+pub mod edu_forward;
 pub mod edus;
 pub mod federation;
 pub mod federation_sender;

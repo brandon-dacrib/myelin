@@ -108,11 +108,76 @@ pub struct ClusterHandles {
     /// [`RoomShardGate`]). `None` in single-node mode, where nothing is pre-minted.
     server_name: Option<ruma::OwnedServerName>,
     mesh: Option<MeshStartConfig>,
-    /// The handler for replica-to-replica messages (`hs_cluster::mesh::PeerHandler`), installed
-    /// by `crate::sync_cluster::install` once the session hub exists and read by
-    /// [`ClusterHandles::spawn_mesh`]. A `OnceLock` rather than a constructor parameter so the
-    /// cluster can start before the hub is wired to it and the mesh listener after.
-    peer_handler: std::sync::OnceLock<Arc<dyn hs_cluster::mesh::PeerHandler>>,
+    /// The handlers for replica-to-replica messages (`hs_cluster::mesh::PeerHandler`), one per
+    /// route prefix, added by whoever speaks on the mesh (`crate::sync_cluster::install` for
+    /// `user.`, `crate::edu_forward::install` for `federation.`) and served by
+    /// [`ClusterHandles::spawn_mesh`]: the mesh takes one handler, and this is it.
+    peer_routes: Arc<PeerRoutes>,
+}
+
+/// The one [`hs_cluster::mesh::PeerHandler`] the mesh serves, handing each message to the
+/// handler added for the longest prefix of its route. A route no prefix matches is answered
+/// `404`.
+#[derive(Default)]
+pub struct PeerRoutes {
+    routes: std::sync::RwLock<Vec<(&'static str, Arc<dyn hs_cluster::mesh::PeerHandler>)>>,
+}
+
+impl PeerRoutes {
+    /// Adds `handler` for every route starting with `prefix`. A second handler for the same
+    /// prefix is ignored with a warning.
+    pub fn add(&self, prefix: &'static str, handler: Arc<dyn hs_cluster::mesh::PeerHandler>) {
+        let mut routes = self
+            .routes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if routes.iter().any(|(known, _)| *known == prefix) {
+            tracing::warn!(
+                prefix,
+                "a mesh peer handler was already added for this prefix; ignoring the second"
+            );
+            return;
+        }
+        routes.push((prefix, handler));
+        // Longest first, so the most specific prefix wins.
+        routes.sort_by_key(|(known, _)| std::cmp::Reverse(known.len()));
+    }
+
+    /// Whether any handler has been added.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.routes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
+    fn handler_for(&self, route: &str) -> Option<Arc<dyn hs_cluster::mesh::PeerHandler>> {
+        self.routes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|(prefix, _)| route.starts_with(prefix))
+            .map(|(_, handler)| handler.clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl hs_cluster::mesh::PeerHandler for PeerRoutes {
+    async fn handle(
+        &self,
+        from: ReplicaId,
+        route: &str,
+        payload: bytes::Bytes,
+    ) -> hs_cluster::mesh::Reply {
+        match self.handler_for(route) {
+            Some(handler) => handler.handle(from, route, payload).await,
+            None => hs_cluster::mesh::Reply {
+                status: 404,
+                payload: bytes::Bytes::from(format!("no such peer route: {route}")),
+            },
+        }
+    }
 }
 
 /// How the mesh listener authenticates peers, decided once in [`start`] from
@@ -283,7 +348,7 @@ pub async fn start<B: KvBackend + 'static>(
             max_in_flight_per_peer,
             ownership,
         }),
-        peer_handler: std::sync::OnceLock::new(),
+        peer_routes: Arc::new(PeerRoutes::default()),
     })
 }
 
@@ -304,7 +369,7 @@ impl ClusterHandles {
             default_deadline: Duration::from_secs(10),
             server_name: None,
             mesh: None,
-            peer_handler: std::sync::OnceLock::new(),
+            peer_routes: Arc::new(PeerRoutes::default()),
         }
     }
 
@@ -320,13 +385,14 @@ impl ClusterHandles {
         self.origin_generation
     }
 
-    /// Installs the handler [`ClusterHandles::spawn_mesh`] serves `POST /mesh/v1/peer` with.
-    /// Must be called before `spawn_mesh`; a second install is ignored with a warning, the
-    /// convention every other `install_*` in this workspace follows.
-    pub fn install_peer_handler(&self, handler: Arc<dyn hs_cluster::mesh::PeerHandler>) {
-        if self.peer_handler.set(handler).is_err() {
-            tracing::warn!("a mesh peer handler was already installed; ignoring the second");
-        }
+    /// Adds a handler for the `POST /mesh/v1/peer` messages whose route starts with `prefix`
+    /// (see [`PeerRoutes`]). Must be called before [`ClusterHandles::spawn_mesh`].
+    pub fn add_peer_handler(
+        &self,
+        prefix: &'static str,
+        handler: Arc<dyn hs_cluster::mesh::PeerHandler>,
+    ) {
+        self.peer_routes.add(prefix, handler);
     }
 
     /// Starts the mesh HTTP/2 listener, if this replica is clustered (`None` in single-node
@@ -364,7 +430,10 @@ impl ClusterHandles {
             // (the same loop runs unconditionally on its own interval); only failover latency
             // is, and only by up to one `heartbeat_interval`. Documented in the status file.
             nudge: None,
-            peers: self.peer_handler.get().cloned(),
+            // No handler at all is the mesh's own `501`, which a sender reads as "this peer
+            // speaks no peer messages" (a replica from before they existed).
+            peers: (!self.peer_routes.is_empty())
+                .then(|| self.peer_routes.clone() as Arc<dyn hs_cluster::mesh::PeerHandler>),
         });
         let server = match MeshServer::new(mesh.listen_addr.clone(), tls_material) {
             Ok(server) => server,
@@ -1082,7 +1151,7 @@ mod tests {
             default_deadline: Duration::from_secs(10),
             server_name: None,
             mesh: None,
-            peer_handler: std::sync::OnceLock::new(),
+            peer_routes: Arc::new(PeerRoutes::default()),
         };
         let gate = RoomShardGate::new(&handles);
         assert!(

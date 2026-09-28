@@ -72,9 +72,11 @@
 //! [`MAX_QUEUED_EDUS_PER_DESTINATION`], dropping the oldest, so a destination that is down for a
 //! day does not hold a day of typing notices. An EDU queued with a coalescing key replaces the
 //! unsent one with the same key (a typing or presence update supersedes the previous one). An
-//! EDU for a destination another replica sends for is dropped, not stored: the replica that owns
-//! it has its own users' EDUs to send, and this one's are not worth a shared table.
-//! To-device messages, which must not be dropped, are not sent this way.
+//! EDU for a destination another replica sends for is not stored: it is handed to the installed
+//! [`EduForwarder`] (`hs-cli` passes it over the mesh to the replica that owns the
+//! destination's federation shard, which queues it with [`FederationSender::enqueue_edu_local`]),
+//! or dropped when there is none. [`FederationSender::enqueue_edu_local`] skips such a
+//! destination instead, for an EDU every replica produces for itself.
 //!
 //! **Only `/send`.** Invites (`PUT /invite`), leaves and knocks against a remote resident
 //! (`make_leave`/`send_leave`, `make_knock`/`send_knock`) are separate handshakes, not
@@ -163,6 +165,24 @@ pub trait SendGate: Send + Sync {
     fn sends_here(&self, destination: &str) -> bool;
 }
 
+/// Where an EDU goes when another replica sends for its destination (see the module docs' "In a
+/// cluster"): `hs-cli` hands it over the mesh to the replica that owns the destination's
+/// federation shard, which queues it with [`FederationSender::enqueue_edu_local`]. Without one
+/// installed, such an EDU is dropped (and counted as `dropped` in
+/// `hs_federation_edus_forwarded_total`).
+pub trait EduForwarder: Send + Sync {
+    /// Hands one EDU for `destination` to the replica that sends for it. Never blocks and never
+    /// fails: delivery is best effort, as an EDU's is anyway, and the implementation logs and
+    /// counts what it could not deliver.
+    fn forward_edu(
+        &self,
+        destination: &str,
+        edu_type: &str,
+        content: &Value,
+        coalesce_key: Option<&str>,
+    );
+}
+
 /// The single-process gate: every destination is sent for here.
 pub struct SendsEverywhere;
 
@@ -217,6 +237,9 @@ struct Shared {
     shut_down: AtomicBool,
     /// Where accepted EDUs are counted, once installed ([`FederationSender::install_edu_metrics`]).
     edu_metrics: std::sync::OnceLock<crate::metrics::EduMetrics>,
+    /// Where an EDU for a destination another replica sends for goes, once installed
+    /// ([`FederationSender::install_edu_forwarder`]).
+    edu_forwarder: std::sync::OnceLock<Arc<dyn EduForwarder>>,
 }
 
 struct DestinationQueue {
@@ -347,6 +370,7 @@ impl FederationSender {
                 pending_total: AtomicUsize::new(0),
                 shut_down: AtomicBool::new(false),
                 edu_metrics: std::sync::OnceLock::new(),
+                edu_forwarder: std::sync::OnceLock::new(),
             }),
             queues: Mutex::new(HashMap::new()),
         }
@@ -357,6 +381,21 @@ impl FederationSender {
     pub fn install_edu_metrics(&self, metrics: crate::metrics::EduMetrics) {
         if self.shared.edu_metrics.set(metrics).is_err() {
             tracing::warn!("EDU metrics were already installed on this sender; ignoring");
+        }
+    }
+
+    /// The EDU metrics installed with [`FederationSender::install_edu_metrics`], if any: what
+    /// an [`EduForwarder`] counts into.
+    #[must_use]
+    pub fn edu_metrics(&self) -> Option<crate::metrics::EduMetrics> {
+        self.shared.edu_metrics.get().cloned()
+    }
+
+    /// Hands every EDU [`FederationSender::enqueue_edu`] is given for a destination another
+    /// replica sends for to `forwarder`, instead of dropping it. A second install is ignored.
+    pub fn install_edu_forwarder(&self, forwarder: Arc<dyn EduForwarder>) {
+        if self.shared.edu_forwarder.set(forwarder).is_err() {
+            tracing::warn!("an EDU forwarder was already installed on this sender; ignoring");
         }
     }
 
@@ -543,12 +582,42 @@ impl FederationSender {
     /// key for the same destination. In memory only; see the module docs' "EDUs" for what is kept,
     /// what is dropped, and why. Like [`FederationSender::enqueue_pdu`] it must be called from
     /// within a Tokio runtime and is a no-op after [`FederationSender::shutdown`].
+    ///
+    /// A destination another replica sends for is handed to the installed [`EduForwarder`]
+    /// (the replica that took a user's typing, receipt, presence or to-device request is the
+    /// only one that knows of it), or dropped without one.
     pub fn enqueue_edu(
         &self,
         destinations: impl IntoIterator<Item = String>,
         edu_type: &str,
         content: Value,
         coalesce_key: Option<String>,
+    ) {
+        self.enqueue_edu_inner(destinations, edu_type, content, coalesce_key, true);
+    }
+
+    /// [`FederationSender::enqueue_edu`], except that a destination another replica sends for
+    /// is skipped rather than forwarded. For an EDU every replica produces on its own (the
+    /// device-list announcer follows a stream every replica reads, so the owner of each
+    /// destination announces to it already; forwarding would send it once per replica), and
+    /// for one a peer forwarded here, which must not be forwarded again.
+    pub fn enqueue_edu_local(
+        &self,
+        destinations: impl IntoIterator<Item = String>,
+        edu_type: &str,
+        content: Value,
+        coalesce_key: Option<String>,
+    ) {
+        self.enqueue_edu_inner(destinations, edu_type, content, coalesce_key, false);
+    }
+
+    fn enqueue_edu_inner(
+        &self,
+        destinations: impl IntoIterator<Item = String>,
+        edu_type: &str,
+        content: Value,
+        coalesce_key: Option<String>,
+        forward: bool,
     ) {
         if self.shared.shut_down.load(Ordering::Acquire) {
             tracing::debug!(
@@ -569,11 +638,42 @@ impl FederationSender {
             }
             if !queues.contains_key(&destination) {
                 if !self.shared.sends_here(&destination) {
-                    tracing::debug!(
-                        destination,
-                        edu_type,
-                        "dropping an EDU for a destination another replica sends for"
-                    );
+                    if !forward {
+                        tracing::debug!(
+                            destination,
+                            edu_type,
+                            "an EDU for a destination another replica sends for; that replica sends its own"
+                        );
+                        continue;
+                    }
+                    match self.shared.edu_forwarder.get() {
+                        Some(forwarder) => {
+                            tracing::debug!(
+                                destination,
+                                edu_type,
+                                "forwarding an EDU to the replica that sends for its destination"
+                            );
+                            forwarder.forward_edu(
+                                &destination,
+                                edu_type,
+                                &edu["content"],
+                                coalesce_key.as_deref(),
+                            );
+                        }
+                        None => {
+                            tracing::debug!(
+                                destination,
+                                edu_type,
+                                "dropping an EDU for a destination another replica sends for"
+                            );
+                            if let Some(metrics) = self.shared.edu_metrics.get() {
+                                metrics.record_forwarded(
+                                    edu_type,
+                                    crate::metrics::EduForwardOutcome::Dropped,
+                                );
+                            }
+                        }
+                    }
                     continue;
                 }
                 let backlog = match self.shared.store.queue_len(&destination) {
@@ -1600,6 +1700,7 @@ mod tests {
             pending_total: AtomicUsize::new(0),
             shut_down: AtomicBool::new(false),
             edu_metrics: std::sync::OnceLock::new(),
+            edu_forwarder: std::sync::OnceLock::new(),
         };
         assert_eq!(shared.backoff(1), Duration::from_millis(100));
         assert_eq!(shared.backoff(2), Duration::from_millis(200));
@@ -1797,6 +1898,87 @@ mod tests {
         assert!(wait_for(Duration::from_secs(10), || sender.pending_pdus() == 0).await);
         assert_eq!(peer.requests().len(), 1);
         assert!(store.queued().unwrap().is_empty());
+    }
+
+    /// One forwarded EDU: destination, type, content, coalescing key.
+    type Forwarded = (String, String, Value, Option<String>);
+
+    /// Records what it is asked to forward.
+    #[derive(Default)]
+    struct RecordingForwarder(Mutex<Vec<Forwarded>>);
+
+    impl EduForwarder for RecordingForwarder {
+        fn forward_edu(
+            &self,
+            destination: &str,
+            edu_type: &str,
+            content: &Value,
+            coalesce_key: Option<&str>,
+        ) {
+            self.0.lock().unwrap().push((
+                destination.to_owned(),
+                edu_type.to_owned(),
+                content.clone(),
+                coalesce_key.map(str::to_owned),
+            ));
+        }
+    }
+
+    /// An EDU for a destination another replica sends for goes to the forwarder, not a queue
+    /// here; without a forwarder it is dropped and counted; `enqueue_edu_local` skips it; one
+    /// this replica sends for is queued as always.
+    #[tokio::test]
+    async fn an_edu_for_a_destination_sent_from_elsewhere_is_forwarded_unless_local_only() {
+        let gate = Arc::new(Only(Mutex::new(HashSet::from(["mine.example".to_owned()]))));
+        let sender = FederationSender::with_store(
+            client(),
+            US,
+            fast(),
+            Arc::new(InMemoryOutboundStore::new()),
+        );
+        sender.set_gate(gate);
+        let metrics = crate::metrics::EduMetrics::default();
+        sender.install_edu_metrics(metrics.clone());
+
+        // No forwarder yet: dropped, and counted.
+        sender.enqueue_edu(
+            ["theirs.example".to_owned()],
+            "m.typing",
+            serde_json::json!({"typing": true}),
+            None,
+        );
+        assert_eq!(
+            metrics.forwarded("m.typing", crate::metrics::EduForwardOutcome::Dropped),
+            1
+        );
+
+        let forwarder = Arc::new(RecordingForwarder::default());
+        sender.install_edu_forwarder(forwarder.clone());
+        sender.enqueue_edu(
+            ["theirs.example".to_owned(), "mine.example".to_owned()],
+            "m.receipt",
+            serde_json::json!({"n": 1}),
+            Some("key".to_owned()),
+        );
+        sender.enqueue_edu_local(
+            ["theirs.example".to_owned()],
+            "m.device_list_update",
+            serde_json::json!({}),
+            None,
+        );
+        assert_eq!(
+            *forwarder.0.lock().unwrap(),
+            vec![(
+                "theirs.example".to_owned(),
+                "m.receipt".to_owned(),
+                serde_json::json!({"n": 1}),
+                Some("key".to_owned()),
+            )],
+            "only the forwardable EDU for the other replica's destination"
+        );
+        assert_eq!(sender.pending_edus_for("theirs.example"), 0);
+        assert_eq!(sender.pending_edus_for("mine.example"), 1);
+        sender.shutdown();
     }
 
     /// Losing a destination stops its worker mid-retry and leaves its queue in the store.

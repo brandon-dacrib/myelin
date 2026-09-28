@@ -30,10 +30,9 @@
 //!
 //! Device-list changes made while the server was down are not announced (the announcer starts at
 //! the stream's position at start). In a cluster, an EDU for a destination whose federation shard
-//! another replica owns is dropped by the sender rather than forwarded to that replica (see
-//! `docs/status/06-federation.md`): the device-list announcer does not lose anything to that
-//! (every replica follows the stream), but typing, receipts, presence and to-device messages
-//! reach only the destinations the replica that took the request sends for.
+//! another replica owns is forwarded to that replica over the mesh (`crate::edu_forward`), except
+//! the device-list announcer's: every replica follows the stream and produces those for itself,
+//! and each queues them only for the destinations it sends for.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -471,7 +470,9 @@ async fn announce<B: KvBackend + 'static>(
             destinations = destinations.len(),
             "announcing a key change to other servers"
         );
-        sender.enqueue_edu(
+        // Local only: every replica follows this stream, so the owner of each destination
+        // announces to it already (`crate::edu_forward`).
+        sender.enqueue_edu_local(
             destinations.iter().cloned(),
             edu_type,
             content,

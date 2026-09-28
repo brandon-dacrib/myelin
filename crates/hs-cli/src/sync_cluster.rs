@@ -277,10 +277,13 @@ pub fn install<B: KvBackend + 'static>(
     ));
     let mirror = Arc::new(RoomMirror::open(backend, identity)?);
     hub.install_cluster(cluster, mirror);
-    handles.install_peer_handler(Arc::new(SessionPeerHandler {
-        hub: hub.clone(),
-        me_key: me_key.clone(),
-    }));
+    handles.add_peer_handler(
+        "user.",
+        Arc::new(SessionPeerHandler {
+            hub: hub.clone(),
+            me_key: me_key.clone(),
+        }),
+    );
     tracing::info!(replica = %me_key, "/sync is cluster-aware: room owners wake this replica's long-polls over the mesh");
     Ok(())
 }

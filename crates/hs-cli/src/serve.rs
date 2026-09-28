@@ -1393,6 +1393,10 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // before any listener is bound: an event sent before the subscription existed would never
     // be sent anywhere (`crate::federation_sender`).
     let outbound_federation = federation_sender.map(|sender| {
+        // In a cluster, an EDU for a destination another replica sends for is handed to that
+        // replica over the mesh (`crate::edu_forward`); before `spawn_mesh` below, which serves
+        // the handler this adds. Nothing in single-node mode.
+        crate::edu_forward::install(&cluster_handles, &sender);
         // Local device-list changes are announced to the servers that share a room with the
         // user (`crate::edus::DeviceListAnnouncer`), through the same sender.
         let device_lists = crate::edus::DeviceListAnnouncer::start(

@@ -9,6 +9,11 @@
 //!   counted by whoever applies them (`hs-cli`'s dispatcher), with what became of each:
 //!   `applied`, `duplicate` (a to-device `message_id` already delivered) or `dropped` (malformed,
 //!   or speaking for a user of another server, or of a type this server does not handle).
+//! - `hs_federation_edus_forwarded_total{edu_type,outcome}`: in a cluster, EDUs for a
+//!   destination another replica sends for. On the replica that took the request: `forwarded`
+//!   (the owning replica took it over the mesh), `failed` (it could not be reached or refused
+//!   it) or `dropped` (no forwarder installed); on the owning replica: `received` (a peer
+//!   forwarded it and it was queued here).
 //!
 //! `edu_type` is bounded: an EDU type that is not one of [`KNOWN_EDU_TYPES`] is counted as
 //! `other`, since the type is whatever a remote server wrote.
@@ -43,6 +48,42 @@ pub struct EduReceivedLabels {
     pub outcome: String,
 }
 
+/// Labels of `hs_federation_edus_forwarded_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+pub struct EduForwardedLabels {
+    /// The EDU type, or `other`.
+    pub edu_type: String,
+    /// `forwarded`, `failed`, `dropped` or `received`.
+    pub outcome: String,
+}
+
+/// What became of an EDU for a destination another replica sends for, for
+/// [`EduMetrics::record_forwarded`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EduForwardOutcome {
+    /// The owning replica took it.
+    Forwarded,
+    /// The owning replica could not be reached, or refused it.
+    Failed,
+    /// Nothing to forward it with (no mesh): dropped.
+    Dropped,
+    /// Counted by the owning replica: a peer forwarded it, and it was queued here.
+    Received,
+}
+
+impl EduForwardOutcome {
+    /// The label value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Forwarded => "forwarded",
+            Self::Failed => "failed",
+            Self::Dropped => "dropped",
+            Self::Received => "received",
+        }
+    }
+}
+
 /// What became of a received EDU, for [`EduMetrics::record_received`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EduOutcome {
@@ -73,6 +114,8 @@ pub struct EduMetrics {
     pub sent_total: Family<EduSentLabels, Counter>,
     /// `hs_federation_edus_received_total{edu_type,outcome}`.
     pub received_total: Family<EduReceivedLabels, Counter>,
+    /// `hs_federation_edus_forwarded_total{edu_type,outcome}`.
+    pub forwarded_total: Family<EduForwardedLabels, Counter>,
 }
 
 impl EduMetrics {
@@ -92,7 +135,35 @@ impl EduMetrics {
             "EDUs received over federation, by EDU type and outcome (applied, duplicate, dropped)",
             metrics.received_total.clone(),
         );
+        registry.register(
+            "hs_federation_edus_forwarded",
+            "EDUs for a destination another replica sends for, by EDU type and outcome \
+             (forwarded, failed, dropped; received on the replica that sends)",
+            metrics.forwarded_total.clone(),
+        );
         metrics
+    }
+
+    /// Counts one EDU of `edu_type` for a destination another replica sends for, with what
+    /// became of it.
+    pub fn record_forwarded(&self, edu_type: &str, outcome: EduForwardOutcome) {
+        self.forwarded_total
+            .get_or_create(&EduForwardedLabels {
+                edu_type: bounded(edu_type).to_owned(),
+                outcome: outcome.as_str().to_owned(),
+            })
+            .inc();
+    }
+
+    /// How many EDUs of `edu_type` have been counted with forwarding `outcome`.
+    #[must_use]
+    pub fn forwarded(&self, edu_type: &str, outcome: EduForwardOutcome) -> u64 {
+        self.forwarded_total
+            .get_or_create(&EduForwardedLabels {
+                edu_type: bounded(edu_type).to_owned(),
+                outcome: outcome.as_str().to_owned(),
+            })
+            .get()
     }
 
     /// Counts one EDU of `edu_type` sent.
