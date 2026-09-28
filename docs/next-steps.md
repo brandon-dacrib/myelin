@@ -445,6 +445,9 @@ configuration history and revert (`ConfigStore` already records the patch per re
 - 18:10 the queue refused it once more on a docs-only conflict with the root redirect's status
   entry; resolved (`5eb40e6`) and back in the queue. `agent/admin-followups` is being rebased
   onto it by a background agent in `.claude/worktrees/agent-a36043e5849457912`.
+- 17:57 **merged `agent/user-moderation`** as `7587a7a` through the full gate (with
+  `HS_CLUSTER_TEST_POSTGRES_DSN`). Admin coverage on `main`: **154 of 158**; the last four are
+  on `agent/admin-followups`.
 
 ## Handover (2026-09-28, 16:00 EDT): where the nine resumed agents stopped
 
