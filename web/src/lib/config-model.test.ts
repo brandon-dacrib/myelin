@@ -6,17 +6,28 @@ import {
   buildMergePatch,
   buildSectionModel,
   changeEntries,
+  chosenVariant,
   cleanDoc,
+  containsSecret,
   deletePath,
+  describeSubPath,
+  entryNoun,
+  entrySummary,
   fieldErrorsFor,
   flattenFields,
   formatValue,
   getPath,
   humanizeKey,
   isChanged,
+  itemField,
+  mapEntryField,
   normalizeErrorPath,
+  nounFromTypeName,
+  ownerFieldPath,
+  propertyFields,
   setPath,
   summarize,
+  switchVariant,
   type SettingField,
 } from "./config-model";
 
@@ -113,8 +124,12 @@ describe("buildSectionModel", () => {
 
     const media = fieldsOf("media");
     expect(media.get("max_upload_size")?.kind).toBe("bytes");
-    // An array of objects has no better control than JSON.
-    expect(media.get("thumbnail_sizes")?.kind).toBe("json");
+    // An array of objects is a form per entry, never JSON (decision 0010).
+    expect(media.get("thumbnail_sizes")?.kind).toBe("object-list");
+    expect(media.get("storage")?.kind).toBe("variant");
+    expect(media.get("remote_media_retention")?.kind).toBe("duration");
+    expect(fieldsOf("listeners").get("listeners")?.kind).toBe("object-list");
+    expect(fieldsOf("auth").get("oidc_providers")?.kind).toBe("object-list");
 
     const telemetry = fieldsOf("telemetry");
     expect(telemetry.get("logging.level")?.kind).toBe("enum");
@@ -343,5 +358,122 @@ describe("formatValue", () => {
     expect(formatValue([])).toBe("empty list");
     expect(formatValue(["a", "b"])).toBe("a, b");
     expect(formatValue({ $secret: true })).toBe("set, hidden");
+  });
+
+  it("says an object in words rather than as JSON", () => {
+    expect(formatValue({ backend: "local", path: "/srv/media" })).toBe(
+      "Backend: local · Path: /srv/media",
+    );
+    expect(formatValue([{ width: 32 }])).toBe("1 entry");
+    expect(formatValue([{ width: 32 }, { width: 96 }])).toBe("2 entries");
+    expect(formatValue({})).toBe("empty");
+  });
+});
+
+describe("nested forms", () => {
+  const media = () => fieldsOf("media");
+
+  it("names a list's entries after the entry type", () => {
+    expect(nounFromTypeName("Listener")).toBe("Listener");
+    expect(nounFromTypeName("ThumbnailSize")).toBe("Thumbnail size");
+    expect(nounFromTypeName("OidcProviderConfig")).toBe("OIDC provider");
+    expect(entryNoun(media().get("thumbnail_sizes")!)).toBe("Thumbnail size");
+  });
+
+  it("builds an entry's own fields from the item schema", () => {
+    const thumbnails = media().get("thumbnail_sizes")!;
+    const entry = itemField(thumbnails, 2, { width: 320, height: 240, method: "scale" });
+    expect(entry.label).toBe("Thumbnail size 3");
+    expect(entry.fullPath).toBe("media.thumbnail_sizes[2]");
+    const fields = propertyFields(entry, { width: 320, height: 240, method: "scale" });
+    expect(fields.map((f) => [f.key, f.kind])).toEqual([
+      ["width", "integer"],
+      ["height", "integer"],
+      ["method", "enum"],
+    ]);
+    expect(fields[2].options?.map((o) => o.label)).toEqual(["Crop", "Scale"]);
+    expect(entrySummary(entry, { width: 320, height: 240, method: "scale" })).toBe(
+      "320 · 240 · scale",
+    );
+  });
+
+  it("switches a tagged variant, keeping what the two variants share", () => {
+    const storage = media().get("storage")!;
+    expect(chosenVariant(storage, { backend: "local", path: "/srv" })?.label).toBe("Local");
+    expect(propertyFields(storage, { backend: "local", path: "/srv" }).map((f) => f.key)).toEqual([
+      "path",
+    ]);
+    const s3 = switchVariant(storage, { backend: "local", path: "/srv" }, "s3");
+    expect(s3).toEqual({ backend: "s3", bucket: "" });
+    const gcs = switchVariant(storage, { backend: "s3", bucket: "media", region: "eu" }, "gcs");
+    expect(gcs).toEqual({ backend: "gcs", bucket: "media" });
+    expect(entrySummary(storage, gcs)).toBe("GCS · media");
+  });
+
+  it("never carries a redacted secret into another variant", () => {
+    const storage = media().get("storage")!;
+    const next = switchVariant(
+      storage,
+      { backend: "s3", bucket: "b", secret_access_key: { $secret: true } },
+      "s3",
+    );
+    expect(next).toEqual({ backend: "s3", bucket: "b" });
+  });
+
+  it("finds a hidden secret anywhere inside a value", () => {
+    expect(containsSecret([{ a: 1 }, { b: { $secret: true } }])).toBe(true);
+    expect(containsSecret([{ a: 1 }])).toBe(false);
+  });
+
+  it("edits a map with one field per key", () => {
+    const field: SettingField = {
+      ...media().get("storage")!,
+      kind: "map",
+      schema: { type: "object", additionalProperties: { $ref: "#/$defs/Duration" } },
+    };
+    const entry = mapEntryField(field, "eu-west", "5s");
+    expect(entry.kind).toBe("duration");
+    expect(entry.label).toBe("eu-west");
+  });
+
+  it("classifies a map and an unknown shape from the schema", () => {
+    const custom = normalizeConfigSchema({
+      schema: {
+        type: "object",
+        properties: {
+          extra: {
+            type: "object",
+            properties: {
+              weights: { type: "object", additionalProperties: { type: "integer" } },
+              anything: { type: "object", additionalProperties: true },
+              mixed: { oneOf: [{ type: "string" }, { type: "object", properties: {} }] },
+            },
+          },
+        },
+      },
+    });
+    const fields = new Map(
+      flattenFields(buildSectionModel(custom, "extra", {})).map((f) => [f.key, f.kind]),
+    );
+    expect(fields.get("weights")).toBe("map");
+    // Neither is a text box: both are read-only with a note.
+    expect(fields.get("anything")).toBe("unsupported");
+    expect(fields.get("mixed")).toBe("unsupported");
+  });
+});
+
+describe("errors inside a list", () => {
+  it("lands on the list's own row", () => {
+    const paths = ["listeners", "password.enabled", "password"];
+    expect(ownerFieldPath("listeners.0.port", paths)).toBe("listeners");
+    expect(ownerFieldPath("listeners[0].port", paths)).toBe("listeners");
+    expect(ownerFieldPath("password.enabled", paths)).toBe("password.enabled");
+    expect(ownerFieldPath("elsewhere", paths)).toBeUndefined();
+  });
+
+  it("says which part of the setting was meant, in words", () => {
+    expect(describeSubPath(".2.width")).toBe("Entry 3, width");
+    expect(describeSubPath("[0].idp_id")).toBe("Entry 1, IdP ID");
+    expect(describeSubPath(".bucket")).toBe("Bucket");
   });
 });

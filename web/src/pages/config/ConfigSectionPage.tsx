@@ -34,10 +34,12 @@ import {
   buildMergePatch,
   buildSectionModel,
   changeEntries,
+  describeSubPath,
   fieldErrorsFor,
   flattenFields,
   getPath,
   humanizeKey,
+  ownerFieldPath,
   settingRowId,
   type Draft,
   type FieldError,
@@ -143,17 +145,32 @@ function SectionForm({ section, data, schema, schemaSettled, onReread }: Section
   const dirtyPaths = useMemo(() => new Set(changes.map((c) => c.path)), [changes]);
   const patch = useMemo(() => buildMergePatch(draft), [draft]);
 
+  const fieldPaths = useMemo(() => fields.map((f) => f.path), [fields]);
+
+  // An error about one entry of a list (`listeners.0.port`) lands on the
+  // list's row, since the list is the setting the operator edits; the detail
+  // then says which part of it the server meant.
   const errorByPath = useMemo(() => {
     const map = new Map<string, string>();
-    for (const e of errors) if (!map.has(e.path)) map.set(e.path, e.detail);
+    for (const e of errors) {
+      const owner = ownerFieldPath(e.path, fieldPaths) ?? e.path;
+      const detail =
+        owner === e.path ? e.detail : `${describeSubPath(e.path.slice(owner.length))}: ${e.detail}`;
+      if (!map.has(owner)) map.set(owner, detail);
+    }
     return map;
-  }, [errors]);
+  }, [errors, fieldPaths]);
 
-  const setValue = useCallback((path: string, next: JsonValue | null) => {
-    setDraft((current) => ({ ...current, [path]: next }));
-    setErrors((current) => current.filter((e) => e.path !== path));
-    setReport(undefined);
-  }, []);
+  const setValue = useCallback(
+    (path: string, next: JsonValue | null) => {
+      setDraft((current) => ({ ...current, [path]: next }));
+      setErrors((current) =>
+        current.filter((e) => (ownerFieldPath(e.path, fieldPaths) ?? e.path) !== path),
+      );
+      setReport(undefined);
+    },
+    [fieldPaths],
+  );
 
   const revert = useCallback((path: string) => {
     setDraft((current) => {
@@ -213,7 +230,7 @@ function SectionForm({ section, data, schema, schemaSettled, onReread }: Section
       const mapped = fieldErrorsFor(problem.errors, section);
       setErrors(mapped);
       setReviewOpen(false);
-      focusSetting(mapped[0]?.path);
+      focusSetting(mapped[0] && (ownerFieldPath(mapped[0].path, fieldPaths) ?? mapped[0].path));
       toast({ title: problem.title, description: problem.detail, variant: "danger" });
       return;
     }
@@ -366,7 +383,7 @@ function SectionForm({ section, data, schema, schemaSettled, onReread }: Section
                 <button
                   type="button"
                   className="text-left text-sm text-danger underline hover:no-underline"
-                  onClick={() => focusSetting(e.path)}
+                  onClick={() => focusSetting(ownerFieldPath(e.path, fieldPaths) ?? e.path)}
                 >
                   <span className="font-identifier">{e.path || section}</span> — {e.detail}
                 </button>

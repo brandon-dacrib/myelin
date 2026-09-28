@@ -12,24 +12,36 @@
  *   and the server's reset (`crates/hs-config/src/document.rs`), so clearing
  *   a box is the same gesture as pressing "Reset to default" — not "set this
  *   to null".
- * - **Half-typed input stays a string.** A duration mid-edit (`1h3`), a
- *   number mid-edit (`0.`) and a JSON object mid-edit are all held in the
- *   draft as the raw text and only converted on blur. The draft can briefly
- *   hold a string where a number belongs, which is harmless: nothing reads it
- *   until the operator saves, by which point blur has happened.
+ * - **Half-typed input stays a string.** A duration mid-edit (`1h3`) and a
+ *   number mid-edit (`0.`) are held in the draft as the raw text and only
+ *   converted on blur. The draft can briefly hold a string where a number
+ *   belongs, which is harmless: nothing reads it until the operator saves, by
+ *   which point blur has happened.
  * - **A secret is never read back.** The API answers `{"$secret": true}` and
  *   has no endpoint that reveals one, so the control offers "replace" and
  *   "clear", never "show".
+ *
+ * And one rule (decision 0010): nothing here edits a file format as text.
+ * Lists of objects, maps and tagged variants get the structured editors in
+ * `StructuredControls.tsx`, built from the schema; a shape the schema cannot
+ * describe is shown read-only there, never as a JSON box.
  */
 import { useId } from "react";
 import { Eye, Plus, X } from "lucide-react";
 import type { JsonValue } from "@/api/config-schema";
-import type { SettingField } from "@/lib/config-model";
+import { formatValue, type SettingField } from "@/lib/config-model";
 import { Button } from "@/components/ui/button/Button";
-import { Input, Textarea } from "@/components/ui/input/Input";
+import { Input } from "@/components/ui/input/Input";
 import { Select } from "@/components/ui/select/Select";
 import { Switch } from "@/components/ui/switch/Switch";
 import { cn } from "@/lib/cn";
+import {
+  MapControl,
+  ObjectControl,
+  ObjectListControl,
+  UnsupportedControl,
+  VariantControl,
+} from "./StructuredControls";
 
 export interface ControlProps {
   field: SettingField;
@@ -39,6 +51,12 @@ export interface ControlProps {
   invalid?: boolean;
   id: string;
   describedBy?: string;
+  /**
+   * The id of the element naming this setting. The controls that are a group
+   * of inputs rather than one (lists, checkboxes, nested forms) are labelled
+   * by it, since a `<label for>` can only name one input.
+   */
+  labelledBy?: string;
   onChange: (value: JsonValue | null) => void;
   /** Drops this setting's pending edit, leaving the server's value alone. */
   onRevert: () => void;
@@ -59,8 +77,18 @@ export function SettingControl(props: ControlProps) {
     case "string-list":
     case "number-list":
       return <ListControl {...props} />;
-    case "json":
-      return <JsonControl {...props} />;
+    case "enum-list":
+      return <EnumListControl {...props} />;
+    case "object":
+      return <ObjectControl {...props} />;
+    case "object-list":
+      return <ObjectListControl {...props} />;
+    case "map":
+      return <MapControl {...props} />;
+    case "variant":
+      return <VariantControl {...props} />;
+    case "unsupported":
+      return <UnsupportedControl {...props} />;
     default:
       return <TextControl {...props} />;
   }
@@ -71,7 +99,9 @@ function asText(value: JsonValue | undefined): string {
   if (value === undefined || value === null) return "";
   if (typeof value === "string") return value;
   if (typeof value === "number" || typeof value === "boolean") return String(value);
-  return JSON.stringify(value, null, 2);
+  // Only reachable when the server's value disagrees with its own schema;
+  // shown as prose rather than as JSON to edit.
+  return formatValue(value);
 }
 
 function BooleanControl({ value, disabled, id, describedBy, onChange }: ControlProps) {
@@ -234,13 +264,27 @@ function SecretControl({
 }
 
 /** An array of scalars, edited one entry at a time. */
-function ListControl({ field, value, disabled, invalid, id, describedBy, onChange }: ControlProps) {
+function ListControl({
+  field,
+  value,
+  disabled,
+  invalid,
+  id,
+  describedBy,
+  labelledBy,
+  onChange,
+}: ControlProps) {
   const numeric = field.kind === "number-list";
   const entries = Array.isArray(value) ? value : [];
   const listId = useId();
 
   return (
-    <div className="flex flex-col gap-2" aria-describedby={describedBy}>
+    <div
+      role="group"
+      aria-labelledby={labelledBy}
+      aria-describedby={describedBy}
+      className="flex flex-col gap-2"
+    >
       {entries.length === 0 && <p className="text-sm text-text-muted">Empty list.</p>}
       <ul className="flex flex-col gap-2">
         {entries.map((entry, index) => (
@@ -292,58 +336,72 @@ function ListControl({ field, value, disabled, invalid, id, describedBy, onChang
 }
 
 /**
- * Anything with no better control: an array of objects, a map, a variant this
- * build does not recognise. Edited as JSON rather than hidden, because an
- * operator who cannot reach a setting at all is worse off than one who has to
- * type `{"width": 96}`. Text that does not parse stays in the box, as text,
- * with the parser's complaint under it.
+ * An array whose entries come from a fixed set — a listener's `resources`.
+ * One checkbox per permitted value rather than a free-text list, so an
+ * operator picks from what the server understands instead of typing it. A
+ * value the schema does not list (a server newer than this build) is kept
+ * and shown, never silently dropped on the next save.
  */
-function JsonControl({ field, value, disabled, invalid, id, describedBy, onChange }: ControlProps) {
-  const text = asText(value);
-  const parseError = typeof value === "string" && value.trim() !== "" ? jsonError(value) : null;
-  const errorId = `${id}-json-error`;
+function EnumListControl({
+  field,
+  value,
+  disabled,
+  invalid,
+  id,
+  describedBy,
+  labelledBy,
+  onChange,
+}: ControlProps) {
+  const selected = Array.isArray(value)
+    ? value.filter((v): v is string => typeof v === "string")
+    : [];
+  const known = field.options ?? [];
+  const unknown = selected
+    .filter((v) => !known.some((o) => o.value === v))
+    .map((v) => ({ value: v, label: v, description: "Not a value this interface knows." }));
 
   return (
-    <div className="flex flex-col gap-1.5">
-      <Textarea
-        id={id}
-        value={text}
-        rows={Math.min(14, Math.max(3, text.split("\n").length))}
-        disabled={disabled}
-        readOnly={field.readOnly}
-        spellCheck={false}
-        aria-describedby={[describedBy, parseError ? errorId : undefined].filter(Boolean).join(" ")}
-        aria-invalid={invalid || Boolean(parseError)}
-        aria-label={`${field.label}, as JSON`}
-        className="font-mono text-sm"
-        onChange={(e) => onChange(e.target.value)}
-        onBlur={(e) => {
-          const raw = e.target.value;
-          if (raw.trim() === "") {
-            onChange(null);
-            return;
-          }
-          try {
-            onChange(JSON.parse(raw) as JsonValue);
-          } catch {
-            // Leave it as text: `parseError` above is what the operator sees.
-          }
-        }}
-      />
-      {parseError && (
-        <p id={errorId} role="alert" className="text-xs text-danger">
-          Not valid JSON: {parseError}
-        </p>
-      )}
+    <div
+      id={id}
+      role="group"
+      aria-labelledby={labelledBy}
+      aria-describedby={describedBy}
+      className="flex flex-col gap-2"
+    >
+      {[...known, ...unknown].map((option) => {
+        const checkboxId = `${id}-${option.value}`;
+        const hintId = `${checkboxId}-hint`;
+        return (
+          <div key={option.value} className="flex items-start gap-2">
+            <input
+              type="checkbox"
+              id={checkboxId}
+              checked={selected.includes(option.value)}
+              disabled={disabled}
+              aria-invalid={invalid}
+              aria-describedby={option.description ? hintId : undefined}
+              className="mt-0.5 size-4 shrink-0 accent-[var(--color-accent)]"
+              onChange={(e) =>
+                onChange(
+                  e.target.checked
+                    ? [...selected, option.value]
+                    : selected.filter((v) => v !== option.value),
+                )
+              }
+            />
+            <div className="min-w-0">
+              <label htmlFor={checkboxId} className="text-sm text-text">
+                {option.label}
+              </label>
+              {option.description && (
+                <p id={hintId} className="text-xs text-text-muted">
+                  {option.description}
+                </p>
+              )}
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
-}
-
-function jsonError(raw: string): string | null {
-  try {
-    JSON.parse(raw);
-    return null;
-  } catch (err) {
-    return err instanceof Error ? err.message : "Not valid JSON";
-  }
 }

@@ -1,6 +1,77 @@
 # 16. Management web interface: status
 
-## Current update: 2026-09-26 (bridge offerings, RFC 0017)
+## Current update: 2026-09-27 (decision 0010: no page edits a file format as text)
+
+Branch `agent/config-structured-editors`.
+
+**The Configuration page's JSON textarea is gone.** `JsonControl` in
+`web/src/pages/config/SettingControls.tsx` rendered every setting of the old `json` kind as a
+JSON text box. Enumerated against the real server's schema (`schemars::schema_for!(hs_config::Config)`,
+dumped verbatim to `web/src/test/fixtures/hs-config-schema.json`), five settings hit it or were
+misclassified: `listeners.listeners` (array of `Listener`), `media.thumbnail_sizes` (array of
+`ThumbnailSize`), `auth.oidc_providers` (array of `OidcProviderConfig`), `media.storage` (the
+internally tagged `MediaStorageBackend`), and `telemetry.logging.level` (a `oneOf` of documented
+`const`s, which `schemars` emits for a Rust enum and the old classifier did not recognise). Two
+more, `auth.refresh_token_lifetime` and `media.remote_media_retention` (`Option<Duration>`),
+rendered as integers because the unit tell was lost in the `anyOf`; the real schema's
+`x-duration`/`x-bytesize` markers now classify them.
+
+- **Model** (`web/src/lib/config-model.ts`): new kinds `enum-list` (checkboxes), `object` (nested
+  form), `object-list` (a form per entry), `map` (key/value rows), `variant` (a tagged-enum
+  picker plus the chosen variant's fields) and `unsupported` (read-only with a note; replaces
+  `json`). `enumOptions` reads both `enum` arrays and `oneOf` of `const`s, carrying each
+  variant's doc comment as its description. Pure helpers for the nested forms:
+  `propertyFields`, `itemField`, `mapEntryField`, `chosenVariant`, `switchVariant` (keeps shared
+  properties, never carries a redacted secret), `emptyValue` (a new entry starts from the
+  schema's defaults, required-without-default fields empty), `entryNoun`, `entrySummary`,
+  `containsSecret`, `ownerFieldPath` and `describeSubPath` (a server error at
+  `/listeners/listeners/1/port` lands on the listeners row as "Entry 2, port: …"). `formatValue`
+  renders objects as prose, not JSON.
+- **Controls** (`web/src/pages/config/StructuredControls.tsx`): `ObjectListControl` (move up,
+  move down, remove, add; focus follows the moved entry, lands in a new entry's first field, and
+  goes to the Add button when the last entry is removed), `ObjectControl` (optional objects such
+  as a listener's `tls` offer "Set up TLS"/"Remove TLS"), `VariantControl`, `MapControl` (keys
+  typed once, duplicates refused inline), `UnsupportedControl`, and `ReadOnlyValue` (what a
+  pinned, locked or bootstrap-only structured setting shows: nested lists and name/value pairs).
+  Every nested field is rendered with the same `SettingControl` a top-level setting gets,
+  recursively. `EnumListControl` joined `SettingControls.tsx`. Structured rows span the row's
+  full width; every group is `role="group"` labelled by its setting.
+- **Honest about one server gap**: a hidden secret inside a list entry (an OIDC provider's inline
+  `client_secret`) does not survive saving the list -- the server's `strip_echoed_secrets` drops
+  the echoed placeholder, and a merge patch replaces the list wholesale. The list editor says so
+  whenever an entry holds one; the mock reproduces it (`stripEchoedSecrets`). RFC 0020
+  (`docs/rfcs/0020-secrets-inside-lists-survive-a-save.md`) asks track 15 to restore it.
+- **Mocks** (`web/src/mocks/data/config.ts`): the schema now uses the real server's shapes for
+  every one of the settings above (listeners with `ListenerResource`/`TlsConfig`, thumbnail
+  sizes with `ThumbnailMethod`, `MediaStorageBackend`, `OidcProviderConfig` with one provider,
+  `x-duration`/`x-bytesize`, `LogLevel` as `oneOf`), validators for listeners, thumbnail sizes,
+  media storage and OIDC providers, and PATCH errors carry whole-configuration pointers as the
+  real server's `config_validation_errors` does (section-relative ones were ambiguous for
+  `listeners.listeners`).
+- **Sweep of the rest of `web/src/pages`**: nothing else edits YAML/JSON as text. The bridge
+  pages' YAML are read-only `CopyBlock` renderings of generated files (allowed by 0010). The one
+  other free-text list, "People who can have one" on the offer-a-bridge wizard and the offering
+  settings dialog, is now a list control (`UserIdList` in `pages/bridges/offering-fields.tsx`):
+  one row per Matrix ID with Remove, Enter or Add to add, pasting several adds them all, an
+  invalid ID stays in the box with the reason, and blur adds what was typed so it is not lost on
+  save. Wizard/dialog state is `users: string[]` instead of `usersText`.
+- `HS_E2E_PORT` (in `web/playwright.config.ts`, with `--strictPort`) moves the mock preview
+  server off 4173: two worktrees running the suite at once were sharing one server, and
+  `reuseExistingServer` would have tested the other checkout's build.
+
+**Verified** (2026-09-27, from `web/`): `npm run check` clean (lint 0 errors, 4 pre-existing
+warnings; typecheck; 28 files / 221 Vitest tests; production build).
+`HS_E2E_PORT=4391 npx playwright test` 28/28 against the mock, including two new configuration
+flows through axe (add, fill, reorder a thumbnail size from the keyboard and save; switch the
+media storage variant; listener resources and TLS) and `--repeat-each=3` of the configuration
+spec (12/12). New tests: `src/lib/config-model.real-schema.test.ts` (walks every setting of the
+real schema, nested ones included, and finds none without a real control),
+`src/pages/config/StructuredControls.test.tsx`, new cases in `config-model.test.ts` and
+`ConfigSectionPage.test.tsx` (no section renders a textarea; a list saved end to end; an error in
+one entry lands on the list), `src/pages/bridges/offering-fields.test.tsx`. Not verified: against
+a real `hs serve` (no `e2e-real` run this session).
+
+## Update: 2026-09-26 (bridge offerings, RFC 0017)
 
 **Bridges are offerings first.** The management half of RFC 0017
 (`docs/rfcs/0017-the-server-deploys-its-own-bridges.md`): an administrator offers a bridge type,
@@ -869,6 +940,13 @@ Element.
 
 ## Interfaces needed
 
+- **15 (hs-admin)**: RFC 0020 -- keep a hidden secret inside a list entry when the list is saved
+  (restore the stored value for an echoed `{"$secret": true}` inside an array, ideally with a
+  `$from` pointer so reordering is safe). Until then the list editor warns and the mock
+  reproduces the loss.
+- **13 (hs-config)**: a test that the web fixture `web/src/test/fixtures/hs-config-schema.json`
+  equals `schema_for!(Config)` would catch drift the moment a config struct changes (this track
+  cannot add a test to `hs-config`).
 - **04 (hs-room), urgent**: fix `RoomActor::create_room` (`crates/hs-room/src/actor.rs`, ~line
   1320) to merge `power_level_content_override` on top of the generated default power-levels
   content instead of replacing it — see "Bugs found" above for the exact repro. This blocks room
@@ -887,6 +965,18 @@ Element.
 
 ## Decisions made
 
+- **No setting falls through to a text box (decision 0010, 2026-09-27).** A shape the schema
+  cannot describe renders read-only with a note naming the admin API route, never as JSON to
+  edit; `config-model.real-schema.test.ts` fails if any setting of the real schema reaches that
+  state. Its fixture is the real schema verbatim and must be regenerated when `hs-config` changes
+  (the test file's header says how).
+- **A list of objects is sent whole.** A merge patch replaces arrays wholesale, so a list entry
+  edit reports the entire list as the setting's value, and the review shows "5 entries → 6
+  entries"; errors inside an entry land on the list's row with the entry named. Inside a nested
+  form, `null` from a child removes that property (an unset `Option<T>`, or a property left to its
+  default) rather than sending `null`.
+- **A map's keys are typed once**, when the entry is added; renaming is remove and re-add. That
+  keeps two keys from colliding mid-edit in a controlled object.
 - **Bridges are offerings first (RFC 0017, 2026-09-26).** `/bridges` lists offerings; the
   registrations list lives at `/bridges/registrations` and the register-it-yourself wizard at
   `/bridges/registrations/new`, self-managed only. Registration detail keeps `/bridges/$bridgeId`
@@ -926,5 +1016,8 @@ npm run test:e2e     # playwright test against the mock (e2e/) — includes the 
 npm run test:e2e:real     # playwright test against a REAL hs serve (e2e-real/), skipped unless HS_REAL_SERVER_URL is set — see README.md "Real-server mode"; confirmed 6/6 pass 2026-09-19 (see the status entry above)
 node scripts/check-contrast.mjs   # offline contrast check for the status tokens
 ```
+
+`HS_E2E_PORT=<port> npm run test:e2e` runs the mock suite on a port of its own (use it whenever
+another checkout may already be serving on 4173).
 
 `npm run check` runs the first four in sequence; as of 2026-09-18 (before this session) it was clean with "30 tests" and all 9 e2e tests passing. **As of 2026-09-19, only lint and typecheck were re-confirmed** — see "Wrap-up note: what's verified and what isn't" above for exactly why and what to run first. `npm run dev:mock` for interactive mock use; sign in with either button on the landing screen. For real-server interactive use, `npm run dev:real` — see README.md.

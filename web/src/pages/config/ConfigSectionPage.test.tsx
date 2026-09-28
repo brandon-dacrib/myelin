@@ -14,6 +14,7 @@ import { ConfigSectionPage } from "./ConfigSectionPage";
 import { Toaster } from "@/components/ui/toast/Toaster";
 import { configRevisions, configValues } from "@/mocks/data/config";
 import { signIn, signOut } from "@/lib/auth";
+import type { JsonValue } from "@/api/config-schema";
 
 const pristineValues = structuredClone(configValues);
 const pristineRevisions = structuredClone(configRevisions);
@@ -207,6 +208,76 @@ describe("ConfigSectionPage", () => {
       screen.getByRole("button", { name: "Re-read the server's copy, keep my edits" }),
     ).toBeInTheDocument();
     expect(configValues.appservices.tracking_failure_threshold).toBe(50);
+  });
+
+  it("edits no section's settings as text (decision 0010)", async () => {
+    for (const section of Object.keys(pristineValues)) {
+      const { container, unmount } = renderSection(section);
+      await screen.findByRole("heading", { level: 1 });
+      await waitFor(() => expect(container.querySelector("[id^='setting-']")).not.toBeNull());
+      expect(container.querySelector("textarea")).toBeNull();
+      expect(screen.queryByLabelText(/as JSON/)).not.toBeInTheDocument();
+      unmount();
+    }
+  });
+
+  it("adds a thumbnail size through its own form, and saves the whole list", async () => {
+    const user = userEvent.setup();
+    renderSection("media");
+
+    await user.click(await screen.findByRole("button", { name: "Add thumbnail size" }));
+    const added = within(screen.getByRole("group", { name: /^Thumbnail size 6/ }));
+    await user.type(added.getByLabelText(/^Width/), "1024");
+    await user.type(added.getByLabelText(/^Height/), "768");
+    await user.tab();
+
+    await user.click(await screen.findByRole("button", { name: "Review and save" }));
+    const dialog = within(await screen.findByRole("dialog"));
+    expect(dialog.getByText("5 entries")).toBeInTheDocument();
+    expect(dialog.getByText("6 entries")).toBeInTheDocument();
+    await user.click(dialog.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => expect(configValues.media.thumbnail_sizes).toHaveLength(6));
+    expect((configValues.media.thumbnail_sizes as JsonValue[])[5]).toEqual({
+      width: 1024,
+      height: 768,
+      method: "crop",
+    });
+  });
+
+  it("lands an error about one list entry on the list, saying which entry", async () => {
+    const user = userEvent.setup();
+    renderSection("listeners");
+
+    await user.click(await screen.findByRole("button", { name: "Add listener" }));
+    const added = within(screen.getByRole("group", { name: /^Listener 2/ }));
+    await user.click(added.getByRole("checkbox", { name: "Client" }));
+
+    await user.click(await screen.findByRole("button", { name: "Review and save" }));
+    const dialog = within(await screen.findByRole("dialog"));
+    await user.click(dialog.getByRole("button", { name: "Save changes" }));
+
+    expect(await screen.findByText("The server rejected 1 setting")).toBeInTheDocument();
+    const row = document.getElementById("setting-listeners")!;
+    expect(within(row).getByRole("alert")).toHaveTextContent(
+      "Entry 2, port: must be a TCP port, 1 to 65535",
+    );
+    expect(configValues.listeners.listeners).toHaveLength(1);
+  });
+
+  it("shows a structured setting it may not change as names and values, not JSON", async () => {
+    await signIn(["admin:read"]);
+    renderSection("listeners");
+
+    const row = await waitFor(() => {
+      const el = document.getElementById("setting-listeners");
+      if (!el) throw new Error("no row yet");
+      return el;
+    });
+    expect(within(row).getByText("Bind addresses")).toBeInTheDocument();
+    expect(within(row).getByText("8008")).toBeInTheDocument();
+    expect(row.textContent).not.toContain("{");
+    expect(within(row).queryByRole("button", { name: "Add listener" })).not.toBeInTheDocument();
   });
 
   it("stages a reset as a removal rather than a null", async () => {

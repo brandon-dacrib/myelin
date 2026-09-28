@@ -4,7 +4,7 @@ import type {
   BridgeOfferingRuntime,
   BridgeType,
 } from "@/api/bridges";
-import { defaultOfferingOptions, parseUserList } from "@/lib/bridge-offerings";
+import { defaultOfferingOptions } from "@/lib/bridge-offerings";
 
 export const OFFER_STEPS = ["kind", "access", "runtime", "options", "review"] as const;
 export type OfferStep = (typeof OFFER_STEPS)[number];
@@ -21,8 +21,8 @@ export const OFFER_STEP_LABELS: Record<OfferStep, string> = {
 export interface OfferFormState {
   type: string;
   allLocalUsers: boolean;
-  /** Who may, when not everyone: Matrix IDs as typed, one per line or comma-separated. */
-  usersText: string;
+  /** Who may, when not everyone: the Matrix IDs listed, one entry each. */
+  users: string[];
   /** What the operator chose; `effectiveRuntime` says what can actually be sent. */
   runtime: BridgeOfferingRuntime;
   imageTag: string;
@@ -34,7 +34,7 @@ export interface OfferFormState {
 export const initialOfferState: OfferFormState = {
   type: "",
   allLocalUsers: true,
-  usersText: "",
+  users: [],
   runtime: "cluster",
   imageTag: "latest",
   encryption: true,
@@ -87,7 +87,7 @@ export function offerRequest(
     image_tag: state.imageTag.trim() || "latest",
     access: {
       all_local_users: state.allLocalUsers,
-      users: state.allLocalUsers ? [] : parseUserList(state.usersText),
+      users: state.allLocalUsers ? [] : state.users,
     },
     options: {
       encryption: state.encryption,

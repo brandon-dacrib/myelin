@@ -10,7 +10,7 @@ import { ApiProblemError } from "@/api/problem";
 import { Button } from "@/components/ui/button/Button";
 import { Dialog, DialogContent } from "@/components/ui/dialog/Dialog";
 import { toast } from "@/components/ui/toast/toast-store";
-import { accessIsValid, parseUserList, requestFromOffering } from "@/lib/bridge-offerings";
+import { accessIsValid, requestFromOffering } from "@/lib/bridge-offerings";
 import {
   AccessFields,
   OptionFields,
@@ -23,7 +23,7 @@ import { clusterAvailability, effectiveRuntime } from "../wizard/offer-state";
 interface Draft extends OptionValues {
   enabled: boolean;
   allLocalUsers: boolean;
-  usersText: string;
+  users: string[];
   runtime: BridgeOfferingRuntime;
   imageTag: string;
 }
@@ -33,7 +33,7 @@ function draftOf(offering: BridgeOffering): Draft {
   return {
     enabled: r.enabled,
     allLocalUsers: r.access.all_local_users ?? true,
-    usersText: (r.access.users ?? []).join("\n"),
+    users: r.access.users ?? [],
     runtime: r.runtime,
     imageTag: r.image_tag,
     encryption: r.options.encryption ?? false,
@@ -102,7 +102,7 @@ function SettingsForm({
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     // The access field already says what is wrong with it.
-    if (!accessIsValid(draft.allLocalUsers, draft.usersText)) return;
+    if (!accessIsValid(draft.allLocalUsers, draft.users)) return;
     setError(null);
     try {
       await put.mutateAsync({
@@ -113,7 +113,7 @@ function SettingsForm({
           image_tag: draft.imageTag.trim() || "latest",
           access: {
             all_local_users: draft.allLocalUsers,
-            users: draft.allLocalUsers ? [] : parseUserList(draft.usersText),
+            users: draft.allLocalUsers ? [] : draft.users,
           },
           options: {
             encryption: draft.encryption,
@@ -152,7 +152,7 @@ function SettingsForm({
           </h3>
           <AccessFields
             allLocalUsers={draft.allLocalUsers}
-            usersText={draft.usersText}
+            users={draft.users}
             onChange={patch}
             serverName={serverName}
           />

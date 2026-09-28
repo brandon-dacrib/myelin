@@ -7,11 +7,16 @@
  * names, types, doc comments and `serde(default = ...)` values all taken
  * from `crates/hs-config/src/*.rs` and the generated `docs/config.md`, so
  * the forms this drives in `npm run dev:mock` are the forms a real server
- * produces. It is not the whole struct (`auth.oidc_providers`'s inner shape
- * and the `mas_delegation` block are elided), but every *kind* of setting is
- * here: booleans, enums, integers, floats, durations, byte sizes, scalar
- * arrays, arrays of objects, nested groups, secrets, a bootstrap-only
- * section and a setting pinned by the environment.
+ * produces. It is not the whole struct (the `mas_delegation` block is
+ * elided), but every *kind* of setting is here, in the shape `schemars`
+ * really emits it: booleans, enums (as a `oneOf` of documented `const`s),
+ * integers, floats, durations and byte sizes (`x-duration`, `x-bytesize`,
+ * also behind `Option<T>`), scalar arrays, an array of enum values, arrays of
+ * objects (listeners, thumbnail sizes, OIDC providers), an optional nested
+ * object (a listener's `tls`), an internally tagged enum (`media.storage`),
+ * nested groups, secrets, a bootstrap-only section and a setting pinned by
+ * the environment. `src/test/fixtures/hs-config-schema.json` is the real
+ * schema itself, for the tests that need exactly that.
  */
 import type { ConfigOrigin, JsonSchemaNode, JsonValue } from "@/api/config-schema";
 import type { AuditEntry } from "@/api/config";
@@ -26,19 +31,34 @@ const secretString: JsonSchemaNode = {
 const defs: Record<string, JsonSchemaNode> = {
   SecretString: secretString,
   Duration: {
-    anyOf: [{ type: "string" }, { type: "integer", minimum: 0 }],
+    type: ["string", "integer"],
+    "x-duration": true,
     description:
       "A duration: a string of <number><unit> groups (ms, s, m, h, d, w, y), or an integer number of milliseconds.",
   },
   ByteSize: {
-    anyOf: [{ type: "string" }, { type: "integer", minimum: 0 }],
+    type: ["string", "integer"],
+    "x-bytesize": true,
     description:
       "A byte size: a number with an optional unit (K, M, G, T with 1024 multipliers; KiB/MiB/GiB; KB/MB/GB with 1000 multipliers), or an integer byte count.",
   },
   LogLevel: {
-    type: "string",
-    enum: ["trace", "debug", "info", "warn", "error"],
     description: "Log level.",
+    oneOf: [
+      {
+        description: "Everything, including per-request tracing detail.",
+        type: "string",
+        const: "trace",
+      },
+      { description: "Verbose diagnostic output.", type: "string", const: "debug" },
+      { description: "Normal operational messages.", type: "string", const: "info" },
+      {
+        description: "Recoverable problems worth an operator's attention.",
+        type: "string",
+        const: "warn",
+      },
+      { description: "Failures.", type: "string", const: "error" },
+    ],
   },
   RateLimitBucket: {
     type: "object",
@@ -60,29 +80,238 @@ const defs: Record<string, JsonSchemaNode> = {
   },
   Listener: {
     type: "object",
-    description: "One bound socket.",
-    required: ["port"],
+    description: "One HTTP listener.",
+    required: ["port", "resources"],
+    additionalProperties: false,
     properties: {
-      bind_addresses: { type: "array", items: { type: "string" } },
-      port: { type: "integer", minimum: 1, maximum: 65535 },
-      tls: { anyOf: [{ type: "object" }, { type: "null" }] },
+      bind_addresses: {
+        type: "array",
+        items: { type: "string" },
+        default: ["::"],
+        description: "Addresses to bind. Corresponds to Synapse's bind_addresses.",
+      },
+      port: {
+        type: "integer",
+        format: "uint16",
+        minimum: 0,
+        maximum: 65535,
+        description: "TCP port.",
+      },
+      tls: {
+        anyOf: [{ $ref: "#/$defs/TlsConfig" }, { type: "null" }],
+        default: null,
+        description:
+          "TLS material, or None to serve plaintext (typically behind a reverse proxy terminating TLS).",
+      },
       resources: {
         type: "array",
-        items: {
-          type: "string",
-          enum: ["client", "federation", "media", "health", "metrics", "admin"],
-        },
+        items: { $ref: "#/$defs/ListenerResource" },
+        description:
+          "Resource families this listener serves. Corresponds to Synapse's resources[].names.",
       },
-      x_forwarded: { type: "boolean" },
+      x_forwarded: {
+        type: "boolean",
+        default: false,
+        description:
+          "Trust X-Forwarded-For and X-Forwarded-Proto from this listener's peers. Corresponds to Synapse's x_forwarded.",
+      },
     },
+  },
+  TlsConfig: {
+    type: "object",
+    description: "TLS material for a listener.",
+    required: ["certificate_path", "private_key_path"],
+    additionalProperties: false,
+    properties: {
+      certificate_path: { type: "string", description: "PEM certificate chain path." },
+      private_key_path: { type: "string", description: "PEM private key path." },
+    },
+  },
+  ListenerResource: {
+    description:
+      "A resource family a listener can serve. Synapse calls these resources with names like client, federation, media, metrics; we keep the same vocabulary since it is what operators already know.",
+    oneOf: [
+      {
+        description: "/_matrix/client/* and legacy /_matrix/r0/*.",
+        type: "string",
+        const: "client",
+      },
+      {
+        description: "/_matrix/federation/*, /_matrix/key/*.",
+        type: "string",
+        const: "federation",
+      },
+      { description: "/_matrix/media/*.", type: "string", const: "media" },
+      { description: "Prometheus text exposition.", type: "string", const: "metrics" },
+      {
+        description: "The native /api/v1 admin API and the embedded management web UI.",
+        type: "string",
+        const: "admin",
+      },
+      {
+        description: "/health liveness/readiness only, no auth, for load balancers.",
+        type: "string",
+        const: "health",
+      },
+    ],
   },
   ThumbnailSize: {
     type: "object",
+    description:
+      "One generated thumbnail size. Corresponds to one entry in Synapse's thumbnail_sizes.",
     required: ["width", "height", "method"],
+    additionalProperties: false,
     properties: {
-      width: { type: "integer", minimum: 1 },
-      height: { type: "integer", minimum: 1 },
-      method: { type: "string", enum: ["crop", "scale"] },
+      width: {
+        type: "integer",
+        format: "uint32",
+        minimum: 0,
+        description: "Target width in pixels.",
+      },
+      height: {
+        type: "integer",
+        format: "uint32",
+        minimum: 0,
+        description: "Target height in pixels.",
+      },
+      method: { $ref: "#/$defs/ThumbnailMethod", description: "Resize method." },
+    },
+  },
+  ThumbnailMethod: {
+    description: "How a thumbnail is fit to its target size.",
+    oneOf: [
+      { description: "Crop to exactly fill the target box.", type: "string", const: "crop" },
+      {
+        description: "Scale to fit within the target box, preserving aspect ratio.",
+        type: "string",
+        const: "scale",
+      },
+    ],
+  },
+  MediaStorageBackend: {
+    description: "Where media bytes live. Restart required to change.",
+    oneOf: [
+      {
+        description: "Local filesystem. Corresponds to Synapse's media_store_path.",
+        type: "object",
+        required: ["backend", "path"],
+        additionalProperties: false,
+        properties: {
+          path: { type: "string", description: "Root directory for stored media." },
+          backend: { type: "string", const: "local" },
+        },
+      },
+      {
+        description: "S3-compatible object storage.",
+        type: "object",
+        required: ["backend", "bucket"],
+        additionalProperties: false,
+        properties: {
+          bucket: { type: "string", description: "Bucket name." },
+          region: {
+            type: ["string", "null"],
+            default: null,
+            description: "Region, if the endpoint requires one.",
+          },
+          endpoint: {
+            type: ["string", "null"],
+            default: null,
+            description: "Custom endpoint for S3-compatible services (MinIO, R2, ...).",
+          },
+          access_key_id: {
+            type: ["string", "null"],
+            default: null,
+            description: "Access key ID.",
+          },
+          secret_access_key: {
+            $ref: "#/$defs/SecretString",
+            default: null,
+            description: "Inline secret access key. Prefer secret_access_key_file.",
+          },
+          secret_access_key_file: {
+            type: ["string", "null"],
+            default: null,
+            description: "Path to a file containing the secret access key.",
+          },
+          backend: { type: "string", const: "s3" },
+        },
+      },
+      {
+        description: "Google Cloud Storage.",
+        type: "object",
+        required: ["backend", "bucket"],
+        additionalProperties: false,
+        properties: {
+          bucket: { type: "string", description: "Bucket name." },
+          service_account_key_file: {
+            type: ["string", "null"],
+            default: null,
+            description: "Path to a service account JSON key file.",
+          },
+          backend: { type: "string", const: "gcs" },
+        },
+      },
+      {
+        description: "Azure Blob Storage.",
+        type: "object",
+        required: ["backend", "container", "account"],
+        additionalProperties: false,
+        properties: {
+          container: { type: "string", description: "Container name." },
+          account: { type: "string", description: "Storage account name." },
+          access_key: {
+            $ref: "#/$defs/SecretString",
+            default: null,
+            description: "Inline access key. Prefer access_key_file.",
+          },
+          access_key_file: {
+            type: ["string", "null"],
+            default: null,
+            description: "Path to a file containing the access key.",
+          },
+          backend: { type: "string", const: "azure" },
+        },
+      },
+    ],
+  },
+  OidcProviderConfig: {
+    type: "object",
+    description:
+      "One upstream OIDC identity provider. Corresponds to one entry in Synapse's oidc_providers.",
+    required: ["idp_id", "issuer", "client_id"],
+    additionalProperties: false,
+    properties: {
+      idp_id: {
+        type: "string",
+        description:
+          "Stable identifier used in the login flow and stored on the user's external identity. Corresponds to Synapse's idp_id.",
+      },
+      idp_name: {
+        type: ["string", "null"],
+        default: null,
+        description: "Display name shown on the login page. Corresponds to Synapse's idp_name.",
+      },
+      issuer: {
+        type: "string",
+        description: "The provider's issuer URL (used for discovery).",
+      },
+      client_id: { type: "string", description: "OAuth client ID registered with the provider." },
+      client_secret: {
+        $ref: "#/$defs/SecretString",
+        default: null,
+        description: "Inline client secret. Prefer client_secret_file.",
+      },
+      client_secret_file: {
+        type: ["string", "null"],
+        default: null,
+        description: "Path to a file containing the client secret.",
+      },
+      scopes: {
+        type: "array",
+        items: { type: "string" },
+        default: ["openid", "profile"],
+        description: "OAuth scopes to request.",
+      },
     },
   },
   MetricsConfig: {
@@ -193,14 +422,6 @@ const defs: Record<string, JsonSchemaNode> = {
         default: false,
         description: "Require mutual TLS between replicas.",
       },
-    },
-  },
-  RemoteMediaRetention: {
-    type: "object",
-    description:
-      "How long to keep cached copies of remote media. Absent means keep forever. Corresponds to Synapse's media_retention.remote_media_lifetime.",
-    properties: {
-      lifetime: { $ref: "#/$defs/Duration" },
     },
   },
   EmbeddedStorage: {
@@ -363,6 +584,12 @@ const properties: Record<string, JsonSchemaNode> = {
     type: "object",
     description: "Media repository settings.",
     properties: {
+      storage: {
+        $ref: "#/$defs/MediaStorageBackend",
+        default: { backend: "local", path: "./media-store" },
+        description:
+          "Storage backend. Corresponds to Synapse's media_storage_providers (simplified to one active backend).",
+      },
       max_upload_size: {
         $ref: "#/$defs/ByteSize",
         description: "Largest single upload accepted. Corresponds to Synapse's max_upload_size.",
@@ -401,7 +628,12 @@ const properties: Record<string, JsonSchemaNode> = {
         description:
           "Serve the pre-authentication-media (legacy, unauthenticated) endpoints alongside the authenticated ones.",
       },
-      remote_media_retention: { $ref: "#/$defs/RemoteMediaRetention" },
+      remote_media_retention: {
+        anyOf: [{ $ref: "#/$defs/Duration" }, { type: "null" }],
+        default: null,
+        description:
+          "How long to keep cached copies of remote media. None means keep forever. Corresponds to Synapse's media_retention.remote_media_lifetime.",
+      },
     },
   },
 
@@ -532,14 +764,14 @@ const properties: Record<string, JsonSchemaNode> = {
         description: "How long an access token stays valid before it must be refreshed.",
       },
       refresh_token_lifetime: {
-        $ref: "#/$defs/Duration",
+        anyOf: [{ $ref: "#/$defs/Duration" }, { type: "null" }],
         default: "1y",
-        description: "Refresh token lifetime; absent means refresh tokens do not expire.",
+        description: "Refresh token lifetime; None means refresh tokens do not expire.",
       },
       password: { $ref: "#/$defs/PasswordConfig" },
       oidc_providers: {
         type: "array",
-        items: { type: "object" },
+        items: { $ref: "#/$defs/OidcProviderConfig" },
         default: [],
         description: "Upstream OIDC providers.",
       },
@@ -749,6 +981,7 @@ export const configValues: Record<string, Record<string, JsonValue>> = {
     data_dir: "/var/lib/myelin/data",
   },
   media: {
+    storage: { backend: "local", path: "/var/lib/myelin/media" },
     max_upload_size: "100M",
     thumbnail_sizes: DEFAULT_THUMBNAIL_SIZES,
     url_preview_enabled: true,
@@ -757,7 +990,7 @@ export const configValues: Record<string, Record<string, JsonValue>> = {
     url_preview_max_fetch_size: "10M",
     url_preview_cache_lifetime: "1h",
     allow_legacy_unauthenticated_media: true,
-    remote_media_retention: { lifetime: "90d" },
+    remote_media_retention: "90d",
   },
   federation: {
     enabled: true,
@@ -804,7 +1037,16 @@ export const configValues: Record<string, Record<string, JsonValue>> = {
         require_lowercase: false,
       },
     },
-    oidc_providers: [],
+    oidc_providers: [
+      {
+        idp_id: "google",
+        idp_name: "Google",
+        issuer: "https://accounts.google.com/",
+        client_id: "myelin-example.apps.googleusercontent.com",
+        client_secret_file: "/run/secrets/oidc-google",
+        scopes: ["openid", "profile", "email"],
+      },
+    ],
   },
   appservices: {
     enabled: true,
@@ -926,6 +1168,29 @@ export function mergePatch(target: JsonValue, patch: JsonValue): JsonValue {
     else base[key] = mergePatch(base[key] ?? {}, value);
   }
   return base;
+}
+
+function isSecretPlaceholder(value: JsonValue): boolean {
+  return isObject(value) && Object.keys(value).length === 1 && value.$secret === true;
+}
+
+/**
+ * `SecretPaths::strip_echoed_secrets` in `crates/hs-admin/src/config_schema.rs`: a form
+ * round-trips the secrets it was shown as `{"$secret": true}`, and the server drops each one from
+ * the patch, which is what "the operator left this alone" means for a setting of its own. It does
+ * the same inside a list entry, and there the effect is different — the list replaces the stored
+ * one wholesale, so the entry loses its secret. The mock does exactly that too, rather than
+ * pretend; docs/rfcs/0020 asks the server to keep it.
+ */
+export function stripEchoedSecrets(patch: JsonValue): JsonValue {
+  if (Array.isArray(patch)) return patch.map(stripEchoedSecrets);
+  if (!isObject(patch)) return patch;
+  const out: Record<string, JsonValue> = {};
+  for (const [key, value] of Object.entries(patch)) {
+    if (isSecretPlaceholder(value)) continue;
+    out[key] = stripEchoedSecrets(value);
+  }
+  return out;
 }
 
 /** Every leaf path a patch touches, as a JSON Pointer relative to the patch root. */
@@ -1064,7 +1329,70 @@ export function validateSection(
     checkBytes(at("url_preview_max_fetch_size"), "/url_preview_max_fetch_size", out);
     checkDuration(at("url_preview_timeout"), "/url_preview_timeout", out);
     checkDuration(at("url_preview_cache_lifetime"), "/url_preview_cache_lifetime", out);
-    checkDuration(at("remote_media_retention.lifetime"), "/remote_media_retention/lifetime", out);
+    checkDuration(at("remote_media_retention"), "/remote_media_retention", out);
+    const thumbnails = at("thumbnail_sizes");
+    if (Array.isArray(thumbnails)) {
+      thumbnails.forEach((entry, index) => {
+        for (const key of ["width", "height"]) {
+          const size = isObject(entry) ? entry[key] : undefined;
+          if (typeof size !== "number" || !Number.isInteger(size) || size < 1) {
+            out.push({
+              pointer: `/thumbnail_sizes/${index}/${key}`,
+              detail: "must be a whole number of pixels, at least 1",
+            });
+          }
+        }
+      });
+    }
+    const storage = at("storage");
+    if (isObject(storage)) {
+      const required: Record<string, string[]> = {
+        local: ["path"],
+        s3: ["bucket"],
+        gcs: ["bucket"],
+        azure: ["container", "account"],
+      };
+      const backend = String(storage.backend);
+      if (!(backend in required)) {
+        out.push({ pointer: "/storage/backend", detail: `unknown backend ${backend}` });
+      } else {
+        for (const key of required[backend]) {
+          if (typeof storage[key] !== "string" || storage[key] === "") {
+            out.push({ pointer: `/storage/${key}`, detail: "required" });
+          }
+        }
+      }
+    }
+  }
+
+  if (section === "listeners") {
+    const listeners = at("listeners");
+    if (Array.isArray(listeners)) {
+      const ports = new Set<number>();
+      listeners.forEach((entry, index) => {
+        const port = isObject(entry) ? entry.port : undefined;
+        if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) {
+          out.push({
+            pointer: `/listeners/${index}/port`,
+            detail: "must be a TCP port, 1 to 65535",
+          });
+        } else if (ports.has(port)) {
+          out.push({
+            pointer: `/listeners/${index}/port`,
+            detail: `another listener already binds port ${port}`,
+          });
+        } else {
+          ports.add(port);
+        }
+        const resources = isObject(entry) ? entry.resources : undefined;
+        if (!Array.isArray(resources) || resources.length === 0) {
+          out.push({
+            pointer: `/listeners/${index}/resources`,
+            detail: "a listener that serves nothing is a mistake; choose at least one",
+          });
+        }
+      });
+    }
   }
 
   if (section === "auth") {
@@ -1075,6 +1403,35 @@ export function validateSection(
       out.push({
         pointer: "/password/policy/minimum_length",
         detail: "must be between 1 and 1024",
+      });
+    }
+    const providers = at("oidc_providers");
+    if (Array.isArray(providers)) {
+      const ids = new Set<string>();
+      providers.forEach((entry, index) => {
+        const provider = isObject(entry) ? entry : {};
+        for (const key of ["idp_id", "issuer", "client_id"]) {
+          if (typeof provider[key] !== "string" || provider[key] === "") {
+            out.push({ pointer: `/oidc_providers/${index}/${key}`, detail: "required" });
+          }
+        }
+        if (typeof provider.issuer === "string" && provider.issuer !== "") {
+          if (!/^https:\/\//.test(provider.issuer)) {
+            out.push({
+              pointer: `/oidc_providers/${index}/issuer`,
+              detail: "must be an https URL",
+            });
+          }
+        }
+        if (typeof provider.idp_id === "string" && provider.idp_id !== "") {
+          if (ids.has(provider.idp_id)) {
+            out.push({
+              pointer: `/oidc_providers/${index}/idp_id`,
+              detail: `another provider is already called ${provider.idp_id}`,
+            });
+          }
+          ids.add(provider.idp_id);
+        }
       });
     }
     if (at("enable_registration") === true && at("registration_shared_secret") === undefined) {

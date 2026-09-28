@@ -11,10 +11,18 @@
 import { useId } from "react";
 import { RotateCcw, Undo2 } from "lucide-react";
 import type { ConfigOrigin, JsonValue } from "@/api/config-schema";
-import { formatValue, isChanged, settingRowId, type SettingField } from "@/lib/config-model";
+import {
+  SCALAR_KINDS,
+  STRUCTURED_KINDS,
+  formatValue,
+  isChanged,
+  settingRowId,
+  type SettingField,
+} from "@/lib/config-model";
 import { Badge } from "@/components/ui/badge/Badge";
 import { Button } from "@/components/ui/button/Button";
 import { SettingControl } from "./SettingControls";
+import { ReadOnlyValue } from "./StructuredControls";
 import { cn } from "@/lib/cn";
 
 const ORIGIN_COPY: Record<ConfigOrigin, { label: string; detail: string }> = {
@@ -43,18 +51,6 @@ export function OriginBadge({ origin }: { origin: ConfigOrigin }) {
     </Badge>
   );
 }
-
-/** The kinds that render as one labelable control; the rest label their own parts. */
-const LABELABLE: ReadonlySet<string> = new Set([
-  "boolean",
-  "enum",
-  "integer",
-  "number",
-  "string",
-  "duration",
-  "bytes",
-  "secret",
-]);
 
 export interface SettingRowProps {
   field: SettingField;
@@ -113,8 +109,14 @@ export function SettingRow({
   const canReset = !readOnly && resettable && (changed || dirty);
   const resetLabel = field.hasDefault ? "Reset to default" : "Unset";
 
-  const describedBy = [hintId, error ? errorId : undefined].filter(Boolean).join(" ") || undefined;
-  const useLabel = LABELABLE.has(field.kind) && !readOnly;
+  const describedBy =
+    [field.summary ? hintId : undefined, error ? errorId : undefined].filter(Boolean).join(" ") ||
+    undefined;
+  const labelId = `${controlId}-label`;
+  const useLabel = SCALAR_KINDS.has(field.kind) && !readOnly;
+  // A nested form needs the room: it spans the row rather than squeezing
+  // into the value column.
+  const structured = STRUCTURED_KINDS.has(field.kind);
 
   return (
     <div
@@ -127,7 +129,7 @@ export function SettingRow({
     >
       <div className="min-w-0">
         {useLabel ? (
-          <label htmlFor={controlId} className="text-sm font-medium text-text">
+          <label id={labelId} htmlFor={controlId} className="text-sm font-medium text-text">
             {field.label}
             {field.required && !field.hasDefault && (
               <span aria-hidden="true" className="text-danger">
@@ -137,7 +139,9 @@ export function SettingRow({
             )}
           </label>
         ) : (
-          <p className="text-sm font-medium text-text">{field.label}</p>
+          <p id={labelId} className="text-sm font-medium text-text">
+            {field.label}
+          </p>
         )}
         <p className="font-identifier text-xs text-text-faint">{field.fullPath}</p>
 
@@ -206,17 +210,22 @@ export function SettingRow({
         {locked && lockedReason && <p className="mt-2 text-xs text-text-muted">{lockedReason}</p>}
       </div>
 
-      <div className="min-w-0">
+      <div className={cn("min-w-0", structured && "sm:col-span-2")}>
         {readOnly ? (
-          <p className="flex min-h-9 items-center break-words font-identifier text-sm text-text">
-            {formatValue(shown)}
-          </p>
+          structured ? (
+            <ReadOnlyValue value={shown} />
+          ) : (
+            <p className="flex min-h-9 items-center break-words font-identifier text-sm text-text">
+              {formatValue(shown)}
+            </p>
+          )
         ) : (
           <SettingControl
             field={field}
             value={shown}
             id={controlId}
             describedBy={describedBy}
+            labelledBy={labelId}
             invalid={Boolean(error)}
             onChange={onChange}
             onRevert={onRevert}

@@ -27,6 +27,12 @@ import {
  * How one setting is edited. Chosen from the schema, with one exception:
  * `secret` can also be forced by the *value* (`{"$secret": true}`), since the
  * API redacts secrets whether or not the schema says which fields they are.
+ *
+ * There is deliberately no "edit it as JSON" kind (decision 0010: no page
+ * edits a file format as text). Every shape the configuration schema uses has
+ * a real control; a shape this build does not recognise is `unsupported`,
+ * rendered read-only, and is a bug to fix here rather than a reason for a
+ * text box.
  */
 export type FieldKind =
   | "boolean"
@@ -39,7 +45,47 @@ export type FieldKind =
   | "secret"
   | "string-list"
   | "number-list"
-  | "json";
+  /** An array whose entries come from a fixed set of strings: one checkbox each. */
+  | "enum-list"
+  /** A fixed set of named settings, edited as a nested form. */
+  | "object"
+  /** An array of objects (or of tagged variants): a repeatable form, one per entry. */
+  | "object-list"
+  /** String keys mapping to values of one schema: key/value rows. */
+  | "map"
+  /** An internally tagged enum: pick the variant, then fill in that variant's fields. */
+  | "variant"
+  /** A shape this interface cannot describe. Shown read-only, with a note. */
+  | "unsupported";
+
+/** The kinds that are one value in one labelable control. */
+export const SCALAR_KINDS: ReadonlySet<FieldKind> = new Set<FieldKind>([
+  "boolean",
+  "enum",
+  "integer",
+  "number",
+  "string",
+  "duration",
+  "bytes",
+  "secret",
+]);
+
+/** The kinds rendered as a nested form, and so given the full width of a row. */
+export const STRUCTURED_KINDS: ReadonlySet<FieldKind> = new Set<FieldKind>([
+  "object",
+  "object-list",
+  "map",
+  "variant",
+  "unsupported",
+]);
+
+/** One permitted value of an `enum` or `enum-list`, already labelled. */
+export interface SettingOption {
+  value: string;
+  label: string;
+  /** The value's own doc comment, when the schema has one (a `oneOf` of `const`s does). */
+  description?: string;
+}
 
 export interface SettingField {
   /** Dotted path within the section: `password.enabled`. */
@@ -53,8 +99,8 @@ export interface SettingField {
   /** The whole doc comment, shown behind a disclosure when it says more than the summary. */
   description?: string;
   kind: FieldKind;
-  /** For `enum`: the permitted values, already labelled. */
-  options?: { value: string; label: string }[];
+  /** For `enum` and `enum-list`: the permitted values, already labelled. */
+  options?: SettingOption[];
   /** The schema's own default, when it has one. `undefined` means the field is required. */
   defaultValue?: JsonValue;
   hasDefault: boolean;
@@ -71,6 +117,15 @@ export interface SettingField {
    * inferred from the origin, which is what it was before the field existed.
    */
   editable: boolean;
+  /**
+   * The schema node the field was built from, `$ref`s followed and `Option<T>`
+   * unwrapped. The structured kinds build their nested forms from it.
+   */
+  schema?: JsonSchemaNode;
+  /** `$defs`, for the `$ref`s inside {@link schema}. */
+  defs?: Record<string, JsonSchemaNode>;
+  /** The schema admits `null` (an `Option<T>`), so a nested form may be left unset. */
+  nullable?: boolean;
 }
 
 export interface SettingGroup {
@@ -161,12 +216,18 @@ const ACRONYMS: Record<string, string> = {
   cidr: "CIDR",
   cors: "CORS",
   db: "DB",
+  dsn: "DSN",
+  gcs: "GCS",
   id: "ID",
+  idp: "IdP",
   ip: "IP",
   ips: "IPs",
   mas: "MAS",
   oidc: "OIDC",
   os: "OS",
+  otlp: "OTLP",
+  pem: "PEM",
+  san: "SAN",
   sso: "SSO",
   tls: "TLS",
   ttl: "TTL",
@@ -256,6 +317,11 @@ function refName(node: JsonSchemaNode): string {
  * one of these tells.
  */
 function unitKind(raw: JsonSchemaNode, resolved: JsonSchemaNode): "duration" | "bytes" | null {
+  // The real schema marks both newtypes outright. It is the only tell that
+  // survives an `Option<Duration>`, whose `$ref` sits inside an `anyOf` and
+  // whose description is the field's own rather than the type's.
+  if (resolved["x-duration"] === true) return "duration";
+  if (resolved["x-bytesize"] === true) return "bytes";
   const ref = refName(raw).toLowerCase();
   if (ref.includes("duration")) return "duration";
   if (ref.includes("bytesize") || ref.includes("byte_size")) return "bytes";
@@ -271,41 +337,163 @@ function isSecretNode(node: JsonSchemaNode): boolean {
   return node["x-secret"] === true || node.writeOnly === true || node.format === "password";
 }
 
+function isNullOnly(node: JsonSchemaNode): boolean {
+  const types = typesOf(node);
+  return types.length === 1 && types[0] === "null";
+}
+
+/** `Option<T>`: a `null` variant, or `null` among the node's own types. */
+function admitsNull(node: JsonSchemaNode, defs: Record<string, JsonSchemaNode>): boolean {
+  if (typesOf(node).includes("null")) return true;
+  const variants = node.anyOf ?? node.oneOf ?? [];
+  return variants.some((v) => isNullOnly(resolveRef(v, defs)));
+}
+
+/**
+ * The permitted values of a string enum, in either spelling: a plain `enum`
+ * array, or what `schemars` emits for a documented Rust enum of unit variants
+ * — a `oneOf` of `{type: "string", const: …}`, one per variant, each carrying
+ * that variant's doc comment (`LogLevel`, `ThumbnailMethod`,
+ * `ListenerResource`). `null` for anything else.
+ */
+function enumOptions(
+  node: JsonSchemaNode,
+  defs: Record<string, JsonSchemaNode>,
+): SettingOption[] | null {
+  if (node.enum && node.enum.length > 0) {
+    if (!node.enum.every((v) => typeof v === "string")) return null;
+    return (node.enum as string[]).map((v) => ({ value: v, label: humanizeKey(v) }));
+  }
+  if (Object.keys(node.properties ?? {}).length > 0) return null;
+  const variants = node.oneOf ?? node.anyOf;
+  if (!variants || variants.length === 0) return null;
+  const options: SettingOption[] = [];
+  for (const variant of variants) {
+    const resolved = resolveRef(variant, defs);
+    if (isNullOnly(resolved)) continue;
+    if (typeof resolved.const === "string") {
+      options.push({
+        value: resolved.const,
+        label: humanizeKey(resolved.const),
+        description: summarize(resolved.description),
+      });
+    } else if (resolved.enum?.length && resolved.enum.every((v) => typeof v === "string")) {
+      options.push(
+        ...(resolved.enum as string[]).map((v) => ({ value: v, label: humanizeKey(v) })),
+      );
+    } else {
+      return null;
+    }
+  }
+  return options.length > 0 ? options : null;
+}
+
+/** One variant of an internally tagged enum. */
+export interface VariantOption extends SettingOption {
+  /** The variant's object schema, the tag property included. */
+  node: JsonSchemaNode;
+}
+
+/** An internally tagged enum: which property is the tag, and the variants it selects. */
+export interface VariantInfo {
+  /** The property every variant pins to a `const`: `backend` for `media.storage`. */
+  tag: string;
+  options: VariantOption[];
+}
+
+/**
+ * Recognises an internally tagged Rust enum (`#[serde(tag = "backend")]`):
+ * a `oneOf` of object variants that all pin one property to a string
+ * `const`. `media.storage` is one (`local`, `s3`, `gcs`, `azure`), and so is
+ * the `storage` section itself.
+ */
+export function variantInfo(
+  node: JsonSchemaNode | undefined,
+  defs: Record<string, JsonSchemaNode>,
+): VariantInfo | null {
+  if (!node || Object.keys(node.properties ?? {}).length > 0) return null;
+  const variants = (node.oneOf ?? node.anyOf ?? [])
+    .map((v) => resolveRef(v, defs))
+    .filter((v) => !isNullOnly(v));
+  if (variants.length === 0) return null;
+  if (variants.some((v) => Object.keys(v.properties ?? {}).length === 0)) return null;
+  const constOf = (variant: JsonSchemaNode, key: string): unknown => {
+    const prop = variant.properties?.[key];
+    return prop ? resolveRef(prop, defs).const : undefined;
+  };
+  const tag = Object.keys(variants[0].properties ?? {}).find((key) =>
+    variants.every((v) => typeof constOf(v, key) === "string"),
+  );
+  if (!tag) return null;
+  return {
+    tag,
+    options: variants.map((variant) => {
+      const value = constOf(variant, tag) as string;
+      return {
+        value,
+        label: humanizeKey(value),
+        description: summarize(variant.description),
+        node: variant,
+      };
+    }),
+  };
+}
+
+/** A map's value schema: an object with no fixed properties but `additionalProperties: {…}`. */
+function mapValueSchema(node: JsonSchemaNode): JsonSchemaNode | null {
+  if (Object.keys(node.properties ?? {}).length > 0) return null;
+  const extra = node.additionalProperties;
+  return typeof extra === "object" && extra !== null ? extra : null;
+}
+
+/** The shapes a nested form can render: an object, a tagged variant, a map. */
+function isFormShape(node: JsonSchemaNode, defs: Record<string, JsonSchemaNode>): boolean {
+  return (
+    Object.keys(node.properties ?? {}).length > 0 ||
+    variantInfo(node, defs) !== null ||
+    mapValueSchema(node) !== null
+  );
+}
+
+/** What an array's entries are, and so which list control edits it. */
+function listKind(
+  items: JsonSchemaNode | undefined,
+  defs: Record<string, JsonSchemaNode>,
+): FieldKind {
+  if (!items) return "unsupported";
+  const item = unwrapNullable(resolveRef(items, defs), defs);
+  if (enumOptions(item, defs)) return "enum-list";
+  const types = typesOf(item);
+  if (types.includes("string")) return "string-list";
+  if (types.includes("integer") || types.includes("number")) return "number-list";
+  if (isFormShape(item, defs)) return "object-list";
+  return "unsupported";
+}
+
 function classify(
   raw: JsonSchemaNode,
   resolved: JsonSchemaNode,
   value: JsonValue | undefined,
-  info?: ConfigSettingInfo,
+  info: ConfigSettingInfo | undefined,
+  defs: Record<string, JsonSchemaNode>,
 ): FieldKind {
   if (info?.secret || isSecretValue(value) || isSecretNode(resolved)) return "secret";
 
   const unit = unitKind(raw, resolved);
   if (unit) return unit;
 
-  const enumValues = resolved.enum;
-  if (enumValues && enumValues.length > 0 && enumValues.every((v) => typeof v === "string")) {
-    return "enum";
-  }
+  if (enumOptions(resolved, defs)) return "enum";
 
   const types = typesOf(resolved).filter((t) => t !== "null");
   if (types.includes("boolean")) return "boolean";
-  if (types.includes("array")) {
-    const itemTypes = typesOf(resolved.items ?? {});
-    if (itemTypes.includes("string") || (resolved.items?.enum?.length ?? 0) > 0) {
-      return "string-list";
-    }
-    if (itemTypes.includes("integer") || itemTypes.includes("number")) return "number-list";
-    return "json";
-  }
+  if (types.includes("array")) return listKind(resolved.items, defs);
   if (types.includes("integer")) return "integer";
   if (types.includes("number")) return "number";
   if (types.includes("string")) return "string";
-  return "json";
-}
-
-/** A node the form should recurse into rather than render as one control. */
-function isGroupNode(node: JsonSchemaNode, kind: FieldKind): boolean {
-  return kind === "json" && Object.keys(node.properties ?? {}).length > 0;
+  if (Object.keys(resolved.properties ?? {}).length > 0) return "object";
+  if (variantInfo(resolved, defs)) return "variant";
+  if (mapValueSchema(resolved)) return "map";
+  return "unsupported";
 }
 
 const UNIT_HINTS: Partial<Record<FieldKind, string>> = {
@@ -313,39 +501,55 @@ const UNIT_HINTS: Partial<Record<FieldKind, string>> = {
   bytes: "e.g. 50M, 512K, 1GiB",
 };
 
-function buildField(
-  key: string,
-  raw: JsonSchemaNode,
-  resolved: JsonSchemaNode,
-  sectionPath: string,
-  sectionName: string,
-  value: JsonValue | undefined,
-  required: boolean,
-  info: ConfigSettingInfo | undefined,
-): SettingField {
-  const kind = classify(raw, resolved, value, info);
+interface FieldSpec {
+  key: string;
+  /** The property's schema as written, before any `$ref` is followed. */
+  raw: JsonSchemaNode;
+  defs: Record<string, JsonSchemaNode>;
+  path: string;
+  fullPath: string;
+  value: JsonValue | undefined;
+  required: boolean;
+  info?: ConfigSettingInfo;
+  /** Overrides {@link ConfigSettingInfo.editable}: a nested field inherits its setting's. */
+  editable?: boolean;
+  /** Overrides the label the key or the schema's `title` would give. */
+  label?: string;
+}
+
+function makeField(spec: FieldSpec): SettingField {
+  const { key, raw, defs, info } = spec;
+  const base = resolveRef(raw, defs);
+  const resolved = unwrapNullable(base, defs);
+  const kind = classify(raw, resolved, spec.value, info, defs);
   const description = cleanDoc(resolved.description);
   const summary = summarize(resolved.description);
+  const options =
+    kind === "enum"
+      ? enumOptions(resolved, defs)
+      : kind === "enum-list"
+        ? enumOptions(unwrapNullable(resolveRef(resolved.items ?? {}, defs), defs), defs)
+        : null;
   return {
-    path: sectionPath,
-    fullPath: `${sectionName}.${sectionPath}`,
+    path: spec.path,
+    fullPath: spec.fullPath,
     key,
-    label: resolved.title ? cleanDoc(resolved.title)! : humanizeKey(key),
+    label: spec.label ?? (resolved.title ? cleanDoc(resolved.title)! : humanizeKey(key)),
     summary,
     description: description && description !== summary ? description : undefined,
     kind,
-    options:
-      kind === "enum"
-        ? (resolved.enum ?? []).map((v) => ({ value: String(v), label: humanizeKey(String(v)) }))
-        : undefined,
+    options: options ?? undefined,
     defaultValue: resolved.default,
     hasDefault: resolved.default !== undefined,
-    required,
+    required: spec.required,
     unitHint: UNIT_HINTS[kind],
     minimum: resolved.minimum,
     maximum: resolved.maximum,
     readOnly: resolved.const !== undefined,
-    editable: info ? info.editable : true,
+    editable: spec.editable ?? (info ? info.editable : true),
+    schema: resolved,
+    defs,
+    nullable: admitsNull(base, defs),
   };
 }
 
@@ -367,11 +571,14 @@ function walk(
     const resolved = unwrapNullable(resolveRef(child, defs), defs);
     const value = getPath(values, path);
     const info = settings[`${sectionName}.${path}`];
-    const kind = classify(child, resolved, value, info);
+    const kind = classify(child, resolved, value, info, defs);
 
-    // Depth 4 is well past anything in `hs_config::Config`; the guard is
-    // against a schema that refs itself, not against a deep config.
-    if (isGroupNode(resolved, kind) && depth < 4) {
+    // A nested object is a group of its own rows, each saved on its own —
+    // merge patch merges objects key by key, so that is exact. Depth 4 is
+    // well past anything in `hs_config::Config`; the guard is against a
+    // schema that refs itself, not against a deep config. Past it, the
+    // object is still edited, as one nested form.
+    if (kind === "object" && depth < 4) {
       const nested = walk(resolved, defs, path, sectionName, values, settings, depth + 1);
       groups.push({
         path,
@@ -384,11 +591,283 @@ function walk(
     }
 
     fields.push(
-      buildField(key, child, resolved, path, sectionName, value, required.has(key), info),
+      makeField({
+        key,
+        raw: child,
+        defs,
+        path,
+        fullPath: `${sectionName}.${path}`,
+        value,
+        required: required.has(key),
+        info,
+      }),
     );
   }
 
   return { fields, groups };
+}
+
+// ---------------------------------------------------------------------------
+// Nested forms: the settings inside one setting's value
+// ---------------------------------------------------------------------------
+
+/**
+ * The variant a tagged value is, by its tag. `undefined` when the value names
+ * no variant this schema has (or is not an object at all).
+ */
+export function chosenVariant(
+  field: SettingField,
+  value: JsonValue | undefined,
+): VariantOption | undefined {
+  const info = variantInfo(field.schema, field.defs ?? {});
+  if (!info || !isRecord(value)) return undefined;
+  return info.options.find((option) => option.value === value[info.tag]);
+}
+
+function propertyFieldsOf(
+  node: JsonSchemaNode,
+  field: SettingField,
+  value: JsonValue | undefined,
+  skip?: string,
+): SettingField[] {
+  const required = new Set(node.required ?? []);
+  return Object.entries(node.properties ?? {})
+    .filter(([key]) => key !== skip)
+    .map(([key, raw]) =>
+      makeField({
+        key,
+        raw,
+        defs: field.defs ?? {},
+        path: `${field.path}.${key}`,
+        fullPath: `${field.fullPath}.${key}`,
+        value: isRecord(value) ? value[key] : undefined,
+        required: required.has(key),
+        editable: field.editable,
+      }),
+    );
+}
+
+/**
+ * The settings inside an `object` value, or inside a `variant` value's
+ * chosen variant (its tag excluded — the variant picker edits that).
+ */
+export function propertyFields(field: SettingField, value: JsonValue | undefined): SettingField[] {
+  if (field.kind === "variant") {
+    const info = variantInfo(field.schema, field.defs ?? {});
+    const chosen = chosenVariant(field, value);
+    return chosen && info ? propertyFieldsOf(chosen.node, field, value, info.tag) : [];
+  }
+  return field.schema ? propertyFieldsOf(field.schema, field, value) : [];
+}
+
+/** `Listener` → "Listener"; `OidcProviderConfig` → "OIDC provider"; `ThumbnailSize` → "Thumbnail size". */
+export function nounFromTypeName(name: string): string {
+  const words = name
+    .replace(/Config$/, "")
+    .split(/(?<=[a-z0-9])(?=[A-Z])/)
+    .filter(Boolean);
+  if (words.length === 0) return "Entry";
+  return humanizeKey(words.map((w) => w.toLowerCase()).join("_"));
+}
+
+/** What one entry of an `object-list` is called: "Listener", "Thumbnail size", "Entry". */
+export function entryNoun(field: SettingField): string {
+  const items = field.schema?.items;
+  const name = items ? refName(items) : "";
+  return name ? nounFromTypeName(name) : "Entry";
+}
+
+/** One entry of a list, as a field of its own: its kind, its nested form. */
+export function itemField(
+  field: SettingField,
+  index: number,
+  value: JsonValue | undefined,
+): SettingField {
+  return makeField({
+    key: String(index),
+    raw: field.schema?.items ?? {},
+    defs: field.defs ?? {},
+    path: `${field.path}.${index}`,
+    fullPath: `${field.fullPath}[${index}]`,
+    value,
+    required: true,
+    editable: field.editable,
+    label: `${entryNoun(field)} ${index + 1}`,
+  });
+}
+
+/** The value under one key of a `map`, as a field of its own. */
+export function mapEntryField(
+  field: SettingField,
+  key: string,
+  value: JsonValue | undefined,
+): SettingField {
+  const extra = field.schema?.additionalProperties;
+  return makeField({
+    key,
+    raw: typeof extra === "object" && extra !== null ? extra : {},
+    defs: field.defs ?? {},
+    path: `${field.path}.${key}`,
+    fullPath: `${field.fullPath}.${key}`,
+    value,
+    // The key being there is what makes the entry exist; its value is not
+    // "required" in any sense worth marking.
+    required: false,
+    editable: field.editable,
+    label: key || "New entry",
+  });
+}
+
+function cloneJson<T extends JsonValue>(value: T): T {
+  return structuredClone(value);
+}
+
+/**
+ * A new, blank value for a field: what "Add a listener" puts in the list.
+ *
+ * Every property with a schema default gets that default, so the new entry
+ * shows what the server would assume; every *required* property without one
+ * starts empty, so the operator can see what still has to be filled in (and
+ * the server says so if it is not); optional properties without a default are
+ * left out, which is what not setting them means.
+ */
+export function emptyValue(field: SettingField): JsonValue {
+  switch (field.kind) {
+    case "boolean":
+      return false;
+    case "enum":
+      return field.options?.[0]?.value ?? "";
+    case "string-list":
+    case "number-list":
+    case "enum-list":
+    case "object-list":
+      return [];
+    case "map":
+      return {};
+    case "object":
+      return objectSkeleton(propertyFields(field, undefined));
+    case "variant": {
+      const info = variantInfo(field.schema, field.defs ?? {});
+      const first = info?.options[0];
+      return info && first ? switchVariant(field, undefined, first.value) : {};
+    }
+    default:
+      return "";
+  }
+}
+
+function objectSkeleton(fields: SettingField[]): Record<string, JsonValue> {
+  const out: Record<string, JsonValue> = {};
+  for (const sub of fields) {
+    if (sub.readOnly && sub.schema?.const !== undefined) {
+      out[sub.key] = cloneJson(sub.schema.const);
+    } else if (sub.hasDefault) {
+      if (sub.defaultValue !== null && sub.defaultValue !== undefined) {
+        out[sub.key] = cloneJson(sub.defaultValue);
+      }
+    } else if (sub.required) {
+      out[sub.key] = emptyValue(sub);
+    }
+  }
+  return out;
+}
+
+/**
+ * The value a variant picker produces when the operator picks `tag`: the new
+ * variant's blank value, keeping whatever the old value said for a property
+ * the new variant also has (`bucket`, moving from S3 to GCS).
+ */
+export function switchVariant(
+  field: SettingField,
+  value: JsonValue | undefined,
+  tag: string,
+): JsonValue {
+  const info = variantInfo(field.schema, field.defs ?? {});
+  const option = info?.options.find((o) => o.value === tag);
+  if (!info || !option) return value ?? {};
+  const fields = propertyFieldsOf(option.node, field, undefined, info.tag);
+  const next: Record<string, JsonValue> = { [info.tag]: tag, ...objectSkeleton(fields) };
+  if (isRecord(value)) {
+    for (const sub of fields) {
+      if (sub.key in value && !isSecretValue(value[sub.key])) next[sub.key] = value[sub.key];
+    }
+  }
+  return next;
+}
+
+/**
+ * A few words that tell one entry of a list from another — its required
+ * scalar settings, in schema order: "8008" for a listener, "google ·
+ * https://accounts.google.com · matrix" for an OIDC provider.
+ */
+export function entrySummary(
+  field: SettingField,
+  value: JsonValue | undefined,
+): string | undefined {
+  if (!isRecord(value)) return value === undefined ? undefined : formatValue(value);
+  const fields = propertyFields(field, value);
+  const scalar = (f: SettingField) =>
+    f.kind !== "secret" && SCALAR_KINDS.has(f.kind) && value[f.key] !== undefined;
+  const picked = fields.filter((f) => f.required && scalar(f));
+  const chosen = (picked.length > 0 ? picked : fields.filter(scalar)).slice(0, 3);
+  const parts = chosen
+    .map((f) => value[f.key])
+    .filter((v) => v !== null && v !== "")
+    .map((v) => formatValue(v));
+  if (field.kind === "variant") {
+    const variant = chosenVariant(field, value);
+    if (variant) parts.unshift(variant.label);
+  }
+  return parts.length > 0 ? parts.join(" · ") : undefined;
+}
+
+/** Whether a value holds a redacted secret anywhere inside it. */
+export function containsSecret(value: JsonValue | undefined): boolean {
+  if (isSecretValue(value)) return true;
+  if (Array.isArray(value)) return value.some(containsSecret);
+  if (isRecord(value)) return Object.values(value).some(containsSecret);
+  return false;
+}
+
+/**
+ * The field a validation error belongs to. The server names the exact
+ * setting that failed — `listeners.0.port`, or `oidc_providers[1].issuer` in
+ * `hs-config`'s own spelling — but a list is edited as one setting, so the
+ * error lands on the list's row. Longest match wins, so `password.enabled`
+ * lands on itself and not on a `password` that is not a field.
+ */
+export function ownerFieldPath(path: string, fieldPaths: Iterable<string>): string | undefined {
+  return ownerOf(path, fieldPaths);
+}
+
+/**
+ * Where inside a setting an error points, in words: the part of
+ * `thumbnail_sizes.2.width` after the setting is "entry 3, width".
+ */
+export function describeSubPath(rest: string): string {
+  return rest
+    .replace(/\[(\d+)\]/g, ".$1")
+    .split(".")
+    .filter(Boolean)
+    .map((part) => (/^\d+$/.test(part) ? `entry ${Number(part) + 1}` : humanizeKey(part)))
+    .map((part, index) => {
+      if (index === 0) return part.charAt(0).toUpperCase() + part.slice(1);
+      // "Width" reads as "width" mid-sentence; "IP range" and "IdP ID" stay.
+      return /^[A-Z][a-z]/.test(part) && !/^IdP/.test(part)
+        ? part.charAt(0).toLowerCase() + part.slice(1)
+        : part;
+    })
+    .join(", ");
+}
+
+function ownerOf(path: string, fieldPaths: Iterable<string>): string | undefined {
+  let best: string | undefined;
+  for (const candidate of fieldPaths) {
+    const owns =
+      path === candidate || path.startsWith(`${candidate}.`) || path.startsWith(`${candidate}[`);
+    if (owns && (best === undefined || candidate.length > best.length)) best = candidate;
+  }
+  return best;
 }
 
 /**
@@ -636,7 +1115,10 @@ export function formatValue(value: JsonValue | undefined): string {
     if (value.length === 0) return "empty list";
     return value.every((v) => typeof v === "string" || typeof v === "number")
       ? value.join(", ")
-      : `${value.length} entries`;
+      : `${value.length} ${value.length === 1 ? "entry" : "entries"}`;
   }
-  return JSON.stringify(value);
+  const entries = Object.entries(value);
+  if (entries.length === 0) return "empty";
+  // Prose, not JSON: this is what a person reads in the review list.
+  return entries.map(([key, v]) => `${humanizeKey(key)}: ${formatValue(v)}`).join(" · ");
 }
