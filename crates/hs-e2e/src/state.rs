@@ -76,6 +76,10 @@ pub struct E2eState<B: KvBackend> {
     /// installed one -- `GET /keys/changes` then treats a `from`/`to` value that isn't a plain
     /// decimal stream position as invalid, same as before this hook existed.
     sync_token_resolver: Arc<OnceLock<Arc<dyn SyncTokenResolver>>>,
+    /// How a local client's `/keys/query` and `/keys/claim` reach other servers' users
+    /// ([`crate::federation::RemoteKeys`]), once installed. Shared across clones like
+    /// `sync_token_resolver`; unset means remote users are skipped.
+    remote_keys: Arc<OnceLock<Arc<dyn crate::federation::RemoteKeys>>>,
     /// Marker so `B` (the backend `E2eState` was constructed over) is nameable in code that
     /// otherwise only touches `store` through the trait object — kept even though `store` itself
     /// erases `B`, so `E2eState<B>: FromRequestParts` bounds line up the same way `RoomState<B>`'s
@@ -126,6 +130,7 @@ impl<B: KvBackend> E2eState<B> {
             auth,
             store,
             sync_token_resolver: Arc::new(OnceLock::new()),
+            remote_keys: Arc::new(OnceLock::new()),
             _backend: std::marker::PhantomData,
         }
     }
@@ -148,6 +153,21 @@ impl<B: KvBackend> E2eState<B> {
     #[must_use]
     pub fn sync_token_resolver(&self) -> Option<&Arc<dyn SyncTokenResolver>> {
         self.sync_token_resolver.get()
+    }
+
+    /// Installs how `/keys/query` and `/keys/claim` reach remote users' servers
+    /// ([`crate::federation::RemoteKeys`]). Same idempotent-install convention as
+    /// [`E2eState::install_sync_token_resolver`].
+    pub fn install_remote_keys(&self, remote: Arc<dyn crate::federation::RemoteKeys>) {
+        if self.remote_keys.set(remote).is_err() {
+            tracing::warn!("remote key access was already installed on this e2e state; ignoring");
+        }
+    }
+
+    /// The installed [`crate::federation::RemoteKeys`], if any.
+    #[must_use]
+    pub fn remote_keys(&self) -> Option<&Arc<dyn crate::federation::RemoteKeys>> {
+        self.remote_keys.get()
     }
 }
 
