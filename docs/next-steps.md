@@ -420,7 +420,10 @@ preview size, a hidden secret in a list entry, the bootstrap flag: `bed8c49`); t
 `Homeserver` reconciler (`e0e6d0e`, `c0bc875`; never run against a real API server).
 
 **Merge queue result (16:05-16:43):** merged `agent/federation-media` (`8991e0d`) and
-`agent/rooms-admin` (`ac7831a`), both through the full gate. Not merged: `agent/two-pod-cluster-2`,
+`agent/rooms-admin` (`ac7831a`), both through the full gate. Later, the migration agent merged the **Migration
+admin area, 8/8** (`45466b7`..`98c4475`): a real Synapse importer (copy as a checkpointed task,
+pause, resume, verify, cutover, abort), the Migration page, and `docs/compat/synapse-migration-runbook.md`.
+Admin coverage is 140 of 158. Not merged: `agent/two-pod-cluster-2`,
 `agent/admin-followups`, `agent/federation-leftovers` and `agent/root-redirect` stopped on
 **rebase conflicts** with what merged today (each needs its owning track to rebase and resolve,
 keeping both sides; merge `two-pod-cluster-2` first, since the others' gates hit the ownership
