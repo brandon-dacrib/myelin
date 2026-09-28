@@ -286,7 +286,7 @@ so the Bridges pages were empty against the real server (decision 0009 has the c
 corrections). Still not run: the `cluster` runtime and the operator against an API server
 (no Kubernetes in a cloud session), and the demo at `myelin.dacrib.net` still has
 2026-09-25's shared WhatsApp registration, which section 6 of the RFC says an offering
-replaces. Both are laptop items in item 1 below.
+replaces. Both are desktop items in item 1 below.
 
 **The admin interface ships.** Until 2026-09-21 it did not: every binary and every published image served a placeholder at `/admin/` saying the interface had not been built in, because nothing embedded `web/dist`. `crates/hs-admin/build.rs` now stages the built interface (or the placeholder, for a Rust-only checkout, and says so at startup); release builds set `HS_ADMIN_WEB_DIST` and *fail* without a built interface; CD refuses to publish an image whose `/admin/` is not the interface. Verified on the published artifact: `ghcr.io/brandon-dacrib/myelin:main`, pulled from the registry on 2026-09-21 and run with the README's exact command, serves the interface at `/admin/`, answers `needs_setup: true`, and logs the setup link. What has still never run is the `v*` binaries job's new Node step, which only a tag exercises.
 
@@ -461,12 +461,24 @@ Semantic conflicts the compiler found: two `MediaRecord` test initializers witho
 |---|---|---|
 | `config-structured-editors` | RFC 0020: a hidden secret inside a list entry is lost on save (server side, track 15); a test that the web's schema fixture equals `schema_for!(Config)` (track 13), which would have caught the drift above; never run against a real server | 2b |
 | `bootstrap-only-config` | Docs sweep (README, chart comments, `docs/bridges`, regenerate `docs/config.md` with `cargo run -p hs-config --bin gen_config_docs`); the web shows the per-setting `bootstrap` flag and `listeners` as a bootstrap section; PostgreSQL not exercised | 2c |
-| `registration-tokens-server-notices` | `e2e-real` Playwright spec for Settings; Complement `TestServerNotices` (laptop); notices to everyone or to a room | 2d |
-| `reports-tasks-stats` | **The Reports, Tasks and Statistics pages and the Overview sparklines are not built**; their operations are real | 2a |
+| `registration-tokens-server-notices` | `e2e-real` Playwright spec for Settings; Complement `TestServerNotices` (desktop); notices to everyone or to a room | 2d |
+| `reports-tasks-stats` | The Reports, Tasks and Statistics pages and the Overview sparklines (built by `admin-web-pages`, merged in the second round below) | 2a |
 | `media-admin` | `rooms.media.*`, `users.media.*`; paging the media listing; bulk operations on `state.tasks.spawn` (see above); RFC 0004 against the document on moderator read scope | 2e, 2g |
 | `federation-membership` | `createRoom`'s `invite` list for remote users; a reject fallback when no resident server helps; neutral error text; restricted joins; Complement | 3 |
 | `federation-edus` | To-device over federation; `m.signing_key_update`; in cluster mode, EDUs only through the owning replica. Its unrun `clippy`/`test -p hs-cli` are now run and green | 3 |
 | `two-pod-cluster` | Nothing installed: the verification cluster's etcd is slow (owner). `deploy/two-pod/verify.py` and `failover.py` are written but not run; the SeaweedFS fix in `my-infra/.../apps/myelin-cluster/s3.yaml` is not applied and that directory is not committed; `storage.postgres.sslMode` is ignored (the server connects `NoTls`). Resume steps at the top of `docs/status/03-cluster.md` | 6 |
+
+**Second round (2026-09-28): two more branches.** `agent/admin-web-pages` (the Reports,
+Tasks and Statistics pages, the Overview sparklines, `TimeseriesChart`) and
+`agent/federation-membership-2` (remote invites from `createRoom`, restricted joins over
+federation, the local reject fallback, neutral error text) were merged the same way.
+The web merge conflicted in `routes.tsx`, `test/setup.ts`, `lib/format.test.ts` and status 16,
+and both branches had added a `formatBytes`, one decimal and one binary. The binary one is
+kept, and the Media page (its sizes and its bulk-delete size floor) now uses MiB. The mock's
+bulk media deletions record their task, as the server does since the first round. The
+federation merge had no textual conflicts and compiled as it was. The gate after both merges:
+fmt and clippy clean; `cargo test --workspace --all-targets` 78 binaries, 2101 passed, 0 failed; doc tests 3 passed; `npm run check` 41
+files and 320 tests; `npm run test:e2e` 38/38.
 
 **On the cluster** (`admin@dacrib0`), unchanged: namespace `myelin-cluster` holds five
 Secrets, a bound `s3` PVC, and a crash-looping SeaweedFS pod and bucket Job (wrong flag;
@@ -475,27 +487,27 @@ harmless). The database is the CNPG `Database` `dacrib/myelin-cluster` on the sh
 is untouched. The cluster's etcd slowness predates this work and needs the owner's attention
 before the two-pod run.
 
-**Toolchain on the laptop.** The laptop's `~/.rustup` held only a minimal stable 1.93.0 (no
-`rustup` binary, no rustfmt or clippy), which cannot build `matrix-sdk` 0.19. This merge ran on
-a stable 1.98.1 installed with rustfmt and clippy into a throwaway `RUSTUP_HOME`/`CARGO_HOME`,
-and Playwright's chromium was also installed into a throwaway path. A laptop session needs a
-real `rustup` install first.
+**Toolchain on the desktop.** The owner's desktop has a `rustup` install (stable 1.98.1 with
+rustfmt and clippy, in `~/.rustup` and `~/.cargo`, sourced from `~/.cargo/env`); the workspace
+needs 1.96 or later for `matrix-sdk` 0.19. Playwright's chromium is not in its default cache:
+run `npx playwright install chromium` in `web/` once before `npm run test:e2e`.
 
 **Carried over from 2026-09-27's cloud session** (still true): with several agents building into
 one shared `target/`, cargo links whichever worktree's copy of a crate was built last, and four
 parallel builds fill a 250 GB disk; this round gave each worktree its own target with
-`CARGO_PROFILE_DEV_DEBUG=0` and deleted test executables at the end, and still ran the laptop
-short. An agent's branch is pushed the moment it has a commit worth keeping.
+`CARGO_PROFILE_DEV_DEBUG=0` and deleted test executables at the end, and still ran the
+owner's machine short. An agent's branch is pushed the moment it has a commit worth keeping.
 
 **Where sessions run now.** The owner works from cloud sessions (Claude Code on the web) as
-well as the laptop. A cloud session has the repository, a Rust toolchain that builds the
+well as the desktop. The desktop has Rust, Node and a `kubectl` context for the verification
+cluster (`admin@dacrib0`). A cloud session has the repository, a Rust toolchain that builds the
 workspace, Node, four cores, outbound HTTPS through a proxy, and root with `apt-get` (a
 PostgreSQL 16 server installs in a minute, so two processes on one database is doable); it
 has **no Docker daemon, no kind, no `kubectl` context for the verification cluster and no
 access to the demo**. So from a cloud session: everything that is a test against the real
 binary, two processes on one PostgreSQL, two in-process servers, or a chart render is doable;
 everything that says "on the cluster", "in a browser against the real binary", Complement, or
-a real bridge is not, and is left for a session on the laptop. Items below say which they
+a real bridge is not, and is left for a session on the desktop. Items below say which they
 are.
 
 ## What to do next, in order
@@ -507,7 +519,7 @@ end to end. "Demonstrable" means: install with one value, add a second replica a
 carry load, offer a bridge and get one by messaging its bot, administer everything from the
 web interface with no page reading from a 501, and talk to another homeserver. The queue below
 is ordered by that; each item says whether a cloud session can do it (no cluster, no Docker)
-or a laptop session must.
+or a desktop session must.
 
 **And a second rule, also 2026-09-27 (decision 0010): the admin API and the web interface are
 how this server is administered.** No operator edits a configuration file or a YAML file to
@@ -521,7 +533,7 @@ edit one is not. New settings and operations arrive with their interface control
 1. ~~RFC 0017 end to end against the real binary.~~ **Done 2026-09-27** (see "And then it
    was run" in the state of things): offering, instance state machine, front door, files,
    the Playwright suite against the real server, and a real heisenbridge from pip reaching
-   `ready`. Left for the laptop: the `cluster` runtime with the operator, and the demo.
+   `ready`. Left for the desktop: the `cluster` runtime with the operator, and the demo.
 2. The admin API's empty areas, each with its interface page reading real data:
    ~~RegistrationTokens 0/5~~ **5/5, 2026-09-27**, with invite-by-link user creation (a token
    registers somebody while open registration is off; Settings > Registration tokens, and the
@@ -535,9 +547,14 @@ edit one is not. New settings and operations arrive with their interface control
    textarea becomes structured editors, and `appservices.registration_files` becomes an
    importer-only migration path.~~ **Done 2026-09-27** (`config-structured-editors`,
    `bootstrap-only-config`). What the merge of 2026-09-28 left, in order:
-   - **2a.** The Reports, Tasks and Statistics pages, and the Overview sparklines, on their
-     real operations (`reports.*`, `tasks.*`, `statistics.*`). Nothing an operator can see
-     uses them yet.
+   - ~~**2a.** The Reports, Tasks and Statistics pages, and the Overview sparklines~~
+     **Done 2026-09-28, mock-tested only** (`agent/admin-web-pages`, merged): 41 Vitest files
+     and 38 Playwright flows are green on MSW. Left: an `e2e-real` run of the three pages
+     against `hs serve` (the real `Report.event.content` shape, a replay task's `resource`);
+     the reported user's other reports on a report page, which needs a contract change from
+     track 15 (**`GET /reports` filtered by `reported_user_id` / `reporter_id`**); acting
+     straight from a report (suspend is 501, redaction has no admin operation);
+     `report.created`/`task.changed` over SSE instead of polling.
    - **2b.** `media.scanning.icap.preview` gets a real control: `config-model.ts` learns
      externally tagged enums (a unit-or-`{bytes: N}` choice), or `PreviewMode` is reshaped
      (track 13's call, since it changes the file format). Then regenerate
@@ -548,7 +565,7 @@ edit one is not. New settings and operations arrive with their interface control
      `docs/config.md`); the Configuration page shows the per-setting `bootstrap` flag and
      `listeners` as a bootstrap section; exercise the bootstrap split on PostgreSQL.
    - **2d.** An `e2e-real` Playwright spec for Settings (tokens, invite link, notices);
-     server notices to everyone or to a room; `TestServerNotices` under Complement (laptop).
+     server notices to everyone or to a room; `TestServerNotices` under Complement (desktop).
    - **2e.** `rooms.media.*`, `users.media.*`, paging the media listing; settle RFC 0004
      against the document on moderator read scope.
    - **2f.** Cluster 1/6, then the long tails of Users 14/41 and Rooms 6/23.
@@ -557,15 +574,23 @@ edit one is not. New settings and operations arrive with their interface control
      answer. Today they run inline and are recorded as finished tasks.
 3. Federation completeness: ~~invites, leaves and knocks over federation; EDUs (typing,
    receipts, presence, device lists)~~ **done 2026-09-27** (`federation-membership`,
-   `federation-edus`, two in-process servers each). Left: restricted joins (ten Complement
-   tests); `createRoom`'s `invite` list for remote users; a reject fallback when no resident
-   server helps; neutral error text; to-device over federation; `m.signing_key_update`; EDUs in
-   cluster mode only through the owning replica. Complement itself is a laptop item.
+   `federation-edus`); ~~`createRoom`'s `invite` list for remote users, restricted joins over
+   federation, a local reject fallback when no resident helps, neutral error text~~ **done
+   2026-09-28** (`federation-membership-2`, six two-server tests in
+   `crates/hs-cli/tests/federation_membership.rs`). Left, in order
+   (`docs/status/06-federation.md`): a local user's join to a restricted room on its own
+   server still needs the client to name an authoriser (`hs_room::actor::membership_action`
+   should pick one as `make_join` does); when every resident refuses with
+   `M_UNABLE_TO_AUTHORISE_JOIN`, fall back to the allowed rooms' servers; the invite and knock
+   stripped state kept in `unsigned` shows in the invitee's timeline rendering; to-device over
+   federation; `m.signing_key_update`; EDUs in cluster mode only through the owning replica;
+   and Complement (`TestRestrictedRoomsRemoteJoin*`, `TestFederationRoomsInvite`,
+   `TestKnocking`, `TestFederationRejectInvite`), a desktop item.
 4. ~~Receipts and presence durable across a restart~~ **done 2026-09-27** (`federation-edus`);
    `/search`.
 5. The operator's `Homeserver` reconciler (unit tests and `helm template` here; the cluster run
-   is a laptop item), and the `Bridge` reconciler's first cluster run (laptop).
-6. Then the cluster items below that need the cluster (laptop): two pods with real traffic
+   is a desktop item), and the `Bridge` reconciler's first cluster run (desktop).
+6. Then the cluster items below that need the cluster (desktop): two pods with real traffic
    (`deploy/two-pod/verify.py` and `failover.py`, written and not yet run; resume steps at the
    top of `docs/status/03-cluster.md`; the cluster's etcd first), the demo's offering, the
    rolling update. Also make `storage.postgres.sslMode` real (the server connects `NoTls`).
@@ -617,7 +642,7 @@ would do it; each ends in a transcript in `docs/status/12-platform-and-kubernete
   `/createRoom`, concurrent sends through both and identical `/messages` on both. Not done:
   the chart's cluster templates were written without `helm` here and have not been rendered;
   `deploy/helm/hs/values-two-replica-experiment.yaml` is the values file for the two-pod run
-  (laptop), with the exact commands for its four Secrets. The outbound federation sender and
+  (desktop), with the exact commands for its four Secrets. The outbound federation sender and
   the appservice pump are shard-gated in a unit test with scripted ownership only.
   ~~And the one that matters most to a client: `/sync` is not cluster-aware.~~
   **Done 2026-09-27** (track 05, `docs/status/05-sync.md` session 7): a `/sync` may reach any
@@ -646,7 +671,7 @@ would do it; each ends in a transcript in `docs/status/12-platform-and-kubernete
   against one replica, then two, then three, on the same PostgreSQL: connected users and
   active rooms at a fixed sync p99. Every number in `PLAN.md` section 13 is a target; this is
   the first fact.
-- **A rolling update that drops nothing** (laptop; after completeness). With two replicas under a loadgen client,
+- **A rolling update that drops nothing** (desktop; after completeness). With two replicas under a loadgen client,
   `kubectl rollout restart` and count failed requests; the target is zero. Readiness is
   withdrawn first now and the drain hands shards off, but nobody has measured it. A `preStop`
   sleep for endpoint propagation (Kubernetes 1.30+ has a native `sleep` action, which matters
@@ -654,7 +679,7 @@ would do it; each ends in a transcript in `docs/status/12-platform-and-kubernete
 - **The operator creates something -- `Bridge` half built, `Homeserver` not started.** Since
   2026-09-26 the operator reconciles a `Bridge` into a claim, a Deployment and a Service (see
   "Bridges are offerings" in the state of things), in unit tests and `helm template` only.
-  The next step, in order (laptop): `kind create cluster`, `helm install` the chart (the
+  The next step, in order (desktop): `kind create cluster`, `helm install` the chart (the
   operator comes with it), `kubectl apply` a hand-written `Bridge` for heisenbridge (no
   external account needed) and watch it reach `Ready` with the transcript in
   `docs/status/12-platform-and-kubernetes.md`; then offer heisenbridge from the interface
@@ -973,14 +998,14 @@ Full detail, by owning track, at the top of `docs/status/14-test-and-conformance
 | The release binaries job's web build has never run | `.github` | it only runs on a `v*` tag; the image path is verified, this one is not |
 | The `main` chart needs `--devel`, and a first tag hides it until Chart.yaml's version moves on | `.github`, `deploy/helm` | pre-releases sort below the release they precede; bump `version` in Chart.yaml right after tagging |
 | An install from a chart before 2026-09-26's label fix cannot be upgraded in place | `deploy/helm` | one `kubectl delete statefulset --cascade=orphan` before the next `helm upgrade`; only the demo existed |
-| Cluster mode between two pods has not been tried | `deploy/helm`, laptop | `deploy/helm/hs/values-two-replica-experiment.yaml` is the values file; the chart's cluster templates were written without `helm` available and have not been rendered |
+| Cluster mode between two pods has not been tried | `deploy/helm`, desktop | `deploy/helm/hs/values-two-replica-experiment.yaml` is the values file; the chart's cluster templates were written without `helm` available and have not been rendered |
 | A room alias in `/join/{alias}` is not shard-gated | `hs-cli` | the alias resolves inside the handler; ids in `/join/{roomId}`, `/knock/{roomId}` and `/rooms/{roomId}/...` are gated |
 | A v12 room's id cannot be pre-assigned | `hs-room` | the id derives from the create event's hash; RFC 0019 describes the retry the handler should do and it is not implemented |
 | Per-replica settings are seeded into the shared database | `hs-config`, `hs-cli` | the second replica to seed loses; `listeners` and `cluster.mesh.port` then apply to both on restart; `hs config unset /listeners/listeners` and `/cluster/mesh/port` is the workaround; cluster mode needs per-replica sections excluded from seeding |
 | A non-owner replica reloads a whole room per event to answer `/sync` | `hs-user`, `hs-room` | correct, and 25 ms for a small room; RFC 0018 asks `hs-room` for an incremental catch-up |
 | Typing, receipts and presence do not cross replicas | `hs-user` | each replica's memory; a user on replica B does not see typing from a user on A |
 | The operator has never run against an API server | `hs-operator` | the `Bridge` reconciler (claim, Deployment, Service, status) is unit-tested only; `Homeserver` reconciles to a status only; the chart is the only way to deploy the server |
-| RFC 0017's `cluster` runtime has never run | `hs-bridges`, `hs-operator`, laptop | the `elsewhere` runtime, the front doors and a real heisenbridge are verified against the real binary; `deploying` through the operator needs a Kubernetes API server |
+| RFC 0017's `cluster` runtime has never run | `hs-bridges`, `hs-operator`, desktop | the `elsewhere` runtime, the front doors and a real heisenbridge are verified against the real binary; `deploying` through the operator needs a Kubernetes API server |
 | `/sync` can repeat an event across two consecutive incremental batches | `hs-user` | an event that arrives while the earlier batch is being assembled appears in it and in the next one (seen with appservice-sent notices, 2026-09-27); clients dedupe by event id, and the bridge test does too |
 | The demo still runs a shared WhatsApp registration | demo | RFC 0017 section 6 says an offering replaces it; not done |
 | The bridge manager runs on one replica only | `hs-cli` | gated to the owner of the global shard, so a handoff pauses provisioning for a tick; never watched on a cluster |
