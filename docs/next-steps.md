@@ -451,6 +451,10 @@ configuration history and revert (`ConfigStore` already records the patch per re
 - 18:15 started `agent/config-reload` (background agent, own worktree): rate limits, then the
   federation policy, then the log filter re-read on a configuration change without a restart,
   so `config.reload` and a save say truthfully what took effect.
+- 18:45 `agent/admin-followups` rebased onto `main` (`b9dcc82`): per-crate, web (49/49) and
+  `e2e-real` (9/9) green; it also fixed a real race (a task's final `task.changed` arriving
+  before the `202` that started it left a finished redaction at "0 of 2"; `web/src/api/task-cache.ts`
+  keeps whichever state is further along). In the merge queue now.
 
 ## Handover (2026-09-28, 16:00 EDT): where the nine resumed agents stopped
 
