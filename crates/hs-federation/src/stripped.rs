@@ -24,6 +24,12 @@ pub const STRIPPED_STATE_TYPES: &[&str] = &[
     "m.room.encryption",
 ];
 
+/// The most stripped state events kept from what another server hands over. Stripped state
+/// describes a room in a handful of events ([`STRIPPED_STATE_TYPES`] and a member or two); a list
+/// longer than this is cut here rather than stored with the invite or knock and served to a
+/// client.
+pub const MAX_RECEIVED_STRIPPED_STATE: usize = 64;
+
 /// One event as a stripped state event: its four allowed properties, nothing else.
 #[must_use]
 pub fn strip(event: &Value) -> Value {
@@ -63,7 +69,8 @@ pub fn stripped_state<'a>(
 /// Keeps only the entries of a stripped-state list received from another server that are
 /// shaped like stripped state events (an object with a string `type`, a string `state_key` and
 /// an object `content`), reduced to the four allowed properties. What a remote server hands over
-/// is shown to a local user's client as it is, so it is not trusted to be anything more.
+/// is shown to a local user's client as it is, so it is not trusted to be anything more, and at
+/// most [`MAX_RECEIVED_STRIPPED_STATE`] entries are kept.
 #[must_use]
 pub fn sanitize_received(received: &[Value]) -> Vec<Value> {
     received
@@ -73,6 +80,7 @@ pub fn sanitize_received(received: &[Value]) -> Vec<Value> {
                 && event.get("state_key").is_some_and(Value::is_string)
                 && event.get("content").is_some_and(Value::is_object)
         })
+        .take(MAX_RECEIVED_STRIPPED_STATE)
         .map(strip)
         .collect()
 }
@@ -114,5 +122,16 @@ mod tests {
         let kept = sanitize_received(&received);
         assert_eq!(kept.len(), 1);
         assert!(kept[0].get("extra").is_none());
+    }
+
+    #[test]
+    fn at_most_a_bounded_number_of_received_entries_are_kept() {
+        let received: Vec<Value> = (0..1000)
+            .map(|i| json!({"type": "m.room.name", "state_key": format!("{i}"), "content": {}}))
+            .collect();
+        assert_eq!(
+            sanitize_received(&received).len(),
+            MAX_RECEIVED_STRIPPED_STATE
+        );
     }
 }
