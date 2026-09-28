@@ -1,6 +1,6 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-09-28. `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-09-28 (afternoon handover). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
@@ -407,6 +407,68 @@ percentage, is what stands between this and a server somebody else would run.
 What is *not* in those percentages, and should temper them: no security review, no load testing
 beyond a loadgen harness, `cargo fuzz` never run, Sytest never run, and no bridge has yet
 carried a message through an encrypted room. Each of those has historically found things.
+
+## Handover (2026-09-28, 16:00 EDT): where the nine resumed agents stopped
+
+The owner stopped the session at 93% of weekly usage. The nine agents cut off by the usage limit
+the night before were resumed in their worktrees (`.claude/worktrees/agent-*`), and the rule
+"everything that works is merged" was applied.
+
+**Merged into `main` this afternoon:** Users devices and identity (`e72ef73`, `8cc6b92`, which
+also raises `hs-loadgen`'s boot deadline to 120 s); the Configuration follow-ups 2b/2c (ICAP
+preview size, a hidden secret in a list entry, the bootstrap flag: `bed8c49`); the operator's
+`Homeserver` reconciler (`e0e6d0e`, `c0bc875`; never run against a real API server).
+
+**Finished, pushed to origin, not merged: the next session's first job.** Each needs the merge
+procedure below and nothing else unless its gate fails:
+
+| Branch | What | Gate state |
+|---|---|---|
+| `agent/two-pod-cluster-2` | Handoff waits instead of 503; `hs_cluster_*` on `/metrics`; **an ownership bug fixed** (a slow convergence outlived the lease and held shards were never checked against the store, so up to 69 of 137 shards stayed ownerless; `crates/hs-cluster/tests/slow_store.rs`) | `hs-cluster` green; the two-replica test passed 10/10 on PostgreSQL 17; full gate not run on the final rebase. **Run it with `HS_CLUSTER_TEST_POSTGRES_DSN` set** or `cluster_admin` prints SKIP and passes |
+| `agent/federation-media` | Known gap closed: remote avatars and attachments over signed federation media, legacy fallback, our media served to peers | fmt, clippy green; `federation_media` 3/3 with two real servers; full gate not run on the final rebase |
+| `agent/user-moderation` | Users 41/41: suspend, shadow-ban, rate limit, login-as, redact, media, sessions (decision 0013) | `cargo test --workspace` 2174/0 on the final rebase; clippy, `npm run check`, `npm run test:e2e` still to run |
+| `agent/rooms-admin` | Rooms 23/23: state, messages, events, aliases, hierarchy, admin join, extremities, media and quarantine, purge and delete as tasks | fmt, clippy green; workspace tests 789/2 (two `e2e.rs` restart tests timed out at load 30-50, pass alone); web checks and `e2e-real/room-page` green |
+| `agent/admin-followups` | Reports filters and `report.created` over SSE, pages listen instead of polling; bulk media deletions as cancellable tasks; Federation 7/7; three bugs from a real-server Playwright run | fmt, clippy, `hs-admin` 237, `test:e2e` 41/41 green; full workspace tests not run since the rebase; `UserIdentity.test.tsx` "renames a device" needs one isolated rerun |
+
+Two more agents were told to stop, commit and push: federation leftovers (restricted joins, knock 403,
+EDUs through the owning replica) and the `/` redirect (see below). Their branches are the
+`agent/*` names on origin that are not in the table; their status files say where each stopped.
+`git branch -r --no-merged origin/main` is the checklist.
+
+**The merge procedure** (parallel agents, one merge at a time): take the lock with
+`mkdir .git/myelin-merge.lock` (in the main checkout's `.git`), `git fetch && git rebase
+origin/main`, run fmt, clippy, `cargo test --workspace --all-targets` (and the web checks if
+`web/` changed), `git push origin HEAD:main`, `rmdir` the lock even on failure, delete the
+origin branch. Two lessons: an agent waiting on the lock is sent back by the harness after a
+while, so the coordinator should run the queue itself; and seven agents running the full gate
+at once made each take 40+ minutes, so the full gate runs only under the lock.
+
+**The cluster.** `kubectl` and `helm` cannot reach `admin@dacrib0` from Claude Code on the
+desktop (macOS Local Network permission; Apple's `curl` can). The owner ran port-forwards
+(hs-0 on :18008 and :19090, hs-1 on :18009), and **`verify.py` passed every check against the
+two pods** on the running image (sha-982370b): rooms created on one pod and joined on the other,
+identical `/messages`, `/sync` woken across pods in 1.2-1.5 s, 200 KB media byte-for-byte. Sends
+took 0.4-3 s. Test users `valice`, `vbob` and admin `verify-ops` were registered (the old
+`alice`/`bob` passwords were lost; this image has no Synapse `reset_password` route); their
+passwords were in the session scratchpad only, so register new ones. Next, once
+`agent/two-pod-cluster-2` is on `main` and CD has built `sha-<commit>`: run `rolling.py` while
+the owner runs `helm --kube-context admin@dacrib0 upgrade hs deploy/helm/hs -n myelin-cluster -f
+deploy/two-pod/values-dacrib0.yaml --set image.tag=sha-<commit> --wait`, then `failover.py`
+while the owner deletes `pod/hs-1`. Target 0 failures.
+
+**The demo's `/` is a 404** (<https://myelin.dacrib.net/>): the ingress routes only `/_matrix`,
+`/.well-known/matrix`, `/admin`, `/api/v1` and `/_synapse`, and the server has no `/` handler,
+so the ingress controller answers. `/admin` works. The fix (`/` redirects to `/admin/`, the
+chart routes an exact `/`) is `agent/root-redirect`; rolling it out needs a `helm upgrade` from
+the owner's terminal.
+
+**New known gaps:** a debug build's cold boot takes 28-60 s under load because about 62 storage
+keyspaces are created one after another, each flushed; a clustered replica shutting down with
+no live peer waits out its whole drain deadline (18 s in the test).
+
+**Clean-up once merged:** the nine worktrees in `.claude/worktrees/` hold about 190 GB of
+`target/` (200 GB free at 14:30); `git worktree remove` each after its branch is on `main`,
+and stop the Docker containers `hs-merge-queue-pg`, `hs-mig-pg` and `hs-fed-edu-pg`.
 
 ## Merged (2026-09-28): the eight agent branches of 2026-09-27
 
