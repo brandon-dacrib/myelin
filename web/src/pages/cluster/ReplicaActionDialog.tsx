@@ -1,4 +1,5 @@
 import { useDrainReplica, useUndrainReplica, type Replica } from "@/api/cluster";
+import { ApiProblemError } from "@/api/problem";
 import { MutationError } from "@/components/MutationError";
 import { Button } from "@/components/ui/button/Button";
 import { Dialog, DialogClose, DialogContent } from "@/components/ui/dialog/Dialog";
@@ -85,17 +86,42 @@ export function ReplicaActionDialog({
             ) : (
               <UndrainConsequences replica={pending.replica} />
             )}
-            {mutation.isError && (
-              <MutationError
-                error={mutation.error}
-                action={pending.action === "drain" ? "drain it" : "undrain it"}
-              />
-            )}
+            {mutation.isError &&
+              (drainRefusal(mutation.error) ? (
+                <p
+                  role="alert"
+                  className="rounded-sm border border-danger-border bg-danger-bg p-3 text-sm"
+                >
+                  <span className="font-medium text-danger">Couldn&apos;t drain it.</span>{" "}
+                  <span className="text-text">{drainRefusal(mutation.error)}</span>
+                </p>
+              ) : (
+                <MutationError
+                  error={mutation.error}
+                  action={pending.action === "drain" ? "drain it" : "undrain it"}
+                />
+              ))}
           </div>
         </DialogContent>
       )}
     </Dialog>
   );
+}
+
+/**
+ * What a drain's 409 means, from the problem's machine-readable `reason` (the server's `detail`
+ * is prose, and is not parsed). `undefined` for any other failure, which `MutationError` shows.
+ */
+function drainRefusal(error: unknown): string | undefined {
+  if (!(error instanceof ApiProblemError) || error.problem.status !== 409) return undefined;
+  switch (error.problem.reason) {
+    case "single_node":
+      return "This server runs as a single node, so there is no other replica to take its shards.";
+    case "no_other_active_replica":
+      return "No other replica is active to take its shards. Start another replica, or undrain one, and try again.";
+    default:
+      return undefined;
+  }
 }
 
 function DrainConsequences({ replica, replicas }: { replica: Replica; replicas: Replica[] }) {

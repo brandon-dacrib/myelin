@@ -244,7 +244,11 @@ export function clusterSummary(): ClusterStatus {
 }
 
 export type ReplicaOutcome =
-  { replica: Replica } | { problem: "not-found" | "conflict"; detail: string };
+  | { replica: Replica }
+  | { problem: "not-found" | "conflict"; detail: string; reason?: DrainRefusal };
+
+/** The drain 409's machine-readable `reason`, as the server words it. */
+export type DrainRefusal = "single_node" | "no_other_active_replica";
 
 /** `POST /cluster/replicas/{id}/drain`, as the server answers it. */
 export function drainReplica(id: string, by = OPERATOR, now = Date.now()): ReplicaOutcome {
@@ -255,10 +259,18 @@ export function drainReplica(id: string, by = OPERATOR, now = Date.now()): Repli
     return { replica: wire(replica) };
   const takers = state.replicas.filter((r) => r.id !== id && r.status === "active");
   if (takers.length === 0) {
-    return {
-      problem: "conflict",
-      detail: `no other replica is active to take ${id}'s shards; start or undrain another replica first`,
-    };
+    return replica.role === "single-node"
+      ? {
+          problem: "conflict",
+          reason: "single_node",
+          detail:
+            "this server is not running as a cluster: there is no other replica to take its shards",
+        }
+      : {
+          problem: "conflict",
+          reason: "no_other_active_replica",
+          detail: `no other replica is active to take ${id}'s shards; start or undrain another replica first`,
+        };
   }
   const owned = state.shards.filter((s) => s.owner === id);
   const handoffs = owned.map((s, i) => ({

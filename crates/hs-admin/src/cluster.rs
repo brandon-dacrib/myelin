@@ -731,8 +731,35 @@ pub(crate) async fn replicas_get(
     }
 }
 
+/// `cluster.get`'s `replica_count`: every registered replica still heartbeating, whatever its
+/// status. A drained replica owns nothing but still serves (by forwarding), so it counts; one
+/// that stopped heartbeating does not.
+#[must_use]
+pub fn serving_replica_count(replicas: &[Replica]) -> u64 {
+    replicas
+        .iter()
+        .filter(|r| r.status != ReplicaStatus::Unreachable)
+        .count() as u64
+}
+
+/// The drain `409`'s machine-readable [`Problem::reason`]: `single_node` for the one replica of
+/// a server not running as a cluster.
+pub const DRAIN_REFUSED_SINGLE_NODE: &str = "single_node";
+/// The drain `409`'s [`Problem::reason`] when no other replica is active to take the shards.
+pub const DRAIN_REFUSED_NO_OTHER_ACTIVE: &str = "no_other_active_replica";
+
+/// Which of the two refusals a drain's `409` is, read from the replicas as they stand now (the
+/// source says why in prose; clients branch on this word instead of parsing it).
+async fn drain_refusal_reason(cluster: &dyn ClusterSource, id: &str) -> &'static str {
+    match cluster.replica(id).await {
+        Ok(Some(replica)) if replica.role == "single-node" => DRAIN_REFUSED_SINGLE_NODE,
+        _ => DRAIN_REFUSED_NO_OTHER_ACTIVE,
+    }
+}
+
 /// `POST /api/v1/cluster/replicas/{id}/drain` (`admin:write`): see the module docs. `200` with
-/// the replica, `draining` (or already `drained`); `409` when nothing would take its shards.
+/// the replica, `draining` (or already `drained`); `409` when nothing would take its shards,
+/// with `reason` [`DRAIN_REFUSED_SINGLE_NODE`] or [`DRAIN_REFUSED_NO_OTHER_ACTIVE`].
 pub(crate) async fn replicas_drain(
     State(state): State<AdminState>,
     headers: HeaderMap,
@@ -762,12 +789,16 @@ pub(crate) async fn replicas_drain(
         started,
     } = match cluster.drain(&id, &principal.id).await {
         Ok(outcome) => outcome,
-        Err(e) => {
-            if let SourceError::Conflict(detail) = &e {
-                tracing::info!(replica = %id, requested_by = %principal.id, %detail, "a drain was refused");
-            }
-            return source_error(e, &id, &instance);
+        Err(SourceError::Conflict(detail)) => {
+            let reason = drain_refusal_reason(cluster.as_ref(), &id).await;
+            tracing::info!(replica = %id, requested_by = %principal.id, %detail, reason, "a drain was refused");
+            return Problem::conflict()
+                .with_detail(detail)
+                .with_reason(reason)
+                .with_instance(instance)
+                .into_response();
         }
+        Err(e) => return source_error(e, &id, &instance),
     };
     if started {
         cluster.observe(DrainEvent::Requested {
@@ -1058,6 +1089,7 @@ mod tests {
                 .contains("not running as a cluster"),
             "{body}"
         );
+        assert_eq!(body["reason"], DRAIN_REFUSED_SINGLE_NODE, "{body}");
         let (status, body) = request(
             &state,
             "POST",
@@ -1070,6 +1102,49 @@ mod tests {
         assert_eq!(body["status"], "active");
         // Nothing changed, so nothing was recorded.
         assert!(entries(&audit).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cluster_get_counts_a_drained_replica_that_owns_nothing() {
+        let (state, _) = with(two_replicas());
+        // The overview counts the replicas that own a shard; after the drain that is one.
+        let state = state.with_overview(Arc::new(crate::sources::StaticOverviewSource {
+            statistics: crate::model::StatisticsOverview::default(),
+            cluster: crate::model::ClusterStatus {
+                mode: "cluster".into(),
+                epoch: None,
+                replica_count: Some(1),
+                shard_count: Some(4),
+            },
+        }));
+        let (status, body) = request(
+            &state,
+            "POST",
+            "/api/v1/cluster/replicas/hs-1/drain",
+            "admin",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let task = body["drain_task_id"].as_str().unwrap().to_owned();
+        wait_for_task(&state, &task, TaskStatus::Succeeded).await;
+        let (_, replica) =
+            request(&state, "GET", "/api/v1/cluster/replicas/hs-1", "read", None).await;
+        assert_eq!(replica["status"], "drained", "{replica}");
+
+        let (status, body) = request(&state, "GET", "/api/v1/cluster", "read", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["replica_count"], 2, "{body}");
+    }
+
+    #[test]
+    fn an_unreachable_replica_is_not_counted_as_serving() {
+        let mut gone = InMemoryCluster::replica("hs-2", false);
+        gone.status = ReplicaStatus::Unreachable;
+        let mut drained = InMemoryCluster::replica("hs-1", false);
+        drained.status = ReplicaStatus::Drained;
+        let replicas = [InMemoryCluster::replica("hs-0", true), drained, gone];
+        assert_eq!(serving_replica_count(&replicas), 2);
     }
 
     #[tokio::test]
@@ -1218,6 +1293,7 @@ mod tests {
                 .unwrap()
                 .contains("no other replica")
         );
+        assert_eq!(body["reason"], DRAIN_REFUSED_NO_OTHER_ACTIVE, "{body}");
 
         let (status, body) = request(
             &state,

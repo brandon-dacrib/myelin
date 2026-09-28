@@ -195,6 +195,34 @@ describe("Cluster", () => {
     expect(hs1.getByText("Active")).toBeInTheDocument();
   });
 
+  it("says what a refused drain means from its reason, not its detail", async () => {
+    server.use(
+      http.post("/api/v1/cluster/replicas/:id/drain", () =>
+        HttpResponse.json(
+          {
+            type: "urn:hs:problem:conflict",
+            title: "Conflict",
+            status: 409,
+            detail: "prose that the page must not need to parse",
+            reason: "no_other_active_replica",
+          },
+          { status: 409 },
+        ),
+      ),
+    );
+    const user = userEvent.setup();
+    open();
+    const hs1 = await replicaRow("hs-1");
+    await user.click(hs1.getByRole("button", { name: "Drain hs-1" }));
+    const dialog = within(await screen.findByRole("dialog"));
+    await user.click(dialog.getByRole("button", { name: "Drain replica" }));
+    const alert = await dialog.findByRole("alert");
+    expect(alert).toHaveTextContent(
+      "Couldn't drain it. No other replica is active to take its shards.",
+    );
+    expect(alert).not.toHaveTextContent("prose");
+  });
+
   it("offers no drain to a single node, and says why", async () => {
     singleNode();
     open();

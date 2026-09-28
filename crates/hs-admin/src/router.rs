@@ -943,7 +943,7 @@ async fn users_create(
                 Err(e) => return e.to_problem().with_instance(instance).into_response(),
             };
 
-            if let Err(resp) = record_mutation(
+            if let Err(resp) = record_mutation_with_status(
                 &state,
                 &principal,
                 "users.create",
@@ -951,6 +951,7 @@ async fn users_create(
                 ResourceRef::new("user", created.user_id.clone()),
                 Vec::new(),
                 json!({ "user_id": created.user_id }),
+                201,
             )
             .await
             {
@@ -1093,12 +1094,32 @@ pub(crate) async fn record_mutation(
     changes: Vec<AuditChange>,
     event_data: serde_json::Value,
 ) -> Result<(), Response> {
+    record_mutation_with_status(
+        state, principal, action, event_type, target, changes, event_data, 200,
+    )
+    .await
+}
+
+/// [`record_mutation`] for a mutation answered with something other than `200` (`201` for a
+/// creation, `202` for a task): the audit entry's `outcome.status` is the status the client is
+/// actually answered with.
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+pub(crate) async fn record_mutation_with_status(
+    state: &AdminState,
+    principal: &Principal,
+    action: &str,
+    event_type: &str,
+    target: ResourceRef,
+    changes: Vec<AuditChange>,
+    event_data: serde_json::Value,
+    status: u16,
+) -> Result<(), Response> {
     let actor = principal.to_actor();
     let mut entry = AuditEntry::new(
         action,
         actor.clone(),
         target.clone(),
-        AuditOutcome::success(200),
+        AuditOutcome::success(status),
     );
     entry.changes = changes;
     state
@@ -3155,7 +3176,7 @@ async fn appservices_create(
                 Ok(a) => a,
                 Err(e) => return e.to_problem().with_instance(instance).into_response(),
             };
-            if let Err(resp) = record_mutation(
+            if let Err(resp) = record_mutation_with_status(
                 &state,
                 &principal,
                 "appservices.create",
@@ -3163,6 +3184,7 @@ async fn appservices_create(
                 ResourceRef::new("appservice", created.id.clone()),
                 Vec::new(),
                 json!({ "id": created.id, "sender_localpart": created.sender_localpart }),
+                201,
             )
             .await
             {
@@ -4443,7 +4465,22 @@ async fn cluster_get(State(state): State<AdminState>, headers: HeaderMap) -> Res
                 return source_unavailable("cluster", instance);
             };
             match overview.cluster().await {
-                Ok(cluster) => axum::Json(cluster).into_response(),
+                Ok(mut cluster) => {
+                    // The overview counts replicas that own a shard, which leaves out a drained
+                    // one; the registry knows every replica that is still heartbeating.
+                    if let Some(source) = &state.cluster {
+                        match source.replicas().await {
+                            Ok(replicas) => {
+                                cluster.replica_count =
+                                    Some(crate::cluster::serving_replica_count(&replicas));
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "cluster.get: could not read the replica registry; answering the owners' count");
+                            }
+                        }
+                    }
+                    axum::Json(cluster).into_response()
+                }
                 Err(e) => e.to_problem().with_instance(instance).into_response(),
             }
         }

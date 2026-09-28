@@ -468,7 +468,7 @@ export interface paths {
         put?: never;
         /**
          * Drain a replica
-         * @description Asks the replica to hand every shard it owns to the other replicas, and answers it as `draining`. The request is recorded in the shared database, so it reaches the replica whichever replica received it, and it outlives a restart. A task (`drain_task_id`, action `cluster.replicas.drain`, resource `{type: replica, id}`) follows the drain and succeeds once the replica owns no shards. Draining a replica that is already draining or drained changes nothing. 409 when no other replica is active to take the shards, which includes a server not running as a cluster.
+         * @description Asks the replica to hand every shard it owns to the other replicas, and answers it as `draining`. The request is recorded in the shared database, so it reaches the replica whichever replica received it, and it outlives a restart. A task (`drain_task_id`, action `cluster.replicas.drain`, resource `{type: replica, id}`) follows the drain and succeeds once the replica owns no shards. Draining a replica that is already draining or drained changes nothing. 409 when no other replica is active to take the shards, which includes a server not running as a cluster; the problem's `reason` is `single_node` for the one replica of a server not running as a cluster and `no_other_active_replica` otherwise.
          */
         post: operations["cluster.replicas.drain"];
         delete?: never;
@@ -506,7 +506,7 @@ export interface paths {
         };
         /**
          * List shards
-         * @description Every shard of the layout in layout order (rooms, users, federation, appservices, then the global shard), or only those of `kind`, with the owner as the answering replica knows it.
+         * @description Every shard of the layout in layout order (rooms, users, federation, appservices, then the global shard), or only those of `kind`, with the owner as the answering replica knows it. Pages hold at most 500 shards (a larger `limit` is clamped to 500, the default is 50); the default layout has 641 shards (256 room, 256 user, 64 federation, 64 appservice and the global shard), so reading all of them takes two pages of 500.
          */
         get: operations["cluster.shards.list"];
         put?: never;
@@ -2636,6 +2636,7 @@ export interface components {
         ClusterStatus: {
             epoch?: number;
             mode?: string;
+            /** @description How many replicas are registered and heartbeating, whatever their status (joining, active, draining or drained; a replica that has stopped heartbeating is not counted). A drained replica is counted, because it is still serving by forwarding. Without the replica registry, the number of replicas owning a shard. 1 for a single node. */
             replica_count?: number;
             shard_count?: number;
         };
@@ -2891,6 +2892,8 @@ export interface components {
             errors?: components["schemas"]["ValidationError"][];
             /** Format: uri-reference */
             instance?: string;
+            /** @description A stable, machine-readable word saying which of several causes one problem type has, where a client should tell them apart (see the operation's description for the words it uses). `detail` stays prose for people; clients branch on `reason`. */
+            reason?: string;
             /** @description ULID; matches X-Request-Id and tracing spans. */
             request_id?: string;
             required_scope?: string;

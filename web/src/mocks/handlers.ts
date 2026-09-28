@@ -68,8 +68,7 @@ import {
   openReportCount,
   resolveReport,
 } from "./data/reports";
-import { cancelTask, getTask, listTasks, recordFinishedTask } from "./data/tasks";
-import { roomStatistics, sortStatistics, timeseries, userMediaStatistics } from "./data/statistics";
+import { cancelTask, getTask, listTasks, recordFinishedTask } from "./data/tasks";import { roomStatistics, sortStatistics, timeseries, userMediaStatistics } from "./data/statistics";
 import type { ReportResolve } from "@/api/reports";
 import { succeeded } from "@/lib/audit";
 import { users, userDevices, findUser } from "./data/users";
@@ -204,7 +203,7 @@ function problem(
   status: number,
   slug: string,
   title: string,
-  extra?: { detail?: string; errors?: { pointer: string; detail: string }[] },
+  extra?: { detail?: string; errors?: { pointer: string; detail: string }[]; reason?: string },
 ) {
   return HttpResponse.json({ type: `urn:hs:problem:${slug}`, title, status, ...extra }, { status });
 }
@@ -276,7 +275,6 @@ export const handlers = [
       operator: { name: "Operator", subject: "@ops:example.org" },
     });
   }),
-
   // ---- First-run setup ----
   // Closed by default, like a server that already has its administrator, so every other flow is
   // unaffected. A test opens it by putting a token in `sessionStorage` before the app loads
@@ -1864,7 +1862,7 @@ function replicaAnswer(outcome: ReplicaOutcome) {
   if ("replica" in outcome) return HttpResponse.json(outcome.replica);
   return outcome.problem === "not-found"
     ? problem(404, "not-found", "Not found", { detail: outcome.detail })
-    : problem(409, "conflict", "Conflict", { detail: outcome.detail });
+    : problem(409, "conflict", "Conflict", { detail: outcome.detail, reason: outcome.reason });
 }
 
 /** A migration control's answer: the new status, the status unchanged, or the refusal. */

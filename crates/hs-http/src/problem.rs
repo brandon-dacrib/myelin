@@ -44,6 +44,11 @@ pub struct Problem {
     pub retry_after_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub required_scope: Option<String>,
+    /// Why, as a stable machine-readable word, when one problem type covers several causes a
+    /// client should tell apart (a `409 conflict` refusing a drain says `single_node` or
+    /// `no_other_active_replica`). `detail` stays prose for people; clients branch on this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// Headers to add to the HTTP response (`WWW-Authenticate`, `Retry-After`, `Allow`), beyond
     /// `Content-Type`. Not part of the JSON body; skipped by serde via a custom impl below is
     /// unnecessary since this field is never serialized (see `#[serde(skip)]`).
@@ -73,8 +78,16 @@ impl Problem {
             errors: Vec::new(),
             retry_after_ms: None,
             required_scope: None,
+            reason: None,
             extra_headers: Vec::new(),
         }
+    }
+
+    /// Sets [`Problem::reason`].
+    #[must_use]
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
     }
 
     problem_kind!(

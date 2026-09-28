@@ -191,6 +191,13 @@ async fn a_created_token_is_listed_read_changed_and_deleted_and_each_change_is_a
         .find(|e| e.action == "registration_tokens.update")
         .unwrap();
     assert_eq!(update.changes.len(), 2);
+    // The audit entry records the status the client was answered with: a creation is `201`.
+    let create = entries
+        .iter()
+        .find(|e| e.action == "registration_tokens.create")
+        .unwrap();
+    assert_eq!(create.outcome.status, 201);
+    assert_eq!(update.outcome.status, 200);
 }
 
 #[tokio::test]
@@ -371,6 +378,13 @@ async fn a_sent_notice_is_listed_audited_and_idempotent() {
             .filter(|e| e.action == "server_notices.send")
             .count(),
         1
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .find(|e| e.action == "server_notices.send")
+            .map(|e| e.outcome.status),
+        Some(201)
     );
 }
 

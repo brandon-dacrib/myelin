@@ -19,8 +19,8 @@ use crate::auth::{ScopeDecision, require_scope};
 use crate::idempotency::{Replay, StoredResponse};
 use crate::model::{Page, ResourceRef, Scope};
 use crate::router::{
-    AdminState, authorization_header, idempotency_key, record_mutation, replay_response,
-    source_unavailable,
+    AdminState, authorization_header, idempotency_key, record_mutation_with_status,
+    replay_response, source_unavailable,
 };
 use crate::sources::SourceError;
 
@@ -206,7 +206,7 @@ pub(crate) async fn send(
         Ok(n) => n,
         Err(e) => return e.to_problem().with_instance(instance).into_response(),
     };
-    if let Err(resp) = record_mutation(
+    if let Err(resp) = record_mutation_with_status(
         &state,
         &principal,
         "server_notices.send",
@@ -218,6 +218,7 @@ pub(crate) async fn send(
             "recipients": sent.recipients,
             "event_ids": sent.event_ids,
         }),
+        201,
     )
     .await
     {

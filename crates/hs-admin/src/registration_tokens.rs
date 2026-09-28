@@ -21,8 +21,8 @@ use crate::auth::{ScopeDecision, require_scope};
 use crate::idempotency::{Replay, StoredResponse};
 use crate::model::{AuditChange, Page, ResourceRef, Scope};
 use crate::router::{
-    AdminState, authorization_header, idempotency_key, record_mutation, replay_response,
-    source_unavailable,
+    AdminState, authorization_header, idempotency_key, record_mutation,
+    record_mutation_with_status, replay_response, source_unavailable,
 };
 use crate::sources::SourceError;
 
@@ -416,7 +416,7 @@ pub(crate) async fn create(
         Ok(t) => t,
         Err(e) => return e.to_problem().with_instance(instance).into_response(),
     };
-    if let Err(resp) = record_mutation(
+    if let Err(resp) = record_mutation_with_status(
         &state,
         &principal,
         "registration_tokens.create",
@@ -435,6 +435,7 @@ pub(crate) async fn create(
             },
         ],
         json!({ "token": created.token }),
+        201,
     )
     .await
     {
