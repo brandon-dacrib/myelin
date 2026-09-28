@@ -22,3 +22,12 @@ Add focused tests with behavior changes. Rust crate tests and integration tests 
 ## Commit & Pull Request Guidelines
 
 Recent commits use short, descriptive sentences about the behavior or bug, without a fixed prefix (for example, “A client's own join is in its very next /sync, every time”). Keep commits focused. Pull requests should explain the change, link relevant issues or RFCs, list checks run, and include screenshots for visible web UI changes. Call out API or cross-crate interface changes and update the relevant decision or status document.
+
+Work does not stay in branches. When a piece of work is done, it is merged into `main` and `main` is pushed; the branch is then deleted, locally and on origin. Done means all of these are true:
+
+- **It works.** Verified against the real `hs` binary, or on the cluster for cluster work, not only against mocks or unit seams.
+- **It has docs.** The track's `docs/status/` file and `docs/next-steps.md` say what changed and what is left, and public items have doc comments.
+- **It is observable.** New behavior has logs, metrics or traces where an operator would need them.
+- **Its tests pass.** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace --all-targets` for Rust changes; `npm run check` and `npm run test:e2e` for `web/` changes.
+
+Before merging, rebase onto (or merge) the latest `origin/main` and run the checks again. When several agents work in parallel they merge one at a time. Work that is not done is reported as not done, with what is left, and is never left quietly in a branch.
