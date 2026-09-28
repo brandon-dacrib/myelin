@@ -1,5 +1,140 @@
 # 12. Platform and Kubernetes
 
+## 2026-09-27, late (shared with docs/status/03-cluster.md): two pods on the owner's cluster -- where this stopped
+
+Branch `agent/two-pod-cluster`. The task was `docs/next-steps.md` item 1's "cluster mode with
+real traffic on a real cluster": two replicas as two pods on `dacrib0` (kubectl context
+`admin@dacrib0`, Talos v1.10.5, Kubernetes v1.33.2), namespace `myelin-cluster`, with a
+health gate on the control plane first. **The gate never passed, so nothing of Myelin was
+installed and no mesh traffic was run.** The session was moved to another machine at 00:11Z.
+Everything below is what to pick up.
+
+### etcd health observed (all times UTC, 2026-09-27/28)
+
+- 23:29:24-25: three `kubectl get --raw=/readyz/etcd` in a row, all `ok`.
+- 23:30:06 `ok`, then 23:30:08 and 23:30:10: `InternalError ... error getting data from etcd:
+  context deadline exceeded`. Nothing was applied from then on.
+- 23:31:01 to 00:10:36, one check every ~21 s (8 s request timeout): **111 checks, 75 `ok`, 36
+  failed**; the longest run of `ok` was 7 (about 2.5 minutes). The gate asked for 9 in a row.
+  The failures were spread evenly over the 40 minutes with no trend either way (three in a row
+  at 23:51:50-23:52:57 and at 23:52:34-23:53:20 was the worst patch).
+- `talosctl etcd status` at ~23:35: leader `ccdbd49478bd5649` (tp0n3, 192.168.115.176), raft
+  term 1314 (stable, no elections), DB 127 MB with 37% in use on all three members; black0n0's
+  member (192.168.115.221) had its applied index 32 entries behind the others.
+- `talosctl logs etcd`, last 3000 lines per member at ~23:31: black0n0 748 "apply request took
+  too long", 102 "waiting for ReadIndex response took too long", 16 "slow fdatasync" (1.2 s to
+  3.1 s against the 1 s expectation); tp0n3 459 slow applies and a slow fdatasync every few
+  minutes (1.0-1.6 s); tp0n1 the same pattern. At 23:41 black0n0 logged a slow fdatasync every
+  few seconds (1.98 s, 1.69 s, 1.21 s). **black0n0 is a VM (`/var` on `/dev/vda4`) and its
+  virtual disk's fsync latency is the likeliest cause**; it is one of the three control-plane
+  members, so every raft commit waits on it or on the slower of the other two.
+- Longhorn at 23:38: every volume `attached`/`healthy`, no engine rebuilding, so the I/O was
+  not a replica rebuild.
+- Not caused by this work: the lead saw the same symptoms at ~23:20, before this session, and
+  this session applied nothing to the cluster (only reads, and `talosctl` log/status reads).
+
+### State of `myelin-cluster` at 00:11Z (left exactly as found)
+
+| Resource | State |
+| --- | --- |
+| Secrets `hs-signing-key`, `hs-mesh-tls`, `hs-registration`, `hs-media-s3`, `postgres-credentials` | Present (made by the lead ~23:08), untouched |
+| PVC `s3` | `Bound`, 5Gi, `longhorn`, `pvc-ddddbbff-e7d8-4acf-8f1b-fa2ed798b71a` |
+| Deployment `s3` / pod `s3-56b7b47c78-brh2z` | 0/1, `CrashLoopBackOff`, 14 restarts. SeaweedFS 3.97 prints its usage and exits: `flag provided but not defined: -filer.defaultStoreDir`. Fixed in `s3.yaml` (below), **not applied** |
+| Job `s3-make-bucket` / pod `s3-make-bucket-x4xj5` | `Running` 0/1, `CrashLoopBackOff`, 13 restarts (nothing listening on `s3:9000`). `backoffLimit: 20`, so it will mark itself Failed; delete and re-apply it after the fix |
+| Service `s3` | ClusterIP 10.96.95.202:9000, no ready endpoints |
+| Helm release `hs`, StatefulSet, `hs-*` pods | **None.** Never installed |
+
+The two crash-looping pods restart on the kubelet's 5-minute backoff and were left running as
+instructed (harmless: a restart every five minutes, no volume churn).
+
+`dacrib/myelin-cluster` (CloudNativePG `Database`): cluster `postgres-cluster`, database
+`myelin_cluster`, owner `appuser`, `ensure: present`, **`databaseReclaimPolicy: delete`**
+(deleting the CR drops the database), status `applied: true`. Not touched; nothing has
+connected to it, so it is empty.
+
+### What was changed
+
+- `~/Documents/git/my-infra/talos-clusters/dacrib0/apps/myelin-cluster/s3.yaml`: removed
+  `-filer.defaultStoreDir=/data/filer` from the SeaweedFS args (3.97 has no such flag; `weed
+  server` keeps master and filer metadata under `-dir` already). Not applied, not committed.
+- Same directory, `README.md` (new): what the experiment is, the resources, the install and
+  resume steps, removal. Not committed (the owner commits that repository).
+- `deploy/helm/hs/values.yaml`: `storage.postgres.sslMode` is now documented as accepted and
+  not honoured. The chart never renders it and the server's PostgreSQL client is `NoTls`
+  (`crates/hs-kv/src/postgres_backend.rs`), so the database must accept plain `host`
+  connections. CloudNativePG's default `pg_hba` ends with `host all all all scram-sha-256`,
+  which does, unless `postgres-cluster`'s spec overrides it; if the pods log `no pg_hba.conf
+  entry ... no encryption`, this is why.
+- `deploy/two-pod/verify.py` and `deploy/two-pod/failover.py` (new, **not yet run against
+  pods**): the whole verification as two scripts against two port-forwards, so the next session
+  runs rather than writes it. `verify.py`: six rooms created through hs-0 (so both pods own
+  some), bob joins each through hs-1, concurrent sends through both, `/messages` identical on
+  both, a long-poll `/sync` on each pod woken by a write on the other (with the wake latency),
+  200 kB of media uploaded through hs-0 and compared byte-for-byte from hs-1. `failover.py`:
+  round-robin writes through hs-0 to all six rooms while hs-1 is deleted, one line per failed
+  or slow send and a per-5-second summary.
+
+### Found by reading, to watch for when it runs
+
+- `refuse_live_duplicate` (`crates/hs-cli/src/cluster.rs`) refuses to start when the registry
+  holds a row under this replica's identity whose heartbeat is younger than `lease_ttl`. A
+  graceful stop removes the row (`KvOwnership::drain` deregisters), so `kubectl delete pod
+  hs-1` should not trip it. A pod killed *ungracefully* (node loss, `--force`, OOM) and
+  restarted by the StatefulSet under the same name within 10 s will exit once with "another
+  replica is already live under this identity", then start on the kubelet's retry. Expected
+  cost: one restart. If it is more than one, that is a bug for track 03.
+- `POST /join/{roomId}` on a non-owner replica was refused 503 by the fence before RFC 0019;
+  `verify.py` uses `POST /rooms/{roomId}/join`. Worth one extra call through hs-1 to see
+  whether `/join/{roomId}` forwards now.
+
+### Resume, exactly
+
+From a checkout of this branch, with `INFRA=~/Documents/git/my-infra/talos-clusters/dacrib0/apps/myelin-cluster`:
+
+```bash
+# 0. Health gate: several in a row, a minute or two apart. Do not proceed on flapping.
+for i in 1 2 3 4 5 6; do kubectl --context admin@dacrib0 get --raw='/readyz/etcd'; echo; sleep 20; done
+talosctl -n 192.168.115.221 logs etcd --tail 200 | grep -c 'slow fdatasync'   # want ~0
+
+# 1. S3: apply the fixed Deployment, recreate the bucket Job, wait for both.
+kubectl apply -f $INFRA/s3.yaml
+kubectl -n myelin-cluster delete job s3-make-bucket
+kubectl apply -f $INFRA/s3.yaml
+kubectl -n myelin-cluster rollout status deploy/s3 --timeout=5m
+kubectl -n myelin-cluster wait --for=condition=complete job/s3-make-bucket --timeout=5m
+
+# 2. The two replicas (image pinned in values.yaml to sha-5b6cda96...; it exists on ghcr).
+helm upgrade --install hs deploy/helm/hs -n myelin-cluster -f $INFRA/values.yaml --wait --timeout 10m
+kubectl -n myelin-cluster get pods -o wide            # hs-0 and hs-1 Ready, on two nodes
+kubectl -n myelin-cluster logs hs-0 | grep -i mesh    # "mesh authentication is mutual TLS", replica=hs-0.hs-headless.myelin-cluster.svc.cluster.local:8449
+kubectl -n myelin-cluster logs hs-1 | grep -i mesh
+
+# 3. The replica registry lists both pods (a throwaway psql pod in the namespace).
+kubectl -n myelin-cluster run psql --rm -i --restart=Never --image=postgres:16-alpine \
+  --env PGPASSWORD="$(kubectl -n myelin-cluster get secret postgres-credentials -o jsonpath='{.data.password}' | base64 -d)" \
+  -- psql -h postgres-cluster-rw.dacrib.svc.cluster.local -U appuser myelin_cluster \
+  -c "select convert_from(k,'UTF8'), convert_from(v,'UTF8') from kv_cluster_replicas"
+
+# 4. Two users (passwords of your choosing; kept out of the transcript).
+SECRET="$(kubectl -n myelin-cluster get secret hs-registration -o jsonpath='{.data.registration-shared-secret}' | base64 -d)"
+kubectl -n myelin-cluster exec hs-0 -- hs register http://localhost:8008 -u alice -p "$ALICE_PW" -k "$SECRET"
+kubectl -n myelin-cluster exec hs-0 -- hs register http://localhost:8008 -u bob -p "$BOB_PW" -k "$SECRET"
+
+# 5. Traffic through each pod separately.
+kubectl -n myelin-cluster port-forward pod/hs-0 18008:8008 &
+kubectl -n myelin-cluster port-forward pod/hs-1 18009:8008 &
+python3 deploy/two-pod/verify.py "$ALICE_PW" "$BOB_PW"
+
+# 6. Failover mid-traffic, then hs-1's return.
+python3 deploy/two-pod/failover.py "$ALICE_PW" 90 & sleep 15
+kubectl -n myelin-cluster delete pod hs-1; wait
+kubectl -n myelin-cluster get pods; kubectl -n myelin-cluster logs hs-1 | grep -iE 'mesh|shard|live under'
+# re-open the hs-1 port-forward and run verify.py again: both pods serving after the return.
+```
+
+Then the transcript goes here and in `docs/status/12-platform-and-kubernetes.md`, and the
+experiment stays up for Element through a port-forward to the Service.
+
 ## The chart install is a CD gate (2026-09-26, evening)
 
 Until this session nothing installed the chart in CD. `cd.yml` booted the image with `docker

@@ -99,6 +99,11 @@ storage:
     port: 5432
     database: hs
     user: hs
+    ## Accepted for ess-helm compatibility and not yet honoured: the server's PostgreSQL client
+    ## connects without TLS (crates/hs-kv/src/postgres_backend.rs, `NoTls`), whatever this says,
+    ## so the database must accept plain `host` connections from the pods (CloudNativePG's
+    ## default `pg_hba` does). Found running two pods against a shared CloudNativePG cluster,
+    ## 2026-09-27.
     sslMode: prefer
     ## Either an inline value or a reference to an existing Secret key, exactly like
     ## ess-helm's `synapse.postgres.password` shape.
