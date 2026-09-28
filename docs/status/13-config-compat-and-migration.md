@@ -4,9 +4,85 @@ Track brief: `docs/workstreams/13-config-compat-and-migration.md`. Owner
 crates/files: `crates/hs-config`, `crates/hs-compat`,
 `tools/synapse_inventory.py`, `docs/synapse-inventory.md`.
 
-Last updated: 2026-09-19 (session 2 — catching up `hs-config`/`hs-compat` with day one's
+Last updated: 2026-09-27 (decision 0010: bootstrap-only settings, importer-only registration files; see "Where this stopped"). Before that: 2026-09-19 (session 2 — catching up `hs-config`/`hs-compat` with day one's
 shipped work: URL-preview config fields, the `serve_server_wellknown`/`federation_custom_ca_list`/
 `max_spider_size` translation-table corrections, and a first slice of `/_synapse/admin` routes).
+
+## Where this stopped (2026-09-27, branch `agent/bootstrap-only-config`, decision 0010 server side)
+
+**Done and verified** (commands below all passed on this branch):
+
+1. **Bootstrap vs. administered, explicit in code.** `crates/hs-config/src/bootstrap.rs` defines
+   the bootstrap set (`BOOTSTRAP_SETTINGS`, each with a `BootstrapReason`): `/storage`,
+   `/listeners`, `/server/server_name`, `/server/signing_key_path`, `/cluster/single_node`,
+   `/cluster/mesh` (port, advertise_address, tls, shared secret), `/appservices/registration_files`.
+   Everything else is administered. `ConfigStore::seed` strips them (the server name is kept as
+   the store's identity, `ConfigMeta::server_name`, not as a setting); `patch_section` refuses
+   them (`StoreError::BootstrapSetting` / `BootstrapSection`, whose message names `HS__` and the
+   bootstrap file); `Layers` ignores any in the database layer; `ConfigStore::purge_bootstrap`
+   removes them from a pre-0010 store with a history entry per section (actor `PURGE_ACTOR`) and
+   `hs serve`'s boot runs it and reports what it removed. `BOOTSTRAP_SECTIONS` is now
+   `storage` and `listeners`. The admin API refuses them in `config.update` (409) and
+   `config.validate` (invalid), and `GET /config/schema` marks each one `editable: false,
+   bootstrap: true` (new `ConfigSettingInfo.bootstrap`, in `openapi.yaml`). `hs config set` and
+   `hs config import` refuse / skip them. This fixes the two-replica bug in
+   `docs/next-steps.md` ("Found on the way, for track 03 and 13").
+2. **`appservices.registration_files` is importer-only.** `crates/hs-cli/src/appservices.rs`:
+   each listed file is imported once (an appservice already registered under the same id is
+   left alone), recorded in the config store (`ImportRecord`, `import/<kind>/<key>`), logged,
+   and audited as `appservices.import` (actor system); later starts skip it without reading it,
+   so API edits and removals survive restarts and a deleted file no longer blocks startup.
+   `hs-compat` reclassifies `app_service_config_files` as Mapped (diff) in `classification.rs`
+   and `docs/compat/synapse-config-table.md` (summary now 25 / 25 / 179). The bridge e2e test
+   (`crates/hs-cli/tests/e2e.rs`, `a_bridge_is_sent_what_happens_...`) checks the audit entry,
+   deletes the registration file before its restart, and still gets delivery.
+3. **Two administered settings that were file-only are now settings.** `media.scanning` moved
+   into `crates/hs-config/src/scanning.rs` (hs-media re-exports the same types from
+   `hs_media::scanning::config`; `http.auth_token` is `x-secret`), and
+   `server.unstable_features` feeds `GET /versions`. `--media-scanning-config` and
+   `--capabilities-config` still work, deprecated, with a startup warning.
+
+Verified: `cargo test -p hs-config` (126 + 3 + 1), `cargo test -p hs-admin` (176 + 5 + 2),
+`cargo test -p hs-compat` (50 + 7), `cargo test -p hs-cli --lib` (145),
+`cargo test -p hs-cli --test bridge_offerings` (3), `cargo test -p hs-cli --test e2e --
+a_bridge_is_sent` (1), `cargo test -p hs-media -- scanning` (74), `cargo clippy -p hs-config -p
+hs-media -p hs-cli -p hs-admin -p hs-compat --all-targets -- -D warnings`, `cargo fmt --all
+--check`, all with `CARGO_PROFILE_DEV_DEBUG=0`. Tests named by the task:
+`store::tests::bootstrap_settings_are_not_seeded_and_the_server_name_becomes_the_identity`,
+`layered::tests::two_replicas_seeding_one_database_keep_their_own_listeners_and_mesh_port`,
+`bootstrap::tests::two_replicas_booting_on_one_database_keep_their_own_listeners_and_mesh_port`
+(hs-cli, real embedded store), `appservices::tests::a_registration_file_is_imported_once_and_then_managed_through_the_registry`.
+
+**Not done / next steps, in order:**
+
+1. **Docs sweep (task item 3), not started.** README ("Behind a reverse proxy, set
+   `HS__SERVER__PUBLIC_BASEURL`" can stay, it is pre-setup, but say it pins the setting),
+   `deploy/helm/hs/values.yaml` and `templates/configmap.yaml` comments (the ConfigMap comment
+   says the file "seeds the database"; listeners no longer seed), `deploy/media-scanning/README.md`
+   (point at `media.scanning` in the interface, not `--media-scanning-config`),
+   `docs/bridges/*.md` (bridges via the Bridges section; registration files are a one-time
+   import), `docs/next-steps.md` (strike the "Found on the way" per-replica item and the
+   `registration_files` half of queue item 2), regenerate `docs/config.md` with
+   `cargo run -p hs-config --bin gen_config_docs` (new `media.scanning`, `server.unstable_features`).
+2. **Web (track 16), not started.** `web/src/api/config-schema.ts` `KNOWN_BOOTSTRAP_SECTIONS`
+   should be `["storage", "listeners"]`; read the new per-setting `bootstrap` flag into
+   `ConfigSettingInfo` and have `SettingRow.tsx` say "set at install (bootstrap file, HS__
+   variable or Helm values)" instead of "This server will not accept a change"; mock
+   `web/src/mocks/data/config.ts` `BOOTSTRAP` and `editable` to match; regenerate
+   `web/src/api/schema.d.ts` (`npm run generate:client`). `npm ci` was run in this worktree's
+   `web/` but nothing there was changed or tested.
+3. The chart's ConfigMap still renders `listeners` into the file layer, which is correct (the
+   file is where bootstrap lives); nothing to change in templates, only comments.
+4. Not run: the full `cargo test --workspace`, the other `hs-cli` integration tests
+   (`federation_*`), Complement, and anything against PostgreSQL (the purge is backend-agnostic
+   `hs-kv` code, tested on memory and Fjall only).
+
+**Decisions made** (also in decision 0010's Consequences): the bootstrap list above; the server
+name is recorded once as the database's identity and a file or `--server-name` that disagrees is
+overridden with a note (an `HS__SERVER__SERVER_NAME` that disagrees still wins, with a note, as
+before); `*_file` secret references and `media.storage` stay administered (they are the same on
+every replica); a registration file's import is keyed by the path as written and an edited file
+is never re-read.
 
 ## Session 2 (2026-09-19)
 
