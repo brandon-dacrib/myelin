@@ -396,12 +396,15 @@ impl Migrator {
 
     /// At startup, after the task registry has marked the previous process's tasks
     /// interrupted: a migration that was copying, verifying or cutting over carries on from its
-    /// last checkpoint, in a new task.
+    /// last checkpoint, in a new task. Whatever the status, the observer (the metrics) is told
+    /// it first.
     ///
     /// # Errors
     /// The store's, or the task registry's.
     pub async fn recover(&self) -> Result<Option<Phase>, SourceError> {
         let before = self.store.load().await.map_err(store_error)?;
+        // What the metrics say starts from what the record says, not from zero.
+        self.observer.observe(&before);
         if !before.phase.is_running() {
             return Ok(None);
         }

@@ -79,6 +79,16 @@ impl StoreConfigSource {
         }
     }
 
+    /// The configuration as it resolves now -- file, database and environment, secrets
+    /// included -- for what reads a setting when it is used rather than at boot (the migration
+    /// from Synapse reads its source when it starts).
+    ///
+    /// # Errors
+    /// The configuration does not resolve.
+    pub async fn current_config(&self) -> Result<Config, hs_config::ConfigError> {
+        Ok(self.state.read().await.layers.resolve()?.config)
+    }
+
     /// Re-reads the database layer from the store, so the next resolve sees what was just
     /// written. See the module docs for what happens without it.
     fn refresh(state: &mut State, store: &OpenedConfigStore) -> Result<(), StoreError> {

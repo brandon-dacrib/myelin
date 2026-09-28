@@ -29,6 +29,7 @@ pub mod hash_password;
 pub mod identity;
 pub mod media;
 pub mod metrics_layer;
+pub mod migration;
 pub mod overview;
 pub mod recover;
 pub mod register;

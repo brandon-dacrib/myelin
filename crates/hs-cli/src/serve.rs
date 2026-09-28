@@ -145,6 +145,11 @@ pub struct ServeOptions {
     /// in-process servers against each other over plain listeners sets `Some("http")`; nothing
     /// in a configuration file can, on purpose.
     pub federation_scheme: Option<&'static str>,
+    /// Where the migration from Synapse reads its source when it starts: the configuration store
+    /// the admin API writes (`crate::migration::StoreSourceConfigs`), so a source an operator set
+    /// a moment ago is the one used. `None` reads it from the configuration this process booted
+    /// on, which is what the in-process tests want.
+    pub migration_configs: Option<Arc<dyn hs_compat::migration::SourceConfigs>>,
 }
 
 impl std::fmt::Debug for ServeOptions {
@@ -1425,6 +1430,70 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             user_state.hub.store().clone(),
             push_state.pushers.clone(),
         ));
+    let migration_hub = user_state.hub.clone();
+    let migration_media = media_repository.clone();
+    let migration_tasks = tasks.clone();
+    let mut admin = admin_state(
+        &auth_state,
+        audit,
+        &rooms,
+        server_name.as_str(),
+        enabled_components,
+        AdminSources {
+            bridge_offerings: bridge_manager.clone(),
+            config: options.config_source.clone(),
+            setup: setup.clone(),
+            recovery: recovery.clone(),
+            overview: overview.clone(),
+            appservices: appservice_delivery.admin_directory(),
+            federation: federation_source.clone(),
+            server_notices: server_notices.clone(),
+            reports,
+            tasks,
+            statistics,
+            media: Arc::new(hs_media::admin_source::RepositoryMediaSource::new(
+                media_repository,
+            )),
+            cluster: cluster_admin,
+            user_data,
+            room_content: crate::room_admin::source(
+                rooms.clone(),
+                auth_state.clone(),
+                crate::room_admin::RoomOperationMetrics::register(&metrics),
+            ),
+        },
+    );
+    // The Migration area: copying a Synapse deployment in, verifying it and cutting over. A
+    // migration that was running when this process last stopped carries on from its checkpoint.
+    let migrator = crate::migration::build(crate::migration::MigrationParts {
+        backend: backend.clone(),
+        server_name: server_name.to_string(),
+        auth: auth_state.store.clone(),
+        hub: migration_hub,
+        rooms: rooms.clone(),
+        media: migration_media,
+        tasks: migration_tasks,
+        events: admin.events.clone(),
+        metrics: &metrics,
+        configs: options
+            .migration_configs
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::migration::BootedSourceConfigs(config.clone()))),
+    })
+    .map_err(|e| ServeError::Sessions(Box::new(e)))?;
+    admin = admin.with_migration(migrator.clone());
+    tokio::spawn(async move {
+        match migrator.recover().await {
+            Ok(Some(phase)) => tracing::warn!(
+                status = phase.as_str(),
+                "the migration from Synapse was running when this server stopped; it carries on"
+            ),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(%error, "could not carry on the migration from Synapse")
+            }
+        }
+    });
     let mounts = Mounts {
         room: room_state,
         federation,
@@ -1433,36 +1502,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         push: push_state,
         media: media_state,
         appservice_ping: appservices.ping_service,
-        admin: admin_state(
-            &auth_state,
-            audit,
-            &rooms,
-            server_name.as_str(),
-            enabled_components,
-            AdminSources {
-                bridge_offerings: bridge_manager.clone(),
-                config: options.config_source.clone(),
-                setup: setup.clone(),
-                recovery: recovery.clone(),
-                overview: overview.clone(),
-                appservices: appservice_delivery.admin_directory(),
-                federation: federation_source.clone(),
-                server_notices: server_notices.clone(),
-                reports,
-                tasks,
-                statistics,
-                media: Arc::new(hs_media::admin_source::RepositoryMediaSource::new(
-                    media_repository,
-                )),
-                cluster: cluster_admin,
-                user_data,
-                room_content: crate::room_admin::source(
-                    rooms.clone(),
-                    auth_state.clone(),
-                    crate::room_admin::RoomOperationMetrics::register(&metrics),
-                ),
-            },
-        ),
+        admin,
     };
 
     overview.set_ownership(cluster_handles.cluster.ownership().clone());

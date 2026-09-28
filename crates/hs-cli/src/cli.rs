@@ -811,8 +811,11 @@ async fn run_serve(args: &ServeArgs) -> i32 {
         capabilities_config: args.capabilities_config.clone(),
         routes_manifest_path: args.routes_manifest.clone(),
         media_scanning_config: args.media_scanning_config.clone(),
-        config_source: Some(config_source),
+        config_source: Some(config_source.clone()),
         federation_scheme: None,
+        migration_configs: Some(std::sync::Arc::new(crate::migration::StoreSourceConfigs(
+            config_source,
+        ))),
     };
     let handle = match crate::serve::spawn_serve_with_storage(booted.storage, config, options).await
     {
