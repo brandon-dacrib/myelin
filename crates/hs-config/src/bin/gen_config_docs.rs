@@ -29,6 +29,7 @@ const SECTIONS: &[&str] = &[
     "appservices",
     "telemetry",
     "cluster",
+    "migration",
 ];
 
 fn main() {

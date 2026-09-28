@@ -378,6 +378,45 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
         entry.handle.clone()
     }
 
+    /// The room to import `room_id`'s history into (the Synapse importer): its handle if the room
+    /// exists here already -- an import that stopped part way resumes into it, and every event
+    /// it already holds is answered `AlreadyKnown` -- and otherwise a new, empty shell for it at
+    /// `room_version`, registered at once. Nothing durable says the room exists until its first
+    /// event (the `m.room.create`) is imported through [`RoomActorHandle::import_event`].
+    ///
+    /// # Errors
+    /// Any error [`RoomRegistry::get_or_load`] or `RoomActor::empty_for` can return
+    /// ([`RoomError::UnsupportedRoomVersion`] for a version this server does not implement).
+    pub async fn import_shell(
+        &self,
+        room_id: &ruma::RoomId,
+        room_version: ruma::RoomVersionId,
+    ) -> Result<RoomActorHandle<B>, RoomError> {
+        match self.get_or_load(room_id).await {
+            Ok(handle) => Ok(handle),
+            Err(RoomError::RoomNotFound(_)) => {
+                let backend = self.backend.clone();
+                let tables = self.tables.clone();
+                let identity = self.identity.clone();
+                let owned_room_id = room_id.to_owned();
+                let shell = tokio::task::spawn_blocking(move || {
+                    RoomActor::empty_for(backend, tables, identity, &owned_room_id, room_version)
+                })
+                .await
+                .map_err(|e| RoomError::Internal(format!("room shell task failed: {e}")))??;
+                Ok(self.insert_if_absent(shell).await)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Forgets a shell [`RoomRegistry::import_shell`] made whose first event was then refused, so
+    /// that the registry does not answer a room that does not exist. A room that holds any event
+    /// is left alone.
+    pub async fn discard_import_shell(&self, room_id: &ruma::RoomId, handle: &RoomActorHandle<B>) {
+        self.drop_if_unbootstrapped(room_id, handle).await;
+    }
+
     /// Drops the registry's entry for `room_id` if it is still `handle`'s actor and that actor
     /// holds no timeline at all -- a shell [`RoomRegistry::bootstrap_from_remote_join`] created
     /// for a join that was then refused. Such a shell has nothing durable behind it

@@ -5,10 +5,11 @@
 //! shared-secret registration protocol ([`shared_secret`]), a first slice of the
 //! `/_synapse/admin` surface forwarded onto the native admin API ([`admin_proxy`]), and (see
 //! `docs/compat/*` for the parts that are analysis rather than code) the rest of the Synapse
-//! admin-API surface and the online importer.
+//! admin-API surface, and the online importer from a Synapse deployment ([`migration`]).
 
 pub mod admin_proxy;
 pub mod classification;
+pub mod migration;
 pub mod report;
 pub mod shared_secret;
 pub mod translate;

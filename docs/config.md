@@ -12,7 +12,7 @@ Decision 0010: this server is administered through the admin API and the web int
 
 ## Reload boundary
 
-Sections not listed here require a process restart to change; see the doc comment on `hs_config::reload` for why each one does or does not. Currently reloadable without a restart: `rate_limits`, `federation`, `telemetry`, `appservices`.
+Sections not listed here require a process restart to change; see the doc comment on `hs_config::reload` for why each one does or does not. Currently reloadable without a restart: `rate_limits`, `federation`, `telemetry`, `appservices`, `migration`.
 
 ## `server`
 
@@ -211,5 +211,16 @@ Cluster topology and ownership tuning.
 | `mesh` *(bootstrap)* | object | — | Internal mesh transport between replicas. |
 | `heartbeat_interval` | string \| integer | — | A duration: a string of <number><unit> groups (ms, s, m, h, d, w, y), or an integer number of milliseconds. |
 | `lease_ttl` | string \| integer | — | A duration: a string of <number><unit> groups (ms, s, m, h, d, w, y), or an integer number of milliseconds. |
+
+
+## `migration`
+
+The migration source, if any.
+
+**Reloadable without a restart.**
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `synapse` | object | — | The Synapse deployment to migrate from. Unset: there is nothing to migrate. |
 
 

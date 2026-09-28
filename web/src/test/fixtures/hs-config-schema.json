@@ -266,6 +266,13 @@
         "heartbeat_interval": "2s",
         "lease_ttl": "10s"
       }
+    },
+    "migration": {
+      "description": "The Synapse deployment to migrate from (the admin API's Migration area).",
+      "$ref": "#/$defs/MigrationConfig",
+      "default": {
+        "synapse": null
+      }
     }
   },
   "additionalProperties": false,
@@ -1999,6 +2006,91 @@
         "certificate_path",
         "private_key_path",
         "ca_certificate_path"
+      ]
+    },
+    "MigrationConfig": {
+      "description": "The migration source, if any.",
+      "type": "object",
+      "properties": {
+        "synapse": {
+          "description": "The Synapse deployment to migrate from. Unset: there is nothing to migrate.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SynapseSourceConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "SynapseSourceConfig": {
+      "description": "A Synapse deployment to copy: its PostgreSQL database and, optionally, its media store. The\ndatabase is only ever read; Synapse keeps working until cutover.",
+      "type": "object",
+      "properties": {
+        "database": {
+          "description": "Synapse's PostgreSQL database: the `database.args` of its `homeserver.yaml`. A Synapse on\nSQLite is moved to PostgreSQL first, with Synapse's own `synapse_port_db`.",
+          "$ref": "#/$defs/SynapseDatabaseConfig"
+        },
+        "media_store_path": {
+          "description": "Synapse's `media_store_path`, as this server sees it (the same volume, mounted). Unset:\nmedia records are copied but the files are not, and local media is missing until they\nare.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "batch_size": {
+          "description": "Rows read from Synapse per batch. Each batch is one step the copy can be paused, resumed\nor stopped between.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 500
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "database"
+      ]
+    },
+    "SynapseDatabaseConfig": {
+      "description": "A connection to Synapse's PostgreSQL database.",
+      "type": "object",
+      "properties": {
+        "host": {
+          "description": "Database host. Synapse's `database.args.host`.",
+          "type": "string"
+        },
+        "port": {
+          "description": "Database port. Synapse's `database.args.port`.",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 5432
+        },
+        "database": {
+          "description": "Database name. Synapse's `database.args.database` (or `dbname`).",
+          "type": "string"
+        },
+        "user": {
+          "description": "Connecting role. A read-only role is enough: nothing is ever written. Synapse's\n`database.args.user`.",
+          "type": "string"
+        },
+        "password": {
+          "description": "The role's password. Synapse's `database.args.password`.",
+          "$ref": "#/$defs/SecretString",
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "host",
+        "database",
+        "user"
       ]
     }
   }

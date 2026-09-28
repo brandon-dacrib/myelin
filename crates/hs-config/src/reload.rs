@@ -12,6 +12,8 @@
 //! - `appservices` — the registry is explicitly designed for hot
 //!   registration (`PLAN.md` D7) through the admin API; this section holds
 //!   delivery tuning and the registration files imported once at startup.
+//! - `migration` — read when a migration from Synapse starts, never at
+//!   startup.
 //!
 //! # Restart required
 //!
@@ -37,7 +39,13 @@ use crate::Config;
 /// Top-level [`Config`] field names that may change on a running server
 /// without a restart. Order matches [`Config`]'s field declaration order
 /// but that is not load-bearing; this is a set.
-pub const RELOADABLE_SECTIONS: &[&str] = &["rate_limits", "federation", "telemetry", "appservices"];
+pub const RELOADABLE_SECTIONS: &[&str] = &[
+    "rate_limits",
+    "federation",
+    "telemetry",
+    "appservices",
+    "migration",
+];
 
 /// True when `section` (a top-level `Config` field name) is in the
 /// reloadable set.
@@ -83,6 +91,7 @@ pub const SECTION_NAMES: &[&str] = &[
     "appservices",
     "telemetry",
     "cluster",
+    "migration",
 ];
 
 #[cfg(test)]

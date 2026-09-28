@@ -2368,10 +2368,13 @@ dependencies = [
 name = "hs-compat"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "axum",
  "hex",
  "hmac 0.12.1",
+ "hs-admin",
  "hs-config",
+ "hs-http",
  "http-body-util",
  "rand 0.9.5",
  "serde",
@@ -2381,7 +2384,9 @@ dependencies = [
  "thiserror 2.0.20",
  "time",
  "tokio",
+ "tokio-postgres",
  "tower",
+ "tracing",
 ]
 
 [[package]]

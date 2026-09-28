@@ -127,6 +127,10 @@ pub struct AdminState {
     /// aliases, hierarchy, extremities and media, and purging and deleting it (see
     /// [`crate::rooms`]). `None` until wired with [`AdminState::with_room_content`].
     pub room_content: Option<Arc<dyn crate::rooms::RoomContentSource>>,
+    /// What the `migration.*` operations act through: the migration from Synapse (see
+    /// [`crate::migration`]). `None` until wired with [`AdminState::with_migration`]; until then
+    /// they answer `503 unavailable`.
+    pub migration: Option<Arc<dyn crate::migration::MigrationSource>>,
     /// The `Idempotency-Key` cache every mutating handler that declares it consults (see
     /// [`crate::idempotency`]). Always present (never `None`): a client is never told its
     /// idempotency key was ignored.
@@ -165,6 +169,7 @@ impl AdminState {
             user_identity: None,
             user_data: None,
             room_content: None,
+            migration: None,
             idempotency: Arc::new(IdempotencyStore::new()),
         }
     }
@@ -252,6 +257,13 @@ impl AdminState {
     #[must_use]
     pub fn with_media(mut self, media: Arc<dyn crate::media::MediaSource>) -> Self {
         self.media = Some(media);
+        self
+    }
+
+    /// Wires the migration from Synapse, making the `migration.*` operations real.
+    #[must_use]
+    pub fn with_migration(mut self, migration: Arc<dyn crate::migration::MigrationSource>) -> Self {
+        self.migration = Some(migration);
         self
     }
 
@@ -386,6 +398,14 @@ const REAL_HANDLERS: &[&str] = &[
     "cluster.replicas.drain",
     "cluster.replicas.undrain",
     "cluster.shards.list",
+    "migration.get",
+    "migration.log",
+    "migration.start",
+    "migration.pause",
+    "migration.resume",
+    "migration.abort",
+    "migration.verify",
+    "migration.cutover",
     "users.list",
     "users.get",
     "users.update",
@@ -4774,6 +4794,14 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
             builder.add(method, &full_path, crate::cluster::replicas_undrain, meta)
         }
         "cluster.shards.list" => builder.add(method, &full_path, crate::cluster::shards_list, meta),
+        "migration.get" => builder.add(method, &full_path, crate::migration::get, meta),
+        "migration.log" => builder.add(method, &full_path, crate::migration::log, meta),
+        "migration.start" => builder.add(method, &full_path, crate::migration::start, meta),
+        "migration.pause" => builder.add(method, &full_path, crate::migration::pause, meta),
+        "migration.resume" => builder.add(method, &full_path, crate::migration::resume, meta),
+        "migration.abort" => builder.add(method, &full_path, crate::migration::abort, meta),
+        "migration.verify" => builder.add(method, &full_path, crate::migration::verify, meta),
+        "migration.cutover" => builder.add(method, &full_path, crate::migration::cutover, meta),
         "users.list" => builder.add(method, &full_path, users_list, meta),
         "users.get" => builder.add(method, &full_path, users_get, meta),
         "users.update" => builder.add(method, &full_path, users_update, meta),
@@ -5121,12 +5149,12 @@ mod tests {
 
     #[tokio::test]
     async fn authorized_request_to_undeclared_handler_is_501() {
-        // Migration is not in REAL_HANDLERS, and exercises the generic seam.
+        // `federation.keys.list` is not in REAL_HANDLERS, and exercises the generic seam.
         let (router, _manifest) = build_router(test_state());
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/migration")
+                    .uri("/api/v1/federation/keys")
                     .header("authorization", "Bearer admin-token")
                     .body(Body::empty())
                     .unwrap(),

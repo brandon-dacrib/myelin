@@ -37,6 +37,7 @@ pub mod federation;
 pub mod layered;
 pub mod listeners;
 pub mod media;
+pub mod migration;
 pub mod ratelimit;
 pub mod reload;
 pub mod scanning;
@@ -62,6 +63,7 @@ pub use federation::FederationConfig;
 pub use layered::{FileLayer, Layers, Resolved};
 pub use listeners::ListenersConfig;
 pub use media::MediaConfig;
+pub use migration::MigrationConfig;
 pub use ratelimit::RateLimitConfig;
 pub use secret::SecretString;
 pub use server::ServerConfig;
@@ -106,6 +108,9 @@ pub struct Config {
     /// Cluster topology.
     #[serde(default)]
     pub cluster: ClusterConfig,
+    /// The Synapse deployment to migrate from (the admin API's Migration area).
+    #[serde(default)]
+    pub migration: MigrationConfig,
 }
 
 impl Config {
@@ -186,6 +191,7 @@ impl Config {
         self.appservices.validate("appservices", &mut errors);
         self.telemetry.validate("telemetry", &mut errors);
         self.cluster.validate("cluster", &mut errors);
+        self.migration.validate("migration", &mut errors);
         errors.into_result()
     }
 }

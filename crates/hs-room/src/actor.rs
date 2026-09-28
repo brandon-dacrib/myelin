@@ -328,6 +328,11 @@ pub struct RoomActor<B: KvBackend> {
     /// existed. Installed by [`crate::registry::RoomRegistry::install_fencing`] onto every actor
     /// it constructs or loads, once `hs-cli` (out of this crate's ownership) calls it.
     fencing: Option<Arc<crate::fencing::RoomFencing<B>>>,
+    /// Set only while [`RoomActor::import_event`] runs: the event is persisted exactly as an
+    /// accepted remote event is, but no [`RoomUpdate`] is published for it. An imported event
+    /// is history this server already had under another implementation; announcing it would
+    /// send it to other servers again, deliver it to bridges again, and wake every client.
+    quiet: bool,
 }
 
 impl<B: KvBackend> RoomActor<B> {
@@ -460,6 +465,7 @@ impl<B: KvBackend> RoomActor<B> {
             publish,
             global: None,
             fencing: None,
+            quiet: false,
         }
     }
 
@@ -1352,6 +1358,22 @@ impl<B: KvBackend> RoomActor<B> {
         Ok(RemoteEventOutcome::Stored(event_sn))
     }
 
+    /// Imports an event copied from another implementation's database for this same server
+    /// (the Synapse importer, `hs_compat::migration`): authorized, checked and stored exactly as
+    /// [`RoomActor::accept_remote_event`] does, but *without* publishing a [`RoomUpdate`]. Nothing
+    /// downstream -- the federation sender, appservice delivery, `/sync` wake-ups -- hears of
+    /// it; the importer announces the room once, when all of it is in, through
+    /// [`RoomActor::head_update`] (which is what makes each member's `/sync` list it).
+    ///
+    /// # Errors
+    /// Exactly [`RoomActor::accept_remote_event`]'s.
+    pub fn import_event(&mut self, event: Event) -> Result<RemoteEventOutcome, RoomError> {
+        self.quiet = true;
+        let outcome = self.accept_remote_event(event);
+        self.quiet = false;
+        outcome
+    }
+
     /// Persists a built, authorized event: interns it, writes the event record, timeline entry,
     /// forward-extremity update and relation index entry (if any) in one `hs-kv` transaction, then
     /// updates the in-memory hot state and publishes a [`RoomUpdate`].
@@ -1603,6 +1625,9 @@ impl<B: KvBackend> RoomActor<B> {
             global_seq: 0,
         };
         self.events.insert(event_sn, event);
+        if self.quiet {
+            return Ok(event_sn);
+        }
         // A broadcast send fails only when there are no subscribers, which is not an error: a
         // room with nobody listening yet (or right now) is normal.
         if let Some(global) = &self.global {
@@ -5063,6 +5088,26 @@ impl<B: KvBackend> RoomActorHandle<B> {
         B: 'static,
     {
         self.with_actor(move |actor| actor.accept_remote_event(event))
+            .await
+    }
+
+    /// [`RoomActor::import_event`] through the handle: the Synapse importer's way in.
+    pub async fn import_event(&self, event: Event) -> Result<RemoteEventOutcome, RoomError>
+    where
+        B: 'static,
+    {
+        self.with_actor(move |actor| actor.import_event(event))
+            .await
+    }
+
+    /// [`RoomActor::apply_redaction`] through the handle, for an imported `m.room.redaction`
+    /// (importing one stores it; its effect on the target is applied separately, once the target
+    /// is known to be held).
+    pub async fn import_redaction(&self, target: ruma::OwnedEventId) -> Result<(), RoomError>
+    where
+        B: 'static,
+    {
+        self.with_actor(move |actor| actor.apply_redaction(&target))
             .await
     }
 

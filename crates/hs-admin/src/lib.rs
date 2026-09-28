@@ -42,6 +42,7 @@ pub mod events;
 mod handler_kit;
 pub mod idempotency;
 pub mod media;
+pub mod migration;
 pub mod model;
 pub mod openapi;
 pub mod operations;
