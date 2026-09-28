@@ -473,6 +473,11 @@ configuration history and revert (`ConfigStore` already records the patch per re
   rebasing it onto the follow-ups and renumbering its decision to 0015 — check the branch tip
   and its status 15 entry); `agent/config-reload` (hot reload of rate limits, federation
   policy, log filter) was still being built — check how far its pushed branch got.
+- 19:25 `agent/config-history` rebased onto `agent/admin-followups` (tip `ed4ce25`, decision
+  renumbered 0015): fmt, clippy, `hs-config`/`hs-admin`/`hs-cli` lib, `--test config_history`,
+  `npm run check` 441, `test:e2e` 50/50 green; coverage **160 of 160** with it. It is stacked on
+  the follow-ups, so merge it right after them: `tools/merge-queue.sh agent/admin-followups
+  agent/config-history`.
 
 ## Handover (2026-09-28, 16:00 EDT): where the nine resumed agents stopped
 
