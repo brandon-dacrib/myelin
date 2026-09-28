@@ -3627,3 +3627,223 @@ async fn an_administrator_can_find_quarantine_protect_and_delete_uploaded_media(
 
     handle.shutdown().await;
 }
+
+/// Read receipts and presence outlive the process: the real binary is stopped and started
+/// again over the same data directory, and what was read and who was away is still there --
+/// in an initial sync, and for a client whose token predates the restart, in its next
+/// incremental one. Before this both lived in memory and a restart forgot them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receipts_and_presence_are_still_there_after_a_restart_of_the_real_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = reserve_ephemeral_port();
+    let config_path = dir.path().join("homeserver.yaml");
+    std::fs::write(
+        &config_path,
+        test_config_yaml(port, &dir.path().join("data")),
+    )
+    .unwrap();
+    let mut server = HsProcess::serve(&config_path);
+    server.wait_for("listening");
+    let base = format!("http://127.0.0.1:{port}");
+
+    // A client of its own for every call: a pooled connection to the process that is stopped
+    // below would be reused against the one that replaces it.
+    let register = |name: &'static str| {
+        let base = base.clone();
+        async move {
+            let registered: serde_json::Value = reqwest::Client::new()
+                .post(format!("{base}/_matrix/client/v3/register"))
+                .json(&json!({"username": name, "password": "hunter2-hunter2", "auth": {"type": "m.login.dummy"}}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            (
+                registered["user_id"].as_str().unwrap().to_owned(),
+                registered["access_token"].as_str().unwrap().to_owned(),
+            )
+        }
+    };
+    let (alice, alice_token) = register("alice").await;
+    let (bob, bob_token) = register("bob").await;
+    let created: serde_json::Value = reqwest::Client::new()
+        .post(format!("{base}/_matrix/client/v3/createRoom"))
+        .bearer_auth(&alice_token)
+        .json(&json!({"preset": "public_chat", "name": "durable"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let room_id = created["room_id"].as_str().unwrap().to_owned();
+    let room_path = room_id.replace('!', "%21").replace(':', "%3A");
+    let joined = reqwest::Client::new()
+        .post(format!("{base}/_matrix/client/v3/join/{room_path}"))
+        .bearer_auth(&bob_token)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(joined.status(), reqwest::StatusCode::OK);
+    let sent: serde_json::Value = reqwest::Client::new()
+        .put(format!(
+            "{base}/_matrix/client/v3/rooms/{room_path}/send/m.room.message/t1"
+        ))
+        .bearer_auth(&alice_token)
+        .json(&json!({"msgtype": "m.text", "body": "read me"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let event_id = sent["event_id"].as_str().unwrap().to_owned();
+    let event_path = event_id.replace('$', "%24").replace(':', "%3A");
+
+    let sync = |token: String, since: Option<String>| {
+        let base = base.clone();
+        async move {
+            // `set_presence=offline`: a sync must not mark its caller online here, or alice's
+            // own syncs would overwrite the "unavailable" this test is about.
+            let mut url = format!("{base}/_matrix/client/v3/sync?timeout=0&set_presence=offline");
+            if let Some(since) = since {
+                url.push_str("&since=");
+                url.push_str(&since);
+            }
+            let response: serde_json::Value = reqwest::Client::new()
+                .get(url)
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            response
+        }
+    };
+    let receipt_content = |sync: &serde_json::Value| -> serde_json::Value {
+        sync["rooms"]["join"][&room_id]["ephemeral"]["events"]
+            .as_array()
+            .and_then(|events| events.iter().find(|e| e["type"] == "m.receipt"))
+            .map(|e| e["content"].clone())
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let presence_of = |sync: &serde_json::Value, user: &str| -> serde_json::Value {
+        sync["presence"]["events"]
+            .as_array()
+            .and_then(|events| events.iter().find(|e| e["sender"] == user))
+            .map(|e| e["content"].clone())
+            .unwrap_or(serde_json::Value::Null)
+    };
+
+    // Alice's token from before anything ephemeral happened, to sync from after the restart.
+    let before = sync(alice_token.clone(), None).await;
+    let alice_since = before["next_batch"].as_str().unwrap().to_owned();
+
+    for kind in ["m.read", "m.read.private"] {
+        let posted = reqwest::Client::new()
+            .post(format!(
+                "{base}/_matrix/client/v3/rooms/{room_path}/receipt/{kind}/{event_path}"
+            ))
+            .bearer_auth(&bob_token)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(posted.status(), reqwest::StatusCode::OK);
+    }
+    let set = reqwest::Client::new()
+        .put(format!("{base}/_matrix/client/v3/presence/{alice}/status"))
+        .bearer_auth(&alice_token)
+        .json(&json!({"presence": "unavailable", "status_msg": "back at three"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(set.status(), reqwest::StatusCode::OK);
+
+    // Seen before the restart, so the check after it is about the restart and nothing else.
+    let alice_sync = sync(alice_token.clone(), None).await;
+    let content = receipt_content(&alice_sync);
+    assert!(
+        content[&event_id]["m.read"][&bob].is_object(),
+        "bob's receipt before the restart: {alice_sync}"
+    );
+    let bob_sync = sync(bob_token.clone(), None).await;
+    assert_eq!(presence_of(&bob_sync, &alice)["presence"], "unavailable");
+
+    let log = server.stop();
+    assert!(log.contains("listening"), "{log}");
+    let mut server = HsProcess::serve(&config_path);
+    server.wait_for("listening");
+
+    // An initial sync on the new process: the read receipt (public to alice, and bob's own
+    // private one only to bob) and the presence are what they were.
+    let alice_sync = sync(alice_token.clone(), None).await;
+    let content = receipt_content(&alice_sync);
+    assert!(
+        content[&event_id]["m.read"][&bob]["ts"].as_u64().is_some(),
+        "the read receipt after the restart: {alice_sync}"
+    );
+    assert!(
+        content[&event_id].get("m.read.private").is_none(),
+        "bob's private receipt is still private after the restart: {content}"
+    );
+    let bob_sync = sync(bob_token.clone(), None).await;
+    let bobs = receipt_content(&bob_sync);
+    assert!(
+        bobs[&event_id]["m.read.private"][&bob].is_object(),
+        "bob's own private receipt after the restart: {bobs}"
+    );
+    let presence = presence_of(&bob_sync, &alice);
+    assert_eq!(presence["presence"], "unavailable", "{bob_sync}");
+    assert_eq!(presence["status_msg"], "back at three");
+
+    // A token from before the restart still means what it meant: everything since it, which
+    // is the receipt and the presence -- and a receipt posted now, whose counter continued
+    // rather than starting over below the token's.
+    let since_restart = sync(alice_token.clone(), Some(alice_since.clone())).await;
+    assert!(
+        receipt_content(&since_restart)[&event_id]["m.read"][&bob].is_object(),
+        "an old token sees the receipt set after it: {since_restart}"
+    );
+    assert_eq!(
+        presence_of(&since_restart, &alice)["presence"],
+        "unavailable"
+    );
+    let later_token = since_restart["next_batch"].as_str().unwrap().to_owned();
+    let second: serde_json::Value = reqwest::Client::new()
+        .put(format!(
+            "{base}/_matrix/client/v3/rooms/{room_path}/send/m.room.message/t2"
+        ))
+        .bearer_auth(&alice_token)
+        .json(&json!({"msgtype": "m.text", "body": "read me too"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let second_id = second["event_id"].as_str().unwrap().to_owned();
+    let second_path = second_id.replace('$', "%24").replace(':', "%3A");
+    let posted = reqwest::Client::new()
+        .post(format!(
+            "{base}/_matrix/client/v3/rooms/{room_path}/receipt/m.read/{second_path}"
+        ))
+        .bearer_auth(&bob_token)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(posted.status(), reqwest::StatusCode::OK);
+    let after = sync(alice_token.clone(), Some(later_token)).await;
+    assert!(
+        receipt_content(&after)[&second_id]["m.read"][&bob].is_object(),
+        "a receipt set after the restart is news to a token minted after it: {after}"
+    );
+
+    server.stop();
+}
