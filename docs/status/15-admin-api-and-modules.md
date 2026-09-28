@@ -6,7 +6,7 @@ Last updated: 2026-09-28 (the admin API follow-ups: bulk media tasks, Federation
 offering operations); before that 2026-09-26 (three public recovery operations); 2026-09-25 (additive schema change for the bridges wizard); the session log that follows is from 2026-09-19 (session 6).
 
 > **2026-09-28, served for real: a configuration section's per-setting history and a revert**
-> (branch `agent/config-history`; decision 0014). `tools/admin_api_coverage.py`: **142 of 160**.
+> (branch `agent/config-history`; decision 0015). `tools/admin_api_coverage.py`: **142 of 160**.
 >
 > - **`GET /config/{section}/history`** (`config.history.list`, `admin:read`) lists the section's
 >   changes newest first, paged by revision (`cursor` is `r<revision>`, both directions, a bad

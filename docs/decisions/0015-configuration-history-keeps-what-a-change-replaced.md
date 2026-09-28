@@ -1,4 +1,4 @@
-# 0014. Configuration history keeps what a change replaced, secrets included, and never serves it
+# 0015. Configuration history keeps what a change replaced, secrets included, and never serves it
 
 Date: 2026-09-28. Tracks: 13 (`hs-config`), 15 (`hs-admin`), 16 (web). Status: accepted.
 

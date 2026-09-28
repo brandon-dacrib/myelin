@@ -1146,7 +1146,7 @@ cannot do, in rough order of how often an operator will hit it:
 - **Switch a tagged-enum backend** — there is no "move from embedded to postgres" flow, only a
   view of whichever variant is live.
 - ~~**See which *setting* changed.**~~ **Done 2026-09-28** (branch `agent/config-history`,
-  decision 0014). `GET /config/{section}/history` lists each change setting by setting (before
+  decision 0015). `GET /config/{section}/history` lists each change setting by setting (before
   and after, actor, time, secrets redacted). `POST /config/{section}/history/{revision}/revert`
   undoes one as a new revision: it is `409` over a later change to the same setting unless
   forced, a secret is restored server-side, and the revert is audited, published
