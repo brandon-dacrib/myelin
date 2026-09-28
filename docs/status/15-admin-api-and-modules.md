@@ -2,8 +2,27 @@
 
 Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-admin`, `hs-modules`, `hs-identity`, `hs-http` (shared with 07 and 14).
 
-Last updated: 2026-09-28 (the Rooms area, 23/23; Users' devices-and-identity half; and the Cluster area, 6/6; all below); before that 2026-09-27 (media, registration tokens and server notices, reports, tasks and statistics, below; before that the bridge
+Last updated: 2026-09-28 (`GET /` redirects to the interface; the Rooms area, 23/23; Users' devices-and-identity half; and the Cluster area, 6/6; all below); before that 2026-09-27 (media, registration tokens and server notices, reports, tasks and statistics, below; before that the bridge
 offering operations); before that 2026-09-26 (three public recovery operations); 2026-09-25 (additive schema change for the bridges wizard); the session log that follows is from 2026-09-19 (session 6).
+
+> **2026-09-28, the server's bare root lands somewhere useful.** Typing the demo's address
+> into a browser gave the ingress controller's 404, and the server had no handler for `/`
+> either. `crates/hs-admin/src/assets.rs` now routes `GET /` (exact path only; `HEAD` too,
+> through axum's `get`) to `root_response(EMBEDDED_UI)`: a `307` to `/admin/`
+> (`ROOT_REDIRECT_TARGET`) when the binary carries the built interface, and otherwise a `200`
+> plain page saying this is a Myelin Matrix homeserver, that this build has no management
+> interface and that the admin API is at `/api/v1` (Synapse's "It works!" page, in effect).
+> Temporary, not permanent, because what the root does depends on the build. It lives in the
+> assets router, so it is merged with `/admin` and is outside the Matrix route manifest; every
+> other path still reaches `hs_http::fallback` (`404 M_UNRECOGNIZED`), and `POST /` is
+> `405`. Tests: five unit tests in `assets.rs` (both branches, the route, `HEAD`, nothing
+> but the root is taken) and the real-binary `crates/hs-cli/tests/root_page.rs` (whichever
+> interface the binary carries, `HEAD`, `POST`, `/index.html` and `/foo` still `404
+> M_UNRECOGNIZED`, `/_matrix/client/versions` and `/api/v1/setup` still `200`), run with both
+> a placeholder build and a build embedding `web/dist` (the `307` to `/admin/`, and `/admin/`
+> then `200`). No new log line or metric: the request is counted and traced by the same HTTP
+> layers as every other route. The chart half
+> (an `Exact` `/` path under `ingress.admin`) is in `docs/status/12-platform-and-kubernetes.md`.
 
 > **2026-09-28, served for real: Migration 8/8 (by track 13).** `crates/hs-admin/src/migration.rs`:
 > `migration.get`, `.log` (paged), `.start`, `.pause`, `.resume`, `.abort` (each answers the

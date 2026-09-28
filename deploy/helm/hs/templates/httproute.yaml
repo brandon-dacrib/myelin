@@ -33,6 +33,10 @@ spec:
         - path:
             type: PathPrefix
             value: /_synapse
+        # The bare root only; the server redirects it to /admin/.
+        - path:
+            type: Exact
+            value: /
         {{- end }}
       backendRefs:
         - name: {{ include "hs.fullname" . }}

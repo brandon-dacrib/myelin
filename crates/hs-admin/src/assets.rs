@@ -2,6 +2,11 @@
 //! `index.html` fallback for client-side routes, `Cache-Control: immutable` for hashed assets,
 //! `no-store` for `index.html` itself.
 //!
+//! It also answers the server's bare root, `GET /` (exact path only): someone who types the
+//! server's address into a browser is sent to `/admin/` when this binary carries the built
+//! interface, and otherwise gets a small plain page saying what this server is (the equivalent of
+//! Synapse's "It works!" page) rather than a `404`. See [`root_response`].
+//!
 //! What is embedded is whatever `build.rs` staged in `$OUT_DIR/web-dist`: the built interface
 //! when there is one, a placeholder page when there is not. See `build.rs` for how that is
 //! chosen and why a release build cannot end up with the placeholder by accident;
@@ -9,7 +14,7 @@
 
 use axum::extract::Path;
 use axum::http::{HeaderValue, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use rust_embed::RustEmbed;
 
@@ -109,6 +114,56 @@ fn serve_index_fallback() -> Response {
     }
 }
 
+/// Where `GET /` sends a browser when the built interface is embedded.
+pub const ROOT_REDIRECT_TARGET: &str = "/admin/";
+
+/// The page `GET /` answers when this binary carries only the placeholder interface: enough for
+/// someone who typed the address into a browser to know they reached a Matrix homeserver, and
+/// where its APIs are.
+const ROOT_PAGE: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Myelin Matrix homeserver</title>
+</head>
+<body>
+<h1>It works! Myelin is running.</h1>
+<p>This is a <a href="https://matrix.org/">Matrix</a> homeserver, running Myelin. To use it,
+sign in from a Matrix client with this server's address.</p>
+<p>This build does not include the management interface. The admin API is at
+<code>/api/v1</code>.</p>
+</body>
+</html>
+"#;
+
+/// What `GET /` (and `HEAD /`) answer, given which interface this binary carries.
+///
+/// With the built interface, a temporary redirect to [`ROOT_REDIRECT_TARGET`]: temporary because
+/// what the root does depends on the build, so a browser must not remember it across an upgrade.
+/// With the placeholder, `200` and a short plain page naming this server as a Myelin Matrix
+/// homeserver. Either way a browser pointed at the server's address lands somewhere useful
+/// instead of on a `404`.
+pub fn root_response(ui: EmbeddedUi) -> Response {
+    match ui {
+        EmbeddedUi::Built => Redirect::temporary(ROOT_REDIRECT_TARGET).into_response(),
+        EmbeddedUi::Placeholder => (
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            )],
+            [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+            ROOT_PAGE,
+        )
+            .into_response(),
+    }
+}
+
+async fn server_root() -> Response {
+    root_response(EMBEDDED_UI)
+}
+
 async fn admin_root() -> Response {
     serve_index_fallback()
 }
@@ -117,9 +172,11 @@ async fn admin_asset(Path(path): Path<String>) -> Response {
     serve_embedded(&path)
 }
 
-/// The `/admin` and `/admin/*` routes, ready to merge into the main router.
+/// The `/admin` and `/admin/*` routes, and the bare root `/` (exact path; see
+/// [`root_response`]), ready to merge into the main router. The `GET` routes answer `HEAD` too.
 pub fn router() -> axum::Router<AdminState> {
     axum::Router::new()
+        .route("/", get(server_root))
         .route("/admin", get(admin_root))
         .route("/admin/", get(admin_root))
         .route("/admin/{*path}", get(admin_asset))
@@ -220,5 +277,90 @@ mod tests {
             response.headers().get(header::CACHE_CONTROL).unwrap(),
             "no-store"
         );
+    }
+
+    async fn request(method: &str, uri: &str) -> Response {
+        app()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn body_text(response: Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn with_the_built_interface_the_root_redirects_to_it() {
+        let response = root_response(EmbeddedUi::Built);
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/admin/");
+    }
+
+    #[tokio::test]
+    async fn without_the_built_interface_the_root_is_a_plain_page_naming_the_server() {
+        let response = root_response(EmbeddedUi::Placeholder);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        assert!(response.headers().get(header::LOCATION).is_none());
+        let text = body_text(response).await;
+        assert!(text.contains("Myelin"), "{text}");
+        assert!(text.contains("Matrix"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn get_root_answers_for_the_interface_this_binary_carries() {
+        let response = request("GET", "/").await;
+        let expected = root_response(EMBEDDED_UI);
+        assert_eq!(response.status(), expected.status());
+        assert_eq!(
+            response.headers().get(header::LOCATION),
+            expected.headers().get(header::LOCATION)
+        );
+        // A query string does not change which route matches.
+        assert_eq!(
+            request("GET", "/?from=bookmark").await.status(),
+            expected.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn head_root_answers_like_get_without_a_body() {
+        let get = request("GET", "/").await;
+        let head = request("HEAD", "/").await;
+        assert_eq!(head.status(), get.status());
+        assert_eq!(
+            head.headers().get(header::LOCATION),
+            get.headers().get(header::LOCATION)
+        );
+        assert!(body_text(head).await.is_empty());
+    }
+
+    /// Only the exact root is taken: every other path is left to whoever else routes it (here,
+    /// nobody, so axum's bare `404`; in the server, the Matrix fallback).
+    #[tokio::test]
+    async fn the_root_route_takes_nothing_but_the_root() {
+        for uri in [
+            "/index.html",
+            "/foo",
+            "/_matrix",
+            "/.well-known/matrix/client",
+        ] {
+            let response = request("GET", uri).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert!(response.headers().get(header::LOCATION).is_none(), "{uri}");
+        }
     }
 }

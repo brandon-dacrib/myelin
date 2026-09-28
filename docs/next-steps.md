@@ -196,7 +196,12 @@ LAN hostname, the chart's ServiceMonitor scraped by the cluster's Prometheus, an
 page opened in a browser at the public address. Doing it found that the chart's Ingress routed
 `/_matrix` and `/.well-known/matrix` only, so the setup link the NOTES tell the operator to open
 would have been a 404 through it; it routes `/admin`, `/api/v1` and `/_synapse` now
-(`ingress.admin`, on by default, and the same on the HTTPRoute). The install took four minutes
+(`ingress.admin`, on by default, and the same on the HTTPRoute). On 2026-09-28 the bare
+address was still the ingress controller's "404 page not found": the server now answers `GET /`
+(exact path) with a redirect to `/admin/` (a small "this is a Myelin Matrix homeserver" page in
+a build without the interface), and `ingress.admin` also routes the exact path `/`
+(`crates/hs-cli/tests/root_page.rs`); the demo needs a `helm upgrade` and a new image to show
+it. The install took four minutes
 there, two and a half of them between the volume attaching and the image pull starting, which
 is the cluster's storage, not the chart, and is written down in the status document because an
 operator would see it.

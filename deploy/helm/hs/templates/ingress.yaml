@@ -55,6 +55,16 @@ spec:
                 port:
                   number: {{ $.Values.service.clientPort }}
           {{- end }}
+          {{- /* The bare root and nothing under it (`Exact`): the server redirects it to
+               `/admin/`, so someone who types the host into a browser lands on the interface
+               instead of the ingress controller's own 404. */}}
+          - path: /
+            pathType: Exact
+            backend:
+              service:
+                name: {{ include "hs.fullname" . }}
+                port:
+                  number: {{ .Values.service.clientPort }}
           {{- end }}
     {{- end }}
     {{- if and .Values.ingress.federationHost (ne .Values.ingress.federationHost .Values.ingress.clientHost) }}

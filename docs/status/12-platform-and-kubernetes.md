@@ -1,5 +1,26 @@
 # 12. Platform and Kubernetes
 
+## 2026-09-28: the bare host is not a 404 any more (chart half; server half in status 15)
+
+`https://myelin.dacrib.net/` answered Traefik's own "404 page not found": the Ingress routed
+`/_matrix`, `/.well-known/matrix` and, with `ingress.admin`, `/admin`, `/api/v1` and
+`/_synapse`, and the server had no handler for `/` either. Both halves are fixed:
+
+- `templates/ingress.yaml`: with `ingress.admin` (on by default) the client host also routes
+  the exact path `/` (`pathType: Exact`, so nothing under it) to the service.
+  `templates/httproute.yaml`: the same with `gatewayApi.admin` (`type: Exact`). The values
+  comments say so. `ingress.admin=false` renders the old two paths, and no `/`.
+- The server redirects `GET /` to `/admin/` (see `docs/status/15-admin-api-and-modules.md`).
+
+Verified: `helm lint` clean; `helm template` (Helm 4.3.0) renders the six paths with `/` last as
+`Exact`, the HTTPRoute with the `Exact` match, and only `/_matrix` and `/.well-known/matrix`
+with `ingress.admin=false`. **Not verified on the demo**: this session could not reach the
+cluster. Rolling it out is a new image (CD publishes `main` and `sha-<commit>` on the push) and
+a `helm upgrade` of the `myelin` release in namespace `myelin` with its existing values file
+(`talos-clusters/dacrib0/apps/myelin/values.yaml` in the infrastructure repository); a chart
+from the checkout pulls the mutable `main` tag, so the pod must also be restarted to pull it,
+while the published pre-release chart pins `sha-<commit>` and rolls the pod by itself.
+
 ## The operator's `Homeserver` reconciler, with drain-before-evict (2026-09-28)
 
 Queue item 5 of `docs/next-steps.md`. Built and tested here against an in-memory cluster, a
