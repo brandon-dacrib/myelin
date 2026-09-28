@@ -54,6 +54,7 @@ pub mod test_fixtures;
 #[cfg(test)]
 mod test_support;
 pub mod thumbnail;
+pub mod usage;
 
 pub use error::MediaError;
 pub use id::MediaId;

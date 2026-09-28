@@ -4,6 +4,72 @@ Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-a
 
 Last updated: 2026-09-27 (the bridge offering operations, below); before that 2026-09-26 (three public recovery operations); 2026-09-25 (additive schema change for the bridges wizard); the session log that follows is from 2026-09-19 (session 6).
 
+> **2026-09-27, branch `agent/reports-tasks-stats`: Reports 4/4, Tasks 3/3, Statistics 4/4
+> served for real** (`tools/admin_api_coverage.py`: **81 of 158**, from 71).
+>
+> - **Reports** (`crates/hs-admin/src/reports.rs`): wire shapes, `ReportSource`, the four
+>   handlers (`moderation:read`/`moderation:write`; resolve and delete audited as
+>   `reports.resolve`/`reports.delete`, published as `report.resolved`/`report.deleted`;
+>   resolve is idempotent by key and `409` on a closed report). `resolution: no_action`
+>   *dismisses*, anything else *resolves*. Contract changes (additive): `Report.kind` gained
+>   `room`; `Report` gained `resolved_at`, `resolved_by` and `event` (the reported event as the
+>   room holds it now, on `GET /reports/{id}` only). Report ids come from a monotonic ULID
+>   generator (`reports::new_report_id`), because plain ULIDs minted in one millisecond do not
+>   sort by time.
+> - **The client-server reporting endpoints** (`crates/hs-room/src/routes/report.rs`):
+>   `POST /rooms/{roomId}/report/{eventId}` (`reason?`, `score?` in -100..=0; 404 for an event
+>   the reporter cannot see), `POST /rooms/{roomId}/report` and `POST /users/{userId}/report`
+>   (`reason` required; 404 for an unknown room or local user; a remote user is accepted). They
+>   write a durable store (`crates/hs-room/src/reports.rs`, keyspace `room_reports`) the
+>   `RoomRegistry` opens (`RoomRegistry::reports()`); `hs_room::reports::RoomReports` is the
+>   `ReportSource`. The Overview's `pending_reports_count` is now counted (`ServerOverview::
+>   set_reports`).
+> - **Tasks** (`crates/hs-admin/src/tasks.rs`): `TaskRegistry` (spawn with progress and
+>   cancellation, `record_finished`, best-effort cancel across replicas, `recover_interrupted`
+>   at startup marks this runner's unfinished tasks failed and prunes finished ones older than
+>   30 days, `task.changed` events), `TaskStore` with an in-memory store; the durable one is
+>   `crates/hs-cli/src/tasks.rs` (`hs_admin.tasks`). What reports into it today:
+>   `appservices.replay` (its answer is now a task `GET /tasks/{id}` can find) and the startup
+>   content-scan sweep (`media.resume_scans`, when it found anything). **For the Media agent and
+>   rooms.delete/purge_history later:** `state.tasks.spawn(action, resource, actor, |ctx| async
+>   { ... ctx.progress(..).await; Ok(json!(..)) })` and answer `202` with the returned task.
+> - **Statistics** (`crates/hs-admin/src/statistics.rs`): `statistics.rooms` over the room
+>   directory; `statistics.users_media` and `statistics.timeseries` over a `StatisticsSource`
+>   (`crates/hs-cli/src/statistics.rs`). The metric vocabulary is `statistics::METRICS` and the
+>   contract's `metric` enum: counters (`users.registered`, `media.uploaded`,
+>   `media.uploaded_bytes`, `reports.received`) from record timestamps, gauges (the
+>   `StatisticsOverview` field names) from samples the server takes every 15 minutes into
+>   `hs_admin.stats_samples` (kept 400 days). Steps are epoch-aligned; at most 1000 points.
+>   Media usage reads `hs_media::usage::local_uploads` (new file in `hs-media`).
+>   `OverviewSource` gained `statistics_now` (default: `statistics`), which the sampler uses so
+>   it neither reads nor refreshes the Overview's one-minute cache.
+>
+> **Verified:** `cargo test -p hs-admin` (198 lib + contract), `cargo test -p hs-room` (incl.
+> `tests/reports.rs`), `cargo test -p hs-media --lib`, `cargo test -p hs-cli --lib`,
+> `cargo test -p hs-cli --test reports_tasks_statistics` (the real binary, twice: reports filed
+> over HTTP, resolved, audited; a replay kept as a task; statistics from real records; all of
+> it still there after a restart), `cargo test -p hs-cli --test e2e the_overview`; clippy
+> `-D warnings` on hs-admin, hs-room, hs-media, hs-cli; `cargo fmt --all`.
+>
+> **Where this stopped** (the session was asked to wrap up before the interface work):
+> - Done and verified: everything above (server side, contract, tests).
+> - Not started: the web interface. `web/src/api/schema.d.ts` has **not** been regenerated
+>   from the changed `openapi.yaml` (`cd web && npm run generate:client`); no Reports page
+>   (`/reports` is still `PlaceholderPage`), no Tasks page, no Statistics page or Overview
+>   sparklines; no MSW mocks for these operations (`web/src/mocks/handlers.ts`,
+>   `web/src/mocks/data/`); `npm run check` not run. `hs-admin-mock`'s report fixtures do not
+>   carry the new optional fields (`resolved_at`, `resolved_by`, `event`) or `kind: room`.
+> - Next, in order: regenerate the client; `web/src/api/reports.ts`, `tasks.ts`,
+>   `statistics.ts` hooks; Reports page (queue with status/kind filters, open first; detail
+>   with the reported event, reporter, reason, score, and resolve/dismiss with a resolution
+>   select and note: structured controls only, decision 0010); Tasks page (list with status
+>   filter, detail, cancel); Statistics page (largest rooms, media by user, time-series
+>   charts with the existing `Sparkline`) and the Overview's Activity sparklines; MSW handlers
+>   whose shapes match the Rust types above; Vitest for each page; `npm run check`; update
+>   `docs/status/16-management-web-interface.md`.
+> - Not run: the full `cargo test -p hs-cli` (only the lib tests and the two e2e tests named
+>   above), and the web checks.
+
 > **2026-09-26, additive, served for real (RFC 0017).** Ten operations under the `Bridges` tag:
 > `bridge_deployments.target` (`GET /bridge-deployment-target`), `bridge_offerings.list/get/
 > put/delete` (`/bridge-offerings`, `/bridge-offerings/{type}`, `DELETE ... ?remove_instances=`

@@ -426,8 +426,7 @@ fn default_step(range_ms: i64) -> i64 {
 }
 
 /// Turns the query into a [`Window`]: `until` defaults to now, `from` to seven days before
-/// `until`. The window's end is rounded up to a whole step, so the last step is complete and
-/// includes `until`.
+/// `until`, both widened to whole steps aligned to the epoch.
 #[allow(clippy::result_large_err)]
 fn window_of(query: &TimeseriesQuery, now_ms: i64, instance: &str) -> Result<Window, Response> {
     let parse_time = |field: &str, raw: &str| -> Result<i64, Response> {
@@ -472,8 +471,12 @@ fn window_of(query: &TimeseriesQuery, now_ms: i64, instance: &str) -> Result<Win
         },
         None => default_step(until - from),
     };
-    // `until` itself falls in the last step: a series ending "now" includes what happened now.
-    let steps = (until - from) / step + 1;
+    // Steps sit on multiples of the step since the epoch (a day step starts at midnight UTC), so
+    // two charts of the same metric line up. The first step is the one `from` falls in, the last
+    // the one `until` falls in: a series ending "now" includes what happened now.
+    let first = from.div_euclid(step) * step;
+    let last = until.div_euclid(step) * step;
+    let steps = (last - first) / step + 1;
     if steps > MAX_POINTS {
         return Err(invalid(
             "/step",
@@ -482,8 +485,8 @@ fn window_of(query: &TimeseriesQuery, now_ms: i64, instance: &str) -> Result<Win
         ));
     }
     Ok(Window {
-        from_ms: from,
-        until_ms: from + steps * step,
+        from_ms: first,
+        until_ms: last + step,
         step_ms: step,
     })
 }

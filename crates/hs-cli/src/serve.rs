@@ -618,6 +618,10 @@ fn admin_state<B: KvBackend + 'static>(
     .with_bridge_offerings(sources.bridge_offerings)
     // The Federation page and the Overview's last 501 panel.
     .with_federation(sources.federation)
+    // Reports, Tasks and the Statistics page.
+    .with_reports(sources.reports)
+    .with_tasks(sources.tasks)
+    .with_statistics(sources.statistics)
     .with_server_info(hs_admin::model::ServerInfo {
         name: server_name.to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -651,6 +655,9 @@ struct AdminSources {
     overview: Arc<dyn hs_admin::sources::OverviewSource>,
     appservices: Arc<dyn hs_admin::sources::AppserviceDirectory>,
     federation: Arc<dyn hs_admin::sources::FederationSource>,
+    reports: Arc<dyn hs_admin::reports::ReportSource>,
+    tasks: Arc<hs_admin::tasks::TaskRegistry>,
+    statistics: Arc<dyn hs_admin::statistics::StatisticsSource>,
 }
 
 /// The `/api/v1` state for [`route_manifest`]'s throwaway router: routes are registered the same
@@ -812,6 +819,9 @@ pub struct ServeHandle {
     /// the same link an operator would.
     pub setup_link: Option<String>,
     bridge_manager: tokio::task::JoinHandle<()>,
+    /// Samples the statistics every quarter hour (`crate::statistics`); stopped on shutdown so
+    /// it does not keep the store open after the server has gone.
+    statistics_sampler: tokio::task::JoinHandle<()>,
     shutdown_tx: watch::Sender<bool>,
     join: tokio::task::JoinHandle<()>,
     /// Ends every `/sync` long-poll in flight (`hs_user::hub::SessionHub::begin_shutdown`), so
@@ -873,6 +883,7 @@ impl ServeHandle {
         // the Service sending new requests here.
         self.withdraw_readiness();
         self.bridge_manager.abort();
+        self.statistics_sampler.abort();
         let report = self.cluster.drain(CLUSTER_DRAIN_DEADLINE).await;
         if report.handed_off > 0 || report.released_unclaimed > 0 {
             tracing::info!(
@@ -1032,25 +1043,70 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         &metrics,
     )?;
 
+    // Where long-running work reports, for the admin API's Tasks page. Opened before anything
+    // that might run such work; what a previous run of this process left unfinished is marked
+    // failed first, because nothing is running it any more.
+    let tasks = hs_admin::tasks::TaskRegistry::new(
+        Arc::new(
+            crate::tasks::TablesTaskStore::open(backend.clone())
+                .map_err(|e| ServeError::Sessions(Box::new(e)))?,
+        ),
+        crate::cluster::task_runner_name(&config),
+    );
+    match tasks.recover_interrupted().await {
+        Ok(0) => {}
+        Ok(count) => tracing::warn!(
+            count,
+            "tasks interrupted by the last shutdown were marked failed"
+        ),
+        Err(error) => {
+            tracing::error!(%error, "could not check for tasks interrupted by the last shutdown")
+        }
+    }
+
     // A content scan in `defer` or `quarantine` mode records its intent durably before the scan
     // task starts, so a crash cannot lose the verdict — but nothing resolves those rows on its
     // own. Sweep them once at startup. Spawned rather than awaited: a slow or unreachable scanner
     // must not hold up binding a listener, and an unresolved item stays unservable meanwhile,
-    // which is the safe direction to fail.
+    // which is the safe direction to fail. A sweep that found something is kept as a task, so an
+    // operator can see it happened and how it went.
     {
         let repository = media_state.repository.clone();
+        let tasks = tasks.clone();
         tokio::spawn(async move {
-            match repository.resume_pending_scans().await {
-                Ok(0) => {}
+            let mut task = hs_admin::model::Task::scheduled(
+                "media.resume_scans",
+                None,
+                hs_admin::model::Actor {
+                    kind: hs_admin::model::ActorKind::System,
+                    id: "server".to_owned(),
+                    display_name: None,
+                    token_id: None,
+                    ip: None,
+                    user_agent: None,
+                },
+            );
+            task.started_at = Some(task.created_at.clone());
+            let outcome = repository.resume_pending_scans().await;
+            task.finished_at = Some(hs_http::time::now_rfc3339());
+            match outcome {
+                Ok(0) => return,
                 Ok(count) => {
                     tracing::info!(
                         count,
                         "resumed content scans left pending by a previous run"
                     );
+                    task.status = hs_admin::model::TaskStatus::Succeeded;
+                    task.result = Some(serde_json::json!({ "resumed": count }));
                 }
                 Err(error) => {
                     tracing::error!(%error, "could not resume pending content scans");
+                    task.status = hs_admin::model::TaskStatus::Failed;
+                    task.error = Some(hs_http::Problem::internal().with_detail(error.to_string()));
                 }
+            }
+            if let Err(error) = tasks.record_finished(task).await {
+                tracing::warn!(%error, "could not record the content-scan sweep as a task");
             }
         });
     }
@@ -1214,6 +1270,24 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         config.cluster.single_node,
     ));
     overview.set_federation(federation_source.clone());
+    // Reports users file, for the Reports page and the Overview's "awaiting action".
+    let reports: Arc<dyn hs_admin::reports::ReportSource> =
+        Arc::new(hs_room::reports::RoomReports::new(rooms.clone()));
+    overview.set_reports(reports.clone());
+    // The Statistics page: media usage and the charts, whose gauges are sampled from here on.
+    let statistics = Arc::new(
+        crate::statistics::ServerStatistics::open(
+            backend.clone(),
+            server_name.as_str(),
+            &auth_state,
+            rooms.clone(),
+            overview.clone(),
+        )
+        .map_err(|e| ServeError::Sessions(Box::new(e)))?,
+    );
+    let statistics_sampler = statistics
+        .clone()
+        .spawn_sampler(crate::statistics::SAMPLE_INTERVAL);
 
     let mounts = Mounts {
         room: room_state,
@@ -1240,6 +1314,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
                 overview: overview.clone(),
                 appservices: appservice_delivery.admin_directory(),
                 federation: federation_source.clone(),
+                reports,
+                tasks,
+                statistics,
             },
         ),
     };
@@ -1389,6 +1466,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
 
     Ok(ServeHandle {
         bridge_manager,
+        statistics_sampler,
         addrs,
         setup_link,
         shutdown_tx,

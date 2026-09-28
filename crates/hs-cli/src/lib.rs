@@ -33,10 +33,12 @@ pub mod register;
 pub mod remote_join;
 pub mod serve;
 pub mod signing_key;
+pub mod statistics;
 pub mod storage;
 pub mod synapse_serve;
 pub mod synapse_shims;
 pub mod sync_cluster;
+pub mod tasks;
 pub mod versions;
 pub mod well_known;
 
