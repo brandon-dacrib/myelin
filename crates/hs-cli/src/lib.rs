@@ -27,6 +27,7 @@ pub mod federation_sender;
 pub mod generate_config;
 pub mod hash_password;
 pub mod identity;
+pub mod live_config;
 pub mod media;
 pub mod metrics_layer;
 pub mod migration;

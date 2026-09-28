@@ -34,8 +34,10 @@ fn config(port: u16, data_dir: &std::path::Path) -> hs_config::Config {
          storage:\n  backend: embedded\n  data_dir: {data_dir:?}\n\
          media:\n  storage:\n    backend: local\n    path: {media_dir:?}\n\
          auth:\n  enable_registration: true\n\
-         federation:\n  ip_range_blocklist: []\n"
+         federation:\n  ip_range_blocklist: []\n\
+         rate_limits:\n  enabled: false\n"
     );
+    // The server-wide send limit is off (decision 0015): this conversation is faster than a person.
     hs_config::Config::from_yaml(&yaml).expect("the test configuration parses")
 }
 

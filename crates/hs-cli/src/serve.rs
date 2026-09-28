@@ -154,6 +154,11 @@ pub struct ServeOptions {
     /// /api/v1/media/purge-remote-cache`) deletes. Zero (the default) is what `hs serve` runs
     /// with; a test that cancels a deletion midway sets one so there is a midway to cancel at.
     pub media_bulk_pause: std::time::Duration,
+    /// Where the parts of this server that can take a configuration change on while running
+    /// register for it (`crate::live_config`), and which the configuration source above applies
+    /// every change to. `None` wires nothing: the server runs on the configuration it was given
+    /// until it stops, which is what an in-process test that never changes it wants.
+    pub live_config: Option<Arc<crate::live_config::LiveConfig>>,
 }
 
 impl std::fmt::Debug for ServeOptions {
@@ -165,6 +170,7 @@ impl std::fmt::Debug for ServeOptions {
             .field("config_source", &self.config_source.is_some())
             .field("federation_scheme", &self.federation_scheme)
             .field("media_bulk_pause", &self.media_bulk_pause)
+            .field("live_config", &self.live_config.is_some())
             .finish()
     }
 }
@@ -1094,6 +1100,30 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         backend.clone(),
         identity.clone(),
     )?);
+    // The server-wide send limit (`rate_limits.message`), and every later change to it: the
+    // room layer's limiter reads it on each event, so swapping it here is all a change needs.
+    rooms
+        .send_limiter()
+        .set_server_limit(crate::live_config::message_limit(&config.rate_limits));
+    metrics.with_registry(crate::live_config::register_metrics);
+    if let Some(live) = &options.live_config {
+        let rooms = rooms.clone();
+        live.on_change("rate_limits", move |config| {
+            let limit = crate::live_config::message_limit(&config.rate_limits);
+            rooms.send_limiter().set_server_limit(limit);
+            tracing::info!(
+                per_second = limit.map(|l| l.per_second),
+                burst_count = limit.map(|l| l.burst_count),
+                "the server-wide send limit is now in force"
+            );
+            Ok(())
+        });
+        if options.migration_configs.is_some() {
+            // Read from the store when a migration starts (`crate::migration::StoreSourceConfigs`),
+            // so there is nothing to swap: the next start sees the change.
+            live.on_change("migration", |_| Ok(()));
+        }
+    }
     let (user_state, e2e_state, push_state) = build_session_mounts(&backend, &auth_state, &rooms)?;
     // The user directory is searched in `hs-auth`, which cannot see rooms; the hub can, and says
     // who each searcher is allowed to find.

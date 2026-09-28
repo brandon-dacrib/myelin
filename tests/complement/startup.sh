@@ -112,6 +112,10 @@ auth:
 federation:
 $FEDERATION_CA_CONFIG
   ip_range_blocklist: []
+# Complement's tests send faster than any person does; Synapse's Complement image lifts its
+# rc_message limit the same way. Decision 0015: the server-wide send limit is enforced.
+rate_limits:
+  enabled: false
 EOF
 
 # ---- 4. TLS termination in front of the plaintext hs listener ---------------------------------

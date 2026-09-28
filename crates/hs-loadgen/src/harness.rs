@@ -97,7 +97,8 @@ fn write_config(data_dir: &Path, port: u16, server_name: &str) -> Result<PathBuf
         "server:\n  server_name: {server_name}\n\
          listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health, metrics]\n\
          storage:\n  backend: embedded\n  data_dir: {data_dir:?}\n\
-         auth:\n  enable_registration: true\n"
+         auth:\n  enable_registration: true\n\
+         rate_limits:\n  enabled: false\n"
     );
     let config_path = data_dir.join("hs-loadgen.yaml");
     std::fs::write(&config_path, yaml).context("writing generated config")?;

@@ -3720,7 +3720,9 @@ fn config_schema_document(sections: &[ConfigSection]) -> ConfigSchema {
                 section: section.name.clone(),
                 origin: origin.clone(),
                 secret: secrets.is_secret(pointer),
-                reloadable: section.reloadable,
+                // Per setting: a section can hold hot settings without every setting in it
+                // being one (`hs_config::reload::HOT_SETTINGS`).
+                reloadable: section.reloadable || hs_config::reload::is_hot_setting(pointer),
                 editable: !bootstrap && origin != "environment",
                 bootstrap,
             });
@@ -8087,7 +8089,11 @@ mod tests {
             !pinned.editable,
             "the interface must not offer an edit this server would refuse"
         );
-        assert!(pinned.reloadable);
+        assert!(
+            !pinned.reloadable,
+            "the federation client reads its timeout once, at startup"
+        );
+        assert!(setting("/rate_limits/message/burst_count").reloadable);
 
         let bootstrap = setting("/storage/data_dir");
         assert!(!bootstrap.editable);
@@ -8220,7 +8226,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let report: crate::model::ConfigReloadReport =
             serde_json::from_slice(&body_bytes(response).await).unwrap();
-        assert!(report.reloaded_sections.contains(&"federation".to_string()));
+        assert!(
+            report
+                .reloaded_sections
+                .contains(&"rate_limits".to_string())
+        );
         assert!(!report.reloaded_sections.contains(&"server".to_string()));
 
         let event = tokio::time::timeout(Duration::from_millis(200), rx.recv())

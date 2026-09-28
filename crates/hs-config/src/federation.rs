@@ -1,5 +1,5 @@
 //! Federation policy: reachability rules, allow/deny lists and outbound
-//! transport tuning. Hot-reloadable (see [`crate::reload`]).
+//! transport tuning. Read at startup; see [`crate::reload`] for what a running server re-reads.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

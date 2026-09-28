@@ -15,6 +15,7 @@
 //! before it returns.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use hs_admin::model::{ConfigChange, ConfigReloadReport, ConfigSection, ConfigValidateReport};
@@ -29,6 +30,7 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 
 use crate::bootstrap::OpenedConfigStore;
+use crate::live_config::{Applied, LiveConfig};
 
 /// How many changes `GET /config/{section}` carries with a section.
 const SECTION_HISTORY_LIMIT: usize = 20;
@@ -42,17 +44,20 @@ const HISTORY_SCAN: usize = 500;
 struct State {
     layers: Layers,
     meta: ConfigMeta,
-    /// When each section was last reloaded, RFC 3339. Only ever written by [`StoreConfigSource::reload`].
+    /// When each section was last hot-applied to the running server, RFC 3339. Written by
+    /// [`StoreConfigSource::refresh`], which every write goes through.
     reloaded_at: BTreeMap<String, String>,
+    /// What takes a change on in the running server (`crate::live_config`). `None` in a process
+    /// that serves nothing, where there is nothing to apply a change to.
+    live: Option<Arc<LiveConfig>>,
 }
 
 /// A [`ConfigSource`] backed by the running server's [`OpenedConfigStore`].
 pub struct StoreConfigSource {
     store: OpenedConfigStore,
     state: RwLock<State>,
-    /// The configuration this process actually booted on, frozen. `reload` compares against it to
-    /// report what has changed since -- which is the only honest thing it can say, because
-    /// nothing in this server re-reads its configuration while running yet.
+    /// The configuration this process actually booted on, frozen. `validate` and `reload`
+    /// compare against it to report which changes wait for a restart.
     booted_config: Config,
 }
 
@@ -77,8 +82,22 @@ impl StoreConfigSource {
                 layers,
                 meta,
                 reloaded_at: BTreeMap::new(),
+                live: None,
             }),
             booted_config,
+        }
+    }
+
+    /// Hot-applies every change this source writes, or reads back, to `live` -- the running
+    /// server's side of the configuration (`crate::live_config`).
+    #[must_use]
+    pub fn with_live(self, live: Arc<LiveConfig>) -> Self {
+        let mut state = self.state.into_inner();
+        state.live = Some(live);
+        Self {
+            store: self.store,
+            state: RwLock::new(state),
+            booted_config: self.booted_config,
         }
     }
 
@@ -93,12 +112,31 @@ impl StoreConfigSource {
     }
 
     /// Re-reads the database layer from the store, so the next resolve sees what was just
-    /// written. See the module docs for what happens without it.
-    fn refresh(state: &mut State, store: &OpenedConfigStore) -> Result<(), StoreError> {
+    /// written (see the module docs for what happens without it), and hot-applies what changed
+    /// to the running server. Every write path calls this, which is what makes a change take
+    /// effect however it was made. `None` when there is no running server to apply to, or the
+    /// configuration does not resolve (the caller reports that itself).
+    fn refresh(
+        state: &mut State,
+        store: &OpenedConfigStore,
+    ) -> Result<Option<Applied>, StoreError> {
         let stored = store.load()?;
         state.layers.database = stored.document;
         state.meta = stored.meta;
-        Ok(())
+        let Some(live) = state.live.clone() else {
+            return Ok(None);
+        };
+        let Ok(resolved) = state.layers.resolve() else {
+            return Ok(None);
+        };
+        let applied = live.apply(&resolved.config);
+        if !applied.reloaded.is_empty() {
+            let now = hs_http::time::now_rfc3339();
+            for section in &applied.reloaded {
+                state.reloaded_at.insert(section.clone(), now.clone());
+            }
+        }
+        Ok(Some(applied))
     }
 
     /// This section's own changes, newest first.
@@ -135,6 +173,28 @@ impl StoreConfigSource {
         Ok(out)
     }
 }
+
+/// [`Applied`] on the wire: a section that failed to apply is an error at its pointer.
+fn reload_report(applied: Applied, revision: u64) -> ConfigReloadReport {
+    ConfigReloadReport {
+        reloaded_sections: applied.reloaded,
+        errors: applied
+            .failed
+            .into_iter()
+            .map(|(section, reason)| {
+                hs_http::ValidationError::new(
+                    format!("/{section}"),
+                    format!(
+                        "not applied to the running server, which keeps the old value: {reason}"
+                    ),
+                )
+            })
+            .collect(),
+        requires_restart: applied.requires_restart,
+        revision,
+    }
+}
+
 
 /// A store failure is not the caller's fault and not something they can fix by changing the
 /// request: it is this server being unable to answer.
@@ -298,12 +358,13 @@ impl ConfigSource for StoreConfigSource {
             }
         }
 
-        Self::refresh(&mut state, &self.store).map_err(|e| store_error(&e))?;
+        let applied = Self::refresh(&mut state, &self.store).map_err(|e| store_error(&e))?;
 
         let resolved = state
             .layers
             .resolve()
             .map_err(|e| SourceError::Unavailable(e.to_string()))?;
+        let revision = state.meta.revision;
         let mut section = config_section(
             &resolved,
             &request.section,
@@ -313,36 +374,33 @@ impl ConfigSource for StoreConfigSource {
         section.history = self
             .section_history(&request.section, SECTION_HISTORY_LIMIT)
             .map_err(|e| store_error(&e))?;
+        section.applied = applied.map(|applied| reload_report(applied, revision));
         Ok(section)
     }
 
     async fn reload(&self) -> Result<ConfigReloadReport, SourceError> {
         let mut state = self.state.write().await;
-        Self::refresh(&mut state, &self.store).map_err(|e| store_error(&e))?;
+        let applied = Self::refresh(&mut state, &self.store).map_err(|e| store_error(&e))?;
         let resolved = state
             .layers
             .resolve()
             .map_err(|e| SourceError::Invalid(e.to_string()))?;
 
-        // Honest, and unflattering: nothing in this server re-reads its configuration while
-        // running. The rate limiter, the federation policy and the telemetry layer are all built
-        // once at startup, so there is no section this call can truthfully claim to have swapped
-        // in -- `reloaded_sections` stays empty until one of them grows a live read. What it does
-        // do is refresh what the API itself serves, and report every section that has drifted
-        // from what the process booted on, so an operator is told a restart is pending rather
-        // than left believing their change is in force.
-        let requires_restart: Vec<String> =
-            hs_config::reload::sections_requiring_restart(&self.booted_config, &resolved.config)
-                .into_iter()
-                .map(str::to_owned)
-                .collect();
-
-        Ok(ConfigReloadReport {
-            reloaded_sections: Vec::new(),
-            errors: Vec::new(),
-            requires_restart,
-            revision: state.meta.revision,
-        })
+        // What was hot-applied is what `crate::live_config` says it applied, and nothing else;
+        // every section that has drifted from what the process booted on in a setting only a
+        // restart reads is reported, so an operator is told a restart is pending rather than
+        // left believing their change is in force.
+        let applied = applied.unwrap_or_else(|| Applied {
+            requires_restart: hs_config::reload::sections_requiring_restart(
+                &self.booted_config,
+                &resolved.config,
+            )
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            ..Applied::default()
+        });
+        Ok(reload_report(applied, state.meta.revision))
     }
 
     async fn history(

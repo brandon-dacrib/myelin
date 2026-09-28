@@ -801,12 +801,19 @@ async fn run_serve(args: &ServeArgs) -> i32 {
     // from, and it is what the admin API's configuration surface writes through: this is the line
     // that turns the management interface from something that displays the configuration into
     // something that changes it.
-    let config_source = std::sync::Arc::new(crate::config_source::StoreConfigSource::new(
-        booted.layers,
-        booted.store,
-        booted.meta,
-        config.clone(),
-    ));
+    // And what makes a saved change take effect without a restart, where one can: the source
+    // applies every change it writes or reads back to this, and the server wires into it the
+    // parts of itself that re-read a setting (`crate::live_config`).
+    let live_config = std::sync::Arc::new(crate::live_config::LiveConfig::new(config.clone()));
+    let config_source = std::sync::Arc::new(
+        crate::config_source::StoreConfigSource::new(
+            booted.layers,
+            booted.store,
+            booted.meta,
+            config.clone(),
+        )
+        .with_live(live_config.clone()),
+    );
     let options = crate::serve::ServeOptions {
         capabilities_config: args.capabilities_config.clone(),
         routes_manifest_path: args.routes_manifest.clone(),
@@ -817,6 +824,7 @@ async fn run_serve(args: &ServeArgs) -> i32 {
             config_source,
         ))),
         media_bulk_pause: std::time::Duration::ZERO,
+        live_config: Some(live_config),
     };
     let handle = match crate::serve::spawn_serve_with_storage(booted.storage, config, options).await
     {

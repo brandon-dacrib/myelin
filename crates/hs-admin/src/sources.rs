@@ -1185,6 +1185,7 @@ pub fn config_section(
         values,
         revision,
         history: Vec::new(),
+        applied: None,
     }
 }
 

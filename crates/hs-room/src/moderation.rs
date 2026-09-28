@@ -15,13 +15,16 @@
 //! - **Rate-limit override**: [`SendLimiter`] holds a token bucket per user with an override,
 //!   filled from [`hs_auth::store::UserRecord::rate_limit_override`]; a sender over it is
 //!   refused `429 M_LIMIT_EXCEEDED` with `retry_after_ms`. An override of `0` per second
-//!   exempts the user. Without an override nothing is limited here: the server-wide
-//!   `rate_limits.message` bucket has never been enforced by this crate, and turning it on is
-//!   a separate decision (it changes the pace of every client and test).
+//!   exempts the user.
+//! - **The server-wide limit**: everybody without an override sends under the configuration's
+//!   `rate_limits.message`, which `hs serve` hands [`SendLimiter::set_server_limit`] at startup
+//!   and again whenever an operator changes it (decision 0015). Without it -- a room layer
+//!   nobody configured, as in this crate's own tests -- nobody without an override is limited.
 //!
-//! Every write refused, swallowed or throttled here is counted in
-//! `hs_room_moderated_writes_total{outcome}` (`suspended`, `shadow_banned`, `rate_limited`),
-//! which `hs serve` registers through [`register_metrics`]; the per-write logs are `debug`.
+//! Every write refused, swallowed or throttled here because of moderation is counted in
+//! `hs_room_moderated_writes_total{outcome}` (`suspended`, `shadow_banned`, `rate_limited`), and
+//! every write refused under the server-wide limit in `hs_room_server_rate_limited_writes_total`;
+//! `hs serve` registers both through [`register_metrics`]. The per-write logs are `debug`.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -48,15 +51,19 @@ struct ModeratedLabels {
 static MODERATED_WRITES: LazyLock<Family<ModeratedLabels, Counter>> =
     LazyLock::new(Family::default);
 
+/// Writes refused under the server-wide `rate_limits.message`, process-wide for the same reason.
+static SERVER_RATE_LIMITED: LazyLock<Counter> = LazyLock::new(Counter::default);
+
 fn count(outcome: &'static str) {
     MODERATED_WRITES
         .get_or_create(&ModeratedLabels { outcome })
         .inc();
 }
 
-/// Registers `hs_room_moderated_writes_total{outcome}` into `registry`: writes this crate
+/// Registers `hs_room_moderated_writes_total{outcome}` into `registry` -- writes this crate
 /// refused from a suspended account (`suspended`), swallowed from a shadow-banned one
-/// (`shadow_banned`) or throttled under a rate-limit override (`rate_limited`).
+/// (`shadow_banned`) or throttled under a rate-limit override (`rate_limited`) -- and
+/// `hs_room_server_rate_limited_writes_total`, writes refused under the server-wide limit.
 pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
     // Registered without `_total`: the text encoder appends it.
     registry.register(
@@ -64,6 +71,11 @@ pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
         "Room writes refused, swallowed or throttled because of an administrator's moderation of \
          the account, by outcome: suspended, shadow_banned, rate_limited",
         MODERATED_WRITES.clone(),
+    );
+    registry.register(
+        "hs_room_server_rate_limited_writes",
+        "Room writes refused 429 under the server-wide rate_limits.message limit",
+        SERVER_RATE_LIMITED.clone(),
     );
 }
 
@@ -100,31 +112,68 @@ pub(crate) fn note_shadowed(requester: &Requester, what: &str) {
     count("shadow_banned");
 }
 
+/// Which limit a user's bucket was filled under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitSource {
+    /// The administrator's per-user override (`users.rate_limit.*`).
+    Override,
+    /// The server-wide `rate_limits.message`, for everybody without an override.
+    Server,
+}
+
 struct Bucket {
     tokens: f64,
     last_ms: u64,
     per_second: f64,
     burst: f64,
+    source: LimitSource,
 }
 
-/// Token buckets for the users who have a rate-limit override. In-process: in cluster mode each
-/// replica limits what it handles, which with room-sharded routing is close to per-room. A
-/// bucket is rebuilt when the override it was built from changes.
+/// Token buckets for senders: under an administrator's per-user override when there is one,
+/// otherwise under the server-wide limit ([`SendLimiter::set_server_limit`], the configuration's
+/// `rate_limits.message`), which is swapped in while the server runs. In-process: in cluster
+/// mode each replica limits what it handles, which with room-sharded routing is close to
+/// per-room.
+///
+/// A bucket starts afresh, full, when the user gains or loses an override or their override
+/// changes. When the server-wide limit changes, a bucket under it keeps what it has left,
+/// clamped to the new burst: lowering the limit takes effect at once rather than handing every
+/// sender a fresh burst first.
 #[derive(Default)]
 pub struct SendLimiter {
     buckets: Mutex<HashMap<OwnedUserId, Bucket>>,
+    server: std::sync::RwLock<Option<RateLimitOverrideRecord>>,
 }
 
 impl SendLimiter {
-    /// An empty limiter.
+    /// An empty limiter, with no server-wide limit.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Takes one event's worth from `user`'s bucket under `limit` at `now_ms`. `Err` carries how
-    /// long until the next event would be allowed, in milliseconds. `limit: None` (no override)
-    /// or `per_second == 0` (exempt) always allows, and forgets any bucket the user had.
+    /// Replaces the server-wide limit for senders without an override. `None`, or a
+    /// `per_second` of `0`, limits nobody. Takes effect on the next event anybody sends.
+    pub fn set_server_limit(&self, limit: Option<RateLimitOverrideRecord>) {
+        *self
+            .server
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = limit;
+    }
+
+    /// The server-wide limit in force.
+    #[must_use]
+    pub fn server_limit(&self) -> Option<RateLimitOverrideRecord> {
+        *self
+            .server
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Takes one event's worth from `user`'s bucket at `now_ms`, under `limit` (their override)
+    /// or, without one, under the server-wide limit. `Err` carries how long until the next event
+    /// would be allowed, in milliseconds. An override with `per_second == 0` (exempt), or no
+    /// limit at all, always allows and forgets any bucket the user had.
     ///
     /// # Errors
     /// The wait, when the bucket is empty.
@@ -134,6 +183,23 @@ impl SendLimiter {
         limit: Option<RateLimitOverrideRecord>,
         now_ms: u64,
     ) -> Result<(), u64> {
+        self.take(user, limit, now_ms).map_err(|(wait, _)| wait)
+    }
+
+    /// [`Self::check`], saying which limit refused.
+    ///
+    /// # Errors
+    /// The wait, and whether the override or the server-wide limit refused.
+    pub fn take(
+        &self,
+        user: &UserId,
+        limit: Option<RateLimitOverrideRecord>,
+        now_ms: u64,
+    ) -> Result<(), (u64, LimitSource)> {
+        let (limit, source) = match limit {
+            Some(own) => (Some(own), LimitSource::Override),
+            None => (self.server_limit(), LimitSource::Server),
+        };
         let mut buckets = self
             .buckets
             .lock()
@@ -148,15 +214,25 @@ impl SendLimiter {
             last_ms: now_ms,
             per_second: limit.per_second,
             burst,
+            source,
         });
         #[allow(clippy::float_cmp)]
-        if bucket.per_second != limit.per_second || bucket.burst != burst {
+        let changed = bucket.per_second != limit.per_second || bucket.burst != burst;
+        if bucket.source != source || (changed && source == LimitSource::Override) {
             *bucket = Bucket {
                 tokens: burst,
                 last_ms: now_ms,
                 per_second: limit.per_second,
                 burst,
+                source,
             };
+        } else if changed {
+            // The server-wide limit moved under this bucket. When is not known (the change is
+            // seen on this sender's next event), so the time since their last one refills at
+            // the new rate, below, and what they had is kept up to the new burst.
+            bucket.tokens = bucket.tokens.min(burst);
+            bucket.per_second = limit.per_second;
+            bucket.burst = burst;
         }
         let elapsed = now_ms.saturating_sub(bucket.last_ms) as f64 / 1000.0;
         bucket.tokens = (bucket.tokens + elapsed * bucket.per_second).min(bucket.burst);
@@ -167,7 +243,7 @@ impl SendLimiter {
         } else {
             let wait = (1.0 - bucket.tokens) / bucket.per_second * 1000.0;
             // The float is small and positive here; the cast saturates rather than wraps.
-            Err(wait.ceil() as u64)
+            Err((wait.ceil() as u64, source))
         }
     }
 }
@@ -209,10 +285,18 @@ pub(crate) async fn check_send_limit<B: KvBackend + 'static>(
     state
         .rooms
         .send_limiter()
-        .check(&requester.user_id, limit, now_ms())
-        .map_err(|retry_after_ms| {
-            tracing::debug!(user = %requester.user_id, retry_after_ms, "a sender is over their rate-limit override");
-            count("rate_limited");
+        .take(&requester.user_id, limit, now_ms())
+        .map_err(|(retry_after_ms, source)| {
+            match source {
+                LimitSource::Override => {
+                    tracing::debug!(user = %requester.user_id, retry_after_ms, "a sender is over their rate-limit override");
+                    count("rate_limited");
+                }
+                LimitSource::Server => {
+                    tracing::debug!(user = %requester.user_id, retry_after_ms, "a sender is over the server-wide rate limit");
+                    SERVER_RATE_LIMITED.inc();
+                }
+            }
             RoomError::LimitExceeded(retry_after_ms)
         })
 }
@@ -281,5 +365,65 @@ mod tests {
             burst_count: 5,
         });
         assert!(limiter.check(alice, looser, 0).is_ok());
+    }
+
+    fn limit(per_second: f64, burst_count: u32) -> Option<RateLimitOverrideRecord> {
+        Some(RateLimitOverrideRecord {
+            per_second,
+            burst_count,
+        })
+    }
+
+    #[test]
+    fn without_an_override_the_server_limit_applies_and_says_so() {
+        let limiter = SendLimiter::new();
+        let alice = user_id!("@alice:example.org");
+        limiter.set_server_limit(limit(1.0, 2));
+        assert!(limiter.take(alice, None, 0).is_ok());
+        assert!(limiter.take(alice, None, 0).is_ok());
+        assert_eq!(
+            limiter.take(alice, None, 0),
+            Err((1_000, LimitSource::Server))
+        );
+        // An override outranks it, in both directions: exempt...
+        assert!(limiter.take(alice, limit(0.0, 1), 0).is_ok());
+        // ...or stricter, and the refusal names the override.
+        assert!(limiter.take(alice, limit(0.5, 1), 0).is_ok());
+        assert_eq!(
+            limiter.take(alice, limit(0.5, 1), 0),
+            Err((2_000, LimitSource::Override))
+        );
+        // Cleared, the server limit is back with a full bucket of its own.
+        assert!(limiter.take(alice, None, 0).is_ok());
+    }
+
+    #[test]
+    fn lowering_the_server_limit_takes_effect_at_once_and_keeps_what_is_left() {
+        let limiter = SendLimiter::new();
+        let alice = user_id!("@alice:example.org");
+        let bob = user_id!("@bob:example.org");
+        limiter.set_server_limit(limit(0.2, 10));
+        for _ in 0..8 {
+            assert!(limiter.take(alice, None, 0).is_ok());
+        }
+        // Alice has two left. Lowered to a burst of one, she keeps one, not a fresh burst.
+        limiter.set_server_limit(limit(0.01, 1));
+        assert_eq!(limiter.server_limit(), limit(0.01, 1));
+        assert!(limiter.take(alice, None, 0).is_ok());
+        assert_eq!(
+            limiter.take(alice, None, 0),
+            Err((100_000, LimitSource::Server))
+        );
+        // Somebody who never sent starts with the new burst.
+        assert!(limiter.take(bob, None, 0).is_ok());
+        assert!(limiter.take(bob, None, 0).is_err());
+        // Raised again, what she has left refills at the new rate from here.
+        limiter.set_server_limit(limit(10.0, 5));
+        assert!(limiter.take(alice, None, 100).is_ok());
+        // Switched off, nobody is limited and the buckets are forgotten.
+        limiter.set_server_limit(None);
+        for _ in 0..50 {
+            assert!(limiter.take(alice, None, 100).is_ok());
+        }
     }
 }

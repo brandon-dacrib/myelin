@@ -1162,10 +1162,15 @@ cannot do, in rough order of how often an operator will hit it:
   are global.
 - **Validate across sections.** `POST /config/validate` is sent one section at a time, so a
   constraint spanning two only fails at save.
-- **Reload anything.** `config.reload` reports honestly that nothing was hot-applied, because
-  nothing in this server re-reads its configuration while running — the rate limiter, the
-  federation policy and the telemetry layer are built once at startup. Giving any one of them a
-  live read is what makes `reloaded_sections` non-empty.
+- **Reload anything — started (decision 0015, branch `agent/config-reload`).** A change to
+  `rate_limits` now takes effect on the running server the moment it is saved (the server-wide
+  send limit is enforced for the first time, and swapped live), and `config.update`,
+  `config.reload` and `config.validate` say which sections were applied and which wait for a
+  restart (`hs_config::reload::HOT_SETTINGS`, `hs_cli::live_config`). Left: the federation
+  allow/deny lists and the log level (the next two to wire); the rest of `rate_limits`
+  (`login`, `registration`, `joins_*`, `federation`, ... are accepted but enforced nowhere);
+  `appservices` tuning; and other replicas of a cluster, which take a change on only at their
+  own next write or `config.reload`.
 - **Nothing here, as it turns out** — this bullet used to claim the interface signs an operator out
   when a request merely fails. It does not: `signInWithToken` already distinguishes a failed fetch
   ("Couldn't reach the server") from a 401 ("That token wasn't recognized"). What actually

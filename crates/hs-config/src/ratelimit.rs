@@ -1,7 +1,12 @@
 //! Rate limits: one token-bucket per limited action. Corresponds to
 //! Synapse's `rc_*` family (`rc_message`, `rc_registration`, `rc_login`,
 //! `rc_joins`, `rc_admin_redaction`, `rc_federation`). Hot-reloadable (see
-//! [`crate::reload`]).
+//! [`crate::reload`]): a change applies to the running server at once.
+//!
+//! Enforced today: `message`, per sender, on sending an event, setting state and redacting
+//! (`429 M_LIMIT_EXCEEDED` with `retry_after_ms`); an administrator's per-user override
+//! replaces it for that user. The other buckets are accepted and kept but nothing enforces them
+//! yet.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -82,7 +87,9 @@ pub struct RateLimitConfig {
     /// only — never recommended in production).
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Per-user event sending. Corresponds to Synapse's `rc_message`.
+    /// Per-user event sending: messages, state and redactions. Corresponds to Synapse's
+    /// `rc_message`. A `per_second` of `0` limits nobody. Appservices that registered with
+    /// `rate_limited: false` are exempt.
     #[serde(default = "default_message")]
     pub message: RateLimitBucket,
     /// `POST /register`. Corresponds to Synapse's `rc_registration`.

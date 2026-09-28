@@ -1353,7 +1353,7 @@
           "default": true
         },
         "message": {
-          "description": "Per-user event sending. Corresponds to Synapse's `rc_message`.",
+          "description": "Per-user event sending: messages, state and redactions. Corresponds to Synapse's\n`rc_message`. A `per_second` of `0` limits nobody. Appservices that registered with\n`rate_limited: false` are exempt.",
           "$ref": "#/$defs/RateLimitBucket",
           "default": {
             "per_second": 0.2,

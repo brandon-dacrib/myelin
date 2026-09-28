@@ -46,6 +46,38 @@ offering operations); before that 2026-09-26 (three public recovery operations);
 >   changes, lists, conflicts, reverts, forces, rotates and reverts a secret, and then reads the
 >   store after shutdown to see the old secret back.
 
+> **2026-09-28, configuration changes take effect without a restart** (branch
+> `agent/config-reload`, decision 0015). Saving a hot setting in the interface now changes the
+> running server, and `config.update`, `config.reload` and `config.validate` say truthfully which
+> sections were applied and which wait for a restart.
+>
+> - **The boundary** (`crates/hs-config/src/reload.rs`): `HOT_SETTINGS` lists, as JSON Pointers,
+>   only what something in `hs serve` re-reads; `RELOADABLE_SECTIONS` is the sections that are
+>   hot throughout (`rate_limits`, `migration`). `federation`, `telemetry` and `appservices` were
+>   listed and were not re-read by anything; they now say "restart required" until they are.
+>   `sections_requiring_restart` ignores hot settings; `hot_sections_changed` is new.
+>   `ConfigSettingInfo.reloadable` in `GET /config/schema` is per setting.
+> - **The choke point** (`crates/hs-cli/src/live_config.rs`): `LiveConfig` holds the appliers
+>   each part of the server registers at startup (`on_change(section, ..)`); the store-backed
+>   `ConfigSource` applies what it reads back after every write (`refresh`), so update, reload
+>   and any later write path (a revert) hot-apply alike. A failed applier keeps the old value and
+>   is retried on the next write. Logged per section ("configuration section reloaded") and
+>   counted in `hs_config_reloads_total{section,outcome}` (`applied`, `failed`, `unwired`).
+> - **Rate limits**: the server-wide `rate_limits.message` is enforced for the first time
+>   (`hs_room::moderation::SendLimiter::set_server_limit`, on send, state and redaction; an
+>   administrator's override still wins), and swapped live; a sender keeps what is left of their
+>   bucket, clamped to the new burst. Refusals are counted in
+>   `hs_room_server_rate_limited_writes_total`. Complement's and `hs-loadgen`'s configurations
+>   switch it off, as Synapse's Complement image does.
+> - **Answers**: `ConfigSection.applied` (a `ConfigReloadReport`) on `config.update`'s answer;
+>   `config.reload` reports what `LiveConfig` applied rather than nothing.
+> - **Verified on the real binary**: `crates/hs-cli/tests/config_reload.rs` boots `hs serve`,
+>   sends three messages, lowers `rate_limits.message` with `PATCH /api/v1/config/rate_limits`
+>   (answer: `applied.reloaded_sections == ["rate_limits"]`), and the next-but-one message is
+>   `429 M_LIMIT_EXCEEDED`; a `federation` change answers `requires_restart: ["federation"]`
+>   (update, validate and reload alike); switching the limit off lets the client send at once;
+>   the log line and both counters are checked.
+>
 > **2026-09-28, Users: moderation and activity, 14 operations** (branch
 > `agent/user-moderation`). `tools/admin_api_coverage.py` now counts **154 of 158** with
 > Rooms 23/23 and Migration 8/8 (below); with the devices-and-identity half below, Users is 41/41.

@@ -1,4 +1,4 @@
-//! Metrics, tracing, logging and error reporting. Hot-reloadable (see
+//! Metrics, tracing, logging and error reporting. Read at startup (see
 //! [`crate::reload`]).
 
 use std::path::PathBuf;

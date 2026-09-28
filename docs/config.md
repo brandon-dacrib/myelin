@@ -12,7 +12,7 @@ Decision 0010: this server is administered through the admin API and the web int
 
 ## Reload boundary
 
-Sections not listed here require a process restart to change; see the doc comment on `hs_config::reload` for why each one does or does not. Currently reloadable without a restart: `rate_limits`, `federation`, `telemetry`, `appservices`, `migration`.
+Sections not listed here require a process restart to change; see the doc comment on `hs_config::reload` for why each one does or does not. Currently reloadable without a restart: `rate_limits`, `migration`.
 
 ## `server`
 
@@ -112,7 +112,7 @@ Media repository settings.
 
 Federation reachability and transport policy.
 
-**Reloadable without a restart.**
+**Restart required to change.**
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -174,7 +174,7 @@ Authentication, session and registration settings.
 
 Appservice delivery settings, and registration files to import once.
 
-**Reloadable without a restart.**
+**Restart required to change.**
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -187,7 +187,7 @@ Appservice delivery settings, and registration files to import once.
 
 Telemetry: metrics, tracing, logging and error reporting.
 
-**Reloadable without a restart.**
+**Restart required to change.**
 
 | Field | Type | Default | Description |
 |---|---|---|---|

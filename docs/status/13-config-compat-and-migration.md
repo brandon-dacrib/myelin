@@ -8,6 +8,16 @@ Last updated: 2026-09-28 (the Migration admin area and the online importer, firs
 shipped work: URL-preview config fields, the `serve_server_wellknown`/`federation_custom_ca_list`/
 `max_spider_size` translation-table corrections, and a first slice of `/_synapse/admin` routes).
 
+## 2026-09-28: the reload boundary says what the server does (decision 0015)
+
+`crates/hs-config/src/reload.rs` claimed `rate_limits`, `federation`, `telemetry` and
+`appservices` were reloadable while nothing in `hs serve` re-read any of them. It is now
+setting-granular and truthful: `HOT_SETTINGS` (JSON Pointers) lists only what a running server
+re-reads -- today `/rate_limits` and `/migration` -- and grows as something is wired
+(`crates/hs-cli/src/live_config.rs`). `sections_requiring_restart` ignores hot settings, and
+`hot_sections_changed` says which sections a running server has to re-read. This supersedes the
+"reload boundary is section-granular" decision below. See status 15 for the rest.
+
 ## 2026-09-28: the Migration admin area and the online importer (8/8)
 
 Before this there was no importer, only its design (`docs/compat/synapse-importer-mapping.md`).
