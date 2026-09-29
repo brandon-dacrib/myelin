@@ -27,6 +27,9 @@ offering operations); before that 2026-09-26 (three public recovery operations);
 >   starts with removed OIDC providers, then enables MAS through a second store handle;
 >   reverting the removal is rejected without changing the store. Without the fix it committed
 >   incompatible authentication settings and only reported an error while rendering the result.
+>   Ordinary saves also refresh before validation and compare-and-swap against that exact revision,
+>   retrying up to three times without `If-Match`. A second regression rejects an OIDC patch after
+>   another writer enabled MAS, both with and without a supplied revision.
 > - **Observability**: audit `config.history.revert` (from/to per setting, redacted), event
 >   `config.reverted` (`section`, `revision`, `reverted_revision`, `forced`), and a log line
 >   `reverted a configuration change` (or `nothing to revert`).

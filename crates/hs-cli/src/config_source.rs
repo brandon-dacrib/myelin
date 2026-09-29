@@ -264,22 +264,39 @@ impl ConfigSource for StoreConfigSource {
                 pinned.join(", ")
             )));
         }
-        // Validate what the patch would produce, not the patch: a stored setting this server then
-        // refuses to boot on is far worse than a rejected request.
-        state
-            .layers
-            .resolve_with_patch(&request.section, &request.patch)
-            .map_err(|e| SourceError::Invalid(e.to_string()))?;
+        // Validate and replace one database revision. A different replica may update settings
+        // outside this patch, including ones that constrain whether the patch is valid.
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            Self::refresh(&mut state, &self.store).map_err(|e| store_error(&e))?;
+            let revision = state.meta.revision;
+            if let Some(expected) = request.expected_revision
+                && expected != revision
+            {
+                return Err(store_error(&StoreError::RevisionMismatch {
+                    expected,
+                    actual: revision,
+                }));
+            }
+            state
+                .layers
+                .resolve_with_patch(&request.section, &request.patch)
+                .map_err(|e| SourceError::Invalid(e.to_string()))?;
 
-        self.store
-            .patch_section_expecting(
+            match self.store.patch_section_expecting(
                 &request.section,
                 &request.patch,
                 request.actor.as_deref(),
                 now_ms(),
-                request.expected_revision,
-            )
-            .map_err(|e| store_error(&e))?;
+                Some(revision),
+            ) {
+                Ok(_) => break,
+                Err(StoreError::RevisionMismatch { .. })
+                    if request.expected_revision.is_none() && attempts < 3 => {}
+                Err(e) => return Err(store_error(&e)),
+            }
+        }
 
         Self::refresh(&mut state, &self.store).map_err(|e| store_error(&e))?;
 
@@ -526,5 +543,54 @@ mod tests {
         let stored = writer.load().unwrap();
         assert_eq!(stored.meta.revision, latest.meta.revision);
         assert_eq!(stored.document["auth"]["oidc_providers"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_patch_validates_against_changes_from_another_source() {
+        for conditional in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let backend = hs_kv::fjall_backend::FjallBackend::open(dir.path()).unwrap();
+            let storage = crate::storage::OpenedStorage::Embedded(backend);
+            let writer = OpenedConfigStore::open(&storage).unwrap();
+            let initial = writer.load().unwrap();
+            let layers = Layers {
+                file: Some(FileLayer {
+                    path: "hs.yaml".into(),
+                    document: json!({"server": {"server_name": "example.org"}}),
+                }),
+                database: initial.document,
+                ..Layers::default()
+            };
+            let booted = layers.resolve().unwrap().config;
+            let source = StoreConfigSource::new(
+                layers,
+                OpenedConfigStore::open(&storage).unwrap(),
+                initial.meta,
+                booted,
+            );
+            let latest = writer
+                .patch_section(
+                    "auth",
+                    &json!({"mas_delegation": {"endpoint": "https://mas.example"}}),
+                    None,
+                    1,
+                )
+                .unwrap();
+            let result = source
+                .patch_section(ConfigPatch {
+                    section: "auth".into(),
+                    patch: json!({"oidc_providers": [{
+                        "idp_id": "example", "issuer": "https://issuer.example",
+                        "client_id": "myelin"
+                    }]}),
+                    actor: None,
+                    expected_revision: conditional.then_some(latest.meta.revision),
+                })
+                .await;
+            assert!(matches!(result, Err(SourceError::Invalid(_))), "{result:?}");
+            let stored = writer.load().unwrap();
+            assert_eq!(stored.meta.revision, latest.meta.revision);
+            assert_eq!(stored.document, latest.document);
+        }
     }
 }

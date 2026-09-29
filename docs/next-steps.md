@@ -1154,7 +1154,9 @@ cannot do, in rough order of how often an operator will hit it:
   page of history in the URL. Verified through the real `hs` binary
   (`crates/hs-cli/tests/config_history.rs`, `web/e2e-real/configuration.spec.ts`).
   Revert validation checks the current database revision, including changes from another
-  writer; a regression test rejects restoring OIDC providers after MAS was enabled elsewhere.
+  writer; regression tests reject restoring or adding OIDC providers after MAS was enabled
+  elsewhere. Saves use the validated revision as their atomic write precondition and retry up
+  to three times when another writer wins and no `If-Match` was sent.
   **Left**: changes recorded before this cannot be reverted, because their prior values were never
   kept. History is never pruned. The mock's revisions are per section while the real server's
   are global.
