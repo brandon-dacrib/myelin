@@ -44,7 +44,7 @@ async function signIn(page: Page) {
 
 async function shot(page: Page, name: string) {
   await settle(page);
-  await page.screenshot({ path: `test-results/real-configuration-${name}.png`, fullPage: true });
+  await page.screenshot({ path: `test-results/real-configuration-${name}.png`, fullPage: false });
 }
 
 async function saveSection(page: Page, label: string) {
@@ -198,6 +198,7 @@ test.describe("configuration against the real server", () => {
     await expect(latest.getByTitle("federation.client_timeout")).toContainText(
       /Client timeout:\s*61s\s*to\s*62s/,
     );
+    await history.scrollIntoViewIfNeeded();
     await shot(page, "history");
 
     await latest.getByRole("button", { name: `Revert revision ${revision}` }).click();

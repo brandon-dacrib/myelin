@@ -1,5 +1,13 @@
 # 16. Management web interface: status
 
+Configuration history verification, 2026-09-28: the real-server configuration suite passed
+4/4 after rebasing onto main. Viewport captures show
+[history](../design/screenshots/configuration-history-real.png),
+[the revert dialog](../design/screenshots/configuration-revert-dialog-real.png), and
+[the recorded revert](../design/screenshots/configuration-reverted-real.png).
+The capture helper scrolls history into view and captures the viewport, avoiding the blank
+area below the application's own scrolling container.
+
 ## Current update: 2026-09-28 (a configuration section's history, setting by setting, with revert)
 
 Branch `agent/config-history`. The section page's **Change history**
