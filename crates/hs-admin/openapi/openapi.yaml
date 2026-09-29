@@ -8308,7 +8308,7 @@ components:
             $ref: '#/components/schemas/ConfigChange'
         applied:
           $ref: '#/components/schemas/ConfigReloadReport'
-          description: 'Only on the answer to config.update: what the write did to the running server -- the sections it hot-applied (reloaded_sections) and those whose change waits for a restart (requires_restart), as config.reload reports them. Absent on reads.'
+          description: 'Only on the answer to config.update or config.history.revert: what the write did to the running server -- the sections it hot-applied (reloaded_sections) and those whose change waits for a restart (requires_restart), as config.reload reports them. Absent on reads.'
     ConfigChange:
       type: object
       properties:

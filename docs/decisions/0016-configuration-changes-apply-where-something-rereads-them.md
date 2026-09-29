@@ -1,4 +1,4 @@
-# 0015. A configuration change applies at once where something re-reads it, and the server-wide send limit is enforced
+# 0016. A configuration change applies at once where something re-reads it, and the server-wide send limit is enforced
 
 Date: 2026-09-28. Status: accepted. Tracks: 15 (admin API), 13 (configuration), 04 (rooms), 12
 (platform), 14 (test harnesses).
@@ -27,7 +27,7 @@ honestly by never listing a section as reloaded, which made it honest and useles
    reload and any later write path such as a revert all go through), so no HTTP handler has to
    remember to. Each section applied, failed or unwired is logged and counted in
    `hs_config_reloads_total{section,outcome}`. A section whose applier fails keeps its old value
-   and is tried again on the next write.
+   and is tried again on the next write or ten-second follower tick, even at the same revision.
 3. **Answers carry what happened.** `config.update`'s answer has `applied` (a
    `ConfigReloadReport`: `reloaded_sections`, `requires_restart`, `errors`); `config.reload`
    answers the same shape; `config.validate`'s `requires_restart` uses the same boundary.
@@ -52,5 +52,6 @@ honestly by never listing a section as reloaded, which made it honest and useles
   also checks the store's revision every ten seconds (`StoreConfigSource::follow_store`) and
   applies what moved, so the others follow within that long; so does a server whose store `hs
   config` wrote to directly.
-- `federation`, `telemetry` and `appservices` are now reported as needing a restart, which is
-  true; each is moved into `HOT_SETTINGS` a setting at a time as something re-reads it.
+- Federation allow/block lists and the telemetry log filter apply immediately. Other
+  federation and telemetry settings, and appservice settings, need a restart; each joins
+  `HOT_SETTINGS` when a running component starts re-reading it.

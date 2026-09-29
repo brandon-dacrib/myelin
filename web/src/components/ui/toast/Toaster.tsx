@@ -21,7 +21,7 @@ export function Toaster() {
             if (!open) dismissToast(t.id);
           }}
           className={cn(
-            "grid grid-cols-[auto_max-content] items-start gap-x-3 gap-y-1 rounded-md border p-4 shadow-2",
+            "grid grid-cols-[minmax(0,1fr)_auto] items-start gap-x-3 gap-y-1 rounded-md border p-4 shadow-2",
             "data-[state=open]:animate-[toast-in-right_240ms_ease-out] data-[state=closed]:animate-[toast-out_120ms_ease-in]",
             t.variant === "danger"
               ? "border-danger-border bg-danger-bg"

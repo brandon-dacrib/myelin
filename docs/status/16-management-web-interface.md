@@ -44,7 +44,7 @@ recorded" with no revert.
 
 ## Update: 2026-09-28 (Configuration: saying whether a save took effect; by track 15, branch `agent/config-reload`)
 
-The server now hot-applies some settings (decision 0015) and says so in `config.update`'s answer
+The server now hot-applies some settings (decision 0016) and says so in `config.update`'s answer
 (`ConfigSection.applied`). The section page's toast reads it: "Applied to the running server.",
 "Stored. It takes effect the next time this server restarts.", both, or the reason the running
 server could not take it. The review dialog and the unsaved-changes bar judge the pending changes
@@ -53,6 +53,12 @@ per setting (`ConfigSettingInfo.reloadable`), and a section with only some hot s
 mocks follow the server's `HOT_SETTINGS`. Checked: `npm run check` (408 tests), `npm run
 test:e2e` (49), and `e2e-real/configuration.spec.ts` against a real `hs serve` (4, including a
 new one that saves a rate limit on the page and checks the toast and `hs_config_reloads_total`).
+
+The revert toast uses the same application report as saving, including pending restarts and
+failures. Verified with `npm run check` (60 files / 443 tests), mock Playwright (50/50), and all
+five real Configuration browser tests. The rate-limit case checks both save and revert.
+Screenshots: `docs/design/screenshots/config-rate-limits-applied.png` and
+`docs/design/screenshots/config-rate-limits-reverted.png`.
 
 ## Current update: 2026-09-28 (a user's moderation and activity; branch `agent/user-moderation`)
 

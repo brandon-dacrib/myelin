@@ -141,15 +141,23 @@ impl StoreConfigSource {
 
     /// Re-reads the store if its revision moved since this source last read it -- a write by
     /// another replica sharing the database, or by `hs config` -- and hot-applies what changed,
-    /// exactly as a write through this source would. `None` when nothing moved.
+    /// exactly as a write through this source would. Failed or unwired hot changes are retried
+    /// even at the same revision. `None` when nothing moved and no hot change is pending.
     ///
     /// # Errors
     /// The store could not be read.
     pub async fn refresh_if_changed(&self) -> Result<Option<Applied>, StoreError> {
-        let known = self.state.read().await.meta.revision;
-        if self.store.load()?.meta.revision == known {
+        let state = self.state.read().await;
+        let pending = state.live.as_ref().is_some_and(|live| {
+            state
+                .layers
+                .resolve()
+                .is_ok_and(|resolved| live.has_pending(&resolved.config))
+        });
+        if self.store.load()?.meta.revision == state.meta.revision && !pending {
             return Ok(None);
         }
+        drop(state);
         let mut state = self.state.write().await;
         let before = state.meta.revision;
         let applied = Self::refresh(&mut state, &self.store)?;
@@ -235,7 +243,6 @@ fn reload_report(applied: Applied, revision: u64) -> ConfigReloadReport {
         revision,
     }
 }
-
 
 /// A store failure is not the caller's fault and not something they can fix by changing the
 /// request: it is this server being unable to answer.
@@ -530,10 +537,12 @@ impl ConfigSource for StoreConfigSource {
                 .as_object()
                 .is_some_and(serde_json::Map::is_empty)
             {
-                Self::refresh(&mut state, &self.store).map_err(|e| store_error(&e))?;
-                return Ok(ConfigRevertOutcome::Unchanged(
-                    self.section_now(&state, &request.section)?,
-                ));
+                let applied =
+                    Self::refresh(&mut state, &self.store).map_err(|e| store_error(&e))?;
+                let mut section = self.section_now(&state, &request.section)?;
+                section.applied =
+                    applied.map(|applied| reload_report(applied, state.meta.revision));
+                return Ok(ConfigRevertOutcome::Unchanged(section));
             }
             // The same four checks as `patch_section`, against the patch the revert would write:
             // a revert is an ordinary write and must not be a way around any of them.
@@ -570,11 +579,10 @@ impl ConfigSource for StoreConfigSource {
                 Err(e) => return Err(store_error(&e)),
             }
         };
-        Self::refresh(&mut state, &self.store).map_err(|e| store_error(&e))?;
-        Ok(ConfigRevertOutcome::Reverted {
-            section: self.section_now(&state, &request.section)?,
-            patch,
-        })
+        let applied = Self::refresh(&mut state, &self.store).map_err(|e| store_error(&e))?;
+        let mut section = self.section_now(&state, &request.section)?;
+        section.applied = applied.map(|applied| reload_report(applied, state.meta.revision));
+        Ok(ConfigRevertOutcome::Reverted { section, patch })
     }
 }
 
@@ -745,5 +753,67 @@ mod tests {
         assert!(section.last_reloaded_at.is_some());
         // Nothing moved since: nothing to do.
         assert!(here.refresh_if_changed().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_and_initially_unwired_changes_retry_without_another_store_write() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::open_storage(&hs_config::StorageConfig::Embedded(
+            hs_config::storage::EmbeddedStorageConfig {
+                data_dir: dir.path().to_owned(),
+            },
+        ))
+        .unwrap();
+        let layers = Layers {
+            file: None,
+            database: json!({}),
+            environment: json!({"server": {"server_name": "example.org"}}),
+        };
+        let booted = layers.resolve().unwrap().config;
+        let live = Arc::new(LiveConfig::new(booted.clone()));
+        let store = OpenedConfigStore::open(&storage).unwrap();
+        let meta = store.load().unwrap().meta;
+        let source = StoreConfigSource::new(layers, store, meta, booted).with_live(live.clone());
+        let saved = source
+            .patch_section(ConfigPatch {
+                section: "rate_limits".to_owned(),
+                patch: json!({"message": {"burst_count": 3}}),
+                actor: None,
+                expected_revision: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(saved.applied.unwrap().requires_restart, vec!["rate_limits"]);
+
+        // Startup can register the reader after the follower first sees a change.
+        let attempts = Arc::new(AtomicU32::new(0));
+        let count = attempts.clone();
+        live.on_change("rate_limits", move |_| {
+            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err("try again".to_owned())
+            } else {
+                Ok(())
+            }
+        });
+        let failed = source.refresh_if_changed().await.unwrap().unwrap();
+        assert_eq!(
+            failed.failed,
+            vec![("rate_limits".to_owned(), "try again".to_owned())]
+        );
+        let applied = source.refresh_if_changed().await.unwrap().unwrap();
+        assert_eq!(applied.reloaded, vec!["rate_limits"]);
+        assert!(source.refresh_if_changed().await.unwrap().is_none());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            source
+                .get_section("rate_limits")
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            saved.revision
+        );
     }
 }

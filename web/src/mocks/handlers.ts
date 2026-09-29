@@ -1814,9 +1814,21 @@ export const handlers = [
     configValues[name] = mergePatch(configValues[name], patch) as Record<string, JsonValue>;
     configRevisions[name] = (configRevisions[name] ?? 0) + 1;
     recordConfigHistory(name, configRevisions[name], patch, before, revision);
-    return HttpResponse.json(configSectionBody(name), {
-      headers: { ETag: configEtag(name) },
-    });
+    const leaves = patchPointers(patch).map((pointer) => `/${name}${pointer}`);
+    const hot = leaves.filter(isHotSetting);
+    if (hot.length > 0) configLastReloaded[name] = new Date().toISOString();
+    return HttpResponse.json(
+      {
+        ...configSectionBody(name),
+        applied: {
+          reloaded_sections: hot.length > 0 ? [name] : [],
+          errors: [],
+          requires_restart: hot.length < leaves.length ? [name] : [],
+          revision: configRevisions[name],
+        },
+      },
+      { headers: { ETag: configEtag(name) } },
+    );
   }),
 
   http.post(`${API}/config/validate`, async ({ request }) => {

@@ -19,6 +19,7 @@
 import { useMemo, useState } from "react";
 import { ArrowRight, History, RotateCcw, TriangleAlert } from "lucide-react";
 import {
+  describeApplied,
   useConfigHistory,
   useRevertConfigChange,
   type ConfigChange,
@@ -48,7 +49,7 @@ export interface ConfigHistoryProps {
   /** The section's current `ETag`, sent as `If-Match` with a revert. */
   etag: string | null;
   canWrite: boolean;
-  reloadable: boolean;
+  isHot: (path: string) => boolean;
   /** The page of history to show (`?history=`); newest when absent. */
   cursor?: string;
   onCursorChange: (cursor: string | undefined) => void;
@@ -59,7 +60,7 @@ export function ConfigHistory({
   model,
   etag,
   canWrite,
-  reloadable,
+  isHot,
   cursor,
   onCursorChange,
 }: ConfigHistoryProps) {
@@ -172,10 +173,9 @@ export function ConfigHistory({
         <RevertDialog
           change={reverting}
           section={section}
-          sectionLabel={model.label}
           labels={labels}
           etag={etag}
-          reloadable={reloadable}
+          isHot={isHot}
           onClose={() => setReverting(null)}
           onReverted={() => onCursorChange(undefined)}
         />
@@ -199,10 +199,9 @@ function SettingLine({ label, words, path }: { label: string; words: ChangeWords
 interface RevertDialogProps {
   change: ConfigChange;
   section: string;
-  sectionLabel: string;
   labels: Map<string, string>;
   etag: string | null;
-  reloadable: boolean;
+  isHot: (path: string) => boolean;
   onClose: () => void;
   onReverted: () => void;
 }
@@ -210,14 +209,15 @@ interface RevertDialogProps {
 function RevertDialog({
   change,
   section,
-  sectionLabel,
   labels,
   etag,
-  reloadable,
+  isHot,
   onClose,
   onReverted,
 }: RevertDialogProps) {
   const revert = useRevertConfigChange();
+  const hotCount = change.settings.filter((row) => isHot(row.path)).length;
+  const allHot = hotCount === change.settings.length;
   // A 409 from the first attempt: later changes wrote the same settings.
   const [conflict, setConflict] = useState<Problem | null>(null);
 
@@ -225,12 +225,12 @@ function RevertDialog({
     revert.mutate(
       { section, revision: change.revision, etag, force: conflict !== null },
       {
-        onSuccess: () => {
+        onSuccess: (result) => {
+          const outcome = describeApplied(result.section.applied, section, allHot);
           toast({
             title: `Revision ${change.revision} reverted`,
-            description: reloadable
-              ? `${sectionLabel} is back as it was before it, on the running server.`
-              : `${sectionLabel} is back as it was before it. It takes effect the next time this server restarts.`,
+            description: outcome.description,
+            variant: outcome.failed ? "danger" : undefined,
           });
           onClose();
           onReverted();
@@ -269,9 +269,11 @@ function RevertDialog({
         size="form"
         title={`Revert revision ${change.revision}?`}
         description={
-          reloadable
+          allHot
             ? "These settings go back to what they were before this change, on the running server straight away."
-            : "These settings go back to what they were before this change. It takes effect the next time the server restarts."
+            : hotCount > 0
+              ? "These settings go back to what they were before this change. Some apply now; the rest take effect the next time the server restarts."
+              : "These settings go back to what they were before this change. It takes effect the next time the server restarts."
         }
         footer={
           <>

@@ -1197,7 +1197,7 @@ pub struct ConfigSection {
     /// histories nobody asked for.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<ConfigChange>,
-    /// Only on the answer to a write (`config.update`): what the write did to the running
+    /// Only on the answer to a write (`config.update` or `config.history.revert`): what the write did to the running
     /// server -- the sections it hot-applied (`reloaded_sections`) and the ones whose change waits
     /// for a restart (`requires_restart`), exactly as `config.reload` would report them. Absent
     /// on reads, and from a source that cannot tell.

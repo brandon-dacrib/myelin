@@ -461,7 +461,7 @@ function SectionForm({ section, data, schema, schemaSettled, onReread }: Section
           model={model}
           etag={data.etag}
           canWrite={canWrite && !bootstrap}
-          reloadable={reloadable}
+          isHot={isHot}
           cursor={search.history}
           onCursorChange={(history) =>
             void navigate({

@@ -37,7 +37,7 @@ fn config(port: u16, data_dir: &std::path::Path) -> hs_config::Config {
          federation:\n  ip_range_blocklist: []\n\
          rate_limits:\n  enabled: false\n"
     );
-    // The server-wide send limit is off (decision 0015): this conversation is faster than a person.
+    // The server-wide send limit is off (decision 0016): this conversation is faster than a person.
     hs_config::Config::from_yaml(&yaml).expect("the test configuration parses")
 }
 

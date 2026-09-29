@@ -47,21 +47,23 @@ offering operations); before that 2026-09-26 (three public recovery operations);
 >   store after shutdown to see the old secret back.
 
 > **2026-09-28, configuration changes take effect without a restart** (branch
-> `agent/config-reload`, decision 0015). Saving a hot setting in the interface now changes the
+> `agent/config-reload`, decision 0016). Saving a hot setting in the interface now changes the
 > running server, and `config.update`, `config.reload` and `config.validate` say truthfully which
 > sections were applied and which wait for a restart.
 >
 > - **The boundary** (`crates/hs-config/src/reload.rs`): `HOT_SETTINGS` lists, as JSON Pointers,
 >   only what something in `hs serve` re-reads; `RELOADABLE_SECTIONS` is the sections that are
 >   hot throughout (`rate_limits`, `migration`). `federation`, `telemetry` and `appservices` were
->   listed and were not re-read by anything; they now say "restart required" until they are.
+>   listed without readers; only the federation lists and telemetry log filter are now hot,
+>   while their other settings and appservices need a restart.
 >   `sections_requiring_restart` ignores hot settings; `hot_sections_changed` is new.
 >   `ConfigSettingInfo.reloadable` in `GET /config/schema` is per setting.
 > - **The choke point** (`crates/hs-cli/src/live_config.rs`): `LiveConfig` holds the appliers
 >   each part of the server registers at startup (`on_change(section, ..)`); the store-backed
 >   `ConfigSource` applies what it reads back after every write (`refresh`), so update, reload
 >   and any later write path (a revert) hot-apply alike. A failed applier keeps the old value and
->   is retried on the next write. Logged per section ("configuration section reloaded") and
+>   is retried on the next write or follower tick, even at the same revision. Readers
+>   registered after a startup tick also receive any pending change. Logged per section ("configuration section reloaded") and
 >   counted in `hs_config_reloads_total{section,outcome}` (`applied`, `failed`, `unwired`).
 >   Every ten seconds each server also checks the store's revision
 >   (`StoreConfigSource::follow_store` / `refresh_if_changed`), so another replica's write, or
@@ -90,7 +92,8 @@ offering operations); before that 2026-09-26 (three public recovery operations);
 >   `hs_config_reloads_total` -- which is how the one-field-of-a-bucket bug (status 13) was
 >   found.
 > - **Answers**: `ConfigSection.applied` (a `ConfigReloadReport`) on `config.update`'s answer;
->   `config.reload` reports what `LiveConfig` applied rather than nothing.
+>   `config.revert` returns the same application report, and `config.reload` reports what
+>   `LiveConfig` applied rather than nothing.
 > - **Verified on the real binary**: `crates/hs-cli/tests/config_reload.rs` boots `hs serve`,
 >   sends three messages, lowers `rate_limits.message` with `PATCH /api/v1/config/rate_limits`
 >   (answer: `applied.reloaded_sections == ["rate_limits"]`), turns the log level up to debug

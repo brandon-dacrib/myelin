@@ -18,7 +18,7 @@
 //!   exempts the user.
 //! - **The server-wide limit**: everybody without an override sends under the configuration's
 //!   `rate_limits.message`, which `hs serve` hands [`SendLimiter::set_server_limit`] at startup
-//!   and again whenever an operator changes it (decision 0015). Without it -- a room layer
+//!   and again whenever an operator changes it (decision 0016). Without it -- a room layer
 //!   nobody configured, as in this crate's own tests -- nobody without an override is limited.
 //!
 //! Every write refused, swallowed or throttled here because of moderation is counted in

@@ -8,7 +8,7 @@ Last updated: 2026-09-28 (the Migration admin area and the online importer, firs
 shipped work: URL-preview config fields, the `serve_server_wellknown`/`federation_custom_ca_list`/
 `max_spider_size` translation-table corrections, and a first slice of `/_synapse/admin` routes).
 
-## 2026-09-28: the reload boundary says what the server does (decision 0015)
+## 2026-09-28: the reload boundary says what the server does (decision 0016)
 
 `crates/hs-config/src/reload.rs` claimed `rate_limits`, `federation`, `telemetry` and
 `appservices` were reloadable while nothing in `hs serve` re-read any of them. It is now

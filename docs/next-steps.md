@@ -1162,12 +1162,16 @@ cannot do, in rough order of how often an operator will hit it:
   are global.
 - **Validate across sections.** `POST /config/validate` is sent one section at a time, so a
   constraint spanning two only fails at save.
-- **Reload anything — started (decision 0015, branch `agent/config-reload`).** A change to
+- **Reload anything — started (decision 0016, branch `agent/config-reload`).** A change to
   `rate_limits` now takes effect on the running server the moment it is saved (the server-wide
   send limit is enforced for the first time, and swapped live), and so does a change to the
   federation domain allowlist and IP-range lists and to the log level (unless `RUST_LOG` pins
   it); `config.update`, `config.reload` and `config.validate` say which sections were applied
   and which wait for a restart (`hs_config::reload::HOT_SETTINGS`, `hs_cli::live_config`).
+  `config.revert` returns the same application report and the UI reports it. Failed or initially
+  unwired changes retry on the next follower tick without a new revision. Focused checks pass:
+  real reload binary test, follower tests, web check (443 tests), mock browser suite (50/50),
+  and real Configuration browser suite (5/5). Full workspace gate awaits the history merge.
   Left: the rest of `rate_limits`
   (`login`, `registration`, `joins_*`, `federation`, ... are accepted but enforced nowhere);
   `appservices` tuning; and a two-replica check on the cluster that the other replica follows

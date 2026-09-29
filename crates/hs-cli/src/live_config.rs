@@ -141,6 +141,20 @@ impl LiveConfig {
             .push(Box::new(applier));
     }
 
+    /// Whether a hot setting still differs from what is running, including changes whose
+    /// appliers failed or were not registered yet. Store followers retry these changes even
+    /// when the stored revision has not moved.
+    #[must_use]
+    pub fn has_pending(&self, config: &Config) -> bool {
+        let Ok(next) = serde_json::to_value(config) else {
+            return false;
+        };
+        let inner = self.lock();
+        hs_config::reload::HOT_SETTINGS
+            .iter()
+            .any(|pointer| inner.running.pointer(pointer) != next.pointer(pointer))
+    }
+
     /// Takes `new` on: every section in which a hot setting differs from what is in force has
     /// its appliers run. Reports those sections, and every section that differs from what the
     /// process booted on in a setting that only a restart reads.

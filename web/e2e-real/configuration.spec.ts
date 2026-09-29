@@ -218,7 +218,7 @@ test.describe("configuration against the real server", () => {
     expect((await api("PATCH", "/config/federation", { client_timeout: null })).status).toBe(200);
   });
 
-  test("a rate limit saved on the page is in force on the running server at once (decision 0015)", async ({
+  test("a rate limit saved on the page is in force on the running server at once (decision 0016)", async ({
     page,
   }) => {
     test.setTimeout(90_000);
@@ -247,6 +247,17 @@ test.describe("configuration against the real server", () => {
     expect(metrics).toMatch(
       /hs_config_reloads_total\{section="rate_limits",outcome="applied"\} \d+/,
     );
+
+    // The history action has the same immediate application/reporting as saving.
+    const revision = (await api("GET", "/config/rate_limits")).json.revision as number;
+    await page.getByRole("button", { name: `Revert revision ${revision}`, exact: true }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Revert", exact: true }).click();
+    await expect(page.getByText(`Revision ${revision} reverted`, { exact: true })).toBeVisible();
+    await expect(
+      page.getByText("Applied to the running server.", { exact: true }).last(),
+    ).toBeVisible();
+    await shot(page, "rate-limits-reverted");
+    expect((await api("GET", "/config/rate_limits")).json.values.message).toEqual(before);
 
     // Tidy up.
     expect((await api("PATCH", "/config/rate_limits", { message: before })).status).toBe(200);

@@ -381,4 +381,50 @@ async fn lowering_the_send_limit_through_the_admin_api_limits_the_next_message_w
         text.contains(r#"hs_config_reloads_total{section="rate_limits",outcome="applied"} 2"#),
         "{text}"
     );
+
+    // Reverting a saved hot setting follows the same apply path as PATCH. The response
+    // and the next client writes must agree: the single-message bucket is enforced again.
+    let reverted = ops
+        .expect(
+            Method::POST,
+            &format!(
+                "/api/v1/config/rate_limits/history/{}/revert",
+                off["revision"]
+            ),
+            Some(json!({})),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        reverted["applied"]["reloaded_sections"],
+        json!(["rate_limits"])
+    );
+    assert_eq!(
+        reverted["applied"]["requires_restart"],
+        json!(["federation"])
+    );
+    assert_eq!(reverted["history"][0]["reverts"], off["revision"]);
+    let _ = alice.send(&room, "after-revert-1").await;
+    let (status, body) = alice.send(&room, "after-revert-2").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+
+    // A cold setting reverted to its boot value clears the pending restart without
+    // claiming that the federation section was hot-applied.
+    let cold_reverted = ops
+        .expect(
+            Method::POST,
+            &format!(
+                "/api/v1/config/federation/history/{}/revert",
+                cold["revision"]
+            ),
+            Some(json!({})),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(cold_reverted["applied"]["reloaded_sections"], json!([]));
+    assert_eq!(cold_reverted["applied"]["requires_restart"], json!([]));
+    assert_eq!(
+        cold_reverted["values"]["domain_allowlist"],
+        json!(["friend.example"])
+    );
 }

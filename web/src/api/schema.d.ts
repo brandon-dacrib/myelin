@@ -2731,7 +2731,7 @@ export interface components {
             settings?: components["schemas"]["ConfigSettingInfo"][];
         };
         ConfigSection: {
-            /** @description Only on the answer to config.update: what the write did to the running server -- the sections it hot-applied (reloaded_sections) and those whose change waits for a restart (requires_restart), as config.reload reports them. Absent on reads. */
+            /** @description Only on the answer to config.update or config.history.revert: what the write did to the running server -- the sections it hot-applied (reloaded_sections) and those whose change waits for a restart (requires_restart), as config.reload reports them. Absent on reads. */
             applied?: components["schemas"]["ConfigReloadReport"];
             /** @description Whether this whole section is bootstrap (decision 0010) -- read before the database is open or belonging to one process, and so never stored in it (storage, listeners). Read-only; config.update refuses it with 409. Sections holding only some bootstrap settings mark them per setting (ConfigSettingInfo.bootstrap). */
             bootstrap?: boolean;
