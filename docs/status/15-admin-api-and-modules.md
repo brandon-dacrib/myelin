@@ -159,6 +159,13 @@ offering operations); before that 2026-09-26 (three public recovery operations);
 > `web/e2e-real/configuration.spec.ts`. The `openapi.yaml` description of `ConfigSettingInfo`
 > mentions it; no operation changed.
 
+> **2026-09-28, merge-gate regression fixes:** the full follow-ups gate found two old
+> assertions in `hs-cli/tests/e2e.rs`. The overview now verifies zero media for an empty
+> repository; the media scenario uploads two files and verifies count 2 and 19 bytes. Bulk
+> deletion follows the returned task through `GET /tasks/{id}` until it finishes (bounded to
+> 30 seconds), then verifies its result, the protected file, and the audit log. Both focused
+> real-server tests pass. Full workspace and web checks remain required under the merge lock.
+
 > **Branch state (2026-09-28, 18:05, ready for the merge queue):** `agent/admin-followups`,
 > rebased onto `origin/main` at `8a4ca9f` (user moderation merged). With it `main` has **158 of
 > 158** operations (`python3 tools/admin_api_coverage.py`). Three fixes came out of the rebase:

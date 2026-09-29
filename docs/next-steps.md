@@ -502,6 +502,12 @@ configuration history and revert (`ConfigStore` already records the patch per re
   `tools/merge-queue.sh agent/admin-followups agent/config-history agent/config-reload`
   (after the follow-ups' two test failures are fixed).
 
+- Resumed `agent/admin-followups`: corrected the two stale real-server assertions that
+  stopped its full gate. Empty overview media counts are zero; two uploaded files are counted
+  as 2 items / 19 bytes; bulk deletion is followed through its task before checking results.
+  Both focused tests pass. The branch is returning to the full workspace/web gate with local
+  PostgreSQL 17 set for the two-replica test; merge is still pending.
+
 ## Handover (2026-09-28, 16:00 EDT): where the nine resumed agents stopped
 
 The owner stopped the session at 93% of weekly usage. The nine agents cut off by the usage limit
@@ -1258,7 +1264,7 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | Postgres `tls`/`pool_size`/schema | `hs-kv`, `hs-cli` | encrypt in front of the database for now |
 | `e2e/configuration.spec.ts` failed once in 112 runs | `web` | unreproduced, and the machine was running Complement at the time; if it recurs, the error is the first thing to capture |
 | A bridge's per-user sign-in state is invisible to the admin API | `hs-admin`, bridges | the Sign in tab says how to sign in, not who has; the bridges keep that state themselves |
-| The live overview statistics leave media out | `hs-cli` | failing destinations and reports are counted now (bf6873e, 56cdf8f); `media_count`/`media_bytes` are absent from `/statistics/overview`, so the Statistics page's two media tiles show dashes; the sampled charts have them, from `hs_media::usage` |
+| ~~The live overview statistics leave media out~~ | `hs-cli` | Fixed by `agent/admin-followups`: overview media totals are wired to the repository and covered by real-server empty/nonempty checks; the overview snapshot is cached for 60 seconds |
 | Setup link assumes `localhost:<bound port>` without `public_baseurl` | `hs-cli` | wrong behind a remapped port or an undescribed proxy |
 | The shard-gated appservice pump has only been tested with a scripted ownership | `hs-cli` | it moves with the global and appservice shards in the unit test; a real two-replica handoff of bridge delivery on the cluster has not been watched |
 | In-process server cannot be restarted over its data directory | `hs-cli` | background tasks hold the store's lock after `shutdown()`; restart tests need the real binary |

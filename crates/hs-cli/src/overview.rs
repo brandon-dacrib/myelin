@@ -18,8 +18,8 @@
 //! - `rooms_count`: rooms this server has state for.
 //! - `federation_destinations_failing_count` and `pending_reports_count` (open reports), once
 //!   their sources are set.
-//! - Media is **left out**, not zero: nothing here counts it yet, and the contract makes every
-//!   field optional so that "not known" does not have to be dressed up as a number.
+//! - `media_count` / `media_bytes`: stored uploads and cached remote copies, once the media
+//!   source is set. An empty repository reports zero; an absent source leaves the fields out.
 //!
 //! # Cost
 //!

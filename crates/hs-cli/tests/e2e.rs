@@ -1649,7 +1649,7 @@ async fn the_setup_link_is_rooted_at_the_public_base_url_when_there_is_one() {
 /// first minute. Before this the two operations answered `501` and the page said "Not
 /// implemented" where these go.
 #[tokio::test]
-async fn the_overview_counts_real_accounts_and_rooms_and_omits_what_nobody_counts() {
+async fn the_overview_counts_real_accounts_rooms_and_an_empty_media_repository() {
     let dir = tempfile::tempdir().unwrap();
     let handle = hs_cli::serve::spawn_serve(
         test_config(0, dir.path()),
@@ -1715,10 +1715,9 @@ async fn the_overview_counts_real_accounts_and_rooms_and_omits_what_nobody_count
             >= first["daily_active_users"].as_u64().unwrap(),
         "{first}"
     );
-    // Nothing here can count these yet, so they are absent -- not 0, not null.
-    for unknown in ["media_count", "media_bytes"] {
-        assert!(first.get(unknown).is_none(), "{unknown} in {first}");
-    }
+    // The media repository is wired into the overview, and no media has been uploaded.
+    assert_eq!(first["media_count"], 0, "{first}");
+    assert_eq!(first["media_bytes"], 0, "{first}");
     // Reports are counted: nobody has filed one.
     assert_eq!(first["pending_reports_count"], 0, "{first}");
     // Failing federation destinations *are* counted now: none, because this server has tried
@@ -3512,6 +3511,13 @@ async fn an_administrator_can_find_quarantine_protect_and_delete_uploaded_media(
         }
     };
 
+    // The first overview snapshot includes both completed uploads and their exact size.
+    let (status, overview) =
+        admin_call(reqwest::Method::GET, "/statistics/overview".into(), None).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{overview}");
+    assert_eq!(overview["media_count"], 2, "{overview}");
+    assert_eq!(overview["media_bytes"], 19, "{overview}");
+
     // Listed, searchable, with what the page shows.
     let (status, page) = admin_call(
         reqwest::Method::GET,
@@ -3578,7 +3584,22 @@ async fn an_administrator_can_find_quarantine_protect_and_delete_uploaded_media(
     )
     .await;
     assert_eq!(status, reqwest::StatusCode::ACCEPTED, "{task}");
-    assert_eq!(task["status"], "succeeded");
+    let task_path = format!("/tasks/{}", task["id"].as_str().unwrap());
+    let task = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let (status, task) = admin_call(reqwest::Method::GET, task_path.clone(), None).await;
+            assert_eq!(status, reqwest::StatusCode::OK, "{task}");
+            match task["status"].as_str() {
+                Some("queued" | "running") => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                _ => break task,
+            }
+        }
+    })
+    .await
+    .expect("bulk deletion should complete within 30 seconds");
+    assert_eq!(task["status"], "succeeded", "{task}");
     assert_eq!(
         task["result"]["deleted_count"], 1,
         "notes, not keep: {task}"
