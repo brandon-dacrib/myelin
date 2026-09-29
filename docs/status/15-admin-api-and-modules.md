@@ -2,7 +2,17 @@
 
 Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-admin`, `hs-modules`, `hs-identity`, `hs-http` (shared with 07 and 14).
 
-Last updated: 2026-09-28 (the admin API follow-ups: bulk media tasks, Federation 7/7, reports by person; `GET /` redirects to the interface; Users moderation and activity, 14 operations, Users 41/41; the Rooms area, 23/23; Users' devices-and-identity half; and the Cluster area, 6/6; all below); before that 2026-09-27 (media, registration tokens and server notices, reports, tasks and statistics, below; before that the bridge
+## 2026-09-29: admin integration complete
+
+Admin follow-ups (`28d40dc`), configuration history/revert (`eedb090`) and hot reload (`12a19eb`)
+are merged and pushed to `main`; their remote branches are deleted. Handler coverage is
+**160/160**. The final gate passed formatting, workspace Clippy, 2,343 Rust tests, 443 web unit
+tests and 50 mock browser flows. PostgreSQL enabled the real two-replica drain check; real-binary
+configuration history and reload tests passed too. The five real Configuration browser flows
+passed separately. [Integration review](reviews/admin-completion-2026-09-29.md) records the
+fixes, evidence and remaining limits. Earlier entries below describe each implementation.
+
+Last updated: 2026-09-29 (integration complete; earlier work: the admin API follow-ups: bulk media tasks, Federation 7/7, reports by person; `GET /` redirects to the interface; Users moderation and activity, 14 operations, Users 41/41; the Rooms area, 23/23; Users' devices-and-identity half; and the Cluster area, 6/6; all below); before that 2026-09-27 (media, registration tokens and server notices, reports, tasks and statistics, below; before that the bridge
 offering operations); before that 2026-09-26 (three public recovery operations); 2026-09-25 (additive schema change for the bridges wizard); the session log that follows is from 2026-09-19 (session 6).
 
 > **2026-09-28, served for real: a configuration section's per-setting history and a revert**
@@ -143,8 +153,8 @@ offering operations); before that 2026-09-26 (three public recovery operations);
 >   other member sees the events redacted; memberships, statistics and media, and deleting the
 >   media). The interface side (status 16) passed `web/e2e-real/user-moderation.spec.ts` against
 >   `hs serve`.
-> - **Left**: the server-wide `rate_limits.message` bucket is still not enforced (decision
->   0014); in cluster mode the override bucket is per replica; suspension of profile and media
+> - **Left**: the server-wide `rate_limits.message` bucket is now enforced by hot reload
+>   (decision 0016); in cluster mode the message and override buckets are per replica; suspension of profile and media
 >   writes is logged but not counted in the metric (those crates do not depend on `hs-room`).
 
 > **2026-09-28, the server's bare root lands somewhere useful.** Typing the demo's address

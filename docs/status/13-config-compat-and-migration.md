@@ -4,7 +4,16 @@ Track brief: `docs/workstreams/13-config-compat-and-migration.md`. Owner
 crates/files: `crates/hs-config`, `crates/hs-compat`,
 `tools/synapse_inventory.py`, `docs/synapse-inventory.md`.
 
-Last updated: 2026-09-28 (the Migration admin area and the online importer, first section; queue items 2b and 2c, second). Before that: 2026-09-27 (decision 0010: bootstrap-only settings, importer-only registration files; see "Where this stopped"). Before that: 2026-09-19 (session 2 — catching up `hs-config`/`hs-compat` with day one's
+## 2026-09-29: configuration history and hot reload merged
+
+History/revert (`eedb090`) and hot reload (`12a19eb`) are on pushed `main`. Saves and reverts
+validate the same database revision they replace, including changes from another writer.
+The real-binary history and reload tests passed in the final full gate; the Configuration page's
+five real-server browser flows passed separately. The full gate had 2,343 passing Rust tests,
+443 web unit tests and 50 mock browser flows. Details and remaining limits are in the
+[integration review](reviews/admin-completion-2026-09-29.md) and status 15.
+
+Last updated: 2026-09-29 (integration complete; earlier work: the Migration admin area and the online importer, first section; queue items 2b and 2c, second). Before that: 2026-09-27 (decision 0010: bootstrap-only settings, importer-only registration files; see "Where this stopped"). Before that: 2026-09-19 (session 2 — catching up `hs-config`/`hs-compat` with day one's
 shipped work: URL-preview config fields, the `serve_server_wellknown`/`federation_custom_ca_list`/
 `max_spider_size` translation-table corrections, and a first slice of `/_synapse/admin` routes).
 

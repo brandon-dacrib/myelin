@@ -1,8 +1,46 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-09-28 (afternoon handover). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-09-29 (admin work completed and pushed). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
+
+## Resume here: 2026-09-29 wrap-up
+
+**The three pending admin branches are merged and pushed to `main`.** The final code commit is
+`12a19eb`. This section supersedes the unfinished admin merge instructions in the historical
+session logs below. Verification details are in [the integration review](status/reviews/admin-completion-2026-09-29.md).
+
+- **Admin follow-ups** (`28d40dc`): reports filter by person and update through the event stream;
+  bulk media deletion runs as a cancellable task; federation keys and shared rooms have real
+  handlers. The task cache keeps completed state when an older response arrives later.
+  The two failed real-server tests were stale expectations: they now check media counts after
+  uploads and follow the deletion task to completion.
+- **Configuration history and revert** (`eedb090`): the section page shows each setting's old
+  and new values, who changed it, and a revert action. Secrets stay redacted. Conflicting later
+  edits require an explicit forced revert. Review also fixed saves and reverts validating stale
+  cached settings after another writer changed the database; validation and writes now use the
+  same revision.
+- **Configuration hot reload** (`12a19eb`): message rate limits, federation allow/block lists,
+  and the log level apply while the server runs. Saves and reverts report what applied and what
+  still needs a restart. Other replicas check for changes every ten seconds; failed application
+  retries even when the revision has not changed. The server-wide message limit is now enforced.
+- **Verified:** final full gate: Rust formatting and Clippy clean; **2,343 Rust tests**, **443
+  web unit tests**, and **50 mock browser flows** passed. The PostgreSQL two-replica drain test
+  ran, and real-binary history/reload tests passed. The five real Configuration browser flows
+  also passed, with screenshots committed. Admin handler coverage is **160/160**; this count is
+  handler coverage, not a claim of full Matrix conformance.
+
+**Unmerged branches**, checked against fetched `origin/main` at wrap-up:
+
+| Branch | Work it holds | Verification still needed |
+|---|---|---|
+| `agent/two-pod-cluster-2` (`0ddf9da`) | Handoff waits, cluster metrics, and the lease/ownership fix for slow convergence | Previous focused `hs-cluster` checks and ten PostgreSQL two-replica runs passed. Rebase onto current main, run the full gate with PostgreSQL, then perform the documented cluster rolling-update/failover checks. |
+| `agent/federation-leftovers` (`8074aec`) | Restricted joins, join server selection, stripped state, knocks, v12 rooms and forwarding EDUs to their owning replica | Previous per-crate checks and federation membership 12/12 passed; targeted Complement was 14/18 top-level and 94/98 subtests. Rebase, run the full gate and remeasure Complement, including `RemoteJoinFailOver`. |
+
+These two branches were outside this admin wrap-up and remain unfinished. No cluster deployment
+was performed. The owner's Helm/port-forward steps below still apply. For the next admin work,
+cross-section validation and an assisted storage-backend migration remain open. Rate-limit
+buckets other than messages are still unenforced, and message buckets are per replica.
 
 ## The state of things
 
@@ -418,7 +456,7 @@ carried a message through an encrypted room. Each of those has historically foun
 The owner asked for the admin area only, documented, committed and pushed at every step. This
 section is the running log; the newest line is the last.
 
-**Admin coverage.** `main` has 140 of 158 operations. The other 18 are all on two finished
+**Admin coverage at the start of this historical session.** `main` had 140 of 158 operations. The other 18 were on two finished
 branches: `agent/user-moderation` (14: suspend, shadow-ban, rate limit, login-as, redact,
 media, sessions, memberships, statistics) and `agent/admin-followups` (4: federation keys
 list/get/refresh, rooms shared with a destination). Merging both makes it **158 of 158**.
@@ -505,8 +543,9 @@ configuration history and revert (`ConfigStore` already records the patch per re
 - Resumed `agent/admin-followups`: corrected the two stale real-server assertions that
   stopped its full gate. Empty overview media counts are zero; two uploaded files are counted
   as 2 items / 19 bytes; bulk deletion is followed through its task before checking results.
-  Both focused tests pass. The branch is returning to the full workspace/web gate with local
-  PostgreSQL 17 set for the two-replica test; merge is still pending.
+  Both focused tests passed. The full workspace/web gate then passed with local PostgreSQL 17
+  set for the two-replica test, and the branch merged as `28d40dc`. Configuration history
+  followed as `eedb090`, and hot reload as `12a19eb`; all three are pushed. See the wrap-up above.
 
 ## Handover (2026-09-28, 16:00 EDT): where the nine resumed agents stopped
 

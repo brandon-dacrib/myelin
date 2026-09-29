@@ -1,5 +1,15 @@
 # 16. Management web interface: status
 
+Last updated: 2026-09-29 (admin integration complete).
+
+## 2026-09-29: admin interface integration complete
+
+The admin follow-ups, configuration history/revert, and hot reload are on pushed `main` at
+`12a19eb`. Final `npm run check` passed (60 files / 443 unit tests, lint, types and production
+build), and mock Playwright passed 50/50. The real Configuration suite passed 5/5, including
+saving and reverting a live rate limit; screenshots below are committed. See the
+[integration review](reviews/admin-completion-2026-09-29.md) for the combined result and limits.
+
 Configuration history verification, 2026-09-28: the real-server configuration suite passed
 4/4 after rebasing onto main. Viewport captures show
 [history](../design/screenshots/configuration-history-real.png),
