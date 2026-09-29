@@ -1152,8 +1152,10 @@ cannot do, in rough order of how often an operator will hit it:
   forced, a secret is restored server-side, and the revert is audited, published
   (`config.reverted`) and logged. The section page shows the rows and a Revert dialog, with the
   page of history in the URL. Verified through the real `hs` binary
-  (`crates/hs-cli/tests/config_history.rs`, `web/e2e-real/configuration.spec.ts`). **Left**:
-  changes recorded before this cannot be reverted, because their prior values were never
+  (`crates/hs-cli/tests/config_history.rs`, `web/e2e-real/configuration.spec.ts`).
+  Revert validation checks the current database revision, including changes from another
+  writer; a regression test rejects restoring OIDC providers after MAS was enabled elsewhere.
+  **Left**: changes recorded before this cannot be reverted, because their prior values were never
   kept. History is never pruned. The mock's revisions are per section while the real server's
   are global.
 - **Validate across sections.** `POST /config/validate` is sent one section at a time, so a

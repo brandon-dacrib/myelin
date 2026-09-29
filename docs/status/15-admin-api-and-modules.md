@@ -22,6 +22,11 @@ offering operations); before that 2026-09-26 (three public recovery operations);
 >   no such change to that section. When the settings already hold their earlier values it
 >   answers `200` and writes nothing. A secret is restored server-side and never serialized: history, the
 >   revert's answer and the audit entry are redacted (`redacted_change` in `router.rs`).
+> - **Integration review**: revert validation now refreshes the database layers and checks
+>   that their revision matches the plan before validating or writing. The regression test
+>   starts with removed OIDC providers, then enables MAS through a second store handle;
+>   reverting the removal is rejected without changing the store. Without the fix it committed
+>   incompatible authentication settings and only reported an error while rendering the result.
 > - **Observability**: audit `config.history.revert` (from/to per setting, redacted), event
 >   `config.reverted` (`section`, `revision`, `reverted_revision`, `forced`), and a log line
 >   `reverted a configuration change` (or `nothing to revert`).

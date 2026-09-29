@@ -390,6 +390,19 @@ impl ConfigSource for StoreConfigSource {
                     actual: plan.revision,
                 }));
             }
+            // Another replica may have written since this source last refreshed. Validate
+            // against the same database revision the plan will atomically replace, including
+            // settings outside the reverted patch that constrain whether it is valid.
+            Self::refresh(&mut state, &self.store).map_err(|e| store_error(&e))?;
+            if state.meta.revision != plan.revision {
+                if request.expected_revision.is_none() && attempts < 3 {
+                    continue;
+                }
+                return Err(store_error(&StoreError::RevisionMismatch {
+                    expected: plan.revision,
+                    actual: state.meta.revision,
+                }));
+            }
             if !plan.conflicts.is_empty() && !request.force {
                 return Ok(ConfigRevertOutcome::Conflicts(revert_conflicts(
                     &request.section,
@@ -446,5 +459,72 @@ impl ConfigSource for StoreConfigSource {
             section: self.section_now(&state, &request.section)?,
             patch,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hs_config::FileLayer;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn a_revert_validates_against_changes_from_another_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = hs_kv::fjall_backend::FjallBackend::open(dir.path()).unwrap();
+        let storage = crate::storage::OpenedStorage::Embedded(backend);
+        let writer = OpenedConfigStore::open(&storage).unwrap();
+        writer
+            .patch_section(
+                "auth",
+                &json!({"oidc_providers": [{
+                    "idp_id": "example", "issuer": "https://issuer.example",
+                    "client_id": "myelin"
+                }]}),
+                None,
+                1,
+            )
+            .unwrap();
+        let removed = writer
+            .patch_section("auth", &json!({"oidc_providers": []}), None, 2)
+            .unwrap();
+        let layers = Layers {
+            file: Some(FileLayer {
+                path: "hs.yaml".into(),
+                document: json!({"server": {"server_name": "example.org"}}),
+            }),
+            database: removed.document,
+            ..Layers::default()
+        };
+        let booted = layers.resolve().unwrap().config;
+        let source = StoreConfigSource::new(
+            layers,
+            OpenedConfigStore::open(&storage).unwrap(),
+            removed.meta.clone(),
+            booted,
+        );
+        // The second source enables MAS after the first source cached its layers. Restoring
+        // OIDC providers must now fail: both auth modes cannot be configured together.
+        let latest = writer
+            .patch_section(
+                "auth",
+                &json!({"mas_delegation": {"endpoint": "https://mas.example"}}),
+                None,
+                3,
+            )
+            .unwrap();
+        let result = source
+            .revert(ConfigRevert {
+                section: "auth".into(),
+                revision: removed.meta.revision,
+                actor: None,
+                expected_revision: Some(latest.meta.revision),
+                force: false,
+            })
+            .await;
+        assert!(matches!(result, Err(SourceError::Invalid(_))), "{result:?}");
+        let stored = writer.load().unwrap();
+        assert_eq!(stored.meta.revision, latest.meta.revision);
+        assert_eq!(stored.document["auth"]["oidc_providers"], json!([]));
     }
 }
