@@ -199,6 +199,40 @@ pub trait UserStore: Send + Sync {
         as_of_feed_seq: u64,
     ) -> Result<Option<i64>, StoreError>;
 
+    /// The room-local position `room_id` was at as of `as_of_feed_seq`, taking the room's
+    /// newest feed entry when that entry is at or before `as_of_feed_seq` -- the common case,
+    /// one keyed read -- and walking the feed back from `as_of_feed_seq`
+    /// ([`UserStore::room_pos_as_of`]) only when the room has moved on past it. What
+    /// `crate::sync` bounds a room's timeline with, so that the batch and the token it hands out
+    /// describe the same point of the feed. `None` as for [`UserStore::room_pos_as_of`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn room_pos_at_token(
+        &self,
+        user_id: &ruma::UserId,
+        room_id: &ruma::RoomId,
+        as_of_feed_seq: u64,
+    ) -> Result<Option<i64>, StoreError> {
+        if let Some(entry) = self.current_feed_entry(user_id, room_id).await?
+            && entry.feed_seq <= as_of_feed_seq
+        {
+            return Ok(Some(entry.room_pos));
+        }
+        self.room_pos_as_of(user_id, room_id, as_of_feed_seq).await
+    }
+
+    /// The newest feed entry for `room_id` -- the one [`UserStore::append_feed_entry`] would
+    /// coalesce into -- or `None` if the room has never had one.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn current_feed_entry(
+        &self,
+        user_id: &ruma::UserId,
+        room_id: &ruma::RoomId,
+    ) -> Result<Option<FeedEntry>, StoreError>;
+
     /// Records that `device_id` was just handed a `next_batch` token carrying `feed_seq` -- the
     /// safety bound [`UserStore::append_feed_entry`]'s coalescing decision reads
     /// ([`UserStore::max_device_cursor`]). Called once per successful `/sync` response, not on

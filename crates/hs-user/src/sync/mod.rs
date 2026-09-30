@@ -272,6 +272,12 @@ fn rendered_with_replaced_state(
 /// With a content filter the forward scan is bounded by [`FILTERED_TIMELINE_SCAN`], and running
 /// into that bound is treated as a gap as well: there may be matching events beyond it, the token
 /// is going to skip past them regardless, and the newest matching events are the ones to send.
+///
+/// `upto` is where this batch ends: the room's position as of the token being handed out with
+/// it ([`crate::store::UserStore::room_pos_at_token`]), or the requester's own departure,
+/// whichever is first. Nothing after it is sent, however much the room has moved on since the
+/// token was fixed -- an event that lands while the response is being assembled has a feed entry
+/// past the token and belongs to the next batch. It used to be sent in both.
 fn build_incremental_timeline(
     actor: &hs_room::actor::RoomActor<impl KvBackend>,
     resume_pos: i64,
@@ -280,12 +286,48 @@ fn build_incremental_timeline(
     requester: &UserId,
     upto: Option<i64>,
 ) -> Timeline {
+    let empty = Timeline {
+        events: Vec::new(),
+        limited: false,
+        prev_batch: None,
+    };
+    if upto.is_some_and(|upto| upto <= resume_pos) {
+        return empty;
+    }
     let from = Some(PaginationToken::new(resume_pos, Direction::Forward));
     // One more than could be returned, so that "exactly `limit` new events" (no gap) can be told
     // from "more than `limit`" (a gap) without a second query.
     let request = content_filter.map_or(limit, |_| limit.max(FILTERED_TIMELINE_SCAN)) + 1;
-    let (raw, _) = actor.paginate(from, Direction::Forward, request);
-    let scan_cut_short = raw.len() == request;
+    let (mut raw, _) = actor.paginate(from, Direction::Forward, request);
+    let mut scan_cut_short = raw.len() == request;
+
+    if let Some(upto) = upto {
+        // The page is cut at the newest event at or before `upto`. `paginate` hands back events
+        // without their positions, so that event is looked up on its own (one keyed read, the
+        // same page a backward `/messages` from `upto` would start with) and found in the page.
+        // Not in the page and the page full: the bound lies beyond the scan, a gap either way.
+        // Not in the page and the page not full: it lies at or before `resume_pos`, so nothing
+        // between the two is new.
+        let (boundary, _) = actor.paginate(
+            Some(PaginationToken::new(
+                upto.saturating_add(1),
+                Direction::Backward,
+            )),
+            Direction::Backward,
+            1,
+        );
+        let Some(boundary) = boundary.first() else {
+            return empty;
+        };
+        match raw.iter().position(|e| e.event_id() == boundary.event_id()) {
+            Some(end) => {
+                raw.truncate(end + 1);
+                scan_cut_short = false;
+            }
+            None if scan_cut_short => {}
+            None => return empty,
+        }
+    }
 
     let events: Vec<&Event> = raw
         .into_iter()
@@ -675,10 +717,13 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
 
     // The positions the next token will carry are fixed *here*, before anything is read, and
     // not afterwards. Whatever arrives while this response is being put together then has a
-    // position beyond the token and is picked up by the next sync -- possibly after also having
-    // made it into this one, which a client de-duplicates by event ID. Taken afterwards, as they
+    // position beyond the token and is picked up by the next sync. Taken afterwards, as they
     // were, the token covered things that arrived too late to be in the response: reported as
-    // consumed, never sent.
+    // consumed, never sent. And the response is held to the same point: the rooms it carries
+    // are those with a feed entry at or before the token, and each room's timeline stops at the
+    // position its feed entry had then (`room_pos_at_token`, applied per room below). It used to
+    // read every room to its live end, so an event that landed during assembly was in this
+    // batch *and*, being past the token, in the next one.
     let new_feed_seq = store.latest_feed_seq(user_id).await?.max(baseline.feed_seq);
     let new_account_data_seq = store
         .latest_account_data_seq(user_id)
@@ -708,6 +753,10 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             .feed_since(user_id, baseline.feed_seq)
             .await?
             .into_iter()
+            // An entry past the token is the next batch's: a room whose only news is that
+            // entry (one joined during assembly, say) would otherwise be sent whole now and
+            // whole again next time.
+            .filter(|e| e.feed_seq <= new_feed_seq)
             .map(|e| e.room_id)
             .collect();
         for m in store.list_memberships(user_id).await? {
@@ -777,6 +826,8 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     // key upload. Not restricted to encrypted rooms, because a room can become one later and
     // nothing would announce its members then.
     let mut newly_shared: BTreeSet<OwnedUserId> = BTreeSet::new();
+    // For the batch's debug line below.
+    let mut timeline_events = 0usize;
 
     for room_id in &candidate_rooms {
         if !params.filter.room_allowed(room_id.as_str()) {
@@ -868,6 +919,21 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         let departed_at = matches!(membership.membership.as_str(), "leave" | "ban")
             .then_some(membership.room_pos)
             .filter(|pos| *pos > 0);
+        // And where the token's view of the room ends: the position its feed entry had as of
+        // `new_feed_seq`, frozen by the device cursor recorded above. A hot room has no feed
+        // entries to bound it by (a stale one from before it went hot would hide everything
+        // since) and is read live, as `resume_mode` documents.
+        let token_bound = if membership.hot_room {
+            None
+        } else {
+            store
+                .room_pos_at_token(user_id, room_id, new_feed_seq)
+                .await?
+        };
+        let upto = match (departed_at, token_bound) {
+            (Some(departed), Some(bound)) => Some(departed.min(bound)),
+            (departed, bound) => departed.or(bound),
+        };
 
         let (timeline, state_events, summary) = handle
             .query(move |actor| {
@@ -878,14 +944,14 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                         timeline_limit,
                         timeline_content_filter.as_ref(),
                         &user_id_owned,
-                        departed_at,
+                        upto,
                     ),
                     ResumeMode::FreshRoom => build_fresh_timeline(
                         actor,
                         timeline_limit,
                         timeline_content_filter.as_ref(),
                         &user_id_owned,
-                        departed_at,
+                        upto,
                     ),
                 };
                 let timeline_ids: HashSet<String> = timeline
@@ -941,6 +1007,7 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             })
             .await?;
 
+        timeline_events += timeline.events.len();
         for event in &timeline.events {
             if event.get("type").and_then(Value::as_str) != Some("m.room.member") {
                 continue;
@@ -1078,6 +1145,19 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             }
         }
     }
+
+    // One line per batch: which stretch of the feed it stands for, and how much it carries.
+    // Two consecutive lines from one device whose `since` and `next` do not chain, or whose
+    // event count is out of step with what the client shows, are where to start reading.
+    tracing::debug!(
+        %user_id,
+        since = baseline.feed_seq,
+        next = new_feed_seq,
+        initial = is_initial,
+        rooms = join.len() + invite.len() + knock.len() + leave.len(),
+        timeline_events,
+        "assembled a /sync batch"
+    );
 
     let global_account_data = if is_initial {
         store.list_global_account_data(user_id).await?
@@ -3437,6 +3517,237 @@ mod tests {
         assert_eq!(
             bodies(&response["rooms"]["join"][room_id.as_str()]["timeline"]),
             vec!["third"]
+        );
+    }
+
+    /// An event that lands *while a batch is being assembled* is sent once: in that batch or the
+    /// next, never both, and never neither.
+    ///
+    /// The token's feed position is fixed before anything is read, so an event arriving during
+    /// assembly has a feed entry past the token and is in the next batch. The room's timeline
+    /// used to be read to its live end regardless, so the same event was in this batch as well:
+    /// clients de-duplicate by event id, and `crates/hs-cli/tests/bridge_offerings.rs` had to.
+    /// Now a room's timeline stops at the position its feed entry had as of the token.
+    ///
+    /// A writer sends as fast as it can while a client with a device syncs in a loop, the way
+    /// `routes::sync` does (build, then record the cursor), with a small timeline limit so gaps
+    /// (`limited: true`, answered from the newest end) are exercised as well as plain deltas.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_event_that_arrives_during_assembly_is_in_exactly_one_batch() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let device = ruma::device_id!("PHONE");
+        std::mem::forget(hub.watch_all(hub.rooms().subscribe_global()));
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        const EVENTS: i64 = 300;
+        let writer = {
+            let (handle, alice) = (handle.clone(), alice.clone());
+            tokio::spawn(async move {
+                let mut ids = Vec::new();
+                for n in 0..EVENTS {
+                    let event = handle
+                        .send_event(
+                            alice.clone(),
+                            "m.room.message".to_owned(),
+                            None,
+                            serde_json::json!({"body": format!("m{n}")}),
+                            None,
+                            100 + n,
+                        )
+                        .await
+                        .unwrap();
+                    ids.push(event.event_id().to_string());
+                    // Give the syncing side a turn between sends, so the writes land at every
+                    // stage of a batch's assembly rather than all before or all after one.
+                    tokio::task::yield_now().await;
+                }
+                ids
+            })
+        };
+
+        // A limit no batch reaches: a limited batch legitimately holds events back behind
+        // `prev_batch`, which is not what is being counted here (`build_incremental_timeline`'s
+        // own tests cover the bound on a gap).
+        let mut params = params(None);
+        params.device_id = Some(device.to_owned());
+        params.timeout = Duration::from_millis(20);
+        params.filter = serde_json::from_value(serde_json::json!({
+            "room": {"timeline": {"limit": 1000}}
+        }))
+        .unwrap();
+        // Every batch's event ids, in order -- the initial sync's included, since the writer is
+        // already running and the same rule holds between it and the first incremental one --
+        // and the set of ids of every batch before it.
+        let mut batches: Vec<Vec<String>> = Vec::new();
+        let mut delivered: HashSet<String> = HashSet::new();
+        let mut repeated: Vec<(usize, String)> = Vec::new();
+        let mut writer = Some(writer);
+        let mut sent: Option<Vec<String>> = None;
+        let mut token: Option<SyncToken> = None;
+        for round in 0..5_000 {
+            let mut p = params.clone();
+            p.since = token;
+            let (response, next) = build(&hub, &e2e, &alice, p).await.unwrap();
+            hub.store()
+                .record_device_cursor(&alice, device, next.feed_seq)
+                .await
+                .unwrap();
+            token = Some(next);
+            let timeline = &response["rooms"]["join"][room_id.as_str()]["timeline"];
+            assert_ne!(timeline["limited"], true, "round {round}: {response}");
+            let ids: Vec<String> = timeline["events"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|e| e["type"] == "m.room.message")
+                .filter_map(|e| e["event_id"].as_str().map(str::to_owned))
+                .collect();
+            for id in &ids {
+                if !delivered.insert(id.clone()) {
+                    repeated.push((round, id.clone()));
+                }
+            }
+            batches.push(ids);
+            if let Some(w) = writer.as_ref()
+                && w.is_finished()
+            {
+                sent = Some(writer.take().unwrap().await.unwrap());
+            }
+            if let Some(sent) = &sent
+                && sent.iter().all(|id| delivered.contains(id))
+            {
+                break;
+            }
+        }
+        let sent = sent.expect("the writer finished");
+
+        let non_empty = batches.iter().filter(|b| !b.is_empty()).count();
+        assert!(
+            non_empty >= 10,
+            "the sync loop should have raced the writer over many batches, got {non_empty}"
+        );
+        let missing: Vec<&String> = sent.iter().filter(|id| !delivered.contains(*id)).collect();
+        assert!(missing.is_empty(), "events never delivered: {missing:?}");
+        assert!(
+            repeated.is_empty(),
+            "{} of {} events were sent twice across {} batches: {:?}",
+            repeated.len(),
+            sent.len(),
+            batches.len(),
+            &repeated[..repeated.len().min(5)]
+        );
+        // And in order: a batch's events follow the previous batch's, as the room has them.
+        let flat: Vec<&String> = batches.iter().flatten().collect();
+        assert_eq!(flat, sent.iter().collect::<Vec<_>>());
+    }
+
+    /// `build_incremental_timeline`'s bound, on its own: what the batch ends at is `upto`, not
+    /// the room's live end, whether the stretch fits in one page or is a gap answered from its
+    /// newest end.
+    #[tokio::test]
+    async fn an_incremental_timeline_ends_at_the_tokens_position_not_the_rooms_live_end() {
+        let hub = hub();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        // m0..m5, and the position of each.
+        let mut positions = Vec::new();
+        for n in 0..6 {
+            let event = handle
+                .send_event(
+                    alice.clone(),
+                    "m.room.message".to_owned(),
+                    None,
+                    serde_json::json!({"body": format!("m{n}")}),
+                    None,
+                    10 + n,
+                )
+                .await
+                .unwrap();
+            let id = event.event_id().to_owned();
+            let pos = handle
+                .query(move |a| a.timeline_position(&id))
+                .await
+                .unwrap();
+            positions.push(pos);
+        }
+        let page = |resume: i64, limit: usize, upto: Option<i64>| {
+            let (handle, alice) = (handle.clone(), alice.clone());
+            async move {
+                let timeline = handle
+                    .query(move |actor| {
+                        build_incremental_timeline(actor, resume, limit, None, &alice, upto)
+                    })
+                    .await;
+                let bodies: Vec<String> = timeline
+                    .events
+                    .iter()
+                    .map(|e| e["content"]["body"].as_str().unwrap().to_owned())
+                    .collect();
+                (bodies, timeline.limited, timeline.prev_batch.is_some())
+            }
+        };
+        let m = |ns: &[usize]| ns.iter().map(|n| format!("m{n}")).collect::<Vec<_>>();
+
+        // Unbounded: everything after the resume point.
+        assert_eq!(
+            page(positions[1], 10, None).await,
+            (m(&[2, 3, 4, 5]), false, true)
+        );
+        // Bounded inside the stretch: up to and including the bound, nothing after it.
+        assert_eq!(
+            page(positions[1], 10, Some(positions[3])).await,
+            (m(&[2, 3]), false, true)
+        );
+        // A bound at, or before, the resume point: nothing is new.
+        assert_eq!(
+            page(positions[1], 10, Some(positions[1])).await,
+            (vec![], false, false)
+        );
+        assert_eq!(
+            page(positions[3], 10, Some(positions[1])).await,
+            (vec![], false, false)
+        );
+        // A bound beyond the end of the room: as if unbounded.
+        assert_eq!(
+            page(positions[1], 10, Some(positions[5] + 100)).await,
+            (m(&[2, 3, 4, 5]), false, true)
+        );
+        // A gap (more than `limit` between the two) is answered with the newest `limit` events
+        // *at or before the bound*, not the room's newest.
+        assert_eq!(
+            page(positions[0], 2, Some(positions[4])).await,
+            (m(&[3, 4]), true, true)
+        );
+        // Exactly `limit` events up to the bound, with more beyond it: not a gap.
+        assert_eq!(
+            page(positions[1], 2, Some(positions[3])).await,
+            (m(&[2, 3]), false, true)
         );
     }
 

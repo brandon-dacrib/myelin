@@ -286,6 +286,42 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
         Ok(None)
     }
 
+    async fn current_feed_entry(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+    ) -> Result<Option<FeedEntry>, StoreError> {
+        let uid = user_id.to_string();
+        let snap = self.backend.snapshot();
+        let Some(seq) = self
+            .feed_by_room
+            .get(&snap, &(uid.clone(), room_id.to_string()))
+            .map_err(StoreError::Table)?
+        else {
+            return Ok(None);
+        };
+        let feed_seq = decode_u64(&seq)?;
+        // The pointer and the row it points at are read from one snapshot, so a coalescing
+        // write landing in between cannot leave this looking at a row that has moved on.
+        match self
+            .feed
+            .get(&snap, &(uid, feed_seq))
+            .map_err(StoreError::Table)?
+        {
+            Some(value) => {
+                let decoded: FeedValue = json_decode(&value)?;
+                Ok(Some(FeedEntry {
+                    feed_seq,
+                    room_id: room_id.to_owned(),
+                    room_pos: decoded.room_pos,
+                }))
+            }
+            None => Err(StoreError::Codec(format!(
+                "feed_by_room points at a feed row that does not exist: ({user_id}, {feed_seq})"
+            ))),
+        }
+    }
+
     async fn record_device_cursor(
         &self,
         user_id: &UserId,
@@ -718,6 +754,55 @@ mod tests {
         );
         // room_b never had activity at or before seq_a1.
         assert_eq!(s.room_pos_as_of(uid, room_b, seq_a1).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn room_pos_at_token_is_the_rooms_newest_entry_unless_that_is_past_the_token() {
+        let s = store();
+        let uid = user_id!("@alice:example.org");
+        let did: &ruma::DeviceId = "DEV1".into();
+        let room = room_id!("!a:example.org");
+        let other = room_id!("!b:example.org");
+
+        assert_eq!(s.current_feed_entry(uid, room).await.unwrap(), None);
+        assert_eq!(s.room_pos_at_token(uid, room, 5).await.unwrap(), None);
+
+        let seq1 = s.append_feed_entry(uid, room, 10).await.unwrap();
+        // Coalesced: the newest entry is still seq1, now at 11.
+        s.append_feed_entry(uid, room, 11).await.unwrap();
+        let current = s.current_feed_entry(uid, room).await.unwrap().unwrap();
+        assert_eq!((current.feed_seq, current.room_pos), (seq1, 11));
+        assert_eq!(
+            s.room_pos_at_token(uid, room, seq1).await.unwrap(),
+            Some(11)
+        );
+
+        // Pinned, then moved on: a token at seq1 still resolves to seq1's position, a token at
+        // the newer entry to the newer one, and a token before either to nothing.
+        s.record_device_cursor(uid, did, seq1).await.unwrap();
+        s.append_feed_entry(uid, other, 1).await.unwrap();
+        let seq3 = s.append_feed_entry(uid, room, 12).await.unwrap();
+        assert!(seq3 > seq1);
+        assert_eq!(
+            s.room_pos_at_token(uid, room, seq1).await.unwrap(),
+            Some(11)
+        );
+        assert_eq!(
+            s.room_pos_at_token(uid, room, seq3).await.unwrap(),
+            Some(12)
+        );
+        assert_eq!(
+            s.room_pos_at_token(uid, room, seq1 - 1).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            s.current_feed_entry(uid, room)
+                .await
+                .unwrap()
+                .unwrap()
+                .feed_seq,
+            seq3
+        );
     }
 
     #[tokio::test]
