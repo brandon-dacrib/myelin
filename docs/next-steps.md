@@ -1,24 +1,22 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-09-30, end of day (eight gaps closed; one branch in the gate). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-09-30, end of day (eight gaps closed; nothing unmerged). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
 ## Resume here: 2026-09-30, end of day
 
-**Where `main` is.** `70e6904`, 2,420 Rust tests, gate green with both PostgreSQL servers (plain
-and TLS) in use. One branch is still out, `agent/as-ephemeral` (`85a38bc`), in the merge gate
-as this is written; the paragraph "Appservices are sent ephemeral data" below says what it holds.
-If it is not on `main` when you read this, `git branch -r --no-merged origin/main` will say so:
-run `tools/merge-queue.sh agent/as-ephemeral` with the six `HS_*_TEST_POSTGRES_*` variables
-(recipe at the top of `crates/hs-kv/tests/postgres_tls.rs`; the two containers are
-`hs-admin-followups-gate-pg` on :5462 and `hs-merge-queue-pg-tls` on :5463, password `hspg`).
+**Where `main` is.** `dce1ffb` plus this document, **2,436 Rust tests**, gate green with both
+PostgreSQL servers (plain and TLS) in use, **nothing unmerged**, one worktree (`merge-queue`).
+The gate's six `HS_*_TEST_POSTGRES_*` variables have their recipe at the top of
+`crates/hs-kv/tests/postgres_tls.rs`; the two containers are `hs-admin-followups-gate-pg` on
+:5462 and `hs-merge-queue-pg-tls` on :5463, password `hspg`.
 
 **What was done today, in one breath:** the two branches left over from 2026-09-29 merged
 (federation leftovers, the two-pod cluster fix); Complement remeasured and a state-resolution
 tie-break bug found and fixed; then eight known gaps closed one agent at a time -- PostgreSQL
 TLS/pool/schema, the client `/hierarchy`, the `/sync` repeat, ephemeral data across replicas,
-CI's web job, appservices sent ephemeral/to-device/device-list data (in the gate), plus the
+CI's web job, appservices sent ephemeral/to-device/device-list data, plus the
 two gate fixes -- and two bugs fixed that had no row (the timestamp truncation, and members of
 a room that went hot left "cold"). Federation's targeted Complement set went 14/18 → 16/18;
 the two left are a race in the tests themselves. Nine stale worktrees (190 GB) removed. Every
@@ -26,9 +24,7 @@ paragraph below gives the commit, the status file and what is left.
 
 **Next steps, in order** (the queue continues; each is one agent, cloud-doable unless marked):
 
-1. **Merge `agent/as-ephemeral`** if the gate did not already (above). Then renumber its
-   decision from 0021 to 0019 (0019 and 0020 are unused; the agent skipped them) in the same
-   docs commit that records the merge here.
+1. ~~Merge `agent/as-ephemeral`~~ merged as `dce1ffb`; its decision is renumbered **0019**.
 2. **Desktop: the two-pod run with the fixed image.** CD has built `sha-<main>` images all day;
    the current one carries the handoff fix (0017), cross-replica ephemeral data (0018) and
    TLS. Steps are item 1 of "Where this stopped on the cluster" below. Target: 0 failures in
@@ -69,8 +65,8 @@ running** -- a hand-run of the `hs-kv` conformance tests during a gate exhausted
 without its own script releasing the lock leaves `.git/myelin-merge.lock` behind -- check for
 running `cargo` processes, then `rmdir` it.
 
-**Appservices are sent ephemeral data** (`agent/as-ephemeral`, `85a38bc`, in the gate; status 11;
-decision 0021 -- to be renumbered 0019; known gap "Appservice delivery carries events only"
+**Appservices are sent ephemeral data** (`agent/as-ephemeral` → `dce1ffb`, 2,436 Rust tests;
+status 11; decision 0019; known gap "Appservice delivery carries events only"
 closed): typing, receipts, presence, to-device messages, device-list changes and one-time-key
 counts, as MSC2409, MSC4203 and MSC3202 ask, read from server-wide streams (`hs_user.
 receipt_stream`, `presence_stream`, `hs_e2e.to_device_stream`) at a durable position per

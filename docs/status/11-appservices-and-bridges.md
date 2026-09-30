@@ -41,7 +41,7 @@ for all of it and been sent none. Decision 0021 records the design; the short ve
 - **To-device messages are not deleted when pushed** (Synapse does not either): a
   double-puppeting registration's non-exclusive namespace names a real person, whose own
   clients need the message, and a sync-mode mautrix bridge ignores what is pushed. Written
-  down in decision 0021 with the cost (a never-syncing bot device's queue grows; track 08's
+  down in decision 0019 with the cost (a never-syncing bot device's queue grows; track 08's
   retention question).
 - **Observability**: `hs_appservice_transactions_total{appservice,outcome}` and
   `hs_appservice_delivered_items_total{appservice,kind}` (`hs_appservice::metrics`,
@@ -101,7 +101,7 @@ for all of it and been sent none. Decision 0021 records the design; the short ve
 counts are computed per transaction with one device listing per interesting user: a room with
 hundreds of ghosts costs hundreds of keyed reads per event, unmeasured. Typing that changes
 while no replica owns the global shard is lost (as designed). The to-device queue of a bot
-device that never syncs is not pruned (decision 0021). A cluster run (two replicas, one bridge)
+device that never syncs is not pruned (decision 0019). A cluster run (two replicas, one bridge)
 of the ephemeral pump has not been watched; the gate is the same as the event pump's, which
 `appservice_delivery::tests::a_replica_pumps_and_delivers_only_for_the_shards_it_owns` covers.
 

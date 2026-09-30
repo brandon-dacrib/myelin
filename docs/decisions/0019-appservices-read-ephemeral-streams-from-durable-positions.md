@@ -1,4 +1,4 @@
-# 0021: Appservices are sent ephemeral data from server-wide streams and durable positions (2026-09-30)
+# 0019: Appservices are sent ephemeral data from server-wide streams and durable positions (2026-09-30)
 
 Status: accepted (track 11, with additions to tracks 05 and 08's stores). Closes the
 `docs/next-steps.md` gap "Appservice delivery carries events only".
