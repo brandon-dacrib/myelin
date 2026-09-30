@@ -150,8 +150,20 @@ fn postgres_backend_conformance_breakdown() {
 
     let mut passed = Vec::new();
     let mut failed = Vec::new();
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {})); // scenario panics are expected control flow here
+    // Scenario panics are expected control flow here, so they are not printed; but the hook is
+    // process-wide and the other tests in this binary run at the same time, so their panics
+    // still go through the previous hook, or a failure elsewhere would be reported with no
+    // message at all (which is how this looked in a merge gate on 2026-09-30).
+    let prev_hook = std::sync::Arc::new(std::panic::take_hook());
+    let scenario_thread = std::thread::current().id();
+    std::panic::set_hook(Box::new({
+        let prev_hook = prev_hook.clone();
+        move |info| {
+            if std::thread::current().id() != scenario_thread {
+                prev_hook(info);
+            }
+        }
+    }));
     for (name, f) in scenarios {
         let schema = fresh_schema_name();
         let backend = open_small(&dsn, &schema).expect("open postgres backend");
@@ -169,7 +181,8 @@ fn postgres_backend_conformance_breakdown() {
             }
         }
     }
-    std::panic::set_hook(prev_hook);
+    let _ = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| prev_hook(info)));
 
     eprintln!(
         "PostgreSQL conformance breakdown: {}/{} scenarios passed",
