@@ -10,7 +10,7 @@ Round-robins a send to each room from rooms.json, one at a time, and prints one 
 that failed or took over a second, plus a per-5-second summary. Some of the six rooms are owned
 by hs-1's shards, so their writes are forwarded over the mesh until hs-1 drains (graceful
 delete) and hs-0 takes the shards. First run 2026-09-28: 7 of 240 sends failed, all in the
-handoff windows (docs/status/03-cluster.md); decision 0013 is the fix.
+handoff windows (docs/status/03-cluster.md); decision 0017 is the fix.
 """
 import json
 import os

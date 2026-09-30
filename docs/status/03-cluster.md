@@ -205,7 +205,7 @@ client behind the Service would have gone to the other pod). `helm upgrade --wai
   caps at 250 ms (`MAX_BACKOFF`), until the attempt budget or until the next attempt could not
   start before the request's deadline; then the last refusal is returned as it is.
   `MeshConfig::max_attempts` default 4 -> 40 (about nine seconds of retrying inside the 10 s
-  deadline). Decision `docs/decisions/0013-forwards-wait-out-a-handoff.md` (it changes RFC
+  deadline). Decision `docs/decisions/0017-forwards-wait-out-a-handoff.md` (it changes RFC
   0001 section 8's "at most 4 attempts, 10/50/200 ms"). Tests:
   `crates/hs-cluster/tests/mesh_handoff.rs` (a peer answering `421` for 2 s, `503` for 0.6 s,
   no owner for 1.2 s: all come through with the 200; a peer that never settles is given up on

@@ -42,7 +42,7 @@ was performed. The owner's Helm/port-forward steps below still apply. For the ne
 cross-section validation and an assisted storage-backend migration remain open. Rate-limit
 buckets other than messages are still unenforced, and message buckets are per replica.
 
-## Where this stopped (2026-09-28, late): start here
+## Where this stopped on the cluster (2026-09-28, late)
 
 **`main` has all the cluster work; no cluster branch is open.** The last two, `agent/two-pod-cluster-2`
 (two pods on the real cluster, the handoff fix, the `hs_cluster_*` metrics) and
@@ -755,7 +755,7 @@ Semantic conflicts the compiler found: two `MediaRecord` test initializers witho
 | `rooms-admin` | `GET /api/v1/events/{id}` (no room in its path) reads the room on whichever replica gets it, not the owner; a purge keeps a redacted skeleton row per purged event instead of deleting rows; the hierarchy reads only rooms this server holds (no federation `/hierarchy`); deleting a room leaves remote members and other servers alone, as Synapse does | 2 |
 | `federation-membership` | `createRoom`'s `invite` list for remote users; a reject fallback when no resident server helps; neutral error text; restricted joins; Complement | 3 |
 | `federation-edus` | ~~To-device over federation; `m.signing_key_update`~~ (done 2026-09-28, `federation-to-device`); ~~in cluster mode, EDUs only through the owning replica~~ (done 2026-09-28). Its unrun `clippy`/`test -p hs-cli` are now run and green | 3 |
-| `two-pod-cluster` | Superseded by `agent/two-pod-cluster-2`, merged 2026-09-28: two pods ran; the handoff fix (decision 0013) and the `hs_cluster_*` metrics are on `main`, not yet on the cluster. See "Where this stopped" at the top | 6 |
+| `two-pod-cluster` | Superseded by `agent/two-pod-cluster-2`, merged 2026-09-28: two pods ran; the handoff fix (decision 0017) and the `hs_cluster_*` metrics are on `main`, not yet on the cluster. See "Where this stopped" at the top | 6 |
 
 **Second round (2026-09-28): two more branches.** `agent/admin-web-pages` (the Reports,
 Tasks and Statistics pages, the Overview sparklines, `TimeseriesChart`) and
@@ -963,7 +963,7 @@ edit one is not. New settings and operations arrive with their interface control
    ran on 2026-09-28** (`docs/status/03-cluster.md`, top): `verify.py` passes (rooms split
    three and three, forwarding, identical `/messages`, cross-pod `/sync` wakes, media across
    pods); `failover.py` lost 7 of 240 sends and a rolling update 322 in three windows, all
-   requests landing mid-handoff. The fix (forwards wait out a handoff, decision 0013; the
+   requests landing mid-handoff. The fix (forwards wait out a handoff, decision 0017; the
    `hs_cluster_*` metrics exported) is on `main`, tested, and **not yet on the cluster**: next
    is its image, upgraded to while `deploy/two-pod/rolling.py` runs (that is the rolling
    update), then `failover.py`, both to 0 failures. Then the demo's offering. Also make `storage.postgres.sslMode` real (the server connects `NoTls`), and look
@@ -1406,7 +1406,7 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | The `main` chart needs `--devel`, and a first tag hides it until Chart.yaml's version moves on | `.github`, `deploy/helm` | pre-releases sort below the release they precede; bump `version` in Chart.yaml right after tagging |
 | An install from a chart before 2026-09-26's label fix cannot be upgraded in place | `deploy/helm` | one `kubectl delete statefulset --cascade=orphan` before the next `helm upgrade`; only the demo existed |
 | A clustered replica shutting down with no live peer waits out its whole drain deadline | `hs-cluster` | nobody can claim its shards, but `Drainable::drain` still waits for a new owner of each until the deadline (18 s in `cluster_admin.rs`); it should stop waiting when no hashable peer is live |
-| Two pods on the cluster have not run with the handoff fix | `deploy/helm`, desktop | two pods ran on 2026-09-28 with an image from before decision 0013 (a request mid-handoff got a `503`); the fixed image, `rolling.py` during its upgrade and `failover.py` need `kubectl`, which agent sessions cannot reach; "Where this stopped" at the top has the steps |
+| Two pods on the cluster have not run with the handoff fix | `deploy/helm`, desktop | two pods ran on 2026-09-28 with an image from before decision 0017 (a request mid-handoff got a `503`); the fixed image, `rolling.py` during its upgrade and `failover.py` need `kubectl`, which agent sessions cannot reach; "Where this stopped" at the top has the steps |
 | A room alias in `/join/{alias}` or `/knock/{alias}` is not shard-gated | `hs-cli` | the alias resolves inside the handler; ids in `/join/{roomId}`, `/knock/{roomId}` and `/rooms/{roomId}/...` are gated |
 | A v12 room's id cannot be pre-assigned | `hs-room` | the id derives from the create event's hash; RFC 0019 describes the retry the handler should do and it is not implemented |
 | ~~Per-replica settings are seeded into the shared database~~ | `hs-config`, `hs-cli` | **Closed** (a3126df): `hs_config::bootstrap::BOOTSTRAP_SETTINGS` (storage, listeners, server name, signing key path, cluster mesh, ...) stay in each replica's file and environment; seeding strips them, boot purges old copies, and the admin API refuses writes to them |

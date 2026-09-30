@@ -1,4 +1,4 @@
-# 0013: A forward waits out a shard handoff (2026-09-28)
+# 0017: A forward waits out a shard handoff (2026-09-28)
 
 Status: accepted (track 03). Amends RFC 0001 section 8's retry policy.
 
