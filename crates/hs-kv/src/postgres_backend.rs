@@ -171,7 +171,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
 use bytes::Bytes;
-use postgres::NoTls;
 use postgres::error::SqlState;
 use postgres::types::ToSql;
 use r2d2::Pool;
@@ -179,10 +178,13 @@ use r2d2_postgres::PostgresConnectionManager;
 
 use crate::error::{Conflict, KvError};
 use crate::limits::{self, TxnBudget};
+use crate::postgres_tls::{self, PgTlsError, PgTlsOptions, RustlsConnector};
 use crate::traits::{KvBackend, KvRead, KvWrite, RangeItem, RangeIter, RangeSpec};
 use crate::watch::{Hub, Watch};
 
-type PgManager = PostgresConnectionManager<NoTls>;
+/// The pool's connection manager. Always the `rustls` connector, whatever the mode: with
+/// [`crate::postgres_tls::PgSslMode::Disable`] the `postgres` crate never invokes it (see [`crate::postgres_tls`]).
+type PgManager = PostgresConnectionManager<RustlsConnector>;
 type PgPool = Pool<PgManager>;
 type PgConn = r2d2::PooledConnection<PgManager>;
 /// A [`PgTxn`]'s buffered, not-yet-flushed writes: `(keyspace's qualified table name, key) ->
@@ -446,6 +448,34 @@ fn create_if_not_exists_race_free(
     }
 }
 
+/// The first host, its port and the database name a `postgres::Config` will connect to, for the
+/// log line [`PostgresBackend::open_with`] writes. Never the password.
+fn describe_target(config: &postgres::Config) -> (String, u16, String) {
+    let host = match config.get_hosts().first() {
+        Some(postgres::config::Host::Tcp(host)) => host.clone(),
+        #[cfg(unix)]
+        Some(postgres::config::Host::Unix(path)) => path.display().to_string(),
+        None => "<none>".to_owned(),
+    };
+    let port = config.get_ports().first().copied().unwrap_or(5432);
+    let database = config
+        .get_dbname()
+        .or_else(|| config.get_user())
+        .unwrap_or("<default>")
+        .to_owned();
+    (host, port, database)
+}
+
+/// Asks PostgreSQL whether this session is encrypted. `pg_stat_ssl` has a row for every backend
+/// (since 9.5); `ssl` is `true` for a TLS session.
+fn connection_is_encrypted(conn: &mut postgres::Client) -> Result<bool, postgres::Error> {
+    let row = conn.query_one(
+        "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+        &[],
+    )?;
+    Ok(row.get(0))
+}
+
 /// How long a write inside a [`PgTxn`] will wait on a row another open (uncommitted) transaction
 /// is holding before giving up. See the module docs: without this, `put`/`delete` would use
 /// PostgreSQL's normal row-lock **wait**, which blocks until the other transaction ends — the
@@ -496,9 +526,45 @@ pub struct PostgresBackend {
     inner: Arc<Inner>,
 }
 
+/// How [`PostgresBackend::open_with`] should open its pool. [`PostgresBackend::open`] uses the
+/// defaults with the schema it is given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostgresOpenOptions {
+    /// The PostgreSQL schema every table lives in; created if missing. A single safe identifier
+    /// (see [`PostgresBackend::open`]).
+    pub schema: String,
+    /// The most pooled connections to hold. At least 1.
+    pub pool_size: u32,
+    /// Whether and how to encrypt the connections (libpq's `sslmode`). Overrides any `sslmode`
+    /// in the DSN.
+    pub tls: PgTlsOptions,
+}
+
+impl Default for PostgresOpenOptions {
+    fn default() -> Self {
+        Self {
+            schema: "public".to_owned(),
+            pool_size: 16,
+            tls: PgTlsOptions::default(),
+        }
+    }
+}
+
+/// What [`PostgresBackend::open_with`] found out about the server it connected to, for the
+/// caller's own logging or health reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PostgresConnectionInfo {
+    /// Whether the connection PostgreSQL reports for the probe session (`pg_stat_ssl.ssl`) was
+    /// encrypted. Under `prefer` this is the only way to know.
+    pub encrypted: bool,
+}
+
 impl PostgresBackend {
     /// Opens a connection pool to `dsn` (a `postgres://` connection string) and ensures `schema`
     /// exists, creating it if necessary. All of this backend's tables live in that schema.
+    /// Everything else is [`PostgresOpenOptions::default`]: a pool of 16 and libpq's default
+    /// `prefer` (encrypted when the server offers it, in the clear otherwise, no certificate
+    /// check); [`PostgresBackend::open_with`] takes the full set.
     ///
     /// `dsn` is parsed by the `postgres` crate itself, so it accepts the same syntax `psql`
     /// does (`postgres://user:password@host:port/database?options`).
@@ -508,16 +574,95 @@ impl PostgresBackend {
     /// [`KvError::Backend`] if the DSN is invalid, no connection could be established, or the
     /// schema could not be created.
     pub fn open(dsn: &str, schema: &str) -> Result<Self, KvError> {
+        Self::open_with(
+            dsn,
+            &PostgresOpenOptions {
+                schema: schema.to_owned(),
+                ..PostgresOpenOptions::default()
+            },
+        )
+    }
+
+    /// Opens a connection pool to `dsn` as `options` says, ensures the schema exists, and logs
+    /// one `info` line naming the host, database, schema, pool size, the `ssl_mode` asked for
+    /// and whether the connection that came up is encrypted.
+    ///
+    /// The first connection is made outside the pool, on purpose: `r2d2` reduces a connect
+    /// failure to a string, and a TLS failure needs to come back as a [`PgTlsError`] (reachable
+    /// through [`KvError::Backend`]'s source) so a caller can name the setting that asked for
+    /// TLS. That connection also asks PostgreSQL whether it is encrypted (`pg_stat_ssl`), which
+    /// under `prefer` is the only way to know.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidKeyspaceName`] if the schema is not a safe identifier, or
+    /// [`KvError::Backend`] if `pool_size` is 0, the DSN is invalid, the TLS configuration
+    /// cannot be built (a verify mode's root certificates are unreadable), no connection could be
+    /// established (including `require`/`verify-*` against a server that does not offer TLS, or
+    /// whose certificate does not verify — a [`PgTlsError`] source), or the schema could not be
+    /// created.
+    pub fn open_with(dsn: &str, options: &PostgresOpenOptions) -> Result<Self, KvError> {
+        Self::open_with_info(dsn, options).map(|(backend, _)| backend)
+    }
+
+    /// [`PostgresBackend::open_with`], also returning what it learned about the connection.
+    ///
+    /// # Errors
+    /// As [`PostgresBackend::open_with`].
+    pub fn open_with_info(
+        dsn: &str,
+        options: &PostgresOpenOptions,
+    ) -> Result<(Self, PostgresConnectionInfo), KvError> {
+        let schema = options.schema.as_str();
         validate_ident(schema)?;
-        let config: postgres::Config = dsn.parse().map_err(pg_error)?;
+        if options.pool_size == 0 {
+            return Err(KvError::backend(DeferredError(
+                "pool_size must be at least 1".to_owned(),
+            )));
+        }
+        let mut config: postgres::Config = dsn.parse().map_err(pg_error)?;
+        config.ssl_mode(options.tls.mode.negotiation());
+        let tls_config = postgres_tls::client_config(&options.tls).map_err(KvError::backend)?;
+        let connector = RustlsConnector::new(tls_config);
+        let ssl_mode = options.tls.mode;
+        let pool_size = options.pool_size;
         // See the module docs ("Execution model"): building the pool and taking its first
         // connection both may dial PostgreSQL, which the synchronous `postgres` crate does by
         // driving a hidden Tokio runtime — never safe to do on the caller's own thread, since
         // `open` itself may be called from inside an async fn (as `hs serve` does).
         run_isolated(move || {
-            let manager = PgManager::new(config, NoTls);
+            let (host, port, database) = describe_target(&config);
+            let mut probe = config.connect(connector.clone()).map_err(|e| {
+                if postgres_tls::is_tls_error(&e) {
+                    KvError::backend(PgTlsError {
+                        mode: ssl_mode,
+                        detail: postgres_tls::error_chain(&e),
+                    })
+                } else {
+                    pg_error(e)
+                }
+            })?;
+            let encrypted = connection_is_encrypted(&mut probe).map_err(pg_error)?;
+            if ssl_mode.requires_tls() && !encrypted {
+                // Belt and braces: the negotiation above should already have refused this.
+                return Err(KvError::backend(PgTlsError {
+                    mode: ssl_mode,
+                    detail: "the server reports the session is not encrypted".to_owned(),
+                }));
+            }
+            // See `create_if_not_exists_race_free`'s docs ("Concurrent setup"): two `hs serve`
+            // replicas booting simultaneously against a fresh database both racing on this
+            // exact statement is a real, seen-in-practice failure, not a hypothetical.
+            create_if_not_exists_race_free(
+                &mut probe,
+                advisory_lock_key(&format!("hs_kv_schema:{schema}")),
+                &format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""),
+                SqlState::DUPLICATE_SCHEMA,
+            )
+            .map_err(pg_error)?;
+            drop(probe);
+            let manager = PgManager::new(config, connector);
             let pool = Pool::builder()
-                .max_size(16)
+                .max_size(pool_size)
                 // Fail fast rather than r2d2's 30-second default: a caller (including a
                 // reachability check like the one `postgres_conformance.rs` uses to decide
                 // whether to skip) should not have to wait half a minute to learn there is no
@@ -527,27 +672,27 @@ impl PostgresBackend {
                 .connection_timeout(std::time::Duration::from_secs(3))
                 .build(manager)
                 .map_err(KvError::backend)?;
-            {
-                let mut conn = pool.get().map_err(KvError::backend)?;
-                // See `create_if_not_exists_race_free`'s docs ("Concurrent setup"): two `hs serve`
-                // replicas booting simultaneously against a fresh database both racing on this
-                // exact statement is a real, seen-in-practice failure, not a hypothetical.
-                create_if_not_exists_race_free(
-                    &mut conn,
-                    advisory_lock_key(&format!("hs_kv_schema:{schema}")),
-                    &format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""),
-                    SqlState::DUPLICATE_SCHEMA,
-                )
-                .map_err(pg_error)?;
-            }
-            Ok(Self {
-                inner: Arc::new(Inner {
-                    pool: Some(pool),
-                    schema: schema.to_owned(),
-                    hub: Hub::new(),
-                    tables: Mutex::new(HashMap::new()),
-                }),
-            })
+            tracing::info!(
+                host,
+                port,
+                database,
+                schema,
+                pool_size,
+                ssl_mode = %ssl_mode,
+                encrypted,
+                "opened the PostgreSQL storage backend"
+            );
+            Ok((
+                Self {
+                    inner: Arc::new(Inner {
+                        pool: Some(pool),
+                        schema: schema.to_owned(),
+                        hub: Hub::new(),
+                        tables: Mutex::new(HashMap::new()),
+                    }),
+                },
+                PostgresConnectionInfo { encrypted },
+            ))
         })
     }
 

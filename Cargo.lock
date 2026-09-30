@@ -2516,9 +2516,14 @@ dependencies = [
  "postgres",
  "r2d2",
  "r2d2_postgres",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pemfile",
+ "rustls-pki-types",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 

@@ -151,6 +151,7 @@ pub mod conformance;
 pub mod fjall_backend;
 pub mod memory;
 pub mod postgres_backend;
+pub mod postgres_tls;
 
 pub use error::{Conflict, KvError};
 pub use retry::{TransactConfig, transact};
