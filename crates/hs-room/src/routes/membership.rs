@@ -951,7 +951,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert!(remote.joins.lock().unwrap().is_empty());
 
-        // Everybody here leaves; bob stays. Alice's rejoin goes through bob's server.
+        // Everybody here leaves; bob stays. Alice's rejoin names nobody, so it goes through
+        // bob's server; carol's names a server, and only that one is asked.
         handle
             .membership(
                 alice_id.clone(),
@@ -975,19 +976,32 @@ mod tests {
         let response = post_join::<MemoryBackend>(
             State(state.clone()),
             Path(room_id.to_string()),
-            RawQuery(Some("server_name=sponsor.example".to_owned())),
+            RawQuery(None),
             alice(),
             PermissiveJson(json!({})),
         )
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let response = post_join::<MemoryBackend>(
+            State(state.clone()),
+            Path(room_id.to_string()),
+            RawQuery(Some("server_name=sponsor.example".to_owned())),
+            RoomRequester(Requester::for_user(carol_id.clone())),
+            PermissiveJson(json!({})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         let joins = remote.joins.lock().unwrap();
-        assert_eq!(joins.len(), 1, "the rejoin went through federation");
+        assert_eq!(joins.len(), 2, "both rejoins went through federation");
         let (user, room, via, _) = &joins[0];
         assert_eq!(user, "@alice:hs1");
         assert_eq!(room, room_id.as_str());
-        assert_eq!(via, &["sponsor.example", "remote.example"]);
+        assert_eq!(via, &["remote.example"]);
+        let (user, _, via, _) = &joins[1];
+        assert_eq!(user, "@carol:hs1");
+        assert_eq!(via, &["sponsor.example"]);
     }
 
     #[tokio::test]
@@ -1013,8 +1027,8 @@ mod tests {
         let (user, room, via, content) = &joins[0];
         assert_eq!(user, "@alice:hs1");
         assert_eq!(room, "!nowhere:remote.example");
-        // The client's servers first, then the room ID's own server as a last resort.
-        assert_eq!(via, &["sponsor.example", "other.example", "remote.example"]);
+        // Only the client's servers: the room ID's own server is asked when it named none.
+        assert_eq!(via, &["sponsor.example", "other.example"]);
         assert_eq!(content["reason"], "curious");
         assert!(
             content.get("membership").is_none(),
