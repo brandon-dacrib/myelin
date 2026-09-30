@@ -81,8 +81,11 @@ Last updated: 2026-09-30 (session 11: the client space hierarchy, below). Before
 >   `TestClientSpacesSummary` (5 subtests: whole graph, `max_depth`, `suggested_only`,
 >   pagination, a redacted link), `TestClientSpacesSummaryJoinRules`, `TestFederatedClientSpaces`
 >   -- went from **0/5 (0/10 with subtests)** on the previous image (`complement-hs-fedc:fix`,
->   the fourteenth session's code) to **5/5 (10/10)**, 72 s. The fourteenth session's targeted
->   set is remeasured below.
+>   the fourteenth session's code) to **5/5 (10/10)**, 72 s. Status 06's fourteenth-session
+>   targeted set (`^(TestRestrictedRooms|TestFederationRoomsInvite|TestKnocking|TestKnockRooms|TestFederationRejectInvite)`,
+>   18 top-level, 98 with subtests) remeasured on the same image: **16/18, 96/98** (was 14/18,
+>   94/98), 437 s; the two left are `TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevels{V11,V12}`,
+>   the test's own federation race that status 06 item 3 describes, failing as before.
 > - **Verified (Rust)**: `cargo test -p hs-room` (154: 122 unit, 32 integration), `cargo test
 >   -p hs-federation` (180), `cargo test -p hs-cli --lib` (173), `cargo test -p hs-cli --test
 >   space_hierarchy` (1, 54 s under load) and `--test federation_reads` (9); `cargo fmt --all

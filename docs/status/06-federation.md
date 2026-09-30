@@ -89,7 +89,9 @@ in `refs/complement`; the image via `tests/complement/build.sh` with `DOCKER_BUI
 > world-readable, or restricted to a room it has a user in) and answers `404` for a root it may
 > not see; `RoomDataSource::hierarchy`'s signature changed accordingly (the in-memory fake too).
 > `FederationClient::room_hierarchy` is the outbound half, used by `hs_cli::hierarchy` for the
-> client-server walk. Details and numbers in status 04, session 11.
+> client-server walk. Details and numbers in status 04, session 11; this section's targeted
+> set remeasured on that branch's image is **16/18, 96/98**, with only the two NoCreators
+> races (item 3) left.
 
 **Left:** the client `/hierarchy` endpoint (item 2, closed above); a wait in Complement's NoCreators test
 or an accepted flake (item 3); the full workspace gate on this branch; the cluster run of the
