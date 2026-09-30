@@ -1,7 +1,102 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-09-27 (RFC 0017 run against the real binary, below); before that 2026-09-27
-(the bridge manager) and 2026-09-25.
+Last updated: 2026-09-30 (ephemeral, to-device and device-list delivery, below); before that
+2026-09-27 (RFC 0017 run against the real binary), 2026-09-27 (the bridge manager) and
+2026-09-25.
+
+## Session 2026-09-30 (branch `agent/as-ephemeral`): bridges are sent everything but events, too
+
+**The gap** (`docs/next-steps.md`, "Appservice delivery carries events only"): `Transaction`
+had the fields for MSC2409 ephemeral events and to-device messages, MSC4203 and MSC3202, and the
+pump filled `events` alone. mautrix-whatsapp in appservice-mode encryption (2026-09-25) had asked
+for all of it and been sent none. Decision 0021 records the design; the short version:
+
+- **Where it reads from.** Receipts, presence and to-device messages each got a server-wide
+  stream in the store that owns them, appended in the write's own transaction
+  (`hs_user.receipt_stream`, `hs_user.presence_stream`, `hs_e2e.to_device_stream`;
+  `UserStore::{receipt,presence}_stream_{since,head}` and `prune_*`,
+  `ToDeviceStore::to_device_stream_{since,head}`, `prune_to_device_stream`). Device lists
+  already had one (`DeviceKeyStore::changed_users_since`). Typing has none: the session hub
+  gained `install_ephemeral_observer` (`hs_user::hub::EphemeralObserver`), called from its
+  local publish path and from `apply_ephemeral`, so on every replica it hears every change.
+- **`hs_appservice::ephemeral`**: `EphemeralPump` over two traits `hs-cli` implements
+  (`EphemeralSource` over the hub, its store and the room registry; `DeviceSource` and
+  `KeyCountSource` over the E2EE store). `tick()` reads each stream from each appservice's
+  durable position (`hs_appservice.ephemeral_pos`, `(appservice, stream)`), builds one
+  transaction per appservice with everything past its position that it is interested in
+  (Synapse's rules, `Interest`), and queues bodies and positions in **one store transaction**
+  (`AppserviceStore::enqueue_ephemeral`), then prunes each stream at and below the lowest
+  position. A new appservice starts at each stream's head. `note(Change)` is the doorbell:
+  typing rooms are remembered and sent as the room's current typing set, once per tick.
+- **`hs-cli`**: `appservice_delivery::Sources` (the trait impls), `Doorbell` (the hub's
+  observer), `follow_ephemeral` (a tick on every doorbell and every 250 ms, on the global
+  shard's owner; others discard their typing notes), `DeliveryDeps` (the start arguments,
+  now with the hub, the E2EE store and the metrics). The event pump also carries MSC3202 key
+  counts now (`Pump::with_key_counts`: the bot and its users among the room's members).
+- **Shapes** (Synapse's, checked against `refs/mautrix-go`'s parser): `typing_event`,
+  `receipt_event`/`receipt_content`, `presence_event` in `transaction.rs`; **`ToDeviceEntry`
+  is now flattened** -- `to_user_id` and `to_device_id` beside `type`, `sender`, `content` --
+  where before the event sat under an `event` key no bridge reads. The conformance suite
+  asserts the flat shape.
+- **To-device messages are not deleted when pushed** (Synapse does not either): a
+  double-puppeting registration's non-exclusive namespace names a real person, whose own
+  clients need the message, and a sync-mode mautrix bridge ignores what is pushed. Written
+  down in decision 0021 with the cost (a never-syncing bot device's queue grows; track 08's
+  retention question).
+- **Observability**: `hs_appservice_transactions_total{appservice,outcome}` and
+  `hs_appservice_delivered_items_total{appservice,kind}` (`hs_appservice::metrics`,
+  registered by `hs serve`), and the scheduler's `info` line `delivered a transaction to an
+  appservice` with `events=`, `typing=`, `receipts=`, `presence=`, `to_device=`,
+  `device_list_changes=`, `one_time_key_counts=`, `fallback_key_types=`. The admin API's
+  backlog entries never counted events, so an ephemeral-only transaction is reported like any
+  other; the health read after one says `healthy`.
+
+**Verified by running.**
+
+- `crates/hs-cli/tests/appservice_ephemeral.rs`,
+  `a_bridge_is_sent_ephemeral_data_once_across_a_restart_and_not_while_paused` (**1 of 1,
+  19 s**, debug binary): a real `hs serve` from a configuration file importing a registration
+  with `receive_ephemeral` and `org.matrix.msc3202` whose `url` is an axum stand-in; alice,
+  bob, the bot and `@ghost_alice` (the last two registered through `m.login.application_service`,
+  the ghost joined by masquerading). Alice types in the ghost's room and in bob's private room:
+  one `m.typing` for the ghost's room, none for the private one. A receipt in each: one
+  `m.receipt` with `content[event_id]["m.read"][alice].ts`. `PUT /presence` unavailable with a
+  status message: `m.presence` from alice with `status_msg`, `last_active_ago`, no `user_id`
+  inside. `/sendToDevice` to the ghost's device and to bob's: one to-device entry, the flat
+  shape, under both spellings. Alice uploads device keys: `device_lists.changed` names her.
+  The bot uploads two one-time keys: the next transaction carries
+  `device_one_time_keys_count[bot][device].signed_curve25519 == 2` under all three spellings.
+  `/metrics` has every `kind` and the log has the delivery line with `to_device=1`. SIGTERM
+  and a restart over the same data directory: three seconds later the stand-in's tallies are
+  unchanged (nothing resent), and a receipt after the restart arrives exactly once. Paused
+  through the admin API: a presence change and a to-device message sit in the backlog and
+  nothing arrives; resumed: both arrive, the to-device message once; health `healthy`.
+  Mutant: with the pump's `tick` replaced by `Ok(vec![])` the test fails at "alice's typing
+  reached the bridge" (73 s, the bound).
+- `cargo test -p hs-appservice`: 99 (from 74). New: `ephemeral::tests` (6: interest and
+  private-receipt scoping, typing/receipts/presence to the interested appservice and nobody
+  else with positions moving and streams pruned, to-device and device lists with key counts, a
+  restarted pump continuing from stored positions, a stream further behind than a page read
+  whole and in order, streams kept empty with nobody listening); `store::tests::
+  ephemeral_positions_are_written_with_the_bodies_they_account_for`; `transaction::tests`
+  (the flat to-device entry, the shapes, `body_counts` reading either spelling once);
+  `metrics::tests`; `pump::tests::an_msc3202_appservice_is_sent_key_counts_with_its_events`.
+- `cargo test -p hs-user`: 148 lib + 6 (`store::tables::tests::
+  receipt_and_presence_writes_append_to_the_server_wide_streams`, `hub::tests::
+  the_ephemeral_observer_is_told_of_local_and_peer_changes`); `cargo test -p hs-e2e`: 30 lib +
+  27 (`to_device_stream_names_every_queued_message_and_is_pruned_below_a_position`);
+  `hs-bridge-conformance` 4; `hs-bridges` 9; `cargo test -p hs-cli --test bridge_offerings`
+  3; `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`.
+- The real mautrix bridge: see the end of this section.
+
+**Not done / what is left.** `device_lists.left` is never filled (Synapse's TODO too). Key
+counts are computed per transaction with one device listing per interesting user: a room with
+hundreds of ghosts costs hundreds of keyed reads per event, unmeasured. Typing that changes
+while no replica owns the global shard is lost (as designed). The to-device queue of a bot
+device that never syncs is not pruned (decision 0021). A cluster run (two replicas, one bridge)
+of the ephemeral pump has not been watched; the gate is the same as the event pump's, which
+`appservice_delivery::tests::a_replica_pumps_and_delivers_only_for_the_shards_it_owns` covers.
+
 
 **RFC 0017 runs end to end against the real binary** (`docs/next-steps.md` item 1). Everything
 below marked *ran* was watched happening over the bound socket of a real `hs serve`; everything
@@ -293,8 +388,7 @@ section was watched pausing and resuming that bridge.
 ## In progress / Known gaps
 
 Since 2026-09-22 the first four items below are superseded by `docs/bridges/heisenbridge.md`'s
-list: the pump delivers events only (no ephemeral, to-device or device-list data yet, though
-`Transaction` has the fields); the pump runs on the global shard's owner and each appservice's worker on its shard's owner, tested with a scripted ownership and not yet on a real cluster; and no mautrix-* bridge with
+list: ~~the pump delivers events only~~ (closed 2026-09-30, the session at the top); the pump runs on the global shard's owner and each appservice's worker on its shard's owner, tested with a scripted ownership and not yet on a real cluster; and no mautrix-* bridge with
 an external service has been tried, only heisenbridge.
 
 Everything below is a real, specific gap, not a vague TODO — each is blocked on a concrete thing
