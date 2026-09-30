@@ -1,6 +1,6 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-09-30 (the last two agent branches merged; nothing is unmerged). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-09-30, evening (seven gaps closed; nothing is unmerged). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
@@ -85,6 +85,33 @@ that reported done is merged; the worktrees are gone):
   both DSNs** and a second PostgreSQL with `ssl = on` for the TLS tests (`HS_KV_TEST_POSTGRES_
   TLS_DSN`/`_CERT`, `HS_CLUSTER_TEST_POSTGRES_TLS_DSN`/`_CERT`; the recipe is at the top of
   `crates/hs-kv/tests/postgres_tls.rs`); without them those tests print `SKIP`.
+
+**Evening: two more, and the day's count.** `main` is `b7f7b51`, 2,420 Rust tests, nothing
+unmerged, one worktree (`merge-queue`) left.
+
+- **Typing, receipts and presence cross replicas** (`agent/ephemeral-replicas` → `d6b3cd7`;
+  decision 0018; status 05 session 9; known gap closed): the wake batch a room owner already
+  sends every live replica carries an ephemeral list -- typing whole, receipts and presence as a
+  hint to reread the store -- published by whichever replica took the change and never
+  re-published by a receiver. `crates/hs-cli/tests/cluster_ephemeral.rs` boots two real `hs
+  serve` on PostgreSQL and checks all three kinds each way through `/sync`, 5 of 5 runs, with
+  `hs_cluster_ephemeral_updates_total{kind,direction}` agreeing on both ends. Best effort like
+  the wake; stamps now assume replica clocks within NTP of each other; not yet watched on two
+  pods.
+- **CI runs the web checks** (`agent/ci-web` → `b7f7b51`; known gap closed): a `web` job in
+  `ci.yml` runs `npm run check` and the mock-backed Playwright suite, required by `ci-ok`;
+  until today CI ran no web checks at all. First run green.
+
+**Known gaps closed today: seven** (federation media was the first, 2026-09-28; today: local
+restricted joins, EDUs to the owning replica, PostgreSQL TLS/pool/schema, the client
+`/hierarchy`, the `/sync` repeat, ephemeral data across replicas, CI's web job), plus two
+bugs nobody had a row for (the state-resolution timestamp truncation, and members of a room
+that went hot being left "cold"). The next gap agent picks from the table below; rows that
+need the cluster or the owner's terminal are marked desktop.
+
+**Tooling note:** `gh` on this desktop has an invalid token (`gh auth status`), so it falls
+back to the unauthenticated API at 60 requests an hour; the CI run above was read off the
+Actions page in a browser. `gh auth login -h github.com` in the owner's terminal fixes it.
 
 **Still owed on the cluster work, and it needs the owner's terminal** (`kubectl` from an agent
 session cannot reach `admin@dacrib0`): the two pods have never run with the handoff fix. CD
