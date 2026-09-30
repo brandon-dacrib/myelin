@@ -27,7 +27,8 @@ full gate with the two-replica PostgreSQL test running (not skipped):
   and never holds on to a shard it lost as ownerless; the two-replica admin test runs against a
   real PostgreSQL 17.
 
-**The federation work's Complement remeasure is in, and it found a bug** (`agent/federation-complement`,
+**The federation work's Complement remeasure is in, and it found a bug** (the hierarchy gap it
+names is closed below) (`agent/federation-complement`,
 merged as `0047379`, 2,365 Rust tests; the fourteenth session in `docs/status/06-federation.md`).
 The targeted set (`TestRestrictedRooms*`, `TestFederationRoomsInvite*`, `TestKnocking*`,
 `TestKnockRooms*`, `TestFederationRejectInvite`) measures **14/18 top-level, 94/98 with
@@ -45,6 +46,45 @@ change). How to run it: `tests/complement/build.sh` needs
 `DOCKER_HOST=unix:///Users/brandon/.orbstack/run/docker.sock` in an agent session
 (`/var/run/docker.sock` is a dangling symlink there), `DOCKER_BUILDKIT=0` and a `DOCKER_CONFIG`
 without the credential helper; the exact invocation is in status 06.
+
+**Later the same day, four more branches, each through the queue with the PostgreSQL tests
+running** (`main` is `22b3b33`, 2,412 Rust tests; the merge queue ran all day and every branch
+that reported done is merged; the worktrees are gone):
+
+- **PostgreSQL TLS, pool size and schema** (`agent/postgres-tls` → `e563dae`; status 01;
+  known gap closed): `storage.postgres.ssl_mode` is real, libpq's five modes over rustls, with
+  `ssl_root_cert` for the verify modes, `tls: true` still loading as `require`; `pool_size` and
+  a new `schema` reach the connection; the chart's `sslMode` is rendered at last, and the
+  operator's `Homeserver` CRD has `sslMode`/`sslRootCert` and renders them as the chart does.
+  `require` against a plain server fails at startup naming the setting. Found on the way: an
+  empty password was rendered as `password=` and rejected by the driver, so a passwordless
+  config never connected. The two-pod values still say `disable`; switching that cluster to
+  `require` against CloudNativePG is a desktop item.
+- **The client `/hierarchy` endpoint** (`agent/hierarchy` → `aea25ed`; status 04 session 11;
+  known gap closed): `GET /rooms/{roomId}/hierarchy` walks `m.space.child` depth-first in the
+  spec's order with the spec's visibility list, pages with expiring tokens, and asks a child's
+  `via` servers over federation `/hierarchy`, whose answer is now spec-shaped (it returned raw
+  PDUs before). Complement's five space tests went 0/5 → 5/5, and the targeted federation set
+  **14/18 → 16/18 (96/98)**; the two left are the `NoCreatorsUsesPowerLevels` test race.
+  Left: no rate limit on the endpoint, no cache of federation answers, and children owned by
+  another replica are loaded on the root's owner rather than forwarded.
+- **`/sync` no longer repeats an event across two batches** (`agent/sync-dup` → `22b3b33`;
+  status 05 session 8; known gap closed): the token's feed position was fixed before the batch
+  was read, but each room's timeline was read to its live end, so an event landing during
+  assembly was in that batch and, being past the token, in the next. A batch now carries the
+  rooms with a feed entry at or before its token, and each room's timeline stops at the position
+  its entry had then. A 300-event writer racing a syncing device repeated 159 on the old code
+  and none now; the bridge test's client fails on a repeat instead of deduping. Found on the
+  way: when a room crossed the fan-out threshold, members already in it kept a record saying
+  "cold" and nothing from that room reached them again; fixed in the hub.
+- **Two gate fixes** (`eb8d3a7`, and on the TLS branch): the `hs-kv` PostgreSQL conformance
+  tests had never run in a gate (no gate set `HS_KV_TEST_POSTGRES_DSN` before today); six of
+  them in parallel opened more eager 16-connection pools than a default server's 100 allow
+  under load, and a process-wide silenced panic hook in one of them hid every message. They
+  open two-connection pools now and the hook covers only its own thread. **The gate now sets
+  both DSNs** and a second PostgreSQL with `ssl = on` for the TLS tests (`HS_KV_TEST_POSTGRES_
+  TLS_DSN`/`_CERT`, `HS_CLUSTER_TEST_POSTGRES_TLS_DSN`/`_CERT`; the recipe is at the top of
+  `crates/hs-kv/tests/postgres_tls.rs`); without them those tests print `SKIP`.
 
 **Still owed on the cluster work, and it needs the owner's terminal** (`kubectl` from an agent
 session cannot reach `admin@dacrib0`): the two pods have never run with the handoff fix. CD
