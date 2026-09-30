@@ -1132,12 +1132,15 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
                 .membership_deltas
                 .iter()
                 .any(|d| &d.user_id == user_id);
-            let missing = self
-                .store
-                .get_membership(user_id, &update.room_id)
-                .await?
-                .is_none();
-            if changed_now || missing {
+            let existing = self.store.get_membership(user_id, &update.room_id).await?;
+            let missing = existing.is_none();
+            // The room crossing the threshold in either direction is written to every member's
+            // record, not only the one whose membership this update changed: `crate::sync`
+            // trusts `hot_room` to say whether a room's feed entries are being written, and a
+            // member whose record still said "cold" for a room that had gone hot was never
+            // sent anything from it again (no entries, and not a candidate without them).
+            let hot_flipped = existing.as_ref().is_some_and(|m| m.hot_room != hot);
+            if changed_now || missing || hot_flipped {
                 // A membership record's `room_pos` is a resume baseline, and `hs_room`'s forward
                 // pagination is *exclusive* of it: whatever sits at that position counts as
                 // already delivered. When this update is the user's own membership change, its
@@ -1147,10 +1150,12 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
                 // position would make the next incremental sync skip it. Back off by one so the
                 // fallback can only ever repeat an event, never lose one, which is the direction
                 // `crate::sync::resume_mode` documents as the safe one.
-                let baseline_pos = if changed_now {
-                    update.room_pos
-                } else {
-                    update.room_pos.saturating_sub(1)
+                // And a record rewritten only because the room's hot-ness flipped keeps the
+                // baseline it had: the user's own membership event has not moved.
+                let baseline_pos = match &existing {
+                    _ if changed_now => update.room_pos,
+                    Some(existing) => existing.room_pos,
+                    None => update.room_pos.saturating_sub(1),
                 };
                 self.store
                     .set_membership(user_id, &update.room_id, membership, baseline_pos, hot)
@@ -1357,6 +1362,63 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(membership.hot_room);
+    }
+
+    /// A member who was there before the room went hot is told so too. Watched from before the
+    /// room exists, as `hs serve` watches every room, the creator's membership record is written
+    /// at the create; it used to be rewritten only when *their* membership changed, so the
+    /// second member arriving left it saying "cold" for a room whose feed entries had stopped.
+    #[tokio::test]
+    async fn a_room_going_hot_is_written_to_the_records_of_the_members_already_there() {
+        let (hub, rooms) = hub(1);
+        std::mem::forget(hub.watch_all(rooms.subscribe_global()));
+        let alice = user_id!("@alice:hub.test").to_owned();
+        let bob = user_id!("@bob:hub.test").to_owned();
+        let handle = rooms
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let cold = hub
+            .store()
+            .get_membership(&alice, &room_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!cold.hot_room);
+        assert!(cold.room_pos > 0);
+
+        handle
+            .membership(
+                bob.clone(),
+                Action::Join,
+                bob.clone(),
+                serde_json::json!({}),
+                2,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let hot = hub
+            .store()
+            .get_membership(&alice, &room_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(hot.hot_room, "{hot:?}");
+        assert_eq!(
+            hot.room_pos, cold.room_pos,
+            "the baseline is still alice's own membership event"
+        );
+        assert_eq!(hot.membership, "join");
     }
 
     /// [`SessionHub::install_device_list_token_resolver`] installs a resolver on the given

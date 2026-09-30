@@ -847,6 +847,29 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             continue;
         }
 
+        // Where this user's view of the room ends, if it has: the position of their own leave,
+        // kick or ban (`MembershipRecord::room_pos` is that of their latest membership event).
+        let departed_at = matches!(membership.membership.as_str(), "leave" | "ban")
+            .then_some(membership.room_pos)
+            .filter(|pos| *pos > 0);
+        // And where the token's view of the room ends: the position its feed entry had as of
+        // `new_feed_seq`, frozen by the device cursor recorded above. Read before the room is
+        // taken, so that on a replica reading the room through a mirror (`SessionHub::room`)
+        // the snapshot validated next is at least as new as this bound. A hot room has no feed
+        // entries to bound it by (a stale one from before it went hot would hide everything
+        // since) and is read live, as `resume_mode` documents.
+        let token_bound = if membership.hot_room {
+            None
+        } else {
+            store
+                .room_pos_at_token(user_id, room_id, new_feed_seq)
+                .await?
+        };
+        let upto = match (departed_at, token_bound) {
+            (Some(departed), Some(bound)) => Some(departed.min(bound)),
+            (departed, bound) => departed.or(bound),
+        };
+
         let handle = hub.room(room_id).await?;
         let room_id_owned = room_id.clone();
         let membership_value = membership.membership.clone();
@@ -913,27 +936,6 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             .iter()
             .map(|a| json!({"type": a.event_type, "content": a.content}))
             .collect();
-
-        // Where this user's view of the room ends, if it has: the position of their own leave,
-        // kick or ban (`MembershipRecord::room_pos` is that of their latest membership event).
-        let departed_at = matches!(membership.membership.as_str(), "leave" | "ban")
-            .then_some(membership.room_pos)
-            .filter(|pos| *pos > 0);
-        // And where the token's view of the room ends: the position its feed entry had as of
-        // `new_feed_seq`, frozen by the device cursor recorded above. A hot room has no feed
-        // entries to bound it by (a stale one from before it went hot would hide everything
-        // since) and is read live, as `resume_mode` documents.
-        let token_bound = if membership.hot_room {
-            None
-        } else {
-            store
-                .room_pos_at_token(user_id, room_id, new_feed_seq)
-                .await?
-        };
-        let upto = match (departed_at, token_bound) {
-            (Some(departed), Some(bound)) => Some(departed.min(bound)),
-            (departed, bound) => departed.or(bound),
-        };
 
         let (timeline, state_events, summary) = handle
             .query(move |actor| {

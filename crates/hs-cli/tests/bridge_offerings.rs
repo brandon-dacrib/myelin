@@ -325,70 +325,77 @@ fn notices_from<'a>(timeline: &'a Value, sender: &str) -> Vec<&'a str> {
 }
 
 /// A running client: one incremental sync after another, each waiting for what comes next.
-/// Like a real client it remembers the event ids it has shown, so an event the server repeats
-/// across two batches (seen here: a bot's reply that arrived while the batch carrying the
-/// message it answers was being assembled) is not taken for a new one.
+/// It remembers every event id it has been sent and fails on one it is sent again: a batch
+/// ends where its token says, so an event that lands while a batch is being assembled is in
+/// the next one and not also in that one (`hs_user::sync`). This client used to de-duplicate,
+/// because a bot's reply that arrived while the batch carrying the message it answers was being
+/// assembled was in both; now it is the check that that no longer happens.
 struct Watch {
     caller: Caller,
-    since: Option<String>,
+    since: String,
     seen: std::collections::HashSet<String>,
 }
 
 impl Watch {
     async fn start(caller: &Caller) -> Self {
         let first = caller.matrix(GET, "/sync?timeout=0", None).await;
-        Self {
+        let mut watch = Self {
             caller: caller.clone(),
-            since: first["next_batch"].as_str().map(str::to_owned),
+            since: first["next_batch"].as_str().unwrap().to_owned(),
             seen: std::collections::HashSet::new(),
-        }
-    }
-
-    /// The next batch for which `wanted` holds; batches before it are passed over.
-    async fn next(&mut self, wanted: impl Fn(&Value) -> bool) -> Value {
-        let batch = self.caller.sync_until(self.since.clone(), wanted).await;
-        self.since = batch["next_batch"].as_str().map(str::to_owned);
-        batch
-    }
-
-    /// The next thing `bot` says in `room` that this client has not shown before.
-    async fn next_notice(&mut self, room: &str, bot: &str) -> String {
-        let seen = self.seen.clone();
-        let fresh = |timeline: &Value| -> Vec<(String, String)> {
-            timeline["events"]
-                .as_array()
-                .map(|events| {
-                    events
-                        .iter()
-                        .filter(|e| e["type"] == "m.room.message" && e["sender"] == bot)
-                        .filter(|e| !seen.contains(e["event_id"].as_str().unwrap_or_default()))
-                        .filter_map(|e| {
-                            Some((
-                                e["event_id"].as_str()?.to_owned(),
-                                e["content"]["body"].as_str()?.to_owned(),
-                            ))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
         };
-        let batch = self
-            .next(|s| !fresh(&s["rooms"]["join"][room]["timeline"]).is_empty())
-            .await;
-        for (_, joined) in batch["rooms"]["join"].as_object().into_iter().flatten() {
+        watch.remember(&first);
+        watch
+    }
+
+    /// The next batch for which `wanted` holds; batches before it are passed over, but every
+    /// one of them counts.
+    async fn next(&mut self, wanted: impl Fn(&Value) -> bool) -> Value {
+        let mut last = Value::Null;
+        for _ in 0..240 {
+            let batch = self
+                .caller
+                .matrix(
+                    GET,
+                    &format!("/sync?timeout=1000&since={}", self.since),
+                    None,
+                )
+                .await;
+            self.since = batch["next_batch"].as_str().unwrap().to_owned();
+            self.remember(&batch);
+            if wanted(&batch) {
+                return batch;
+            }
+            last = batch;
+        }
+        panic!("the sync never said what was expected; the last one said: {last}");
+    }
+
+    fn remember(&mut self, batch: &Value) {
+        for (room, joined) in batch["rooms"]["join"].as_object().into_iter().flatten() {
             for event in joined["timeline"]["events"]
                 .as_array()
                 .into_iter()
                 .flatten()
             {
                 if let Some(id) = event["event_id"].as_str() {
-                    self.seen.insert(id.to_owned());
+                    assert!(
+                        self.seen.insert(id.to_owned()),
+                        "{id} in {room} was sent in an earlier batch and again in this one: {batch}"
+                    );
                 }
             }
         }
-        fresh(&batch["rooms"]["join"][room]["timeline"])
+    }
+
+    /// The next thing `bot` says in `room`.
+    async fn next_notice(&mut self, room: &str, bot: &str) -> String {
+        let batch = self
+            .next(|s| !notices_from(&s["rooms"]["join"][room]["timeline"], bot).is_empty())
+            .await;
+        notices_from(&batch["rooms"]["join"][room]["timeline"], bot)
             .first()
-            .map(|(_, body)| body.clone())
+            .map(|body| (*body).to_owned())
             .unwrap_or_default()
     }
 }

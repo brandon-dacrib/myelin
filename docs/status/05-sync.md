@@ -1,9 +1,103 @@
 # 05 Sync: status
 
-Last updated: 2026-09-27 (session 7: `/sync` is cluster-aware -- the room owner wakes the
-replica holding the user's session over the mesh, with read-your-writes across replicas;
-verified as two `hs serve` processes on one PostgreSQL 16. Sessions 1-6 preserved unchanged
-further down, after the integration note.)
+Last updated: 2026-09-30 (session 8: a `/sync` batch ends where its token says, so an event
+that lands during assembly is sent once. Session 7 and the integration note follow; sessions
+1-6 are preserved unchanged further down.)
+
+## Session 8 (2026-09-30, branch `agent/sync-dup`): a batch and its token describe the same point
+
+**The gap** (`docs/next-steps.md`, "Known gaps"): `/sync` could repeat an event across two
+consecutive batches. Seen on 2026-09-27 with appservice-sent notices, and tolerated by
+`crates/hs-cli/tests/bridge_offerings.rs`, whose client de-duplicated by event id.
+
+**The mechanism** was neither of the two the gap row guessed at exactly, but the second one:
+the `next_batch` token's feed position *was* taken before the batch was read (the fix pinned
+by `an_event_that_arrives_while_a_sync_is_in_flight_is_not_lost` moved it there so that
+nothing could be reported as consumed without being sent), but each room's
+timeline was then read from its resume position to the room's *live end*, with no upper
+bound. An event landing in the window between fixing the token and reading the room was in
+the batch; its feed entry, written after the token was fixed and after the device cursor had
+pinned the older entry, was past the token; so the next sync, resuming from the pinned
+entry's position, sent it again. Every `await` between the two reads is a place for it to
+land -- the cursor write, `feed_since`, three membership listings, the typing and receipt
+sweeps, `get_membership`, `room_pos_as_of`, the account-data read -- and a writer racing the
+loop in-process hit it on more than half of its events. Initial syncs had the same window
+(their rooms were read from the live end too), so the repeat could also be between the
+initial batch and the first incremental one. The same window let a room joined during
+assembly be sent whole in that batch and whole again in the next.
+
+**The fix** (`crates/hs-user/src/sync/mod.rs`, `store/mod.rs`, `store/tables.rs`):
+
+- A batch's rooms are those with a feed entry at or before its token: `feed_since(baseline)`
+  is filtered to `feed_seq <= new_feed_seq`. An entry past the token is the next batch's.
+- Each room's timeline stops at the position its feed entry had as of the token.
+  `UserStore::room_pos_at_token(user, room, as_of)` is that position: the room's newest entry
+  when that entry is at or before `as_of` (`current_feed_entry`, a keyed read through the
+  existing `feed_by_room` pointer, one snapshot for pointer and row), and the existing
+  `room_pos_as_of` feed walk only when the room has moved on past the token, which is the
+  rare case this bug is about. The value is frozen by the device cursor `build` already
+  records before reading. It is applied as `build_incremental_timeline`'s and
+  `build_fresh_timeline`'s `upto`, combined (`min`) with the requester's own departure for a
+  left room, on incremental and initial syncs alike.
+- `build_incremental_timeline` cuts its forward page at the newest event at or before `upto`.
+  `RoomActor::paginate` returns events without their positions and `timeline_position` is a
+  linear walk, so the boundary event is fetched with one backward page of one from `upto + 1`
+  (a keyed read) and found in the forward page by id; not in the page and the page full means
+  the bound is beyond the scan (a gap, answered by `build_fresh_timeline` from `upto`, which
+  already honored it); not in the page and the page not full means nothing between the resume
+  point and the bound is new. A bound at or before the resume point returns an empty timeline
+  before any read.
+- A hot room (`MembershipRecord::hot_room`) has no feed entries to bound it by -- and a stale
+  one from before it went hot would hide everything since -- so it is read live, as before.
+  Hot rooms remain fan-out-on-read and may repeat, as `resume_mode` has always documented.
+  Found on the way (`hub.rs`): the hub rewrote a member's record, `hot_room` included, only
+  when *that member's* membership changed or the record was missing, so when a room crossed
+  the threshold every member already there kept a record saying "cold" -- no feed entries any
+  more, and not a candidate without them, so nothing from that room reached them again. With
+  the bound trusting the flag, that would have become a stale bound rather than a missing
+  candidate; either way wrong. `apply_room_update` now rewrites a record whose `hot_room`
+  disagrees with the room's current hot-ness, keeping its baseline position
+  (`hub::tests::a_room_going_hot_is_written_to_the_records_of_the_members_already_there`,
+  fails without it -- checked). The existing hub test did not see this because it started
+  watching the room after its creation, so the creator's record was "missing" at the flip.
+- A `tracing::debug!` per batch, `"assembled a /sync batch"`, with `user_id`, `since`, `next`,
+  `initial`, `rooms` and `timeline_events`. No metric: `hs-user` registers none today and a
+  batch counter is not worth a registry hook.
+
+**What it does not change.** No latency on the common path: one keyed read per room in a
+batch (the pointer) and one keyed read per room with a non-empty timeline (the boundary),
+both O(log n) on the in-memory backend; the feed walk only when the room has moved past the
+token. `wait_for_consumed` and `settle_before_read` are untouched. To-device, device lists,
+account data, typing, receipts and presence keep their own cursors and were never affected.
+A requester with no device (some appservice callers) still records no cursor, so its entries
+still coalesce; that row in "Known gaps" stands.
+
+**Tests** (`cargo test -p hs-user`: 140 lib + 6 scenario, from 136 + 6):
+
+- `sync::tests::an_event_that_arrives_during_assembly_is_in_exactly_one_batch`: a writer task
+  sends 300 messages as fast as it can (yielding between sends) while a device syncs in a loop
+  the way `routes::sync` does (build, then record the cursor), initial batch included, on a
+  four-thread runtime. Asserts no batch is `limited`, no event id is sent twice, none is lost,
+  and the batches concatenated are the room's order. On `main` before the fix: `159 of 300
+  events were sent twice across 136 batches`. After: passes, five runs in a row, 0.3 s each.
+- `sync::tests::an_incremental_timeline_ends_at_the_tokens_position_not_the_rooms_live_end`:
+  `build_incremental_timeline` directly, six messages: unbounded, bounded mid-stretch, bound
+  at and before the resume point (empty), bound beyond the room's end, a gap answered with the
+  newest `limit` events at or before the bound (`limited: true`), and exactly `limit` events
+  up to the bound with more beyond it (not a gap).
+- `store::tables::tests::room_pos_at_token_is_the_rooms_newest_entry_unless_that_is_past_the_token`:
+  the pointer path, coalescing, pinning, and the fallback walk.
+- `crates/hs-cli/tests/bridge_offerings.rs`: its `Watch` client no longer de-duplicates; it
+  remembers every event id in every batch it is sent (the initial one and the ones passed
+  over included) and fails on a repeat. The dedupe existed only for this bug. Against the real
+  binary with the bound taken back out (a one-line mutant passing `departed_at` instead of
+  `upto`), `a_person_gets_a_bridge_by_messaging_its_front_door_and_the_manager_bot_takes_commands`
+  fails at once: `$B933_... in !rf9E...:example.org was sent in an earlier batch and again in
+  this one`. With the fix, 3 of 3 pass (33 s).
+
+**Verification**: `cargo fmt --all --check`; `cargo clippy -p hs-user --all-targets -- -D
+warnings`; `cargo test -p hs-user`; `cargo test -p hs-cli --test bridge_offerings`; results
+in the section's commit and in `docs/next-steps.md`'s struck row.
 
 ## Where this stopped (2026-09-27, branch `agent/federation-edus`): ephemeral data across servers and restarts
 
