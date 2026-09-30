@@ -1,6 +1,22 @@
 # 02 State and model: status
 
-Updated: 2026-09-18 (session 5).
+Updated: 2026-09-30 (a mainline tie-break bug, found by Complement; below). Before that 2026-09-18 (session 5).
+
+## 2026-09-30: mainline ties were broken by event ID, not by time
+
+Found by track 06's Complement remeasure (`docs/status/06-federation.md`, fourteenth session):
+`TestRestrictedRoomsRemoteJoinFailOver` passed about half the time because a leave forked from a
+power-levels change lost to the join it superseded. The `ruma_state_res::Event` adapter in
+`crates/hs-state/src/state_res/v2.rs` returned `origin_server_ts` through
+`u32::try_from(..).unwrap_or(u32::MAX)`; every real timestamp (about 1.79e12 ms) overflows
+`u32`, so every event carried `u32::MAX` and the mainline ordering's timestamp tie-break fell
+through to the event-ID tie-break, a coin toss per pair. Every resolver test had used timestamps
+counted from zero and never saw it. Now the timestamp is passed whole (`UInt::new_saturating`).
+The test clock in `state_res/test_support.rs` starts at a real 2026 timestamp (`REAL_CLOCK_START`),
+which makes the oracle-versus-ruma property test fail on the old code (regression seed committed),
+and `cross_check_tests.rs::a_later_event_at_the_same_mainline_position_wins_at_real_timestamps`
+pins the case in versions 8, 10 and 11. This affected every room version from 2 up on any fork
+whose conflicting events shared a mainline position.
 
 ## Session 5 (this session): the room-version-12 gap, verified and closed where this track owns it
 
