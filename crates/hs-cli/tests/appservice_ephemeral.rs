@@ -353,6 +353,20 @@ fn escape(id: &str) -> String {
         .replace('@', "%40")
 }
 
+/// The bridge's tally once it has not changed for two seconds: what was sent before some
+/// point, with nothing from before it still on its way.
+async fn settled(bridge: &StandIn) -> (usize, usize, usize, usize, usize, usize) {
+    let mut last = bridge.tally();
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let now = bridge.tally();
+        if now == last {
+            return now;
+        }
+        last = now;
+    }
+}
+
 /// Polls `f` until it says yes, or panics after a bound.
 async fn until<F, Fut>(what: &str, mut f: F)
 where
@@ -800,8 +814,9 @@ async fn a_bridge_is_sent_ephemeral_data_once_across_a_restart_and_not_while_pau
     );
 
     // A restart over the same data directory: nothing is sent twice, and what happens next is
-    // sent once.
-    let before = bridge.tally();
+    // sent once. Counted once nothing more is arriving from before the restart (the typing
+    // stop and the bot's own device-list change may still be on their way).
+    let before = settled(&bridge).await;
     let first_log = server.stop();
     assert!(
         first_log.contains("delivered a transaction to an appservice"),
@@ -856,7 +871,7 @@ async fn a_bridge_is_sent_ephemeral_data_once_across_a_restart_and_not_while_pau
             Some(json!({})),
         )
         .await;
-    let while_paused = bridge.tally();
+    let while_paused = settled(&bridge).await;
     alice
         .matrix(
             reqwest::Method::PUT,

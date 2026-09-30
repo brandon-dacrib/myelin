@@ -87,7 +87,15 @@ for all of it and been sent none. Decision 0021 records the design; the short ve
   27 (`to_device_stream_names_every_queued_message_and_is_pruned_below_a_position`);
   `hs-bridge-conformance` 4; `hs-bridges` 9; `cargo test -p hs-cli --test bridge_offerings`
   3; `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`.
-- The real mautrix bridge: see the end of this section.
+- **The real mautrix bridge** (`docs/bridges/mautrix.md`, "2026-09-30"): mautrix-whatsapp
+  `v26.09+dev.a0325e76` in Docker, from an offering's rendered files, in appservice-mode
+  encryption. 200 ms after its key upload it was sent its own device-list change with its
+  one-time-key count and fallback key type and logged "Device list changes in /sync
+  changes=[@whatsappbot_alice:test.local]"; alice's typing, receipt and presence arrived as
+  `unstable_edu` transactions (the registration asks for the legacy spelling); and an
+  `m.room_key_request` sent to its device arrived as `{"to_device":1}` and was handed to its
+  Olm machine ("Starting handling to-device event ... type=m.room_key_request"). Eleven
+  transactions delivered, counted the same on both sides. No phone, so no encrypted message.
 
 **Not done / what is left.** `device_lists.left` is never filled (Synapse's TODO too). Key
 counts are computed per transaction with one device listing per interesting user: a room with

@@ -45,10 +45,56 @@ The reproduction is a Playwright spec against the real binary,
 
 **Not verified:** signing in, which needs a phone with WhatsApp (the steps are on the page and
 at <https://docs.mau.fi/bridges/go/whatsapp/authentication.html>), and therefore any message
-in either direction. The MSC3202 transaction fields and MSC4203 to-device delivery have been
+in either direction. ~~The MSC3202 transaction fields and MSC4203 to-device delivery have been
 *asked for* by a real bridge and set up on both sides; they have not yet carried an encrypted
-conversation. That is the next thing to watch, and the reason the bridges number in
-`docs/next-steps.md` is not higher.
+conversation.~~ Since 2026-09-30 the bridge is sent them (below); an encrypted conversation
+still needs the phone.
+
+## 2026-09-30: the bridge receives device lists, key counts, ephemeral events and to-device messages
+
+Until this day the server sent a bridge events only (`docs/next-steps.md`, "Appservice delivery
+carries events only"). The same bridge image (`dock.mau.dev/mautrix/whatsapp:latest`,
+`v26.09+dev.a0325e76`, mautrix-go `v0.31.0+dev.4aac2bbf`, pulled from mau.dev; Docker Hub is
+not involved) was run again on the binary of branch `agent/as-ephemeral`, from the files of a
+`mautrix-whatsapp` offering's instance for `@alice:test.local` (`PUT /api/v1/bridge-offerings/
+mautrix-whatsapp` with `runtime: elsewhere`, `PUT .../instances/@alice:test.local`, `POST
+.../files`, the registration's `url` patched to `http://127.0.0.1:29318`, `docker run -d -p
+29318:29318 -v $DIR:/data`), the server at `public_baseurl: http://host.docker.internal:8018`.
+The registration the offering rendered asks for `de.sorunome.msc2409.push_ephemeral`,
+`org.matrix.msc3202` and `io.element.msc4190`; the config has `encryption.appservice: true`.
+In the bridge's log, in order (`Starting handling of transaction content=...` is mautrix-go's
+own count of what a transaction carried; `unstable_edu` is what it calls the legacy
+`de.sorunome.msc2409.ephemeral` key, which is the one this registration asked for):
+
+1. Start as before: `/versions`, `/register` as the bot, the ping (the first lost the race
+   with its own listener, the retry worked), "Creating bot device with MSC4190", `/keys/upload`
+   with 51 one-time keys, "End-to-bridge encryption is in appservice mode, registering event
+   listeners and not starting syncer", "Added listeners for encryption data coming from
+   appservice transactions", "Bridge started".
+2. **Transaction 3, 200 ms after its key upload:**
+   `{"device_changes":1,"fallback_key_users":1,"otk_count_users":1,"pdu":0,...}`, then the
+   crypto component: "Device list changes in /sync changes=["@whatsappbot_alice:test.local"]",
+   "Finished handling device list changes". Its own device list change and its own one-time-key
+   count and fallback key type, from the server's device-list stream and key store (MSC3202).
+   From here every transaction carried `otk_count_users: 1, fallback_key_users: 1`.
+3. Alice joined the bot's DM, typed, sent a message, sent a read receipt, set her presence
+   and sent an `m.room_key_request` to the bot's device (`IEXNEKZESJ`) with `/sendToDevice`.
+   **Transactions 4 to 11**: `unstable_edu: 1` for her presence (three times: her `/sync` put
+   her online, her join restamped it, then `unavailable`), the typing and the receipt; `pdu: 1`
+   for the join and the message; and **transaction 11 `{"to_device":1}`** followed by "Starting
+   handling to-device event component=crypto sender=@alice:test.local type=m.room_key_request"
+   and "Finished handling to-device event". The server's side of the same, from its log and
+   `/metrics`: `delivered a transaction to an appservice appservice=whatsapp-alice txn_id=11
+   ... to_device=1 ... one_time_key_counts=1 fallback_key_types=1`;
+   `hs_appservice_transactions_total{appservice="whatsapp-alice",outcome="delivered"} 11`;
+   `hs_appservice_delivered_items_total{...,kind="to_device"} 1`, `kind="typing"} 1`,
+   `kind="receipts"} 1`, `kind="presence"} 3`, `kind="device_list_changes"} 1`,
+   `kind="one_time_key_counts"} 9`, `kind="events"} 11`.
+
+So the bridge's Olm machine now receives what appservice-mode encryption needs from this
+server. What it has still not done is decrypt or encrypt a room message: that needs a signed-in
+WhatsApp account, and a phone. The bridge's avatar fetch from `maunium.net` got a 502 (no
+federation on that test server), which is unrelated and harmless.
 
 ## What the bridge's first minute found
 
