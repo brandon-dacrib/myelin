@@ -21,7 +21,23 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use hs_kv::postgres_backend::PostgresBackend;
+use hs_kv::postgres_backend::{PostgresBackend, PostgresOpenOptions};
+
+/// Opens `schema` on `dsn` with a pool of two connections. The default pool is sixteen eager
+/// connections, and the six tests in this binary run at once, each opening a probe pool and
+/// then its own (the breakdown opens eleven in turn): on a server with PostgreSQL's default
+/// `max_connections = 100` that is "sorry, too many clients already" whenever the machine is
+/// busy enough for dropped pools to linger, which is how a merge gate failed on 2026-09-30.
+fn open_small(dsn: &str, schema: &str) -> Result<PostgresBackend, hs_kv::KvError> {
+    PostgresBackend::open_with(
+        dsn,
+        &PostgresOpenOptions {
+            schema: schema.to_owned(),
+            pool_size: 2,
+            ..PostgresOpenOptions::default()
+        },
+    )
+}
 
 fn test_dsn() -> String {
     std::env::var("HS_KV_TEST_POSTGRES_DSN")
@@ -33,7 +49,7 @@ fn test_dsn() -> String {
 /// still gets a green `cargo test`.
 fn reachable_dsn() -> Option<String> {
     let dsn = test_dsn();
-    match PostgresBackend::open(&dsn, "hs_kv_reachability_probe") {
+    match open_small(&dsn, "hs_kv_reachability_probe") {
         Ok(_backend) => Some(dsn),
         Err(e) => {
             eprintln!(
@@ -138,7 +154,7 @@ fn postgres_backend_conformance_breakdown() {
     std::panic::set_hook(Box::new(|_| {})); // scenario panics are expected control flow here
     for (name, f) in scenarios {
         let schema = fresh_schema_name();
-        let backend = PostgresBackend::open(&dsn, &schema).expect("open postgres backend");
+        let backend = open_small(&dsn, &schema).expect("open postgres backend");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(backend)));
         match result {
             Ok(()) => passed.push(*name),
@@ -206,7 +222,7 @@ fn reopen_against_the_same_schema_preserves_committed_data() {
     {
         use hs_kv::{KvBackend as _, KvWrite as _, TransactConfig, transact};
 
-        let backend = PostgresBackend::open(&dsn, &schema).expect("open");
+        let backend = open_small(&dsn, &schema).expect("open");
         let ks = backend.keyspace("durable").expect("keyspace");
         transact(&backend, TransactConfig::default(), |txn| {
             txn.put(&ks, b"key-1", b"value-1")?;
@@ -221,7 +237,7 @@ fn reopen_against_the_same_schema_preserves_committed_data() {
     use bytes::Bytes;
     use hs_kv::{KvBackend as _, KvRead as _};
 
-    let reopened = PostgresBackend::open(&dsn, &schema).expect("reopen (same schema, new pool)");
+    let reopened = open_small(&dsn, &schema).expect("reopen (same schema, new pool)");
     let ks = reopened.keyspace("durable").expect("keyspace");
     let snap = reopened.snapshot();
     assert_eq!(
@@ -266,7 +282,7 @@ fn postgres_keyspace_name_with_a_dotted_crate_prefix_round_trips() {
     {
         use hs_kv::{KvBackend as _, KvWrite as _, TransactConfig, transact};
 
-        let backend = PostgresBackend::open(&dsn, &schema).expect("open");
+        let backend = open_small(&dsn, &schema).expect("open");
         let ks = backend
             .keyspace(keyspace_name)
             .expect("dotted keyspace name must be accepted");
@@ -282,7 +298,7 @@ fn postgres_keyspace_name_with_a_dotted_crate_prefix_round_trips() {
     use bytes::Bytes;
     use hs_kv::{KvBackend as _, KvRead as _};
 
-    let reopened = PostgresBackend::open(&dsn, &schema).expect("reopen (same schema, new pool)");
+    let reopened = open_small(&dsn, &schema).expect("reopen (same schema, new pool)");
     let ks = reopened
         .keyspace(keyspace_name)
         .expect("reopening must accept the same dotted keyspace name");
@@ -340,11 +356,11 @@ fn postgres_two_replicas_opening_the_same_fresh_schema_simultaneously_both_succe
         let (opened_a, opened_b) = std::thread::scope(|scope| {
             let a = scope.spawn(|| {
                 schema_barrier.wait();
-                PostgresBackend::open(&dsn, &schema)
+                open_small(&dsn, &schema)
             });
             let b = scope.spawn(|| {
                 schema_barrier.wait();
-                PostgresBackend::open(&dsn, &schema)
+                open_small(&dsn, &schema)
             });
             (
                 a.join().expect("replica A's open() thread did not panic"),
@@ -415,7 +431,7 @@ fn round_trip_body(dsn: &str, schema: &str) {
     use bytes::Bytes;
     use hs_kv::{KvBackend as _, KvRead as _, KvWrite as _, TransactConfig, transact};
 
-    let backend = PostgresBackend::open(dsn, schema).expect("open");
+    let backend = open_small(dsn, schema).expect("open");
     let ks = backend.keyspace("roundtrip").expect("keyspace");
     transact(&backend, TransactConfig::default(), |txn| {
         txn.put(&ks, b"k1", b"v1")?;
