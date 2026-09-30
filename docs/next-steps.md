@@ -109,9 +109,10 @@ bugs nobody had a row for (the state-resolution timestamp truncation, and member
 that went hot being left "cold"). The next gap agent picks from the table below; rows that
 need the cluster or the owner's terminal are marked desktop.
 
-**Tooling note:** `gh` on this desktop has an invalid token (`gh auth status`), so it falls
-back to the unauthenticated API at 60 requests an hour; the CI run above was read off the
-Actions page in a browser. `gh auth login -h github.com` in the owner's terminal fixes it.
+**Tooling note:** `gh` on this desktop had an invalid token for most of the day (it fell back
+to the unauthenticated API at 60 requests an hour, and the CI run above was read off the
+Actions page in a browser); the owner ran `gh auth login` in the evening and it is
+authenticated again (`gh api rate_limit` shows the 5,000/hour limit).
 
 **Still owed on the cluster work, and it needs the owner's terminal** (`kubectl` from an agent
 session cannot reach `admin@dacrib0`): the two pods have never run with the handoff fix. CD
