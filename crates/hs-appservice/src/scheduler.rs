@@ -41,9 +41,10 @@ use hs_kv::KvBackend;
 use serde_json::Value;
 
 use crate::error::AppserviceError;
+use crate::metrics::AppserviceMetrics;
 use crate::registry::Registry;
 use crate::store::{QueueStatus, QueuedTransaction};
-use crate::transaction::Transaction;
+use crate::transaction::{Transaction, body_counts};
 
 /// Tuning for [`Scheduler::drain`].
 #[derive(Debug, Clone, Copy)]
@@ -266,6 +267,7 @@ pub struct Scheduler<B: KvBackend> {
     clock: Arc<dyn Clock>,
     sender: Arc<dyn TransactionSender>,
     config: SchedulerConfig,
+    metrics: Option<AppserviceMetrics>,
 }
 
 impl<B: KvBackend> Scheduler<B> {
@@ -281,6 +283,7 @@ impl<B: KvBackend> Scheduler<B> {
             clock,
             sender,
             config: SchedulerConfig::default(),
+            metrics: None,
         }
     }
 
@@ -288,6 +291,14 @@ impl<B: KvBackend> Scheduler<B> {
     #[must_use]
     pub fn with_config(mut self, config: SchedulerConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Counts every delivery into `metrics` ([`crate::metrics`]). Without this, nothing is
+    /// counted, which is what tests and the conformance harness want.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: AppserviceMetrics) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
@@ -400,6 +411,24 @@ impl<B: KvBackend> Scheduler<B> {
                         .store()
                         .delete_queue_entry(appservice_id, entry.seq)?;
                 }
+                let counts = body_counts(&merged);
+                tracing::info!(
+                    appservice = %appservice_id,
+                    txn_id = %txn_id,
+                    entries = batch.len(),
+                    events = counts.events,
+                    typing = counts.typing,
+                    receipts = counts.receipts,
+                    presence = counts.presence,
+                    to_device = counts.to_device,
+                    device_list_changes = counts.device_list_changes,
+                    one_time_key_counts = counts.one_time_key_counts,
+                    fallback_key_types = counts.fallback_key_types,
+                    "delivered a transaction to an appservice"
+                );
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_delivered(appservice_id, &counts);
+                }
                 let mut health = self.registry.store().health(appservice_id)?;
                 health.consecutive_failures = 0;
                 health.last_error = None;
@@ -412,6 +441,9 @@ impl<B: KvBackend> Scheduler<B> {
                 })
             }
             Err(err) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_failed(appservice_id);
+                }
                 let mut dead_lettered = 0usize;
                 for mut entry in batch.clone() {
                     entry.attempts += 1;

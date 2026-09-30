@@ -197,6 +197,17 @@ impl hs_e2e::state::SyncTokenResolver for DeviceListTokenResolver {
 /// The per-process hub: one [`crate::store::UserStore`] shared by every user, a [`RoomSource`]
 /// for querying room member lists, and the in-memory wakers `/sync` long-polls block on.
 ///
+/// What [`SessionHub::install_ephemeral_observer`] installs: told of every typing, receipt and
+/// presence change the hub applies, from its own clients and from other replicas. Must return
+/// at once (it is called on the request path); a slow consumer takes a note and does its work
+/// on its own task.
+pub trait EphemeralObserver: Send + Sync {
+    /// A change was applied here. For a receipt or presence hint the data is already in the
+    /// store; for typing, in this hub's [`crate::typing::TypingRegistry`]
+    /// ([`SessionHub::typing_users`]).
+    fn ephemeral_changed(&self, update: &EphemeralUpdate);
+}
+
 /// Deliberately holds no per-user in-memory *state* beyond the wakers -- everything a sync
 /// response needs comes from `store` (`PLAN.md` section 5.4: "Everything the user session holds
 /// is derivable from room positions and the feed"), so this hub is cheap to reconstruct after a
@@ -233,6 +244,10 @@ pub struct SessionHub<B: KvBackend, R: RoomSource<B>> {
     /// once `hs-cli` installs it ([`SessionHub::install_edu_outbox`]). `None`: nothing leaves
     /// this server, which is what federation being off means.
     edu_outbox: OnceLock<Arc<dyn EduOutbox>>,
+    /// Told of every typing, receipt and presence change this hub applies -- its own users' and
+    /// other replicas' alike -- once installed ([`SessionHub::install_ephemeral_observer`]).
+    /// `None`: nobody is listening, which is the default.
+    ephemeral_observer: OnceLock<Arc<dyn EphemeralObserver>>,
     /// `m.presence` state, written through to `store`. See [`crate::presence`]'s module docs.
     presence: PresenceRegistry,
     /// `m.receipt` state, written through to `store`. See [`crate::receipts`]'s module docs.
@@ -277,6 +292,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             typing: Arc::new(TypingRegistry::new()),
             edu_outbox: OnceLock::new(),
+            ephemeral_observer: OnceLock::new(),
             presence,
             receipts,
             push_rules: OnceLock::new(),
@@ -344,6 +360,21 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     pub fn install_edu_outbox(&self, outbox: Arc<dyn EduOutbox>) {
         if self.edu_outbox.set(outbox).is_err() {
             tracing::warn!("an EDU outbox was already installed on this hub; ignoring");
+        }
+    }
+
+    /// Installs what is told of every typing, receipt and presence change this hub applies: a
+    /// change one of this replica's own clients made, or a change another replica made and
+    /// sent here in a wake batch ([`SessionHub::apply_ephemeral`]). On every replica together
+    /// that is every change on the server, which is what appservice delivery of ephemeral
+    /// data (MSC2409, `hs-appservice`'s ephemeral pump, wired by `hs-cli`) needs: typing is in
+    /// no store, so the observer is the only way to hear of it, and for receipts and presence
+    /// it is the doorbell that spares the pump waiting for its next poll of the store's streams
+    /// ([`crate::store::UserStore::receipt_stream_since`]). Same idempotent-install convention
+    /// as [`SessionHub::install_edu_outbox`].
+    pub fn install_ephemeral_observer(&self, observer: Arc<dyn EphemeralObserver>) {
+        if self.ephemeral_observer.set(observer).is_err() {
+            tracing::warn!("an ephemeral observer was already installed on this hub; ignoring");
         }
     }
 
@@ -462,6 +493,9 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             ?update,
             "applying a peer's ephemeral update"
         );
+        if let Some(observer) = self.ephemeral_observer.get() {
+            observer.ephemeral_changed(&update);
+        }
         match update {
             EphemeralUpdate::Typing {
                 room_id,
@@ -525,8 +559,12 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         }
     }
 
-    /// Hands `update` to the cluster for every other replica, if this hub is part of one.
+    /// Hands `update` to the cluster for every other replica, if this hub is part of one, and
+    /// to the ephemeral observer, if one is installed.
     fn publish_ephemeral(&self, update: EphemeralUpdate) {
+        if let Some(observer) = self.ephemeral_observer.get() {
+            observer.ephemeral_changed(&update);
+        }
         if let Some(link) = self.cluster.get() {
             link.cluster.publish_ephemeral(update);
         }
@@ -1351,6 +1389,67 @@ mod tests {
             StdArc::new(SessionHub::new(store, rooms.clone(), threshold)),
             rooms,
         )
+    }
+
+    /// The observer hears every change this hub applies: its own clients' typing, receipts and
+    /// presence, and a peer's update, in the order they happened -- and hears nothing when
+    /// nothing is installed.
+    #[tokio::test]
+    async fn the_ephemeral_observer_is_told_of_local_and_peer_changes() {
+        struct Recorder(std::sync::Mutex<Vec<String>>);
+        impl EphemeralObserver for Recorder {
+            fn ephemeral_changed(&self, update: &EphemeralUpdate) {
+                self.0.lock().unwrap().push(update.kind().to_owned());
+            }
+        }
+        let (hub, rooms) = hub(500);
+        let alice = user_id!("@alice:hub.test").to_owned();
+        let handle = rooms
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        let recorder = StdArc::new(Recorder(std::sync::Mutex::new(Vec::new())));
+        hub.install_ephemeral_observer(recorder.clone());
+
+        hub.set_typing(&room_id, &alice, true, Duration::from_secs(30))
+            .await
+            .unwrap();
+        hub.set_receipt(
+            &room_id,
+            &alice,
+            crate::receipts::ReceiptKind::Read,
+            ruma::event_id!("$e:hub.test").to_owned(),
+            1,
+        )
+        .await
+        .unwrap();
+        hub.set_presence(&alice, "online".to_owned(), None)
+            .await
+            .unwrap();
+        hub.apply_ephemeral(
+            "peer#1",
+            EphemeralUpdate::Typing {
+                room_id: room_id.clone(),
+                user_id: alice.clone(),
+                typing: false,
+                timeout_ms: 0,
+            },
+        )
+        .await;
+        assert_eq!(
+            *recorder.0.lock().unwrap(),
+            vec!["typing", "receipt", "presence", "typing"]
+        );
+        // The peer's typing stop was applied before the observer heard of it.
+        assert!(hub.typing_users(&room_id).await.0.is_empty());
     }
 
     #[tokio::test]

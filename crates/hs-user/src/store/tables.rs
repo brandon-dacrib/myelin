@@ -18,6 +18,9 @@
 //! | `hs_user.filters` | `(user_id, filter_id)` | uploaded named filters (`POST /user/{userId}/filter`) |
 //! | `hs_user.receipts` | `(room_id, user_id, kind)` | the latest read receipt of each kind per user per room |
 //! | `hs_user.presence` | `user_id` | each user's latest presence |
+//! | `hs_user.receipt_stream` | `(pos: u64,)` | the server-wide receipt stream: one entry per receipt written, for appservice delivery |
+//! | `hs_user.presence_stream` | `(pos: u64,)` | the server-wide presence stream: one entry per presence change (a new stamp), for appservice delivery |
+//! | `hs_user.ephemeral_counters` | `receipt_stream` / `presence_stream` (raw `atomic_add` keys) | the two streams' position counters |
 //!
 //! # The coalescing invariant, precisely
 //!
@@ -59,8 +62,8 @@ use ruma::{DeviceId, RoomId, UserId};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AccountDataRecord, FeedEntry, MembershipRecord, PublicRoomEntry, StoreError, StoredPresence,
-    StoredReceipt, UserStore,
+    AccountDataRecord, FeedEntry, MembershipRecord, PresenceStreamEntry, PublicRoomEntry,
+    ReceiptStreamEntry, StoreError, StoredPresence, StoredReceipt, UserStore,
 };
 
 fn to_kv<E: std::error::Error + Send + Sync + 'static>(e: E) -> hs_kv::KvError {
@@ -109,6 +112,34 @@ pub struct TablesUserStore<B: KvBackend> {
     public_rooms: TypedKeyspace<B::Keyspace, (String,)>,
     receipts: TypedKeyspace<B::Keyspace, (String, String, String)>,
     presence: TypedKeyspace<B::Keyspace, (String,)>,
+    receipt_stream: TypedKeyspace<B::Keyspace, (u64,)>,
+    presence_stream: TypedKeyspace<B::Keyspace, (u64,)>,
+    ephemeral_counters: B::Keyspace,
+}
+
+/// A `hs_user.receipt_stream` row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReceiptStreamValue {
+    room_id: String,
+    receipt: StoredReceipt,
+}
+
+/// Reads a raw `atomic_add` counter, `0` when it has never been bumped.
+fn read_counter<R: KvRead>(
+    snap: &R,
+    keyspace: &R::Keyspace,
+    key: &[u8],
+) -> Result<u64, StoreError> {
+    match snap.get(keyspace, key).map_err(StoreError::Kv)? {
+        None => Ok(0),
+        Some(bytes) => {
+            let arr: [u8; 8] = bytes
+                .as_ref()
+                .try_into()
+                .map_err(|_| StoreError::Codec("expected an 8-byte counter".to_owned()))?;
+            Ok(u64::try_from(i64::from_be_bytes(arr)).unwrap_or(0))
+        }
+    }
 }
 
 impl<B: KvBackend> TablesUserStore<B> {
@@ -132,6 +163,9 @@ impl<B: KvBackend> TablesUserStore<B> {
             public_rooms: TypedKeyspace::new(open("hs_user.public_rooms")?),
             receipts: TypedKeyspace::new(open("hs_user.receipts")?),
             presence: TypedKeyspace::new(open("hs_user.presence")?),
+            receipt_stream: TypedKeyspace::new(open("hs_user.receipt_stream")?),
+            presence_stream: TypedKeyspace::new(open("hs_user.presence_stream")?),
+            ephemeral_counters: open("hs_user.ephemeral_counters")?,
             backend,
         })
     }
@@ -618,8 +652,22 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
             receipt.kind.clone(),
         );
         let value = json_encode(receipt)?;
+        let stream_value = json_encode(&ReceiptStreamValue {
+            room_id: room_id.to_string(),
+            receipt: receipt.clone(),
+        })?;
         transact(&self.backend, TransactConfig::default(), |txn| {
-            self.receipts.put(txn, &key, &value).map_err(to_kv)
+            self.receipts.put(txn, &key, &value).map_err(to_kv)?;
+            // The server-wide stream (`UserStore::receipt_stream_since`), in the same
+            // transaction: an entry exists exactly when the receipt does.
+            let pos = txn
+                .atomic_add(&self.ephemeral_counters, b"receipt_stream", 1)
+                .map_err(to_kv)?;
+            #[allow(clippy::cast_sign_loss, reason = "atomic_add never goes negative here")]
+            let pos = pos as u64;
+            self.receipt_stream
+                .put(txn, &(pos,), &stream_value)
+                .map_err(to_kv)
         })
         .map_err(StoreError::Kv)
     }
@@ -643,8 +691,28 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
     ) -> Result<(), StoreError> {
         let key = (user_id.to_string(),);
         let value = json_encode(presence)?;
+        let stream_value = user_id.to_string().into_bytes();
         transact(&self.backend, TransactConfig::default(), |txn| {
-            self.presence.put(txn, &key, &value).map_err(to_kv)
+            // A stream entry (`UserStore::presence_stream_since`) only for a change: a
+            // `last_active` refresh keeps the record's stamp and is nobody's news.
+            let changed = match self.presence.get(txn, &key).map_err(to_kv)? {
+                Some(old) => {
+                    json_decode::<StoredPresence>(&old).is_ok_and(|old| old.seq != presence.seq)
+                }
+                None => true,
+            };
+            self.presence.put(txn, &key, &value).map_err(to_kv)?;
+            if changed {
+                let pos = txn
+                    .atomic_add(&self.ephemeral_counters, b"presence_stream", 1)
+                    .map_err(to_kv)?;
+                #[allow(clippy::cast_sign_loss, reason = "atomic_add never goes negative here")]
+                let pos = pos as u64;
+                self.presence_stream
+                    .put(txn, &(pos,), &stream_value)
+                    .map_err(to_kv)?;
+            }
+            Ok(())
         })
         .map_err(StoreError::Kv)
     }
@@ -660,6 +728,86 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
             None => Ok(None),
         }
     }
+
+    async fn receipt_stream_since(
+        &self,
+        since: u64,
+        limit: usize,
+    ) -> Result<Vec<ReceiptStreamEntry>, StoreError> {
+        let snap = self.backend.snapshot();
+        let start = std::ops::Bound::Excluded(Bytes::from(hs_tables::key::encode(&(since,))));
+        let spec = RangeSpec::new(start, std::ops::Bound::Unbounded).limit(limit.max(1));
+        let mut out = Vec::new();
+        for item in self.receipt_stream.range(&snap, spec) {
+            let ((pos,), value) = item.map_err(StoreError::Table)?;
+            let row: ReceiptStreamValue = json_decode(&value)?;
+            out.push(ReceiptStreamEntry {
+                pos,
+                room_id: row.room_id,
+                receipt: row.receipt,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn receipt_stream_head(&self) -> Result<u64, StoreError> {
+        let snap = self.backend.snapshot();
+        read_counter(&snap, &self.ephemeral_counters, b"receipt_stream")
+    }
+
+    async fn prune_receipt_stream(&self, below: u64) -> Result<usize, StoreError> {
+        prune_stream(&self.backend, &self.receipt_stream, below)
+    }
+
+    async fn presence_stream_since(
+        &self,
+        since: u64,
+        limit: usize,
+    ) -> Result<Vec<PresenceStreamEntry>, StoreError> {
+        let snap = self.backend.snapshot();
+        let start = std::ops::Bound::Excluded(Bytes::from(hs_tables::key::encode(&(since,))));
+        let spec = RangeSpec::new(start, std::ops::Bound::Unbounded).limit(limit.max(1));
+        let mut out = Vec::new();
+        for item in self.presence_stream.range(&snap, spec) {
+            let ((pos,), value) = item.map_err(StoreError::Table)?;
+            let user_id = String::from_utf8(value.to_vec())
+                .map_err(|e| StoreError::Codec(format!("non-utf8 user id in stream: {e}")))?;
+            out.push(PresenceStreamEntry { pos, user_id });
+        }
+        Ok(out)
+    }
+
+    async fn presence_stream_head(&self) -> Result<u64, StoreError> {
+        let snap = self.backend.snapshot();
+        read_counter(&snap, &self.ephemeral_counters, b"presence_stream")
+    }
+
+    async fn prune_presence_stream(&self, below: u64) -> Result<usize, StoreError> {
+        prune_stream(&self.backend, &self.presence_stream, below)
+    }
+}
+
+/// Deletes every entry of a `(pos,)`-keyed stream below `below`, returning how many.
+fn prune_stream<B: KvBackend>(
+    backend: &B,
+    stream: &TypedKeyspace<B::Keyspace, (u64,)>,
+    below: u64,
+) -> Result<usize, StoreError> {
+    transact(backend, TransactConfig::default(), |txn| {
+        let end = std::ops::Bound::Excluded(Bytes::from(hs_tables::key::encode(&(below,))));
+        let spec = RangeSpec::new(std::ops::Bound::Unbounded, end);
+        let mut keys = Vec::new();
+        for item in stream.range(&*txn, spec) {
+            let (k, _v) = item.map_err(to_kv)?;
+            keys.push(k);
+        }
+        let count = keys.len();
+        for k in keys {
+            stream.delete(txn, &k).map_err(to_kv)?;
+        }
+        Ok(count)
+    })
+    .map_err(StoreError::Kv)
 }
 
 #[cfg(test)]
@@ -670,6 +818,64 @@ mod tests {
 
     fn store() -> TablesUserStore<MemoryBackend> {
         TablesUserStore::open(MemoryBackend::new()).unwrap()
+    }
+
+    /// Every receipt written is one entry of the receipt stream, carrying the receipt; a
+    /// presence write is an entry only when its stamp changed. Both are read from a position
+    /// and pruned below one.
+    #[tokio::test]
+    async fn receipt_and_presence_writes_append_to_the_server_wide_streams() {
+        let s = store();
+        let room = room_id!("!a:example.org");
+        let alice = user_id!("@alice:example.org");
+        assert_eq!(s.receipt_stream_head().await.unwrap(), 0);
+        assert_eq!(s.presence_stream_head().await.unwrap(), 0);
+
+        let receipt = |event: &str, seq: u64| StoredReceipt {
+            user_id: alice.to_string(),
+            kind: "m.read".to_owned(),
+            event_id: event.to_owned(),
+            ts: 1000,
+            seq,
+        };
+        s.put_receipt(room, &receipt("$one", 10)).await.unwrap();
+        s.put_receipt(room, &receipt("$two", 11)).await.unwrap();
+        assert_eq!(s.receipt_stream_head().await.unwrap(), 2);
+        let entries = s.receipt_stream_since(0, 10).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].pos, 1);
+        assert_eq!(entries[0].room_id, room.as_str());
+        assert_eq!(entries[0].receipt.event_id, "$one");
+        assert_eq!(entries[1].receipt.event_id, "$two");
+        assert_eq!(s.receipt_stream_since(1, 10).await.unwrap().len(), 1);
+        assert_eq!(s.receipt_stream_since(0, 1).await.unwrap().len(), 1);
+        assert_eq!(s.prune_receipt_stream(2).await.unwrap(), 1);
+        assert_eq!(s.receipt_stream_since(0, 10).await.unwrap()[0].pos, 2);
+        // The receipt is still there.
+        assert_eq!(s.list_room_receipts(room).await.unwrap().len(), 1);
+
+        let presence = |seq: u64, active: u64| StoredPresence {
+            presence: "online".to_owned(),
+            status_msg: None,
+            last_active_ms: active,
+            seq,
+            currently_active: None,
+        };
+        s.put_presence(alice, &presence(5, 1)).await.unwrap();
+        // A `last_active` refresh under the same stamp is not a change.
+        s.put_presence(alice, &presence(5, 2)).await.unwrap();
+        s.put_presence(alice, &presence(6, 3)).await.unwrap();
+        assert_eq!(s.presence_stream_head().await.unwrap(), 2);
+        let entries = s.presence_stream_since(0, 10).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].user_id, alice.as_str());
+        assert_eq!(entries[1].pos, 2);
+        assert_eq!(s.prune_presence_stream(u64::MAX).await.unwrap(), 2);
+        assert!(s.presence_stream_since(0, 10).await.unwrap().is_empty());
+        assert_eq!(
+            s.get_presence(alice).await.unwrap().unwrap().last_active_ms,
+            3
+        );
     }
 
     #[tokio::test]

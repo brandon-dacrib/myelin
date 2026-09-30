@@ -15,6 +15,11 @@
 //!   legacy key spelling Appendix B lists.
 //! - [`scheduler`]: the per-appservice delivery scheduler ([`scheduler::Scheduler`]) — ordered
 //!   delivery, batching, retry with backoff, dead-letter and replay.
+//! - [`pump`]: what queues a room's events for the appservices that want them, from a durable
+//!   cursor per room; [`ephemeral`]: the same for typing, receipts, presence (MSC2409),
+//!   to-device messages (MSC2409/MSC4203) and device lists with key counts (MSC3202), from a
+//!   durable position per appservice and stream; [`delivery`]: the per-appservice workers.
+//! - [`metrics`]: the `hs_appservice_*` counters.
 //! - [`ping`]: ping in both directions ([`ping::PingService`]) plus the inbound axum route
 //!   ([`routes::ping_router`]).
 //! - [`query`]: the outbound user/room-alias query protocol and third-party lookups
@@ -29,7 +34,9 @@
 pub mod admin_directory;
 pub mod auth_registry;
 pub mod delivery;
+pub mod ephemeral;
 pub mod error;
+pub mod metrics;
 pub mod namespace;
 pub mod ping;
 pub mod pump;

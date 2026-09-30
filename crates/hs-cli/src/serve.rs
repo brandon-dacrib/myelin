@@ -1392,12 +1392,20 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         &metrics,
     )
     .map_err(|e| ServeError::Sessions(Box::new(e)))?;
+    // Delivery to bridges is counted (`hs_appservice_*`, `hs_appservice::metrics`).
+    let appservice_metrics =
+        metrics.with_registry(hs_appservice::metrics::AppserviceMetrics::register);
     let appservice_delivery = crate::appservice_delivery::AppserviceDelivery::start(
-        appservices.registry.clone(),
-        appservices.ping_service.clone(),
-        rooms.clone(),
-        cluster_handles.cluster.ownership().clone(),
-        cluster_handles.layout,
+        crate::appservice_delivery::DeliveryDeps {
+            appservices: appservices.registry.clone(),
+            ping: appservices.ping_service.clone(),
+            rooms: rooms.clone(),
+            hub: user_state.hub.clone(),
+            e2e: e2e_state.store.clone(),
+            ownership: cluster_handles.cluster.ownership().clone(),
+            layout: cluster_handles.layout,
+            metrics: Some(appservice_metrics),
+        },
     )
     .await
     .map_err(|e| ServeError::Sessions(Box::new(e)))?;

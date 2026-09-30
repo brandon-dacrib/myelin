@@ -95,6 +95,14 @@ async fn transaction_contents_and_key_spellings() {
         body["de.sorunome.msc2409.to_device"][0]["to_device_id"],
         "DEVICE1"
     );
+    // The event's own keys are beside the addressing keys, not under one of their own: what
+    // `mautrix-go`'s `event.Event` reads (`to_user_id`/`to_device_id` next to `type`).
+    assert_eq!(body["to_device"][0]["type"], "m.room_key");
+    assert_eq!(
+        body["to_device"][0]["sender"],
+        "@whatsapp_alice:example.org"
+    );
+    assert!(body["to_device"][0].get("event").is_none());
     assert_eq!(
         body["device_lists"]["changed"][0],
         "@whatsapp_alice:example.org"

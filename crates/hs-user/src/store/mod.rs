@@ -437,6 +437,80 @@ pub trait UserStore: Send + Sync {
         &self,
         user_id: &ruma::UserId,
     ) -> Result<Option<StoredPresence>, StoreError>;
+
+    /// Receipts written after stream position `since`, oldest first, capped at `limit`. The
+    /// server-wide receipt stream: every [`UserStore::put_receipt`] appends one entry, in the
+    /// same transaction as the receipt, for a reader that has to follow every room's receipts
+    /// from a durable position -- appservice delivery (MSC2409). A room's receipts are a per-room
+    /// read (`list_room_receipts`); nothing else orders receipts across rooms.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn receipt_stream_since(
+        &self,
+        since: u64,
+        limit: usize,
+    ) -> Result<Vec<ReceiptStreamEntry>, StoreError>;
+
+    /// The position of the newest receipt stream entry, or `0` if no receipt was ever written.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn receipt_stream_head(&self) -> Result<u64, StoreError>;
+
+    /// Deletes receipt stream entries below `below` and returns how many. The receipts
+    /// themselves are untouched.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn prune_receipt_stream(&self, below: u64) -> Result<usize, StoreError>;
+
+    /// Presence changes written after stream position `since`, oldest first, capped at `limit`.
+    /// The server-wide presence stream, the counterpart of [`UserStore::receipt_stream_since`]:
+    /// [`UserStore::put_presence`] appends an entry when the record's stamp (`seq`) changed --
+    /// not for a `last_active` refresh written under the same stamp.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn presence_stream_since(
+        &self,
+        since: u64,
+        limit: usize,
+    ) -> Result<Vec<PresenceStreamEntry>, StoreError>;
+
+    /// The position of the newest presence stream entry, or `0` if none was ever written.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn presence_stream_head(&self) -> Result<u64, StoreError>;
+
+    /// Deletes presence stream entries below `below` and returns how many.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn prune_presence_stream(&self, below: u64) -> Result<usize, StoreError>;
+}
+
+/// One entry of the server-wide receipt stream ([`UserStore::receipt_stream_since`]): the
+/// receipt as it was written, and where.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiptStreamEntry {
+    /// This entry's position in the stream: strictly increasing, one per receipt written.
+    pub pos: u64,
+    /// The room the receipt is in.
+    pub room_id: String,
+    /// The receipt, as [`UserStore::put_receipt`] was given it.
+    pub receipt: StoredReceipt,
+}
+
+/// One entry of the server-wide presence stream ([`UserStore::presence_stream_since`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresenceStreamEntry {
+    /// This entry's position in the stream: strictly increasing, one per presence change.
+    pub pos: u64,
+    /// Whose presence changed. The record itself is read with [`UserStore::get_presence`]: the
+    /// current one is what a reader wants, not the one that was current at this position.
+    pub user_id: String,
 }
 
 /// Shorthand for the trait-object form every consumer (`crate::hub::SessionHub`,

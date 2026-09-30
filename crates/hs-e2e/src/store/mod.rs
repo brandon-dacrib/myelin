@@ -407,9 +407,51 @@ pub trait BackupStore: Send + Sync {
     async fn delete_all_sessions(&self, user_id: &UserId, version: u64) -> Result<(), StoreError>;
 }
 
+/// One entry of the server-wide to-device stream: which device's queue grew, and where. See
+/// [`ToDeviceStore::to_device_stream_since`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToDeviceStreamEntry {
+    /// This entry's position in the server-wide stream: strictly increasing, one per queued
+    /// message.
+    pub pos: u64,
+    /// The recipient.
+    pub user_id: OwnedUserId,
+    /// The recipient's device.
+    pub device_id: OwnedDeviceId,
+    /// The message's position in that device's own queue ([`ToDeviceMessage::stream_id`]).
+    pub stream_id: u64,
+}
+
 /// The to-device message queue: local delivery and the cursor `/sync` will read.
+///
+/// # The server-wide stream
+///
+/// Each device's queue is its own, read by that device's `/sync`. An appservice is not a
+/// device: it is told about messages for every user in its namespaces (MSC2409), and there is
+/// no way to enumerate those users. So every message queued also appends one small entry to a
+/// server-wide stream (`to_device_stream_*`), which `hs-appservice`'s ephemeral pump reads from
+/// a durable position and prunes once every appservice has passed it. The message itself stays
+/// in the device's queue until that device's `/sync` acknowledges it, as in Synapse: a
+/// namespace can be non-exclusive (double puppeting names a real person's account), and a
+/// bridge in sync mode ignores what is pushed to it.
 #[async_trait]
 pub trait ToDeviceStore: Send + Sync {
+    /// Entries of the server-wide stream with a position greater than `since`, oldest first,
+    /// capped at `limit`.
+    async fn to_device_stream_since(
+        &self,
+        since: u64,
+        limit: usize,
+    ) -> Result<Vec<ToDeviceStreamEntry>, StoreError>;
+
+    /// The position of the newest entry of the server-wide stream, or `0` if nothing has ever
+    /// been queued.
+    async fn to_device_stream_head(&self) -> Result<u64, StoreError>;
+
+    /// Deletes every entry of the server-wide stream with a position below `below`, and
+    /// returns how many. The messages themselves are not touched.
+    async fn prune_to_device_stream(&self, below: u64) -> Result<usize, StoreError>;
+
     /// Enqueues one message for a local recipient device, returning its assigned per-device
     /// stream id.
     async fn send_to_device(

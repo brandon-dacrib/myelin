@@ -18,6 +18,7 @@
 //! | `hs_e2e.backup_sessions` | `(user_id, version, room_id, session_id)` | [`BackupStore`] |
 //! | `hs_e2e.to_device` | `(user_id, device_id, stream_id: u64)` | [`ToDeviceStore`] |
 //! | `hs_e2e.to_device_txn` | `(sender_user, sender_device, txn_id)` | [`ToDeviceStore`] idempotency |
+//! | `hs_e2e.to_device_stream` | `(pos: u64,)` | [`ToDeviceStore`]'s server-wide stream: one entry per queued message, naming the device and its queue position, for appservice delivery |
 //! | `hs_e2e.counters` | varies (raw tuple-encoded) | monotonic counters via `atomic_add` |
 //!
 //! No secondary indexes are needed anywhere in this table: every lookup this crate performs is
@@ -40,7 +41,7 @@ use serde_json::Value;
 use super::{
     BackupSessionRow, BackupStore, BackupVersionRow, CrossSigningKeyType, CrossSigningStore,
     DeviceKeyStore, DeviceKeysRow, FallbackKeyStore, OneTimeKeyStore, StoreError, ToDeviceMessage,
-    ToDeviceStore,
+    ToDeviceStore, ToDeviceStreamEntry,
 };
 
 type DeviceKeysKey = (String, String);
@@ -52,6 +53,7 @@ type BackupVersionKey = (String, u64);
 type BackupSessionKey = (String, u64, String, String);
 type ToDeviceKey = (String, String, u64);
 type ToDeviceTxnKey = (String, String, String);
+type ToDeviceStreamKey = (u64,);
 
 fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, StoreError> {
     serde_json::from_slice(bytes).map_err(|e| StoreError::Backend(format!("decode: {e}")))
@@ -120,6 +122,7 @@ pub struct TablesE2eStore<B: KvBackend> {
     backup_sessions: TypedKeyspace<B::Keyspace, BackupSessionKey>,
     to_device: TypedKeyspace<B::Keyspace, ToDeviceKey>,
     to_device_txn: TypedKeyspace<B::Keyspace, ToDeviceTxnKey>,
+    to_device_stream: TypedKeyspace<B::Keyspace, ToDeviceStreamKey>,
     counters: B::Keyspace,
 }
 
@@ -145,6 +148,7 @@ impl<B: KvBackend> TablesE2eStore<B> {
             backup_sessions: TypedKeyspace::new(open("hs_e2e.backup_sessions")?),
             to_device: TypedKeyspace::new(open("hs_e2e.to_device")?),
             to_device_txn: TypedKeyspace::new(open("hs_e2e.to_device_txn")?),
+            to_device_stream: TypedKeyspace::new(open("hs_e2e.to_device_stream")?),
             counters: open("hs_e2e.counters")?,
             backend,
         })
@@ -931,6 +935,14 @@ struct ToDeviceRow {
     content: Value,
 }
 
+/// A `hs_e2e.to_device_stream` row: the device whose queue grew, and where in it.
+#[derive(Debug, Serialize, serde::Deserialize)]
+struct ToDeviceStreamRow {
+    user_id: String,
+    device_id: String,
+    stream_id: u64,
+}
+
 #[async_trait::async_trait]
 impl<B: KvBackend> ToDeviceStore for TablesE2eStore<B> {
     async fn send_to_device(
@@ -961,7 +973,86 @@ impl<B: KvBackend> ToDeviceStore for TablesE2eStore<B> {
             );
             let value = encode_kv(&row)?;
             self.to_device.put(txn, &key, &value).map_err(to_kv)?;
+            // The server-wide stream, for appservice delivery (the trait's module docs): in the
+            // same transaction, so the entry exists exactly when the message does.
+            let pos = next_counter(
+                txn,
+                &self.counters,
+                &("to_device_stream".to_string(),).encode(),
+            )?;
+            let entry = ToDeviceStreamRow {
+                user_id: recipient.to_string(),
+                device_id: recipient_device.to_string(),
+                stream_id,
+            };
+            self.to_device_stream
+                .put(txn, &(pos,), &encode_kv(&entry)?)
+                .map_err(to_kv)?;
             Ok(stream_id)
+        })
+        .map_err(store_err)
+    }
+
+    async fn to_device_stream_since(
+        &self,
+        since: u64,
+        limit: usize,
+    ) -> Result<Vec<ToDeviceStreamEntry>, StoreError> {
+        let snap = self.backend.snapshot();
+        let start = Bound::Excluded(Bytes::from((since,).encode()));
+        let spec = RangeSpec::new(start, Bound::Unbounded).limit(limit.max(1));
+        let mut out = Vec::new();
+        for item in self.to_device_stream.range(&snap, spec) {
+            let ((pos,), value) = item.map_err(|e| StoreError::Backend(e.to_string()))?;
+            let row: ToDeviceStreamRow = decode(&value)?;
+            let user_id = UserId::parse(&row.user_id)
+                .map_err(|e| StoreError::Backend(format!("invalid user id in stream: {e}")))?
+                .to_owned();
+            out.push(ToDeviceStreamEntry {
+                pos,
+                user_id,
+                device_id: OwnedDeviceId::from(row.device_id),
+                stream_id: row.stream_id,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn to_device_stream_head(&self) -> Result<u64, StoreError> {
+        let snap = self.backend.snapshot();
+        let counter_key = ("to_device_stream".to_string(),).encode();
+        match snap
+            .get(&self.counters, &counter_key)
+            .map_err(|e| StoreError::Backend(e.to_string()))?
+        {
+            None => Ok(0),
+            Some(bytes) => {
+                let arr: [u8; 8] = bytes
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| StoreError::Backend("corrupt counter".to_string()))?;
+                Ok(u64::try_from(i64::from_be_bytes(arr)).unwrap_or(0))
+            }
+        }
+    }
+
+    async fn prune_to_device_stream(&self, below: u64) -> Result<usize, StoreError> {
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let end = Bound::Excluded(Bytes::from((below,).encode()));
+            let spec = RangeSpec::new(Bound::Unbounded, end);
+            let to_delete: Vec<ToDeviceStreamKey> = {
+                let mut keys = Vec::new();
+                for item in self.to_device_stream.range(&*txn, spec) {
+                    let (k, _v) = item.map_err(to_kv)?;
+                    keys.push(k);
+                }
+                keys
+            };
+            let count = to_delete.len();
+            for k in to_delete {
+                self.to_device_stream.delete(txn, &k).map_err(to_kv)?;
+            }
+            Ok(count)
         })
         .map_err(store_err)
     }
@@ -1299,6 +1390,69 @@ mod tests {
         s.delete_up_to(&bob, &bob_device, next).await.unwrap();
         let (msgs2, _) = s.poll_since(&bob, &bob_device, 0, 10).await.unwrap();
         assert!(msgs2.is_empty());
+    }
+
+    /// Every queued message is one entry of the server-wide stream, naming the device and its
+    /// queue position; the stream is read from a position, and pruned below one, without the
+    /// messages themselves being touched.
+    #[tokio::test]
+    async fn to_device_stream_names_every_queued_message_and_is_pruned_below_a_position() {
+        let s = store();
+        let alice = uid("@alice:example.org");
+        let bob = uid("@bob:example.org");
+        let ghost = uid("@ghost:example.org");
+        assert_eq!(s.to_device_stream_head().await.unwrap(), 0);
+        s.send_to_device(
+            &alice,
+            &bob,
+            &did("BBBB"),
+            "m.room_key",
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        s.send_to_device(
+            &alice,
+            &ghost,
+            &did("GGGG"),
+            "m.room_key",
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        s.send_to_device(
+            &alice,
+            &ghost,
+            &did("GGGG"),
+            "m.room_key",
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.to_device_stream_head().await.unwrap(), 3);
+
+        let all = s.to_device_stream_since(0, 10).await.unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(
+            (all[0].pos, all[0].user_id.as_str(), all[0].stream_id),
+            (1, "@bob:example.org", 1)
+        );
+        assert_eq!(
+            (all[2].pos, all[2].user_id.as_str(), all[2].stream_id),
+            (3, "@ghost:example.org", 2)
+        );
+        assert_eq!(all[2].device_id.as_str(), "GGGG");
+        let later = s.to_device_stream_since(1, 1).await.unwrap();
+        assert_eq!(later.len(), 1, "capped at the limit");
+        assert_eq!(later[0].pos, 2);
+
+        assert_eq!(s.prune_to_device_stream(3).await.unwrap(), 2);
+        let left = s.to_device_stream_since(0, 10).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].pos, 3);
+        // The messages are where they were.
+        let (msgs, _) = s.poll_since(&ghost, &did("GGGG"), 0, 10).await.unwrap();
+        assert_eq!(msgs.len(), 2);
     }
 
     #[tokio::test]

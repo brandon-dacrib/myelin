@@ -1,6 +1,8 @@
-//! Wires `hs-appservice`'s event delivery into the running server: the pump that reads rooms
-//! (`hs_appservice::pump`), the workers that send what it queues
-//! (`hs_appservice::delivery`), and the room registry they read from.
+//! Wires `hs-appservice`'s delivery into the running server: the pump that reads rooms
+//! (`hs_appservice::pump`), the pump that reads typing, receipts, presence, to-device messages
+//! and device lists (`hs_appservice::ephemeral`, MSC2409/MSC3202/MSC4203), the workers that
+//! send what they queue (`hs_appservice::delivery`), and the registries and stores they read
+//! from.
 //!
 //! Until this module existed, a bridge could register, ping, and be masqueraded through, and
 //! was sent no event, ever: `Scheduler` delivered a queue nothing filled. See
@@ -11,18 +13,30 @@
 //!
 //! Every replica sees every room update, and the queue is shared storage, so two replicas each
 //! pumping would queue every event twice, and two each draining would send every transaction
-//! twice. RFC 0001's shard layout has a place for both: the pump is a singleton background job
-//! and runs on whichever replica owns [`ShardId::GLOBAL`]; the worker for an appservice runs on
+//! twice. RFC 0001's shard layout has a place for both: the pumps are singleton background jobs
+//! and run on whichever replica owns [`ShardId::GLOBAL`]; the worker for an appservice runs on
 //! whichever replica owns that appservice's shard (`ShardLayout::appservice_shard`). A replica
 //! that acquires the global shard catches up on every room; one that acquires an appservice
 //! shard nudges every appservice in it; one that loses a shard stops the work it was doing for
 //! it. In single-node mode every shard is always mine and none of this is visible.
+//!
+//! The ephemeral pump reads the receipt, presence, to-device and device-list streams from the
+//! shared store, so whichever replica owns the global shard reads everything; typing it reads
+//! from this replica's session hub, which holds every replica's typing (the wake batch carries
+//! it, decision 0018). The hub's ephemeral observer ([`Doorbell`]) rings on every replica; only
+//! the owner acts on it, and the others drop their notes ([`EphemeralPump::discard_typing`]).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use hs_appservice::delivery::Delivery;
+use hs_appservice::ephemeral::{
+    Change, DeviceKeyCounts, DeviceSource, EphemeralPump, EphemeralSource, KeyCountSource,
+    PresenceChange, ReceiptChange, RoomFacts, ToDeviceChange, ToDeviceMessage,
+};
+use hs_appservice::metrics::AppserviceMetrics;
 use hs_appservice::pump::{Pump, RoomEvent, RoomPage, RoomSource};
 use hs_appservice::registry::Registry;
 use hs_appservice::scheduler::{HttpTransactionSender, Scheduler};
@@ -31,6 +45,15 @@ use hs_cluster::{ShardId, ShardKind, ShardLayout};
 use hs_kv::KvBackend;
 use hs_room::registry::RoomRegistry;
 use hs_room::routes::render::client_event_json;
+use hs_user::cluster::EphemeralUpdate;
+use hs_user::hub::{EphemeralObserver, SessionHub};
+
+/// How often the ephemeral pump looks at the streams that have no doorbell (to-device messages
+/// and device-list changes), and the backstop for the ones that do.
+const EPHEMERAL_POLL: Duration = Duration::from_millis(250);
+
+/// The session hub as `hs serve` builds it.
+type Hub<B> = SessionHub<B, Arc<RoomRegistry<B>>>;
 
 /// `hs_appservice::pump::RoomSource` over the real room registry.
 struct Rooms<B: KvBackend + 'static> {
@@ -112,6 +135,295 @@ impl<B: KvBackend + 'static> RoomSource for Rooms<B> {
     }
 }
 
+/// The ephemeral pump's sources over the real server: the session hub (typing, presence),
+/// its store (the receipt and presence streams, memberships), the room registry (members and
+/// aliases) and the E2EE store (to-device messages, device lists, key counts).
+struct Sources<B: KvBackend + 'static> {
+    hub: Arc<Hub<B>>,
+    rooms: Arc<RoomRegistry<B>>,
+    e2e: Arc<dyn hs_e2e::store::E2eStore>,
+}
+
+fn user(id: &str) -> Result<ruma::OwnedUserId, String> {
+    ruma::UserId::parse(id)
+        .map(|u| u.to_owned())
+        .map_err(|e| e.to_string())
+}
+
+fn room(id: &str) -> Result<ruma::OwnedRoomId, String> {
+    ruma::RoomId::parse(id)
+        .map(|r| r.to_owned())
+        .map_err(|e| e.to_string())
+}
+
+#[async_trait]
+impl<B: KvBackend + 'static> EphemeralSource for Sources<B> {
+    async fn typing_in(&self, room_id: &str) -> Result<Vec<String>, String> {
+        let (users, _) = self.hub.typing_users(&room(room_id)?).await;
+        Ok(users.into_iter().map(|u| u.to_string()).collect())
+    }
+
+    async fn receipts_since(&self, since: u64, limit: usize) -> Result<Vec<ReceiptChange>, String> {
+        Ok(self
+            .hub
+            .store()
+            .receipt_stream_since(since, limit)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|entry| ReceiptChange {
+                pos: entry.pos,
+                room_id: entry.room_id,
+                user_id: entry.receipt.user_id,
+                kind: entry.receipt.kind,
+                event_id: entry.receipt.event_id,
+                ts: entry.receipt.ts,
+            })
+            .collect())
+    }
+
+    async fn receipts_head(&self) -> Result<u64, String> {
+        self.hub
+            .store()
+            .receipt_stream_head()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn prune_receipts_below(&self, below: u64) -> Result<(), String> {
+        self.hub
+            .store()
+            .prune_receipt_stream(below)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    async fn presence_since(
+        &self,
+        since: u64,
+        limit: usize,
+    ) -> Result<Vec<PresenceChange>, String> {
+        Ok(self
+            .hub
+            .store()
+            .presence_stream_since(since, limit)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|entry| PresenceChange {
+                pos: entry.pos,
+                user_id: entry.user_id,
+            })
+            .collect())
+    }
+
+    async fn presence_head(&self) -> Result<u64, String> {
+        self.hub
+            .store()
+            .presence_stream_head()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn prune_presence_below(&self, below: u64) -> Result<(), String> {
+        self.hub
+            .store()
+            .prune_presence_stream(below)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    async fn presence_content(&self, user_id: &str) -> Result<Option<serde_json::Value>, String> {
+        let Some(record) = self.hub.presence_of(&user(user_id)?).await else {
+            return Ok(None);
+        };
+        let mut content = serde_json::json!({
+            "presence": record.presence,
+            "last_active_ago": record.last_active_ago_ms(),
+            "currently_active": record.currently_active(),
+        });
+        if let Some(msg) = &record.status_msg {
+            content["status_msg"] = serde_json::Value::String(msg.clone());
+        }
+        Ok(Some(content))
+    }
+
+    async fn room_facts(&self, room_id: &str) -> Result<Option<RoomFacts>, String> {
+        let handle = match self.rooms.get_or_load(&room(room_id)?).await {
+            Ok(handle) => handle,
+            Err(hs_room::error::RoomError::RoomNotFound(_)) => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        handle
+            .query(|actor| {
+                let joined_members = actor
+                    .joined_members()
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .filter_map(|event| event.header().state_key.clone())
+                    .collect();
+                let aliases = actor.list_aliases().map_err(|e| e.to_string())?;
+                Ok(Some(RoomFacts {
+                    joined_members,
+                    aliases,
+                }))
+            })
+            .await
+    }
+
+    async fn joined_rooms_of(&self, user_id: &str) -> Result<Vec<String>, String> {
+        Ok(self
+            .hub
+            .store()
+            .list_memberships(&user(user_id)?)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|record| record.membership == "join")
+            .map(|record| record.room_id.to_string())
+            .collect())
+    }
+}
+
+#[async_trait]
+impl<B: KvBackend + 'static> KeyCountSource for Sources<B> {
+    async fn key_counts(&self, user_id: &str) -> Result<Vec<DeviceKeyCounts>, String> {
+        let user_id = user(user_id)?;
+        let mut out = Vec::new();
+        for (device_id, _) in self
+            .e2e
+            .list_device_keys(&user_id)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            let one_time_keys: BTreeMap<String, u64> = self
+                .e2e
+                .count_one_time_keys(&user_id, &device_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .collect();
+            let unused_fallback_key_types = self
+                .e2e
+                .unused_fallback_key_algorithms(&user_id, &device_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            out.push(DeviceKeyCounts {
+                device_id: device_id.to_string(),
+                one_time_keys,
+                unused_fallback_key_types,
+            });
+        }
+        Ok(out)
+    }
+}
+
+#[async_trait]
+impl<B: KvBackend + 'static> DeviceSource for Sources<B> {
+    async fn to_device_since(
+        &self,
+        since: u64,
+        limit: usize,
+    ) -> Result<Vec<ToDeviceChange>, String> {
+        Ok(self
+            .e2e
+            .to_device_stream_since(since, limit)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|entry| ToDeviceChange {
+                pos: entry.pos,
+                user_id: entry.user_id.to_string(),
+                device_id: entry.device_id.to_string(),
+                stream_id: entry.stream_id,
+            })
+            .collect())
+    }
+
+    async fn to_device_head(&self) -> Result<u64, String> {
+        self.e2e
+            .to_device_stream_head()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn prune_to_device_below(&self, below: u64) -> Result<(), String> {
+        self.e2e
+            .prune_to_device_stream(below)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    async fn to_device_message(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        stream_id: u64,
+    ) -> Result<Option<ToDeviceMessage>, String> {
+        let (messages, _) = self
+            .e2e
+            .poll_since(
+                &user(user_id)?,
+                &ruma::OwnedDeviceId::from(device_id),
+                stream_id.saturating_sub(1),
+                1,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(messages
+            .into_iter()
+            .find(|m| m.stream_id == stream_id)
+            .map(|m| ToDeviceMessage {
+                sender: m.sender.to_string(),
+                event_type: m.event_type,
+                content: m.content,
+            }))
+    }
+
+    async fn device_lists_head(&self) -> Result<u64, String> {
+        self.e2e
+            .current_stream_pos()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn device_lists_changed(
+        &self,
+        since: u64,
+        upto: u64,
+    ) -> Result<BTreeSet<String>, String> {
+        Ok(self
+            .e2e
+            .changed_users_since(since, Some(upto))
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|u| u.to_string())
+            .collect())
+    }
+}
+
+/// The hub's ephemeral observer: rings the ephemeral pump's doorbell.
+struct Doorbell<B: KvBackend + 'static> {
+    pump: Arc<EphemeralPump<B>>,
+}
+
+impl<B: KvBackend + 'static> EphemeralObserver for Doorbell<B> {
+    fn ephemeral_changed(&self, update: &EphemeralUpdate) {
+        let change = match update {
+            EphemeralUpdate::Typing { room_id, .. } => Change::Typing {
+                room_id: room_id.to_string(),
+            },
+            EphemeralUpdate::Receipt { .. } => Change::Receipt,
+            EphemeralUpdate::Presence { .. } => Change::Presence,
+        };
+        self.pump.note(&change);
+    }
+}
+
 /// Which of the delivery work is this replica's: the pump, if it owns the global shard; an
 /// appservice's worker, if it owns that appservice's shard. See the module docs.
 struct Gate<B: KvBackend + 'static> {
@@ -162,11 +474,32 @@ impl<B: KvBackend + 'static> Gate<B> {
     }
 }
 
+/// What [`AppserviceDelivery::start`] needs from the rest of the server.
+pub struct DeliveryDeps<B: KvBackend + 'static> {
+    /// The appservice registry: who to deliver to, and the queues.
+    pub appservices: Arc<Registry<B>>,
+    /// The ping service, for the admin API's view.
+    pub ping: Arc<hs_appservice::ping::PingService<B>>,
+    /// The rooms, read by the event pump and for interest.
+    pub rooms: Arc<RoomRegistry<B>>,
+    /// The session hub: typing, presence, and the receipt and presence streams through its store.
+    pub hub: Arc<Hub<B>>,
+    /// The E2EE store: to-device messages, device lists and key counts.
+    pub e2e: Arc<dyn hs_e2e::store::E2eStore>,
+    /// Which shards are this replica's.
+    pub ownership: Arc<dyn Ownership>,
+    /// Which shard an appservice belongs to.
+    pub layout: ShardLayout,
+    /// The `hs_appservice_*` counters, if registered.
+    pub metrics: Option<AppserviceMetrics>,
+}
+
 /// The running delivery machinery: stopped by [`AppserviceDelivery::stop`], which `hs serve`'s
 /// shutdown calls.
 pub struct AppserviceDelivery<B: KvBackend + 'static> {
     delivery: Arc<Delivery<B>>,
     pump_task: tokio::task::AbortHandle,
+    ephemeral_task: tokio::task::AbortHandle,
     /// What the admin API's `appservices.*` operations run against: the same registry,
     /// scheduler and workers, so a replay from the interface is delivered by the worker that
     /// delivers everything else.
@@ -181,18 +514,28 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
     /// # Errors
     /// Returns the store error if the pump cannot read its cursors or the room heads.
     pub async fn start(
-        appservices: Arc<Registry<B>>,
-        ping: Arc<hs_appservice::ping::PingService<B>>,
-        rooms: Arc<RoomRegistry<B>>,
-        ownership: Arc<dyn Ownership>,
-        layout: ShardLayout,
+        deps: DeliveryDeps<B>,
     ) -> Result<Self, hs_appservice::error::AppserviceError> {
+        let DeliveryDeps {
+            appservices,
+            ping,
+            rooms,
+            hub,
+            e2e,
+            ownership,
+            layout,
+            metrics,
+        } = deps;
         let clock: Arc<dyn hs_auth::clock::Clock> = Arc::new(hs_auth::clock::SystemClock);
-        let scheduler = Arc::new(Scheduler::new(
+        let mut scheduler = Scheduler::new(
             appservices.clone(),
             clock,
             Arc::new(HttpTransactionSender::new()),
-        ));
+        );
+        if let Some(metrics) = metrics {
+            scheduler = scheduler.with_metrics(metrics);
+        }
+        let scheduler = Arc::new(scheduler);
         let gate = Arc::new(Gate {
             delivery: Delivery::new(scheduler.clone()),
             ownership,
@@ -210,12 +553,26 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
                 },
             ),
         );
-        let pump = Arc::new(Pump::new(
-            appservices,
-            Arc::new(Rooms {
-                registry: rooms.clone(),
-            }),
-        ));
+        let sources = Arc::new(Sources {
+            hub: hub.clone(),
+            rooms: rooms.clone(),
+            e2e,
+        });
+        let pump = Arc::new(
+            Pump::new(
+                appservices.clone(),
+                Arc::new(Rooms {
+                    registry: rooms.clone(),
+                }),
+            )
+            .with_key_counts(sources.clone()),
+        );
+        let ephemeral = Arc::new(EphemeralPump::new(appservices, sources.clone(), sources));
+        // Installed before the first tick, so that a change in between rings a bell the tick
+        // answers, rather than waiting for the timer.
+        hub.install_ephemeral_observer(Arc::new(Doorbell {
+            pump: ephemeral.clone(),
+        }));
 
         // Subscribed before catching up, so that nothing published in between is missed: an
         // update the catch-up already covered is read again and found to be nothing new.
@@ -229,11 +586,37 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
         gate.nudge_everything_mine();
         let pump_task = tokio::spawn(Self::follow(pump, gate.clone(), updates, ownership_events))
             .abort_handle();
+        let ephemeral_task =
+            tokio::spawn(Self::follow_ephemeral(ephemeral, gate.clone())).abort_handle();
         Ok(Self {
             delivery: gate.delivery.clone(),
             pump_task,
+            ephemeral_task,
             admin_directory,
         })
+    }
+
+    /// The ephemeral pump's task: a tick on every doorbell and every [`EPHEMERAL_POLL`], on the
+    /// replica that owns the global shard. Another replica drops the typing rooms it was told
+    /// of; the owner was told of the same ones.
+    async fn follow_ephemeral(pump: Arc<EphemeralPump<B>>, gate: Arc<Gate<B>>) {
+        loop {
+            if gate.pumps_here() {
+                match pump.tick().await {
+                    Ok(ids) => {
+                        for id in ids {
+                            gate.nudge(&id);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "appservice ephemeral delivery could not read a stream; the next tick will try again");
+                    }
+                }
+            } else {
+                pump.discard_typing();
+            }
+            let _ = tokio::time::timeout(EPHEMERAL_POLL, pump.wait()).await;
+        }
     }
 
     /// The admin API's view onto this machinery.
@@ -323,6 +706,7 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
     /// start.
     pub fn stop(&self) {
         self.pump_task.abort();
+        self.ephemeral_task.abort();
         self.delivery.stop();
     }
 }
@@ -418,6 +802,18 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
 
+    /// A session hub and an E2EE store over the room registry's backend, as `hs serve` has.
+    fn hub_and_e2e(
+        rooms: &Arc<RoomRegistry<MemoryBackend>>,
+    ) -> (Arc<Hub<MemoryBackend>>, Arc<dyn hs_e2e::store::E2eStore>) {
+        let store: hs_user::store::DynUserStore =
+            Arc::new(hs_user::store::tables::TablesUserStore::open(MemoryBackend::new()).unwrap());
+        let hub = Arc::new(SessionHub::new(store, rooms.clone(), usize::MAX));
+        let e2e: Arc<dyn hs_e2e::store::E2eStore> =
+            Arc::new(hs_e2e::store::tables::TablesE2eStore::open(MemoryBackend::new()).unwrap());
+        (hub, e2e)
+    }
+
     /// Two replicas would each queue every event and each send every transaction. So a replica
     /// does the pump's work only while it owns the global shard, and an appservice's delivery
     /// only while it owns that appservice's shard -- and picks each up, from shared storage,
@@ -450,13 +846,17 @@ mod tests {
         );
         let ownership = Scripted::owning_nothing();
         let layout = ShardLayout::default();
-        let delivery = AppserviceDelivery::start(
-            registry.clone(),
+        let (hub, e2e) = hub_and_e2e(&rooms);
+        let delivery = AppserviceDelivery::start(DeliveryDeps {
+            appservices: registry.clone(),
             ping,
-            rooms.clone(),
-            ownership.clone(),
+            rooms: rooms.clone(),
+            hub,
+            e2e,
+            ownership: ownership.clone(),
             layout,
-        )
+            metrics: None,
+        })
         .await
         .unwrap();
 

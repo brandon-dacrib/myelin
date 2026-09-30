@@ -57,6 +57,7 @@ use async_trait::async_trait;
 use hs_kv::KvBackend;
 use serde_json::Value;
 
+use crate::ephemeral::{Interest, KeyCountSource, key_counts_for};
 use crate::error::AppserviceError;
 use crate::namespace::{NamespaceKind, Namespaces};
 use crate::registry::Registry;
@@ -144,51 +145,80 @@ pub fn interested(
     event.joined_members.iter().any(|member| is_theirs(member))
 }
 
-/// An appservice, as the pump needs it while it reads one page: compiled once, not per event.
-struct Listener {
-    row: AppserviceRow,
-    namespaces: Namespaces,
-    bot_user_id: String,
+/// An appservice, as the pumps need it while they read one page: compiled once, not per event.
+pub(crate) struct Listener {
+    pub(crate) row: AppserviceRow,
+    pub(crate) namespaces: Namespaces,
+    pub(crate) bot_user_id: String,
+}
+
+impl Listener {
+    /// The interest rules for this appservice.
+    pub(crate) fn interest(&self) -> Interest<'_> {
+        Interest::new(&self.namespaces, &self.bot_user_id)
+    }
+}
+
+/// Every appservice that can be sent anything: one with a `url`. (A registration with
+/// `url: null` exists to give a bridge an `as_token`, and is never pushed to.) A registration
+/// whose namespaces no longer compile is skipped, loudly: it was accepted once, and one bad
+/// pattern must not stop every other bridge from hearing anything.
+pub(crate) fn listeners<B: KvBackend>(
+    registry: &Registry<B>,
+) -> Result<Vec<Listener>, AppserviceError> {
+    let mut out = Vec::new();
+    for row in registry.list()? {
+        if row.url.is_none() {
+            continue;
+        }
+        let namespaces = match row.namespaces.compile() {
+            Ok(namespaces) => namespaces,
+            Err(error) => {
+                tracing::error!(appservice = %row.id, %error, "this appservice's namespaces do not compile; it is being sent nothing");
+                continue;
+            }
+        };
+        let bot_user_id = format!("@{}:{}", row.sender_localpart, registry.server_name());
+        out.push(Listener {
+            row,
+            namespaces,
+            bot_user_id,
+        });
+    }
+    Ok(out)
 }
 
 /// See the module docs.
 pub struct Pump<B: KvBackend> {
     registry: Arc<Registry<B>>,
     source: Arc<dyn RoomSource>,
+    /// MSC3202's key counts, for the transactions of an appservice that asked for them. `None`
+    /// sends none (tests, and a server without an E2EE store).
+    keys: Option<Arc<dyn KeyCountSource>>,
 }
 
 impl<B: KvBackend> Pump<B> {
     /// Builds a pump that reads rooms from `source` and queues for the appservices in `registry`.
     #[must_use]
     pub fn new(registry: Arc<Registry<B>>, source: Arc<dyn RoomSource>) -> Self {
-        Self { registry, source }
+        Self {
+            registry,
+            source,
+            keys: None,
+        }
     }
 
-    /// Every appservice that can be sent anything: one with a `url`. (A registration with
-    /// `url: null` exists to give a bridge an `as_token`, and is never pushed to.) A
-    /// registration whose namespaces no longer compile is skipped, loudly: it was accepted once,
-    /// and one bad pattern must not stop every other bridge from hearing anything.
+    /// Puts MSC3202's one-time-key counts and unused fallback key types, read from `keys`, in
+    /// every transaction for an appservice with `org.matrix.msc3202`: for its bot and for its
+    /// users among the members of the room, as Synapse does for every transaction it sends.
+    #[must_use]
+    pub fn with_key_counts(mut self, keys: Arc<dyn KeyCountSource>) -> Self {
+        self.keys = Some(keys);
+        self
+    }
+
     fn listeners(&self) -> Result<Vec<Listener>, AppserviceError> {
-        let mut out = Vec::new();
-        for row in self.registry.list()? {
-            if row.url.is_none() {
-                continue;
-            }
-            let namespaces = match row.namespaces.compile() {
-                Ok(namespaces) => namespaces,
-                Err(error) => {
-                    tracing::error!(appservice = %row.id, %error, "this appservice's namespaces do not compile; it is being sent nothing");
-                    continue;
-                }
-            };
-            let bot_user_id = format!("@{}:{}", row.sender_localpart, self.registry.server_name());
-            out.push(Listener {
-                row,
-                namespaces,
-                bot_user_id,
-            });
-        }
-        Ok(out)
+        listeners(&self.registry)
     }
 
     /// Called at start, before anything else. The first time ever, records the present and reads
@@ -280,10 +310,29 @@ impl<B: KvBackend> Pump<B> {
                     })
                     .map(|event| event.json.clone())
                     .collect();
-                let transaction = Transaction {
+                let mut transaction = Transaction {
                     events,
                     ..Transaction::default()
                 };
+                if listener.row.msc3202
+                    && !transaction.events.is_empty()
+                    && let Some(keys) = &self.keys
+                {
+                    let interest = listener.interest();
+                    let mut users = BTreeSet::from([listener.bot_user_id.clone()]);
+                    for event in &page.events {
+                        users.extend(
+                            event
+                                .joined_members
+                                .iter()
+                                .filter(|member| interest.user(member))
+                                .cloned(),
+                        );
+                    }
+                    let (counts, fallback) = key_counts_for(keys.as_ref(), &users).await?;
+                    transaction.one_time_keys_count = counts;
+                    transaction.unused_fallback_key_types = fallback;
+                }
                 if let Some(body) = wire_body(&listener.row, &transaction) {
                     deliveries.push((listener.row.id.clone(), body));
                 }
@@ -624,6 +673,46 @@ mod tests {
         assert_eq!(
             heard.last().unwrap(),
             &format!("message {}", PUMP_PAGE * 2 + 4)
+        );
+    }
+
+    /// An MSC3202 appservice's event transactions carry the one-time-key counts of its bot and
+    /// of its users in the room, and nobody else's.
+    #[tokio::test]
+    async fn an_msc3202_appservice_is_sent_key_counts_with_its_events() {
+        struct Keys;
+        #[async_trait]
+        impl KeyCountSource for Keys {
+            async fn key_counts(
+                &self,
+                user_id: &str,
+            ) -> Result<Vec<crate::ephemeral::DeviceKeyCounts>, String> {
+                Ok(vec![crate::ephemeral::DeviceKeyCounts {
+                    device_id: format!("DEV-{}", &user_id[1..4]),
+                    one_time_keys: BTreeMap::from([("signed_curve25519".to_owned(), 3)]),
+                    unused_fallback_key_types: vec![],
+                }])
+            }
+        }
+        let e2ee_bridge = format!(
+            "{BRIDGE}org.matrix.msc3202: true
+"
+        );
+        let (registry, rooms, pump) = setup(&[&e2ee_bridge]);
+        let pump = pump.with_key_counts(Arc::new(Keys));
+        pump.start().await.unwrap();
+        rooms.join("!bridged:example.org", "@alice:example.org");
+        rooms.join("!bridged:example.org", "@irc_bob:example.org");
+        rooms.say("!bridged:example.org", "@alice:example.org", "hello");
+        pump.pump_room("!bridged:example.org").await.unwrap();
+        let body = &registry.store().queue_for("irc").unwrap()[0].body;
+        assert_eq!(
+            body["device_one_time_keys_count"],
+            json!({
+                "@ircbot:example.org": {"DEV-irc": {"signed_curve25519": 3}},
+                "@irc_bob:example.org": {"DEV-irc": {"signed_curve25519": 3}},
+            }),
+            "{body}"
         );
     }
 

@@ -181,6 +181,23 @@ pub struct AppserviceStore<B: KvBackend> {
     room_cursor: TypedKeyspace<B::Keyspace, (String,)>,
     /// Facts about the pump as a whole, by name. One today: [`PUMP_STARTED`].
     pump_meta: TypedKeyspace<B::Keyspace, (String,)>,
+    /// `(appservice id, stream name) -> position`: how far into each of the server's ephemeral
+    /// streams (receipts, presence, to-device, device lists) each appservice has been sent.
+    /// See [`AppserviceStore::enqueue_ephemeral`] and [`crate::ephemeral`].
+    ephemeral_pos: TypedKeyspace<B::Keyspace, (String, String)>,
+}
+
+/// What [`AppserviceStore::enqueue_ephemeral`] queues for one appservice: a transaction body,
+/// or none when nothing was for it, and the stream positions it has now been sent up to.
+#[derive(Debug, Clone)]
+pub struct EphemeralDelivery {
+    /// The appservice.
+    pub appservice_id: String,
+    /// The wire body to queue, if there is anything to send.
+    pub body: Option<Value>,
+    /// `(stream name, position)`: written whether or not there is a body, so that a scanned
+    /// range with nothing in it for this appservice is not scanned again.
+    pub positions: Vec<(String, u64)>,
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, AppserviceError> {
@@ -221,6 +238,7 @@ impl<B: KvBackend> AppserviceStore<B> {
         let txn_seq = TypedKeyspace::new(backend.keyspace("hs_appservice.txn_seq")?);
         let room_cursor = TypedKeyspace::new(backend.keyspace("hs_appservice.room_cursor")?);
         let pump_meta = TypedKeyspace::new(backend.keyspace("hs_appservice.pump_meta")?);
+        let ephemeral_pos = TypedKeyspace::new(backend.keyspace("hs_appservice.ephemeral_pos")?);
         Ok(Self {
             backend,
             registry,
@@ -231,6 +249,7 @@ impl<B: KvBackend> AppserviceStore<B> {
             txn_seq,
             room_cursor,
             pump_meta,
+            ephemeral_pos,
         })
     }
 
@@ -536,6 +555,65 @@ impl<B: KvBackend> AppserviceStore<B> {
         .map_err(|e| AppserviceError::Store(e.to_string()))
     }
 
+    // ---- the ephemeral pump's place in each stream ----
+
+    /// How far into the server's `stream` (`receipts`, `presence`, `to_device`,
+    /// `device_lists`) appservice `id` has been sent: the position of the last entry dealt
+    /// with. `None` if it has never been sent any of it.
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`]/[`AppserviceError::Decode`] on failure.
+    pub fn ephemeral_pos(&self, id: &str, stream: &str) -> Result<Option<u64>, AppserviceError> {
+        let snap = self.backend.snapshot();
+        match self
+            .ephemeral_pos
+            .get(&snap, &(id.to_string(), stream.to_string()))?
+        {
+            Some(bytes) => decode(&bytes).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Queues each delivery's body (where there is one) and records each delivery's stream
+    /// positions, in one transaction: as with [`AppserviceStore::enqueue_for_room`], the
+    /// position says "everything up to here has been queued for this appservice", and written
+    /// separately a crash between the two would send a receipt twice or never.
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`]/[`AppserviceError::Decode`] on failure.
+    pub fn enqueue_ephemeral(
+        &self,
+        deliveries: &[EphemeralDelivery],
+        now_ms: u64,
+    ) -> Result<(), AppserviceError> {
+        type Encoded = (String, Option<Value>, Vec<(String, Vec<u8>)>);
+        let encoded: Vec<Encoded> = deliveries
+            .iter()
+            .map(|d| {
+                let positions = d
+                    .positions
+                    .iter()
+                    .map(|(stream, pos)| Ok((stream.clone(), encode(pos)?)))
+                    .collect::<Result<Vec<_>, AppserviceError>>()?;
+                Ok((d.appservice_id.clone(), d.body.clone(), positions))
+            })
+            .collect::<Result<_, AppserviceError>>()?;
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            for (id, body, positions) in &encoded {
+                if let Some(body) = body {
+                    self.enqueue_in(txn, id, body.clone(), now_ms)?;
+                }
+                for (stream, pos) in positions {
+                    self.ephemeral_pos
+                        .put(txn, &(id.clone(), stream.clone()), pos)
+                        .map_err(to_kv)?;
+                }
+            }
+            Ok(())
+        })
+        .map_err(|e| AppserviceError::Store(e.to_string()))
+    }
+
     /// Whether the pump has ever started against this store. See
     /// [`AppserviceStore::start_pump_at`].
     ///
@@ -764,6 +842,33 @@ mod tests {
         assert_eq!((a1, a2, b1), (1, 2, 1));
         assert_eq!(s.queue_for("a").unwrap().len(), 2);
         assert_eq!(s.queue_for("b").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ephemeral_positions_are_written_with_the_bodies_they_account_for() {
+        let s = store();
+        assert_eq!(s.ephemeral_pos("a", "receipts").unwrap(), None);
+        s.enqueue_ephemeral(
+            &[
+                EphemeralDelivery {
+                    appservice_id: "a".to_string(),
+                    body: Some(serde_json::json!({"ephemeral": [1]})),
+                    positions: vec![("receipts".to_string(), 7), ("presence".to_string(), 3)],
+                },
+                EphemeralDelivery {
+                    appservice_id: "b".to_string(),
+                    body: None,
+                    positions: vec![("receipts".to_string(), 7)],
+                },
+            ],
+            100,
+        )
+        .unwrap();
+        assert_eq!(s.ephemeral_pos("a", "receipts").unwrap(), Some(7));
+        assert_eq!(s.ephemeral_pos("a", "presence").unwrap(), Some(3));
+        assert_eq!(s.ephemeral_pos("b", "receipts").unwrap(), Some(7));
+        assert_eq!(s.queue_for("a").unwrap().len(), 1);
+        assert!(s.queue_for("b").unwrap().is_empty());
     }
 
     #[test]
