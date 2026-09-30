@@ -796,6 +796,22 @@ async fn run_serve(args: &ServeArgs) -> i32 {
         revision = booted.meta.revision,
         "configuration resolved from file, database and environment"
     );
+    if let crate::storage::OpenedStorage::Postgres(backend) = &booted.storage {
+        // Storage opened before telemetry (the configuration lives in it), so its own line went
+        // nowhere; this is the one an operator sees. `encrypted` is what PostgreSQL reported for
+        // the session, which under `prefer` is the only way to know.
+        let info = backend.connection_info();
+        tracing::info!(
+            host = %info.host,
+            port = info.port,
+            database = %info.database,
+            schema = %info.schema,
+            pool_size = info.pool_size,
+            ssl_mode = %info.ssl_mode,
+            encrypted = info.encrypted,
+            "opened the PostgreSQL storage backend"
+        );
+    }
 
     // The store is a handle on the same open backend `spawn_serve_with_storage` is about to serve
     // from, and it is what the admin API's configuration surface writes through: this is the line

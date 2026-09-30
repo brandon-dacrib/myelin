@@ -377,6 +377,44 @@ server:
     }
 
     #[test]
+    fn env_override_sets_the_postgres_ssl_mode_schema_and_pool_size() {
+        // The Helm chart's `storage.postgres.sslMode` reaches the server this way
+        // (`deploy/helm/hs/templates/statefulset.yaml`).
+        let cfg = Config::from_yaml_with_env(
+            MINIMAL,
+            [
+                ("HS__STORAGE__BACKEND".to_string(), "postgres".to_string()),
+                ("HS__STORAGE__HOST".to_string(), "db.internal".to_string()),
+                ("HS__STORAGE__DATABASE".to_string(), "hs".to_string()),
+                ("HS__STORAGE__USER".to_string(), "hs".to_string()),
+                (
+                    "HS__STORAGE__SSL_MODE".to_string(),
+                    "verify-full".to_string(),
+                ),
+                (
+                    "HS__STORAGE__SSL_ROOT_CERT".to_string(),
+                    "/etc/hs/pg-ca/ca.crt".to_string(),
+                ),
+                ("HS__STORAGE__SCHEMA".to_string(), "hs_prod".to_string()),
+                ("HS__STORAGE__POOL_SIZE".to_string(), "4".to_string()),
+            ],
+        )
+        .unwrap();
+        match cfg.storage {
+            StorageConfig::Postgres(p) => {
+                assert_eq!(p.ssl_mode, storage::PostgresSslMode::VerifyFull);
+                assert_eq!(
+                    p.ssl_root_cert.as_deref(),
+                    Some(std::path::Path::new("/etc/hs/pg-ca/ca.crt"))
+                );
+                assert_eq!(p.schema, "hs_prod");
+                assert_eq!(p.pool_size, 4);
+            }
+            other => panic!("expected Postgres, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn secret_file_is_read_at_load_time() {
         let dir = std::env::temp_dir().join(format!("hs-config-lib-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

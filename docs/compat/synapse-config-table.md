@@ -149,7 +149,7 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 
 | Option | Status | Native | Notes |
 |---|---|---|---|
-| `database` | Mapped (diff) | `storage` (`Postgres` variant) | Synapse's `name: sqlite3` has no equivalent (the embedded backend is Fjall, not SQLite); `txn_limit` and `allow_unsafe_locale` are not modeled; `args.cp_max` maps to `storage.postgres.pool_size`. |
+| `database` | Mapped (diff) | `storage` (`Postgres` variant) | Synapse's `name: sqlite3` has no equivalent (the embedded backend is Fjall, not SQLite); `txn_limit` and `allow_unsafe_locale` are not modeled; `args.cp_max` maps to `storage.postgres.pool_size`; `args.sslmode` and `args.sslrootcert` (libpq's) map to `storage.postgres.ssl_mode` and `ssl_root_cert`, with `allow` read as `prefer` and a root certificate kept only for the verify modes. |
 | `databases` | Unsupported | — | Database sharding across multiple Postgres hosts by table is superseded by the store's own shard mechanism (`storage.slatedb.shard_count`, `PLAN.md` section 6.5); the Postgres backend uses one database. |
 
 ## Logging

@@ -529,16 +529,29 @@
               "default": null
             },
             "pool_size": {
-              "description": "Connection pool size. Corresponds to Synapse's\n`database.args.cp_max`. Accepted by `hs_kv::postgres_backend::PostgresBackend::open`'s\ncaller today but not yet threaded through — `open` hardcodes a pool size of 16 regardless\nof this value (see `docs/status/01-storage-engine.md`'s \"Wiring the integration lead must\nadd\" item 5, checked); wiring it is a small change to that backend's public constructor,\nnot a config-schema gap.",
+              "description": "Connection pool size: the most open connections this replica holds. Corresponds to\nSynapse's `database.args.cp_max`.",
               "type": "integer",
               "format": "uint32",
               "minimum": 0,
               "default": 10
             },
-            "tls": {
-              "description": "Require TLS for the connection. Accepted but not yet honoured:\n`hs_kv::postgres_backend::PostgresBackend::open` connects with `postgres::NoTls`\nunconditionally, and `crates/hs-cli/src/storage.rs` (checked) returns a startup error\nnaming this field rather than silently connecting in the clear when it is `true`, until\nTLS support is added to that backend.",
-              "type": "boolean",
-              "default": false
+            "schema": {
+              "description": "The PostgreSQL schema every table lives in; created at startup if missing. One safe SQL\nidentifier (`[A-Za-z_][A-Za-z0-9_]*`, at most 55 bytes). Several homeservers can share\none database by each taking a schema of their own.",
+              "type": "string",
+              "default": "public"
+            },
+            "ssl_mode": {
+              "description": "Whether and how the connection is encrypted, in libpq's terms: `disable` (in the clear),\n`prefer` (encrypted when the server offers it, no certificate check; the default),\n`require` (encrypted or refused, no certificate check), `verify-ca` (encrypted, and the\nserver's certificate chains to `ssl_root_cert`), or `verify-full` (`verify-ca`, and the\ncertificate names `host`). Corresponds to Synapse's `database.args.sslmode`, which libpq\nreads (Synapse's `allow` is treated as `prefer`).\n\nThe earlier boolean `tls` key still loads, as an alias: `tls: true` is `require` and\n`tls: false` is `disable`. A file with both keys is refused as a duplicate.",
+              "$ref": "#/$defs/PostgresSslMode",
+              "default": "prefer"
+            },
+            "ssl_root_cert": {
+              "description": "A PEM file of CA certificates the server's certificate must chain to, for the\n`verify-ca` and `verify-full` modes. When unset, those modes use the platform's trust\nstore. Corresponds to Synapse's `database.args.sslrootcert`. A self-signed server\ncertificate is its own root here, as long as it is not marked as a CA\n(`basicConstraints=CA:FALSE`; OpenSSL's `req -x509` marks one as a CA by default, and\nsuch a certificate is refused as a server certificate).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
             },
             "backend": {
               "type": "string",
@@ -590,6 +603,36 @@
       "description": "An inline secret value. Prefer the matching `*_file` key to avoid putting secrets in the config file.",
       "type": "string",
       "x-secret": true
+    },
+    "PostgresSslMode": {
+      "description": "libpq's `sslmode` values, as `storage.postgres.ssl_mode` takes them. See\n[`PostgresStorageConfig::ssl_mode`] for what each one checks.",
+      "oneOf": [
+        {
+          "description": "Never negotiate TLS.",
+          "type": "string",
+          "const": "disable"
+        },
+        {
+          "description": "Encrypt when the server offers it; no certificate check. The default.",
+          "type": "string",
+          "const": "prefer"
+        },
+        {
+          "description": "Encrypt or refuse; no certificate check.",
+          "type": "string",
+          "const": "require"
+        },
+        {
+          "description": "Encrypt, and the server's certificate must chain to the trusted CA.",
+          "type": "string",
+          "const": "verify-ca"
+        },
+        {
+          "description": "`verify-ca`, and the certificate must name the host connected to.",
+          "type": "string",
+          "const": "verify-full"
+        }
+      ]
     },
     "Duration": {
       "description": "A duration: a string of <number><unit> groups (ms, s, m, h, d, w, y), or an integer number of milliseconds.",

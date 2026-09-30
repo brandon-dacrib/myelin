@@ -42,6 +42,10 @@ data:
       database: {{ .Values.storage.postgres.database | quote }}
       user: {{ .Values.storage.postgres.user | quote }}
       {{- end }}
+      ssl_mode: {{ .Values.storage.postgres.sslMode | default "prefer" | quote }}
+      {{- if and .Values.storage.postgres.sslRootCert (has .Values.storage.postgres.sslMode (list "verify-ca" "verify-full")) }}
+      ssl_root_cert: {{ .Values.storage.postgres.sslRootCert | quote }}
+      {{- end }}
       {{- else if eq $backend "slatedb" }}
       bucket_url: {{ .Values.storage.objectStorage.bucketUrl | quote }}
       shard_count: {{ .Values.storage.objectStorage.shardCount }}

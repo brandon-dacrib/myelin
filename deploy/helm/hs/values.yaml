@@ -21,7 +21,7 @@
 #
 # Naming follows element-hq/ess-helm's `matrix-stack` chart conventions where a direct analog
 # exists (refs/ess-helm/charts/matrix-stack/values.yaml: `image.{registry,repository,tag,digest,
-# pullPolicy,pullSecrets}`, `postgres.{host,port,user,database,sslMode,password:{value|secret+
+# pullPolicy,pullSecrets}`, `postgres.{host,port,user,database,sslMode,sslRootCert,password:{value|secret+
 # secretKey}}`, `media.storage.{existingClaim,size,storageClassName}`,
 # `ingress.{className,tlsEnabled,tlsSecret,annotations}`, `containersSecurityContext`,
 # `storage.resourcePolicy`) so an operator who already runs ESS Community's Synapse component
@@ -107,12 +107,20 @@ storage:
     port: 5432
     database: hs
     user: hs
-    ## Accepted for ess-helm compatibility and not yet honoured: the server's PostgreSQL client
-    ## connects without TLS (crates/hs-kv/src/postgres_backend.rs, `NoTls`), whatever this says,
-    ## so the database must accept plain `host` connections from the pods (CloudNativePG's
-    ## default `pg_hba` does). Found running two pods against a shared CloudNativePG cluster,
-    ## 2026-09-27.
+    ## libpq's `sslmode`, rendered as `storage.ssl_mode` in the server's configuration:
+    ## `disable`, `prefer` (encrypt when the database offers it, no certificate check),
+    ## `require` (encrypt or refuse to start), `verify-ca` (encrypt, and the database's
+    ## certificate must chain to `sslRootCert`), or `verify-full` (`verify-ca`, and the
+    ## certificate must name `host`). Same names as ess-helm's `synapse.postgres.sslMode`.
+    ## With `require` or the verify modes the pod refuses to start, naming this setting, when
+    ## the database cannot meet it. CloudNativePG serves TLS by default, so `require` works
+    ## there out of the box; for `verify-*` mount its `<clusterName>-ca` Secret (key `ca.crt`)
+    ## with `extraVolumes`/`extraVolumeMounts` and point `sslRootCert` at it.
     sslMode: prefer
+    ## Path, inside the pod, of a PEM file of CA certificates for `verify-ca`/`verify-full`
+    ## (`storage.ssl_root_cert`). Empty means the platform's trust store. Only rendered for the
+    ## verify modes; the server refuses it with any other `sslMode`.
+    sslRootCert: ""
     ## Either an inline value or a reference to an existing Secret key, exactly like
     ## ess-helm's `synapse.postgres.password` shape.
     password: {}

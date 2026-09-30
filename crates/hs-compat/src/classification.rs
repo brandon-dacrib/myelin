@@ -515,7 +515,7 @@ pub const OPTIONS: &[KeyInfo] = &[
         key: "database",
         classification: Classification::MappedDiff,
         native: "`storage` (`Postgres` variant)",
-        note: "Synapse's `name: sqlite3` has no equivalent (the embedded backend is Fjall, not SQLite); `txn_limit` and `allow_unsafe_locale` are not modeled; `args.cp_max` maps to `storage.postgres.pool_size`.",
+        note: "Synapse's `name: sqlite3` has no equivalent (the embedded backend is Fjall, not SQLite); `txn_limit` and `allow_unsafe_locale` are not modeled; `args.cp_max` maps to `storage.postgres.pool_size`; `args.sslmode` and `args.sslrootcert` (libpq's) map to `storage.postgres.ssl_mode` and `ssl_root_cert`, with `allow` read as `prefer` and a root certificate kept only for the verify modes.",
     },
     KeyInfo {
         key: "databases",

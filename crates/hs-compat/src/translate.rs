@@ -22,7 +22,7 @@ use hs_config::listeners::{Listener, ListenerResource, TlsConfig};
 use hs_config::media::{MediaStorageBackend, ThumbnailMethod, ThumbnailSize};
 use hs_config::ratelimit::RateLimitBucket;
 use hs_config::secret::SecretString;
-use hs_config::storage::{PostgresStorageConfig, StorageConfig};
+use hs_config::storage::{PostgresSslMode, PostgresStorageConfig, StorageConfig};
 use hs_config::{ByteSize, Config, Duration};
 use serde_yaml_ng::Value;
 
@@ -717,6 +717,25 @@ fn apply_database(v: &Value, config: &mut Config) {
         .map(SecretString::from)
         .unwrap_or_default();
     let pool_size = get_u32(&args, "cp_max").unwrap_or(10);
+    // libpq's own `sslmode` and `sslrootcert`, which Synapse passes through to psycopg2
+    // untouched; the native names are the same five, and libpq's `allow` (TLS only if the server
+    // insists) has no native equivalent nearer than `prefer`.
+    let ssl_mode = match get_str(&args, "sslmode").as_deref() {
+        Some("disable") => PostgresSslMode::Disable,
+        Some("require") => PostgresSslMode::Require,
+        Some("verify-ca") => PostgresSslMode::VerifyCa,
+        Some("verify-full") => PostgresSslMode::VerifyFull,
+        Some("prefer" | "allow") | None => PostgresSslMode::Prefer,
+        Some(_) => PostgresSslMode::Prefer,
+    };
+    let ssl_root_cert = get_str(&args, "sslrootcert")
+        .filter(|_| {
+            matches!(
+                ssl_mode,
+                PostgresSslMode::VerifyCa | PostgresSslMode::VerifyFull
+            )
+        })
+        .map(PathBuf::from);
     config.storage = StorageConfig::Postgres(PostgresStorageConfig {
         host,
         port,
@@ -725,7 +744,9 @@ fn apply_database(v: &Value, config: &mut Config) {
         password,
         password_file: None,
         pool_size,
-        tls: false,
+        schema: "public".to_owned(),
+        ssl_mode,
+        ssl_root_cert,
     });
 }
 
@@ -863,6 +884,8 @@ database:
     user: synapse
     password: hunter2
     cp_max: 20
+    sslmode: verify-full
+    sslrootcert: /etc/synapse/pg-ca.pem
 "#;
         let (config, _) = translate(yaml, TranslateOptions::default()).unwrap();
         match config.storage {
@@ -870,9 +893,44 @@ database:
                 assert_eq!(p.host, "db.internal");
                 assert_eq!(p.pool_size, 20);
                 assert_eq!(p.password.as_str(), Some("hunter2"));
+                assert_eq!(p.ssl_mode, PostgresSslMode::VerifyFull);
+                assert_eq!(
+                    p.ssl_root_cert.as_deref(),
+                    Some(std::path::Path::new("/etc/synapse/pg-ca.pem"))
+                );
+                assert_eq!(p.schema, "public");
             }
             other => panic!("expected Postgres, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn translates_postgres_sslmode_defaults_and_drops_an_unused_root_cert() {
+        let yaml = r#"
+server_name: example.org
+database:
+  name: psycopg2
+  args:
+    host: db.internal
+    sslmode: require
+    sslrootcert: /etc/synapse/pg-ca.pem
+"#;
+        let (config, _) = translate(yaml, TranslateOptions::default()).unwrap();
+        let StorageConfig::Postgres(p) = config.storage else {
+            panic!("expected Postgres");
+        };
+        assert_eq!(p.ssl_mode, PostgresSslMode::Require);
+        // `require` does not read a root certificate natively (no libpq-style promotion to
+        // verify-ca), and the native validator refuses the pair, so the path is dropped.
+        assert_eq!(p.ssl_root_cert, None);
+
+        let yaml =
+            "server_name: example.org\ndatabase:\n  name: psycopg2\n  args:\n    sslmode: allow\n";
+        let (config, _) = translate(yaml, TranslateOptions::default()).unwrap();
+        let StorageConfig::Postgres(p) = config.storage else {
+            panic!("expected Postgres");
+        };
+        assert_eq!(p.ssl_mode, PostgresSslMode::Prefer);
     }
 
     #[test]

@@ -26,7 +26,8 @@ storage:
     port: 5432
     database: myelin_cluster
     user: appuser
-    ## Ignored: the server connects without TLS (values.yaml says why).
+    ## Honoured since agent/postgres-tls: the pods connect in the clear on purpose here, as they
+    ## always did; `prefer` or `require` would encrypt against CloudNativePG's default TLS.
     sslMode: disable
     password:
       secret: postgres-credentials

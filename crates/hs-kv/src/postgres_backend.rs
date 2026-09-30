@@ -178,7 +178,7 @@ use r2d2_postgres::PostgresConnectionManager;
 
 use crate::error::{Conflict, KvError};
 use crate::limits::{self, TxnBudget};
-use crate::postgres_tls::{self, PgTlsError, PgTlsOptions, RustlsConnector};
+use crate::postgres_tls::{self, PgSslMode, PgTlsError, PgTlsOptions, RustlsConnector};
 use crate::traits::{KvBackend, KvRead, KvWrite, RangeItem, RangeIter, RangeSpec};
 use crate::watch::{Hub, Watch};
 
@@ -501,6 +501,7 @@ struct Inner {
     schema: String,
     hub: Hub,
     tables: Mutex<HashMap<String, Arc<str>>>,
+    info: PostgresConnectionInfo,
 }
 
 impl Drop for Inner {
@@ -550,11 +551,23 @@ impl Default for PostgresOpenOptions {
     }
 }
 
-/// What [`PostgresBackend::open_with`] found out about the server it connected to, for the
-/// caller's own logging or health reporting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What [`PostgresBackend::open_with`] connected to and how, for the caller's own log line or
+/// health reporting ([`PostgresBackend::connection_info`]). Never carries the password.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostgresConnectionInfo {
-    /// Whether the connection PostgreSQL reports for the probe session (`pg_stat_ssl.ssl`) was
+    /// The host connected to (the DSN's first host).
+    pub host: String,
+    /// Its port.
+    pub port: u16,
+    /// The database name.
+    pub database: String,
+    /// The schema the tables live in.
+    pub schema: String,
+    /// The pool's size.
+    pub pool_size: u32,
+    /// The `ssl_mode` asked for.
+    pub ssl_mode: PgSslMode,
+    /// Whether the connection PostgreSQL reports for the first session (`pg_stat_ssl.ssl`) was
     /// encrypted. Under `prefer` this is the only way to know.
     pub encrypted: bool,
 }
@@ -584,8 +597,12 @@ impl PostgresBackend {
     }
 
     /// Opens a connection pool to `dsn` as `options` says, ensures the schema exists, and logs
-    /// one `info` line naming the host, database, schema, pool size, the `ssl_mode` asked for
-    /// and whether the connection that came up is encrypted.
+    /// one `debug` line naming the host, database, schema, pool size, the `ssl_mode` asked for
+    /// and whether the connection that came up is encrypted. `debug`, not `info`, because the
+    /// binary that matters (`hs serve`) opens storage before its log subscriber exists (the
+    /// configuration lives in the database) and writes the `info` line itself, later, from
+    /// [`PostgresBackend::connection_info`]; an `info` line here would be lost there and doubled
+    /// anywhere else.
     ///
     /// The first connection is made outside the pool, on purpose: `r2d2` reduces a connect
     /// failure to a string, and a TLS failure needs to come back as a [`PgTlsError`] (reachable
@@ -604,7 +621,8 @@ impl PostgresBackend {
         Self::open_with_info(dsn, options).map(|(backend, _)| backend)
     }
 
-    /// [`PostgresBackend::open_with`], also returning what it learned about the connection.
+    /// [`PostgresBackend::open_with`], also returning what it learned about the connection
+    /// (the same as [`PostgresBackend::connection_info`] afterwards).
     ///
     /// # Errors
     /// As [`PostgresBackend::open_with`].
@@ -672,7 +690,7 @@ impl PostgresBackend {
                 .connection_timeout(std::time::Duration::from_secs(3))
                 .build(manager)
                 .map_err(KvError::backend)?;
-            tracing::info!(
+            tracing::debug!(
                 host,
                 port,
                 database,
@@ -682,6 +700,15 @@ impl PostgresBackend {
                 encrypted,
                 "opened the PostgreSQL storage backend"
             );
+            let info = PostgresConnectionInfo {
+                host,
+                port,
+                database,
+                schema: schema.to_owned(),
+                pool_size,
+                ssl_mode,
+                encrypted,
+            };
             Ok((
                 Self {
                     inner: Arc::new(Inner {
@@ -689,11 +716,18 @@ impl PostgresBackend {
                         schema: schema.to_owned(),
                         hub: Hub::new(),
                         tables: Mutex::new(HashMap::new()),
+                        info: info.clone(),
                     }),
                 },
-                PostgresConnectionInfo { encrypted },
+                info,
             ))
         })
+    }
+
+    /// What this backend connected to and how; see [`PostgresConnectionInfo`].
+    #[must_use]
+    pub fn connection_info(&self) -> &PostgresConnectionInfo {
+        &self.inner.info
     }
 
     /// Drops this backend's whole schema, including every keyspace's table. Only ever used by
