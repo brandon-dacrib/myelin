@@ -222,17 +222,36 @@ async fn public_rooms(
         .into_response()
 }
 
+#[derive(serde::Deserialize)]
+struct HierarchyParams {
+    #[serde(default)]
+    suggested_only: Option<bool>,
+}
+
+/// `GET /hierarchy/{roomId}` (MSC2946). Not paginated: the space and the children this server
+/// holds, filtered to what the requesting server may see, for it to filter further per user.
+/// A room the requester may not see is `404 M_NOT_FOUND`, the same as one this server does not
+/// hold, as the spec says ("not known to the server or the requesting server is unable to
+/// peek/join it"): the two must be told apart no more here than through `/make_join`.
 async fn hierarchy(
     State(state): State<FederationState>,
     Path(room_id): Path<String>,
+    Query(params): Query<HierarchyParams>,
     headers: axum::http::HeaderMap,
 ) -> Response {
     let requester = match requesting_server(&headers) {
         Ok(r) => r,
         Err(e) => return (*e).into_response(),
     };
-    match state.rooms.hierarchy(&room_id, &requester).await {
-        Ok(rooms) => axum::Json(serde_json::json!({ "children": rooms })).into_response(),
+    match state
+        .rooms
+        .hierarchy(&room_id, params.suggested_only.unwrap_or(false), &requester)
+        .await
+    {
+        Ok(body) => axum::Json(body).into_response(),
+        Err(RoomSourceError::NotVisible) => {
+            MatrixError::not_found("room not known or not accessible").into_response()
+        }
         Err(e) => room_source_error_to_response(e).into_response(),
     }
 }

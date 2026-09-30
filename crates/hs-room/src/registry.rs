@@ -119,6 +119,13 @@ pub struct RoomRegistry<B: KvBackend> {
     /// server holds: `crate::routes::query::get_messages` reaches the oldest held event and
     /// says so, as it did before this hook existed.
     backfill: OnceLock<Arc<dyn crate::backfill::Backfill>>,
+    /// See [`crate::hierarchy::RemoteHierarchy`] and [`RoomRegistry::install_remote_hierarchy`].
+    /// Unset (`None`, the default until `hs-cli` installs one) means the space hierarchy shows
+    /// only the rooms this server holds: a child on another server is left out.
+    remote_hierarchy: OnceLock<Arc<dyn crate::hierarchy::RemoteHierarchy>>,
+    /// The `GET /hierarchy` pagination tokens this process has handed out
+    /// (`crate::hierarchy::PaginationSessions`).
+    hierarchy_sessions: crate::hierarchy::PaginationSessions,
     /// See [`crate::fencing::RoomFencing`] and [`RoomRegistry::install_fencing`]. Unset (`None`,
     /// the default until `hs-cli` installs one) means every actor this registry constructs or
     /// loads runs with no cluster-fencing check at all -- `RoomActor::persist` behaves exactly as
@@ -162,6 +169,8 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             global,
             global_token_resolver: OnceLock::new(),
             backfill: OnceLock::new(),
+            remote_hierarchy: OnceLock::new(),
+            hierarchy_sessions: crate::hierarchy::PaginationSessions::default(),
             fencing: OnceLock::new(),
             server_notices_user: OnceLock::new(),
             reports,
@@ -228,6 +237,31 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     #[must_use]
     pub fn backfill_hook(&self) -> Option<&Arc<dyn crate::backfill::Backfill>> {
         self.backfill.get()
+    }
+
+    /// Installs the hook `GET /rooms/{roomId}/hierarchy` (`crate::hierarchy::walk`) uses to ask
+    /// another server about a room of a space this server does not hold. Idempotent past the
+    /// first call, same as [`RoomRegistry::install_backfill`]: a second install is logged and
+    /// ignored.
+    pub fn install_remote_hierarchy(&self, hook: Arc<dyn crate::hierarchy::RemoteHierarchy>) {
+        if self.remote_hierarchy.set(hook).is_err() {
+            tracing::warn!(
+                "a remote-hierarchy hook was already installed on this room registry; ignoring \
+                 the second install"
+            );
+        }
+    }
+
+    /// The installed [`crate::hierarchy::RemoteHierarchy`] hook, if any.
+    #[must_use]
+    pub fn remote_hierarchy_hook(&self) -> Option<&Arc<dyn crate::hierarchy::RemoteHierarchy>> {
+        self.remote_hierarchy.get()
+    }
+
+    /// The `GET /hierarchy` pagination sessions this process holds.
+    #[must_use]
+    pub fn hierarchy_sessions(&self) -> &crate::hierarchy::PaginationSessions {
+        &self.hierarchy_sessions
     }
 
     /// Names the user server notices are sent as (the Matrix specification's "Server Notices"

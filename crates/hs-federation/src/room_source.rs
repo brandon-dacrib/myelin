@@ -129,15 +129,20 @@ pub trait RoomDataSource: Send + Sync {
         requesting_server: &str,
     ) -> Result<(String, u64), RoomSourceError>;
 
-    /// The room's `m.space.child`-derived hierarchy summary rooted at `room_id`, for `/hierarchy`.
-    /// Each entry is a `(room_id, state_json)` pair the caller serializes into the spec's
-    /// `m.space.child`/room-summary shape; the *filtering* to "rooms this requester may see" is
-    /// this method's job, not the caller's.
+    /// `GET /hierarchy/{roomId}` (MSC2946): the spec's whole response object for the space
+    /// rooted at `room_id` -- `room` (its summary with `children_state`), `children` (the
+    /// summaries of the children this server holds and `requesting_server` may see) and
+    /// `inaccessible_children` (the held children it may not). `suggested_only` keeps only the
+    /// links marked `suggested`. The filtering to "rooms the requesting server may see" (a user
+    /// of it joined or invited, public or knockable, world-readable, or restricted to a room it
+    /// has a user in) is this method's job, not the caller's; a root it may not see is
+    /// [`RoomSourceError::NotVisible`], which the route answers `404` like an unknown room.
     async fn hierarchy(
         &self,
         room_id: &str,
+        suggested_only: bool,
         requesting_server: &str,
-    ) -> Result<Vec<EventJson>, RoomSourceError>;
+    ) -> Result<EventJson, RoomSourceError>;
 
     /// The room's join rule / world-readability-relevant profile info for `/query/directory` and
     /// `/publicRooms`-shaped calls: `(canonical_alias, is_public)`.
@@ -410,8 +415,9 @@ impl RoomDataSource for InMemoryRoomSource {
     async fn hierarchy(
         &self,
         room_id: &str,
+        suggested_only: bool,
         requesting_server: &str,
-    ) -> Result<Vec<EventJson>, RoomSourceError> {
+    ) -> Result<EventJson, RoomSourceError> {
         let room = self
             .rooms
             .get(room_id)
@@ -419,7 +425,32 @@ impl RoomDataSource for InMemoryRoomSource {
         if !self.is_visible_to(room_id, requesting_server).await {
             return Err(RoomSourceError::NotVisible);
         }
-        Ok(room.state.clone())
+        let children_state: Vec<Value> = room
+            .state
+            .iter()
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some("m.space.child"))
+            .filter(|event| {
+                !suggested_only
+                    || event
+                        .get("content")
+                        .and_then(|c| c.get("suggested"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+            })
+            .cloned()
+            .collect();
+        Ok(serde_json::json!({
+            "room": {
+                "room_id": room_id,
+                "num_joined_members": room.joined_servers.len(),
+                "world_readable": room.world_readable,
+                "guest_can_join": false,
+                "join_rule": if room.public { "public" } else { "invite" },
+                "children_state": children_state,
+            },
+            "children": [],
+            "inaccessible_children": [],
+        }))
     }
 
     async fn public_room_summary(&self, room_id: &str) -> Option<(Option<String>, bool)> {

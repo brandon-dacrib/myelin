@@ -7,6 +7,7 @@
 pub mod aliases;
 pub mod create_room;
 pub mod directory;
+pub mod hierarchy;
 pub mod membership;
 pub mod profile;
 pub mod query;
@@ -226,6 +227,13 @@ pub fn router<B: KvBackend + 'static>() -> (axum::Router<RoomState<B>>, RouteMan
             "/rooms/{roomId}/threads",
             threads::get_threads::<B>,
             matrix_client("getThreadRoots"),
+        )
+        // The space hierarchy (MSC2946) is a `v1` route like `/relations` and `/threads`;
+        // `hs-cli` mounts this router under `/_matrix/client/v1` for exactly that reason.
+        .get(
+            "/rooms/{roomId}/hierarchy",
+            hierarchy::get_hierarchy::<B>,
+            matrix_client("getSpaceHierarchy"),
         )
         .post(
             "/rooms/{roomId}/upgrade",

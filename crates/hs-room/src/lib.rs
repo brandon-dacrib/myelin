@@ -38,6 +38,7 @@ pub mod admin_users;
 pub mod backfill;
 pub mod error;
 pub mod fencing;
+pub mod hierarchy;
 pub mod history_visibility;
 pub mod identity;
 pub mod membership;

@@ -1307,6 +1307,11 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             rooms.clone(),
             identity.clone(),
         )));
+        // And how `GET /rooms/{roomId}/hierarchy` learns about a room of a space that this
+        // server does not hold (`crate::hierarchy`): the same client.
+        rooms.install_remote_hierarchy(Arc::new(crate::hierarchy::FederationHierarchy::new(
+            mount.client.clone(),
+        )));
         Some((
             mount.state,
             mount.x_matrix,

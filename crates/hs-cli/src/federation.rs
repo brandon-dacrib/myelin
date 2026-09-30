@@ -115,6 +115,59 @@ impl<B: KvBackend + 'static> RegistryRoomSource<B> {
             .await
     }
 
+    /// One room of a space as `/hierarchy` describes it to `server`: its summary and its
+    /// `m.space.child` links, or `None` when `server` may not see it
+    /// (`hs_room::hierarchy::server_access`). A restricted room's answer needs the allowed
+    /// rooms' members, so those rooms are loaded and asked whether `server` has a user in them.
+    async fn space_room_for(
+        &self,
+        handle: &hs_room::actor::RoomActorHandle<B>,
+        server: &str,
+        suggested_only: bool,
+    ) -> Result<
+        Option<(
+            hs_room::hierarchy::RoomSummary,
+            Vec<hs_room::hierarchy::ChildLink>,
+        )>,
+        RoomSourceError,
+    > {
+        use hs_room::hierarchy::{Access, child_links, server_access, summarize};
+        let server_owned = server.to_owned();
+        let (access, summary, links) = handle
+            .query(move |actor| {
+                let access = server_access(actor, &server_owned);
+                let summary = summarize(actor).map_err(|_| RoomSourceError::RoomNotFound)?;
+                let links = child_links(actor, suggested_only)
+                    .map_err(|_| RoomSourceError::RoomNotFound)?;
+                Ok::<_, RoomSourceError>((access, summary, links))
+            })
+            .await?;
+        let visible = match access {
+            Access::Visible => true,
+            Access::Hidden => false,
+            Access::IfInAnyOf(allowed) => {
+                let mut found = false;
+                for room in allowed {
+                    let Ok(allowed_handle) = self.handle(room.as_str()).await else {
+                        continue;
+                    };
+                    let server_owned = server.to_owned();
+                    if allowed_handle
+                        .query(move |actor| {
+                            hs_room::hierarchy::server_has_member(actor, &server_owned)
+                        })
+                        .await
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                found
+            }
+        };
+        Ok(visible.then_some((summary, links)))
+    }
+
     /// The pagination token a `/backfill` call should start from: the position of the earliest
     /// event the caller says it already has, plus one, so that event is the first one returned.
     /// An event ID that does not parse, is not in this room, or is a state-only outlier with no
@@ -529,19 +582,52 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
     async fn hierarchy(
         &self,
         room_id: &str,
+        suggested_only: bool,
         requesting_server: &str,
-    ) -> Result<Vec<EventJson>, RoomSourceError> {
-        self.with_visible_room(room_id, requesting_server, move |actor| {
-            let state = actor
-                .full_state()
-                .map_err(|_| RoomSourceError::RoomNotFound)?;
-            Ok(state
-                .into_iter()
-                .filter(|event| event.header().event_type == "m.space.child")
-                .map(full_pdu)
-                .collect())
-        })
-        .await
+    ) -> Result<EventJson, RoomSourceError> {
+        // Not `with_visible_room`: the spec's list for who may see a room in a space is wider
+        // than "a member or world-readable" (a public or knockable room, a restricted room the
+        // server has a user in), and is `hs_room::hierarchy::server_access`'s.
+        let root = self.handle(room_id).await?;
+        let Some((summary, links)) = self
+            .space_room_for(&root, requesting_server, suggested_only)
+            .await?
+        else {
+            return Err(RoomSourceError::NotVisible);
+        };
+        let mut children = Vec::new();
+        let mut inaccessible_children = Vec::new();
+        for link in links
+            .iter()
+            .take(hs_room::hierarchy::MAX_CHILDREN_PER_SPACE)
+        {
+            // A child this server does not hold is left out, not listed as inaccessible: the
+            // asking server may know a server that does.
+            let Ok(child) = self.handle(link.room_id.as_str()).await else {
+                continue;
+            };
+            match self
+                .space_room_for(&child, requesting_server, suggested_only)
+                .await?
+            {
+                Some((summary, _)) => children
+                    .push(serde_json::to_value(summary).map_err(|_| RoomSourceError::NotFound)?),
+                None => inaccessible_children.push(link.room_id.to_string()),
+            }
+        }
+        tracing::debug!(
+            room_id,
+            requesting_server,
+            suggested_only,
+            children = children.len(),
+            inaccessible = inaccessible_children.len(),
+            "answered a federation hierarchy request"
+        );
+        Ok(serde_json::json!({
+            "room": summary.to_json_with_children(&links),
+            "children": children,
+            "inaccessible_children": inaccessible_children,
+        }))
     }
 
     async fn public_room_summary(&self, room_id: &str) -> Option<(Option<String>, bool)> {

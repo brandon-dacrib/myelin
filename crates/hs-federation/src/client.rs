@@ -581,6 +581,35 @@ impl FederationClient {
             .unwrap_or_default())
     }
 
+    /// The outbound half of `GET /hierarchy/{roomId}` (MSC2946): asks `destination` to describe
+    /// `room_id` and the children it holds, for the client-server `/hierarchy` walk of a space
+    /// with rooms this server does not hold. The body is handed back as it came (`room`,
+    /// `children`, `inaccessible_children`); `hs_room::hierarchy::RemoteHierarchyPage` reads it.
+    /// Nothing in it is trusted beyond what the summary says about itself: it decides what the
+    /// requesting user is shown of a room this server cannot see, never anything in a room.
+    ///
+    /// # Errors
+    /// See [`ClientError`]; a `404` (the room is unknown to that server, or it will not show it
+    /// to this one) is [`ClientError::Rejected`].
+    pub async fn room_hierarchy(
+        &self,
+        destination: &str,
+        room_id: &str,
+        suggested_only: bool,
+    ) -> Result<serde_json::Value, ClientError> {
+        let path =
+            format!("/_matrix/federation/v1/hierarchy/{room_id}?suggested_only={suggested_only}");
+        let response = self.send(destination, "GET", &path, None).await?;
+        if response.status / 100 != 2 {
+            return Err(ClientError::Rejected {
+                destination: destination.to_owned(),
+                status: response.status,
+                body: rejection_body(&response.body),
+            });
+        }
+        Ok(response.body)
+    }
+
     /// The outbound half of `/get_missing_events`: asks `destination` for up to `limit` PDUs on
     /// the paths from `latest_events` back to, not including, `earliest_events`, none below
     /// `min_depth`. Oldest first, per the spec. Like [`FederationClient::backfill`], the returned
