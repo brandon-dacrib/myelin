@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc c8860dce970210e83732d8883c92c5da179419ac40746a539c0c824ae3006e2a # shrinks to version_idx = 0, actions_a = [Ban { who: 0, by: 0 }], actions_b = []
+cc 3771c1ad6fc3cb043d33bf340326309a2a8990fe5460503b0d97172a592cc50d # shrinks to version_idx = 0, actions_a = [Kick { who: 0, by: 0 }, RaisePower { who: 0, level: 0, by: 0 }], actions_b = [ChangeJoinRule { rule: "public", by: 0 }, Kick { who: 2, by: 2 }]

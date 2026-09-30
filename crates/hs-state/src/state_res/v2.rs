@@ -187,8 +187,14 @@ impl RumaEvent for Adapter {
     }
 
     fn origin_server_ts(&self) -> MilliSecondsSinceUnixEpoch {
-        let ts = u32::try_from(self.origin_server_ts.max(0)).unwrap_or(u32::MAX);
-        MilliSecondsSinceUnixEpoch(UInt::from(ts))
+        // The whole millisecond timestamp, saturated at JavaScript's safe-integer maximum
+        // (`UInt::MAX`, 2^53 - 1), which every real timestamp is far below. This used to go
+        // through `u32`, which every timestamp since 2004 overflows: each real event then
+        // carried `u32::MAX`, every mainline tie broke on event ID instead of time, and a leave
+        // forked from a power-levels change lost to the join it superseded on about half of
+        // all rooms (Complement's `TestRestrictedRoomsRemoteJoinFailOver`, flapping).
+        let ts = u64::try_from(self.origin_server_ts).unwrap_or(0);
+        MilliSecondsSinceUnixEpoch(UInt::new_saturating(ts))
     }
 
     fn event_type(&self) -> &TimelineEventType {

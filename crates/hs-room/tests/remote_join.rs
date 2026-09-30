@@ -586,3 +586,132 @@ async fn a_refused_bootstrap_leaves_no_room_behind() {
         Err(RoomError::RoomNotFound(_))
     ));
 }
+
+/// Bob leaves on `b.example` while alice, who has not seen the leave, changes the power levels
+/// on `a.example`: both cite bob's join, which named alice as its authoriser (Complement's
+/// `TestRestrictedRoomsRemoteJoinFailOver`, where the leave and the power-levels change are
+/// milliseconds apart). Each server takes the other's event, and on both bob is left: the leave
+/// is later than the join it supersedes, at the same mainline position. Timestamps are real
+/// ones, since `hs_state::state_res::v2` used to truncate them to `u32` and break the tie on
+/// event ID instead, resurrecting the join on about half of all rooms (this room's event IDs
+/// happen to sort the right way, so the test that fails without that fix is
+/// `hs_state::state_res::cross_check_tests::a_later_event_at_the_same_mainline_position_wins_at_real_timestamps`;
+/// this one covers the remote-join snapshot and the fork through the room actor).
+#[test]
+fn a_leave_that_races_a_power_levels_change_in_a_restricted_room_is_a_leave() {
+    const T0: i64 = 1_790_000_000_000;
+    let backend = MemoryBackend::new();
+    let tables = Tables::open(&backend).expect("open tables");
+    let alice = user_id!("@alice:a.example").to_owned();
+    let bob = user_id!("@bob:b.example").to_owned();
+    let mut resident = RoomActor::create_room(
+        backend,
+        tables,
+        HomeserverIdentity::for_tests("a.example"),
+        alice.clone(),
+        CreateRoomRequest {
+            preset: Some("public_chat".to_owned()),
+            room_version: Some(RoomVersionId::V8),
+            initial_state: vec![hs_room::actor::InitialStateEvent {
+                event_type: "m.room.join_rules".to_owned(),
+                state_key: String::new(),
+                content: json!({
+                    "join_rule": "restricted",
+                    "allow": [{"type": "m.room_membership", "room_id": "!allowed:a.example", "via": ["a.example"]}],
+                }),
+            }],
+            ..Default::default()
+        },
+        T0,
+    )
+    .expect("create the resident room");
+    let pl1 = resident
+        .send_event(
+            alice.clone(),
+            "m.room.power_levels".to_owned(),
+            Some(String::new()),
+            json!({
+                "users": {alice.as_str(): 100},
+                "users_default": 0, "events_default": 0, "state_default": 50,
+                "ban": 50, "kick": 50, "redact": 50, "invite": 100,
+            }),
+            None,
+            T0 + 1,
+        )
+        .expect("alice restricts invites to herself");
+    let join = resident
+        .membership_action(
+            bob.clone(),
+            Action::Join,
+            bob.clone(),
+            json!({"join_authorised_via_users_server": alice.as_str()}),
+            T0 + 2,
+        )
+        .expect("bob joins, authorised by alice");
+    let StateAtEvent { state, auth_chain } = resident
+        .state_at_event(pl1.event_id())
+        .expect("state lookup")
+        .expect("known");
+    let room_id = resident.room_id().to_owned();
+
+    let backend_b = MemoryBackend::new();
+    let tables_b = Tables::open(&backend_b).expect("open tables");
+    let mut local = RoomActor::create_from_remote_join(
+        backend_b,
+        tables_b,
+        HomeserverIdentity::for_tests("b.example"),
+        &room_id,
+        RoomVersionId::V8,
+        state,
+        auth_chain,
+        join.clone(),
+    )
+    .expect("bootstrap from the join response");
+
+    let leave = local
+        .membership_action(bob.clone(), Action::Leave, bob.clone(), json!({}), T0 + 3)
+        .expect("bob leaves on b");
+    let levels = resident
+        .send_event(
+            alice.clone(),
+            "m.room.power_levels".to_owned(),
+            Some(String::new()),
+            json!({
+                "users": {alice.as_str(): 100, bob.as_str(): 100},
+                "users_default": 0, "events_default": 0, "state_default": 50,
+                "ban": 50, "kick": 50, "redact": 50, "invite": 100,
+            }),
+            None,
+            T0 + 4,
+        )
+        .expect("alice changes the power levels on a");
+    for event in [&leave, &levels] {
+        let prevs: Vec<String> = event.json()["prev_events"]
+            .as_array()
+            .expect("prev_events")
+            .iter()
+            .map(|v| v.as_str().expect("an id").to_owned())
+            .collect();
+        assert_eq!(prevs, vec![join.event_id().to_string()]);
+    }
+
+    local
+        .accept_remote_event(levels.clone())
+        .expect("b takes the power levels");
+    resident
+        .accept_remote_event(leave.clone())
+        .expect("a takes the leave");
+
+    for (name, actor) in [("b", &local), ("a", &resident)] {
+        let member = actor
+            .state_event("m.room.member", bob.as_str())
+            .expect("state")
+            .expect("bob has a membership");
+        assert_eq!(
+            member.event_id(),
+            leave.event_id(),
+            "on {name} bob's membership must be the leave"
+        );
+        assert!(!actor.is_joined(&bob), "on {name} bob is not joined");
+    }
+}

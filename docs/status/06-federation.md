@@ -1,5 +1,90 @@
 # 06 Federation: status
 
+## Fourteenth session (2026-09-30): Complement remeasured, and a state-resolution tie-break
+
+**Branch state:** `agent/federation-complement`, on top of `agent/federation-leftovers` at
+874e696 (271ebb0 plus the two join-route test fixes). Not merged.
+
+**Measured (Complement, image built from 271ebb0, targeted set `TestRestrictedRooms*`,
+`TestFederationRoomsInvite`, `TestKnocking*`, `TestKnockRooms*`, `TestFederationRejectInvite`;
+18 top-level tests, 98 counting subtests, `go test -count=1 -p 1` on the `tests` package):**
+
+| Run | Image | Top-level | With subtests | Failing |
+|---|---|---|---|---|
+| 1 | 271ebb0 | 12/18 | 92/98 | `RemoteJoinFailOver`, `RemoteJoinFailOverInMSC3787Room`, `SpacesSummaryLocal`, `SpacesSummaryFederation`, `NoCreatorsUsesPowerLevelsV11`, `V12` |
+| 2 | 271ebb0 | 13/18 | 93/98 | as run 1, without `RemoteJoinFailOverInMSC3787Room` |
+| 3 | 271ebb0 + the fix below | 14/18 | 94/98 | `SpacesSummaryLocal`, `SpacesSummaryFederation`, `NoCreatorsUsesPowerLevelsV11`, `V12` |
+| 4 | same | 14/18 | 94/98 | same four |
+
+Every subtest that ran passed in every run (80/80); the 09-28 numbers (14/18, 94/98) counted
+top-level tests among the "subtests", and so do these. The `RemoteJoinFailOver` pair moved
+between runs (5 passes in 10 attempts before the fix, 10 in 10 after: runs 3 and 4 plus three
+runs of the pair alone). The other four failed identically every time.
+
+**Causes, read from the Complement log and the servers' logs (`RUST_LOG` through Complement's
+`COMPLEMENT_SHARE_ENV_PREFIX=PASS_ PASS_RUST_LOG=...`):**
+
+1. `TestRestrictedRoomsRemoteJoinFailOver{,InMSC3787Room}`, flapping: **this server's bug, in
+   `hs-state`, fixed here.** The test has charlie (hs3) leave the restricted room 2 ms after
+   alice (hs1) changed the power levels, so the leave and the power-levels event both cite
+   charlie's join: a fork on every server. hs3 resolved it with charlie *joined* (the join it had
+   superseded), so the next `/join` "via hs2, which is expected to fail" was answered `200` in
+   1.8 ms by a local join event, without asking hs2 at all (no `remote_join` line in hs3's log;
+   a new `m.room.member` queued for federation). `hs_state::state_res::v2`'s `ruma_state_res::Event`
+   adapter returned `origin_server_ts` through `u32::try_from(..).unwrap_or(u32::MAX)`: every
+   real millisecond timestamp (1.79e12) overflows `u32`, so every real event carried `u32::MAX`,
+   and the mainline ordering's timestamp tie-break silently became an event-ID tie-break, that
+   is, a coin toss per pair of events. Every unit and property test of the resolver used
+   timestamps starting at zero and never saw it. The join and the leave sit at the same
+   mainline position (both cite the earlier power levels), so the leave won only when its
+   event ID sorted after the join's. Fixed: the adapter passes the whole timestamp
+   (`UInt::new_saturating`). `RoomBuilder`'s clock now starts at a real 2026 timestamp, which
+   makes the existing oracle-vs-ruma property test fail on the old code, and
+   `hs_state::state_res::cross_check_tests::a_later_event_at_the_same_mainline_position_wins_at_real_timestamps`
+   is the deterministic case (event IDs chosen to sort the wrong way; fails on the old code
+   with `$e9` where `$e10` is expected, in versions 8, 10 and 11).
+   `crates/hs-room/tests/remote_join.rs::a_leave_that_races_a_power_levels_change_in_a_restricted_room_is_a_leave`
+   covers the same fork through the room actor with a remote-join snapshot and real timestamps
+   (its event IDs happen to sort the right way, so it passes on the old code too; it is there
+   for the actor path, not as the regression test).
+   This affected every room version from 2 up, on every server: any fork whose conflicting
+   events shared a mainline position resolved by event ID. Track 02's crate; the change is
+   nine lines in `crates/hs-state/src/state_res/v2.rs` plus tests.
+
+2. `TestRestrictedRoomsSpacesSummary{Local,Federation}`: **missing feature.**
+   `GET /_matrix/client/v1/rooms/{roomId}/hierarchy` answers `404 M_UNRECOGNIZED`. The
+   federation side (`GET /_matrix/federation/v1/hierarchy/{roomId}`, `hs_federation`'s
+   `read_routes`, `RoomSource::hierarchy`) exists; the client endpoint (MSC2946: walk
+   `m.space.child` from the root, summarise each room the requester may see, ask the
+   `via` servers over federation for rooms this server does not hold, `suggested_only`, `limit`,
+   `max_depth`, `from` pagination) does not. It is a track 04/05 client route with a
+   federation fan-out; a few hundred lines, not started here.
+
+3. `TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevels{V11,V12}`: **a race in the test that
+   this server loses under load; not a bug.** Alice (hs1) sets power levels giving bob (hs2)
+   invite power; the test then, without waiting for hs2, has charlie (hs2) join the allowed
+   room and the restricted room, and expects bob to authorise. hs1 queued the power-levels
+   event at 44,972 and hs2 acknowledged it at 44,977; hs2 decided charlie's join at 44,974
+   ("no user of this server may authorise the restricted join; joining through another
+   server"), 2 ms after the client's `PUT` returned, and hs1 then refused `make_join` because
+   charlie's allowed-room join (queued by hs2 at 44,974) had not reached it either. Synapse
+   passes because its per-request latency is longer than its federation delivery; this server
+   answers the client in under a millisecond. Both tests passed on 09-28 on an idle machine and
+   failed in all four runs today with the workspace gate running alongside. Nothing on the
+   server can make hs2 know about a power-levels event it has not received; the fix is a wait
+   in the test.
+
+**Verification:** `cargo fmt --all --check`, `cargo clippy -p hs-state -p hs-room --all-targets
+-- -D warnings`, `cargo test -p hs-state` (72 passed) and `cargo test -p hs-room` pass. The
+Complement invocation is `logs/0930/run.sh` in the worktree (untracked): `DOCKER_HOST` set to
+OrbStack's socket, `DOCKER_CONFIG` pointing at a config with no credential helper,
+`COMPLEMENT_SPAWN_HS_TIMEOUT_SECS=120`, `go test -v -count=1 -p 1 -timeout 45m -run '^(TestRestrictedRooms|TestFederationRoomsInvite|TestKnocking|TestKnockRooms|TestFederationRejectInvite)' ./tests/`
+in `refs/complement`; the image via `tests/complement/build.sh` with `DOCKER_BUILDKIT=0`.
+
+**Left:** the client `/hierarchy` endpoint (item 2); a wait in Complement's NoCreators test
+or an accepted flake (item 3); the full workspace gate on this branch; the cluster run of the
+thirteenth session's item 5.
+
 ## Thirteenth session (2026-09-28): what was left after the join
 
 **Branch state (2026-09-28, wrap-up):** branch `agent/federation-leftovers`, not merged. Items 1-5

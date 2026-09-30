@@ -16,6 +16,12 @@ use serde_json::json;
 use super::{EventStore, ResolutionEvent, StateMap};
 use crate::auth;
 
+/// Where every [`RoomBuilder`]'s clock starts: a real `origin_server_ts` (2026-09-30, in
+/// milliseconds since the Unix epoch), one tick per event. The clock used to start at zero,
+/// which hid a `u32` truncation of every real timestamp in [`super::v2`]'s adapter: at real
+/// timestamps every event tied, and mainline ordering fell back to event IDs.
+pub(crate) const REAL_CLOCK_START: i64 = 1_790_000_000_000;
+
 /// Builds a room's event store branch by branch, computing realistic `auth_events` for each new
 /// event via [`auth::expected_auth_types`] resolved against that branch's running state.
 pub(crate) struct RoomBuilder {
@@ -38,7 +44,7 @@ impl RoomBuilder {
             rules,
             store: EventStore::new(),
             next_n: 0,
-            next_ts: 0,
+            next_ts: REAL_CLOCK_START,
             order: Vec::new(),
         }
     }
