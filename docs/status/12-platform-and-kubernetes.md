@@ -288,12 +288,13 @@ connected to it, so it is empty.
   server` keeps master and filer metadata under `-dir` already). Not applied, not committed.
 - Same directory, `README.md` (new): what the experiment is, the resources, the install and
   resume steps, removal. Not committed (the owner commits that repository).
-- `deploy/helm/hs/values.yaml`: `storage.postgres.sslMode` is now documented as accepted and
-  not honoured. The chart never renders it and the server's PostgreSQL client is `NoTls`
-  (`crates/hs-kv/src/postgres_backend.rs`), so the database must accept plain `host`
-  connections. CloudNativePG's default `pg_hba` ends with `host all all all scram-sha-256`,
-  which does, unless `postgres-cluster`'s spec overrides it; if the pods log `no pg_hba.conf
-  entry ... no encryption`, this is why.
+- `deploy/helm/hs/values.yaml`: `storage.postgres.sslMode` was documented as accepted and
+  not honoured. **Since 2026-09-30 it is honoured** (`agent/postgres-tls`, status 01): the chart
+  renders it as `storage.postgres.ssl_mode`, with `sslRootCert` for the verify modes, and the
+  server's PostgreSQL client speaks TLS over rustls in libpq's five modes. The two-pod values
+  still say `disable`; switching that cluster to `require` against CloudNativePG (TLS on by
+  default) is a desktop item, not yet run. CloudNativePG's default `pg_hba` ends with
+  `host all all all scram-sha-256`, which accepts plain and TLS connections alike.
 - `deploy/two-pod/verify.py` and `deploy/two-pod/failover.py` (new, **not yet run against
   pods**): the whole verification as two scripts against two port-forwards, so the next session
   runs rather than writes it. `verify.py`: six rooms created through hs-0 (so both pods own

@@ -282,7 +282,9 @@ right per this track's own stated risk. This session:
    Synapse's real behavior) — worth a one-line mention in `hs-media`'s own status file when it
    wires this through, since it is a small, deliberate behavior change, not just a refactor.
 2. **Investigated the PostgreSQL `pool_size`/`tls` gap named in the brief and found it already
-   closed at the config-schema level**: both fields already exist on
+   closed at the config-schema level** (superseded 2026-09-30: `tls` became `ssl_mode`, kept as an
+   alias, and `pool_size`, `schema` and `ssl_mode` all reach the connection; `database.args.sslmode`
+   and `sslrootcert` translate; see status 01 and the translation table): both fields already exist on
    `hs_config::storage::PostgresStorageConfig` (added before this session). The actual gap is
    entirely in the *consumers*, not the schema: `hs_kv::postgres_backend::PostgresBackend::open`
    hardcodes `max_size(16)` and `postgres::NoTls` regardless of these fields (track 01's own status
