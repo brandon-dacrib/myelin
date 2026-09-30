@@ -1,10 +1,95 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-09-30, evening (seven gaps closed; nothing is unmerged). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-09-30, end of day (eight gaps closed; one branch in the gate). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-09-30
+## Resume here: 2026-09-30, end of day
+
+**Where `main` is.** `70e6904`, 2,420 Rust tests, gate green with both PostgreSQL servers (plain
+and TLS) in use. One branch is still out, `agent/as-ephemeral` (`85a38bc`), in the merge gate
+as this is written; the paragraph "Appservices are sent ephemeral data" below says what it holds.
+If it is not on `main` when you read this, `git branch -r --no-merged origin/main` will say so:
+run `tools/merge-queue.sh agent/as-ephemeral` with the six `HS_*_TEST_POSTGRES_*` variables
+(recipe at the top of `crates/hs-kv/tests/postgres_tls.rs`; the two containers are
+`hs-admin-followups-gate-pg` on :5462 and `hs-merge-queue-pg-tls` on :5463, password `hspg`).
+
+**What was done today, in one breath:** the two branches left over from 2026-09-29 merged
+(federation leftovers, the two-pod cluster fix); Complement remeasured and a state-resolution
+tie-break bug found and fixed; then eight known gaps closed one agent at a time -- PostgreSQL
+TLS/pool/schema, the client `/hierarchy`, the `/sync` repeat, ephemeral data across replicas,
+CI's web job, appservices sent ephemeral/to-device/device-list data (in the gate), plus the
+two gate fixes -- and two bugs fixed that had no row (the timestamp truncation, and members of
+a room that went hot left "cold"). Federation's targeted Complement set went 14/18 → 16/18;
+the two left are a race in the tests themselves. Nine stale worktrees (190 GB) removed. Every
+paragraph below gives the commit, the status file and what is left.
+
+**Next steps, in order** (the queue continues; each is one agent, cloud-doable unless marked):
+
+1. **Merge `agent/as-ephemeral`** if the gate did not already (above). Then renumber its
+   decision from 0021 to 0019 (0019 and 0020 are unused; the agent skipped them) in the same
+   docs commit that records the merge here.
+2. **Desktop: the two-pod run with the fixed image.** CD has built `sha-<main>` images all day;
+   the current one carries the handoff fix (0017), cross-replica ephemeral data (0018) and
+   TLS. Steps are item 1 of "Where this stopped on the cluster" below. Target: 0 failures in
+   `deploy/two-pod/rolling.py` during the `helm upgrade` and in `failover.py`; then watch a
+   user on `hs-1` see a user on `hs-0` typing (new today, never seen on pods), and switch
+   `deploy/two-pod/values-dacrib0.yaml` from `sslMode: disable` to `require` against
+   CloudNativePG. Needs the owner's terminal for `kubectl`/`helm` and port-forwards.
+3. **Next known gaps, one agent at a time**, in this suggested order (each is a row in the table
+   at the bottom; pick one that does not touch crates another running agent is in):
+   - "A rejoined room's gap is never filled" (`hs-room`): topological pagination for the
+     leave-to-rejoin gap; Complement's `TestMessagesOverFederation` "re-joining" subtest.
+   - "The state at a backfilled event is walked, not asked for" (`hs-room`): `/state_ids` and an
+     auth check on backfilled events; closes the two together.
+   - "A destination down for longer than its queue is not caught up" (`hs-federation`): Synapse's
+     `destination_rooms` catch-up.
+   - "A requester with no device never records a feed cursor" (`hs-user`): small; some
+     appservice callers.
+   - "A room alias in `/join/{alias}` is not shard-gated" (`hs-cli`): small.
+   - "Setup link assumes `localhost:<bound port>`" (`hs-cli`): small.
+   - "`/search` unimplemented" (`hs-room`): large; needs a cross-room index (tantivy exists in
+     `hs-tables`); Element's search box is the visible consequence.
+   - "A non-owner replica reloads a whole room per event to answer `/sync`" (RFC 0018): the
+     biggest cluster-performance item; after the two-pod run says what the latency is.
+4. **The two test races Complement still fails** (`TestRestrictedRoomsLocalJoinNoCreators
+   UsesPowerLevels{V11,V12}`): a wait in Complement's test, not a server change; worth an
+   upstream issue or a local patch in `tests/complement/`, and a note in status 06 either way.
+5. **Encrypted bridging end to end** (desktop, needs a phone): mautrix-whatsapp now receives
+   device lists, key counts and to-device; signing in is what is left before an encrypted
+   message crosses a bridge (`docs/bridges/mautrix.md`).
+6. **Admin, unchanged from 2026-09-29:** cross-section validation, an assisted storage-backend
+   migration, the rate-limit buckets other than messages, message buckets per replica.
+
+**How today's merges were run, for the next coordinator:** `tools/merge-queue.sh` serially,
+one branch at a time, the full gate under `.git/myelin-merge.lock`; agents pushed `agent/<name>`
+and reported, never merged. Two lessons: (a) **never touch the test PostgreSQL while a gate is
+running** -- a hand-run of the `hs-kv` conformance tests during a gate exhausted the server's
+100 connections and failed that gate's two-replica test with an empty log; (b) a gate that stops
+without its own script releasing the lock leaves `.git/myelin-merge.lock` behind -- check for
+running `cargo` processes, then `rmdir` it.
+
+**Appservices are sent ephemeral data** (`agent/as-ephemeral`, `85a38bc`, in the gate; status 11;
+decision 0021 -- to be renumbered 0019; known gap "Appservice delivery carries events only"
+closed): typing, receipts, presence, to-device messages, device-list changes and one-time-key
+counts, as MSC2409, MSC4203 and MSC3202 ask, read from server-wide streams (`hs_user.
+receipt_stream`, `presence_stream`, `hs_e2e.to_device_stream`) at a durable position per
+appservice and stream, stored in the same transaction as the queued body, so a restart resends
+nothing and misses nothing; typing has no position, as in Synapse, and is read from the pumping
+replica's hub (which holds every replica's typing since 0018). The to-device entry was nested
+under `event` before, a shape no bridge reads; it is flat now, as mautrix-go parses. Verified by
+`crates/hs-cli/tests/appservice_ephemeral.rs` (real binary, axum stand-in: each kind arrives
+once, a restart resends nothing, pause holds, resume delivers; 15 of 16 runs, one early
+uncaptured client-call failure that did not recur in 10 consecutive runs) and by a real
+mautrix-whatsapp in appservice-mode encryption, which received its device-list change, key
+counts, the ephemeral data and an `m.room_key_request` handed to its Olm machine. Metrics
+`hs_appservice_transactions_total{appservice,outcome}` and `hs_appservice_delivered_items_total
+{appservice,kind}`. Left: `device_lists.left` is never filled (Synapse's TODO too); key counts
+cost one device listing per interesting user per transaction; a never-syncing bot device's
+to-device queue is not pruned (pushed to-device is not deleted, as Synapse); no cluster run of
+the ephemeral pump.
+
+## Earlier on 2026-09-30: the merges, in order
 
 **Nothing is unmerged.** `git branch -r --no-merged origin/main` is empty. The two branches the
 2026-09-29 wrap-up left open went through `tools/merge-queue.sh` today, each after a rebase and a
