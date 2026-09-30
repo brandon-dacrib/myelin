@@ -27,11 +27,24 @@ full gate with the two-replica PostgreSQL test running (not skipped):
   and never holds on to a shard it lost as ownerless; the two-replica admin test runs against a
   real PostgreSQL 17.
 
-**Still owed on the federation work:** the Complement remeasure of the rebased commit
-(`TestRestrictedRooms*` including `RemoteJoinFailOver`, `TestFederationRoomsInvite*`,
-`TestKnocking*`, `TestFederationRejectInvite`; 14/18 top-level and 94/98 subtests before the
-rebase). It is running as this is written; its numbers and per-failure causes go into
-`docs/status/06-federation.md`, and this section is updated when they are in.
+**The federation work's Complement remeasure is in, and it found a bug** (`agent/federation-complement`,
+merged as `0047379`, 2,365 Rust tests; the fourteenth session in `docs/status/06-federation.md`).
+The targeted set (`TestRestrictedRooms*`, `TestFederationRoomsInvite*`, `TestKnocking*`,
+`TestKnockRooms*`, `TestFederationRejectInvite`) measures **14/18 top-level, 94/98 with
+subtests**, twice in a row, with the two `RemoteJoinFailOver` tests no longer flapping: `hs-state`'s
+adapter for the state-resolution library truncated every real `origin_server_ts` to `u32::MAX`, so
+mainline ties fell through to the event-ID tie-break and a leave forked from a power-levels change
+lost to the join it superseded about half the time (every room version from 2 up; every resolver
+test had used timestamps counted from zero). Fixed in `crates/hs-state/src/state_res/v2.rs`, with
+the test clock now starting at a real timestamp and a pinned case; noted in status 02. What is
+left in that set: the client `GET /rooms/{roomId}/hierarchy` (MSC2946; the two `SpacesSummary`
+tests; the federation side exists, the client endpoint answers `M_UNRECOGNIZED`; a track 04/05
+feature, a few hundred lines) and the two `NoCreatorsUsesPowerLevels` tests, which race the test's
+own federation delivery and fail only when the machine is loaded (a wait in the test, not a server
+change). How to run it: `tests/complement/build.sh` needs
+`DOCKER_HOST=unix:///Users/brandon/.orbstack/run/docker.sock` in an agent session
+(`/var/run/docker.sock` is a dangling symlink there), `DOCKER_BUILDKIT=0` and a `DOCKER_CONFIG`
+without the credential helper; the exact invocation is in status 06.
 
 **Still owed on the cluster work, and it needs the owner's terminal** (`kubectl` from an agent
 session cannot reach `admin@dacrib0`): the two pods have never run with the handoff fix. CD
@@ -1425,6 +1438,7 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | ~~EDUs are dropped for a destination another replica sends for~~ | `hs-federation`, `hs-cli` | **Closed** (`da97adc`, merged 2026-09-30): an EDU taken by a replica that does not send for its destination is forwarded over the mesh to the one that does; `hs-cli/tests/cluster_edus.rs` runs two replicas on PostgreSQL. Not yet watched on the cluster. Before that: single-node was complete: typing, receipts, presence, device lists, signing-key updates and to-device cross servers both ways (e4543e4, 649302e, `hs-cli/tests/federation_edus.rs`); in cluster mode `FederationSender::enqueue_edu` drops an EDU whose destination shard another replica owns, so it needs a mesh forward to the owner (status 06, twelfth session) |
 | ~~Invites, leaves and knocks over federation are seams~~ | `hs-federation` | **Closed** (e6d4a71, 249fcee, ea990cb): `transport/membership.rs` serves make/send leave, make/send knock and invite v1/v2, and `hs-cli/tests/federation_membership.rs` drives each between two servers. Not yet measured against Complement |
 | ~~Federation media fetch broken~~ | `hs-media` | **Closed** 2026-09-28 (status 09, session 6). Both directions work. A client's download or thumbnail of another server's media is fetched over the signed `/_matrix/federation/v1/media/download`, with the redirect form and the legacy `/_matrix/media/v3/download` fallback. It is then served from the held copy, even with the origin down; the copy honors quarantine and the admin purge. This server's own media is served to other servers as `multipart/mixed`. `hs-cli/tests/federation_media.rs` covers this with two servers and a stand-in origin. Not yet checked against a real Synapse |
+| The client `/hierarchy` endpoint is unimplemented | `hs-room`, `hs-user` | `GET /_matrix/client/v1/rooms/{roomId}/hierarchy` answers `M_UNRECOGNIZED`; the federation `/hierarchy` and `RoomSource::hierarchy` exist. MSC2946: walk `m.space.child`, per-room summaries with visibility, fan out over federation via `via`, `suggested_only`, `limit`, `max_depth`, `from`. Complement's two `TestRestrictedRoomsSpacesSummary*` tests, and Element's space view |
 | `/search` unimplemented | `hs-room` | needs a cross-room index the actor model has no place for |
 | Nothing hot-applies a config change | all | every change needs a restart, and says so |
 | One `/api/v1` fetch fails under the full `e2e-real` suite | `web` (dev proxy) | two tests fail together, pass alone |
