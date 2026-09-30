@@ -24,6 +24,17 @@
 //!   read-only [`RoomActor::load`] snapshot per room, checked against the store's durable
 //!   timeline head on every access and reloaded when the store is ahead. The store is the source
 //!   of truth; the wake is only the doorbell, the same rule `hs-appservice`'s pump follows.
+//! - **Typing, receipts and presence.** None of the three is on the registry stream, so the wake
+//!   above never carries them, and each replica's registries (`crate::typing`,
+//!   `crate::receipts`, `crate::presence`) are its own memory. A replica that changes one of
+//!   them -- a client's `PUT .../typing`, a receipt, a presence change, an EDU from another
+//!   server -- hands an [`EphemeralUpdate`] to [`SessionCluster::publish_ephemeral`], which
+//!   travels in the same [`WakeBatch`] to every other live replica. The receiver
+//!   ([`crate::hub::SessionHub::receive_wakes`]) applies a typing update to its own registry
+//!   (typing is nobody's durable state, so the update carries it whole and each replica expires
+//!   it on its own clock) and, for a receipt or a presence change, which *are* durable, forgets
+//!   what it had cached for that room or user so that its next read comes from the store; then
+//!   it wakes the long-polls concerned. A receiver never re-publishes what it was sent.
 //!
 //! The trait is implemented over the real mesh in `hs-cli` (`crate::sync_cluster` there); this
 //! crate defines only what it needs so that a test can stand two hubs up in one process.
@@ -42,6 +53,57 @@ use ruma::{OwnedRoomId, OwnedUserId, RoomId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
+
+/// One change to typing, receipt or presence state made on one replica, for every other
+/// replica to apply. See the module docs, "Typing, receipts and presence".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EphemeralUpdate {
+    /// `user_id` started (`typing: true`, for `timeout_ms`) or stopped typing in `room_id`.
+    /// Carried whole: typing is in no store, so the receiver's registry is the only copy it
+    /// will have, and the timeout lets it expire the entry itself.
+    Typing {
+        /// The room.
+        room_id: OwnedRoomId,
+        /// Who is typing, or has stopped.
+        user_id: OwnedUserId,
+        /// Whether they are typing now.
+        typing: bool,
+        /// How long the notification is honored for, in milliseconds; meaningless when
+        /// `typing` is false.
+        timeout_ms: u64,
+    },
+    /// A receipt in `room_id` was written to the store with stamp `seq`. The receiver drops
+    /// what it had cached for the room and reads the store again; `seq` raises its counter so
+    /// that nothing it stamps afterwards is older than what it just learned of.
+    Receipt {
+        /// The room whose receipts changed.
+        room_id: OwnedRoomId,
+        /// The stamp the writer gave the receipt (`crate::stamp`).
+        seq: u64,
+    },
+    /// `user_id`'s presence was written to the store with stamp `seq`. As for a receipt: the
+    /// receiver forgets its cached record and rereads.
+    Presence {
+        /// Whose presence changed.
+        user_id: OwnedUserId,
+        /// The stamp the writer gave the record.
+        seq: u64,
+    },
+}
+
+impl EphemeralUpdate {
+    /// The update's kind as a short label (`typing`, `receipt`, `presence`), for logs and
+    /// counters.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Typing { .. } => "typing",
+            Self::Receipt { .. } => "receipt",
+            Self::Presence { .. } => "presence",
+        }
+    }
+}
 
 /// What a room's owner tells every other replica once it has fed one update: which room moved,
 /// to where, the owner's own stream number for the update, and whose long-polls it woke.
@@ -73,6 +135,11 @@ pub struct WakeBatch {
     pub consumed: u64,
     /// The rooms that moved, one entry per room.
     pub wakes: Vec<RoomWake>,
+    /// Typing, receipt and presence changes made on the sender since its last batch, in the
+    /// order they were made. Absent from a batch sent by a replica from before this field
+    /// existed, which is an empty list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ephemeral: Vec<EphemeralUpdate>,
 }
 
 impl WakeBatch {
@@ -83,6 +150,54 @@ impl WakeBatch {
             from: from.into(),
             consumed: 0,
             wakes: Vec::new(),
+            ephemeral: Vec::new(),
+        }
+    }
+
+    /// Folds `update` in. A later typing update for the same room and user replaces the earlier
+    /// one (only the latest state matters, and it carries the fresh timeout); a receipt hint for
+    /// a room already hinted, or a presence hint for a user already hinted, keeps the higher
+    /// stamp, since the receiver rereads the store either way.
+    pub fn push_ephemeral(&mut self, update: EphemeralUpdate) {
+        let same = self
+            .ephemeral
+            .iter_mut()
+            .find(|existing| match (&**existing, &update) {
+                (
+                    EphemeralUpdate::Typing {
+                        room_id: r1,
+                        user_id: u1,
+                        ..
+                    },
+                    EphemeralUpdate::Typing {
+                        room_id: r2,
+                        user_id: u2,
+                        ..
+                    },
+                ) => r1 == r2 && u1 == u2,
+                (
+                    EphemeralUpdate::Receipt { room_id: r1, .. },
+                    EphemeralUpdate::Receipt { room_id: r2, .. },
+                ) => r1 == r2,
+                (
+                    EphemeralUpdate::Presence { user_id: u1, .. },
+                    EphemeralUpdate::Presence { user_id: u2, .. },
+                ) => u1 == u2,
+                _ => false,
+            });
+        match same {
+            Some(existing) => match (existing, update) {
+                (
+                    EphemeralUpdate::Receipt { seq, .. },
+                    EphemeralUpdate::Receipt { seq: new, .. },
+                )
+                | (
+                    EphemeralUpdate::Presence { seq, .. },
+                    EphemeralUpdate::Presence { seq: new, .. },
+                ) => *seq = (*seq).max(new),
+                (existing, update) => *existing = update,
+            },
+            None => self.ephemeral.push(update),
         }
     }
 
@@ -107,10 +222,11 @@ impl WakeBatch {
         }
     }
 
-    /// Whether the batch carries nothing a peer needs: no wakes and no mark.
+    /// Whether the batch carries nothing a peer needs: no wakes, no mark and no ephemeral
+    /// update.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.wakes.is_empty() && self.consumed == 0
+        self.wakes.is_empty() && self.consumed == 0 && self.ephemeral.is_empty()
     }
 }
 
@@ -136,6 +252,13 @@ pub trait SessionCluster: Send + Sync {
     /// Queues `wake` for every other live replica and returns at once. Delivery is best effort
     /// and coalesced; the store, not the wake, is what a reader trusts.
     fn publish(&self, wake: RoomWake);
+
+    /// Queues `update` for every other live replica and returns at once, in the same batches
+    /// as [`SessionCluster::publish`]'s wakes. Best effort, like the wake: a receipt or
+    /// presence hint that is lost leaves the peer serving its cache until the next one, and a
+    /// typing update that is lost leaves the peer not knowing until the client sends the next
+    /// (real clients repeat it every few seconds while the user types).
+    fn publish_ephemeral(&self, update: EphemeralUpdate);
 
     /// Asks every other live replica what it has published, waiting at most `deadline` for the
     /// slowest. A peer that does not answer in time is left out: a `/sync` cannot wait on a
@@ -363,12 +486,37 @@ pub(crate) mod test_support {
         }
 
         fn publish(&self, wake: RoomWake) {
+            let mut batch = WakeBatch::new(&self.me);
+            batch.push(wake);
+            self.deliver(batch);
+        }
+
+        fn publish_ephemeral(&self, update: EphemeralUpdate) {
+            let mut batch = WakeBatch::new(&self.me);
+            batch.push_ephemeral(update);
+            self.deliver(batch);
+        }
+
+        async fn peer_positions(&self, _deadline: Duration) -> Vec<PeerPosition> {
+            self.peers
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|p| PeerPosition {
+                    peer: p.key.clone(),
+                    published: p.hub.rooms().global_published_seq(),
+                })
+                .collect()
+        }
+    }
+
+    impl<B: KvBackend + 'static, R: RoomSource<B> + 'static> FakeCluster<B, R> {
+        /// Sends `batch` to every peer hub, after the configured delay, unless muted.
+        fn deliver(&self, batch: WakeBatch) {
             self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.mute.load(std::sync::atomic::Ordering::SeqCst) {
                 return;
             }
-            let mut batch = WakeBatch::new(&self.me);
-            batch.push(wake);
             let delay = self.delivery_delay;
             let hubs: Vec<Arc<SessionHub<B, R>>> = self
                 .peers
@@ -386,18 +534,6 @@ pub(crate) mod test_support {
                     hub.receive_wakes(batch).await;
                 });
             }
-        }
-
-        async fn peer_positions(&self, _deadline: Duration) -> Vec<PeerPosition> {
-            self.peers
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|p| PeerPosition {
-                    peer: p.key.clone(),
-                    published: p.hub.rooms().global_published_seq(),
-                })
-                .collect()
         }
     }
 }
@@ -450,9 +586,99 @@ mod tests {
             global_seq: 7,
             users: vec![user_id!("@alice:test").to_owned()],
         });
+        batch.push_ephemeral(EphemeralUpdate::Typing {
+            room_id: room_id!("!r:test").to_owned(),
+            user_id: user_id!("@alice:test").to_owned(),
+            typing: true,
+            timeout_ms: 30_000,
+        });
+        batch.push_ephemeral(EphemeralUpdate::Presence {
+            user_id: user_id!("@alice:test").to_owned(),
+            seq: 99,
+        });
         let json = serde_json::to_vec(&batch).unwrap();
         let back: WakeBatch = serde_json::from_slice(&json).unwrap();
         assert_eq!(back, batch);
+
+        // A batch from a replica that predates the field parses, with nothing ephemeral in it.
+        let old: WakeBatch =
+            serde_json::from_str(r#"{"from":"a#1","consumed":3,"wakes":[]}"#).unwrap();
+        assert!(old.ephemeral.is_empty());
+        assert!(!old.is_empty());
+    }
+
+    #[test]
+    fn ephemeral_updates_coalesce_by_what_they_are_about_and_alone_make_a_batch_worth_sending() {
+        let room = room_id!("!r:test").to_owned();
+        let alice = user_id!("@alice:test").to_owned();
+        let bob = user_id!("@bob:test").to_owned();
+        let mut batch = WakeBatch::new("a#1");
+        assert!(batch.is_empty());
+        batch.push_ephemeral(EphemeralUpdate::Typing {
+            room_id: room.clone(),
+            user_id: alice.clone(),
+            typing: true,
+            timeout_ms: 30_000,
+        });
+        assert!(!batch.is_empty(), "an ephemeral update alone is a batch");
+        // Alice stops: the stop replaces the start, in place.
+        batch.push_ephemeral(EphemeralUpdate::Typing {
+            room_id: room.clone(),
+            user_id: alice.clone(),
+            typing: false,
+            timeout_ms: 0,
+        });
+        // Bob is a different entry.
+        batch.push_ephemeral(EphemeralUpdate::Typing {
+            room_id: room.clone(),
+            user_id: bob.clone(),
+            typing: true,
+            timeout_ms: 5_000,
+        });
+        // Two receipts in one room: one hint, the higher stamp.
+        batch.push_ephemeral(EphemeralUpdate::Receipt {
+            room_id: room.clone(),
+            seq: 10,
+        });
+        batch.push_ephemeral(EphemeralUpdate::Receipt {
+            room_id: room.clone(),
+            seq: 8,
+        });
+        // Two presence changes for one user, likewise.
+        batch.push_ephemeral(EphemeralUpdate::Presence {
+            user_id: alice.clone(),
+            seq: 5,
+        });
+        batch.push_ephemeral(EphemeralUpdate::Presence {
+            user_id: alice.clone(),
+            seq: 6,
+        });
+        assert_eq!(
+            batch.ephemeral,
+            vec![
+                EphemeralUpdate::Typing {
+                    room_id: room.clone(),
+                    user_id: alice.clone(),
+                    typing: false,
+                    timeout_ms: 0,
+                },
+                EphemeralUpdate::Typing {
+                    room_id: room.clone(),
+                    user_id: bob,
+                    typing: true,
+                    timeout_ms: 5_000,
+                },
+                EphemeralUpdate::Receipt {
+                    room_id: room,
+                    seq: 10
+                },
+                EphemeralUpdate::Presence {
+                    user_id: alice,
+                    seq: 6
+                },
+            ]
+        );
+        assert_eq!(batch.ephemeral[2].kind(), "receipt");
     }
 }
 
@@ -471,13 +697,14 @@ mod two_replica_tests {
     use hs_room::identity::HomeserverIdentity;
     use hs_room::membership::Action;
     use hs_room::registry::RoomRegistry;
-    use ruma::{OwnedRoomId, OwnedUserId, RoomId, user_id};
+    use ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId, user_id};
     use serde_json::{Value, json};
 
     use super::test_support::FakeCluster;
     use super::*;
     use crate::filter::SyncFilter;
     use crate::hub::SessionHub;
+    use crate::receipts::ReceiptKind;
     use crate::store::DynUserStore;
     use crate::store::tables::TablesUserStore;
     use crate::sync::{SyncParams, build};
@@ -723,6 +950,307 @@ mod two_replica_tests {
             timeline_event_ids(&response, &room_id).contains(&sent.event_id().to_string()),
             "{response}"
         );
+    }
+
+    /// The `m.typing` event for `room_id` in a response, if there is one: its `user_ids`.
+    fn typing_user_ids(response: &Value, room_id: &RoomId) -> Option<Vec<String>> {
+        response["rooms"]["join"][room_id.as_str()]["ephemeral"]["events"]
+            .as_array()?
+            .iter()
+            .find(|e| e["type"] == "m.typing")
+            .map(|e| {
+                e["content"]["user_ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|u| u.as_str().map(str::to_owned))
+                    .collect()
+            })
+    }
+
+    /// The `m.receipt` content for `room_id` in a response, if there is one.
+    fn receipt_content(response: &Value, room_id: &RoomId) -> Option<Value> {
+        response["rooms"]["join"][room_id.as_str()]["ephemeral"]["events"]
+            .as_array()?
+            .iter()
+            .find(|e| e["type"] == "m.receipt")
+            .map(|e| e["content"].clone())
+    }
+
+    /// The presence event from `sender` in a response, if there is one: its content.
+    fn presence_from(response: &Value, sender: &UserId) -> Option<Value> {
+        response["presence"]["events"]
+            .as_array()?
+            .iter()
+            .find(|e| e["sender"] == sender.as_str())
+            .map(|e| e["content"].clone())
+    }
+
+    /// Bob's session is on B. Alice types on A (the owner, where every `PUT .../typing` for the
+    /// room lands): bob's long-poll on B is woken with her in `m.typing`, and again with her
+    /// gone when she stops. A short typing timeout lapses on B by itself, on B's clock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn typing_on_one_replica_is_in_a_long_poll_on_the_other_and_goes_away_when_it_stops() {
+        let (a, b) = two_replicas(Duration::ZERO);
+        let (room_id, alice, bob) = room_with_alice_and_bob(&a).await;
+        let (_, token) = build(&b.hub, &b.e2e, &bob, params(None, Duration::ZERO))
+            .await
+            .unwrap();
+
+        let poll = |token: SyncToken| {
+            let (hub, e2e, bob) = (b.hub.clone(), b.e2e.clone(), bob.clone());
+            tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                let out = build(
+                    &hub,
+                    &e2e,
+                    &bob,
+                    params(Some(token), Duration::from_secs(10)),
+                )
+                .await
+                .unwrap();
+                (out, started.elapsed())
+            })
+        };
+
+        let waiting = poll(token);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        a.hub
+            .set_typing(&room_id, &alice, true, Duration::from_secs(30))
+            .await
+            .unwrap();
+        let ((response, token), elapsed) = waiting.await.unwrap();
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "bob's long-poll on B was not woken by alice typing on A; it took {elapsed:?}"
+        );
+        assert_eq!(
+            typing_user_ids(&response, &room_id),
+            Some(vec![alice.to_string()]),
+            "{response}"
+        );
+
+        let waiting = poll(token);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        a.hub
+            .set_typing(&room_id, &alice, false, Duration::from_secs(30))
+            .await
+            .unwrap();
+        let ((response, token), elapsed) = waiting.await.unwrap();
+        assert!(elapsed < Duration::from_millis(400), "{elapsed:?}");
+        assert_eq!(
+            typing_user_ids(&response, &room_id),
+            Some(vec![]),
+            "the stop must reach B too: {response}"
+        );
+
+        // A timeout lapses on B without anybody saying so: the lazy prune on B's next re-check.
+        a.hub
+            .set_typing(&room_id, &alice, true, Duration::from_millis(200))
+            .await
+            .unwrap();
+        let ((response, token), _) = poll(token).await.unwrap();
+        assert_eq!(
+            typing_user_ids(&response, &room_id),
+            Some(vec![alice.to_string()])
+        );
+        let ((response, _), elapsed) = poll(token).await.unwrap();
+        assert_eq!(
+            typing_user_ids(&response, &room_id),
+            Some(vec![]),
+            "the lapse must show on B: {response}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a lapse is noticed within the re-check interval, not the poll timeout: {elapsed:?}"
+        );
+        assert_eq!(b.cluster.sent(), 0, "B, told, tells nobody");
+    }
+
+    /// The receipt is durable, so B could read it from the store -- but B loaded the room's
+    /// receipts once (bob's first sync) and served that copy: with nothing telling it, alice's
+    /// later receipt never shows. With the hint, it does, and so does the one after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_receipt_on_one_replica_is_in_the_next_sync_on_the_other_and_not_served_stale() {
+        let (a, b) = two_replicas(Duration::ZERO);
+        let (room_id, alice, bob) = room_with_alice_and_bob(&a).await;
+        let handle = a.registry.get_or_load(&room_id).await.unwrap();
+        let mut sent = Vec::new();
+        for i in 0..3 {
+            sent.push(
+                handle
+                    .send_event(
+                        alice.clone(),
+                        "m.room.message".to_owned(),
+                        None,
+                        json!({"msgtype": "m.text", "body": format!("#{i}")}),
+                        None,
+                        10 + i,
+                    )
+                    .await
+                    .unwrap()
+                    .event_id()
+                    .to_owned(),
+            );
+        }
+        // Bob's first sync on B loads the room's receipts into B's cache (none yet).
+        let (_, mut token) = build(&b.hub, &b.e2e, &bob, params(None, Duration::ZERO))
+            .await
+            .unwrap();
+
+        // Without the hint: what the gap looked like. B keeps serving its copy.
+        a.cluster.mute(true);
+        a.hub
+            .set_receipt(&room_id, &alice, ReceiptKind::Read, sent[0].clone(), 1)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (stale, next) = build(&b.hub, &b.e2e, &bob, params(Some(token), Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(
+            receipt_content(&stale, &room_id),
+            None,
+            "muted, B serves its cache; this is the gap the hint closes: {stale}"
+        );
+        token = next;
+        a.cluster.mute(false);
+
+        // With it: the receipt, then a later one for the same room.
+        for (i, ts) in [(1, 2), (2, 3)] {
+            let waiting = {
+                let (hub, e2e, bob) = (b.hub.clone(), b.e2e.clone(), bob.clone());
+                let token = token;
+                tokio::spawn(async move {
+                    build(
+                        &hub,
+                        &e2e,
+                        &bob,
+                        params(Some(token), Duration::from_secs(10)),
+                    )
+                    .await
+                    .unwrap()
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            a.hub
+                .set_receipt(&room_id, &alice, ReceiptKind::Read, sent[i].clone(), ts)
+                .await
+                .unwrap();
+            let (response, next) = tokio::time::timeout(Duration::from_secs(3), waiting)
+                .await
+                .expect("bob's long-poll on B is woken by the receipt on A")
+                .unwrap();
+            let content = receipt_content(&response, &room_id).unwrap_or_else(|| {
+                panic!("receipt #{i} on A is not in bob's sync on B: {response}")
+            });
+            assert_eq!(
+                content[sent[i].as_str()]["m.read"][alice.as_str()]["ts"],
+                json!(ts),
+                "{content}"
+            );
+            assert!(
+                content.get(sent[i - 1].as_str()).is_none(),
+                "a later receipt replaces the earlier one: {content}"
+            );
+            // Nothing new: not sent again.
+            let (again, next) = build(&b.hub, &b.e2e, &bob, params(Some(next), Duration::ZERO))
+                .await
+                .unwrap();
+            assert_eq!(receipt_content(&again, &room_id), None, "{again}");
+            token = next;
+        }
+    }
+
+    /// Alice sets her presence on A (a `PUT /presence` lands wherever it arrives; nothing
+    /// forwards it): bob on B sees it, and the change after it, though B had her record cached.
+    /// Bob's own presence, set on B, reaches alice on A the same way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_presence_change_on_one_replica_reaches_a_room_mate_on_the_other() {
+        let (a, b) = two_replicas(Duration::ZERO);
+        let (_room_id, alice, bob) = room_with_alice_and_bob(&a).await;
+        // Both replicas cache alice's presence (bob's sync on B reads it; alice's on A too).
+        let (_, mut bob_token) = build(&b.hub, &b.e2e, &bob, params(None, Duration::ZERO))
+            .await
+            .unwrap();
+        let (_, alice_token) = build(&a.hub, &a.e2e, &alice, params(None, Duration::ZERO))
+            .await
+            .unwrap();
+
+        for (presence, msg) in [("unavailable", "lunch"), ("online", "back")] {
+            let waiting = {
+                let (hub, e2e, bob) = (b.hub.clone(), b.e2e.clone(), bob.clone());
+                let token = bob_token;
+                tokio::spawn(async move {
+                    build(
+                        &hub,
+                        &e2e,
+                        &bob,
+                        params(Some(token), Duration::from_secs(10)),
+                    )
+                    .await
+                    .unwrap()
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            a.hub
+                .set_presence(&alice, presence.to_owned(), Some(msg.to_owned()))
+                .await
+                .unwrap();
+            let (response, next) = tokio::time::timeout(Duration::from_secs(3), waiting)
+                .await
+                .expect("bob's long-poll on B is woken by alice's presence change on A")
+                .unwrap();
+            let content = presence_from(&response, &alice).unwrap_or_else(|| {
+                panic!("alice's {presence} is not in bob's sync on B: {response}")
+            });
+            assert_eq!(content["presence"], presence, "{content}");
+            assert_eq!(content["status_msg"], msg, "{content}");
+            bob_token = next;
+        }
+
+        // And the other way round. Alice's own changes are hers to see too, so her token is
+        // moved past them first.
+        let (_, alice_token) = build(
+            &a.hub,
+            &a.e2e,
+            &alice,
+            params(Some(alice_token), Duration::ZERO),
+        )
+        .await
+        .unwrap();
+        let waiting = {
+            let (hub, e2e, alice) = (a.hub.clone(), a.e2e.clone(), alice.clone());
+            let token = alice_token;
+            tokio::spawn(async move {
+                build(
+                    &hub,
+                    &e2e,
+                    &alice,
+                    params(Some(token), Duration::from_secs(10)),
+                )
+                .await
+                .unwrap()
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        b.hub
+            .set_presence(&bob, "unavailable".to_owned(), None)
+            .await
+            .unwrap();
+        let (response, next) = tokio::time::timeout(Duration::from_secs(3), waiting)
+            .await
+            .expect("alice's long-poll on A is woken by bob's presence change on B")
+            .unwrap();
+        assert_eq!(
+            presence_from(&response, &bob).map(|c| c["presence"].clone()),
+            Some(json!("unavailable")),
+            "{response}"
+        );
+        let (again, _) = build(&a.hub, &a.e2e, &alice, params(Some(next), Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(presence_from(&again, &bob), None, "not sent twice: {again}");
     }
 
     #[tokio::test]

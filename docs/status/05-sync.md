@@ -1,8 +1,119 @@
 # 05 Sync: status
 
-Last updated: 2026-09-30 (session 8: a `/sync` batch ends where its token says, so an event
-that lands during assembly is sent once. Session 7 and the integration note follow; sessions
-1-6 are preserved unchanged further down.)
+Last updated: 2026-09-30 (session 9: typing, receipts and presence cross replicas. Session 8,
+session 7 and the integration note follow; sessions 1-6 are preserved unchanged further down.)
+
+## Session 9 (2026-09-30, branch `agent/ephemeral-replicas`): typing, receipts and presence cross replicas
+
+**The gap** (`docs/next-steps.md`, "Known gaps"): typing was each replica's memory; receipts
+and presence were durable, but a replica read a room's receipts (or a user's presence) from
+the store once and then served its cache. A user on replica B saw no typing, and no later
+receipt or presence change, from a user on replica A. Decision 0018 records the choice.
+
+**The mechanism: the wake batch carries it.** Session 7's `user.wake` message (a
+`hs_user::cluster::WakeBatch`, one pump per peer, coalesced per mesh round trip, to every
+live replica) gained an `ephemeral: Vec<EphemeralUpdate>` field. The alternatives -- a
+second mesh message, or a per-room pull from the owner on every `/sync` -- were a second
+pump for nothing, and RFC 0018's rejected fan-out respectively. What travels:
+
+- **Typing, whole**: `Typing { room_id, user_id, typing, timeout_ms }`. Typing is in no store
+  and stays that way. The receiver's `TypingRegistry::set` takes it with the timeout and
+  expires it on its own clock, so a lapse shows on every replica within its own 500 ms
+  re-check, and a stop is a second update. Not through the database, as the gap row asked.
+- **Receipts and presence, as a hint to reread**: `Receipt { room_id, seq }` and
+  `Presence { user_id, seq }`. The data is in the shared store already, written by the replica
+  that took it; only the peer's cache is behind. New `ReceiptRegistry::forget(room, seq)` and
+  `PresenceRegistry::forget(user, seq)` drop the cached room or user (a cached "no record"
+  included) so the next read is from the store, and `Stamps::observe` the writer's stamp so
+  nothing stamped here afterwards is older. Rereading, not re-sending: one source of truth,
+  one code path for a restart and for a peer.
+- **Who publishes**: whichever replica changed the state, not only a room's owner.
+  `SessionHub::set_typing`, `set_receipt`, `set_presence`, `touch_presence` (on a change),
+  the join restamp in `apply_room_update`, and `receive_edu` (an EDU from another server is
+  applied on the replica whose transaction it arrived in, and the others were never told) all
+  call `publish_ephemeral`. A receiver (`SessionHub::receive_wakes` ->
+  `apply_ephemeral`) applies and wakes -- the room's joined members for typing and receipts
+  (read through the mirror on a non-owner), the presence audience and the user for presence
+  -- and never re-publishes, so there is no loop. Typing and receipts are `/rooms/...`
+  requests and so always land on the room's owner (the gate forwards them); presence and EDUs
+  land wherever they arrive.
+- **`SessionCluster::publish_ephemeral`** is the one new trait method; `hs-cli`'s
+  `MeshSessionCluster` queues it into the same per-peer pump (`Outbound::{Wake, Ephemeral}`),
+  the pump folds both into one batch (`WakeBatch::push_ephemeral` coalesces: a later typing
+  update for the same room and user replaces the earlier one; a second receipt hint for a
+  room, or presence hint for a user, keeps the higher stamp). A batch with only ephemeral
+  updates is a batch (`is_empty` knows), and moves no consumed mark.
+- **Observability**: `hs_cluster_ephemeral_updates_total{kind="typing|receipt|presence",
+  direction="sent|received"}` in `hs-cli`'s `sync_cluster` (`SyncClusterMetrics`, registered by
+  `install`, so single-node registers nothing). `sent` is counted once the peer has answered
+  200, so a sender's count never exceeds the receiver's. Plus `tracing::debug!` per applied
+  update (`"applying a peer's ephemeral update"`) and the batch log lines now carry
+  `ephemeral=`. The install line says "and typing, receipts and presence cross it", which the
+  real-binary test checks in both logs.
+
+**What it does not do.** No read-your-writes wait for ephemeral data across replicas:
+`settle_before_read` waits on registry-stream numbers and these are not on it; the hint is on
+the peer within a millisecond, before any `/sync` there can be built, and a long-poll there is
+woken by it. Best effort like the wake: a lost hint leaves a peer serving its cache until the
+next one, a lost typing update leaves a peer not knowing until the client's next `PUT` (every
+few seconds, from real clients). Stamps are now compared across replicas (a client's token
+holds the largest it saw from any replica); the hints carry the writer's stamp and the
+receiver observes it, so the counters converge with traffic, but a replica whose clock is
+behind by more than the gap between two changes could stamp below a token. NTP is assumed,
+as the restart-safety of stamps already assumed. A replica that starts after a typing began
+has no copy until the next `PUT`. A handoff mid-typing loses nothing: every replica already
+holds every typing entry, the next `PUT` lands on the new owner and is published from there,
+and applying the same update twice is an idempotent map insert.
+
+**Tests.**
+
+- `crates/hs-cli/tests/cluster_ephemeral.rs` (new; two real `hs serve` processes on
+  PostgreSQL, `SKIP` without `HS_CLUSTER_TEST_POSTGRES_DSN`; `pool_size: 8`):
+  `typing_receipts_and_presence_cross_two_replicas_in_both_directions`. Alice registers on A
+  and bob on B, one room (created on A, joined through B; the gate forwards both to whichever
+  replica the room hashes to), each polling `/sync` with `set_presence=offline` on their own
+  replica. Every check polls one-second long-polls until a condition, 15 s deadline, never a
+  fixed sleep. Typing A->B (start, then stop), typing B->A with a 1.5 s timeout lapsing on A
+  by itself (bounded at 10 s, measured under 2); a receipt on the first message A->B, then a
+  receipt on the second A->B (the "not served from the cache" case: B had the room's receipts
+  loaded), then B->A; presence A->B twice (the second with B's cache warm), then B->A; a
+  final `timeout=0` sync on each side carries none of it again; and per kind, what A sent
+  equals what B received and vice versa with a non-zero total (typing and receipts are only
+  ever sent by the owner; presence by both). **5 of 5 runs pass, 28-30 s each** on the
+  desktop's PostgreSQL 17 at `127.0.0.1:5462`, debug binaries. Mutant: with the hub's
+  `publish_ephemeral` a no-op it fails at the first check whose direction crosses the mesh
+  (which one depends on which replica the room hashed to; seen at "bob typing (set on B) in
+  alice's sync on A", 22 s).
+- `crates/hs-user/src/cluster.rs`, `two_replica_tests` (fake cluster, shared memory store, A
+  owns everything): `typing_on_one_replica_is_in_a_long_poll_on_the_other_and_goes_away_when_it_stops`
+  (woken under 400 ms, the stop too, a 200 ms timeout lapses on B within the re-check, B
+  publishes nothing back), `a_receipt_on_one_replica_is_in_the_next_sync_on_the_other_and_not_served_stale`
+  (with the fake cluster muted the receipt does *not* show on B -- the gap, in the test --
+  then two receipts in a row each show, each replacing the last, none sent twice),
+  `a_presence_change_on_one_replica_reaches_a_room_mate_on_the_other` (two changes A->B
+  with B's cache warm, one B->A, not sent twice). `cluster::tests`: JSON round trip with the
+  new field and a pre-field batch parsing, `push_ephemeral`'s coalescing.
+- `receipts::tests::a_forgotten_room_is_read_from_the_store_again`,
+  `presence::tests::a_forgotten_user_is_read_from_the_store_again`: two registries over one
+  store as two replicas; the second serves its copy until told to forget, then reads the
+  store, keeps the writer's stamp and stamps past it.
+- `hs_cli::sync_cluster::tests::the_peer_handler_applies_a_batchs_ephemeral_updates_and_counts_them`.
+- `cargo test -p hs-user`: 146 lib + 6 scenario (from 140 + 6). `cargo test -p hs-cli --test
+  cluster_edus --test cluster_admin --test cluster_ephemeral` with the DSN: see the commit.
+
+**Files.** `crates/hs-user/src/cluster.rs` (`EphemeralUpdate`, `WakeBatch::{ephemeral,
+push_ephemeral}`, `SessionCluster::publish_ephemeral`, the fake cluster, tests);
+`hub.rs` (`apply_ephemeral`, `wake_room_members`, `wake_presence_audience`,
+`publish_ephemeral`, the six publish sites); `receipts.rs`, `presence.rs` (`forget`;
+`touch`/`restamp` return the stamp as `Option<u64>`); `crates/hs-cli/src/sync_cluster.rs`
+(`Outbound`, `SyncClusterMetrics`, the pump and handler; `install` takes `&Metrics`);
+`serve.rs` (one argument); `crates/hs-cli/tests/cluster_ephemeral.rs`;
+`docs/decisions/0018-ephemeral-state-rides-the-wake-batch.md`; `docs/scaling.md` (the row
+and the honest-status bullet that said this was not built).
+
+**Verification**: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D
+warnings`; `cargo test -p hs-user`; `HS_CLUSTER_TEST_POSTGRES_DSN=... cargo test -p hs-cli
+--test cluster_ephemeral --test cluster_edus --test cluster_admin`.
 
 ## Session 8 (2026-09-30, branch `agent/sync-dup`): a batch and its token describe the same point
 

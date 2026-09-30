@@ -42,7 +42,9 @@ use hs_room::protocol::RoomUpdate;
 use ruma::{OwnedUserId, RoomId, UserId};
 use tokio::sync::{Mutex, Notify};
 
-use crate::cluster::{ClusterLink, RoomMirror, RoomWake, SessionCluster, WakeBatch};
+use crate::cluster::{
+    ClusterLink, EphemeralUpdate, RoomMirror, RoomWake, SessionCluster, WakeBatch,
+};
 use crate::edu::{EduOutbox, InboundEdu};
 use crate::error::UserError;
 use crate::presence::PresenceRegistry;
@@ -416,18 +418,23 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         }
     }
 
-    /// Takes one peer's [`WakeBatch`]: wakes every user it names, then records the sender's
-    /// consumed mark for [`SessionHub::settle_before_read`]. In that order, so a `/sync` released
-    /// by the mark cannot run before the wake that goes with it. Called by the mesh's peer
-    /// handler in `hs-cli`; in tests, directly.
+    /// Takes one peer's [`WakeBatch`]: applies its typing, receipt and presence updates
+    /// ([`SessionHub::apply_ephemeral`]), wakes every user its wakes name, then records the
+    /// sender's consumed mark for [`SessionHub::settle_before_read`]. In that order, so a
+    /// `/sync` released by the mark cannot run before the wake that goes with it. Called by the
+    /// mesh's peer handler in `hs-cli`; in tests, directly.
     pub async fn receive_wakes(&self, batch: WakeBatch) {
         tracing::debug!(
             from = %batch.from,
             consumed = batch.consumed,
             rooms = batch.wakes.len(),
             users = batch.wakes.iter().map(|w| w.users.len()).sum::<usize>(),
+            ephemeral = batch.ephemeral.len(),
             "received a wake batch from a peer"
         );
+        for update in batch.ephemeral {
+            self.apply_ephemeral(&batch.from, update).await;
+        }
         for wake in &batch.wakes {
             for user in &wake.users {
                 self.wake(user).await;
@@ -435,6 +442,93 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         }
         if batch.consumed > 0 {
             self.advance_peer_consumed(&batch.from, batch.consumed);
+        }
+    }
+
+    /// Applies one typing, receipt or presence change another replica made
+    /// (`crate::cluster`'s module docs, "Typing, receipts and presence"): a typing update goes
+    /// into this replica's registry as if the client had sent it here, with its own timeout; a
+    /// receipt or presence hint makes the registry forget its cached copy so the next read is
+    /// from the store, where the change already is. Then the long-polls concerned are woken,
+    /// exactly as the local change would have woken them. Nothing here is published on: the
+    /// replica that took the change told every other one.
+    ///
+    /// A room this replica cannot read (not in the store yet, or unreadable) means nobody here
+    /// to wake; the update is still applied, and logged at `debug`.
+    pub async fn apply_ephemeral(&self, from: &str, update: EphemeralUpdate) {
+        tracing::debug!(
+            from,
+            kind = update.kind(),
+            ?update,
+            "applying a peer's ephemeral update"
+        );
+        match update {
+            EphemeralUpdate::Typing {
+                room_id,
+                user_id,
+                typing,
+                timeout_ms,
+            } => {
+                self.typing
+                    .set(
+                        &room_id,
+                        &user_id,
+                        typing,
+                        Duration::from_millis(timeout_ms),
+                    )
+                    .await;
+                self.wake_room_members(&room_id).await;
+            }
+            EphemeralUpdate::Receipt { room_id, seq } => {
+                self.receipts.forget(&room_id, seq).await;
+                self.wake_room_members(&room_id).await;
+            }
+            EphemeralUpdate::Presence { user_id, seq } => {
+                self.presence.forget(&user_id, seq).await;
+                self.wake_presence_audience(&user_id).await;
+                self.wake(&user_id).await;
+            }
+        }
+    }
+
+    /// Wakes every joined member of `room_id`; a room that cannot be read here wakes nobody
+    /// and is logged at `debug`.
+    async fn wake_room_members(&self, room_id: &RoomId) {
+        match self.joined_member_ids(room_id).await {
+            Ok(members) => {
+                for member in &members {
+                    self.wake(member).await;
+                }
+            }
+            Err(error) => tracing::debug!(
+                %room_id,
+                %error,
+                "a peer's ephemeral update names a room not readable here; nobody to wake"
+            ),
+        }
+    }
+
+    /// Wakes everyone who shares a joined room with `user_id`; logged at `debug` if the walk
+    /// fails.
+    async fn wake_presence_audience(&self, user_id: &UserId) {
+        match self.users_sharing_room_with(user_id).await {
+            Ok(audience) => {
+                for other in &audience {
+                    self.wake(other).await;
+                }
+            }
+            Err(error) => tracing::debug!(
+                %user_id,
+                %error,
+                "could not work out who shares a room with a user whose presence changed"
+            ),
+        }
+    }
+
+    /// Hands `update` to the cluster for every other replica, if this hub is part of one.
+    fn publish_ephemeral(&self, update: EphemeralUpdate) {
+        if let Some(link) = self.cluster.get() {
+            link.cluster.publish_ephemeral(update);
         }
     }
 
@@ -621,6 +715,13 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         for member in &members {
             self.wake(member).await;
         }
+        self.publish_ephemeral(EphemeralUpdate::Typing {
+            room_id: room_id.to_owned(),
+            user_id: user_id.to_owned(),
+            typing,
+            timeout_ms: u64::try_from(timeout.min(crate::typing::MAX_TYPING_TIMEOUT).as_millis())
+                .unwrap_or(u64::MAX),
+        });
         if let Some(outbox) = self.edu_outbox.get() {
             let destinations = crate::edu::servers_of(&members);
             let key = format!("typing {room_id} {user_id}");
@@ -673,11 +774,15 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         presence: String,
         status_msg: Option<String>,
     ) -> Result<(), UserError> {
-        self.presence.set(user_id, presence, status_msg).await;
+        let seq = self.presence.set(user_id, presence, status_msg).await;
         let audience = self.users_sharing_room_with(user_id).await?;
         for other in &audience {
             self.wake(other).await;
         }
+        self.publish_ephemeral(EphemeralUpdate::Presence {
+            user_id: user_id.to_owned(),
+            seq,
+        });
         self.send_presence(user_id, &audience).await;
         // A user always sees their own just-set presence on their own next sync too (Synapse
         // behavior: a client's own `set_presence` call is reflected back to it), so wake the
@@ -696,13 +801,17 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     /// # Errors
     /// Returns [`UserError`] if a shared room could not be loaded.
     pub async fn touch_presence(&self, user_id: &UserId, presence: &str) -> Result<(), UserError> {
-        if !self.presence.touch(user_id, presence).await {
+        let Some(seq) = self.presence.touch(user_id, presence).await else {
             return Ok(());
-        }
+        };
         let audience = self.users_sharing_room_with(user_id).await?;
         for other in &audience {
             self.wake(other).await;
         }
+        self.publish_ephemeral(EphemeralUpdate::Presence {
+            user_id: user_id.to_owned(),
+            seq,
+        });
         self.send_presence(user_id, &audience).await;
         Ok(())
     }
@@ -747,13 +856,20 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         event_id: ruma::OwnedEventId,
         ts: u64,
     ) -> Result<(), UserError> {
-        self.receipts
+        let seq = self
+            .receipts
             .set(room_id, user_id, kind, event_id.clone(), ts)
             .await;
         let members = self.joined_member_ids(room_id).await?;
         for member in &members {
             self.wake(member).await;
         }
+        // Every replica is told, a private receipt included: the hint names only the room, and
+        // the other replica's registry scopes what it rereads per viewer as this one does.
+        self.publish_ephemeral(EphemeralUpdate::Receipt {
+            room_id: room_id.to_owned(),
+            seq,
+        });
         // A private receipt is its sender's alone; only a public one goes to other servers.
         if let (ReceiptKind::Read, Some(outbox)) = (kind, self.edu_outbox.get()) {
             outbox.send_edu(
@@ -770,7 +886,9 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     /// local users it concerns. Returns how many updates were applied; what was dropped (a user
     /// of another server, a user not joined to the room here, a room this server does not have)
     /// is logged at `debug`. Nothing applied here is sent on to any other server: each server
-    /// distributes its own users' EDUs. See `crate::edu`'s module docs.
+    /// distributes its own users' EDUs. See `crate::edu`'s module docs. In a cluster, what is
+    /// applied here is published to the other replicas as a local change would be: the
+    /// transaction arrived at this one, and they were not told.
     pub async fn receive_edu(
         &self,
         origin: &str,
@@ -799,6 +917,13 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
                     for member in &members {
                         self.wake(member).await;
                     }
+                    self.publish_ephemeral(EphemeralUpdate::Typing {
+                        room_id,
+                        user_id,
+                        typing,
+                        timeout_ms: u64::try_from(crate::edu::REMOTE_TYPING_TIMEOUT.as_millis())
+                            .unwrap_or(u64::MAX),
+                    });
                     applied += 1;
                 }
                 InboundEdu::Receipt {
@@ -810,12 +935,14 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
                     let Some(members) = self.members_if_joined(&room_id, &user_id).await else {
                         continue;
                     };
-                    self.receipts
+                    let seq = self
+                        .receipts
                         .set(&room_id, &user_id, ReceiptKind::Read, event_id, ts)
                         .await;
                     for member in &members {
                         self.wake(member).await;
                     }
+                    self.publish_ephemeral(EphemeralUpdate::Receipt { room_id, seq });
                     applied += 1;
                 }
                 InboundEdu::Presence {
@@ -825,7 +952,8 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
                     last_active_ago,
                     currently_active,
                 } => {
-                    self.presence
+                    let seq = self
+                        .presence
                         .set_remote(
                             &user_id,
                             presence,
@@ -834,18 +962,8 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
                             currently_active,
                         )
                         .await;
-                    match self.users_sharing_room_with(&user_id).await {
-                        Ok(audience) => {
-                            for other in &audience {
-                                self.wake(other).await;
-                            }
-                        }
-                        Err(error) => tracing::debug!(
-                            %user_id,
-                            %error,
-                            "could not work out who shares a room with a remote user"
-                        ),
-                    }
+                    self.wake_presence_audience(&user_id).await;
+                    self.publish_ephemeral(EphemeralUpdate::Presence { user_id, seq });
                     applied += 1;
                 }
             }
@@ -1122,8 +1240,14 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         // reaches them (`PresenceRegistry::restamp`); the wake below is the same one the join
         // itself causes. Complement's "Existing members see new members' presence" is this.
         for delta in &update.membership_deltas {
-            if delta.membership == "join" {
-                self.presence.restamp(&delta.user_id).await;
+            if delta.membership == "join"
+                && let Some(seq) = self.presence.restamp(&delta.user_id).await
+            {
+                // The other replicas hold the joiner's record under its old stamp, if at all.
+                self.publish_ephemeral(EphemeralUpdate::Presence {
+                    user_id: delta.user_id.clone(),
+                    seq,
+                });
             }
         }
 

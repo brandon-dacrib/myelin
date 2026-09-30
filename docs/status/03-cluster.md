@@ -1,3 +1,12 @@
+## 2026-09-30: the `user.wake` batch carries typing, receipts and presence (track 05)
+
+Nothing in `hs-cluster` changed. Track 05's `WakeBatch` on the `user.wake` peer route gained
+an `ephemeral` field (decision 0018): typing travels whole, receipts and presence as a hint to
+reread the store, from whichever replica took the change to every live peer, in the same
+per-peer pump. `hs_cluster_ephemeral_updates_total{kind,direction}` counts them on both ends.
+Verified by `crates/hs-cli/tests/cluster_ephemeral.rs`, two real `hs serve` processes on
+PostgreSQL 17, 5 of 5 runs. Details in `docs/status/05-sync.md`, session 9.
+
 ## 2026-09-28: the two-replica admin test runs against PostgreSQL, and found two ownership bugs
 
 `crates/hs-cli/tests/cluster_admin.rs`'s two-process test needs a PostgreSQL whose user can

@@ -227,6 +227,17 @@ impl ReceiptRegistry {
         seq
     }
 
+    /// Forgets what is cached for `room_id`, so that the next call about the room reads the
+    /// store again, and raises the counter past `seq`, the stamp of the receipt that made the
+    /// cache stale. How another replica's receipt reaches this one
+    /// (`crate::cluster::EphemeralUpdate::Receipt`): the receipt itself is in the shared store,
+    /// written by the replica that took it, and only the cache here is behind. Returns whether
+    /// anything was cached.
+    pub async fn forget(&self, room_id: &RoomId, seq: u64) -> bool {
+        self.counter.observe(seq);
+        self.rooms.lock().await.remove(room_id).is_some()
+    }
+
     /// This room's current cursor (`0` if this room has never had a receipt, which is always
     /// `<=` any client's baseline -- see `crate::typing`'s identical convention).
     pub async fn seq(&self, room_id: &RoomId) -> u64 {
@@ -443,5 +454,84 @@ mod tests {
             )
             .await;
         assert!(new_seq > old_seq);
+    }
+
+    /// The other-replica property: two registries over one store are two replicas' caches.
+    /// A receipt set through one is not seen by the other, which loaded the room before, until
+    /// it is told to forget the room; then it reads the store and has it, with the writer's
+    /// stamp, and stamps nothing older than that itself.
+    #[tokio::test]
+    async fn a_forgotten_room_is_read_from_the_store_again() {
+        let backend = hs_kv::memory::MemoryBackend::new();
+        let room = room_id!("!r:example.org");
+        let alice = user_id!("@alice:example.org");
+        let bob = user_id!("@bob:example.org");
+        let a = ReceiptRegistry::with_store(store_over(&backend));
+        let b = ReceiptRegistry::with_store(store_over(&backend));
+        let first = a
+            .set(
+                room,
+                alice,
+                ReceiptKind::Read,
+                event_id!("$one").to_owned(),
+                1,
+            )
+            .await;
+        // B loads the room now, and serves that copy from here on.
+        assert_eq!(b.seq(room).await, first);
+
+        let second = a
+            .set(
+                room,
+                alice,
+                ReceiptKind::Read,
+                event_id!("$two").to_owned(),
+                2,
+            )
+            .await;
+        assert_eq!(b.seq(room).await, first, "B's cache is behind, as expected");
+        let (stale, _) = b.content_for(room, bob).await;
+        assert_eq!(
+            stale,
+            json!({"$one": {"m.read": {"@alice:example.org": {"ts": 1}}}})
+        );
+
+        assert!(b.forget(room, second).await);
+        assert_eq!(b.seq(room).await, second);
+        let (fresh, seq) = b.content_for(room, bob).await;
+        assert_eq!(
+            fresh,
+            json!({"$two": {"m.read": {"@alice:example.org": {"ts": 2}}}})
+        );
+        assert_eq!(seq, second);
+        assert!(
+            b.set(
+                room,
+                bob,
+                ReceiptKind::Read,
+                event_id!("$two").to_owned(),
+                3
+            )
+            .await
+                > second,
+            "B's own stamps are past what it learned of"
+        );
+
+        // Forgetting a room never cached is nothing, and still raises the floor.
+        assert!(
+            !b.forget(room_id!("!other:example.org"), second + 1_000)
+                .await
+        );
+        assert!(
+            b.set(
+                room,
+                bob,
+                ReceiptKind::Read,
+                event_id!("$two").to_owned(),
+                4
+            )
+            .await
+                > second + 1_000
+        );
     }
 }

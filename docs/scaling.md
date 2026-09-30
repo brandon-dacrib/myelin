@@ -51,7 +51,7 @@ what spreads that work.
 | Faster single requests | a request for a room another replica owns pays one mesh hop. Latency does not go down with N; it goes up by that hop when the client happens to hit a non-owner |
 | Federation bandwidth to one peer | one destination's queue lives on one shard |
 | Cheaper reads of a room from a replica that does not own it | such a replica reads the room through a snapshot it reloads from the store whenever the owner has written (`hs_user::cluster::RoomMirror`). Today that reload is the whole room, O(room size) per new event, in every room a replica has sessions in but does not own; the incremental catch-up is RFC 0018. Until then, a cluster's `/sync` costs more store reads per event than a single node's |
-| Typing, receipts and presence across replicas | they live in memory on the replica that took the request. A typing notice reaches the sessions on the room owner's replica (room requests are forwarded there) and nobody else's; presence set on one replica is seen from that replica |
+| Cheaper typing, receipts and presence with more replicas | every change is sent to every live replica in the wake batch (decision 0018): typing whole, receipts and presence as a hint to reread the store. O(replicas) small messages per change, coalesced per peer, and each replica keeps a copy of every typing entry |
 
 ## The same thing in Synapse's terms
 
@@ -83,8 +83,9 @@ clients. As of 2026-09-26:
   `timeout=0` sync on the other. A replica reads a room it does not own through a snapshot
   checked against the store's head on every access. What is *not* built: the user-session
   *owner* of `PLAN.md` 5.4 (no `/sync` is forwarded; there is no per-user shard in use), the
-  incremental catch-up that would make a non-owner's reads cheap (RFC 0018), and any exchange
-  of typing, receipts or presence between replicas. Two pods have still not done this: the
+  incremental catch-up that would make a non-owner's reads cheap (RFC 0018). Typing, receipts
+  and presence cross replicas since 2026-09-30 (decision 0018; two real processes on
+  PostgreSQL, `crates/hs-cli/tests/cluster_ephemeral.rs`). Two pods have still not done this: the
   run was two processes on one host over a plain (non-TLS) mesh. Release build, same host: a
   cross-replica long-poll returns about 150 ms after the write is acknowledged, of which the
   mesh is under a millisecond.

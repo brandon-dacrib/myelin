@@ -1389,6 +1389,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         &cluster_handles,
         backend.clone(),
         mirror_identity,
+        &metrics,
     )
     .map_err(|e| ServeError::Sessions(Box::new(e)))?;
     let appservice_delivery = crate::appservice_delivery::AppserviceDelivery::start(

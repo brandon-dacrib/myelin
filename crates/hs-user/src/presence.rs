@@ -221,7 +221,8 @@ impl PresenceRegistry {
 
     /// Records `presence` for `user_id` without touching their status message, and counts as a
     /// change -- a new stamp, and so a presence event other people's syncs will carry -- only when
-    /// the state actually differs from what is stored. Returns whether it was a change.
+    /// the state actually differs from what is stored. Returns the new stamp when it was a
+    /// change, `None` when it was not.
     ///
     /// This exists because `GET /sync` marks its caller online on *every* poll: that is the
     /// spec's default when `set_presence` is omitted. Bumping the stamp each time would wake
@@ -232,7 +233,7 @@ impl PresenceRegistry {
     /// The status message is deliberately preserved: `set_presence` on `/sync` says what state
     /// the client is in, not what the user wants to tell people, and clearing somebody's "On
     /// holiday until Monday" because their client polled would be wrong.
-    pub async fn touch(&self, user_id: &UserId, presence: &str) -> bool {
+    pub async fn touch(&self, user_id: &UserId, presence: &str) -> Option<u64> {
         let mut users = self.users.lock().await;
         let slot = self.slot(&mut users, user_id).await;
         let now = now_ms();
@@ -243,7 +244,7 @@ impl PresenceRegistry {
                 {
                     self.persist(user_id, existing).await;
                 }
-                false
+                None
             }
             Some(existing) => {
                 existing.presence = presence.to_owned();
@@ -251,7 +252,7 @@ impl PresenceRegistry {
                 existing.remote_currently_active = None;
                 existing.seq = self.counter.next();
                 self.persist(user_id, existing).await;
-                true
+                Some(existing.seq)
             }
             None => {
                 let record = slot.insert(PresenceRecord {
@@ -263,30 +264,41 @@ impl PresenceRegistry {
                     persisted_active_ms: 0,
                 });
                 self.persist(user_id, record).await;
-                true
+                Some(record.seq)
             }
         }
     }
 
     /// Gives `user_id`'s record a new stamp without changing what it says, so that it counts as
-    /// news to everyone whose sync token predates this moment. Returns whether there was a record
-    /// to restamp.
+    /// news to everyone whose sync token predates this moment. Returns the new stamp, or `None`
+    /// when there was no record to restamp.
     ///
     /// Presence has one sequence for the whole server, but the *audience* of a record is
     /// everyone who shares a room with its owner, and that set grows. When somebody joins a
     /// room, the people already in it have tokens newer than the joiner's last presence change
     /// -- they were syncing while the joiner was elsewhere -- so by stamp alone they would never
     /// be sent it. A join is news about who you can see; this makes it news in the stream too.
-    pub async fn restamp(&self, user_id: &UserId) -> bool {
+    pub async fn restamp(&self, user_id: &UserId) -> Option<u64> {
         let mut users = self.users.lock().await;
         match self.slot(&mut users, user_id).await {
             Some(existing) => {
                 existing.seq = self.counter.next();
                 self.persist(user_id, existing).await;
-                true
+                Some(existing.seq)
             }
-            None => false,
+            None => None,
         }
+    }
+
+    /// Forgets what is cached for `user_id` -- a record, or the knowledge that there is none --
+    /// so that the next call about them reads the store again, and raises the counter past
+    /// `seq`, the stamp of the change that made the cache stale. How another replica's presence
+    /// change reaches this one (`crate::cluster::EphemeralUpdate::Presence`): the record is in
+    /// the shared store, written by the replica that took the change. Returns whether a record
+    /// was cached.
+    pub async fn forget(&self, user_id: &UserId, seq: u64) -> bool {
+        self.counter.observe(seq);
+        self.users.lock().await.remove(user_id).flatten().is_some()
     }
 
     /// This user's current record, if there is one.
@@ -315,11 +327,14 @@ mod tests {
         let reg = PresenceRegistry::new();
         let uid = user_id!("@alice:example.org");
 
-        assert!(reg.touch(uid, "online").await, "the first one is a change");
+        assert!(
+            reg.touch(uid, "online").await.is_some(),
+            "the first one is a change"
+        );
         let first = reg.get(uid).await.unwrap().seq;
         for _ in 0..10 {
             assert!(
-                !reg.touch(uid, "online").await,
+                reg.touch(uid, "online").await.is_none(),
                 "polling again is not a presence change"
             );
         }
@@ -337,7 +352,7 @@ mod tests {
         reg.touch(uid, "online").await;
         let first = reg.get(uid).await.unwrap().seq;
 
-        assert!(reg.touch(uid, "unavailable").await);
+        assert!(reg.touch(uid, "unavailable").await.is_some());
         let record = reg.get(uid).await.unwrap();
         assert_eq!(record.presence, "unavailable");
         assert!(record.seq > first);
@@ -422,8 +437,46 @@ mod tests {
         assert!(record.last_active_ago_ms() < 5000);
         assert!(after.get(user_id!("@nobody:example.org")).await.is_none());
 
-        assert!(after.touch(alice, "online").await);
+        assert!(after.touch(alice, "online").await.is_some());
         assert!(after.get(alice).await.unwrap().seq > old_seq);
+    }
+
+    /// The other-replica property: two registries over one store are two replicas' caches. A
+    /// change made through one is invisible to the other, which has the user cached (as a
+    /// record, or as "no record"), until it is told to forget them; then it reads the store.
+    #[tokio::test]
+    async fn a_forgotten_user_is_read_from_the_store_again() {
+        let backend = hs_kv::memory::MemoryBackend::new();
+        let alice = user_id!("@alice:example.org");
+        let a = PresenceRegistry::with_store(store_over(&backend));
+        let b = PresenceRegistry::with_store(store_over(&backend));
+        // B asks first and caches "no record".
+        assert!(b.get(alice).await.is_none());
+
+        let first = a.set(alice, "online".to_owned(), None).await;
+        assert!(
+            b.get(alice).await.is_none(),
+            "B's cache is behind, as expected"
+        );
+        assert!(
+            !b.forget(alice, first).await,
+            "nothing but a None was cached"
+        );
+        assert_eq!(b.get(alice).await.unwrap().seq, first);
+
+        let second = a
+            .set(alice, "unavailable".to_owned(), Some("lunch".to_owned()))
+            .await;
+        assert_eq!(b.get(alice).await.unwrap().presence, "online");
+        assert!(b.forget(alice, second).await);
+        let record = b.get(alice).await.unwrap();
+        assert_eq!(record.presence, "unavailable");
+        assert_eq!(record.status_msg.as_deref(), Some("lunch"));
+        assert_eq!(record.seq, second);
+        // B's own stamps are past what it learned of, and polling with the state the store
+        // already has is not a change on B either.
+        assert!(b.touch(alice, "unavailable").await.is_none());
+        assert!(b.touch(alice, "online").await.unwrap() > second);
     }
 
     #[tokio::test]
