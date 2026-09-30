@@ -1,10 +1,54 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-09-29 (admin work completed and pushed). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-09-30 (the last two agent branches merged; nothing is unmerged). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-09-29 wrap-up
+## Resume here: 2026-09-30
+
+**Nothing is unmerged.** `git branch -r --no-merged origin/main` is empty. The two branches the
+2026-09-29 wrap-up left open went through `tools/merge-queue.sh` today, each after a rebase and a
+full gate with the two-replica PostgreSQL test running (not skipped):
+
+- **`agent/federation-leftovers`** merged as `874e696` (2,354 Rust tests): a local user joins a
+  restricted room without naming an authoriser, and through another server when nobody here may
+  invite; a join asks only the servers the client named, the allowed rooms' servers only when it
+  named none, and the room ID's server only as a last resort; stripped state stays out of the
+  timeline; version 12 rooms cross servers; knocks are repeatable and refused with `403` on a
+  room version without knocking; only the inviter rescinds an invite over federation; a typing,
+  receipt, presence or to-device EDU taken by a replica that does not send for its destination
+  is forwarded over the mesh to the one that does. The first gate run found two unit tests in
+  `hs-room`'s join route still expecting the old server list (the branch's last commit changed
+  the rule and was cut off before its per-crate tests ran); fixed as the branch's last commit.
+- **`agent/two-pod-cluster-2`** merged as `a5ee260` (2,363 Rust tests): a request that lands
+  mid-handoff waits for the new owner instead of failing (decision **0017**, renumbered from
+  0013 because Rooms took that number first); a clustered replica's `/metrics` has its
+  `hs_cluster_*` series; a replica never takes shards from a live peer during a long convergence
+  and never holds on to a shard it lost as ownerless; the two-replica admin test runs against a
+  real PostgreSQL 17.
+
+**Still owed on the federation work:** the Complement remeasure of the rebased commit
+(`TestRestrictedRooms*` including `RemoteJoinFailOver`, `TestFederationRoomsInvite*`,
+`TestKnocking*`, `TestFederationRejectInvite`; 14/18 top-level and 94/98 subtests before the
+rebase). It is running as this is written; its numbers and per-failure causes go into
+`docs/status/06-federation.md`, and this section is updated when they are in.
+
+**Still owed on the cluster work, and it needs the owner's terminal** (`kubectl` from an agent
+session cannot reach `admin@dacrib0`): the two pods have never run with the handoff fix. CD
+builds `ghcr.io/brandon-dacrib/myelin:sha-a5ee260...` from this `main`; the steps are item 1 of
+"Where this stopped on the cluster" just below, unchanged. Target: 0 failures in
+`deploy/two-pod/rolling.py` during the `helm upgrade` and in `failover.py`, and the
+`hs_cluster_*` series on a pod's `/metrics`.
+
+**Housekeeping done today:** nine stale agent worktrees (all their commits on `main`; about
+190 GB of `target/`) and their local branches were removed. The tag `backup/...` used during
+the federation rebase is gone too.
+
+**For the next admin work,** unchanged from 2026-09-29: cross-section validation and an assisted
+storage-backend migration remain open; rate-limit buckets other than messages are unenforced,
+and message buckets are per replica.
+
+## 2026-09-29 wrap-up: the admin branches
 
 **The three pending admin branches are merged and pushed to `main`.** The final code commit is
 `12a19eb`. This section supersedes the unfinished admin merge instructions in the historical
@@ -30,24 +74,15 @@ session logs below. Verification details are in [the integration review](status/
   also passed, with screenshots committed. Admin handler coverage is **160/160**; this count is
   handler coverage, not a claim of full Matrix conformance.
 
-**Unmerged branches**, checked against fetched `origin/main` at wrap-up:
-
-| Branch | Work it holds | Verification still needed |
-|---|---|---|
-| `agent/two-pod-cluster-2` (`0ddf9da`) | Handoff waits, cluster metrics, and the lease/ownership fix for slow convergence | Previous focused `hs-cluster` checks and ten PostgreSQL two-replica runs passed. Rebase onto current main, run the full gate with PostgreSQL, then perform the documented cluster rolling-update/failover checks. |
-| `agent/federation-leftovers` (`8074aec`) | Restricted joins, join server selection, stripped state, knocks, v12 rooms and forwarding EDUs to their owning replica | Previous per-crate checks and federation membership 12/12 passed; targeted Complement was 14/18 top-level and 94/98 subtests. Rebase, run the full gate and remeasure Complement, including `RemoteJoinFailOver`. |
-
-These two branches were outside this admin wrap-up and remain unfinished. No cluster deployment
-was performed. The owner's Helm/port-forward steps below still apply. For the next admin work,
-cross-section validation and an assisted storage-backend migration remain open. Rate-limit
-buckets other than messages are still unenforced, and message buckets are per replica.
+**Unmerged branches at that wrap-up:** `agent/two-pod-cluster-2` and `agent/federation-leftovers`;
+both merged 2026-09-30, see the top. No cluster deployment was performed.
 
 ## Where this stopped on the cluster (2026-09-28, late)
 
-**`main` has all the cluster work; no cluster branch is open.** The last two, `agent/two-pod-cluster-2`
-(two pods on the real cluster, the handoff fix, the `hs_cluster_*` metrics) and
-`agent/cluster-admin` (drain and undrain through the admin API, the Cluster page), are merged;
-`agent/two-pod-cluster` is superseded and deleted.
+**`main` has all the cluster work; no cluster branch is open** (as of 2026-09-30: `agent/two-pod-cluster-2`,
+two pods on the real cluster, the handoff fix, the `hs_cluster_*` metrics, merged that day; and
+`agent/cluster-admin`, drain and undrain through the admin API, the Cluster page, merged
+2026-09-28; `agent/two-pod-cluster` is superseded and deleted).
 
 **The cluster, exactly** (`admin@dacrib0`, namespace `myelin-cluster`; the demo in `myelin` is
 untouched):
@@ -1387,7 +1422,7 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | A rejoined room's gap is never filled | `hs-room` | history is fetched before the oldest held event; what happened between a leave and a rejoin stays on the resident |
 | The state at a backfilled event is walked, not asked for | `hs-room` | exact while the history is linear and the previous event for each reverted key is within reach; a key set before the fetched history reads as unset until that history arrives; no auth check runs on backfilled events |
 | A destination down for longer than its queue is not caught up from the room | `hs-federation` | what was queued survives a restart and is sent; what was never queued because the destination was already known failing is not re-derived (Synapse's `destination_rooms`) |
-| EDUs are dropped for a destination another replica sends for | `hs-federation`, `hs-cli` | single-node is complete: typing, receipts, presence, device lists, signing-key updates and to-device cross servers both ways (e4543e4, 649302e, `hs-cli/tests/federation_edus.rs`); in cluster mode `FederationSender::enqueue_edu` drops an EDU whose destination shard another replica owns, so it needs a mesh forward to the owner (status 06, twelfth session) |
+| ~~EDUs are dropped for a destination another replica sends for~~ | `hs-federation`, `hs-cli` | **Closed** (`da97adc`, merged 2026-09-30): an EDU taken by a replica that does not send for its destination is forwarded over the mesh to the one that does; `hs-cli/tests/cluster_edus.rs` runs two replicas on PostgreSQL. Not yet watched on the cluster. Before that: single-node was complete: typing, receipts, presence, device lists, signing-key updates and to-device cross servers both ways (e4543e4, 649302e, `hs-cli/tests/federation_edus.rs`); in cluster mode `FederationSender::enqueue_edu` drops an EDU whose destination shard another replica owns, so it needs a mesh forward to the owner (status 06, twelfth session) |
 | ~~Invites, leaves and knocks over federation are seams~~ | `hs-federation` | **Closed** (e6d4a71, 249fcee, ea990cb): `transport/membership.rs` serves make/send leave, make/send knock and invite v1/v2, and `hs-cli/tests/federation_membership.rs` drives each between two servers. Not yet measured against Complement |
 | ~~Federation media fetch broken~~ | `hs-media` | **Closed** 2026-09-28 (status 09, session 6). Both directions work. A client's download or thumbnail of another server's media is fetched over the signed `/_matrix/federation/v1/media/download`, with the redirect form and the legacy `/_matrix/media/v3/download` fallback. It is then served from the held copy, even with the origin down; the copy honors quarantine and the admin purge. This server's own media is served to other servers as `multipart/mixed`. `hs-cli/tests/federation_media.rs` covers this with two servers and a stand-in origin. Not yet checked against a real Synapse |
 | `/search` unimplemented | `hs-room` | needs a cross-room index the actor model has no place for |
