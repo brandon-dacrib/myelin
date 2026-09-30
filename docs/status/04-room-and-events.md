@@ -2,8 +2,99 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
-Last updated: 2026-09-28 (session 10: the admin API's room long tail, below). Before that,
-2026-09-26 (session 9, next paragraph).
+Last updated: 2026-09-30 (session 11: the client space hierarchy, below). Before that,
+2026-09-28 (session 10: the admin API's room long tail).
+
+> **2026-09-30, session 11: `GET /_matrix/client/v1/rooms/{roomId}/hierarchy`** (MSC2946, spec
+> 1.2), branch `agent/hierarchy`. It answered `404 M_UNRECOGNIZED`; Complement's two
+> `TestRestrictedRoomsSpacesSummary*` tests and Element's space view needed it.
+>
+> - **`crate::hierarchy`** (new): `child_links` (a space's `m.space.child` links in the spec's
+>   order: a valid `order` key -- at most 50 printable-ASCII characters -- then
+>   `origin_server_ts`, then child room ID; a link with no `via` is a removed one; a plain
+>   room has no children, so Complement's `R2 -> R5` link is ignored); `summarize` (the
+>   `RoomSummary`: `PublicRoomsChunk` plus `room_type`, `allowed_room_ids` for a restricted
+>   room, `encryption`, `room_version`; unset fields left out); `local_access` /
+>   `server_access` (the spec's "may be able to see the room" list for a user and for a server:
+>   joined or invited, `public`/`knock`/`knock_restricted`, `world_readable`, or restricted to
+>   a room the requester is in -- the last is an `Access::IfInAnyOf` the caller resolves against
+>   `RoomRegistry::rooms_joined_by_user`, a table read, or the allowed room's members);
+>   `RemoteHierarchy` (the seam to federation, installed on the registry like `Backfill`:
+>   `RoomRegistry::install_remote_hierarchy`); `PaginationSessions` (opaque 24-byte random
+>   tokens, five minutes' validity, at most 4,096 held, oldest dropped); `walk` (the endpoint).
+> - **The walk** is depth-first, pre-order, a stack with each room's children pushed in reverse:
+>   the spec says depth-first and Complement's `pagination` subtest pins the page split
+>   (`limit=4` gives `Root, R1, SS1, SS2`, then `R3, R4, R2`). `limit` defaults to and is capped
+>   at 50 (Synapse's `MAX_ROOMS`); `max_depth` has no default, like Synapse; at most 50 children
+>   per space are queued; a room linked twice is visited once. A room is described from this
+>   server's copy when a local user is joined to it; otherwise its `via` servers (at most 3,
+>   never this one) are asked over federation `/hierarchy`, first answer wins, a failure is
+>   logged at debug and skipped; a held-but-unjoined copy is the fallback when nobody answers.
+>   A federation answer's `children` are kept on the queue entries they describe, so a leaf (or
+>   a space at the depth limit) is not asked for again, and its `inaccessible_children` are
+>   dropped without a request. A remote room is shown when its summary says open join rule,
+>   world-readable, or `allowed_room_ids` naming a room the requester is joined to; otherwise
+>   what this server holds (an invite) decides. A root the requester may not see, or that nobody
+>   describes, is `403 M_FORBIDDEN`. A `from` token that is unknown, expired, or belongs to a
+>   different requester, root, `suggested_only` or `max_depth` is `400 M_INVALID_PARAM`.
+> - **`crate::routes::hierarchy`**: parameter parsing (`suggested_only` must be `true`/`false`,
+>   `limit` an integer above zero, `max_depth` a non-negative integer, each `M_INVALID_PARAM`
+>   naming itself), and one `debug` line per request: root, requester, filters, rooms
+>   returned, depth reached, rooms hidden, remote fetches, failures and skips, elapsed. The
+>   route is in the room router, which `hs-cli` already mounts under `/_matrix/client/v1` (for
+>   `/relations` and `/threads`), and the cluster's `RoomShardGate` routes it to the root
+>   room's owner like every `/rooms/{roomId}/...` request.
+> - **Federation side** (`hs-federation`, `hs-cli`; a line in status 06):
+>   `RoomDataSource::hierarchy` now takes `suggested_only` and returns the spec's object
+>   (`room` with `children_state`, `children` as summaries, `inaccessible_children`); before it
+>   answered `{"children": [raw m.space.child PDUs]}`, which no requester could use. The route
+>   answers `404` for a root the asking server may not see, as the spec says. `hs-cli`'s
+>   adapter applies `server_access` to the root and each held child (an unheld child is left
+>   out, not called inaccessible: the asker may know a server that holds it); a restricted
+>   room's allowed rooms are loaded to see whether the asking server has a user in them. The
+>   client gained `FederationClient::room_hierarchy`; `hs_cli::hierarchy::FederationHierarchy`
+>   implements `RemoteHierarchy` over it and `serve` installs it when federation is on.
+> - **Observability**: the debug line above per client request, one per federation request
+>   answered, one per remote fetch made or failed. `hs-federation` has no per-request client
+>   counter to add the fetches to (only the EDU family), so they are in the log line, not
+>   `/metrics`.
+> - **Tests**: `crates/hs-room/src/hierarchy/tests.rs` (23: ordering and the `order` rules,
+>   summaries, the spec's visibility list for a user and a server, a remote summary's judgement,
+>   the whole graph depth-first with `children_state`, `max_depth`, `suggested_only`, a `limit`
+>   with its token and every way a token is refused, the clamp, expiry and the store's bound, a
+>   room linked twice, subtrees hidden and revealed by invites, a restricted room revealed by
+>   joining the space, a forbidden root, and the federation seam through a fake: `via` servers
+>   asked in order, a leaf taken from its parent's answer, a failing server skipped,
+>   `inaccessible_children` not asked about, a remote restricted room judged per requester, no
+>   hook meaning left out, a lenient page parse); `crates/hs-room/src/routes/hierarchy.rs` (3,
+>   parameters); `crates/hs-cli/tests/space_hierarchy.rs` (two real servers: a space on A with
+>   local, private and suggested children and B's public child, sub-space and restricted room,
+>   walked by two users on A and, after a join, by one on B; the private child out, the
+>   restricted one in once B holds the space, `suggested_only`, `max_depth`, `limit` and `from`,
+>   refused tokens, forbidden roots).
+> - **Verified (Complement, image `complement-hs-hier:c31f95a` built by
+>   `tests/complement/build.sh` with `DOCKER_BUILDKIT=0`, `DOCKER_HOST` on OrbStack's socket and
+>   a `DOCKER_CONFIG` without the credential helper; `go test -v -count=1 -p 1 -timeout 45m
+>   -run '^(TestRestrictedRoomsSpacesSummary|TestClientSpacesSummary|TestFederatedClientSpaces)'
+>   ./tests/` in `refs/complement` with `COMPLEMENT_SPAWN_HS_TIMEOUT_SECS=120`)**: the five
+>   space tests -- `TestRestrictedRoomsSpacesSummaryLocal`, `...Federation`,
+>   `TestClientSpacesSummary` (5 subtests: whole graph, `max_depth`, `suggested_only`,
+>   pagination, a redacted link), `TestClientSpacesSummaryJoinRules`, `TestFederatedClientSpaces`
+>   -- went from **0/5 (0/10 with subtests)** on the previous image (`complement-hs-fedc:fix`,
+>   the fourteenth session's code) to **5/5 (10/10)**, 72 s. The fourteenth session's targeted
+>   set is remeasured below.
+> - **Verified (Rust)**: `cargo test -p hs-room` (154: 122 unit, 32 integration), `cargo test
+>   -p hs-federation` (180), `cargo test -p hs-cli --lib` (173), `cargo test -p hs-cli --test
+>   space_hierarchy` (1, 54 s under load) and `--test federation_reads` (9); `cargo fmt --all
+>   --check`; `cargo clippy --workspace --all-targets -- -D warnings`, all clean.
+> - **Cluster caveat, same as the admin hierarchy's**: the walk loads each child's actor on
+>   the replica that owns the *root*, so a child owned by another replica is read there (a
+>   read-only actor, its writes fenced) rather than forwarded. Tokens live in the root owner's
+>   memory; when ownership moves, the token is unknown and the client starts over.
+> - **Left**: no rate limit on the endpoint (Synapse has one); no cache of federation
+>   answers (Synapse caches `/hierarchy` responses briefly); `max_depth` has no server maximum
+>   (the total work is bounded by the tree and the page limit); `m.space.parent` is not read
+>   (the spec's endpoint reads only child links).
 
 > **Branch state (2026-09-28):** `agent/rooms-admin`, rebased on `8cc6b92`, not yet on main. Done: all
 > 17 Rooms operations, the room page, e2e-real passed against `hs serve`. Gate: fmt and workspace clippy clean;

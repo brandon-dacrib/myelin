@@ -81,7 +81,17 @@ OrbStack's socket, `DOCKER_CONFIG` pointing at a config with no credential helpe
 `COMPLEMENT_SPAWN_HS_TIMEOUT_SECS=120`, `go test -v -count=1 -p 1 -timeout 45m -run '^(TestRestrictedRooms|TestFederationRoomsInvite|TestKnocking|TestKnockRooms|TestFederationRejectInvite)' ./tests/`
 in `refs/complement`; the image via `tests/complement/build.sh` with `DOCKER_BUILDKIT=0`.
 
-**Left:** the client `/hierarchy` endpoint (item 2); a wait in Complement's NoCreators test
+> **2026-09-30, later (track 04, branch `agent/hierarchy`):** item 2 is closed. The federation
+> `GET /hierarchy/{roomId}` now answers the spec's object (`room` with `children_state`,
+> `children` as summaries, `inaccessible_children`) instead of `{"children": [raw PDUs]}`, takes
+> `suggested_only`, applies the spec's "may see" list to the asking server
+> (`hs_room::hierarchy::server_access`: a user of it joined or invited, public or knockable,
+> world-readable, or restricted to a room it has a user in) and answers `404` for a root it may
+> not see; `RoomDataSource::hierarchy`'s signature changed accordingly (the in-memory fake too).
+> `FederationClient::room_hierarchy` is the outbound half, used by `hs_cli::hierarchy` for the
+> client-server walk. Details and numbers in status 04, session 11.
+
+**Left:** the client `/hierarchy` endpoint (item 2, closed above); a wait in Complement's NoCreators test
 or an accepted flake (item 3); the full workspace gate on this branch; the cluster run of the
 thirteenth session's item 5.
 
