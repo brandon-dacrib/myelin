@@ -115,12 +115,24 @@ fn render_header(out: &mut String) {
 
 /// Resolves a `$ref` against `defs`, one level (schemas here are not
 /// self-referential).
+/// Follows a `$ref` into `defs`. Keys beside the `$ref` (a field's own `description` and
+/// `default`, which schemars writes next to the reference) outrank the definition's, so a field
+/// typed by a shared enum is documented as that field, not as the enum.
 fn resolve<'a>(schema: &'a Value, defs: &'a Map<String, Value>) -> std::borrow::Cow<'a, Value> {
     if let Some(reference) = schema.get("$ref").and_then(Value::as_str)
         && let Some(name) = reference.strip_prefix("#/$defs/")
         && let Some(resolved) = defs.get(name)
     {
-        return std::borrow::Cow::Borrowed(resolved);
+        let siblings = schema.as_object().into_iter().flatten();
+        let mut merged = resolved.clone();
+        if let Some(target) = merged.as_object_mut() {
+            for (key, value) in siblings {
+                if key != "$ref" {
+                    target.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        return std::borrow::Cow::Owned(merged);
     }
     std::borrow::Cow::Borrowed(schema)
 }
@@ -236,6 +248,16 @@ fn type_summary(schema: &Value, defs: &Map<String, Value>) -> String {
             .to_owned();
     }
     if let Some(one_of) = schema.get("oneOf").and_then(Value::as_array) {
+        // A documented unit enum (`#[serde(rename_all = ...)]` with a doc comment per variant)
+        // is a `oneOf` of string constants; show the constants, not "string" five times.
+        let constants: Vec<String> = one_of
+            .iter()
+            .filter_map(|v| v.get("const").and_then(Value::as_str))
+            .map(|s| format!("`{s}`"))
+            .collect();
+        if constants.len() == one_of.len() && !constants.is_empty() {
+            return constants.join(" \\| ");
+        }
         let names: Vec<String> = one_of
             .iter()
             .map(|v| type_summary(&resolve(v, defs), defs))
@@ -273,6 +295,33 @@ fn type_summary(schema: &Value, defs: &Map<String, Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_ref_field_keeps_its_own_description_and_default() {
+        let mut defs = Map::new();
+        defs.insert(
+            "Mode".to_owned(),
+            serde_json::json!({
+                "description": "the enum's own words",
+                "oneOf": [
+                    {"type": "string", "const": "a", "description": "A."},
+                    {"type": "string", "const": "b", "description": "B."}
+                ]
+            }),
+        );
+        let field = serde_json::json!({
+            "description": "the field's words",
+            "$ref": "#/$defs/Mode",
+            "default": "a"
+        });
+        let resolved = resolve(&field, &defs);
+        assert_eq!(
+            resolved.get("description").and_then(Value::as_str),
+            Some("the field's words")
+        );
+        assert_eq!(resolved.get("default").and_then(Value::as_str), Some("a"));
+        assert_eq!(type_summary(&resolved, &defs), "`a` \\| `b`");
+    }
 
     #[test]
     fn resolves_a_ref_against_defs() {

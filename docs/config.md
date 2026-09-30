@@ -16,9 +16,7 @@ Sections not listed here require a process restart to change; see the doc commen
 
 ## `server`
 
-Server identity. Restart required to change (see [`crate::reload`]):
-`server_name` is embedded in every user ID, room ID and event this
-process has ever produced.
+Server identity: name, public URL, signing keys.
 
 **Restart required to change.**
 
@@ -35,8 +33,7 @@ process has ever produced.
 
 ## `listeners`
 
-All configured listeners. Restart required to change (see
-[`crate::reload`]): sockets are bound once at startup.
+HTTP listeners.
 
 **Bootstrap: set at install (bootstrap file, `HS__` variables, command line or Helm values), never stored in the database.**
 
@@ -47,8 +44,7 @@ All configured listeners. Restart required to change (see
 
 ## `storage`
 
-Which storage backend this replica uses, and its backend-specific
-settings. Restart required to change (see [`crate::reload`]).
+Storage backend selection.
 
 **Bootstrap: set at install (bootstrap file, `HS__` variables, command line or Helm values), never stored in the database.**
 
@@ -71,10 +67,12 @@ PostgreSQL. The default clustered backend.
 | `port` | integer | `5432` | Database port. |
 | `database` | string | *required* | Database name. |
 | `user` | string | *required* | Connecting role. |
-| `password` *(secret)* | string | — | An inline secret value. Prefer the matching `*_file` key to avoid putting secrets in the config file. |
+| `password` *(secret)* | string | — | Inline password. Prefer `password_file`. |
 | `password_file` *(secret)* | string \| null | — | Path to a file containing the password. |
-| `pool_size` | integer | `10` | Connection pool size. Corresponds to Synapse's `database.args.cp_max`. Accepted by `hs_kv::postgres_backend::PostgresBackend::open`'s caller today but not yet threaded through — `open` hardcodes a pool size of 16 regardless of this value (see `docs/status/01-storage-engine.md`'s "Wiring the integration lead must add" item 5, checked); wiring it is a small change to that backend's public constructor, not a config-schema gap. |
-| `tls` | boolean | `false` | Require TLS for the connection. Accepted but not yet honoured: `hs_kv::postgres_backend::PostgresBackend::open` connects with `postgres::NoTls` unconditionally, and `crates/hs-cli/src/storage.rs` (checked) returns a startup error naming this field rather than silently connecting in the clear when it is `true`, until TLS support is added to that backend. |
+| `pool_size` | integer | `10` | Connection pool size: the most open connections this replica holds. Corresponds to Synapse's `database.args.cp_max`. |
+| `schema` | string | `"public"` | The PostgreSQL schema every table lives in; created at startup if missing. One safe SQL identifier (`[A-Za-z_][A-Za-z0-9_]*`, at most 55 bytes). Several homeservers can share one database by each taking a schema of their own. |
+| `ssl_mode` | `disable` \| `prefer` \| `require` \| `verify-ca` \| `verify-full` | `"prefer"` | Whether and how the connection is encrypted, in libpq's terms: `disable` (in the clear), `prefer` (encrypted when the server offers it, no certificate check; the default), `require` (encrypted or refused, no certificate check), `verify-ca` (encrypted, and the server's certificate chains to `ssl_root_cert`), or `verify-full` (`verify-ca`, and the certificate names `host`). Corresponds to Synapse's `database.args.sslmode`, which libpq reads (Synapse's `allow` is treated as `prefer`).  The earlier boolean `tls` key still loads, as an alias: `tls: true` is `require` and `tls: false` is `disable`. A file with both keys is refused as a duplicate. |
+| `ssl_root_cert` | string \| null | — | A PEM file of CA certificates the server's certificate must chain to, for the `verify-ca` and `verify-full` modes. When unset, those modes use the platform's trust store. Corresponds to Synapse's `database.args.sslrootcert`. A self-signed server certificate is its own root here, as long as it is not marked as a CA (`basicConstraints=CA:FALSE`; OpenSSL's `req -x509` marks one as a CA by default, and such a certificate is refused as a server certificate). |
 
 ### `storage` variant: `slatedb`
 
@@ -84,33 +82,33 @@ SlateDB on object storage. Diskless clusters.
 |---|---|---|---|
 | `bucket_url` | string | *required* | The object store URL (`s3://bucket/prefix`, `gs://...`, `az://...`), passed to the `object_store` crate. |
 | `shard_count` | integer | `256` | Number of virtual storage shards. Fixed at cluster creation; see `docs/rfcs/0001-cluster-ownership.md`. |
-| `lease_duration` | string \| integer | — | A duration: a string of <number><unit> groups (ms, s, m, h, d, w, y), or an integer number of milliseconds. |
+| `lease_duration` | string \| integer | `"30s"` | How long a writer may go without renewing its manifest lease before another replica is allowed to fence it and take over the shard. |
 
 
 ## `media`
 
-Media repository settings.
+Media repository.
 
 **Restart required to change.**
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `storage` | object \| object \| object \| object | — | Where media bytes live. Restart required to change (see [`crate::reload`]). |
-| `max_upload_size` | string \| integer | — | A byte size: a number with an optional unit (K, M, G, T with 1024 multipliers; KiB/MiB/GiB; KB/MB/GB with 1000 multipliers), or an integer byte count. |
+| `storage` | object \| object \| object \| object | `{"backend":"local","path":"./media-store"}` | Storage backend. Corresponds to Synapse's `media_storage_providers` (simplified to one active backend; a caching remote provider is a separate, orthogonal setting in Synapse we fold into `local` plus the object-store cache layer). |
+| `max_upload_size` | string \| integer | `"50M"` | Maximum accepted upload size. Corresponds to Synapse's `max_upload_size`. |
 | `thumbnail_sizes` | array<object> | `[{"width":32,"height":32,"method":"crop"},{"width":96,"height":96,"method":"crop"},{"width":320,"height":240,"method":"scale"},{"width":640,"height":480,"method":"scale"},{"width":800,"height":600,"method":"scale"}]` | Thumbnail sizes to pre-generate/serve on demand. Corresponds to Synapse's `thumbnail_sizes`. |
 | `url_preview_enabled` | boolean | `false` | Enable `GET /_matrix/media/*/preview_url`. Corresponds to Synapse's `url_preview_enabled`. |
 | `url_preview_ip_range_blocklist` | array<string> | `["127.0.0.0/8","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","100.64.0.0/10","169.254.0.0/16","::1/128","fe80::/10","fc00::/7"]` | IP ranges URL previews must not fetch from (SSRF protection). Corresponds to Synapse's `url_preview_ip_range_blacklist`. |
 | `remote_media_retention` | object | — | How long to keep cached copies of remote media. `None` means keep forever. Corresponds to Synapse's `media_retention.remote_media_lifetime`. |
 | `allow_legacy_unauthenticated_media` | boolean | `true` | Serve the pre-authentication-media (legacy, unauthenticated) endpoints alongside the authenticated ones. Corresponds to Synapse's `enable_authenticated_media` (inverted: this flag adds the legacy endpoints rather than removing the new ones, since authenticated media is not optional here). |
-| `url_preview_timeout` | string \| integer | — | A duration: a string of <number><unit> groups (ms, s, m, h, d, w, y), or an integer number of milliseconds. |
-| `url_preview_max_fetch_size` | string \| integer | — | A byte size: a number with an optional unit (K, M, G, T with 1024 multipliers; KiB/MiB/GiB; KB/MB/GB with 1000 multipliers), or an integer byte count. |
-| `url_preview_cache_lifetime` | string \| integer | — | A duration: a string of <number><unit> groups (ms, s, m, h, d, w, y), or an integer number of milliseconds. |
-| `scanning` | object | — | Top-level scanning/adaptation configuration (`media.scanning` in the operator's YAML). |
+| `url_preview_timeout` | string \| integer | `"30s"` | Per-request timeout for a `preview_url` fetch (each redirect hop is timed separately). Synapse has no config knob for this — it hardcodes a 30-second body-read timeout in its HTTP client (`refs/synapse/synapse/http/client.py`'s `get_file`, `timeout_deferred(..., timeout=30, ...)`); this project exposes it as a real setting instead. See `docs/rfcs/0006-url-previews.md` section 4.5 and `hs_media::preview::FetchLimits::timeout`, which this field is meant to populate (`hs-media` cannot depend on this crate's consumer wiring — see that crate's status file for the one-line change needed). |
+| `url_preview_max_fetch_size` | string \| integer | `"10M"` | Maximum response body size accepted for a `preview_url` page fetch or its `og:image` fetch (each capped independently at this value). Corresponds to Synapse's `max_spider_size`, whose own default is `"10M"` (`refs/synapse/synapse/config/repository.py`: `self.max_spider_size = self.parse_size(config.get("max_spider_size", "10M"))`). See `hs_media::preview::FetchLimits::max_body_bytes`. |
+| `url_preview_cache_lifetime` | string \| integer | `"1h"` | How long a `preview_url` response is cached before it is fetched again. Synapse has no config knob for this either — it hardcodes a one-hour cache lifetime (`refs/synapse/synapse/media/url_previewer.py`: `ONE_HOUR = 60 * 60 * 1000`, used as both the in-memory and the on-disk `url_cache` expiry); this project exposes it as a real setting instead. See `hs_media::preview::DEFAULT_PREVIEW_CACHE_TTL_MS`, which this field is meant to replace. |
+| `scanning` | object | `{"mode":"off","provider":"none","fail":null,"allow_replacement":false,"timeout":"30s","max_size":"100M","oversize":"quarantine","cache":{"ttl":"1w","unversioned_ttl":"1h","capacity":100000},"unscannable":{"encrypted":"allow","other":"block"},"appservice_bypass":{"exempt_appservice_ids":[]},"icap":null,"http":null}` | Content scanning of uploads (RFC 0008): when to scan, with which provider, and what to do when the scanner cannot answer. Off by default. See [`crate::scanning`]. |
 
 
 ## `federation`
 
-Federation reachability and transport policy.
+Federation policy.
 
 **Restart required to change.**
 
@@ -123,56 +121,56 @@ Federation reachability and transport policy.
 | `verify_certificates` | boolean | `true` | Verify TLS certificates on outbound federation requests. Corresponds to Synapse's `federation_verify_certificates`.  Leave this `true` in production: setting it `false` makes outbound federation TLS accept *any* certificate, which is trivially machine-in-the-middled. It exists for test deployments and conformance harnesses (Complement and similar) that terminate TLS with a certificate this server has no other way to trust yet. The outbound client logs a prominent startup warning whenever this is `false`, precisely so it cannot go unnoticed in a real deployment. Prefer [`Self::custom_ca_certificates`] instead, if the actual goal is federating with one specific server whose certificate chains to a CA this server does not already trust — that trusts exactly the named CA, not every certificate on the internet. |
 | `custom_ca_certificates` | array<string> | `[]` | Paths to additional PEM-encoded CA certificate files trusted for outbound federation TLS, on top of (never instead of) the ~140 public root CAs this server trusts by default. Corresponds to Synapse's `federation_custom_ca_list`. This is the answer to "how do I federate with a server whose certificate was issued by a CA that is not one of the public roots" without resorting to [`Self::verify_certificates`], which would trust every certificate rather than just the one CA actually meant: name the CA's certificate file here. A conformance harness's generated CA (Complement) and an internal deployment's private CA are both meant to be configured this way. |
 | `trust_os_root_store` | boolean | `false` | Whether outbound federation TLS also trusts whatever CA store the *operating system* trusts, in addition to this server's bundled public root CAs. Defaults to `false`.  Trusting the OS store is the right choice for some deployments: an administrator who runs `update-ca-certificates` (or the platform equivalent) to add a corporate or internal CA reasonably expects every TLS client on that machine, including this one, to honour it automatically, and it is what many other pieces of server software do by default. It is the wrong choice as this *server's* unconditional default, though: outbound federation traffic authenticates events between servers that never agreed on a shared root of trust ahead of time (unlike, say, an internal service mesh with its own CA hierarchy), so silently broadening federation's trust to include every CA some unrelated piece of installed software, corporate TLS-inspecting proxy, or forgotten test certificate has added to the OS store is a real, if quiet, security regression for exactly the traffic this setting controls — and it is a regression the operator of *this* server may not even have chosen (the OS store can be broadened by anyone with root on the machine, for reasons having nothing to do with running a homeserver). Defaulting to `false` and pairing it with [`Self::custom_ca_certificates`] for the explicit, narrow case (name exactly the CA meant to be trusted) keeps that choice with the person configuring federation, not with whoever last ran an unrelated `update-ca-certificates`. |
-| `client_timeout` | string \| integer | — | A duration: a string of <number><unit> groups (ms, s, m, h, d, w, y), or an integer number of milliseconds. |
-| `max_retry_backoff` | string \| integer | — | A duration: a string of <number><unit> groups (ms, s, m, h, d, w, y), or an integer number of milliseconds. |
+| `client_timeout` | string \| integer | `"30s"` | Per-request timeout for outbound federation HTTP calls. Corresponds to Synapse's `federation_client_timeout`. |
+| `max_retry_backoff` | string \| integer | `"1h"` | Cap on the exponential backoff between retries of a failed federation destination. Corresponds to Synapse's `destination_min_retry_interval` family, simplified to one ceiling. |
 | `allow_public_rooms_over_federation` | boolean | `false` | Advertise this room's public directory over federation. Corresponds to Synapse's `allow_public_rooms_over_federation`. |
 | `allow_device_name_lookup_over_federation` | boolean | `false` | Answer remote servers' `/_matrix/federation/*/user/devices/*` queries for device display names. Corresponds to Synapse's `allow_device_name_lookup_over_federation`. |
 
 
 ## `rate_limits`
 
-All configured rate-limit buckets.
+Rate limits.
 
 **Reloadable without a restart.**
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | boolean | `true` | Master switch; when false, no limiter runs (tests and benchmarking only — never recommended in production). |
-| `message` | object | — | A token-bucket rate limit: `burst_count` tokens refilling at `per_second` tokens/second.  # A bucket written in part  Each named bucket on [`RateLimitConfig`] (`message`, `login`, ...) has its own default values for the two fields, which a per-field `serde(default = ...)` cannot express. So each bucket field of [`RateLimitConfig`] is read through its own function (`partial_message`, ...) that fills a field left out with *that bucket's* default. A bucket can therefore be written in part anywhere: `HS__RATE_LIMITS__LOGIN__PER_SECOND` alone, or a `config.update` of just `rate_limits.message.burst_count` (which the management interface sends when one field is edited), keeps the bucket's own default for the other field. |
-| `registration` | object | — | A token-bucket rate limit: `burst_count` tokens refilling at `per_second` tokens/second.  # A bucket written in part  Each named bucket on [`RateLimitConfig`] (`message`, `login`, ...) has its own default values for the two fields, which a per-field `serde(default = ...)` cannot express. So each bucket field of [`RateLimitConfig`] is read through its own function (`partial_message`, ...) that fills a field left out with *that bucket's* default. A bucket can therefore be written in part anywhere: `HS__RATE_LIMITS__LOGIN__PER_SECOND` alone, or a `config.update` of just `rate_limits.message.burst_count` (which the management interface sends when one field is edited), keeps the bucket's own default for the other field. |
-| `login` | object | — | A token-bucket rate limit: `burst_count` tokens refilling at `per_second` tokens/second.  # A bucket written in part  Each named bucket on [`RateLimitConfig`] (`message`, `login`, ...) has its own default values for the two fields, which a per-field `serde(default = ...)` cannot express. So each bucket field of [`RateLimitConfig`] is read through its own function (`partial_message`, ...) that fills a field left out with *that bucket's* default. A bucket can therefore be written in part anywhere: `HS__RATE_LIMITS__LOGIN__PER_SECOND` alone, or a `config.update` of just `rate_limits.message.burst_count` (which the management interface sends when one field is edited), keeps the bucket's own default for the other field. |
-| `joins_local` | object | — | A token-bucket rate limit: `burst_count` tokens refilling at `per_second` tokens/second.  # A bucket written in part  Each named bucket on [`RateLimitConfig`] (`message`, `login`, ...) has its own default values for the two fields, which a per-field `serde(default = ...)` cannot express. So each bucket field of [`RateLimitConfig`] is read through its own function (`partial_message`, ...) that fills a field left out with *that bucket's* default. A bucket can therefore be written in part anywhere: `HS__RATE_LIMITS__LOGIN__PER_SECOND` alone, or a `config.update` of just `rate_limits.message.burst_count` (which the management interface sends when one field is edited), keeps the bucket's own default for the other field. |
-| `joins_remote` | object | — | A token-bucket rate limit: `burst_count` tokens refilling at `per_second` tokens/second.  # A bucket written in part  Each named bucket on [`RateLimitConfig`] (`message`, `login`, ...) has its own default values for the two fields, which a per-field `serde(default = ...)` cannot express. So each bucket field of [`RateLimitConfig`] is read through its own function (`partial_message`, ...) that fills a field left out with *that bucket's* default. A bucket can therefore be written in part anywhere: `HS__RATE_LIMITS__LOGIN__PER_SECOND` alone, or a `config.update` of just `rate_limits.message.burst_count` (which the management interface sends when one field is edited), keeps the bucket's own default for the other field. |
-| `admin_redaction` | object | — | A token-bucket rate limit: `burst_count` tokens refilling at `per_second` tokens/second.  # A bucket written in part  Each named bucket on [`RateLimitConfig`] (`message`, `login`, ...) has its own default values for the two fields, which a per-field `serde(default = ...)` cannot express. So each bucket field of [`RateLimitConfig`] is read through its own function (`partial_message`, ...) that fills a field left out with *that bucket's* default. A bucket can therefore be written in part anywhere: `HS__RATE_LIMITS__LOGIN__PER_SECOND` alone, or a `config.update` of just `rate_limits.message.burst_count` (which the management interface sends when one field is edited), keeps the bucket's own default for the other field. |
-| `federation` | object | — | A token-bucket rate limit: `burst_count` tokens refilling at `per_second` tokens/second.  # A bucket written in part  Each named bucket on [`RateLimitConfig`] (`message`, `login`, ...) has its own default values for the two fields, which a per-field `serde(default = ...)` cannot express. So each bucket field of [`RateLimitConfig`] is read through its own function (`partial_message`, ...) that fills a field left out with *that bucket's* default. A bucket can therefore be written in part anywhere: `HS__RATE_LIMITS__LOGIN__PER_SECOND` alone, or a `config.update` of just `rate_limits.message.burst_count` (which the management interface sends when one field is edited), keeps the bucket's own default for the other field. |
-| `third_party_id_validation` | object | — | A token-bucket rate limit: `burst_count` tokens refilling at `per_second` tokens/second.  # A bucket written in part  Each named bucket on [`RateLimitConfig`] (`message`, `login`, ...) has its own default values for the two fields, which a per-field `serde(default = ...)` cannot express. So each bucket field of [`RateLimitConfig`] is read through its own function (`partial_message`, ...) that fills a field left out with *that bucket's* default. A bucket can therefore be written in part anywhere: `HS__RATE_LIMITS__LOGIN__PER_SECOND` alone, or a `config.update` of just `rate_limits.message.burst_count` (which the management interface sends when one field is edited), keeps the bucket's own default for the other field. |
+| `message` | object | `{"per_second":0.2,"burst_count":10}` | Per-user event sending: messages, state and redactions. Corresponds to Synapse's `rc_message`. A `per_second` of `0` limits nobody. Appservices that registered with `rate_limited: false` are exempt. |
+| `registration` | object | `{"per_second":0.17,"burst_count":3}` | `POST /register`. Corresponds to Synapse's `rc_registration`. |
+| `login` | object | `{"per_second":0.17,"burst_count":3}` | `POST /login`. Corresponds to Synapse's `rc_login.address`. |
+| `joins_local` | object | `{"per_second":0.1,"burst_count":10}` | Local room joins. Corresponds to Synapse's `rc_joins.local`. |
+| `joins_remote` | object | `{"per_second":0.01,"burst_count":10}` | Joins to rooms on remote servers. Corresponds to Synapse's `rc_joins.remote`. |
+| `admin_redaction` | object | `{"per_second":1.0,"burst_count":50}` | Admin-triggered redactions. Corresponds to Synapse's `rc_admin_redaction`. |
+| `federation` | object | `{"per_second":10.0,"burst_count":100}` | Inbound federation transactions per origin server. Corresponds to Synapse's `rc_federation`. |
+| `third_party_id_validation` | object | `{"per_second":0.003,"burst_count":5}` | `POST /account/3pid/*/requestToken`. Corresponds to Synapse's `rc_3pid_validation`. |
 
 
 ## `auth`
 
-Authentication, session and registration settings.
+Authentication and authorization.
 
 **Restart required to change.**
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `enable_registration` | boolean | `false` | Allow `POST /register`. Corresponds to Synapse's `enable_registration`. |
-| `registration_shared_secret` *(secret)* | string | — | An inline secret value. Prefer the matching `*_file` key to avoid putting secrets in the config file. |
+| `registration_shared_secret` *(secret)* | string | — | Inline shared secret for the `/_synapse/mk_admin_user`-equivalent shared-secret registration protocol (see `hs-compat`). Prefer `registration_shared_secret_file`. Corresponds to Synapse's `registration_shared_secret`. |
 | `registration_shared_secret_file` *(secret)* | string \| null | — | Path to a file containing the shared-secret-registration secret. |
 | `user_directory_search_all_users` | boolean | `false` | Let the user directory (`POST /user_directory/search`, the box a client's invite dialog searches) find every account on this server. Off by default: a search then finds only the people the searcher shares a room with and the members of public rooms, which is what the Matrix specification requires and no more. Turning it on lets people find somebody they have not met yet -- convenient on a small server where everyone knows everyone -- at the cost that any account can list every other account's name, including the accounts a bridge creates for other people's contacts. Corresponds to Synapse's `user_directory.search_all_users`. |
 | `enable_legacy_login` | boolean | `true` | Serve the legacy `/login` and user-interactive-auth flows in addition to the native OAuth 2.0 issuer. Needed for older clients, bridges and `m.login.application_service`. |
-| `session_secret` *(secret)* | string | — | An inline secret value. Prefer the matching `*_file` key to avoid putting secrets in the config file. |
+| `session_secret` *(secret)* | string | — | Inline key signing issued access/refresh tokens and session cookies. Prefer `session_secret_file`. Corresponds to Synapse's `macaroon_secret_key`. |
 | `session_secret_file` *(secret)* | string \| null | — | Path to a file containing the session-signing secret. |
-| `access_token_lifetime` | string \| integer | — | A duration: a string of <number><unit> groups (ms, s, m, h, d, w, y), or an integer number of milliseconds. |
+| `access_token_lifetime` | string \| integer | `"1h"` | Access token lifetime. Corresponds to Synapse's `access_token_lifetime` (native OAuth tokens; legacy non-refreshable tokens are unaffected, matching Synapse's own carve-out). |
 | `refresh_token_lifetime` | object | `"1y"` | Refresh token lifetime; `None` means refresh tokens do not expire. Corresponds to Synapse's `refreshable_access_token_lifetime` family. |
-| `password` | object | — | Password login and policy. Corresponds to Synapse's `password_config`. |
+| `password` | object | `{"enabled":true,"pepper":null,"pepper_file":null,"policy":{"minimum_length":8,"require_digit":false,"require_symbol":false,"require_uppercase":false,"require_lowercase":false}}` | Password login settings. |
 | `oidc_providers` | array<object> | `[]` | Upstream OIDC providers. |
 | `mas_delegation` | object | — | When set, delegate to Matrix Authentication Service instead of running the native OAuth issuer. |
 
 
 ## `appservices`
 
-Appservice delivery settings, and registration files to import once.
+Appservice (bridge) registry bootstrap.
 
 **Restart required to change.**
 
@@ -185,21 +183,21 @@ Appservice delivery settings, and registration files to import once.
 
 ## `telemetry`
 
-Telemetry: metrics, tracing, logging and error reporting.
+Metrics, tracing, logging and error reporting.
 
 **Restart required to change.**
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `metrics` | object | — | Prometheus metrics. |
-| `tracing` | object | — | OpenTelemetry distributed tracing. |
-| `logging` | object | — | Structured logging. |
+| `metrics` | object | `{"enabled":false,"synapse_compat_names":true}` | Prometheus metrics. |
+| `tracing` | object | `{"enabled":false,"otlp_endpoint":null,"sample_ratio":0.1}` | OpenTelemetry tracing. |
+| `logging` | object | `{"level":"info","json":false}` | Structured logging. |
 | `sentry` | object | — | Sentry error reporting; absent disables it. |
 
 
 ## `cluster`
 
-Cluster topology and ownership tuning.
+Cluster topology.
 
 **Restart required to change.**
 
@@ -208,14 +206,14 @@ Cluster topology and ownership tuning.
 | `single_node` *(bootstrap)* | boolean | `true` | Run as a single replica owning everything, with the ownership manager inert and no mesh listener. Corresponds to `hs serve --single-node`. |
 | `room_shards` | integer | `256` | Number of room ownership shards. Fixed at cluster creation. |
 | `user_shards` | integer | `256` | Number of user-session ownership shards. Fixed at cluster creation. |
-| `mesh` *(bootstrap)* | object | — | Internal mesh transport between replicas. |
-| `heartbeat_interval` | string \| integer | — | A duration: a string of <number><unit> groups (ms, s, m, h, d, w, y), or an integer number of milliseconds. |
-| `lease_ttl` | string \| integer | — | A duration: a string of <number><unit> groups (ms, s, m, h, d, w, y), or an integer number of milliseconds. |
+| `mesh` *(bootstrap)* | object | `{"port":8449,"advertise_address":null,"tls":null,"shared_secret":null,"shared_secret_file":null}` | Internal replica-to-replica mesh. |
+| `heartbeat_interval` | string \| integer | `"2s"` | How often a replica renews its liveness heartbeat. |
+| `lease_ttl` | string \| integer | `"10s"` | How long a lease survives without a heartbeat before another replica may claim ownership. |
 
 
 ## `migration`
 
-The migration source, if any.
+The Synapse deployment to migrate from (the admin API's Migration area).
 
 **Reloadable without a restart.**
 

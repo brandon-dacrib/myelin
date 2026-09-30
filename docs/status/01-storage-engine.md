@@ -1,5 +1,107 @@
 # 01 Storage engine: status
 
+## PostgreSQL TLS, pool size and schema are real (2026-09-30, branch `agent/postgres-tls`)
+
+Closes the "Postgres `tls`/`pool_size`/schema" row of `docs/next-steps.md`'s known gaps, and the
+cluster work's "`storage.postgres.sslMode` is ignored (the server connects `NoTls`)".
+
+### What changed
+
+- `crates/hs-kv/src/postgres_tls.rs` (new): libpq's five `sslmode`s over `rustls`
+  (`PgSslMode`: `disable`, `prefer`, `require`, `verify-ca`, `verify-full`; `PgTlsOptions` adds an
+  optional PEM root-certificate file, with the platform trust store as the fallback for the verify
+  modes). A small `MakeTlsConnect`/`TlsConnect`/`TlsStream` adapter over `tokio-rustls` for the
+  synchronous `postgres` crate and `r2d2_postgres`, written here rather than pulled in as
+  `tokio-postgres-rustls`: the workspace already standardizes on `rustls` + `ring` (`hs-cluster`'s
+  mesh, `hs-federation`'s client), and the adapter is under a hundred lines with no new
+  third-party crates. `prefer`/`require` accept any certificate (libpq's contract: encryption
+  without authentication), `verify-ca` runs the WebPKI chain check and forgives only the host-name
+  error, `verify-full` is plain `rustls`. No channel binding (`SCRAM-SHA-256`, not `-PLUS`; the
+  server accepts either).
+- `PostgresBackend::open_with(dsn, &PostgresOpenOptions { schema, pool_size, tls })` and
+  `open_with_info`, which also returns a `PostgresConnectionInfo` (host, port, database, schema,
+  pool size, mode, and whether PostgreSQL reports the session encrypted, from `pg_stat_ssl`; also
+  available afterwards as `PostgresBackend::connection_info()`). `open(dsn, schema)` is unchanged
+  in signature and now means pool 16, `prefer`. The pool's `max_size` is the option, not 16.
+- The first connection is made outside the pool on purpose: `r2d2` reduces a connect failure to a
+  string, and a TLS failure has to come back as `PgTlsError { mode, detail }` (the source of the
+  `KvError::Backend`) so the binary can name the setting. `postgres::Error` keeps its kind private,
+  so a TLS failure is recognized by its fixed `Display` text ("error performing TLS handshake"),
+  and `detail` carries the whole cause chain, which is where the reason lives ("server does not
+  support TLS", "invalid peer certificate: UnknownIssuer", "NotValidForName").
+- `hs-config`: `PostgresStorageConfig.tls: bool` is now `ssl_mode: PostgresSslMode` (default
+  `prefer`, libpq's default and the chart's), with `tls` kept as a serde alias — `tls: true` loads
+  as `require`, `tls: false` as `disable`, both keys at once is a duplicate-field error — plus
+  `ssl_root_cert: Option<PathBuf>` and `schema: String` (default `public`). Validation: `schema`
+  must be one safe SQL identifier; `ssl_root_cert` with a mode other than `verify-*` is refused
+  rather than silently ignored (libpq promotes `require` to `verify-ca` when a root file exists;
+  this does not, on purpose — say `verify-ca` when that is what is wanted).
+- `hs-cli/src/storage.rs`: passes all of it through; a TLS failure is
+  `StorageOpenError::PostgresTls`, whose message starts with `storage.postgres.ssl_mode = <mode>
+  could not be satisfied connecting to host:port/db: <detail>`; `hs serve` exits 1 with it. Also
+  fixed on the way: an empty `password` produced `password=` in the key-value connection string,
+  which the `postgres` crate rejects as a parse error ("unexpected EOF"), so a config without a
+  password (peer/trust auth) never connected; values are now single-quoted and escaped, and an
+  empty password is left out.
+- `hs-cli/src/cli.rs`: one `info` line after telemetry is up, `opened the PostgreSQL storage
+  backend host= port= database= schema= pool_size= ssl_mode= encrypted=`. Storage opens before the
+  log subscriber exists (the configuration lives in the database), so `hs-kv`'s own line is
+  `debug`, and this one is the operator's.
+- Helm chart: `storage.postgres.sslMode` is rendered as `ssl_mode` in the ConfigMap's `storage`
+  block (both the inline and the CloudNativePG branches), and a new `sslRootCert` value as
+  `ssl_root_cert` for the verify modes only. `deploy/two-pod/values-dacrib0.yaml` keeps
+  `disable` (unchanged behavior on the cluster) with a corrected comment.
+- `hs-compat`: Synapse's `database.args.sslmode` and `sslrootcert` map to the new fields
+  (`allow` reads as `prefer`; a root cert is kept only for the verify modes). Table row updated in
+  `docs/compat/synapse-config-table.md` and `classification.rs`.
+- `docs/config.md` regenerated; `gen_config_docs` now keeps a `$ref` field's own description and
+  default and renders a documented unit enum as its constants (`disable` \| `prefer` \| ...), which
+  also fixed every duration, byte-size, secret and rate-limit row that used to show the shared
+  type's boilerplate and no default.
+- `web/src/test/fixtures/hs-config-schema.json` regenerated; `npm run check` passes (443 tests),
+  so the Configuration page renders `ssl_mode` as a choice under the bootstrap storage section.
+
+### Verified, against real servers
+
+A PostgreSQL 17 (`public.ecr.aws/docker/library/postgres:17`) with `ssl = on` and a CA-signed
+server certificate naming `localhost` only, on 127.0.0.1:5463, and the merge gate's plain one on
+127.0.0.1:5462:
+
+- `cargo test -p hs-kv` with `HS_KV_TEST_POSTGRES_DSN` (plain) and `HS_KV_TEST_POSTGRES_TLS_DSN`
+  + `HS_KV_TEST_POSTGRES_TLS_CERT` (TLS): 15 unit, 2 fjall, 1 memory, 6 postgres conformance,
+  1 `postgres_tls`, 1 doc — all pass. `tests/postgres_tls.rs` does, in one test: `disable` in the
+  clear against the TLS server; `prefer`/`require` encrypted; `verify-ca` with the CA; `verify-full`
+  by `localhost` passes and by `127.0.0.1` fails on the name while `verify-ca` by IP passes;
+  `verify-ca` without the CA file fails (platform roots do not know a test CA); against the plain
+  server `disable`/`prefer` connect unencrypted and `require`/`verify-ca`/`verify-full` fail with
+  `PgTlsError { mode, "server does not support TLS" }`.
+- `cargo test -p hs-cli --test postgres_tls` (new, real binary; `SKIP` without
+  `HS_CLUSTER_TEST_POSTGRES_TLS_DSN`/`_CERT`): six boots (`require`, `verify-ca`, `verify-full`
+  by name, `prefer` against TLS, `prefer` against plain, `disable`), each checked for the log line's
+  `ssl_mode`, `encrypted`, `schema=hs_tls_test`, `pool_size=3` and `database`; then `require`
+  against the plain server and `verify-full` by IP both exit at startup with
+  `storage.postgres.ssl_mode = ... could not be satisfied`. 1 passed, 4.7 s.
+- `cargo test -p hs-cli --test cluster_admin` with `HS_CLUSTER_TEST_POSTGRES_DSN`: 2 passed (its
+  config still says `tls: false`, so the alias is exercised through the real binary too).
+- `cargo test -p hs-cli --lib`: 174 passed. `cargo test -p hs-config`: 157 + 1 + 1 + 3 passed.
+  `cargo test -p hs-compat`: 59 + 7 + 5 passed. `cargo fmt --all --check`, `cargo clippy
+  --workspace --all-targets -- -D warnings`: clean. `helm lint`: clean; `helm template` checked in
+  the inline, CloudNativePG and default shapes.
+- Also checked: a self-signed server certificate with `basicConstraints=CA:FALSE` is its own
+  trust anchor and passes `verify-ca`/`verify-full`; one with `CA:TRUE` (what `openssl req -x509`
+  makes by default) is refused by WebPKI as `CaUsedAsEndEntity`. The `ssl_root_cert` doc says so.
+
+### Left
+
+- The two-pod cluster deployment still says `sslMode: disable`; switching it to `require`
+  against CloudNativePG (which serves TLS by default) is a desktop item, not verified here.
+- `prefer` does not fall back to plaintext when the server *offers* TLS but the handshake fails
+  (libpq does); the `postgres` crate's negotiation has no such retry. Documented in
+  `postgres_tls.rs`.
+- Client certificates (`sslcert`/`sslkey`) are not supported.
+- `docs/status/12-platform-and-kubernetes.md` and `13-config-compat-and-migration.md` still
+  describe `sslMode`/`tls` as unhonoured (their files; not edited here).
+
 ## The cold boot measured: it is keyspace creation, and only the first boot pays it (2026-09-27)
 
 `docs/next-steps.md` items 1 ("The first-boot startup probe") and 3 ("A first boot takes
@@ -475,13 +577,15 @@ loudly if any *other* scenario ever fails, or if the first divergence ever stops
    `format!("postgres://{user}:{password}@{host}:{port}/{database}")` (URL-encode user/password/
    database if they can contain reserved characters; this track's backend does not do that
    encoding for you, `postgres::Config`'s parser expects a valid DSN).
-3. **`pg.tls` has no effect on `hs_kv::postgres_backend::PostgresBackend::open`, which is
+3. *(Done 2026-09-30, `agent/postgres-tls`: `ssl_mode` reaches the backend, see the top of this
+   file.)* **`pg.tls` has no effect on `hs_kv::postgres_backend::PostgresBackend::open`, which is
    `NoTls`-only.** If `pg.tls` is `true`, `open_postgres` should return a clear
    `StorageOpenError` (a new variant, e.g. `TlsNotImplemented`) rather than silently connecting
    without TLS despite the operator asking for it. Wiring TLS into this backend (swapping
    `postgres::NoTls` for `postgres_native_tls` or `postgres_rustls`, wiring `PgManager`'s type
    parameter accordingly) is future work on this track, not blocking this wiring.
-4. **`PostgresStorageConfig` has no `schema` field.** `PostgresBackend::open(dsn, schema)` takes a
+4. *(Done 2026-09-30: `storage.postgres.schema`, default `public`.)* **`PostgresStorageConfig`
+   has no `schema` field.** `PostgresBackend::open(dsn, schema)` takes a
    PostgreSQL schema name to scope its tables under; every field needed for the DSN already exists
    (see point 2), but there is nothing to pass as `schema` beyond a hardcoded default. Recommend
    `open_postgres` passes `"public"` for now (PostgreSQL's own default schema, and correct for a
@@ -489,7 +593,8 @@ loudly if any *other* scenario ever fails, or if the first divergence ever stops
    if a future requirement wants several `hs` instances or environments sharing one physical
    PostgreSQL database, and can be added to `PostgresStorageConfig` by track 12/13 later without
    any change to this crate (`PostgresBackend::open` already takes it as a parameter).
-5. `pool_size` (already on `PostgresStorageConfig`, default 10) is **not yet wired**:
+5. *(Done 2026-09-30: `PostgresOpenOptions::pool_size`.)* `pool_size` (already on
+   `PostgresStorageConfig`, default 10) is **not yet wired**:
    `PostgresBackend::open` hardcodes `r2d2::Pool::builder().max_size(16)`. A trivial follow-up: add
    a `max_size` parameter (or a small `PostgresOptions` struct) to `PostgresBackend::open` so
    `open_postgres` can pass `pg.pool_size` through. Not done this session because it touches the
@@ -834,6 +939,12 @@ None.
   this session. Three backends now: `hs_kv::memory::MemoryBackend`,
   `hs_kv::fjall_backend::FjallBackend`, `hs_kv::postgres_backend::PostgresBackend` (new this
   session; `PostgresBackend::open(dsn, schema)`).
+- **2026-09-30, additive**: `hs_kv::postgres_backend::{PostgresOpenOptions, PostgresConnectionInfo,
+  PostgresBackend::open_with, PostgresBackend::open_with_info, PostgresBackend::connection_info}`
+  and the `hs_kv::postgres_tls` module (`PgSslMode`, `PgTlsOptions`, `PgTlsError`, `RustlsConnector`,
+  `client_config`, `is_tls_error`, `error_chain`). `hs_config::storage::PostgresSslMode` and the
+  `ssl_mode`/`ssl_root_cert`/`schema` fields (the `tls` field is gone from the struct; the key
+  still loads as an alias).
 - **New, additive-only this session**: `hs_kv::KvError::MidTransactionConflict` (a new enum
   variant — see "Decisions made" for why this is safe) and `hs_kv::conformance`'s eleven scenario
   functions are now individually `pub` (were private), alongside the unchanged
@@ -862,6 +973,18 @@ None.
   error string (nothing in this workspace was, checked).
 
 ## Decisions made
+
+- **TLS to PostgreSQL is `rustls` with a crate-local adapter, and the modes are libpq's five.**
+  (2026-09-30.) The workspace's TLS stack is `rustls`/`ring` everywhere else; an adapter over
+  `tokio-rustls` for the synchronous `postgres` crate is under a hundred lines, so no
+  `tokio-postgres-rustls`/`postgres-native-tls`. Modes follow libpq exactly except that `require`
+  is never promoted to `verify-ca` by the presence of a root file, and a root file with a
+  non-verify mode is a validation error. `prefer` is the default (libpq's, and the chart's).
+  `PostgresBackend::open` keeps its signature and means `prefer` + pool 16;
+  `open_with`/`open_with_info` take `PostgresOpenOptions`.
+- **`hs-kv` logs its connection line at `debug`; the binary logs at `info`.** `hs serve` opens
+  storage before its subscriber exists, so an `info` line in the library goes nowhere there and
+  would be doubled anywhere else; `PostgresConnectionInfo` is the API the binary logs from.
 
 - **Fixed-width integers, not varint, inside tuple keys.** One of the brief's open questions.
   Varint does not preserve order across a byte-length boundary without extra machinery FoundationDB
@@ -945,6 +1068,11 @@ None.
   `assert_eq!` already does throughout it.
 
 ## Shared dependencies added
+
+2026-09-30 (`agent/postgres-tls`): nothing new to `[workspace.dependencies]`. `crates/hs-kv/Cargo.toml`
+gained `tokio` (moved from dev-dependencies; only for the `AsyncRead`/`AsyncWrite` traits),
+`tokio-rustls`, `rustls`, `rustls-pki-types`, `rustls-pemfile` and `rustls-native-certs`, all already
+workspace entries.
 
 Session 1: `fjall`, `tokio-postgres`, `deadpool-postgres`, `tempfile` (plus already-present
 `bytes`, `thiserror`, `tracing`, `criterion`, `proptest`). `hs-tables` added ordinary path
