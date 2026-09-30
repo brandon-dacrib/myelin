@@ -385,6 +385,14 @@ spec:
                         format: int32
                         nullable: true
                         type: integer
+                      sslMode:
+                        description: libpq's `sslmode` for the connection (`disable`, `prefer`, `require`, `verify-ca` or `verify-full`; the chart's `storage.postgres.sslMode`); `prefer` when omitted. The server refuses to start when `require` or a verify mode cannot be met.
+                        nullable: true
+                        type: string
+                      sslRootCert:
+                        description: A path inside the pod to the PEM the server's certificate chains to, used by the verify modes only (the chart's `storage.postgres.sslRootCert`); ignored with any other mode.
+                        nullable: true
+                        type: string
                       user:
                         description: Connecting role; `hs` when omitted.
                         nullable: true

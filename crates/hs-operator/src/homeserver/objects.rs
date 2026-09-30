@@ -38,7 +38,8 @@ use sha2::{Digest as _, Sha256};
 
 use crate::bridge::MANAGER;
 use crate::crds::{
-    AntiAffinity, Homeserver, HomeserverSpec, MediaBackend, SecretKeyRef, StorageBackend,
+    AntiAffinity, Homeserver, HomeserverSpec, MediaBackend, PostgresStorageSpec, SecretKeyRef,
+    StorageBackend,
 };
 
 /// `app.kubernetes.io/name` of a homeserver's objects: the chart's name, so the chart and the
@@ -102,6 +103,19 @@ pub fn desired_replicas(spec: &HomeserverSpec) -> i32 {
     } else {
         1
     }
+}
+
+/// The PostgreSQL `ssl_mode` and, for the verify modes only, the root certificate, exactly as
+/// the chart's `configmap.yaml` renders `storage.postgres.sslMode` and `sslRootCert`.
+fn postgres_ssl(pg: Option<&PostgresStorageSpec>) -> (String, Option<String>) {
+    let mode = pg
+        .and_then(|p| p.ssl_mode.clone())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| "prefer".to_owned());
+    let cert = pg
+        .and_then(|p| p.ssl_root_cert.clone())
+        .filter(|c| !c.is_empty() && matches!(mode.as_str(), "verify-ca" | "verify-full"));
+    (mode, cert)
 }
 
 /// Why a spec cannot be turned into a workload: the same checks as the chart's `hs.validate`,
@@ -388,7 +402,7 @@ pub fn config_value(spec: &HomeserverSpec) -> Value {
                 .as_ref()
                 .and_then(|p| p.cloud_native_pg_cluster.as_ref())
                 .is_some_and(|c| !c.is_empty());
-            let storage = if cnpg {
+            let mut storage = if cnpg {
                 json!({
                     "backend": "postgres",
                     "host": "PLACEHOLDER_SET_VIA_HS__STORAGE__HOST_ENV",
@@ -396,7 +410,7 @@ pub fn config_value(spec: &HomeserverSpec) -> Value {
                     "user": "PLACEHOLDER_SET_VIA_HS__STORAGE__USER_ENV",
                 })
             } else {
-                let pg = pg.unwrap_or_default();
+                let pg = pg.clone().unwrap_or_default();
                 json!({
                     "backend": "postgres",
                     "host": pg.host.unwrap_or_default(),
@@ -405,6 +419,13 @@ pub fn config_value(spec: &HomeserverSpec) -> Value {
                     "user": pg.user.unwrap_or_else(|| "hs".to_owned()),
                 })
             };
+            // As the chart's configmap.yaml: `ssl_mode` always, `prefer` by default; the root
+            // certificate only with a verify mode.
+            let (ssl_mode, ssl_root_cert) = postgres_ssl(pg.as_ref());
+            storage["ssl_mode"] = json!(ssl_mode);
+            if let Some(cert) = ssl_root_cert {
+                storage["ssl_root_cert"] = json!(cert);
+            }
             config.insert("storage".to_owned(), storage);
         }
         StorageBackend::Slatedb => {
@@ -1114,7 +1135,12 @@ pub fn chart_values(hs: &Homeserver) -> Value {
                 .filter(|c| !c.is_empty());
             if let Some(cluster_name) = cnpg {
                 values["cloudNativePG"] = json!({"enabled": true, "clusterName": cluster_name});
-                values["storage"] = json!({"backend": "postgres"});
+                let (ssl_mode, ssl_root_cert) = postgres_ssl(pg);
+                let mut postgres = json!({"sslMode": ssl_mode});
+                if let Some(cert) = ssl_root_cert {
+                    postgres["sslRootCert"] = json!(cert);
+                }
+                values["storage"] = json!({"backend": "postgres", "postgres": postgres});
             } else {
                 let mut postgres = json!({
                     "host": pg.and_then(|p| p.host.clone()).unwrap_or_default(),
@@ -1124,6 +1150,11 @@ pub fn chart_values(hs: &Homeserver) -> Value {
                 });
                 if let Some(pw) = pg.and_then(|p| p.password_secret_ref.as_ref()) {
                     postgres["password"] = json!({"secret": pw.name, "secretKey": pw.key});
+                }
+                let (ssl_mode, ssl_root_cert) = postgres_ssl(pg);
+                postgres["sslMode"] = json!(ssl_mode);
+                if let Some(cert) = ssl_root_cert {
+                    postgres["sslRootCert"] = json!(cert);
                 }
                 values["storage"] = json!({"backend": "postgres", "postgres": postgres});
             }

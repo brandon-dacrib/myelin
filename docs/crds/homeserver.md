@@ -48,6 +48,7 @@ server, not both.
 | `storage.embedded.size`, `.storageClassName` | | `storage.embedded.*` | The data claim. |
 | `storage.postgres.cloudNativePgCluster` | | `cloudNativePG.clusterName` | Connection from `<cluster>-app`. |
 | `storage.postgres.host`, `.port` (5432), `.database` (hs), `.user` (hs), `.passwordSecretRef` | | `storage.postgres.*` | An external database. |
+| `storage.postgres.sslMode` (prefer), `.sslRootCert` | | `storage.postgres.sslMode`, `.sslRootCert` | libpq's `sslmode`; the root certificate is rendered for `verify-ca` and `verify-full` only. |
 | `storage.slatedb.bucketUrl`, `.shardCount` (256) | | `storage.objectStorage.*` | |
 | `signingKeySecretRef` | required | `secrets.signingKey` | Mounted whole as a directory. |
 | `registrationSharedSecretRef`, `sessionSecretRef` | | `secrets.*` | |

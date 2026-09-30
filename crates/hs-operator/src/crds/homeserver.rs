@@ -92,6 +92,15 @@ pub struct PostgresStorageSpec {
     /// The Secret key holding the connection password.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_secret_ref: Option<SecretKeyRef>,
+    /// libpq's `sslmode` for the connection (`disable`, `prefer`, `require`, `verify-ca` or
+    /// `verify-full`; the chart's `storage.postgres.sslMode`); `prefer` when omitted. The server
+    /// refuses to start when `require` or a verify mode cannot be met.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssl_mode: Option<String>,
+    /// A path inside the pod to the PEM the server's certificate chains to, used by the verify
+    /// modes only (the chart's `storage.postgres.sslRootCert`); ignored with any other mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssl_root_cert: Option<String>,
 }
 
 /// SlateDB-on-object-storage settings. See [`StorageSpec::slatedb`].
