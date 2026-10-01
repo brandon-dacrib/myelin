@@ -1,5 +1,5 @@
 //! Process-wide metrics of this crate that are not about moderation (`crate::moderation` has
-//! its own): how many attempts placing a new room's ID took, and the room-event search index.
+//! its own): how many attempts placing a new room's ID took, room upgrades, and the room-event search index.
 //!
 //! Process-wide statics, like `crate::moderation`'s: the code that observes them runs inside a
 //! room actor's blocking construction or a background task with no registry at hand, and a
@@ -10,6 +10,7 @@ use std::sync::LazyLock;
 use std::sync::atomic::AtomicI64;
 
 use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
 
@@ -43,6 +44,13 @@ static SEARCH_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
     ])
 });
 
+/// `hs_room_upgrades_total{outcome}`: room upgrades this replica ran, by how they ended --
+/// `completed`, or `replacement_orphaned` when one half was written and the other failed (a
+/// tombstone naming a room whose create failed, or a replacement room whose tombstone the old
+/// room refused).
+static ROOM_UPGRADES: LazyLock<Family<Vec<(String, String)>, Counter>> =
+    LazyLock::new(Family::default);
+
 /// Milliseconds since the Unix epoch, now.
 pub(crate) fn now_ms() -> i64 {
     i64::try_from(
@@ -57,6 +65,13 @@ pub(crate) fn now_ms() -> i64 {
 /// Observes one room creation's ID attempts in `hs_room_create_room_id_attempts`.
 pub(crate) fn observe_create_room_id_attempts(attempts: u32) {
     CREATE_ROOM_ID_ATTEMPTS.observe(f64::from(attempts));
+}
+
+/// Counts one room upgrade in `hs_room_upgrades_total` with its `outcome`.
+pub(crate) fn count_room_upgrade(outcome: &str) {
+    ROOM_UPGRADES
+        .get_or_create(&vec![("outcome".to_owned(), outcome.to_owned())])
+        .inc();
 }
 
 /// Counts `added` newly indexed events and records that the index holds `documents`.
@@ -82,7 +97,7 @@ pub(crate) fn observe_search_duration(elapsed: std::time::Duration) {
 }
 
 /// Registers this module's metrics into `registry`: `hs_room_create_room_id_attempts` (decision
-/// 0020), and the search index's `hs_room_search_indexed_events_total`,
+/// 0020), `hs_room_upgrades_total`, and the search index's `hs_room_search_indexed_events_total`,
 /// `hs_room_search_index_documents`, `hs_room_search_rooms_behind`,
 /// `hs_room_search_index_delay_seconds` and `hs_room_search_duration_seconds` (decision 0021).
 pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
@@ -90,6 +105,11 @@ pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
         "hs_room_create_room_id_attempts",
         "Room IDs built per room creation before one hashed to a room shard this replica owns",
         CREATE_ROOM_ID_ATTEMPTS.clone(),
+    );
+    registry.register(
+        "hs_room_upgrades",
+        "Room upgrades this replica ran, by outcome (completed, replacement_orphaned)",
+        ROOM_UPGRADES.clone(),
     );
     // Registered without `_total`: the text encoder appends it.
     registry.register(

@@ -1,0 +1,369 @@
+//! `POST /_matrix/client/v3/rooms/{roomId}/upgrade` against the real `hs` binary, to room
+//! version 12 and to an opaque-ID version.
+//!
+//! A version-12 room's ID is its create event's reference hash (MSC4291), so the replacement
+//! room cannot be named before it is created. Before the fix the old room's tombstone named an
+//! ID minted ahead, which the version-12 create ignored, so the tombstone pointed at a room that
+//! never existed, and the replacement's carried-over power levels named its creator, which
+//! version 12's auth rules refuse. Here alice upgrades a version-11 room to 12 through the
+//! client API, bob follows the tombstone's `replacement_room` and joins it by that ID, and the
+//! replacement names the old room as its predecessor and holds the moved alias. The same is done
+//! for an upgrade from 10 to 11, which keeps the old order (ID, tombstone, room). `/metrics`
+//! counts both upgrades.
+
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+
+fn reserve_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// One `hs serve` process, its stdout read line by line.
+struct HsProcess {
+    child: std::process::Child,
+    lines: std::sync::mpsc::Receiver<String>,
+    seen: Vec<String>,
+}
+
+impl HsProcess {
+    fn serve(config_path: &std::path::Path) -> Self {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+            .args(["serve", "-c"])
+            .arg(config_path)
+            .env_remove("RUST_LOG")
+            .env_remove("HS_DATA_DIR")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("the hs binary should start");
+        let stdout = child.stdout.take().unwrap();
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            child,
+            lines,
+            seen: Vec::new(),
+        }
+    }
+
+    /// Reads the log until a line contains `needle`. A debug `hs` under load can take a minute
+    /// to boot, so the deadline is generous.
+    fn wait_for(&mut self, needle: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok(line) => {
+                    self.seen.push(line.clone());
+                    if line.contains(needle) {
+                        return line;
+                    }
+                }
+                Err(_) => panic!(
+                    "the log never said {needle:?}; it said:\n{}",
+                    self.seen.join("\n")
+                ),
+            }
+        }
+    }
+}
+
+impl Drop for HsProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+const SERVER: &str = "upgrade.example.org";
+
+fn config_yaml(port: u16, data_dir: &std::path::Path) -> String {
+    format!(
+        "server:\n  server_name: \"{SERVER}\"\n\
+         listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health, metrics]\n\
+         storage:\n  backend: embedded\n  data_dir: {data_dir:?}\n\
+         media:\n  storage:\n    backend: local\n    path: {media:?}\n\
+         auth:\n  enable_registration: true\n\
+         rate_limits:\n  enabled: false\n",
+        media = data_dir.join("media"),
+    )
+}
+
+struct Client {
+    http: reqwest::Client,
+    base: String,
+}
+
+impl Client {
+    /// `method path` with `body`, asserting success.
+    async fn call(&self, method: reqwest::Method, path: &str, token: &str, body: Value) -> Value {
+        let response = self
+            .http
+            .request(method.clone(), format!("{}{path}", self.base))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let value: Value = response.json().await.unwrap_or(Value::Null);
+        assert!(status.is_success(), "{method} {path}: {status} {value}");
+        value
+    }
+
+    async fn get(&self, path: &str, token: &str) -> Value {
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let value: Value = response.json().await.unwrap_or(Value::Null);
+        assert!(status.is_success(), "GET {path}: {status} {value}");
+        value
+    }
+
+    async fn register(&self, username: &str) -> String {
+        let first: Value = self
+            .http
+            .post(format!("{}/_matrix/client/v3/register", self.base))
+            .json(&json!({"username": username, "password": "correct horse"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let done: Value = self
+            .http
+            .post(format!("{}/_matrix/client/v3/register", self.base))
+            .json(&json!({
+                "username": username,
+                "password": "correct horse",
+                "auth": {"type": "m.login.dummy", "session": first["session"]},
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        done["access_token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("registration failed: {done}"))
+            .to_owned()
+    }
+
+    async fn metric(&self, sample: &str) -> u64 {
+        let text = self
+            .http
+            .get(format!("{}/metrics", self.base))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        text.lines()
+            .find_map(|line| line.strip_prefix(sample)?.trim().parse::<f64>().ok())
+            .map_or(0, |v| v as u64)
+    }
+}
+
+/// A room ID or alias as one path segment.
+fn segment(id: &str) -> String {
+    id.replace('!', "%21")
+        .replace('#', "%23")
+        .replace(':', "%3A")
+}
+
+/// Alice makes a public room at `from` with alias `#{alias}`, bob joins it, alice upgrades it to
+/// `to`; then bob joins the room the old room's tombstone names, by that ID, and says something
+/// there. Returns `(old room, replacement room)`.
+async fn upgrade_and_follow(
+    client: &Client,
+    alice: &str,
+    bob: &str,
+    from: &str,
+    to: &str,
+    alias: &str,
+) -> (String, String) {
+    let post = reqwest::Method::POST;
+    let old = client
+        .call(
+            post.clone(),
+            "/_matrix/client/v3/createRoom",
+            alice,
+            json!({
+                "preset": "public_chat",
+                "room_version": from,
+                "room_alias_name": alias,
+                "topic": format!("a version {from} room"),
+            }),
+        )
+        .await["room_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    client
+        .call(
+            post.clone(),
+            &format!("/_matrix/client/v3/join/{}", segment(&old)),
+            bob,
+            json!({}),
+        )
+        .await;
+
+    let upgraded = client
+        .call(
+            post.clone(),
+            &format!("/_matrix/client/v3/rooms/{}/upgrade", segment(&old)),
+            alice,
+            json!({"new_version": to}),
+        )
+        .await;
+    let replacement = upgraded["replacement_room"].as_str().unwrap().to_owned();
+
+    // What a client does: read the tombstone and follow it.
+    let tombstone = client
+        .get(
+            &format!(
+                "/_matrix/client/v3/rooms/{}/state/m.room.tombstone/",
+                segment(&old)
+            ),
+            bob,
+        )
+        .await;
+    let named = tombstone["replacement_room"].as_str().unwrap().to_owned();
+    assert_eq!(named, replacement, "the tombstone names the replacement");
+    let joined = client
+        .call(
+            post.clone(),
+            &format!("/_matrix/client/v3/join/{}", segment(&named)),
+            bob,
+            json!({}),
+        )
+        .await;
+    assert_eq!(joined["room_id"], named.as_str());
+    client
+        .call(
+            reqwest::Method::PUT,
+            &format!(
+                "/_matrix/client/v3/rooms/{}/send/m.room.message/t-{to}",
+                segment(&named)
+            ),
+            bob,
+            json!({"msgtype": "m.text", "body": "followed the tombstone"}),
+        )
+        .await;
+
+    let create = client
+        .get(
+            &format!(
+                "/_matrix/client/v3/rooms/{}/state/m.room.create/",
+                segment(&named)
+            ),
+            bob,
+        )
+        .await;
+    assert_eq!(create["room_version"], to);
+    assert_eq!(create["predecessor"]["room_id"], old.as_str());
+    let topic = client
+        .get(
+            &format!(
+                "/_matrix/client/v3/rooms/{}/state/m.room.topic/",
+                segment(&named)
+            ),
+            bob,
+        )
+        .await;
+    assert_eq!(topic["topic"], format!("a version {from} room"));
+    let resolved = client
+        .get(
+            &format!(
+                "/_matrix/client/v3/directory/room/{}",
+                segment(&format!("#{alias}:{SERVER}"))
+            ),
+            bob,
+        )
+        .await;
+    assert_eq!(resolved["room_id"], named.as_str(), "the alias moved");
+    (old, named)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tombstone_names_a_replacement_room_that_can_be_joined_by_that_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = reserve_port();
+    let config = dir.path().join("hs.yaml");
+    std::fs::write(&config, config_yaml(port, &dir.path().join("data"))).unwrap();
+    let client = Client {
+        http: reqwest::Client::new(),
+        base: format!("http://127.0.0.1:{port}"),
+    };
+    let mut hs = HsProcess::serve(&config);
+    hs.wait_for("listening");
+
+    let alice = client.register("alice").await;
+    let bob = client.register("bob").await;
+
+    let (old12, new12) = upgrade_and_follow(&client, &alice, &bob, "11", "12", "to-twelve").await;
+    assert!(
+        !new12.contains(':'),
+        "a version-12 room id carries no server name: {new12}"
+    );
+    let create = client
+        .get(
+            &format!(
+                "/_matrix/client/v3/rooms/{}/state/m.room.create/",
+                segment(&new12)
+            ),
+            &bob,
+        )
+        .await;
+    assert!(
+        create["predecessor"].get("event_id").is_none(),
+        "a version-12 predecessor names the room only: {create}"
+    );
+    let (_, new11) = upgrade_and_follow(&client, &alice, &bob, "10", "11", "to-eleven").await;
+    assert!(new11.ends_with(&format!(":{SERVER}")), "{new11}");
+
+    // The old room is locked down after the upgrade: bob may no longer speak in it.
+    let refused = client
+        .http
+        .put(format!(
+            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/late",
+            client.base,
+            segment(&old12)
+        ))
+        .bearer_auth(&bob)
+        .json(&json!({"msgtype": "m.text", "body": "too late"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), reqwest::StatusCode::FORBIDDEN);
+
+    assert_eq!(
+        client
+            .metric("hs_room_upgrades_total{outcome=\"completed\"}")
+            .await,
+        2
+    );
+}

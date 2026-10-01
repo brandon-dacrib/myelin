@@ -75,7 +75,7 @@ impl<B: KvBackend> RoomFencing<B> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use hs_cluster::store::ClusterStore;
     use hs_cluster::{Fence, Generation, OwnershipEvent, ReplicaId, ShardId, ShardMap};
     use hs_kv::memory::MemoryBackend;
@@ -286,9 +286,12 @@ mod tests {
         }
     }
 
-    const LAYOUT: hs_cluster::ShardLayout = hs_cluster::ShardLayout::small(4);
+    pub(crate) const LAYOUT: hs_cluster::ShardLayout = hs_cluster::ShardLayout::small(4);
 
-    fn owning(backend: &MemoryBackend, owned: Vec<u32>) -> Arc<RoomFencing<MemoryBackend>> {
+    pub(crate) fn owning(
+        backend: &MemoryBackend,
+        owned: Vec<u32>,
+    ) -> Arc<RoomFencing<MemoryBackend>> {
         Arc::new(RoomFencing {
             ownership: Arc::new(OwnsShards {
                 me: ReplicaId::new("hs-a"),

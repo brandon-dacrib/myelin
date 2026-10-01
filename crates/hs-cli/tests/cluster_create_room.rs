@@ -12,7 +12,10 @@
 //! `hs_room_create_room_id_attempts_count` counts the rooms it built; it must equal the number
 //! of rooms whose shard it owns, and every room then takes a message through the replica that
 //! did not build it. A search through either replica then finds all forty messages: the search
-//! index is in the shared store, each replica indexing the rooms it owns.
+//! index is in the shared store, each replica indexing the rooms it owns. Last, six rooms are
+//! upgraded (to 12 and to 11) through the replica that does not own them: the gate forwards
+//! each upgrade to the owner, which builds the replacement on a shard of its own, and the old
+//! room's tombstone names it.
 //!
 //! Runs when a PostgreSQL server is reachable, and prints a skip message otherwise:
 //!
@@ -539,6 +542,85 @@ async fn every_v12_room_is_built_by_the_owner_of_its_shard_whichever_replica_too
             );
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+    }
+
+    // An upgrade asked of the replica that does not own the old room is forwarded by the shard
+    // gate to the one that does, which builds the replacement on a shard it owns (version 12 by
+    // rebuilding the create event, an opaque version by minting the id until it lands there).
+    // The old room's tombstone names that replacement, and the replacement takes a message
+    // through the other replica. Before, an upgrade to 12 tombstoned the old room with an id
+    // that never existed, and an upgrade to 11 was refused by the fence whenever its random id
+    // hashed to the other replica's shard, after the tombstone was written.
+    const UPGRADES: &str = "hs_room_upgrades_total{outcome=\"completed\"}";
+    let mut upgrades_before = Vec::new();
+    for (_, base) in &replicas {
+        upgrades_before.push(metric(&client, base, UPGRADES).await);
+    }
+    let mut upgraded_by: BTreeMap<String, u64> = BTreeMap::new();
+    let to_upgrade = rooms
+        .iter()
+        .take(3)
+        .chain(rooms.iter().skip(ROOMS_PER_REPLICA).take(3));
+    for (n, (old, owner)) in to_upgrade.enumerate() {
+        let version = if n % 2 == 0 { "12" } else { "11" };
+        let other = &replicas.iter().find(|(mesh, _)| mesh != owner).unwrap().1;
+        let response = client
+            .post(format!("{other}/_matrix/client/v3/rooms/{old}/upgrade"))
+            .bearer_auth(&alice)
+            .json(&json!({"new_version": version}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: Value = response.json().await.unwrap_or_default();
+        assert!(status.is_success(), "upgrading {old}: {status} {body}");
+        let replacement = body["replacement_room"].as_str().unwrap().to_owned();
+        let shard = format!("room/{}", layout.room_shard(&replacement).index);
+        assert_eq!(
+            &owners[&shard], owner,
+            "the replacement {replacement} (version {version}) is on a shard of the replica \
+             that owns the old room {old}"
+        );
+        *upgraded_by.entry(owner.clone()).or_default() += 1;
+
+        let tombstone: Value = client
+            .get(format!(
+                "{other}/_matrix/client/v3/rooms/{old}/state/m.room.tombstone/"
+            ))
+            .bearer_auth(&alice)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(tombstone["replacement_room"], replacement.as_str());
+        let (status, text) = loop {
+            let sent = client
+                .put(format!(
+                    "{other}/_matrix/client/v3/rooms/{replacement}/send/m.room.message/u{n}"
+                ))
+                .bearer_auth(&alice)
+                .json(&json!({"msgtype": "m.text", "body": "after the upgrade"}))
+                .send()
+                .await
+                .unwrap();
+            if sent.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let status = sent.status();
+                break (status, sent.text().await.unwrap_or_default());
+            }
+            let body: Value = sent.json().await.unwrap_or_default();
+            let wait = body["retry_after_ms"].as_u64().unwrap_or(500);
+            tokio::time::sleep(Duration::from_millis(wait.max(50))).await;
+        };
+        assert!(status.is_success(), "{replacement}: {status} {text}");
+    }
+    for (i, (mesh, base)) in replicas.iter().enumerate() {
+        assert_eq!(
+            metric(&client, base, UPGRADES).await - upgrades_before[i],
+            upgraded_by.get(mesh).copied().unwrap_or(0),
+            "replica {mesh} ran the upgrades of the rooms it owns"
+        );
     }
 
     drop(replica_2);

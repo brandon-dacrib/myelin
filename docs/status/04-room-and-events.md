@@ -2,11 +2,68 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
-Last updated: 2026-10-01 (session 15: `POST /search`, below). Before that, 2026-09-30 (session
+Last updated: 2026-10-01 (session 16: upgrading a room to version 12; session 15: `POST
+/search`, below). Before that, 2026-09-30 (session
 14: a new room's id is placed on a shard the replica building it owns, version 12 included;
 session 13: the state at backfilled history is asked for; session 12: the history between a
 leave and a rejoin; session 11: the client space hierarchy) and 2026-09-28 (session 10: the
 admin API's room long tail).
+
+> **2026-10-01, session 16: an upgrade to room version 12 tombstones the old room with the
+> replacement's real id** (branch `agent/room-cluster-small`, its first commit; known gap
+> "Upgrading a room to version 12 leaves a tombstone pointing nowhere" closed).
+> `POST /rooms/{roomId}/upgrade` minted the replacement's opaque id, tombstoned the old room
+> naming it, then created the room under it. A version-12 create ignores a chosen id (it is the
+> create event's hash), so the tombstone named a room that never existed.
+>
+> - **Two orders, by the target's id format** (`crates/hs-room/src/routes/upgrade.rs`).
+>   Version 12+: the requester's join and power to send `m.room.tombstone` are checked first
+>   (`RoomActor::can_send_state`), then the replacement is created (placed on an owned shard by
+>   `create_placed`, decision 0020) with `predecessor: {room_id}` only (`event_id` is optional
+>   from client-server API v1.16), then the tombstone names its real id. Versions 1-11 keep
+>   id, tombstone, room, with `predecessor.event_id` naming the tombstone.
+> - **Found on the way, both fixed, both with no row.** (1) Upgrading *to* 12 also failed on
+>   its power levels: the old room's `users` named the upgrader, which version 12's auth rules
+>   refuse for a creator (`creator user IDs are not allowed in the users field`), so every
+>   11-to-12 upgrade was `403` after the tombstone was already written. The replacement's
+>   creators (the upgrader and the new `additional_creators` body field, v1.16) are now taken
+>   out of `users`; upgrading *from* 12 to an earlier version gives the old room's creators 100,
+>   or the upgrader had no power to send the replacement's initial state. (2) In a cluster an
+>   opaque replacement id was random, so three upgrades in four (with four room shards, one
+>   owned) tombstoned the old room and then had the create refused by the fence (`503`): the
+>   gate forwards an upgrade to the owner of the *old* room, and the replacement's id was not
+>   placed. It is now minted until it hashes to an owned shard (`RoomRegistry::owns_room`),
+>   before anything is written, and refused with `503` if the bound runs out.
+> - **Observability.** `hs_room_upgrades_total{outcome="completed"|"replacement_orphaned"}`;
+>   `info` "upgraded a room" with both ids and the version; `warn` when one half was written
+>   and the other failed (a tombstone naming a room whose create failed, or a replacement whose
+>   tombstone was refused).
+> - **Tests**, the first five failing without the fix (checked by putting the old handler back
+>   under the new tests, and the creator-power translation by switching it off):
+>   `routes::upgrade::tests::an_upgrade_to_v12_tombstones_the_old_room_with_the_real_replacement_id`
+>   (the tombstone's `replacement_room` is a room the registry has, at version 12, its create
+>   names the old room, the topic and alias moved, the creator joined and is not in `users`),
+>   `an_upgrade_to_v12_names_additional_creators`,
+>   `an_upgrade_from_v12_to_an_earlier_version_keeps_the_creator_in_charge`,
+>   `an_upgrades_replacement_lands_on_a_shard_this_replica_owns` (fencing installed, one shard of
+>   four owned; eight upgrades to 9-12 all land there), and
+>   `a_refused_upgrade_to_v12_creates_no_room` (passes either way; guards the new order).
+>   `crates/hs-cli/tests/room_upgrade.rs` (new; the real `hs` binary): 11 to 12 and 10 to 11
+>   through the client API, bob reads the tombstone, joins the replacement by its id and
+>   speaks there, the create's `predecessor`, the moved topic and alias, the old room locked,
+>   and `hs_room_upgrades_total` is 2. `crates/hs-cli/tests/cluster_create_room.rs` (two
+>   replicas on PostgreSQL) now also upgrades six rooms (to 12 and 11) through the replica that
+>   does not own them: each replacement is on a shard of the old room's owner, the tombstone
+>   names it, it takes a message through the other replica, and each replica's
+>   `hs_room_upgrades_total` counts the upgrades of the rooms it owns.
+> - **How to verify.** `cargo test -p hs-room --lib upgrade`; `cargo test -p hs-cli --test
+>   room_upgrade`; `HS_CLUSTER_TEST_POSTGRES_DSN=... cargo test -p hs-cli --test
+>   cluster_create_room`.
+> - **Interfaces provided (new).** `RoomActor::{creators, privileges_creators}`; the
+>   `additional_creators` field of `POST /upgrade`.
+> - **Not done.** The replacement gets the spec's recommended transferable state only; bans in
+>   the old room are not carried over (Synapse carries them). Complement's upgrade tests were
+>   not run this session.
 
 > **2026-10-01, session 15: `POST /search` finds room events** (branch `agent/room-gaps`; known
 > gap "`/search` unimplemented" closed; decision 0021). Element's search box answered

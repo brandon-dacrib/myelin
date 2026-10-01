@@ -3526,7 +3526,23 @@ impl<B: KvBackend> RoomActor<B> {
     }
 
     /// This room's creators: the `m.room.create` sender (or its `creator` field, below room
-    /// version 11) plus any `additional_creators`.
+    /// version 11) plus any `additional_creators` (room version 12 and later).
+    ///
+    /// # Errors
+    /// Returns [`RoomError::State`] if the room's state could not be read, or
+    /// [`RoomError::Internal`] if the room has no `m.room.create`.
+    pub fn creators(&self) -> Result<Vec<OwnedUserId>, RoomError> {
+        self.room_creators(&self.rules)
+    }
+
+    /// Whether this room's version gives its creators implicit, unlimited power (room version
+    /// 12 and later, MSC4289), rather than the power their `m.room.power_levels` entry names.
+    #[must_use]
+    pub fn privileges_creators(&self) -> bool {
+        self.rules.explicitly_privilege_room_creators
+    }
+
+    /// [`RoomActor::creators`] under `rules`.
     fn room_creators(
         &self,
         rules: &hs_model::room_version::RoomVersionRules,
