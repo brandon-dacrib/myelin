@@ -96,6 +96,43 @@ server. What it has still not done is decrypt or encrypt a room message: that ne
 WhatsApp account, and a phone. The bridge's avatar fetch from `maunium.net` got a 502 (no
 federation on that test server), which is unrelated and harmless.
 
+## 2026-10-01: the server asks the bridge who has signed in
+
+The render now writes a `provisioning.shared_secret` of its own into `config.yaml` and keeps the
+same value in the registration (`io.myelin.provisioning_secret`), so `GET
+/api/v1/appservices/{id}/logins?user_id=` can ask the bridge's provisioning API
+(`GET /_matrix/provision/v3/whoami` on its appservice listener, bearer the secret) and the Sign in
+tab can say "Signed in as +1 555… since …" or "not signed in". Branch `agent/bridge-logins`;
+the design is in `docs/status/11-appservices-and-bridges.md` (2026-10-01).
+
+Run against the same image (`dock.mau.dev/mautrix/whatsapp:latest`, `v26.09+dev.a0325e76`) on
+that branch's debug binary: the files of a `POST /bridge-types/mautrix-whatsapp/render`
+(`bridgeAddress: http://127.0.0.1:29399`, the server at `http://host.docker.internal:18731`),
+registered with `POST /appservices`, the container started with `-p 29399:29318`. The bridge's
+config upgrader completed `config.yaml` (40 lines to 666) and **kept the rendered secret**
+(line 439, the same 64 hex characters as the registration's). Nobody signed in, so:
+
+```
+GET /api/v1/appservices/whatsapp/logins?user_id=@ops:test.local
+{"appservice_id":"whatsapp","bridge_type":"mautrix-whatsapp","provisioning_api":"mautrix_v3",
+ "supported":true,"reason":null,"user_id":"@ops:test.local","signed_in":false,"logins":[],
+ "checked_at":"2026-10-01T06:51:55.727Z","cached":false,"error":null}
+```
+
+Asked again at once, `cached: true`; `/metrics` had
+`hs_admin_bridge_login_queries_total{type="mautrix-whatsapp",outcome="answered"} 1` and
+`outcome="cached"} 1`. With the container stopped, the same question about another user was a
+`200` with `error: {status: 502, reason: "unreachable", ...}` and the server logged `WARN ...
+could not ask a bridge who has signed in appservice=whatsapp ... reason=unreachable`. A login
+with a phone (and so the `logins[]` entries of a real WhatsApp account) has not been seen; the
+shape is mautrix-go's `RespWhoami`, which `hs_admin::bridge_logins::answered` reads and the
+stand-ins in the tests serve.
+
+A bridge registered before this (the demo's, from 2026-09-25) has a secret the bridge generated
+itself; the answer says so, and copying `provisioning.shared_secret` from its `config.yaml` into
+the registration with `PATCH /api/v1/appservices/{id}` `{"io.myelin.provisioning_secret": "..."}`
+makes it answer.
+
 ## What the bridge's first minute found
 
 - **The first ping lost a race, and the server kept the loss.** A mautrix bridge pings the

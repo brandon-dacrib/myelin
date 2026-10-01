@@ -43,6 +43,17 @@ a room that went hot left "cold"). Federation's targeted Complement set went 14/
 the two left are a race in the tests themselves. Nine stale worktrees (190 GB) removed. Every
 paragraph below gives the commit, the status file and what is left.
 
+**Branch `agent/bridge-logins` (not merged by its agent; for the merge queue): the admin API
+says who has signed in to a bridge.** `GET /api/v1/appservices/{id}/logins?user_id=`
+(`bridges:read`) asks a mautrix `bridgev2` bridge's `/_matrix/provision/v3/whoami` with a
+provisioning secret the render and the offering manager now mint into `config.yaml` and the
+registration; heisenbridge, matrix-appservice-irc and hookshot answer `supported: false` with
+why; the Sign in tab shows it. Real `hs` binary test `crates/hs-cli/tests/bridge_logins.rs`, and
+the real mautrix-whatsapp image answered "not signed in" through it. Also fixed: a registration
+merge patch dropped unrecognised top-level keys. Touches `hs-admin` (one additive operation,
+`BridgeType.provisioning_*`), `hs-appservice`, `hs-bridges`, `hs-cli/src/appservice_delivery.rs`
+and `web/`. Details in `docs/status/11-appservices-and-bridges.md` (2026-10-01).
+
 **Branch `agent/cluster-gaps` (not merged by its agent; for the merge queue): two `hs-cluster`
 gaps closed.** The last replica of a cluster stopping no longer waits out its drain deadline
 for a claim that cannot come (it releases its shards at once with their epochs advanced;
@@ -1782,7 +1793,7 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | ~~Receipts and presence in memory~~ | `hs-user` | **Closed** (e808bac, 51ba7bd): the `hs_user.receipts` and `hs_user.presence` keyspaces; `e2e.rs::receipts_and_presence_are_still_there_after_a_restart_of_the_real_binary` |
 | ~~Postgres `tls`/`pool_size`/schema~~ | `hs-kv`, `hs-cli` | **Closed** (`agent/postgres-tls`, 2026-09-30): `storage.postgres.ssl_mode` (libpq's `disable`/`prefer`/`require`/`verify-ca`/`verify-full`, `tls: true` still loads as `require`), `ssl_root_cert`, `schema` and `pool_size` all reach the connection over `rustls`; the chart's `sslMode` is rendered; `hs-cli/tests/postgres_tls.rs` boots the real binary in every mode against a TLS PostgreSQL and a plain one. The two-pod values still say `disable`; not yet switched on the cluster |
 | ~~`e2e/configuration.spec.ts` failed once in 112 runs~~ | `web` | **Closed** 2026-10-01 (`agent/web-gaps`, status 16): not reproduced in 150 runs of the spec (750 of 750 tests) under a one-minute load average of 23-37 (mean 30, 12 cores) on 2026-10-01; trace capture left on, and made to work in CI: `playwright.config.ts` traces every attempt and keeps a failing one's (`retain-on-failure-and-retries`; `on-first-retry` traced only the retry that passed), and `failOnFlakyTests` in CI, so a flake fails the job and `ci.yml` uploads the report with the trace instead of a green run hiding it |
-| A bridge's per-user sign-in state is invisible to the admin API | `hs-admin`, bridges | the Sign in tab says how to sign in, not who has; the bridges keep that state themselves |
+| ~~A bridge's per-user sign-in state is invisible to the admin API~~ | `hs-admin`, `hs-appservice`, `hs-bridges`, `web` | **Closed** 2026-10-01 (`agent/bridge-logins`, status 11): `GET /api/v1/appservices/{id}/logins?user_id=` asks a mautrix `bridgev2` bridge's `/_matrix/provision/v3/whoami` with the provisioning secret a catalogue render or an offering's instance now mints into `config.yaml` and the registration (`io.myelin.provisioning_secret`), and answers `user_id`, `remote_id`, `remote_name`, `state`, `since` per login, cached 30 s per bridge and user, counted in `hs_admin_bridge_login_queries_total{type,outcome}`. **Every `mautrix-*` type answers; heisenbridge (`none`), matrix-appservice-irc (`irc_v1`) and hookshot (`hookshot_v1`) answer `200 supported: false` with why**, as does a registration made before the secret was kept (an administrator can patch the bridge's own secret in). An unreachable bridge is a `200` with the error in the answer. The Sign in tab shows "Signed in as … since …" / "not signed in". Left: mautrix-discord not checked to be on bridgev2; hookshot's accounts not read; the offering page lists instances without their sign-in state |
 | ~~The live overview statistics leave media out~~ | `hs-cli` | Fixed by `agent/admin-followups`: overview media totals are wired to the repository and covered by real-server empty/nonempty checks; the overview snapshot is cached for 60 seconds |
 | Setup link assumes `localhost:<bound port>` without `public_baseurl` | `hs-cli` | wrong behind a remapped port or an undescribed proxy |
 | The shard-gated appservice pump has only been tested with a scripted ownership | `hs-cli` | it moves with the global and appservice shards in the unit test; a real two-replica handoff of bridge delivery on the cluster has not been watched |

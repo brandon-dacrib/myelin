@@ -80,6 +80,21 @@ sure the next failure leaves its error behind, in CI too (`web/playwright.config
   `data/`) is uploaded. Checked with a throwaway spec that fails on its first attempt only:
   `CI=1 npx playwright test` exits 1, "1 flaky", and the report holds both attempts' traces.
 
+## 2026-10-01: the Sign in tab says who has signed in (by track 11)
+
+Branch `agent/bridge-logins`. The bridge page's Sign in tab opens with **Who has signed in**
+(`src/components/BridgeSignInState.tsx`, `useAppserviceLogins` in `api/bridges.ts`), from the
+new `appservices.logins` operation: "Signed in as +1 555-123-4567 since 28 Sep 2026, 10:00" per
+login (with a warning badge and the bridge's reason when the login is not `connected`),
+"@bob:example.org is not signed in.", "Could not ask the bridge: ..." when the bridge did not
+answer, and "This bridge keeps who has signed in itself." with the server's reason for a type
+without a provisioning API (heisenbridge, matrix-appservice-irc, hookshot) or a registration
+made before the server kept the bridge's secret. A shared bridge asks for a "Matrix user"
+(starting with the operator's own ID); a per-user instance is asked about its owner. The guide
+(how to sign in) is unchanged below it. `schema.d.ts` regenerated (additive); the mock server
+answers every case (`mocks/data/appservices.ts`, `appserviceLogins`); four unit tests
+(`BridgeSignInState.test.tsx`). No Playwright flow covers the tab's new part yet.
+
 ## 2026-09-29: admin interface integration complete
 
 The admin follow-ups, configuration history/revert, and hot reload are on pushed `main` at

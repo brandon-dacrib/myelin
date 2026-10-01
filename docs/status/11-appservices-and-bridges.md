@@ -1,9 +1,103 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-01 (the `cluster` runtime run on kind, below); before that 2026-09-30
-(ephemeral, to-device and device-list delivery); before that
+Last updated: 2026-10-01 (who has signed in to a bridge; the `cluster` runtime run on kind;
+both below); before that 2026-09-30 (ephemeral, to-device and device-list delivery); before that
 2026-09-27 (RFC 0017 run against the real binary), 2026-09-27 (the bridge manager) and
 2026-09-25.
+
+## Session 2026-10-01 (branch `agent/bridge-logins`): the admin API says who has signed in to a bridge
+
+**The gap** (`docs/next-steps.md`, "A bridge's per-user sign-in state is invisible to the admin
+API"): the Sign in tab said how to sign in, never who had; the bridges keep that state
+themselves. Now `GET /api/v1/appservices/{id}/logins?user_id=` (`appservices.logins`,
+`bridges:read`, a read so not audited) asks the bridge, honestly per bridge type:
+
+- **Which types answer.** The catalogue (`hs_admin::bridge_types`) gained `provisioning_api`
+  and `provisioning_note` per type (`BridgeType`, OpenAPI). Every `mautrix-*` entry is
+  `mautrix_v3` (a `bridgev2` bridge's `/_matrix/provision/v3`, on its appservice listener, the
+  registration's `url`) and **is asked**; heisenbridge is `none` (no provisioning API, its
+  state is its control room), matrix-appservice-irc is `irc_v1` (it links rooms to channels,
+  reports no nicks), hookshot is `hookshot_v1` (connections, not accounts). Those three answer
+  `200 {"supported": false, "reason": ...}`, never a `501`; so does a registration not made from
+  the catalogue.
+- **The secret.** A mautrix render (`POST /bridge-types/{type}/render`) and an offering's
+  instance (`hs-bridges`, minted with its tokens, `InstanceRow::provisioning_secret`,
+  `#[serde(default)]`) now carry a 64-hex `provisioning.shared_secret` in `config.yaml` and the
+  same value in the registration's `io.myelin.provisioning_secret` (`PROVISIONING_SECRET_KEY`),
+  which the registry keeps with the other unrecognised keys and exports with the registration
+  (which already carries both tokens). A registration made before this has none and says so,
+  naming the key; an administrator can copy the bridge's own secret in with a merge patch.
+  **Found on the way, no row:** `PATCH /appservices/{id}` silently dropped any top-level key
+  the registration format does not define (the merge went into a JSON shape that holds
+  unrecognised keys under `extra`); it now merges such keys into `extra`, and a `null` removes
+  one (`Registry::update`, `PATCHABLE_KEYS`).
+- **The answer** (`hs_admin::bridge_logins`, pure: `plan` decides from the registration whether
+  and how to ask, `answered` normalises mautrix-go's `RespWhoami`, `failed`/`refused` shape a
+  failure): `{appservice_id, bridge_type, provisioning_api, supported, reason, user_id,
+  signed_in, logins: [{user_id, remote_id, remote_name, state, state_reason, since}],
+  checked_at, cached, error}`. `state` is the bridge's `state_event` lower-cased
+  (`connected`, `bad_credentials`, ...); `since` is its `state_ts` (seconds) as RFC 3339;
+  `remote_name` is the login's `name`, else the profile's name, phone, username or email.
+  `user_id` may be left out for a per-user instance (its owner is asked about); a shared bridge
+  without it is a `400` at `/user_id`.
+- **The asking** (`hs_appservice::provisioning::BridgeLogins`, behind
+  `AppserviceDirectory::logins`, a new trait method whose default answers `503`): bearer secret,
+  `?user_id=`, 10 s timeout, no redirects. An unreachable, refusing or slow bridge is a `200`
+  with `error: {status, reason: unreachable|timeout|refused|invalid_answer, detail}` (502, 504,
+  or the bridge's own status with its `errcode`), the way a ping reports an unreachable bridge.
+  Answers are kept **30 s per (bridge, user)**; failures are not kept.
+- **Observability.** `hs_admin_bridge_login_queries_total{type,outcome}` (`outcome`:
+  `answered`, `cached`, `unsupported`, `unreachable`, `timeout`, `refused`, `invalid_answer`;
+  registered with the other appservice series in `AppserviceMetrics`, so `hs serve` needed no
+  change beyond handing the directory its metrics in `appservice_delivery.rs`), and a `warn`
+  line `could not ask a bridge who has signed in` with the appservice, type, user, URL, reason,
+  status and detail.
+- **The interface** (`web/src/components/BridgeSignInState.tsx`, on the bridge page's Sign in
+  tab above the guide): "Signed in as +1 555-123-4567 since ..." per login (a badge and the
+  bridge's reason when a login is not `connected`), "@bob:… is not signed in.", "Could not ask
+  the bridge: ..." when it could not be asked, and "This bridge keeps who has signed in itself."
+  with the reason for a type without an API. A shared bridge gets a "Matrix user" box that
+  starts with the operator's own ID.
+
+**Verified.**
+
+- `cargo test -p hs-admin`: `bridge_logins::tests` (5: planning per type and per missing
+  piece, the whoami normalisation including seconds and milliseconds, a null `logins`, a
+  refusal's words), `bridge_types::tests::every_type_says_what_provisioning_api_it_has_and_only_mautrix_reports_logins`,
+  the mautrix render and instance tests now assert the secret in both files, and
+  `router::tests::a_bridges_logins_are_read_per_type_and_a_type_without_an_api_says_so`
+  (`bridges:read` suffices; heisenbridge `200 supported: false`; `400` at `/user_id`; `404`).
+  The contract test still holds; `tools/admin_api_coverage.py`: **161 of 161**.
+- `cargo test -p hs-appservice`: `provisioning::tests` (4, against an axum stand-in serving
+  mautrix's `whoami` shape: answered then cached with one request to the bridge, per-user
+  caching, an instance's owner asked about unnamed; an unreachable port, a wrong secret (twice,
+  not cached), a bridge slower than the timeout, each an answer with the error; heisenbridge and
+  a custom registration not asked; the counter for each outcome);
+  `admin_directory::tests::a_registrations_provisioning_secret_is_kept_and_a_patch_can_add_one`
+  (failed before the merge-patch fix: the patched secret vanished); `metrics::tests`.
+- `cargo test -p hs-bridges`: the manager test asserts an instance's registration and
+  `config.yaml` carry the same secret and that its owner is asked about at
+  `http://whatsapp-alice:29318/_matrix/provision/v3/whoami`.
+- `crates/hs-cli/tests/bridge_logins.rs`,
+  `the_admin_api_says_who_has_signed_in_to_a_bridge_and_says_so_when_it_cannot` (**1 of 1,
+  29 s**, the real `hs` binary from a configuration file): mautrix-whatsapp rendered and
+  registered over the admin API, its stand-in accepting only the secret from the rendered
+  `config.yaml`; alice signed in (`remote_name`, `state: connected`, `since`), bob not, alice
+  again `cached` with the bridge asked twice in all, `400` with no `user_id`; heisenbridge
+  `supported: false`; a mautrix-signal with nothing listening, `error.status 502
+  unreachable` and the `warn` line; the four counter series on `/metrics`.
+- **The real mautrix-whatsapp** (`docs/bridges/mautrix.md`, "2026-10-01"), not signed in: its
+  config upgrader kept the rendered secret, and the admin API answered `supported: true,
+  signed_in: false, logins: []` from its `whoami`; asked again, `cached: true`; with the
+  container stopped, `error.reason: unreachable`. No phone, so no `logins[]` from a real
+  account.
+- `web`: `BridgeSignInState.test.tsx` (4); mock server answers the operation for every case.
+
+**Left.** Only mautrix `bridgev2` bridges answer. mautrix-discord was not checked to be on
+`bridgev2`; if it is not, its answer is an honest `refused` (404 or 401) rather than a list.
+hookshot's provisioning API may expose linked GitHub/GitLab accounts; not read. The cache is per
+replica. The offering page lists instances without their sign-in state (one request per
+instance; the instance's registration page has it).
 
 ## 2026-10-01 (branch `agent/platform-gaps`, track 12): RFC 0017's `cluster` runtime has run
 
@@ -515,6 +609,11 @@ to anything broken.
 
 ## Interfaces provided
 
+- `hs_appservice::provisioning::BridgeLogins` (2026-10-01): asks a mautrix bridge's
+  provisioning API who has signed in, with a 30 s cache and the
+  `hs_admin_bridge_login_queries_total` counter; `RegistryAppserviceDirectory::
+  with_bridge_logins`. The pure half, and the registration key `io.myelin.provisioning_secret`,
+  are `hs_admin::bridge_logins` and `hs_admin::bridge_types::PROVISIONING_SECRET_KEY`.
 - `hs_appservice::registry::Registry<B: hs_kv::KvBackend>`: the registration/health/backlog API —
   intended consumer: track 15's admin API and console (shapes chosen to match
   `crates/hs-admin/openapi/openapi.yaml`'s `AppService`/`AppServiceHealth`/

@@ -2,6 +2,22 @@
 
 Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-admin`, `hs-modules`, `hs-identity`, `hs-http` (shared with 07 and 14).
 
+## 2026-10-01: `appservices.logins`, who has signed in to a bridge (by track 11)
+
+Branch `agent/bridge-logins`. One additive operation, `GET /appservices/{id}/logins?user_id=`
+(`appservices.logins`, `bridges:read`, not audited): the bridge's own answer, from a mautrix
+`bridgev2` bridge's `/_matrix/provision/v3/whoami`, normalised to `BridgeLogins` /
+`BridgeLogin` / `BridgeLoginsError` (new schemas). A type without such an API is a `200` with
+`supported: false` and a `reason`, never a `501`; a bridge that could not be asked is a `200`
+with `error` set (as `appservices.ping` reports an unreachable bridge). `BridgeType` gained
+`provisioning_api` (`mautrix_v3`, `irc_v1`, `hookshot_v1`, `none`) and `provisioning_note`.
+`AppserviceDirectory` gained `logins` with a default that answers `503`, so no other
+implementation had to change; the in-memory one answers from `with_logins`. The handler
+enforces `bridges:read`, as the document says; the older `appservices.*` read handlers still
+enforce `admin:read` (which implies it), so a token with only `bridges:read` is refused by
+them, a mismatch with the document noted here and not changed. Coverage **161 of 161**. Details
+in `docs/status/11-appservices-and-bridges.md` (2026-10-01).
+
 ## 2026-09-29: admin integration complete
 
 Admin follow-ups (`28d40dc`), configuration history/revert (`eedb090`) and hot reload (`12a19eb`)
