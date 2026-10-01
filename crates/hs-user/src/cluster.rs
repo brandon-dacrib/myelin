@@ -1720,8 +1720,29 @@ mod two_replica_tests {
             })
             .await;
         say(&a, &room_id, &alice, 1, 200).await;
-        b.mirror.get_or_load(&room_id).await.unwrap();
-        assert_eq!(b.mirror.stats().full_loads, loads + 1);
+        let copy = b.mirror.get_or_load(&room_id).await.unwrap();
+        // One reload at least: the wake's prefetch and this read may each find the copy stale.
+        assert!(
+            b.mirror.stats().full_loads > loads,
+            "{:?}",
+            b.mirror.stats()
+        );
+        let timeline = |handle: hs_room::actor::RoomActorHandle<MemoryBackend>| async move {
+            handle
+                .query(|actor| {
+                    actor
+                        .events_after(i64::MIN, usize::MAX)
+                        .into_iter()
+                        .map(|(pos, e)| (pos, e.event_id().to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .await
+        };
+        assert_eq!(
+            timeline(copy).await,
+            timeline(owner).await,
+            "the copy shows the room as the owner does, purged events gone"
+        );
     }
 
     #[tokio::test]
