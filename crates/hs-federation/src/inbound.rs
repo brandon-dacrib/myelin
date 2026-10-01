@@ -249,6 +249,11 @@ pub struct WriteRejected {
     /// this, not string-matching on [`WriteRejected::error`], to decide whether a gap is worth
     /// trying to close.
     pub missing_ancestors: Vec<String>,
+    /// Whether event authorization refused the event (as opposed to it being unusable, or
+    /// unplaceable for now). Such an event was received and processed: `/send` answers `{}` for
+    /// it, as the spec's "a rejected event is still processed" and Synapse do, rather than an
+    /// error the sending server would read as a delivery failure.
+    pub auth_rejected: bool,
 }
 
 impl WriteRejected {
@@ -258,6 +263,18 @@ impl WriteRejected {
         Self {
             error: message.into(),
             missing_ancestors: Vec::new(),
+            auth_rejected: false,
+        }
+    }
+
+    /// A rejection by event authorization: the event was processed and refused
+    /// ([`WriteRejected::auth_rejected`]).
+    #[must_use]
+    pub fn auth(message: impl Into<String>) -> Self {
+        Self {
+            error: message.into(),
+            missing_ancestors: Vec::new(),
+            auth_rejected: true,
         }
     }
 
@@ -268,6 +285,7 @@ impl WriteRejected {
         Self {
             error: message.into(),
             missing_ancestors: missing,
+            auth_rejected: false,
         }
     }
 }
@@ -524,10 +542,8 @@ pub async fn process_transaction(
                             results.insert(event_id, serde_json::json!({}));
                         }
                         Err(still_rejected) => {
-                            results.insert(
-                                event_id,
-                                serde_json::json!({"error": still_rejected.error}),
-                            );
+                            let result = rejection_result(origin, &event_id, &still_rejected);
+                            results.insert(event_id, result);
                         }
                     },
                     Err(gave_up) => {
@@ -544,7 +560,8 @@ pub async fn process_transaction(
                 }
             }
             Err(rejected) => {
-                results.insert(event_id, serde_json::json!({"error": rejected.error}));
+                let result = rejection_result(origin, &event_id, &rejected);
+                results.insert(event_id, result);
             }
         }
     }
@@ -565,6 +582,24 @@ pub async fn process_transaction(
     let response = serde_json::json!({ "pdus": Value::Object(results) });
     transactions.put(origin, txn_id, response.clone()).await;
     Ok(response)
+}
+
+/// What `/send` answers for a PDU the sink did not take: `{}` for one event authorization
+/// rejected -- it was received and processed, and the spec and Synapse answer success for it
+/// (an error there tells the sender its delivery failed, which it did not) -- and `{"error": ..}`
+/// for everything else (a PDU that could not be parsed, placed or stored).
+fn rejection_result(origin: &str, event_id: &str, rejected: &WriteRejected) -> Value {
+    if rejected.auth_rejected {
+        tracing::info!(
+            origin,
+            event_id,
+            reason = %rejected.error,
+            "a PDU received over federation was rejected by event authorization"
+        );
+        serde_json::json!({})
+    } else {
+        serde_json::json!({ "error": rejected.error })
+    }
 }
 
 /// Why [`process_transaction`] refused a whole transaction outright (as opposed to one PDU within
@@ -838,6 +873,109 @@ mod tests {
         assert_eq!(pdus.len(), 1);
         let (_, result) = pdus.iter().next().unwrap();
         assert!(result.get("error").is_some());
+    }
+
+    /// A PDU event authorization rejects was received and processed: `/send` answers `{}` for
+    /// it, as Synapse does and Sytest expects ("Unexpected response from /send" in ten tests
+    /// before), while a PDU the sink could not take for any other reason is still an error.
+    #[tokio::test]
+    async fn a_pdu_rejected_by_auth_is_answered_with_an_empty_result() {
+        struct Refusing(bool);
+        #[async_trait]
+        impl RoomWriteSink for Refusing {
+            async fn accept_verified_event(
+                &self,
+                _room_id: &str,
+                _event_id: &str,
+                _event_json: &Value,
+            ) -> Result<WriteOutcome, WriteRejected> {
+                Err(if self.0 {
+                    WriteRejected::auth("event rejected: not allowed")
+                } else {
+                    WriteRejected::other("the store is down")
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let keys = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
+        let cache = key_cache(&keys, "origin.example.org");
+        let raw = signed_event(&keys, "!r:origin.example.org", "@alice:origin.example.org");
+        let event_id = Event::parse(&raw, RoomVersionId::V11)
+            .unwrap()
+            .event_id()
+            .to_string();
+        let rooms = room_source("!r:origin.example.org");
+        let body = serde_json::json!({"pdus": [raw], "edus": []});
+        for (auth, expected_error) in [(true, false), (false, true)] {
+            let response = process_transaction(
+                "origin.example.org",
+                &format!("txn-{auth}"),
+                &body,
+                &rooms,
+                &Refusing(auth),
+                &cache,
+                &InMemoryTransactionStore::new(),
+                None,
+                &crate::backfill::BackfillLimits::default(),
+                None,
+            )
+            .await
+            .unwrap();
+            let result = &response["pdus"][event_id.as_str()];
+            assert_eq!(result.get("error").is_some(), expected_error, "{response}");
+            if auth {
+                assert_eq!(*result, serde_json::json!({}));
+            }
+        }
+    }
+
+    /// A PDU in a room whose server ACL denies the transaction's origin is refused with an
+    /// error, by event ID, and not handed to the sink at all.
+    #[tokio::test]
+    async fn a_pdu_from_a_server_the_room_acl_denies_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
+        let cache = key_cache(&keys, "origin.example.org");
+        let raw = signed_event(&keys, "!r:origin.example.org", "@alice:origin.example.org");
+        let event_id = Event::parse(&raw, RoomVersionId::V11)
+            .unwrap()
+            .event_id()
+            .to_string();
+        let mut rooms = InMemoryRoomSource::new();
+        rooms.insert_room(
+            "!r:origin.example.org",
+            FakeRoom {
+                room_version: Some("11".to_owned()),
+                state: vec![serde_json::json!({
+                    "event_id": "$acl", "type": "m.room.server_acl", "state_key": "",
+                    "room_id": "!r:origin.example.org", "sender": "@admin:us.example.org",
+                    "content": {"allow": ["*"], "deny": ["origin.example.org"]},
+                })],
+                ..FakeRoom::default()
+            },
+        );
+        // A sink that would accept it: the refusal has to come before it.
+        let sink = StaticWriteSink::new(vec![event_id.clone()], "n/a");
+        let before = crate::metrics::acl_refusals("send");
+        let response = process_transaction(
+            "origin.example.org",
+            "txn-acl",
+            &serde_json::json!({"pdus": [raw], "edus": []}),
+            &rooms,
+            &sink,
+            &cache,
+            &InMemoryTransactionStore::new(),
+            None,
+            &crate::backfill::BackfillLimits::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        let error = response["pdus"][event_id.as_str()]["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{response}"));
+        assert!(error.contains("server ACL"), "{error}");
+        assert!(crate::metrics::acl_refusals("send") > before);
     }
 
     /// **Mutation test 2** (see the status file): replaying the same `(origin, txn_id)` must not

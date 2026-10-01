@@ -912,6 +912,9 @@ impl<B: KvBackend + 'static> hs_federation::inbound::RoomWriteSink for RegistryW
                     ),
                 ))
             }
+            // Event authorization refused it: processed and rejected, which `/send` answers
+            // `{}` for (`WriteRejected::auth_rejected`).
+            Err(e @ hs_room::RoomError::Forbidden(_)) => Err(WriteRejected::auth(e.to_string())),
             Err(e) => Err(WriteRejected::other(e.to_string())),
         }
     }
