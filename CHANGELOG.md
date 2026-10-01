@@ -163,6 +163,15 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Bridges
 
+- **A bridge is sent typing, receipts, presence, to-device messages and device-list changes,
+  each once.** MSC2409, MSC3202 and MSC4203 for a registration that asks for them, read from
+  server-wide streams at a durable position per appservice, stored in the same transaction as
+  the queued transaction body so a restart resends nothing and misses nothing; a paused bridge
+  holds them and resume delivers them. Verified 2026-09-30 against the real binary with a
+  stand-in bridge across a restart and a pause, and with a real mautrix-whatsapp in
+  appservice-mode encryption, which received its device-list change, one-time-key counts, the
+  ephemeral data and an `m.room_key_request` it handed to its Olm machine. Not yet done:
+  `device_lists.left` is never filled (Synapse's gap too), and no cluster run of this pump.
 - **Bridges are offerings, one per person, and the server deploys them.** RFC 0017
   (`docs/rfcs/0017-the-server-deploys-its-own-bridges.md`), built 2026-09-26 and run
   end to end against the real binary on 2026-09-27: an offering made through the admin API,
@@ -278,6 +287,22 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Federation
 
+- **Restricted rooms, invites, leaves and knocks cross servers, and so do the ephemeral
+  things.** A local user joins a restricted room without naming an authoriser, and through
+  another server when nobody here may invite; invites (v1 and v2), leaves and knocks are served
+  and sent between two servers; typing, receipts, presence, device-list changes, signing-key
+  updates and to-device messages cross servers both ways, and in cluster mode an EDU taken by a
+  replica that does not send for its destination is forwarded over the mesh to the one that
+  does. Another server's media is fetched over the signed federation media endpoints (with the
+  legacy fallback), served from the held copy afterwards, and this server's media is served to
+  others as `multipart/mixed`. Spaces answer: the client `/hierarchy` walks `m.space.child` and
+  asks a child's servers over federation. Measured 2026-09-30 on Complement's restricted-room,
+  invite and knock tests: 16 of 18 (96 of 98 with subtests), from 5 of 18 four days earlier;
+  the five space tests 5 of 5. Found on the way and fixed: the state-resolution adapter
+  truncated every real `origin_server_ts` to `u32::MAX`, so a leave forked from a power-levels
+  change lost to the join it superseded about half the time. Not yet: a rejoining server does
+  not fetch what it missed while out, a destination down for longer than its queue is not
+  caught up, and none of it has been tried against Synapse.
 - **An event queued for a server that is down survives a restart, and arrives.** The outbound
   queue and every destination's retry state (failing since, next attempt, last error) are in
   the database: a PDU is written before any worker sees it and removed only when the
@@ -405,6 +430,35 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Operations
 
+- **Two pods on a real cluster, and what is between them crosses.** Two replicas ran as pods
+  on the owner's cluster on 2026-09-28 with a CloudNativePG database and SeaweedFS media: a
+  client's `/sync` from either pod, rooms handed between them during a rolling update and a
+  pod loss, drain and undrain through the admin API and the Cluster page. That run found
+  requests landing mid-handoff failing (322 during the rolling update, 7 of 240 in the
+  failover); on `main` since 2026-09-30 such a request waits for the new owner instead
+  (decision 0017), typing, receipts and presence cross replicas on the wake the room owner
+  already sends (decision 0018, verified as two real `hs serve` on PostgreSQL), and a replica's
+  `/metrics` has the `hs_cluster_*` series. The pods have not yet run with that image.
+- **PostgreSQL over TLS.** `storage.postgres.ssl_mode` is libpq's five modes over rustls with
+  `ssl_root_cert`, `pool_size` and `schema` reach the connection, the chart renders `sslMode`
+  and the operator's `Homeserver` has it; `require` against a plain server fails at startup
+  naming the setting. Verified 2026-09-30 with the real binary in every mode against a TLS
+  PostgreSQL and a plain one. An empty password used to be rendered as `password=` and rejected.
+- **`/sync` never repeats an event across two batches, and a join is in the very next sync.**
+  A batch carries the rooms with a feed entry at or before its token and each room's timeline
+  stops where it was then; a 300-event writer racing a syncing device repeated 159 before and
+  none now (2026-09-30). Members of a room that crossed the fan-out threshold used to be left
+  "cold" and hear nothing more from it; fixed the same day.
+- **Configuration history, revert and hot reload.** The section page shows each setting's old
+  and new values and who changed it, with a revert; message rate limits, the federation allow
+  and block lists and the log level apply on the running server, and a save says what applied
+  and what waits for a restart; other replicas pick a change up within ten seconds. Verified
+  2026-09-29 with real-binary tests and five browser flows against the real server.
+- **The admin API is complete at the handler level: 160 of 160 operations** (2026-09-29,
+  `tools/admin_api_coverage.py`), reports, tasks, statistics, media (listing, quarantine,
+  deletion as a cancellable task), registration tokens, server notices, federation keys and
+  shared rooms among the last; the interface's Reports, Tasks, Statistics, Media, Cluster and
+  Migration pages are real. Handler coverage is a ceiling, not a conformance claim.
 - **Replicas know their own address, speak mutual TLS to each other, and a room is created
   by the replica that owns it.** A replica advertises the address it is configured with (the
   chart gives each pod its stable DNS name under the headless Service, so one wildcard
@@ -447,7 +501,8 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 ### Build and release
 
 - CI on amd64 and arm64: fmt, clippy with `-D warnings`, the full workspace test suite, and a
-  dependency audit.
+  dependency audit; since 2026-09-30 also the web interface's lint, types, unit tests, build and
+  the mock-backed Playwright suite (until then CI ran no web checks at all).
 - CD publishes multi-architecture images with an SBOM and build provenance, and **refuses to
   publish an image that has not booted and answered `/health/live` and `/_matrix/client/versions`
   on both architectures**. Releases are gated on CI being green for that exact commit.
@@ -460,8 +515,9 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Numbers
 
-26 crates, ~154,000 lines of Rust (`wc -l` over `crates/**/*.rs`, tests included), 1,678 passing tests, plus a TypeScript management interface
-with its own unit and end-to-end suites.
+27 crates, ~249,000 lines of Rust (`wc -l` over `crates/**/*.rs`, tests included), 2,436 passing
+tests (2026-09-30), plus a TypeScript management interface with 443 unit tests and 50 mock-backed
+browser flows, both run by CI.
 
 ## Notes on how this was built
 

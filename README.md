@@ -32,7 +32,10 @@ one renders the bridge's own `config.yaml` and its registration, already pointed
 server; the Created page says where to put them, how to start the bridge, turns green when it
 connects, and gives the sign-in steps for that network with the bot's real name.
 mautrix-whatsapp was added exactly that way and connected in seconds
-(`docs/bridges/mautrix.md`).
+(`docs/bridges/mautrix.md`). A bridge is sent what the bridge specifications ask for: events,
+typing, receipts, presence, to-device messages and device-list changes (MSC2409, MSC3202,
+MSC4203), each exactly once across a restart; mautrix-whatsapp runs its encryption in
+appservice mode against it.
 
 **And a bridge can be offered to everyone.** An administrator switches WhatsApp on for the
 server; a person gets their own bridge by messaging `@whatsappbot`, which sets it up and
@@ -50,15 +53,17 @@ Megolm establishes, the recipient decrypts. `cargo test -p hs-loadgen --test rea
 
 | | |
 |---|---|
-| Complement `csapi` | 314 / 384 assertions (78 / 106 tests) |
-| Complement federation | 73 / 250 assertions (12 / 88 tests), measured 2026-09-26; 59 / 246 (6 / 88) five days earlier |
+| Complement `csapi` | 317 / 384 assertions (78 / 106 tests), measured 2026-09-26 |
+| Complement federation, whole package | 75 / 250 assertions (14 / 88 tests), measured 2026-09-26; 59 / 246 (6 / 88) five days earlier |
+| Complement federation, restricted rooms, invites and knocks | 16 / 18 tests (96 / 98 with subtests), measured 2026-09-30; the two left are a race in the tests themselves |
 | Spec routes served | 138 / 235 (58.7%) — client-server 108/166, server-server 30/36 |
-| Rust | 26 crates, ~154k lines, 1,678 tests |
+| Rust | 27 crates, ~249k lines including tests, 2,436 tests |
 
-**It runs for real.** PostgreSQL or an embedded store, a distroless non-root image on amd64 and
-arm64, a Helm chart, and a Kubernetes operator. Two replicas share a room without forking its
-history. CD refuses to publish an image that has not booted and answered `/health/live` on both
-architectures.
+**It runs for real.** PostgreSQL (over TLS, with libpq's five modes) or an embedded store, a
+distroless non-root image on amd64 and arm64, a Helm chart, and a Kubernetes operator. Two
+replicas share a room without forking its history, and have run as two pods on a real cluster.
+CD refuses to publish an image that has not booted and answered `/health/live` on both
+architectures, and runs the web interface's checks and browser flows on every push.
 
 ```sh
 docker run -d --name myelin -p 8008:8008 -v myelin:/data \
@@ -126,36 +131,39 @@ refused, which found that the chart's volume claim template carried labels that 
 every publish and that Kubernetes never lets change; fixed the same day, and
 `docs/status/12-platform-and-kubernetes.md` has the one manual step an install made before the
 fix needs. Cluster mode
-(`mode=cluster`, PostgreSQL or CloudNativePG, media on S3, a shared signing-key Secret) renders
-and has run as two processes on one PostgreSQL, but has not yet carried real traffic on a
-cluster; that is the top of `docs/next-steps.md`. `docs/scaling.md` says exactly what adding a
+(`mode=cluster`, PostgreSQL or CloudNativePG, media on S3, a shared signing-key Secret) has run
+as two pods on a real cluster (2026-09-28): a client's `/sync` served from either pod, rooms
+handed between them during a rolling update and a pod loss. That run found requests landing
+mid-handoff failing; the fix is on `main` and the re-run with it is the top of
+`docs/next-steps.md`. `docs/scaling.md` says exactly what adding a
 replica buys (rooms and clients in flight, availability) and what it does not (one room's
 throughput, database capacity), and which of that is built today.
 
 `CHANGELOG.md` is the full record of what has been built, and is honest about the difference
 between a route that is registered and a route that works. `docs/next-steps.md` is what comes next
-and the gaps as they actually stand — the largest being that administering this server should be
-pleasant, and is not yet.
+and the gaps as they actually stand, as a table that is refreshed against the code and closed
+one row at a time — the largest being that a user here cannot yet talk to the rest of Matrix the
+way a Synapse user can.
 
 ## How far along is it
 
-Roughly **60% of a homeserver somebody else could run**, but the number only means something
+Roughly **65% of a homeserver somebody else could run**, but the number only means something
 broken up, because the parts are nowhere near each other. This table is kept current with
 `docs/next-steps.md`, which has the basis for each figure.
 
 | Area | Done | Basis |
 |---|---|---|
-| Client-server API | ~75% | 317/384 Complement csapi assertions; two Element sessions chat encrypted |
-| Storage, rooms, state resolution | ~85% | 1,600+ tests, two backends through one conformance suite |
-| Configuration and first run | ~90% | database-backed, edited in the UI, one command from nothing to a server |
-| Admin API | ~61% | 97 of 158 operations have a real handler (`python3 tools/admin_api_coverage.py`); the rest answer an honest 501 |
-| Management web interface | ~80% | users, rooms, bridges (catalogue, wizard, runbook, sign-in guides), federation, media, registration tokens, server notices, configuration (structured settings as forms) and the audit log are real against the real server; the Reports, Tasks and Statistics pages are not built yet |
-| Bridges | ~75% | heisenbridge works end to end; mautrix-whatsapp, added through the wizard, connects and starts encrypted; no mautrix bridge has carried a message yet; offering a bridge to everyone, each person getting their own instance by messaging its bot, runs end to end against the real server, with a real heisenbridge started from the rendered files; the server deploying the instance itself has not run against Kubernetes |
-| Operations (HA, scale-out) | ~50% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; the chart is published from `main` and installs from the registry in one sentence; a standing demo behind an Ingress with a real certificate, scraped by Prometheus, its setup page opened in a browser; a locked-out administrator gets back in with one command run where the key is; readiness is withdrawn the moment a shutdown begins; two replicas on one PostgreSQL serve a client's `/sync` from either, woken over the mesh, with the outbound federation queue durable and shard-gated; the cluster path has not carried real traffic on a cluster; the operator reconciles a `Bridge` into a pod, a Service and a volume in unit tests only, and does not deploy the server itself |
-| **Federation** | **~30%** | 75/250 assertions, 14/88 tests; a user joins a room hosted elsewhere through the client API, messages flow both ways between two instances of this server, and the room's history from before the join is fetched as the client scrolls back; no EDUs, in-memory outbound queue, not yet tried against Synapse |
+| Client-server API | ~75% | 317/384 Complement csapi assertions; two Element sessions chat encrypted; spaces (`/hierarchy`) answer; `/search` does not |
+| Storage, rooms, state resolution | ~85% | 2,400+ tests, two backends through one conformance suite, PostgreSQL over TLS |
+| Configuration and first run | ~90% | database-backed, edited in the UI with per-setting history and revert, one command from nothing to a server; rate limits, federation lists and the log level apply without a restart, the rest say they need one |
+| Admin API | ~90% | 160 of 160 operations have a real handler (`python3 tools/admin_api_coverage.py`), with real-server tests behind them; that is handler coverage, not a claim that every Synapse admin workflow has an equivalent |
+| Management web interface | ~85% | users, rooms, bridges (catalogue, wizard, runbook, sign-in guides, offerings), federation, media, registration tokens, server notices, reports, tasks, statistics, cluster, migration, configuration (structured settings as forms, with history) and the audit log are real against the real server |
+| Bridges | ~80% | heisenbridge works end to end; mautrix-whatsapp, added through the wizard, connects, runs encryption in appservice mode and receives device lists, key counts, to-device messages and ephemeral data; no mautrix bridge has carried a message yet (signing in needs a phone); offering a bridge to everyone, each person getting their own instance by messaging its bot, runs end to end against the real server, with a real heisenbridge started from the rendered files; the server deploying the instance itself has not run against Kubernetes |
+| Operations (HA, scale-out) | ~55% | one-value `helm install` verified on a real cluster with the published image, including a restart and an upgrade that kept the signing key; the chart is published from `main` and installs from the registry in one sentence; a standing demo behind an Ingress with a real certificate, scraped by Prometheus; a locked-out administrator gets back in with one command run where the key is; readiness is withdrawn the moment a shutdown begins; two pods on a real cluster serve a client's `/sync` from either, with typing, receipts and presence crossing replicas, the outbound federation queue durable and shard-gated, and drain through the admin API; the fix for requests landing mid-handoff has not been run on those pods yet; the operator reconciles a `Bridge` into a pod, a Service and a volume in unit tests only, and does not deploy the server itself |
+| **Federation** | **~40%** | 75/250 assertions, 14/88 tests on the whole package (2026-09-26), 16/18 on restricted rooms, invites and knocks (2026-09-30); a user joins a room hosted elsewhere through the client API, including restricted rooms and through another server, messages flow both ways between two instances of this server, the history from before the join is fetched as the client scrolls back, invites, leaves and knocks cross servers, so do typing, receipts, presence, device lists and to-device messages, and so does media; the outbound queue survives a restart; what a rejoining server missed while it was out is not fetched, a destination down for longer than its queue is not caught up, and it has not been tried against Synapse |
 
-Federation is the honest answer to "when could I use this": a user here cannot really talk to
-the rest of Matrix yet.
+Federation is the honest answer to "when could I use this": a user here can join a room on
+another instance of this server and talk, but it has not been pointed at Synapse.
 
 ## Where things are
 
