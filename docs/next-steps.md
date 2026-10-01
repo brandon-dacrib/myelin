@@ -33,6 +33,18 @@ built the web interface, embedded it and booted). `main`'s chart now outlives a 
 without a Chart.yaml bump (`deploy/helm/hs/ci/chart-version.sh`). Status 12 has all of it.
 Left: the `Homeserver`'s cluster mode and drain on a cluster, and a real `v*` tag.
 
+**Branch `agent/importer-gaps` (2026-10-01, night, status 13): the Synapse importer's two rows.**
+The importer now copies end-to-end keys (device, one-time, fallback), cross-signing with its
+signatures, key backups, push rules, pushers, filters, receipts and rooms joined over federation,
+each verified and served by the real binary (`cargo test -p hs-cli --test migration`, 2 tests;
+`cargo test -p hs-compat`); copies a room a page at a time; and logs and exports each room's
+throughput and the peak memory. Measured on a 100,000-event, 2,000-member room
+(`crates/hs-compat/tests/fixtures/synapse-big`), with the caveat in the Known-gaps row: the desktop
+was deep in swap. Touches `hs-user` (`UserStore::import_filter`, `SessionHub::import_receipt`) and
+`hs-room` (`RoomActorHandle::import_remote_join`), additively; `hs-cli`'s `serve.rs` only where
+the migration is built. Adds `libc` to the workspace dependencies. Gate run for `hs-compat`,
+`hs-cli` (migration), `hs-user`, `hs-room` clippy; not the full workspace gate.
+
 **What was done today, in one breath:** the two branches left over from 2026-09-29 merged
 (federation leftovers, the two-pod cluster fix); Complement remeasured and a state-resolution
 tie-break bug found and fixed; then eight known gaps closed one agent at a time -- PostgreSQL
@@ -1869,6 +1881,10 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | ~~Any member could redact any other member's message~~ | `hs-room` | **Fixed** 2026-10-01 (`agent/test-infra-gaps`): from room version 3 the auth rules admit any member's redaction and leave the check to whoever applies it; nothing checked, so a member at power 0 emptied others' messages for everyone (Sytest `10redactions.pl`, reproduced on the real binary). `RoomActor::may_redact` now refuses it (403) unless it is the sender's own event or they have the redact level. Left: no code path applies a redaction that arrives over federation (only the local send and the importer call `apply_redaction`); not yet checked end to end |
 | ~~Every password hash leaked 19 MiB on glibc 2.36~~ | `hs-auth` | **Fixed** 2026-10-01 (`agent/test-infra-gaps`): the `argon2` crate's per-hash aligned allocation is never reused by glibc 2.36's heap; Sytest drove a server past 10 GB into the OOM killer; 40 logins: 661 MB before, 39 MB after. Argon2 working memory is pooled. The production image is musl; a release binary on Debian 12 or Ubuntu 22.04 leaked |
 | ~~`cargo fuzz` never executed~~ | `crates/*/fuzz`, `tests/fuzz` | **Closed** 2026-10-01 (`agent/test-infra-gaps`, status 14 session 5): nightly and `cargo-fuzz` installed; all eight targets (five `hs-federation`, three `hs-media`) built and run ten minutes each with `tests/fuzz/run_all.sh 600`: 18.7 million executions, no crash, so no artifact or regression test. `ci.yml`'s new `fuzz` job runs each for 60 s on every push, outside `ci-ok` (nightly can break on its own). Found and fixed on the way: `hs-admin`'s build script made every cargo invocation without `web/dist` recompile `hs-admin` and its dependents. Left: ten minutes is not saturation (every target still found new features at the end); no target covers the client-server JSON bodies, canonical JSON or event auth |
+| ~~The Synapse importer leaves some things behind~~ | `hs-compat`, `hs-cli` | **Closed** (`agent/importer-gaps`, 2026-10-01, status 13): end-to-end device, one-time and fallback keys, cross-signing keys with their signatures, key backups (same version numbers), push rules and pushers, receipts, filters (same ids) and rooms this server's users joined over federation (started from the first local join with the state Synapse held for it, through a quiet `RoomActorHandle::import_remote_join`) are copied and verified; `hs-cli/tests/migration.rs` has the real binary serve each (`/keys/query`, `/keys/claim`, `/room_keys`, `/pushrules`, `/pushers`, `/filter/0`, receipts in `/sync`, both federated rooms of a new two-Synapse fixture). Remote media is struck as by design (a cache, fetched again). Left: history from before a federated join is left to backfill; a room still partial-state in Synapse, or one the local users were only invited to, is skipped and logged; receipts in threads other than `main` are left out; a backed-up key deleted in Synapse after an earlier pass stays here (`docs/compat/synapse-migration-runbook.md`, "What does not move") |
+| The Synapse importer has only met a small Synapse | `hs-compat`, `hs-cli` | **Mostly closed** (`agent/importer-gaps`, 2026-10-01, status 13): a room is copied a page of `batch_size` events at a time (the next read while one is written), and each room's and the copy's events/s, bytes/s and peak memory are logged and exported (`hs_migration_events_read_total`, `hs_migration_room_seconds`, `hs_migration_peak_rss_bytes`, ...). Measured on one room of 100,000 events and 2,000 members (`hs-compat/tests/fixtures/synapse-big`): MEASURED_SUMMARY. Left: every run was on the owner's desktop deep in swap under other agents' load, so the times vary two- to eight-fold between runs of the same binary -- measure again on a quiet machine; the room actor still holds every event of a room in memory (`RoomActor::events`), so a room's import is bounded by the room, not by the importer; no `hs import` command line |
+| Sytest never run | `tests/sytest` | CPAN dependencies absent |
+| `cargo fuzz` never executed | `fuzz/` | no nightly toolchain |
 
 ## Conventions worth keeping
 

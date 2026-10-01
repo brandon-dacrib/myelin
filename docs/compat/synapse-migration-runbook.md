@@ -4,7 +4,7 @@ How to move a Synapse deployment onto Myelin with the Migration page (`/admin/mi
 admin API's Migration area (`/api/v1/migration*`). Nothing on either side is edited by hand:
 the source is set through the configuration API, and Synapse's database is only ever read.
 
-What is copied is listed under "What moves", what is not under "What does not move yet". The
+What is copied is listed under "What moves", what is not (and why) under "What does not move". The
 table-by-table mapping is `synapse-importer-mapping.md`.
 
 ## Before you start
@@ -50,8 +50,17 @@ curl -X PATCH -H "authorization: Bearer $ADMIN" -H 'content-type: application/js
 server name before anything is copied; an unreachable database or a wrong name is refused with a
 `400` saying so. The copy then runs as a task (`migration.copy`, on the Tasks page too), in this
 order: accounts (with password hashes, flags and profiles), devices, access tokens, account data
-and room tags, rooms, media. The page shows each stream's rows copied, not copied on purpose,
-failed, and the rate, and an estimate of the time left.
+and room tags, end-to-end keys (`e2e_keys`, one row per device), cross-signing keys
+(`cross_signing`, per account), key backups (`key_backups`, per version), push rules
+(`push_rules`, per account), pushers, filters, rooms, receipts, media. The page shows each
+stream's rows copied, not copied on purpose, failed, and the rate, and an estimate of the time
+left.
+
+A room is copied a page of `batch_size` events at a time, so a room of any size is copied in
+bounded memory. When each room is done the log says how long it took, its events and bytes per
+second and the server's peak memory (`throughput: ...`), and at the end of the rooms the same for
+all of them; the metrics are `hs_migration_events_read_total`, `_events_stored_total`,
+`_event_bytes_read_total`, `hs_migration_room_seconds` and `hs_migration_peak_rss_bytes`.
 
 - **Pause / Resume** stop the copy between two batches and carry it on from there
   (`POST /migration/pause`, `/migration/resume`).
@@ -68,8 +77,11 @@ When everything has been copied once the status is `ready_for_cutover`.
 "Verify" (`POST /api/v1/migration/verify`, `202` and a task) counts every stream in Synapse and
 looks each row up here, then compares field by field: every account's sample (password hash,
 display name, avatar, administrator, deactivation), each device's name, the account and device
-every access token signs in, each piece of account data, every room's events and its current
-state against Synapse's `current_state_events`, and media files byte for byte (a sample). The
+every access token signs in, each piece of account data, each device's identity keys, one-time
+key counts and unused fallback keys, each account's cross-signing keys, each backup version and
+how many room keys it holds, each account's push rules, each pusher, filter and receipt, every
+room's events (from its join, for a room joined over federation) and its current state against
+Synapse's `current_state_events`, and media files byte for byte (a sample). The
 findings are on the page and in `GET /api/v1/migration` (`verification`). Run it as often as you
 like while Synapse is still in service; a difference is a bug report, not something to live with.
 
@@ -102,17 +114,34 @@ servers must never answer for the same name at once.
 | `devices` (not hidden ones) | devices, with their names and last-seen |
 | `access_tokens` (not an administrator's "login as" tokens) | sessions: the same token strings sign in the same account and device |
 | `account_data`, `room_account_data`, `room_tags` | global and per-room account data; tags as `m.tag` |
+| `e2e_device_keys_json`, `e2e_one_time_keys_json`, `e2e_fallback_keys_json` | each copied device's identity keys (with the cross-signing signatures on them), its unclaimed one-time keys in the order they are handed out, and its fallback key: other people's clients find the same keys in `/keys/query` and `/keys/claim`, and nobody has to verify anybody again |
+| `e2e_cross_signing_keys`, `e2e_cross_signing_signatures` | each account's master, self-signing and user-signing keys, with the signatures on them (a verified device, a verified person) |
+| `e2e_room_keys_versions`, `e2e_room_keys` | server-side key backups under the same version numbers (a deleted version stays deleted), with every room key: encrypted history stays readable on a new sign-in |
+| `push_rules`, `push_rules_enable` | each account's own push rules, server-default rules turned off or with changed actions, on top of this server's defaults |
+| `pushers` | pushers (not ones turned off in Synapse): phones keep being notified |
+| `user_filters` | sync filters under the ids Synapse gave them: a client's `/sync?filter=0` keeps working |
 | `rooms`, `events`/`event_json`, `redactions`, `room_aliases` | each room this server's users created, every event with its original id replayed in order through this server's own authorization, redactions applied, aliases, directory listing |
+| `events`, `event_to_state_groups`, `state_groups_state` (rooms made on another server) | each room this server's users joined over federation: held from the first such join as the join made it held in Synapse (the state before the join and its auth chain, as the other server's `send_join` answered), then every event after it, as above; a room Synapse backfilled to its beginning is replayed whole |
+| `receipts_linearized` | read receipts, public and private, after the rooms they are in |
 | `local_media_repository`, `media_store/local_content` | local media under the same `mxc://` ids, with their files |
 
-## What does not move yet
+## What does not move
 
-- **End-to-end encryption keys** (device keys, one-time keys, cross-signing keys, key backups):
-  clients upload device keys again; key backups have to be restored from the client.
-- **Push rules and pushers**: people's custom notification settings go back to the defaults.
-- **Read receipts**, filters, presence, and **remote media** (cached again on first use).
-- **Rooms joined over federation**: a room whose `m.room.create` is not part of its history here
-  (it was created on another server) is skipped and logged; its members rejoin it after cutover.
+- **History from before this server's users joined a room on another server** is not copied
+  unless Synapse held it whole: Synapse fetched it from the other servers (backfill), and this
+  server does the same when someone reads back past the join. A room Synapse is still joining
+  (a faster join still fetching its state) is skipped and logged until Synapse has finished; a
+  room this server's users were only invited to, or have all left, is skipped and logged, and is
+  joined again after cutover.
+- **Remote media** (`remote_media_cache`): by design. It is a cache of other servers' media, and
+  this server fetches each item again the first time someone asks for it.
+- **Presence**: by design. It is how people are right now, and starts again as they come back.
+- **Receipts in threads** (other than the main timeline) are left out and logged: this server
+  keeps one receipt per person and type in a room. **Pushers turned off** in Synapse are left
+  out. **Push rules of kinds this server does not have** (MSC4306 `postcontent`), and changes to
+  server-default rules the specification has retired, are logged and left out.
+- **A backed-up room key deleted in Synapse after an earlier pass** stays here (cutover's final
+  pass adds and updates keys, it does not delete them); the backup is still the user's own.
 - **Rejected events and outliers** are left out of each room's history, as Synapse held them
   outside it.
 - **Appservice registrations** are not read from the database; list the registration files in

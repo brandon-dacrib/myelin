@@ -7,8 +7,9 @@
 //! does an event arriving over federation. A room's events are read from Synapse in pages of
 //! [`EventKey`] order, `(topological_ordering, stream_ordering)`: Synapse's own index on a
 //! room's events, and an order in which an event's ancestors come before it (an event's depth
-//! is greater than that of every event it cites). Each page is written before the next is read,
-//! so the importer holds one page of a room at a time however large the room is.
+//! is greater than that of every event it cites). The next page is read while one is written, so
+//! the importer holds at most two pages of a room at a time however large the room is, and
+//! Synapse's database and this server's store work at the same time.
 //!
 //! If Synapse's depths are ever out of step with the graph (a remote server's events can carry
 //! any depth), an event can arrive before an event it cites. The target answers it as waiting
@@ -137,9 +138,9 @@ pub async fn copy_room(
     target.begin_room(room).await?;
     let mut outcome = RoomOutcome::default();
     let mut held: Vec<SynapseEvent> = Vec::new();
-    let mut after = None;
     let mut events_read = 0_u64;
     let mut bytes = 0_u64;
+    let page_size = page_size.max(1);
     let stats = |outcome: &RoomOutcome, events_read, bytes| RoomStats {
         room_id: room.room_id.clone(),
         events_read,
@@ -148,6 +149,7 @@ pub async fn copy_room(
         elapsed: started.elapsed(),
         peak_rss_bytes: peak_rss_bytes(),
     };
+    let mut page = pages.page(None, page_size).await?;
     loop {
         if cancelled() {
             let stats = stats(&outcome, events_read, bytes);
@@ -157,15 +159,21 @@ pub async fn copy_room(
                 stopped: true,
             });
         }
-        let page = pages.page(after, page_size.max(1)).await?;
         let Some((_, last)) = page.last() else {
             break;
         };
-        after = Some(*last);
+        let after = Some(*last);
         let events: Vec<SynapseEvent> = page.into_iter().map(|(event, _)| event).collect();
         events_read += events.len() as u64;
         bytes += events.iter().map(|e| e.json_bytes).sum::<u64>();
-        let mut out = target.import_room_events(room, &events).await?;
+        // The next page is read while this one is written: two pages are held at most, and
+        // Synapse's database and this server's store are busy at the same time.
+        let (out, next) = tokio::join!(
+            target.import_room_events(room, &events),
+            pages.page(after, page_size)
+        );
+        page = next?;
+        let mut out = out?;
         let waiting: std::collections::HashSet<String> =
             std::mem::take(&mut out.waiting).into_iter().collect();
         let stored = out.stored;

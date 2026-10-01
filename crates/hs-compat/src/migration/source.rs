@@ -59,6 +59,10 @@ pub struct SynapseSource {
     /// `events.rejection_reason` exists (newer Synapses); older ones keep rejections only in
     /// `rejections`.
     rejection_reason: bool,
+    /// [`SynapseSource::room_events`]'s query, prepared the first time it runs.
+    room_events_statement: tokio::sync::OnceCell<tokio_postgres::Statement>,
+    /// [`SynapseSource::room_event_ids`]'s query, prepared the first time it runs.
+    room_event_ids_statement: tokio::sync::OnceCell<tokio_postgres::Statement>,
 }
 
 impl std::fmt::Debug for SynapseSource {
@@ -167,6 +171,8 @@ impl SynapseSource {
             description,
             tables: HashSet::new(),
             rejection_reason: false,
+            room_events_statement: tokio::sync::OnceCell::new(),
+            room_event_ids_statement: tokio::sync::OnceCell::new(),
         };
         let optional: Vec<&str> = OPTIONAL_TABLES.to_vec();
         source.tables = source
@@ -597,21 +603,31 @@ impl SynapseSource {
         limit: i64,
         since: Option<i64>,
     ) -> Result<Vec<(SynapseEvent, EventKey)>, MigrationError> {
-        let rejected = self.rejected_sql();
         let (topological, stream) = after.unzip();
+        // Prepared once: planning this query costs more than running it for a page.
+        let statement = self
+            .room_events_statement
+            .get_or_try_init(|| async {
+                let rejected = self.rejected_sql();
+                self.client
+                    .prepare(&format!(
+                        "SELECT e.event_id, e.depth, coalesce(e.topological_ordering, e.depth), \
+                           coalesce(e.stream_ordering, 0), j.json \
+                         FROM events e JOIN event_json j ON j.event_id = e.event_id \
+                         WHERE e.room_id = $1 AND NOT e.outlier AND NOT {rejected} \
+                           AND ($2::bigint IS NULL \
+                                OR (e.topological_ordering, e.stream_ordering) > ($2::bigint, $3::bigint)) \
+                           AND ($5::bigint IS NULL OR e.stream_ordering > $5::bigint) \
+                         ORDER BY e.topological_ordering, e.stream_ordering LIMIT $4"
+                    ))
+                    .await
+            })
+            .await
+            .map_err(db)?;
         let rows = self
             .client
             .query(
-                &format!(
-                    "SELECT e.event_id, e.depth, coalesce(e.topological_ordering, e.depth), \
-                       coalesce(e.stream_ordering, 0), j.json \
-                     FROM events e JOIN event_json j ON j.event_id = e.event_id \
-                     WHERE e.room_id = $1 AND NOT e.outlier AND NOT {rejected} \
-                       AND ($2::bigint IS NULL \
-                            OR (e.topological_ordering, e.stream_ordering) > ($2::bigint, $3::bigint)) \
-                       AND ($5::bigint IS NULL OR e.stream_ordering > $5::bigint) \
-                     ORDER BY e.topological_ordering, e.stream_ordering LIMIT $4"
-                ),
+                statement,
                 &[&room_id, &topological, &stream, &limit, &since],
             )
             .await
@@ -654,21 +670,30 @@ impl SynapseSource {
         limit: i64,
         since: Option<i64>,
     ) -> Result<Vec<(String, EventKey)>, MigrationError> {
-        let rejected = self.rejected_sql();
         let (topological, stream) = after.unzip();
+        let statement = self
+            .room_event_ids_statement
+            .get_or_try_init(|| async {
+                let rejected = self.rejected_sql();
+                self.client
+                    .prepare(&format!(
+                        "SELECT e.event_id, coalesce(e.topological_ordering, e.depth), \
+                           coalesce(e.stream_ordering, 0) \
+                         FROM events e \
+                         WHERE e.room_id = $1 AND NOT e.outlier AND NOT {rejected} \
+                           AND ($2::bigint IS NULL \
+                                OR (e.topological_ordering, e.stream_ordering) > ($2::bigint, $3::bigint)) \
+                           AND ($5::bigint IS NULL OR e.stream_ordering > $5::bigint) \
+                         ORDER BY e.topological_ordering, e.stream_ordering LIMIT $4"
+                    ))
+                    .await
+            })
+            .await
+            .map_err(db)?;
         Ok(self
             .client
             .query(
-                &format!(
-                    "SELECT e.event_id, coalesce(e.topological_ordering, e.depth), \
-                       coalesce(e.stream_ordering, 0) \
-                     FROM events e \
-                     WHERE e.room_id = $1 AND NOT e.outlier AND NOT {rejected} \
-                       AND ($2::bigint IS NULL \
-                            OR (e.topological_ordering, e.stream_ordering) > ($2::bigint, $3::bigint)) \
-                       AND ($5::bigint IS NULL OR e.stream_ordering > $5::bigint) \
-                     ORDER BY e.topological_ordering, e.stream_ordering LIMIT $4"
-                ),
+                statement,
                 &[&room_id, &topological, &stream, &limit, &since],
             )
             .await

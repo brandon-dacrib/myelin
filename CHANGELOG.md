@@ -18,6 +18,19 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Installing and administering it
 
+- **A migration from Synapse keeps people's encryption, notifications and rooms on other
+  servers.** The importer now also copies each device's end-to-end keys (identity, one-time and
+  fallback), cross-signing keys with the signatures on them, server-side key backups under the
+  same version numbers, push rules and pushers, sync filters under the ids clients cached, read
+  receipts, and rooms the server's users joined over federation (started from the join, with the
+  state Synapse held for it). Verified by running: a real Synapse 1.161 populated by real clients'
+  requests was migrated into the real binary, which then answered `/keys/query` with the same
+  signed keys, handed out the same one-time key, served the key backup, the push rules, the
+  pusher and filter `0`, carried both receipts in `/sync`; and two real Synapses federating over
+  TLS on one machine gave a server whose rooms on the other server were migrated, verified,
+  served and written to. A room is copied a page at a time, and each room's events per second,
+  bytes per second and the server's peak memory are logged and in `/metrics`; one room of
+  100,000 events and 2,000 members was measured (`docs/status/13-config-compat-and-migration.md`).
 - **The chart install is a CD gate.** CD installs the Helm chart on a kind cluster with the
   freshly built amd64 image, waits for Ready, reads the setup link from the pod log, checks
   `/health/ready` and the management interface through a port-forward, and creates the first
