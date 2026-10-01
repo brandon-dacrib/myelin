@@ -34,9 +34,11 @@ name: cd
 #
 # Each `image` leg boots the image it just built with the README's `docker run` line and checks
 # it answers; the amd64 leg then installs the Helm chart with that image on a kind cluster, one
-# value, and claims the server through the setup link the pod logs. Both happen inside `image`,
-# so a failure there means `manifest` never runs: no tag moves, no chart is published. The
-# `chart` job's own check afterwards is of what reached the registry, not a second gate.
+# value, and claims the server through the setup link the pod logs, then runs the operator on the
+# same cluster against a `Bridge` and a `Homeserver` (deploy/operator/ci/kind-smoke.sh). All of
+# it happens inside `image`, so a failure there means `manifest` never runs: no tag moves, no
+# chart is published. The `chart` job's own check afterwards is of what reached the registry,
+# not a second gate.
 #
 # # Provenance
 #
@@ -281,6 +283,25 @@ jobs:
         # it, because that is the one thing this step cannot see: what reached the registry.
         if: matrix.arch == 'amd64'
         run: deploy/helm/hs/ci/install-smoke.sh myelin:smoke --kind smoke
+
+      - name: Prove the operator reconciles a Bridge and a Homeserver on that cluster
+        # The same kind cluster and image, after the install smoke has cleaned up after itself.
+        # deploy/operator/ci/kind-smoke.sh installs the chart again and checks its bridge
+        # operator end to end: a hand-written `Bridge` (nginx standing in for a bridge) becomes
+        # a claim, a Deployment and a Service owned by it and goes Ready; a missing image turns
+        # it Degraded with the kubelet's reason and putting it back makes it Ready again;
+        # deleting it removes everything built from it. `--homeserver` then runs
+        # `hs operator --homeservers` from deploy/operator/ on a single-node `Homeserver`: the
+        # chart's objects, Ready, an image change rolled through the StatefulSet partition,
+        # deletion. Until 2026-10-01 neither controller had ever run against an API server.
+        #
+        # Here, in the gate, for the reason the install smoke is: a failure stops `manifest`.
+        # About three to four minutes on a loaded desktop's kind (docs/status/12, 2026-10-01).
+        # The script's `--heisenbridge` walk (the server deploying a real bridge itself) is
+        # left out: it pulls `hif1/heisenbridge:latest` from Docker Hub, and a release should
+        # not wait on someone else's moving tag.
+        if: matrix.arch == 'amd64'
+        run: deploy/operator/ci/kind-smoke.sh myelin:smoke --kind smoke --homeserver
 
       - name: Export the digest
         id: export

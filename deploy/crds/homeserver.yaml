@@ -123,7 +123,7 @@ spec:
                   roomShards:
                     default: 256
                     description: Room shards (`cluster.room_shards`).
-                    format: uint32
+                    format: int64
                     minimum: 0.0
                     type: integer
                   terminationGracePeriodSeconds:
@@ -134,7 +134,7 @@ spec:
                   userShards:
                     default: 256
                     description: User shards (`cluster.user_shards`).
-                    format: uint32
+                    format: int64
                     minimum: 0.0
                     type: integer
                 type: object
@@ -154,7 +154,7 @@ spec:
                   timeoutSeconds:
                     default: 600
                     description: How long a replica may take to hand off every shard before `onTimeout` applies.
-                    format: uint64
+                    format: int64
                     minimum: 0.0
                     type: integer
                 type: object
@@ -408,7 +408,7 @@ spec:
                       shardCount:
                         default: 256
                         description: Number of virtual storage shards.
-                        format: uint32
+                        format: int64
                         minimum: 0.0
                         type: integer
                     required:
@@ -479,7 +479,7 @@ spec:
                     type: string
                   shardsRemaining:
                     description: Shards the replica still owned when last read.
-                    format: uint64
+                    format: int64
                     minimum: 0.0
                     nullable: true
                     type: integer

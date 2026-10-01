@@ -22,8 +22,11 @@
 //!
 //! The builders, the status mapping and the manifest rendering are unit-tested; the
 //! `Homeserver` reconciler is tested against an in-memory cluster and the chart (`helm
-//! template`). Neither controller has yet run against a cluster
-//! (`docs/status/12-platform-and-kubernetes.md` has the steps).
+//! template`). Both controllers have run against a real API server since 2026-10-01:
+//! `deploy/operator/ci/kind-smoke.sh` (in CD's amd64 image leg) drives a `Bridge` through
+//! Ready, Degraded, Ready and deletion, and a single-node `Homeserver` through Ready, an image
+//! roll and deletion. Cluster mode (draining through the admin API) has not run on a cluster
+//! yet (`docs/status/12-platform-and-kubernetes.md`).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

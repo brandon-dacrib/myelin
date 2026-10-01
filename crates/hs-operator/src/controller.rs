@@ -54,6 +54,33 @@ pub struct Options {
     pub default_storage_class: Option<String>,
 }
 
+/// The label selector of everything the `Bridge` controller watches besides the `Bridge`s:
+/// objects and pods the operator made for a bridge (`app.kubernetes.io/name=myelin-bridge`,
+/// `managed-by=myelin-operator`).
+///
+/// `managed-by` alone is not enough: `hs operator --homeservers` labels a `Homeserver`'s
+/// StatefulSet, Services and pods `managed-by=myelin-operator` too, and the pod watch maps a pod
+/// to the `Bridge` named by its `app.kubernetes.io/instance`. On the first run against an API
+/// server (2026-10-01, `deploy/operator/ci/kind-smoke.sh`) every change to a `Homeserver` named
+/// `hs` logged "tried to reconcile object Bridge.../hs that was not found in local store".
+#[must_use]
+pub fn watch_selector() -> String {
+    format!(
+        "app.kubernetes.io/name={},app.kubernetes.io/managed-by={MANAGER}",
+        crate::bridge::APP_NAME
+    )
+}
+
+/// Whether a controller's run stream reports a watched object (a pod, a Deployment) that maps
+/// to a resource no longer in the store: the pods of a `Bridge` or `Homeserver` that was just
+/// deleted keep changing while they terminate. Nothing failed, so the controllers log it at
+/// debug rather than as a failed reconcile (on the first cluster run every deleted bridge left
+/// three to ten such warnings).
+#[must_use]
+pub fn is_stale_trigger<E1, E2>(error: &kube::runtime::controller::Error<E1, E2>) -> bool {
+    matches!(error, kube::runtime::controller::Error::ObjectNotFound(_))
+}
+
 /// Shared state of every reconcile.
 struct Context {
     client: Client,
@@ -99,8 +126,7 @@ pub async fn run_with_metrics(
     let services: Api<Service> = Api::namespaced(client.clone(), &namespace);
     let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &namespace);
     let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
-    let owned =
-        || watcher::Config::default().labels(&format!("app.kubernetes.io/managed-by={MANAGER}"));
+    let owned = || watcher::Config::default().labels(&watch_selector());
 
     tracing::info!(namespace = %namespace, "bridge operator starting");
     let pod_namespace = namespace.clone();
@@ -126,6 +152,9 @@ pub async fn run_with_metrics(
         .for_each(|result| async move {
             match result {
                 Ok((object, _action)) => tracing::debug!(bridge = %object.name, "reconciled"),
+                Err(e) if is_stale_trigger(&e) => {
+                    tracing::debug!(error = %e, "a change to an object of a deleted bridge");
+                }
                 Err(e) => tracing::warn!(error = %e, "bridge reconcile failed"),
             }
         })
@@ -263,6 +292,100 @@ mod tests {
         assert_eq!(class(&bridge, Some("fast")), Some("fast".to_owned()));
         bridge.spec.storage.storage_class_name = Some("longhorn".to_owned());
         assert_eq!(class(&bridge, Some("fast")), Some("longhorn".to_owned()));
+    }
+
+    /// Whether `labels` satisfy an equality-only selector `k=v,k=v`, as the API server would.
+    fn selects(
+        selector: &str,
+        labels: Option<&std::collections::BTreeMap<String, String>>,
+    ) -> bool {
+        selector.split(',').all(|term| {
+            let (k, v) = term.split_once('=').expect("equality selector");
+            labels.and_then(|l| l.get(k)).is_some_and(|got| got == v)
+        })
+    }
+
+    #[test]
+    fn the_watches_see_a_bridges_objects_and_not_a_homeservers() {
+        use crate::crds::{BridgeSpec, BridgeStorage, ImageSpec};
+        use kube::Resource as _;
+        let mut bridge = Bridge::new(
+            "hs",
+            BridgeSpec {
+                bridge_type: "heisenbridge".to_owned(),
+                appservice_id: "heisenbridge".to_owned(),
+                image: ImageSpec {
+                    repository: "hif1/heisenbridge".to_owned(),
+                    tag: None,
+                    digest: None,
+                    pull_policy: None,
+                },
+                port: 9898,
+                files_secret: "hs-files".to_owned(),
+                args: Vec::new(),
+                storage: BridgeStorage::default(),
+                resources: None,
+            },
+        );
+        bridge.meta_mut().namespace = Some("matrix".to_owned());
+        bridge.meta_mut().uid = Some("uid-bridge".to_owned());
+        let selector = watch_selector();
+
+        let deployment = desired_deployment(&bridge);
+        assert!(selects(&selector, deployment.metadata.labels.as_ref()));
+        let pod_labels = deployment
+            .spec
+            .and_then(|s| s.template.metadata)
+            .and_then(|m| m.labels);
+        assert!(selects(&selector, pod_labels.as_ref()));
+        assert!(selects(
+            &selector,
+            desired_service(&bridge).metadata.labels.as_ref()
+        ));
+        assert!(selects(
+            &selector,
+            desired_pvc(&bridge).metadata.labels.as_ref()
+        ));
+
+        // A Homeserver of the same name in the same namespace: its pods carry
+        // `managed-by=myelin-operator` and `instance=hs`, and must not reach the Bridge `hs`.
+        let objects =
+            crate::homeserver::build(&crate::homeserver::testing::single_node_homeserver("hs"))
+                .expect("builds");
+        let hs_pod_labels = objects
+            .stateful_set
+            .spec
+            .and_then(|s| s.template.metadata)
+            .and_then(|m| m.labels);
+        assert_eq!(
+            hs_pod_labels
+                .as_ref()
+                .and_then(|l| l.get("app.kubernetes.io/managed-by"))
+                .map(String::as_str),
+            Some(MANAGER),
+            "the premise: a Homeserver's pods are the operator's too"
+        );
+        assert!(!selects(&selector, hs_pod_labels.as_ref()));
+        assert!(!selects(
+            &selector,
+            objects.service.metadata.labels.as_ref()
+        ));
+    }
+
+    #[test]
+    fn only_a_missing_object_is_a_stale_trigger() {
+        use kube::runtime::controller::Error;
+        let missing: Error<ControllerError, std::io::Error> =
+            Error::ObjectNotFound(ObjectRef::<Bridge>::new("gone").within("matrix").erase());
+        assert!(is_stale_trigger(&missing));
+        let failed: Error<ControllerError, std::io::Error> = Error::ReconcilerFailed(
+            ControllerError::Missing("name"),
+            ObjectRef::<Bridge>::new("here").within("matrix").erase(),
+        );
+        assert!(!is_stale_trigger(&failed));
+        let queue: Error<ControllerError, std::io::Error> =
+            Error::QueueError(std::io::Error::other("watch failed"));
+        assert!(!is_stale_trigger(&queue));
     }
 
     #[test]

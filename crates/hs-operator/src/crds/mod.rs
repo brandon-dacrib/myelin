@@ -38,6 +38,36 @@ pub fn all_crds() -> Vec<(&'static str, CustomResourceDefinition)> {
         ("pushgateway", PushGateway::crd()),
         ("identityservice", IdentityService::crd()),
     ]
+    .into_iter()
+    .map(|(label, crd)| (label, with_kubernetes_formats(crd)))
+    .collect()
+}
+
+/// The CRD with schemars' unsigned integer formats (`uint32`, `uint64`, ...) replaced by
+/// `int64`, the format Kubernetes knows; the `minimum: 0` schemars writes beside them keeps
+/// them unsigned. The API server accepts the unknown ones but warns on every apply
+/// ("unrecognized format \"uint64\""), seen on the first apply to a real cluster (2026-10-01).
+fn with_kubernetes_formats(crd: CustomResourceDefinition) -> CustomResourceDefinition {
+    fn rewrite(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::String(format)) = map.get_mut("format")
+                    && format.starts_with("uint")
+                {
+                    "int64".clone_into(format);
+                }
+                map.values_mut().for_each(rewrite);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(rewrite),
+            _ => {}
+        }
+    }
+    // A CRD always round-trips through JSON; on the impossible failure keep it as generated.
+    let Ok(mut value) = serde_json::to_value(&crd) else {
+        return crd;
+    };
+    rewrite(&mut value);
+    serde_json::from_value(value).unwrap_or(crd)
 }
 
 /// Where the Helm chart keeps its copy of the `Bridge` CRD, relative to the workspace root.
@@ -111,6 +141,19 @@ mod tests {
                 Some("CustomResourceDefinition"),
                 "{label}"
             );
+        }
+    }
+
+    #[test]
+    fn every_integer_format_is_one_kubernetes_knows() {
+        // The API server warns on every apply of a schema with `format: uint32`; the unsigned
+        // fields keep their `minimum: 0` instead.
+        for (label, crd) in all_crds() {
+            let yaml = render(label, &crd).unwrap();
+            assert!(!yaml.contains("format: uint"), "{label}");
+            if label == "homeserver" {
+                assert!(yaml.contains("format: int64"), "{label}");
+            }
         }
     }
 

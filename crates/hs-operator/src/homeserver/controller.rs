@@ -83,6 +83,9 @@ pub async fn run(
         .for_each(|result| async move {
             match result {
                 Ok((object, _)) => tracing::debug!(homeserver = %object.name, "reconciled"),
+                Err(e) if crate::controller::is_stale_trigger(&e) => {
+                    tracing::debug!(error = %e, "a change to an object of a deleted homeserver");
+                }
                 Err(e) => tracing::warn!(error = %e, "homeserver reconcile failed"),
             }
         })

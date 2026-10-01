@@ -9,8 +9,13 @@ Schema: `deploy/crds/homeserver.yaml` (generated from `crates/hs-operator/src/cr
 by `cargo run -p hs-operator --bin gen-crds`). Examples: `deploy/operator/examples/`. Install:
 `deploy/operator/` (below).
 
-Status as of 2026-09-28: tested against an in-memory cluster and against `helm template`; **not
-yet run on a cluster**. The first run's steps are in `docs/status/12-platform-and-kubernetes.md`.
+Status as of 2026-10-01: tested against an in-memory cluster and against `helm template`, and
+**run on a kind cluster in single-node mode** by `deploy/operator/ci/kind-smoke.sh --homeserver`
+(CD runs it before tagging an image): the objects below, owned by the resource, `Ready` once the
+pod is, an image change rolled through the partition (1 → 0 → 1, pod replaced, `Ready` again)
+and deletion removing all but the data claim. **Cluster mode has not run on a cluster yet**:
+replicas, the PodDisruptionBudget and draining through the admin API are tested only against
+the in-memory cluster; the steps are in `docs/status/12-platform-and-kubernetes.md`.
 
 ## What it becomes
 
