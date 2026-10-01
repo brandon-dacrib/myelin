@@ -1,5 +1,85 @@
 # 12. Platform and Kubernetes
 
+## 2026-10-01 (branch `agent/platform-gaps`): the release binaries ran, and a release no longer hides `main`'s chart
+
+Two rows of the known-gaps table, closed by running them.
+
+### The release binaries job, run without a tag (CD run 36808313763)
+
+Until today the `binaries` job had only ever been read: it runs on a `v*` tag, and there has
+been none. `cd.yml` now has a dry run: a manual dispatch with `binaries=true images=false`
+runs the gate and the binary matrix and nothing else (`image`, `manifest`, `chart` and
+`release` are skipped; no tag, no GitHub release, nothing pushed), and uploads the archives as
+workflow artifacts.
+
+```sh
+gh workflow run cd --ref agent/platform-gaps-dry-run -f binaries=true -f images=false -f publish=false
+```
+
+Run 36808313763 at `cea86cb` (a branch of its own, so that pushing to `agent/platform-gaps`
+could not cancel the CI run the gate waits for -- the first dispatch, 36808222794, was
+cancelled for exactly that reason):
+
+| job | runner | started | took | result |
+|---|---|---|---|---|
+| require green ci | ubuntu-24.04 | 02:58:16Z | 12m15s (CI run 36808310762) | success |
+| binary (x86_64-unknown-linux-gnu) | ubuntu-24.04 | 03:10:33Z | 7m39s | success |
+| binary (aarch64-unknown-linux-gnu) | ubuntu-24.04-arm | 03:10:36Z | 8m34s | success |
+| binary (aarch64-apple-darwin) | macos-14 | 03:10:40Z | 15m04s | success |
+
+Every leg built the web interface with Node 22 (`npm ci && npm run build`, Vite's own build
+0.6 s on Linux, 1.0 s on macOS), built `hs` in release with `HS_ADMIN_WEB_DIST` set, and then
+**booted it**: `hs serve --data-dir <tmp> --server-name smoke.invalid` answered
+`/health/live`, `/admin/` was the management interface (`<div id="root">`, not the page
+saying it was left out), and the log had a setup link -- "the binary serves, /admin/ is the
+interface, and the log offers a setup link" at 03:17:58Z, 03:18:51Z and 03:24:56Z. Artifacts:
+`myelin-x86_64-unknown-linux-gnu` (27.5 MB), `myelin-aarch64-unknown-linux-gnu` (27.9 MB),
+`myelin-aarch64-apple-darwin` (24.6 MB). All three legs run on GitHub's free runners for a
+public repository, natively; none needed cross-compilation.
+
+Found on the way: the job's old check was `hs --version || true`. `hs` has no `--version`
+flag (clap's `version` attribute is not set on `Cli`), so the step always failed and `|| true`
+always passed it; it proved nothing. Replaced by the boot above (nothing in `hs-cli` changed).
+Also: the archive was named `myelin-${{ github.ref_name }}-<target>`, and a branch name with a
+`/` would have put it in a subdirectory the upload pattern does not match; off a tag it is now
+`myelin-manual-<12 hex of the commit>-<target>`.
+
+### `main`'s chart after a release (deploy/helm/hs/ci/chart-version.sh)
+
+SemVer sorts `0.1.0-main.N` below `0.1.0`, so the day `v0.1.0` is tagged `helm install --devel`
+would stop picking `main` until somebody raised Chart.yaml's `version`. The chart job now gets
+its version from `deploy/helm/hs/ci/chart-version.sh`: a tag publishes the tag's version; `main`
+publishes `<base>-main.<run>.g<sha>`, where `<base>` is Chart.yaml's version unless a `v*` tag
+has released that version or a later one, in which case it is the patch after the newest tag
+(numerically: `v0.10.0` beats `v0.9.0`; a release candidate counts by its core). Its
+`--self-test` (eleven cases) runs in the chart job before anything is packaged. Why not have
+the release workflow commit a Chart.yaml bump to `main`: `main` is written by the serial merge
+queue under its lock, a workflow's push would race it, and a push made with the workflow's
+token starts no CI or CD of its own. A pre-release still needs `--devel`; that is what it is.
+
+The rendered check (as if `v0.1.0` were tagged, `main` at run 412):
+
+```text
+$ deploy/helm/hs/ci/chart-version.sh refs/heads/main 412 f5bb8fc49d61a5666a630f08cbbc6f6a85af3f1e 0.1.0 v0.1.0
+note: v0.1.0 is tagged and Chart.yaml says 0.1.0, so main publishes 0.1.1 pre-releases (raise Chart.yaml's version to choose another)
+version=0.1.1-main.412.gf5bb8fc
+app_version=sha-f5bb8fc49d61a5666a630f08cbbc6f6a85af3f1e
+$ helm package deploy/helm/hs --version 0.1.1-main.412.gf5bb8fc --app-version sha-f5bb8fc49d61a5666a630f08cbbc6f6a85af3f1e
+$ helm show chart hs-0.1.1-main.412.gf5bb8fc.tgz | grep -E '^(version|appVersion)'
+appVersion: sha-f5bb8fc49d61a5666a630f08cbbc6f6a85af3f1e
+version: 0.1.1-main.412.gf5bb8fc
+$ helm template x hs-0.1.1-main.412.gf5bb8fc.tgz --set serverName=example.org | grep -m1 image:
+          image: ghcr.io/brandon-dacrib/myelin:sha-f5bb8fc49d61a5666a630f08cbbc6f6a85af3f1e
+$ tar -tzf hs-0.1.1-main.412.gf5bb8fc.tgz | grep -c '^hs/ci/'   # the CI scripts stay out of the package
+0
+versions in a `helm repo index` of that chart and a 0.1.0 release, newest first, as helm sorts them:
+    version: 0.1.1-main.412.gf5bb8fc
+    version: 0.1.0
+```
+
+Not run by a real tag or a real push to `main` yet; the first push to `main` after this merges
+runs the self-test and publishes `0.1.0-main.N` exactly as before (there are no `v*` tags).
+
 ## 2026-10-01: the demo runs `sha-a01c1e0` (verified on the cluster)
 
 Release `myelin` (namespace `myelin`, context `admin@dacrib0`) rolled from revision 5

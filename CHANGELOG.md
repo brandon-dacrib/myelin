@@ -522,8 +522,18 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 - CD publishes multi-architecture images with an SBOM and build provenance, and **refuses to
   publish an image that has not booted and answered `/health/live` and `/_matrix/client/versions`
   on both architectures**. Releases are gated on CI being green for that exact commit.
-- Binaries for Linux (amd64, arm64) and Apple silicon, plus the Helm chart as an OCI artifact, are
-  wired to `v*` tags and have not been exercised yet.
+- **Binaries for Linux (amd64, arm64) and Apple silicon have been built and booted.** They are
+  attached to a release on a `v*` tag, and since 2026-10-01 a manual dispatch of CD with
+  `binaries=true images=false` runs the same matrix as a dry run (no tag, no release, archives
+  as workflow artifacts). Its first run (36808313763) built the web interface with Node 22 on
+  each runner, embedded it, and booted each binary: `/health/live` answered, `/admin/` was the
+  interface and the log offered a setup link, in 7.5, 8.5 and 15 minutes. The old check,
+  `hs --version || true`, had always passed because `hs` has no `--version`.
+- The Helm chart is published as an OCI artifact on every push to `main` (a pre-release, for
+  `helm install --devel`) and on a `v*` tag. After a release, `main`'s pre-releases move past it
+  by themselves (`0.1.1-main.N` after `v0.1.0`), so `--devel` keeps getting `main` without a
+  Chart.yaml bump (`deploy/helm/hs/ci/chart-version.sh`, self-tested in CD). No `v*` tag exists
+  yet.
 - The published `main` image was pulled from GHCR and run as a new user would: generate a config,
   start the container, health up in about a second, then register a user, call `/account/whoami`
   and create a room. All of it worked. Getting there took four steps and an edit to a 158-line
