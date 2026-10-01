@@ -9,7 +9,7 @@
 | Run | Package | Assertions | Top-level | Against 09-26 |
 |---|---|---|---|---|
 | csapi 1 | `tests/csapi/...` | 343 / 384 | 82 / 106 | `TestDeviceListUpdates`, `TestMessagesOverFederation`, `TestSearch`, `TestServerNotices` FAIL -> PASS; nothing PASS -> FAIL |
-| federation 1 | `tests` | running | | |
+| federation 1 | `tests` | 225 / 314 | 50 / 90 (1 skipped) | 36 FAIL -> PASS (invites, leaves, knocks, restricted joins, `/hierarchy`, media, typing and presence over federation, version 12); nothing PASS -> FAIL; Complement's checkout replaced `TestMSC4311FullCreateEventOnStrippedState` with three new `TestMSC4311*` tests, which fail |
 | csapi 2 | | | | |
 | federation 2 | | | | |
 
