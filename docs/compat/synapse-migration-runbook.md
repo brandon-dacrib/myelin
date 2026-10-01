@@ -171,7 +171,12 @@ cargo test -p hs-cli --test migration          # the whole path, through the adm
 cargo test -p hs-compat --test migration       # the engine: pause, resume, abort, restart
 ```
 
-and, for the page, load `schema.sql` and `data.sql` into a database, boot `hs serve` named
+`crates/hs-compat/tests/fixtures/synapse-federated` is a real Synapse that joined two rooms of
+another real Synapse over federation (both tests above load it too), and
+`crates/hs-compat/tests/fixtures/synapse-big` has the scripts that build a Synapse with one room
+of 100,000 events and 2,000 members and measure a migration of it (`measure.py`).
+
+And, for the page, load `schema.sql` and `data.sql` into a database, boot `hs serve` named
 `fixture.test` with the fixture's `signing.key` in its `signing_key_path` directory, create the
 administrator, and run `web/e2e-real/migration.spec.ts` with `HS_REAL_MIGRATION_SOURCE` and
 `HS_REAL_MIGRATION_FACTS` (see the spec's header).

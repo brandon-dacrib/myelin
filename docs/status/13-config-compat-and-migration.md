@@ -75,13 +75,39 @@ logged (`throughput: ...`) and exported (`hs_migration_events_read_total`,
   time with an event 500 ahead of its parent waiting for it and one citing nothing held
   refused; a cancelled copy stopping before its next page.
 - `cargo test -p hs-user --lib imported` (the imported filter).
+- **Each check fails without its import.** A temporary build (not committed) turned each new
+  import of `StoreTarget`, and its verification, into a no-op that claims success, chosen at run
+  time; the real-binary tests then failed once per kind, each at its own check: device keys
+  (`/keys/query` without the phone), cross-signing (no master key), the backup and the filter
+  (`404`), push rules (no content rules), the pusher, the receipts, and the federated join (the
+  room not copied). The same build with no mutant chosen passed both tests.
 
 **Measured** (one room of 100,000 events, 2,000 joined members, 5,163 of them Synapse's own and
 the rest written by `extend_big.py` with Synapse's signing code; `crates/hs-compat/tests/
 fixtures/synapse-big/`; release builds, embedded store, on the owner's desktop under other
 agents' load): see the table below.
 
-MEASUREMENTS_TABLE
+| Binary | Runs | The room (100,000 events) | Events/s | Peak RSS |
+|---|---|---|---|---|
+| Before (whole room in memory, `main` at the branch point) | 8 | 38 to 256 s; 69 and 79 s in the last two, each run right after the line below | 390 to 2,650 | 214 to 586 MiB |
+| Paged, each page read then written (the branch's first importer commit) | 4 | 112 to 925 s | 108 to 892 | 153 to 240 MiB |
+| Paged, the next page read while one is written | 2 | 63 and 79 s | 1,267 and 1,581 | 346 and 355 MiB |
+| Paged, read-ahead, page query prepared once (the branch) | 2 | **32 and 35 s** | **3,135 and 2,876** | **260 and 262 MiB** |
+
+"The room" is the importer's own `throughput:` line for the paged binaries, and the rooms
+stream's rate for the baseline (which logs none); the rooms stream for the last pair took 40 and
+59 s against the baseline's 69 and 79 s run straight after each. Peak RSS is `getrusage` for the
+paged binaries and `ps` sampled every 0.2 s for the baseline. The same baseline binary varied
+from 38 to 256 s between runs: the machine was swapping 11 to 25 GB throughout (a resident
+21 GB model server and other agents' builds), and resident memory under that pressure
+understates what a process would hold on a quiet machine, so only runs taken back to back
+compare. What does compare: the first paged binary lost time to 200 unprepared page queries
+read and written in turn (planning the page query costs more than running it: in `psql`, 200
+pages took 7.5 s unprepared, 2.2 s prepared, 4.0 s for the whole room in one query); with the
+read-ahead and the prepared statement it is faster than the baseline back to back, and its
+memory no longer grows with the room (two pages, 1,000 events, against all 100,000 as parsed
+JSON in the baseline -- whose least-pressured run peaked at 586 MiB). Most of what is left is the
+room actor holding every event (`RoomActor::events`).
 
 **Left:** a backed-up room key deleted in Synapse after an earlier pass is not deleted here; a
 one-time key pool is made equal by count, which removes the oldest here (both servers hand them
