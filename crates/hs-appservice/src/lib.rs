@@ -22,6 +22,8 @@
 //! - [`metrics`]: the `hs_appservice_*` counters.
 //! - [`ping`]: ping in both directions ([`ping::PingService`]) plus the inbound axum route
 //!   ([`routes::ping_router`]).
+//! - [`provisioning`]: asking a bridge's own provisioning API who has signed in
+//!   ([`provisioning::BridgeLogins`]), for the admin API's `appservices.logins`.
 //! - [`query`]: the outbound user/room-alias query protocol and third-party lookups
 //!   ([`query::QueryService`]).
 //! - [`auth_registry`]: the [`hs_auth::appservice::AppserviceRegistry`] implementation over
@@ -39,6 +41,7 @@ pub mod error;
 pub mod metrics;
 pub mod namespace;
 pub mod ping;
+pub mod provisioning;
 pub mod pump;
 pub mod query;
 pub mod regexp;

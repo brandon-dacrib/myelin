@@ -12,6 +12,14 @@
 //!   reported). Counted from the body as sent ([`crate::transaction::body_counts`]), once the
 //!   appservice has answered 2xx, so a retry is not counted twice.
 //!
+//! - `hs_admin_bridge_login_queries_total{type,outcome}`: `GET /api/v1/appservices/{id}/logins`
+//!   answers ([`crate::provisioning`]), by catalogue bridge type (`custom` for a registration
+//!   that did not come from the catalogue) and outcome: `answered` (the bridge's provisioning
+//!   API answered), `cached` (an answer under 30 seconds old was reused), `unsupported` (the
+//!   type has no API that reports sign-ins, or the registration lacks what asking needs),
+//!   `unreachable`, `timeout`, `refused` (the bridge answered with an error) or
+//!   `invalid_answer`. Named for the admin API it serves; counted here, where the asking is.
+//!
 //! `appservice` is the registration id: bounded by how many bridges an operator runs, and what
 //! the operator looks at the numbers by.
 
@@ -39,6 +47,15 @@ pub struct DeliveredItemLabels {
     pub kind: String,
 }
 
+/// Labels of `hs_admin_bridge_login_queries_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+pub struct BridgeLoginLabels {
+    /// The catalogue bridge type, or `custom`.
+    pub r#type: String,
+    /// See the module docs.
+    pub outcome: String,
+}
+
 /// The delivery metric families. Cheap to clone; every clone counts into the same families.
 #[derive(Clone, Default)]
 pub struct AppserviceMetrics {
@@ -46,6 +63,8 @@ pub struct AppserviceMetrics {
     pub transactions_total: Family<TransactionLabels, Counter>,
     /// `hs_appservice_delivered_items_total{appservice,kind}`.
     pub delivered_items_total: Family<DeliveredItemLabels, Counter>,
+    /// `hs_admin_bridge_login_queries_total{type,outcome}`.
+    pub bridge_login_queries_total: Family<BridgeLoginLabels, Counter>,
 }
 
 impl AppserviceMetrics {
@@ -67,7 +86,24 @@ impl AppserviceMetrics {
              fallback_key_types)",
             metrics.delivered_items_total.clone(),
         );
+        registry.register(
+            "hs_admin_bridge_login_queries",
+            "Admin API questions to a bridge's provisioning API about who has signed in, by \
+             bridge type and outcome (answered, cached, unsupported, unreachable, timeout, \
+             refused, invalid_answer)",
+            metrics.bridge_login_queries_total.clone(),
+        );
         metrics
+    }
+
+    /// Counts one `appservices.logins` answer.
+    pub fn record_login_query(&self, bridge_type: &str, outcome: &str) {
+        self.bridge_login_queries_total
+            .get_or_create(&BridgeLoginLabels {
+                r#type: bridge_type.to_owned(),
+                outcome: outcome.to_owned(),
+            })
+            .inc();
     }
 
     /// Counts a transaction the appservice accepted, and what it carried.
@@ -125,6 +161,7 @@ mod tests {
             },
         );
         metrics.record_failed("irc");
+        metrics.record_login_query("mautrix-whatsapp", "answered");
         let mut text = String::new();
         prometheus_client::encoding::text::encode(&mut text, &registry).unwrap();
         assert!(
@@ -148,6 +185,12 @@ mod tests {
         assert!(
             text.contains(
                 "hs_appservice_delivered_items_total{appservice=\"irc\",kind=\"to_device\"} 3"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "hs_admin_bridge_login_queries_total{type=\"mautrix-whatsapp\",outcome=\"answered\"} 1"
             ),
             "{text}"
         );

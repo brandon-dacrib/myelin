@@ -5,7 +5,8 @@
 //! The registry already spoke the admin API's vocabulary ([`Health`], [`BacklogEntry`], merge
 //! patch updates, YAML export); this is the translation into `hs-admin`'s models and errors,
 //! plus the two things the registry alone cannot do: send a ping ([`PingService`]) and put
-//! dead-lettered transactions back ([`Scheduler::replay`]). A replay is followed by a nudge to
+//! dead-lettered transactions back ([`Scheduler::replay`]), and ask a bridge who has signed in
+//! ([`BridgeLogins`]). A replay is followed by a nudge to
 //! whatever drives delivery (`crate::delivery`), so that "replay" means "sent again now", not
 //! "sent again within fifteen seconds".
 
@@ -14,7 +15,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use hs_admin::model::{
     AdminAppservice, AdminAppserviceBacklogEntry, AdminAppserviceCreate, AdminAppserviceHealth,
-    AdminAppserviceLinks, AdminAppserviceReplay, AdminAppserviceTokens,
+    AdminAppserviceLinks, AdminAppserviceReplay, AdminAppserviceTokens, AdminBridgeLogins,
 };
 use hs_admin::sources::{AdminAppserviceRegistration, AppserviceDirectory, SourceError};
 use hs_kv::KvBackend;
@@ -22,6 +23,7 @@ use serde_json::Value;
 
 use crate::error::AppserviceError;
 use crate::ping::PingService;
+use crate::provisioning::BridgeLogins;
 use crate::registration::Registration;
 use crate::registry::{BacklogEntry, Health, Registry};
 use crate::scheduler::{ReplayRequest, Scheduler};
@@ -36,6 +38,7 @@ pub struct RegistryAppserviceDirectory<B: KvBackend + 'static> {
     ping: Arc<PingService<B>>,
     scheduler: Arc<Scheduler<B>>,
     nudge: NudgeDelivery,
+    logins: Arc<BridgeLogins>,
 }
 
 impl<B: KvBackend + 'static> RegistryAppserviceDirectory<B> {
@@ -52,7 +55,16 @@ impl<B: KvBackend + 'static> RegistryAppserviceDirectory<B> {
             ping,
             scheduler,
             nudge,
+            logins: Arc::new(BridgeLogins::new()),
         }
+    }
+
+    /// Asks bridges who has signed in through `logins` (with its metrics and cache) rather than
+    /// a plain [`BridgeLogins::new`].
+    #[must_use]
+    pub fn with_bridge_logins(mut self, logins: BridgeLogins) -> Self {
+        self.logins = Arc::new(logins);
+        self
     }
 
     fn view(&self, row: &AppserviceRow) -> Result<AdminAppservice, SourceError> {
@@ -262,6 +274,20 @@ impl<B: KvBackend + 'static> AppserviceDirectory for RegistryAppserviceDirectory
         }
         Ok(replayed)
     }
+
+    async fn logins(
+        &self,
+        id: &str,
+        user_id: Option<&str>,
+    ) -> Result<AdminBridgeLogins, SourceError> {
+        let row = self
+            .registry
+            .get(id)
+            .map_err(to_source)?
+            .ok_or(SourceError::NotFound)?;
+        let registration = row.to_registration().map_err(to_source)?.to_json();
+        self.logins.query(id, &registration, user_id).await
+    }
 }
 
 #[cfg(test)]
@@ -448,6 +474,84 @@ mod tests {
         ));
         assert!(matches!(
             directory.backlog("nope").await.unwrap_err(),
+            SourceError::NotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_registrations_provisioning_secret_is_kept_and_a_patch_can_add_one() {
+        use hs_admin::bridge_types::{BRIDGE_TYPE_KEY, PROVISIONING_SECRET_KEY};
+        // A bridge whose whoami says alice has signed in, for the secret "s2".
+        let app = axum::Router::new().route(
+            crate::provisioning::WHOAMI_PATH,
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                if headers.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer s2") {
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({"logins": [{"id": "1", "state_event": "CONNECTED"}]})),
+                    )
+                } else {
+                    (
+                        axum::http::StatusCode::UNAUTHORIZED,
+                        axum::Json(json!({"errcode": "M_UNKNOWN_TOKEN"})),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let Fixture { directory, .. } = directory();
+        let mut registration = irc();
+        registration["url"] = json!(url);
+        registration[BRIDGE_TYPE_KEY] = json!("mautrix-whatsapp");
+        directory
+            .create(AdminAppserviceCreate {
+                registration: Some(registration),
+                registration_yaml: None,
+            })
+            .await
+            .unwrap();
+        // Made before the server kept a secret: it says so, and how to fix it.
+        let before = directory
+            .logins("irc", Some("@alice:example.org"))
+            .await
+            .unwrap();
+        assert!(!before.supported);
+        assert!(before.reason.unwrap().contains(PROVISIONING_SECRET_KEY));
+
+        directory
+            .update("irc", json!({PROVISIONING_SECRET_KEY: "s2"}))
+            .await
+            .unwrap();
+        let after = directory
+            .logins("irc", Some("@alice:example.org"))
+            .await
+            .unwrap();
+        assert!(after.supported, "{after:?}");
+        assert_eq!(after.signed_in, Some(true), "{after:?}");
+        assert_eq!(after.logins[0].state, "connected");
+        // The secret is exported with the registration, which already carries both tokens.
+        assert_eq!(
+            directory.registration("irc").await.unwrap().json[PROVISIONING_SECRET_KEY],
+            "s2"
+        );
+        // And a null takes it out again, as a merge patch's null does; the type stays.
+        directory
+            .update("irc", json!({PROVISIONING_SECRET_KEY: null}))
+            .await
+            .unwrap();
+        let removed = directory
+            .logins("irc", Some("@bob:example.org"))
+            .await
+            .unwrap();
+        assert!(!removed.supported);
+        assert_eq!(removed.bridge_type.as_deref(), Some("mautrix-whatsapp"));
+        assert!(matches!(
+            directory.logins("nope", None).await.unwrap_err(),
             SourceError::NotFound
         ));
     }

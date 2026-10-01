@@ -523,6 +523,7 @@ const REAL_HANDLERS: &[&str] = &[
     "appservices.update",
     "appservices.delete",
     "appservices.health",
+    "appservices.logins",
     "appservices.backlog",
     "appservices.registration",
     "appservices.pause",
@@ -3116,6 +3117,44 @@ async fn appservices_health(
 }
 
 #[derive(Debug, Deserialize)]
+struct LoginsQuery {
+    user_id: Option<String>,
+}
+
+/// `GET /api/v1/appservices/{id}/logins` (`bridges:read`): who has signed in to the bridge and
+/// as what, from the bridge's own provisioning API (`crate::bridge_logins`). A bridge type
+/// with no such API is a `200` saying `supported: false`, never a `501`; a bridge that could
+/// not be asked is a `200` with `error` set. A read: not audited.
+async fn appservices_logins(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<LoginsQuery>,
+) -> Response {
+    let instance = format!("/api/v1/appservices/{id}/logins");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::BridgesRead),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(_principal) => {
+            let Some(appservices) = &state.appservices else {
+                return source_unavailable("appservice registry", &instance);
+            };
+            match appservices.logins(&id, query.user_id.as_deref()).await {
+                Ok(answer) => axum::Json(answer).into_response(),
+                Err(SourceError::NotFound) => no_such_appservice(&id, &instance),
+                Err(e) => e.to_problem().with_instance(instance).into_response(),
+            }
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct BacklogQuery {
     limit: Option<usize>,
     cursor: Option<String>,
@@ -5334,6 +5373,7 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         "appservices.update" => builder.add(method, &full_path, appservices_update, meta),
         "appservices.delete" => builder.add(method, &full_path, appservices_delete, meta),
         "appservices.health" => builder.add(method, &full_path, appservices_health, meta),
+        "appservices.logins" => builder.add(method, &full_path, appservices_logins, meta),
         "appservices.backlog" => builder.add(method, &full_path, appservices_backlog, meta),
         "appservices.registration" => {
             builder.add(method, &full_path, appservices_registration, meta)
@@ -8959,6 +8999,99 @@ mod tests {
             &router,
             "GET",
             "/api/v1/appservices/nope/health",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_bridges_logins_are_read_per_type_and_a_type_without_an_api_says_so() {
+        use crate::bridge_types::{BRIDGE_TYPE_KEY, PROVISIONING_SECRET_KEY};
+        let reader = Principal {
+            kind: PrincipalKind::User,
+            id: "@viewer:example.org".into(),
+            display_name: None,
+            scopes: vec![Scope::BridgesRead],
+            token_id: None,
+            expires_at: None,
+            issued_by: None,
+        };
+        let state = AdminState::new(
+            Arc::new(StaticVerifier::new().with_token("admin-token", reader)),
+            Arc::new(InMemoryAuditSink::new()),
+            Arc::new(EventBus::new()),
+        );
+        let signed_in = crate::model::AdminBridgeLogins {
+            appservice_id: "whatsapp".into(),
+            bridge_type: Some("mautrix-whatsapp".into()),
+            provisioning_api: "mautrix_v3".into(),
+            supported: true,
+            user_id: Some("@alice:example.org".into()),
+            signed_in: Some(true),
+            logins: vec![crate::model::AdminBridgeLogin {
+                user_id: "@alice:example.org".into(),
+                remote_id: "15551234567".into(),
+                remote_name: Some("+1 555-123-4567".into()),
+                state: "connected".into(),
+                state_reason: None,
+                since: Some("2026-09-30T12:00:00.000Z".into()),
+            }],
+            checked_at: Some("2026-10-01T00:00:00.000Z".into()),
+            ..crate::model::AdminBridgeLogins::default()
+        };
+        let state = state.with_appservices(Arc::new(
+            crate::sources::InMemoryAppserviceDirectory::new()
+                .with_registration(json!({
+                    "id": "whatsapp", "url": "http://wa:29318", "as_token": "a1", "hs_token": "h1",
+                    "sender_localpart": "whatsappbot",
+                    BRIDGE_TYPE_KEY: "mautrix-whatsapp", PROVISIONING_SECRET_KEY: "s",
+                }))
+                .with_registration(json!({
+                    "id": "irc", "url": "http://irc:9898", "as_token": "a2", "hs_token": "h2",
+                    "sender_localpart": "heisenbridge", BRIDGE_TYPE_KEY: "heisenbridge",
+                }))
+                .with_logins("whatsapp", "@alice:example.org", signed_in.clone()),
+        ));
+        let (router, _manifest) = build_router(state);
+
+        // `bridges:read` is enough, and the answer is the bridge's, normalised.
+        let (status, body, _) = call(
+            &router,
+            "GET",
+            "/api/v1/appservices/whatsapp/logins?user_id=%40alice%3Aexample.org",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let answer: crate::model::AdminBridgeLogins = serde_json::from_slice(&body).unwrap();
+        assert_eq!(answer, signed_in);
+
+        // A type with no provisioning API: 200 and why, never a 501.
+        let (status, body, _) =
+            call(&router, "GET", "/api/v1/appservices/irc/logins", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(answer["supported"], false, "{answer}");
+        assert_eq!(answer["provisioning_api"], "none");
+        assert!(answer["reason"].as_str().unwrap().contains("control room"));
+
+        // A shared mautrix bridge has to be told whom to ask about, as a Matrix ID.
+        for uri in [
+            "/api/v1/appservices/whatsapp/logins",
+            "/api/v1/appservices/whatsapp/logins?user_id=alice",
+        ] {
+            let (status, body, _) = call(&router, "GET", uri, None, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(problem["errors"][0]["pointer"], "/user_id", "{problem}");
+        }
+        let (status, _, _) = call(
+            &router,
+            "GET",
+            "/api/v1/appservices/nope/logins",
             None,
             None,
         )

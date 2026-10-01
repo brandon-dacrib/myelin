@@ -64,6 +64,15 @@
       "idempotent_post": false
     },
     {
+      "method": "GET",
+      "path": "/appservices/{id}/logins",
+      "operation_id": "appservices.logins",
+      "scope": "bridges:read",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
+    },
+    {
       "method": "POST",
       "path": "/appservices/{id}/pause",
       "operation_id": "appservices.pause",

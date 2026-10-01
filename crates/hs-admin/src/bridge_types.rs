@@ -353,6 +353,78 @@ fn mode(entry: &Entry) -> &'static str {
     }
 }
 
+/// The registration key holding the secret a bridge's provisioning API takes
+/// (`provisioning.shared_secret` in a mautrix bridge's `config.yaml`). A render mints it and
+/// writes it into both, so that the server can ask the bridge who has signed in
+/// (`GET /appservices/{id}/logins`, [`crate::bridge_logins`]). Kept by the registry with the
+/// other unrecognised keys; a bridge's own registration parser ignores it. A registration made
+/// before this key existed has none, and an administrator can add the bridge's own secret with
+/// a merge patch.
+pub const PROVISIONING_SECRET_KEY: &str = "io.myelin.provisioning_secret";
+
+/// A bridge's own provisioning surface ([`BridgeType::provisioning_api`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisioningApi {
+    /// A mautrix `bridgev2` bridge: `/_matrix/provision/v3` on its appservice listener,
+    /// authenticated by `provisioning.shared_secret` and told the user with `?user_id=`.
+    /// `GET /v3/whoami` lists the user's logins with their state.
+    MautrixV3,
+    /// matrix-appservice-irc's `/_matrix/provision` v1: links rooms to channels. It does not
+    /// report who is connected as which nick.
+    IrcV1,
+    /// matrix-hookshot's provisioning API: a room's connections (webhooks, feeds, repositories).
+    HookshotV1,
+    /// None at all.
+    None,
+}
+
+impl ProvisioningApi {
+    /// The wire word.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MautrixV3 => "mautrix_v3",
+            Self::IrcV1 => "irc_v1",
+            Self::HookshotV1 => "hookshot_v1",
+            Self::None => "none",
+        }
+    }
+
+    /// Whether this server can read who has signed in through it.
+    #[must_use]
+    pub fn reports_logins(self) -> bool {
+        self == Self::MautrixV3
+    }
+}
+
+fn provisioning_of(entry: &Entry) -> (ProvisioningApi, &'static str) {
+    match entry.runtime {
+        Runtime::Mautrix => (
+            ProvisioningApi::MautrixV3,
+            "The bridge's provisioning API (/_matrix/provision/v3/whoami) says who has signed in and as what, with the shared secret Myelin writes into its config.yaml.",
+        ),
+        Runtime::Heisenbridge => (
+            ProvisioningApi::None,
+            "heisenbridge has no provisioning API: its networks, and who uses them, live in its control room, so the bridge keeps that itself.",
+        ),
+        Runtime::AppserviceIrc => (
+            ProvisioningApi::IrcV1,
+            "matrix-appservice-irc's provisioning API links rooms to channels; it does not report who is connected as which nick, so the bridge keeps that itself.",
+        ),
+        Runtime::Hookshot => (
+            ProvisioningApi::HookshotV1,
+            "Hookshot's provisioning API manages each room's connections (webhooks, feeds, repositories); Myelin does not read accounts from it, so the bridge keeps that itself.",
+        ),
+    }
+}
+
+/// The provisioning surface of catalogue entry `type_id` and what it means in words; `None`
+/// for a type not in the catalogue.
+#[must_use]
+pub fn provisioning(type_id: &str) -> Option<(ProvisioningApi, &'static str)> {
+    entry(type_id).map(provisioning_of)
+}
+
 /// Whether an instance runs from what a render writes alone. Not matrix-appservice-irc or
 /// hookshot, whose configs name networks and services only an operator knows; not Telegram,
 /// whose config needs the operator's own API ID and hash.
@@ -429,6 +501,8 @@ fn bridge_type(entry: &Entry, server_name: &str) -> BridgeType {
         mode: mode(entry).to_owned(),
         deployable: deployable(entry),
         not_deployable_reason: not_deployable_reason(entry),
+        provisioning_api: provisioning_of(entry).0.as_str().to_owned(),
+        provisioning_note: Some(provisioning_of(entry).1.to_owned()),
         sign_in: BridgeTypeSignIn {
             steps: entry
                 .sign_in
@@ -568,6 +642,7 @@ pub fn render(type_id: &str, server_name: &str, values: &Value) -> Option<Bridge
 
     let as_token = token();
     let hs_token = token();
+    let provisioning_secret = provisioning_of(entry).0.reports_logins().then(token);
     let mut registration = Map::new();
     registration.insert("id".into(), json!(c.id));
     registration.insert("url".into(), json!(url));
@@ -611,6 +686,9 @@ pub fn render(type_id: &str, server_name: &str, values: &Value) -> Option<Bridge
         }
     }
     registration.insert(BRIDGE_TYPE_KEY.to_owned(), json!(entry.id));
+    if let Some(secret) = &provisioning_secret {
+        registration.insert(PROVISIONING_SECRET_KEY.to_owned(), json!(secret));
+    }
     let registration = Value::Object(registration);
     let registration_yaml = serde_yaml_ng::to_string(&registration).unwrap_or_default();
 
@@ -634,6 +712,7 @@ pub fn render(type_id: &str, server_name: &str, values: &Value) -> Option<Bridge
             backfill: true,
             double_puppeting,
             encryption: c.encryption,
+            provisioning_secret: provisioning_secret.as_deref(),
         })
     });
     let compose_yaml = compose(entry, &c, &image, server_name);
@@ -666,6 +745,8 @@ struct MautrixParams<'a> {
     backfill: bool,
     double_puppeting: bool,
     encryption: bool,
+    /// `provisioning.shared_secret`, when this server is to read the bridge's sign-ins.
+    provisioning_secret: Option<&'a str>,
 }
 
 /// The `config.yaml` a mautrix `bridgev2` bridge reads, with everything that ties it to this
@@ -745,6 +826,14 @@ fn mautrix_config(p: &MautrixParams<'_>) -> String {
         out.push_str("  msc4190: true\n");
     } else {
         out.push_str("  allow: false\n");
+    }
+    if let Some(secret) = p.provisioning_secret {
+        out.push_str(
+            "# The server asks /_matrix/provision/v3/whoami with this secret, to show its\n",
+        );
+        out.push_str("# administrators who has signed in to the bridge and as what.\n");
+        out.push_str("provisioning:\n");
+        out.push_str(&format!("  shared_secret: {secret}\n"));
     }
     out
 }
@@ -875,6 +964,10 @@ pub struct InstanceSpec<'a> {
     pub encryption: Option<bool>,
     pub double_puppeting: Option<bool>,
     pub backfill: Option<bool>,
+    /// The secret its provisioning API takes, written into its config and kept in its
+    /// registration ([`PROVISIONING_SECRET_KEY`]); `None` for an instance made before the
+    /// manager minted one, or a type whose provisioning API this server does not read.
+    pub provisioning_secret: Option<&'a str>,
 }
 
 /// An instance, rendered: its registration, the files its process reads from `/data`, and how
@@ -995,6 +1088,12 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
                 .unwrap_or(crate::bridge_offerings::SHARED_INSTANCE)
         ),
     );
+    let provisioning_secret = spec
+        .provisioning_secret
+        .filter(|_| provisioning_of(entry).0.reports_logins());
+    if let Some(secret) = provisioning_secret {
+        registration.insert(PROVISIONING_SECRET_KEY.to_owned(), json!(secret));
+    }
     let registration = Value::Object(registration);
     let registration_yaml = serde_yaml_ng::to_string(&registration).unwrap_or_default();
 
@@ -1024,6 +1123,7 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
                 backfill,
                 double_puppeting,
                 encryption,
+                provisioning_secret,
             });
             files.insert("config.yaml".to_owned(), config.clone());
             Some(config)
@@ -1291,6 +1391,16 @@ mod tests {
         assert_eq!(config["encryption"]["appservice"], true);
         assert_eq!(config["encryption"]["msc4190"], true);
         assert_eq!(config["backfill"]["enabled"], true);
+        // A provisioning secret of its own, the same in the config and the registration, so the
+        // server can ask the bridge who has signed in; and a different one each render.
+        let secret = r[PROVISIONING_SECRET_KEY]
+            .as_str()
+            .expect("a minted secret");
+        assert_eq!(secret.len(), 64);
+        assert_eq!(config["provisioning"]["shared_secret"], secret);
+        assert_ne!(secret, r["as_token"].as_str().unwrap());
+        // The registration a bridge reads keeps it as one more unrecognised key.
+        assert!(result.registration_yaml.contains(PROVISIONING_SECRET_KEY));
         // The Compose comment tells the operator what to do with the files.
         assert!(
             result
@@ -1412,6 +1522,7 @@ mod tests {
             encryption: None,
             double_puppeting: None,
             backfill: None,
+            provisioning_secret: Some("p".repeat(64).as_str()),
         })
         .unwrap();
         let reg = &r.registration;
@@ -1439,6 +1550,10 @@ mod tests {
             config["homeserver"]["address"],
             "http://myelin-hs.myelin.svc:8008"
         );
+        // The provisioning API's secret is the same in the config the bridge reads and the
+        // registration the server keeps, which is how the server asks who has signed in.
+        assert_eq!(config["provisioning"]["shared_secret"], "p".repeat(64));
+        assert_eq!(reg[PROVISIONING_SECRET_KEY], "p".repeat(64));
         let permissions = config["bridge"]["permissions"].as_object().unwrap();
         assert_eq!(permissions.len(), 1);
         assert_eq!(permissions["@alice:chat.example.net"], "admin");
@@ -1477,10 +1592,15 @@ mod tests {
                 encryption: None,
                 double_puppeting: None,
                 backfill: None,
+                provisioning_secret: Some("ignored"),
             }
         })
         .unwrap();
         assert!(heisen.config_yaml.is_none());
+        assert!(
+            heisen.registration.get(PROVISIONING_SECRET_KEY).is_none(),
+            "heisenbridge has no provisioning API to give a secret to"
+        );
         assert_eq!(heisen.args.last().unwrap(), "http://hs:8008");
         // Shared: nobody is named as the owner; the first local user to talk to it claims it.
         assert!(!heisen.args.contains(&"-o".to_owned()), "{:?}", heisen.args);
@@ -1491,6 +1611,29 @@ mod tests {
             crate::bridge_offerings::SHARED_INSTANCE
         );
         assert_eq!(heisen.image_tag, "latest");
+    }
+
+    #[test]
+    fn every_type_says_what_provisioning_api_it_has_and_only_mautrix_reports_logins() {
+        for t in list("x.org") {
+            let expected = match t.id.as_str() {
+                id if id.starts_with("mautrix-") => "mautrix_v3",
+                "heisenbridge" => "none",
+                "matrix-appservice-irc" => "irc_v1",
+                "matrix-hookshot" => "hookshot_v1",
+                other => panic!("{other} has no expectation"),
+            };
+            assert_eq!(t.provisioning_api, expected, "{}", t.id);
+            assert!(t.provisioning_note.is_some_and(|n| !n.is_empty()));
+            let (api, _) = provisioning(&t.id).unwrap();
+            assert_eq!(api.reports_logins(), expected == "mautrix_v3");
+        }
+        assert!(provisioning("nope").is_none());
+        // A type with no API mints no secret it could never use.
+        let heisen = render("heisenbridge", "x.org", &json!({})).unwrap();
+        assert!(heisen.registration.get(PROVISIONING_SECRET_KEY).is_none());
+        let irc = render("matrix-appservice-irc", "x.org", &json!({})).unwrap();
+        assert!(irc.registration.get(PROVISIONING_SECRET_KEY).is_none());
     }
 
     #[test]

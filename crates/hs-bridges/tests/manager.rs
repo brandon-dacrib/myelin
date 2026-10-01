@@ -229,6 +229,28 @@ async fn an_instance_is_registered_then_waits_for_its_bridge_then_is_ready() {
     let config = files.config_yaml.unwrap();
     assert!(config.contains(registration["as_token"].as_str().unwrap()));
     assert!(config.contains("address: https://example.org"), "{config}");
+    // The instance's own provisioning secret, in the config it runs with and the registration
+    // the server keeps, so that the admin API can ask it who has signed in; and the admin API
+    // asks about its owner without being told whom.
+    let secret = registration["io.myelin.provisioning_secret"]
+        .as_str()
+        .expect("the instance's registration keeps a provisioning secret");
+    assert_eq!(secret.len(), 64);
+    assert!(
+        config.contains(&format!("shared_secret: {secret}")),
+        "{config}"
+    );
+    let plan = hs_admin::bridge_logins::plan("whatsapp-alice", &registration, None).unwrap();
+    match plan {
+        hs_admin::bridge_logins::LoginsPlan::Ask(request) => {
+            assert_eq!(request.user_id, "@alice:example.org");
+            assert_eq!(
+                request.url,
+                "http://whatsapp-alice:29318/_matrix/provision/v3/whoami"
+            );
+        }
+        other => panic!("an instance is asked: {other:?}"),
+    }
     assert!(files.registration_yaml.contains("id: whatsapp-alice"));
     assert!(
         files

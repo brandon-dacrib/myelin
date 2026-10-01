@@ -518,6 +518,83 @@ pub struct BridgeType {
     /// Why it cannot, when `deployable` is false, in words for an administrator.
     #[serde(default)]
     pub not_deployable_reason: Option<String>,
+    /// The bridge's own provisioning surface, which decides whether
+    /// `GET /appservices/{id}/logins` can say who has signed in: `mautrix_v3` (a mautrix
+    /// `bridgev2` bridge's `/_matrix/provision/v3`, which this server reads), `irc_v1`
+    /// (matrix-appservice-irc's room-linking API), `hookshot_v1` (hookshot's connections API)
+    /// or `none`. Only `mautrix_v3` reports sign-ins.
+    #[serde(default)]
+    pub provisioning_api: String,
+    /// What that surface means for an administrator, in words: what is read, or why nothing
+    /// can be.
+    #[serde(default)]
+    pub provisioning_note: Option<String>,
+}
+
+/// The OpenAPI `BridgeLogins` schema: `GET /appservices/{id}/logins`, who has signed in to a
+/// bridge and as what, as the bridge itself says through its provisioning API.
+///
+/// A bridge type with no such API answers `supported: false` and a `reason`; a bridge that could
+/// not be asked (unreachable, refused the secret, answered nonsense) answers `supported: true`
+/// with `error` set, the way a ping of an unreachable bridge reports the bridge, not a failure
+/// of the request.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminBridgeLogins {
+    pub appservice_id: String,
+    /// The catalogue entry the registration came from, if any.
+    pub bridge_type: Option<String>,
+    /// [`BridgeType::provisioning_api`] for that entry; `none` without one.
+    pub provisioning_api: String,
+    /// Whether this server can ask the bridge at all.
+    pub supported: bool,
+    /// Why not, when `supported` is false, in words for an administrator.
+    pub reason: Option<String>,
+    /// The Matrix user asked about.
+    pub user_id: Option<String>,
+    /// Whether the bridge reported at least one login for the user; `None` when it was not
+    /// asked or did not answer.
+    pub signed_in: Option<bool>,
+    /// The user's logins, as the bridge reported them.
+    pub logins: Vec<AdminBridgeLogin>,
+    /// When the bridge answered (RFC 3339). Answers are kept for 30 seconds per bridge and
+    /// user, so this may be up to that old.
+    pub checked_at: Option<String>,
+    /// Whether this answer came from that cache.
+    pub cached: bool,
+    /// Why the bridge could not be asked, when it could not.
+    pub error: Option<AdminBridgeLoginsError>,
+}
+
+/// One entry of [`AdminBridgeLogins::logins`]: one remote account a Matrix user has signed in
+/// with, normalised from the bridge's own shape.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminBridgeLogin {
+    /// The Matrix user who signed in.
+    pub user_id: String,
+    /// The remote network's id for the login (a phone number's digits, an account id).
+    pub remote_id: String,
+    /// What the remote account is called, for a person: `+1 555…`, a username.
+    pub remote_name: Option<String>,
+    /// The bridge's state for the login, lower-cased: `connected`, `connecting`,
+    /// `transient_disconnect`, `bad_credentials`, `logged_out`, `unknown_error`, ...
+    pub state: String,
+    /// The bridge's reason for that state, when it gave one.
+    pub state_reason: Option<String>,
+    /// Since when it has been in that state (RFC 3339), when the bridge said.
+    pub since: Option<String>,
+}
+
+/// [`AdminBridgeLogins::error`]: why the bridge's provisioning API gave no answer.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminBridgeLoginsError {
+    /// `502` for a bridge that could not be reached or answered something unreadable, `504`
+    /// for one that did not answer in time, otherwise the bridge's own status.
+    pub status: u16,
+    /// `unreachable`, `timeout`, `refused` (the bridge answered with an error) or
+    /// `invalid_answer`.
+    pub reason: String,
+    /// In words, with the bridge's own `errcode` and `error` when it gave them.
+    pub detail: String,
 }
 
 /// [`BridgeType::sign_in`]: the bridge's own documented login flow, one step per line. `{bot}`

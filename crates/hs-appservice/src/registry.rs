@@ -265,7 +265,25 @@ impl<B: KvBackend> Registry<B> {
         let reg = existing.to_registration()?;
         let mut as_json = serde_json::to_value(RegistrationJson::from(&reg))
             .map_err(|e| AppserviceError::Decode(e.to_string()))?;
-        json_merge_patch(&mut as_json, patch);
+        // A top-level key the registration format does not define (`io.myelin.*`, a bridge's
+        // vendor key) is one of the registration's unrecognised keys, kept in `extra`, exactly
+        // as a registration file's would be; merged anywhere else it would be dropped.
+        let (known, unknown): (
+            serde_json::Map<String, Value>,
+            serde_json::Map<String, Value>,
+        ) = match patch {
+            Value::Object(map) => map
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .partition(|(k, _)| PATCHABLE_KEYS.contains(&k.as_str())),
+            _ => (serde_json::Map::new(), serde_json::Map::new()),
+        };
+        if patch.is_object() {
+            json_merge_patch(&mut as_json, &Value::Object(known));
+            json_merge_patch(&mut as_json["extra"], &Value::Object(unknown));
+        } else {
+            json_merge_patch(&mut as_json, patch);
+        }
         // sender_localpart and id are not part of a merge-patchable registration surface.
         as_json["id"] = Value::String(id.to_string());
         as_json["sender_localpart"] = Value::String(existing.sender_localpart.clone());
@@ -508,6 +526,24 @@ fn generate_token() -> String {
     rand::rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
 }
+
+/// The top-level keys of [`RegistrationJson`]; any other key in a patch is an unrecognised
+/// registration key, merged into `extra`.
+const PATCHABLE_KEYS: &[&str] = &[
+    "id",
+    "url",
+    "as_token",
+    "hs_token",
+    "sender_localpart",
+    "rate_limited",
+    "namespaces",
+    "protocols",
+    "receive_ephemeral",
+    "push_ephemeral_legacy",
+    "org.matrix.msc3202",
+    "io.element.msc4190",
+    "extra",
+];
 
 /// The JSON Merge Patch (RFC 7396) target shape for [`Registry::update`]: exactly the fields of
 /// [`Registration`] that a merge patch can touch, using plain JSON types (so `namespaces` is the

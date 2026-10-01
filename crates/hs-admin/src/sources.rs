@@ -20,12 +20,12 @@ use serde_json::{Map, Value, json};
 
 use crate::model::{
     AdminAppservice, AdminAppserviceBacklogEntry, AdminAppserviceCreate, AdminAppserviceHealth,
-    AdminAppserviceLinks, AdminAppserviceReplay, AdminAppserviceTokens, AdminDestination,
-    AdminDevice, AdminPasswordReset, AdminRoom, AdminRoomMember, AdminUser, ClusterStatus,
-    ConfigChange, ConfigReloadReport, ConfigSection, ConfigSettingChange, ConfigSettingValue,
-    ConfigValidateReport, ExternalId, RecoveryAdministrator, RecoveryInspection, RecoveryLink,
-    RecoveryLinkKind, RecoveryLinkRequest, RecoveryResetRequest, SetupRequest, SetupSession,
-    StatisticsOverview, ThreePid,
+    AdminAppserviceLinks, AdminAppserviceReplay, AdminAppserviceTokens, AdminBridgeLogins,
+    AdminDestination, AdminDevice, AdminPasswordReset, AdminRoom, AdminRoomMember, AdminUser,
+    ClusterStatus, ConfigChange, ConfigReloadReport, ConfigSection, ConfigSettingChange,
+    ConfigSettingValue, ConfigValidateReport, ExternalId, RecoveryAdministrator,
+    RecoveryInspection, RecoveryLink, RecoveryLinkKind, RecoveryLinkRequest, RecoveryResetRequest,
+    SetupRequest, SetupSession, StatisticsOverview, ThreePid,
 };
 
 /// Why a data-source call failed. Mirrors [`crate::auth::AuthError`]'s "only unavailable escapes
@@ -2328,6 +2328,22 @@ pub trait AppserviceDirectory: Send + Sync + 'static {
     async fn ping(&self, id: &str) -> Result<AdminAppserviceHealth, SourceError>;
     /// Puts dead-lettered transactions back in the queue for immediate retry. Returns how many.
     async fn replay(&self, id: &str, request: AdminAppserviceReplay) -> Result<usize, SourceError>;
+    /// Who has signed in to the bridge `id`, and as what, as its provisioning API says
+    /// ([`crate::bridge_logins`]): `user_id`, or a per-user instance's owner when absent. A
+    /// bridge type with no such API is an `Ok` with `supported: false`; a bridge that could not
+    /// be asked is an `Ok` with `error` set, as a ping of an unreachable bridge is.
+    ///
+    /// The default answers [`SourceError::Unavailable`], for a directory that cannot ask.
+    async fn logins(
+        &self,
+        id: &str,
+        user_id: Option<&str>,
+    ) -> Result<AdminBridgeLogins, SourceError> {
+        let _ = (id, user_id);
+        Err(SourceError::Unavailable(
+            "this appservice directory cannot ask bridges who has signed in".to_owned(),
+        ))
+    }
 }
 
 /// A registration in both notations, for `GET /appservices/{id}/registration` to answer in
@@ -2351,6 +2367,8 @@ impl std::fmt::Debug for AdminAppserviceRegistration {
 pub struct InMemoryAppserviceDirectory {
     rows: RwLock<BTreeMap<String, InMemoryAppserviceRow>>,
     unreachable: RwLock<Vec<String>>,
+    /// What `logins` answers for a bridge it would ask, by `(appservice id, user id)`.
+    logins: RwLock<BTreeMap<(String, String), AdminBridgeLogins>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2400,6 +2418,17 @@ impl InMemoryAppserviceDirectory {
         {
             row.backlog = entries;
         }
+        self
+    }
+
+    /// What `logins` answers for `user_id` on `id` once [`crate::bridge_logins::plan`] says
+    /// the bridge would be asked; an unasked bridge answers `Unavailable` here, since nothing in
+    /// memory can reach one.
+    pub fn with_logins(self, id: &str, user_id: &str, answer: AdminBridgeLogins) -> Self {
+        self.logins
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((id.to_owned(), user_id.to_owned()), answer);
         self
     }
 
@@ -2629,5 +2658,27 @@ impl AppserviceDirectory for InMemoryAppserviceDirectory {
             }
             replayed
         })
+    }
+
+    async fn logins(
+        &self,
+        id: &str,
+        user_id: Option<&str>,
+    ) -> Result<AdminBridgeLogins, SourceError> {
+        let registration = self.with_row(id, |row| row.registration.clone())?;
+        match crate::bridge_logins::plan(id, &registration, user_id)? {
+            crate::bridge_logins::LoginsPlan::Unsupported(answer) => Ok(answer),
+            crate::bridge_logins::LoginsPlan::Ask(request) => self
+                .logins
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&(id.to_owned(), request.user_id.clone()))
+                .cloned()
+                .ok_or_else(|| {
+                    SourceError::Unavailable(
+                        "the in-memory appservice directory asks no bridge".to_owned(),
+                    )
+                }),
+        }
     }
 }

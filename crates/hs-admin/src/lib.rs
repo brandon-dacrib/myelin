@@ -28,6 +28,8 @@
 //! - [`user_moderation`]: the moderation and activity half of the Users area (suspension,
 //!   shadow-bans, rate-limit overrides, support sessions, sessions, memberships, statistics,
 //!   a user's media, redacting what a user sent) and the two source traits it calls.
+//! - [`bridge_logins`]: who has signed in to a bridge, decided from its registration and
+//!   normalised from its provisioning API's answer.
 //! - [`openapi`]: the embedded OpenAPI document.
 //!
 //! The `hs-admin-mock` binary (`src/bin/hs-admin-mock.rs`) is a separate, self-contained fixture
@@ -37,6 +39,7 @@
 pub mod assets;
 pub mod audit;
 pub mod auth;
+pub mod bridge_logins;
 pub mod bridge_offerings;
 pub mod bridge_types;
 pub mod cluster;

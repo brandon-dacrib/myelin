@@ -312,6 +312,51 @@ paths:
           $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
+  /appservices/{id}/logins:
+    get:
+      summary: Who has signed in to a bridge, and as what
+      description: >-
+        Asks the bridge's own provisioning API who has signed in (a mautrix bridgev2 bridge's
+        `/_matrix/provision/v3/whoami`, with the shared secret a catalogue render mints and keeps
+        in the registration's `io.myelin.provisioning_secret`). Answers are kept for 30 seconds
+        per bridge and user. A bridge type with no such API answers `200` with `supported: false`
+        and a `reason`; a bridge that could not be asked answers `200` with `error` set. A read,
+        so not audited.
+      operationId: appservices.logins
+      tags:
+      - Bridges
+      security:
+      - OAuth2:
+        - bridges:read
+      parameters:
+      - $ref: '#/components/parameters/AppserviceId'
+      - name: user_id
+        in: query
+        required: false
+        description: The Matrix user to ask about. Optional for a per-user bridge instance, whose owner is asked about; required for a shared bridge whose type reports sign-ins.
+        schema:
+          type: string
+      responses:
+        '200':
+          description: What the bridge says, or why it cannot be asked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BridgeLogins'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
   /appservices/{id}/pause:
     post:
       summary: Pause an appservice
@@ -7766,6 +7811,19 @@ components:
           - string
           - 'null'
           description: Why it cannot, when `deployable` is false, in words for an administrator.
+        provisioning_api:
+          type: string
+          enum:
+          - mautrix_v3
+          - irc_v1
+          - hookshot_v1
+          - none
+          description: The bridge's own provisioning surface. Only `mautrix_v3` (a mautrix bridgev2 bridge's `/_matrix/provision/v3`) reports who has signed in, through `GET /appservices/{id}/logins`.
+        provisioning_note:
+          type:
+          - string
+          - 'null'
+          description: What that surface means for an administrator, in words.
         sign_in:
           type: object
           description: The bridge's own documented login flow. `{bot}` in a step stands for the bridge bot's Matrix ID, which the interface substitutes.
@@ -7778,6 +7836,115 @@ components:
               type:
               - string
               - 'null'
+    BridgeLogins:
+      type: object
+      description: Who has signed in to a bridge and as what, as the bridge's provisioning API says.
+      required:
+      - appservice_id
+      - provisioning_api
+      - supported
+      - logins
+      - cached
+      properties:
+        appservice_id:
+          type: string
+        bridge_type:
+          type:
+          - string
+          - 'null'
+          description: The catalogue entry the registration came from.
+        provisioning_api:
+          type: string
+          enum:
+          - mautrix_v3
+          - irc_v1
+          - hookshot_v1
+          - none
+        supported:
+          type: boolean
+          description: Whether the server can ask this bridge who has signed in.
+        reason:
+          type:
+          - string
+          - 'null'
+          description: Why not, when `supported` is false.
+        user_id:
+          type:
+          - string
+          - 'null'
+          description: The Matrix user asked about.
+        signed_in:
+          type:
+          - boolean
+          - 'null'
+          description: Whether the bridge reported at least one login for the user; null when it was not asked or did not answer.
+        logins:
+          type: array
+          items:
+            $ref: '#/components/schemas/BridgeLogin'
+        checked_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When the bridge answered; answers are kept for 30 seconds.
+        cached:
+          type: boolean
+          description: Whether this answer came from the 30-second cache.
+        error:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/BridgeLoginsError'
+    BridgeLogin:
+      type: object
+      required:
+      - user_id
+      - remote_id
+      - state
+      properties:
+        user_id:
+          type: string
+          description: The Matrix user who signed in.
+        remote_id:
+          type: string
+          description: The remote network's id for the login.
+        remote_name:
+          type:
+          - string
+          - 'null'
+          description: What the remote account is called, for a person (a phone number, a username).
+        state:
+          type: string
+          description: The bridge's state for the login, lower-cased (`connected`, `connecting`, `transient_disconnect`, `bad_credentials`, `logged_out`, `unknown_error`, ...).
+        state_reason:
+          type:
+          - string
+          - 'null'
+        since:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Since when the login has been in that state.
+    BridgeLoginsError:
+      type: object
+      required:
+      - status
+      - reason
+      - detail
+      properties:
+        status:
+          type: integer
+          description: 502 for a bridge that could not be reached or answered something unreadable, 504 for one that did not answer in time, otherwise the bridge's own status.
+        reason:
+          type: string
+          enum:
+          - unreachable
+          - timeout
+          - refused
+          - invalid_answer
+        detail:
+          type: string
     BridgeTypeRenderRequest:
       type: object
       description: The wizard's chosen configuration values.

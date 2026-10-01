@@ -382,6 +382,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             encryption: offering.options.encryption,
             double_puppeting: offering.options.double_puppeting,
             backfill: offering.options.backfill,
+            provisioning_secret: row.provisioning_secret.as_deref(),
         })
     }
 
@@ -649,6 +650,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                     r.deploy_name = Some(name.clone());
                     r.as_token = Some(crate::random_hex(32));
                     r.hs_token = Some(crate::random_hex(32));
+                    r.provisioning_secret = Some(crate::random_hex(32));
                     r.url = Some(url.clone());
                     true
                 })

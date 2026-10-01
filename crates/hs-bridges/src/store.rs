@@ -86,6 +86,12 @@ pub struct InstanceRow {
     pub deploy_name: Option<String>,
     pub as_token: Option<String>,
     pub hs_token: Option<String>,
+    /// The secret its provisioning API takes (`provisioning.shared_secret` in its config, and
+    /// `io.myelin.provisioning_secret` in its registration), minted with its tokens, so the
+    /// admin API can ask it who has signed in. `None` for an instance registered before the
+    /// manager minted one.
+    #[serde(default)]
+    pub provisioning_secret: Option<String>,
     /// Where this server reaches it: the registration's `url`.
     pub url: Option<String>,
     /// The room its owner asked for it in, to tell them there when it is ready.
@@ -124,6 +130,7 @@ impl InstanceRow {
             deploy_name: None,
             as_token: None,
             hs_token: None,
+            provisioning_secret: None,
             url: None,
             front_door_room: None,
             dm_room: None,
