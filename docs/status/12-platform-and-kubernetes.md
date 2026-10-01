@@ -1,5 +1,47 @@
 # 12. Platform and Kubernetes
 
+## 2026-10-01: the demo runs `sha-a01c1e0` (verified on the cluster)
+
+Release `myelin` (namespace `myelin`, context `admin@dacrib0`) rolled from revision 5
+(`sha-d6b3cd7928e8956ff86f174005e63cdf63b15e27`) to revision 6,
+`sha-a01c1e0f32a192e43fe6df540f046dcec5ca9482`: the image CD run 36800831078 published from
+`main` `a01c1e0` (the two CI races fixed in `hs-user`), the first green build since `d6b3cd7`.
+
+**Before.** `docker manifest inspect` found the tag. `helm get values` was the revision-5 set
+(`mode: singleNode`, embedded storage 10Gi, Traefik Ingress on `myelin.dacrib.net` with
+cert-manager, `serviceMonitor.enabled`, registration shared secret from
+`myelin-registration-shared-secret`, `image.tag` the `d6b3cd7` pin); both pods ran
+`sha-d6b3cd7…` with 0 restarts; signing key `ed25519:a_JBQV7r` =
+`H+BeCj+FLf/SkfE8un6Blp3QW0v85Z2NHPr3+EeTjxU`. `helm template` with those values and the new
+tag rendered.
+
+**Run** (no orphan-delete; the `volumeClaimTemplates` labels fixed in revision 5 held):
+
+```sh
+helm get values myelin -n myelin --kube-context admin@dacrib0 -o yaml > values.yaml
+helm upgrade myelin deploy/helm/hs -n myelin --kube-context admin@dacrib0 -f values.yaml \
+  --set image.tag=sha-a01c1e0f32a192e43fe6df540f046dcec5ca9482 --wait --timeout 10m
+```
+
+Revision 6, "Upgrade complete", in under a minute.
+
+**Verified** (2026-10-01 01:50Z):
+
+- `/` → `307 https://myelin.dacrib.net/admin/`; `/admin/` → `200`;
+  `/.well-known/matrix/client` → `{"m.homeserver":{"base_url":"https://myelin.dacrib.net"}}`;
+  `/_matrix/client/versions` → `200`.
+- `/health/ready` through `kubectl port-forward svc/myelin-hs 18008:8008` → `200`.
+- `myelin-hs-0` and `myelin-hs-bridges-operator-749c67bbf9-742mr` both run
+  `ghcr.io/brandon-dacrib/myelin:sha-a01c1e0f32a192e43fe6df540f046dcec5ca9482`, digest
+  `sha256:2d09094cc1ee2dda0c5b4567448eeda73e8da9d98b634eb90229260b09091d13`, ready, 0 restarts;
+  PVC `data-myelin-hs-0` the same volume (`pvc-2a3aa49f…`, age 4d7h).
+- Signing key unchanged: `ed25519:a_JBQV7r` = `H+BeCj+FLf/SkfE8un6Blp3QW0v85Z2NHPr3+EeTjxU`.
+- The server log: configuration resolved at database revision 2, `.well-known` published,
+  listening on 8008 and 9090; no setup link (an administrator exists) and no `ERROR` line in the
+  first minutes. The operator logged "bridge operator starting". No account created.
+
+No chart change.
+
 ## 2026-09-30: the demo runs `sha-d6b3cd7` and `/` redirects to `/admin/` (verified on the cluster)
 
 **What was wrong.** Release `myelin` (namespace `myelin`, context `admin@dacrib0`) sat at

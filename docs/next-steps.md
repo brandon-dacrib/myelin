@@ -50,13 +50,17 @@ server` every twenty minutes or so and `postgres::config: WARNING: there is no t
 progress` at INFO many times an hour -- a `COMMIT` or `ROLLBACK` sent outside a transaction,
 which has no row yet.
 
-**Later that evening: the demo runs `sha-d6b3cd7` and `/` redirects to `/admin/`.** An agent
+**Later that evening: the demo runs `sha-a01c1e0` (since 2026-10-01) and `/` redirects to `/admin/`.** An agent
 upgraded release `myelin` to revision 5 with the pinned image `sha-d6b3cd7928e8956ff86f174005e63cdf63b15e27`;
 `https://myelin.dacrib.net/` now answers `307` to `/admin/`, the Ingress routes `Exact /`, and
 the signing key (`ed25519:a_JBQV7r`) and data came across. The old revision-3 failure was the
 pre-2026-09-26 `volumeClaimTemplates` labels; one `kubectl delete statefulset myelin-hs
 --cascade=orphan` cleared it and is not needed again. No chart change. Details and transcript in
-`docs/status/12-platform-and-kubernetes.md` (2026-09-30). **At the next green `main`**, roll it
+`docs/status/12-platform-and-kubernetes.md` (2026-09-30). **On 2026-10-01 (01:49Z) it was rolled
+again, to `sha-a01c1e0f32a192e43fe6df540f046dcec5ca9482`** (revision 6, CD run 36800831078 from
+`main` `a01c1e0`, the CI-race fix): no orphan-delete needed, both pods on the new tag, `/` still
+`307` to `/admin/`, `/health/ready` 200, signing key unchanged, no setup link and no `ERROR` in the
+log (status 12, 2026-10-01). **At the next green `main`**, roll it
 the same way, with the release's values in a file (`helm get values myelin -n myelin
 --kube-context admin@dacrib0 -o yaml > values.yaml`; not `--reuse-values`) and the new commit's
 full SHA:
