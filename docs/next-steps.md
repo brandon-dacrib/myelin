@@ -247,9 +247,10 @@ session 12, note in status 03). Rebased on `main` after `agent/room-gaps` merged
 every write that is not an append at the head); `hs-user`'s `RoomMirror` catches its copies up
 instead of reloading them, on each read and on each wake, holds at most 1,024, and exports
 `hs_user_mirror_*`; `hs-cli` registers the metrics and honours `HS_SYNC_MIRROR_FULL_RELOAD=1`.
-New real-binary test `crates/hs-cli/tests/cluster_mirror.rs` (three replicas; about 25 minutes
-on the loaded desktop at its default sizes -- it is slow because of the owner fan-out gap it
-found, a new row in the table). Touches `crates/hs-cli/src/serve.rs` (one line) and
+New real-binary test `crates/hs-cli/tests/cluster_mirror.rs` (three replicas; 67 s in a debug
+build at its default sizes on a quiet desktop, much longer under load because of the owner
+fan-out gap it found, a new row in the table; the 2,000-message, 303-member measurement is a
+55-minute release run, its command in the file's docs). Touches `crates/hs-cli/src/serve.rs` (one line) and
 `sync_cluster.rs`.
 
 **Branch `agent/cluster-gaps` (not merged by its agent; for the merge queue): two `hs-cluster`
