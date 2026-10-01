@@ -6,8 +6,10 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 
 ## Resume here: 2026-09-30, end of day
 
-**Where `main` is.** `dce1ffb` plus this document, **2,436 Rust tests**, gate green with both
-PostgreSQL servers (plain and TLS) in use, **nothing unmerged**, one worktree (`merge-queue`).
+**Where `main` is.** `083b58e` plus this document, **2,446 Rust tests**, gate green with both
+PostgreSQL servers (plain and TLS) in use; CI green again at `a01c1e0` after a red evening (the
+two races below); one branch open, `agent/federation-catchup` (the next gap, in progress); one
+worktree (`merge-queue`).
 The gate's six `HS_*_TEST_POSTGRES_*` variables have their recipe at the top of
 `crates/hs-kv/tests/postgres_tls.rs`; the two containers are `hs-admin-followups-gate-pg` on
 :5462 and `hs-merge-queue-pg-tls` on :5463, password `hspg`. The running TLS container's
@@ -35,7 +37,7 @@ joined member`: `put_typing` reads membership from the user store, which the ses
 moment after the join, the lag `/sync` already waits out with `wait_for_consumed`) and
 `admin_rooms.rs::a_deleted_room_empties_moves_its_members_and_cannot_be_joined` (`GET
 /sync?timeout=0` answers `404 room not found` once the admin delete has purged a room whose
-kick is still in the member's feed). An agent on `agent/ci-flakes` is fixing both in `hs-user`.
+kick is still in the member's feed). Both fixed in `hs-user` and merged as `a01c1e0` (below).
 The demo at `myelin.dacrib.net` (release `myelin`, namespace `myelin`) ran an image from
 before the `GET /` → `/admin/` redirect (`06db4ef`, 2026-09-28) and an Ingress without the
 exact `/` route until the upgrade in the next paragraph. **`kubectl` and `helm` reach
@@ -60,7 +62,8 @@ the same way, with the release's values in a file (`helm get values myelin -n my
 full SHA:
 `helm upgrade myelin deploy/helm/hs -n myelin --kube-context admin@dacrib0 -f values.yaml --set image.tag=sha-<full commit sha> --wait --timeout 10m`.
 
-**Both CI races are fixed in the server, on `agent/ci-flakes`** (status 05, session 10). A
+**Both CI races are fixed in the server** (`agent/ci-flakes` → `a01c1e0`; status 05, session 10;
+CI green on it, the first green run since `d6b3cd7`). A
 typing, receipt or read-marker request no longer trusts the user store alone for "is this a
 joined member": `SessionHub::is_joined` asks the room's own state when the record does not say
 `join` yet, then waits for the hub as `/sync` does. An admin room deletion no longer leaves
@@ -134,7 +137,7 @@ cost one device listing per interesting user per transaction; a never-syncing bo
 to-device queue is not pruned (pushed to-device is not deleted, as Synapse); no cluster run of
 the ephemeral pump.
 
-**A rejoined room's gap is filled** (`agent/rejoin-gap`, commit not yet known, not merged;
+**A rejoined room's gap is filled** (`agent/rejoin-gap` → `083b58e`, 2,446 Rust tests;
 status 04 session 12; known gap "A rejoined room's gap is never filled" closed). Bob leaves a
 room hosted elsewhere, alice talks, bob rejoins through her server: B's copy came back with the
 current state but `/messages` from the rejoin went straight to the leave. Now an event taken
