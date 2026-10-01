@@ -447,13 +447,19 @@ async fn every_v12_room_is_built_by_the_owner_of_its_shard_whichever_replica_too
                 .await
                 .unwrap();
             if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
-                break response.status();
+                let status = response.status();
+                break (status, response.text().await.unwrap_or_default());
             }
             let body: Value = response.json().await.unwrap_or_default();
             let wait = body["retry_after_ms"].as_u64().unwrap_or(500);
             tokio::time::sleep(Duration::from_millis(wait.max(50))).await;
         };
-        assert!(status.is_success(), "{room_id}: {status}");
+        assert!(
+            status.0.is_success(),
+            "{room_id}: {} {}",
+            status.0,
+            status.1
+        );
     }
 
     drop(replica_2);

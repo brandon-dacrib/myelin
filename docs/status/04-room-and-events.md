@@ -108,7 +108,9 @@ admin API's room long tail).
 >   so that each has its own `/metrics`): twenty version-12 rooms created through each replica;
 >   each replica's `hs_room_create_room_id_attempts_count` equals the number of rooms whose
 >   shard it owns, and every room takes a message through the replica that did not build it.
->   Passed in 230 s on a loaded machine; with placement switched off the first create whose
+>   Passed 4 of 5 runs (170-230 s on a loaded machine); the fifth built and counted every room
+>   correctly and then had one message forwarded to the owner answered `503` (body not captured
+>   then; the test now prints it). With placement switched off the first create whose
 >   hash lands elsewhere is refused by the (now earlier) fence, `503 fenced`.
 > - **How to verify.** `cargo test -p hs-room --lib fencing`;
 >   `HS_CLUSTER_TEST_POSTGRES_DSN=postgres://postgres:hspg@127.0.0.1:5462/postgres cargo test -p
