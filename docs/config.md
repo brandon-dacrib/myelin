@@ -22,7 +22,8 @@ The **Applies** column below gives each setting's kind and what reads it. Sectio
 
 ## `server`
 
-Server identity: name, public URL, signing keys.
+Who this server is and how it is reached: its name, the address clients use, where its
+signing keys are, and what it advertises about itself.
 
 **Every administered setting here applies to the running server at once.**
 
@@ -39,7 +40,8 @@ Server identity: name, public URL, signing keys.
 
 ## `listeners`
 
-HTTP listeners.
+The ports this replica listens on and what each serves (clients, other servers, media,
+health checks, this interface, metrics). Set per replica at install.
 
 **Bootstrap: set at install (bootstrap file, `HS__` variables, command line or Helm values), never stored in the database.**
 
@@ -50,7 +52,8 @@ HTTP listeners.
 
 ## `storage`
 
-Storage backend selection.
+Where this server keeps its data: an embedded database on local disk, or PostgreSQL.
+Set at install, since everything else is stored there.
 
 **Bootstrap: set at install (bootstrap file, `HS__` variables, command line or Helm values), never stored in the database.**
 
@@ -93,7 +96,8 @@ SlateDB on object storage. Diskless clusters.
 
 ## `media`
 
-Media repository.
+Uploaded files: where they are stored, how large they may be, thumbnails, link previews
+and scanning uploads for malware.
 
 **Some settings here apply to the running server at once; the rest at the next restart (see Applies).**
 
@@ -114,7 +118,9 @@ Media repository.
 
 ## `federation`
 
-Federation policy.
+Talking to other Matrix servers: which servers this one may talk to, how it trusts their
+certificates, how long it waits and retries, and how much it queues for a server that
+is down.
 
 **Some settings here apply to the running server at once; the rest at the next restart (see Applies).**
 
@@ -136,7 +142,7 @@ Federation policy.
 
 ## `rate_limits`
 
-Rate limits.
+How fast one user, address or server may do each costly thing before it is told to wait.
 
 **Every administered setting here applies to the running server at once.**
 
@@ -155,7 +161,8 @@ Rate limits.
 
 ## `auth`
 
-Authentication and authorization.
+Who can sign up and how people sign in: registration, passwords, tokens and other
+sign-in services.
 
 **Some settings here apply to the running server at once; the rest at the next restart (see Applies).**
 
@@ -179,7 +186,8 @@ Authentication and authorization.
 
 ## `appservices`
 
-Appservice (bridge) registry bootstrap.
+Bridges and other appservices: delivering events to them, and registration files to
+import once.
 
 **Some settings here apply to the running server at once; the rest at the next restart (see Applies).**
 
@@ -192,7 +200,7 @@ Appservice (bridge) registry bootstrap.
 
 ## `telemetry`
 
-Metrics, tracing, logging and error reporting.
+What the server tells an operator about itself: metrics, traces, logs and error reports.
 
 **Some settings here apply to the running server at once; the rest at the next restart (see Applies).**
 
@@ -206,7 +214,8 @@ Metrics, tracing, logging and error reporting.
 
 ## `cluster`
 
-Cluster topology.
+Running as several replicas: whether this is a cluster, how work is split between the
+replicas, and how fast a lost replica's work moves to the others.
 
 **Restart required to change.**
 
@@ -222,7 +231,8 @@ Cluster topology.
 
 ## `migration`
 
-The Synapse deployment to migrate from (the admin API's Migration area).
+The Synapse server to migrate from, which the Migration page copies from. Unset until a
+migration is set up there.
 
 **Every administered setting here applies to the running server at once.**
 

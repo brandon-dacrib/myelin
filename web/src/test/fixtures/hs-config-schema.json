@@ -5,7 +5,7 @@
   "type": "object",
   "properties": {
     "server": {
-      "description": "Server identity: name, public URL, signing keys.",
+      "description": "Who this server is and how it is reached: its name, the address clients use, where its\nsigning keys are, and what it advertises about itself.",
       "$ref": "#/$defs/ServerConfig",
       "default": {
         "server_name": "",
@@ -18,7 +18,7 @@
       }
     },
     "listeners": {
-      "description": "HTTP listeners.",
+      "description": "The ports this replica listens on and what each serves (clients, other servers, media,\nhealth checks, this interface, metrics). Set per replica at install.",
       "$ref": "#/$defs/ListenersConfig",
       "default": {
         "listeners": [
@@ -41,7 +41,7 @@
       "x-applies": "bootstrap"
     },
     "storage": {
-      "description": "Storage backend selection.",
+      "description": "Where this server keeps its data: an embedded database on local disk, or PostgreSQL.\nSet at install, since everything else is stored there.",
       "$ref": "#/$defs/StorageConfig",
       "default": {
         "backend": "embedded",
@@ -50,7 +50,7 @@
       "x-applies": "bootstrap"
     },
     "media": {
-      "description": "Media repository.",
+      "description": "Uploaded files: where they are stored, how large they may be, thumbnails, link previews\nand scanning uploads for malware.",
       "$ref": "#/$defs/MediaConfig",
       "default": {
         "storage": {
@@ -128,7 +128,7 @@
       }
     },
     "federation": {
-      "description": "Federation policy.",
+      "description": "Talking to other Matrix servers: which servers this one may talk to, how it trusts their\ncertificates, how long it waits and retries, and how much it queues for a server that\nis down.",
       "$ref": "#/$defs/FederationConfig",
       "default": {
         "enabled": true,
@@ -156,7 +156,7 @@
       }
     },
     "rate_limits": {
-      "description": "Rate limits.",
+      "description": "How fast one user, address or server may do each costly thing before it is told to wait.",
       "$ref": "#/$defs/RateLimitConfig",
       "default": {
         "enabled": true,
@@ -195,7 +195,7 @@
       }
     },
     "auth": {
-      "description": "Authentication and authorization.",
+      "description": "Who can sign up and how people sign in: registration, passwords, tokens and other\nsign-in services.",
       "$ref": "#/$defs/AuthConfig",
       "default": {
         "enable_registration": false,
@@ -226,7 +226,7 @@
       }
     },
     "appservices": {
-      "description": "Appservice (bridge) registry bootstrap.",
+      "description": "Bridges and other appservices: delivering events to them, and registration files to\nimport once.",
       "$ref": "#/$defs/AppservicesConfig",
       "default": {
         "enabled": true,
@@ -235,7 +235,7 @@
       }
     },
     "telemetry": {
-      "description": "Metrics, tracing, logging and error reporting.",
+      "description": "What the server tells an operator about itself: metrics, traces, logs and error reports.",
       "$ref": "#/$defs/TelemetryConfig",
       "default": {
         "metrics": {
@@ -255,7 +255,7 @@
       }
     },
     "cluster": {
-      "description": "Cluster topology.",
+      "description": "Running as several replicas: whether this is a cluster, how work is split between the\nreplicas, and how fast a lost replica's work moves to the others.",
       "$ref": "#/$defs/ClusterConfig",
       "default": {
         "single_node": true,
@@ -273,7 +273,7 @@
       }
     },
     "migration": {
-      "description": "The Synapse deployment to migrate from (the admin API's Migration area).",
+      "description": "The Synapse server to migrate from, which the Migration page copies from. Unset until a\nmigration is set up there.",
       "$ref": "#/$defs/MigrationConfig",
       "default": {
         "synapse": null
