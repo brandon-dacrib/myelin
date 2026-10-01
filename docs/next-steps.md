@@ -6,10 +6,12 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 
 ## Resume here: 2026-09-30, end of day
 
-**Where `main` is.** `611ea59` plus this document, **2,453 Rust tests**, gate green with both
+**Where `main` is.** `ed3ad77` plus this document, **2,461 Rust tests**, gate green with both
 PostgreSQL servers (plain and TLS) in use; CI green again at `a01c1e0` after a red evening (the
-two races below); the demo runs `sha-a01c1e0`; one branch open, `agent/backfill-state` (the next
-gap, done and pushed, waiting for the merge queue; paragraph below); one worktree (`merge-queue`).
+two races below); the demo runs `sha-a01c1e0`. **The night of 2026-09-30 is an all-gaps run**
+(the owner: "go all night, close all remaining gaps"): several agents at once in disjoint crates,
+merged serially; the branches open at any moment are `git branch -r --no-merged origin/main`,
+each with a paragraph below, and each is merged as it reports. One worktree (`merge-queue`).
 The gate's six `HS_*_TEST_POSTGRES_*` variables have their recipe at the top of
 `crates/hs-kv/tests/postgres_tls.rs`; the two containers are `hs-admin-followups-gate-pg` on
 :5462 and `hs-merge-queue-pg-tls` on :5463, password `hspg`. The running TLS container's
@@ -174,7 +176,7 @@ state; the state at gap events is walked, not asked for (the next queue item cov
 done on `agent/backfill-state`, below).
 
 **The state at backfilled history is asked for, and every backfilled event is authorized**
-(`agent/backfill-state`, not merged yet; merge commit not yet known; status 04 session 13;
+(`agent/backfill-state` → `ed3ad77`, 2,461 Rust tests; status 04 session 13;
 known gap "The state at a backfilled event is walked, not asked for" closed). Both kinds of
 backfill -- history before the oldest held event and a rejoin's gap -- now go through
 `RoomActor::accept_history`: `hs_cli::backfill` asks the server that sent the batch
@@ -1733,6 +1735,7 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | A hot room joined after the token is resumed from the join, not sent whole | `hs-user` | the client recovers from `/state` and `/messages`; rare, and written down in `resume_mode` |
 | A requester with no device never records a feed cursor | `hs-user` | its feed entries coalesce forever and an incremental sync sees no change; some appservice callers |
 | The PostgreSQL backend logs `WARNING: there is no transaction in progress` at INFO | `hs-kv` | seen many times an hour on the two-pod cluster's `hs-0`: a `COMMIT`/`ROLLBACK` is sent outside a transaction, and the driver's notices are logged at INFO rather than mapped to the server's own levels |
+| A released shard keeps its fencing epoch until the next owner acquires it | `hs-cluster` | found by the cluster-gaps agent (2026-09-30, status 03): an ordinary `release_shard` (handoff, convergence) leaves the epoch unchanged, so a fence the old owner still holds passes `Fence::check` while the shard has no owner; the next acquisition advances it, so the window is the ownerless interval only. Closing it changes the contract in `store::tests::acquire_then_release_round_trips_epoch`; a decision, not yet taken |
 | `heartbeat_seq` is derived from wall-clock milliseconds | `hs-cluster` | two ticks in one millisecond read as "no progress", i.e. death; harmless at the production 1s interval, surfaces only in tests |
 | ~~Appservice delivery carries events only~~ | `hs-appservice`, `hs-user`, `hs-e2e` | **Closed** 2026-09-30 (branch `agent/as-ephemeral`, decision 0019, status 11): MSC2409 typing, receipts and presence, MSC2409/MSC4203 to-device messages and MSC3202 device lists with one-time-key counts reach a registration that asked for them, from server-wide receipt, presence and to-device streams read at a durable position per appservice and stream (queued in one store transaction with the body, so a restart resends nothing); typing through the hub's new ephemeral observer. `hs-cli/tests/appservice_ephemeral.rs` drives the real binary through all of it, a restart and a pause; mautrix-whatsapp in appservice-mode encryption received its device-list change, key counts, ephemeral events and a to-device message (`docs/bridges/mautrix.md`). Left: `device_lists.left` is never filled (as Synapse), a never-syncing bot device's to-device queue is not pruned, key counts cost one device listing per interesting user per transaction (unmeasured), and no cluster run of the ephemeral pump yet |
 | Only heisenbridge has been run against it | `hs-appservice` | a mautrix-* bridge with an external service (and its media, double puppeting, MSC3202) is the next real-bridge check |
