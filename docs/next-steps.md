@@ -22,6 +22,29 @@ a room that went hot left "cold"). Federation's targeted Complement set went 14/
 the two left are a race in the tests themselves. Nine stale worktrees (190 GB) removed. Every
 paragraph below gives the commit, the status file and what is left.
 
+**Evening, 2026-09-30: `main` has not built since `d6b3cd7`, and the demo is behind.** Every CD run
+after `d6b3cd7` (17:07) failed at "require green ci" because CI's amd64 `test` job failed one of
+two real-binary tests on the loaded runner, each a server race rather than test noise:
+`appservice_ephemeral.rs` (alice's `PUT /typing` right after her join answers `403 must be a
+joined member`: `put_typing` reads membership from the user store, which the session hub fills a
+moment after the join, the lag `/sync` already waits out with `wait_for_consumed`) and
+`admin_rooms.rs::a_deleted_room_empties_moves_its_members_and_cannot_be_joined` (`GET
+/sync?timeout=0` answers `404 room not found` once the admin delete has purged a room whose
+kick is still in the member's feed). An agent on `agent/ci-flakes` is fixing both in `hs-user`.
+The demo at `myelin.dacrib.net` (release `myelin`, namespace `myelin`) still runs an image from
+before the `GET /` → `/admin/` redirect (`06db4ef`, 2026-09-28) and an Ingress without the
+exact `/` route, so the bare address is still Traefik's 404. **`kubectl` and `helm` reach
+`admin@dacrib0` from an agent session now** (the "no route to host" of 2026-09-28 is gone), but
+the auto-mode classifier refuses `helm upgrade` from a session; the upgrade to the last green
+image, `--set image.tag=sha-d6b3cd7928e8956ff86f174005e63cdf63b15e27` with the release's
+values passed as a file (`--reuse-values` fails on the new `bridges.enabled` key), is one
+command for the owner's terminal; then again at the first green `main`. Seen on the two-pod
+cluster while looking: `hs-0` on `black0n0` has 25 restarts, all exit 255 "Unknown" with no
+panic in the log (the node, not the server), and its log carries `r2d2: error connecting to
+server` every twenty minutes or so and `postgres::config: WARNING: there is no transaction in
+progress` at INFO many times an hour -- a `COMMIT` or `ROLLBACK` sent outside a transaction,
+which has no row yet.
+
 **Next steps, in order** (the queue continues; each is one agent, cloud-doable unless marked):
 
 1. ~~Merge `agent/as-ephemeral`~~ merged as `dce1ffb`; its decision is renumbered **0019**.
@@ -1621,6 +1644,7 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | `TestNetworkPartitionOrdering` moved PASS to FAIL between runs 5 and 6 | `hs-room` | found: an event concurrent with a member's join was hidden from them or not depending on which server's events arrived first; the `shared` rule counts "joined when it arrived" now (2026-09-26), and run 7 has it passing again |
 | A hot room joined after the token is resumed from the join, not sent whole | `hs-user` | the client recovers from `/state` and `/messages`; rare, and written down in `resume_mode` |
 | A requester with no device never records a feed cursor | `hs-user` | its feed entries coalesce forever and an incremental sync sees no change; some appservice callers |
+| The PostgreSQL backend logs `WARNING: there is no transaction in progress` at INFO | `hs-kv` | seen many times an hour on the two-pod cluster's `hs-0`: a `COMMIT`/`ROLLBACK` is sent outside a transaction, and the driver's notices are logged at INFO rather than mapped to the server's own levels |
 | `heartbeat_seq` is derived from wall-clock milliseconds | `hs-cluster` | two ticks in one millisecond read as "no progress", i.e. death; harmless at the production 1s interval, surfaces only in tests |
 | ~~Appservice delivery carries events only~~ | `hs-appservice`, `hs-user`, `hs-e2e` | **Closed** 2026-09-30 (branch `agent/as-ephemeral`, decision 0019, status 11): MSC2409 typing, receipts and presence, MSC2409/MSC4203 to-device messages and MSC3202 device lists with one-time-key counts reach a registration that asked for them, from server-wide receipt, presence and to-device streams read at a durable position per appservice and stream (queued in one store transaction with the body, so a restart resends nothing); typing through the hub's new ephemeral observer. `hs-cli/tests/appservice_ephemeral.rs` drives the real binary through all of it, a restart and a pause; mautrix-whatsapp in appservice-mode encryption received its device-list change, key counts, ephemeral events and a to-device message (`docs/bridges/mautrix.md`). Left: `device_lists.left` is never filled (as Synapse), a never-syncing bot device's to-device queue is not pruned, key counts cost one device listing per interesting user per transaction (unmeasured), and no cluster run of the ephemeral pump yet |
 | Only heisenbridge has been run against it | `hs-appservice` | a mautrix-* bridge with an external service (and its media, double puppeting, MSC3202) is the next real-bridge check |
