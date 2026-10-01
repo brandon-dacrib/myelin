@@ -342,7 +342,25 @@ pub struct RemoteKeyCache<F: KeyServerFetcher> {
     /// When a response was last accepted for each server (ms since the epoch), for the admin
     /// API's view of the cache.
     fetched_at: std::sync::Mutex<HashMap<String, u64>>,
+    /// The last self-signed response accepted that listed each `(server, key_id)` in its
+    /// `verify_keys`, exactly as the server published it, kept for the notary endpoints
+    /// ([`RemoteKeyCache::notary_responses`]): a notary co-signs the origin's own document, so
+    /// the parsed keys above are not enough. Expired responses are kept too -- the spec's
+    /// notary answers with the last keys it holds for a server that cannot be reached.
+    responses: std::sync::Mutex<HashMap<(String, String), StoredResponse>>,
 }
+
+/// One response held for the notary endpoints: the document and its `valid_until_ts`.
+#[derive(Debug, Clone)]
+struct StoredResponse {
+    valid_until_ts: u64,
+    doc: Arc<serde_json::Value>,
+}
+
+/// The most servers one notary query (`POST /_matrix/key/v2/query`) may ask about. Each server
+/// not held fresh enough costs this server one outbound fetch, so a request naming thousands
+/// would turn the notary into an amplifier; Synapse's clients ask about one or a few at a time.
+pub const MAX_NOTARY_SERVERS_PER_QUERY: usize = 100;
 
 /// One key [`RemoteKeyCache`] holds for a server, as the admin API shows it
 /// (`federation.keys.get`).
@@ -378,6 +396,88 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
             old: std::sync::Mutex::new(HashMap::new()),
             in_flight: std::sync::Mutex::new(HashMap::new()),
             fetched_at: std::sync::Mutex::new(HashMap::new()),
+            responses: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The notary half of `/_matrix/key/v2/query`: the self-signed key responses this cache
+    /// holds for `server_name`, as the server published them (not yet co-signed: the transport
+    /// adds this server's signature, [`wrap_for_notary`]).
+    ///
+    /// `key_ids` names the keys asked about (empty: all of them). A response is fresh enough
+    /// when its `valid_until_ts` is at least `minimum_valid_until_ts`; when some key asked about
+    /// has no fresh-enough response held (or, for an empty `key_ids`, none at all is), the server
+    /// is asked again first. Whatever the fetch's outcome, the answer is every response then held
+    /// for the keys asked about -- expired ones included, since the spec's notary returns the
+    /// last keys it has for a server that is offline -- and a response that lists another key
+    /// does not displace one held for a key it no longer lists (Synapse issue 5305, Sytest's
+    /// "must not overwrite a valid key with a spurious result from the origin server").
+    pub async fn notary_responses(
+        &self,
+        server_name: &str,
+        key_ids: &[String],
+        minimum_valid_until_ts: u64,
+    ) -> Vec<serde_json::Value> {
+        if !self.held_fresh_enough(server_name, key_ids, minimum_valid_until_ts)
+            && let Err(error) = self.refresh(server_name).await
+        {
+            tracing::debug!(
+                server = server_name,
+                %error,
+                "notary: could not refresh a server's keys; answering with what is held"
+            );
+        }
+        let held = self
+            .responses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut docs: Vec<Arc<serde_json::Value>> = Vec::new();
+        let mut push = |doc: &Arc<serde_json::Value>| {
+            if !docs.iter().any(|seen| Arc::ptr_eq(seen, doc)) {
+                docs.push(doc.clone());
+            }
+        };
+        if key_ids.is_empty() {
+            let mut all: Vec<(&String, &StoredResponse)> = held
+                .iter()
+                .filter(|((server, _), _)| server == server_name)
+                .map(|((_, key_id), stored)| (key_id, stored))
+                .collect();
+            all.sort_by(|a, b| a.0.cmp(b.0));
+            for (_, stored) in all {
+                push(&stored.doc);
+            }
+        } else {
+            for key_id in key_ids {
+                if let Some(stored) = held.get(&(server_name.to_owned(), key_id.clone())) {
+                    push(&stored.doc);
+                }
+            }
+        }
+        docs.into_iter().map(|doc| (*doc).clone()).collect()
+    }
+
+    /// Whether every key `key_ids` names (or, when it names none, some key of the server) has a
+    /// held response valid until at least `minimum_valid_until_ts`.
+    fn held_fresh_enough(
+        &self,
+        server_name: &str,
+        key_ids: &[String],
+        minimum_valid_until_ts: u64,
+    ) -> bool {
+        let held = self
+            .responses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fresh = |stored: &StoredResponse| stored.valid_until_ts >= minimum_valid_until_ts;
+        if key_ids.is_empty() {
+            held.iter()
+                .any(|((server, _), stored)| server == server_name && fresh(stored))
+        } else {
+            key_ids.iter().all(|key_id| {
+                held.get(&(server_name.to_owned(), key_id.clone()))
+                    .is_some_and(fresh)
+            })
         }
     }
 
@@ -675,6 +775,24 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
                         },
                     );
                 }
+            }
+        }
+
+        // The document itself, for the notary endpoints, under every key it vouches for.
+        let stored = StoredResponse {
+            valid_until_ts,
+            doc: Arc::new(doc.clone()),
+        };
+        {
+            let mut responses = self
+                .responses
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for key_id in candidates.keys() {
+                responses.insert(
+                    (expected_server_name.to_string(), key_id.clone()),
+                    stored.clone(),
+                );
             }
         }
 

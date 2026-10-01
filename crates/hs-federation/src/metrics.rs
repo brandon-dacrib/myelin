@@ -17,6 +17,9 @@
 //!
 //! `edu_type` is bounded: an EDU type that is not one of [`KNOWN_EDU_TYPES`] is counted as
 //! `other`, since the type is whatever a remote server wrote.
+//!
+//! The transport's own counters (server ACL refusals, notary queries) are process-wide and
+//! registered by [`register_transport_metrics`].
 
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
@@ -296,6 +299,75 @@ impl CatchUpMetrics {
     pub fn record_dropped(&self, n: u64) {
         self.dropped_total.inc_by(n);
     }
+}
+
+/// Labels of `hs_federation_acl_refusals_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+pub struct AclRefusalLabels {
+    /// The federation endpoint refused (`send`, `make_join`, `state_ids`, ...): one of a fixed
+    /// set this crate names, never caller input.
+    pub endpoint: &'static str,
+}
+
+/// Labels of `hs_federation_notary_queries_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+pub struct NotaryLabels {
+    /// `answered` (some key was held or fetched for the server asked about) or `none`.
+    pub outcome: &'static str,
+}
+
+/// Process-wide, like the other transport-side counters: the handlers that count into them are
+/// built per mount, and a counter is only an atomic. [`register_transport_metrics`] puts them in
+/// a server's registry.
+static ACL_REFUSALS: std::sync::LazyLock<Family<AclRefusalLabels, Counter>> =
+    std::sync::LazyLock::new(Family::default);
+static NOTARY_QUERIES: std::sync::LazyLock<Family<NotaryLabels, Counter>> =
+    std::sync::LazyLock::new(Family::default);
+
+/// Counts one federation request refused because the room's `m.room.server_acl` denies the
+/// requesting server (for `/send`, one PDU), by endpoint.
+pub fn record_acl_refusal(endpoint: &'static str) {
+    ACL_REFUSALS
+        .get_or_create(&AclRefusalLabels { endpoint })
+        .inc();
+}
+
+/// How many requests to `endpoint` the server ACL refused, in this process.
+#[must_use]
+pub fn acl_refusals(endpoint: &'static str) -> u64 {
+    ACL_REFUSALS
+        .get_or_create(&AclRefusalLabels { endpoint })
+        .get()
+}
+
+/// Counts one server asked about through the notary endpoints, by whether anything was answered.
+pub fn record_notary_answer(answered: bool) {
+    NOTARY_QUERIES
+        .get_or_create(&NotaryLabels {
+            outcome: if answered { "answered" } else { "none" },
+        })
+        .inc();
+}
+
+/// Registers the transport's counters into `registry` (the shared one, in `hs serve`):
+///
+/// - `hs_federation_acl_refusals_total{endpoint}`: requests (for `/send`, PDUs) from a server a
+///   room's `m.room.server_acl` denies, refused with `403 M_FORBIDDEN`.
+/// - `hs_federation_notary_queries_total{outcome}`: servers asked about through
+///   `/_matrix/key/v2/query`, `answered` or `none` (nothing held and the server unreachable).
+pub fn register_transport_metrics(registry: &mut Registry) {
+    // Registered without `_total`: the text encoder appends it.
+    registry.register(
+        "hs_federation_acl_refusals",
+        "Federation requests (for /send, PDUs) refused because the room's server ACL denies the \
+         requesting server, by endpoint",
+        ACL_REFUSALS.clone(),
+    );
+    registry.register(
+        "hs_federation_notary_queries",
+        "Servers asked about through the notary key query, by outcome (answered, none)",
+        NOTARY_QUERIES.clone(),
+    );
 }
 
 /// `edu_type` if it is one of [`KNOWN_EDU_TYPES`], `other` if not.

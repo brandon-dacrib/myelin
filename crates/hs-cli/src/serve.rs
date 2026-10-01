@@ -404,36 +404,18 @@ fn build_router<B: KvBackend>(
             media_federation_router.with_state(mounts.media.clone()),
             x_matrix.clone(),
         );
+        // The key server (`/_matrix/key/v2/server`, its deprecated `/server/{keyId}` spelling and
+        // the notary `/query`) is deliberately *outside* the `X-Matrix` layer: it must answer an
+        // unsigned request, since it is what a remote server fetches in order to be able to
+        // check signatures in the first place. The notary answers from the same key cache that
+        // layer verifies against.
+        let (key_router, key_manifest) = hs_federation::transport::key_server::router(
+            crate::federation::key_server_state(&server_name, own_keys, x_matrix.key_cache.clone()),
+        );
         let (federation_router_v2, federation_manifest_v2) =
             hs_federation::transport::router_v2(state, x_matrix);
-        // `/_matrix/key/v2/server` is deliberately *outside* that router: it is the one federation
-        // endpoint that must answer an unsigned request, since it is what a remote server fetches
-        // in order to be able to check signatures in the first place. Putting it behind the
-        // `X-Matrix` layer would make key discovery require the keys it discovers.
         builder = builder
-            .get(
-                "/_matrix/key/v2/server",
-                move || {
-                    let own_keys = own_keys.clone();
-                    let server_name = server_name.clone();
-                    async move {
-                        match crate::federation::server_key_response(&server_name, &own_keys) {
-                            Ok(body) => axum::Json(body).into_response(),
-                            Err(error) => {
-                                tracing::error!(%error, "could not sign this server's key response");
-                                hs_http::error::MatrixError::custom(
-                                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                                    hs_http::error::MatrixErrorCode::Unknown,
-                                    "could not sign the server key response",
-                                )
-                                .into_response()
-                            }
-                        }
-                    }
-                },
-                RouteMeta::new(Surface::MatrixFederation, AuthKind::None)
-                    .with_operation_id("getServerKey"),
-            )
+            .merge_router("/_matrix/key/v2", key_router, key_manifest.routes)
             .merge_router(
                 "/_matrix/federation/v1",
                 federation_router,
@@ -1347,6 +1329,8 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     metrics.with_registry(hs_user::metrics::register_metrics);
     // History fetched from other servers into rooms' timelines (`crate::backfill`).
     metrics.with_registry(crate::backfill::register_metrics);
+    // Federation requests a room's server ACL refused, and notary key queries.
+    metrics.with_registry(hs_federation::metrics::register_transport_metrics);
 
     // The first HTTP client is built in here (the ping transport); the roots are ready by now
     // on any machine that is not very slow, and on one that is, waiting beats blocking.

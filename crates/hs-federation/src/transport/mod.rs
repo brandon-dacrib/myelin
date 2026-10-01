@@ -17,6 +17,7 @@
 //! `/invite` are real now (`send`, `join`, `membership`).
 
 mod join;
+pub mod key_server;
 mod keys;
 mod membership;
 mod queries;

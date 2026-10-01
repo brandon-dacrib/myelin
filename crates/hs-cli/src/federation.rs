@@ -1459,6 +1459,25 @@ pub fn server_key_response(
     hs_federation::keys::build_server_key_response(server_name, own_keys, &[], KEY_VALIDITY_SECS)
 }
 
+/// What the key server (`hs_federation::transport::key_server`) answers from: this server's
+/// name and keys, [`KEY_VALIDITY_SECS`], no `old_verify_keys` (nothing rotates keys yet), and
+/// `cache`, the remote-key cache inbound `X-Matrix` verification fills, which the notary
+/// `/_matrix/key/v2/query` answers from.
+#[must_use]
+pub fn key_server_state(
+    server_name: &str,
+    own_keys: Arc<hs_federation::keys::OwnSigningKeys>,
+    cache: Arc<hs_federation::keys::DynRemoteKeyCache>,
+) -> hs_federation::transport::key_server::KeyServerState {
+    hs_federation::transport::key_server::KeyServerState {
+        server_name: Arc::from(server_name),
+        own_keys,
+        old_keys: Arc::from(Vec::new()),
+        valid_for_secs: KEY_VALIDITY_SECS,
+        cache,
+    }
+}
+
 /// A mount whose data sources hold nothing and whose key cache can fetch nothing, for
 /// [`crate::serve::route_manifest`]: the federation router's *routes* are static, so reading them
 /// off does not need real stores, a real DNS resolver or a real signing key -- and building it
