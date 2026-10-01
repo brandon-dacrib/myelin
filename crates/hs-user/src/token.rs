@@ -25,7 +25,8 @@
 //! construct one themselves. This codec's wire format (a version byte, six big-endian `u64`
 //! fields, base64url-no-pad, prefixed with `hsu1_` for grep-ability in logs) is therefore an
 //! implementation detail this server is free to change across a version bump -- see
-//! [`SyncToken::decode`]'s handling of [`TokenError::UnsupportedVersion`].
+//! [`SyncToken::decode`]'s handling of [`TokenError::UnsupportedVersion`]. (There are nine fields
+//! now; the version-3 layout, eight, is still read.)
 
 use std::fmt;
 use std::str::FromStr;
@@ -56,10 +57,22 @@ const PREFIX: &str = "hsu1_";
 /// current one, which is correct and harmless here: every test and every real deployment of this
 /// greenfield server restarts from a freshly built binary, so no long-lived client ever holds a
 /// stale-version token across a version bump.
-const VERSION: u8 = 3;
+///
+/// Bumped `3` -> `4` to add `hot_seq` (below), and unlike the bumps before it a version-3 token
+/// is still accepted: there are real clients now, holding tokens across an upgrade, and a `400`
+/// on `since` makes some of them start again from nothing. A version-3 token decodes with
+/// `hot_seq` zero -- "no hot-room position known" -- which costs a room that is hot being sent
+/// whole once (`crate::sync`'s `resume_mode`), the safe direction.
+const VERSION: u8 = 4;
 
-/// `1` (version byte) + `8 * 8` (eight `u64` fields).
-const PAYLOAD_LEN: usize = 1 + 8 * 8;
+/// The previous wire version, still decoded (see [`VERSION`]).
+const VERSION_3: u8 = 3;
+
+/// `1` (version byte) + `9 * 8` (nine `u64` fields).
+const PAYLOAD_LEN: usize = 1 + 9 * 8;
+
+/// A version-3 payload: the first eight fields, without `hot_seq`.
+const PAYLOAD_LEN_V3: usize = 1 + 8 * 8;
 
 /// A decoded `/sync` token: the user's feed position plus the independent extension cursors.
 ///
@@ -96,6 +109,13 @@ pub struct SyncToken {
     /// had already changed their rules -- initial syncs always send it regardless, per
     /// `crate::sync`'s own is-initial branch.
     pub push_rules_seq: u64,
+    /// Position in the server-wide stream of hot-room positions
+    /// (`crate::store::UserStore::append_hot_position`): what a room above the fan-out
+    /// threshold, which gets no feed entries (`crate::hub`'s module docs), is resumed from. A
+    /// hot room's position as of this token is the newest it had at or before this value
+    /// (`crate::store::UserStore::hot_room_pos_as_of`). `0`: none known (an initial sync, or a
+    /// version-3 token).
+    pub hot_seq: u64,
 }
 
 impl SyncToken {
@@ -114,6 +134,7 @@ impl SyncToken {
             receipts_seq: 0,
             typing_seq: 0,
             push_rules_seq: 0,
+            hot_seq: 0,
         }
     }
 
@@ -130,6 +151,7 @@ impl SyncToken {
         buf.extend_from_slice(&self.receipts_seq.to_be_bytes());
         buf.extend_from_slice(&self.typing_seq.to_be_bytes());
         buf.extend_from_slice(&self.push_rules_seq.to_be_bytes());
+        buf.extend_from_slice(&self.hot_seq.to_be_bytes());
         debug_assert_eq!(buf.len(), PAYLOAD_LEN);
         format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(buf))
     }
@@ -146,31 +168,42 @@ impl SyncToken {
         let bytes = URL_SAFE_NO_PAD
             .decode(payload)
             .map_err(|_| TokenError::InvalidBase64)?;
-        if bytes.len() != PAYLOAD_LEN {
+        let expected = match bytes.first() {
+            Some(&VERSION_3) => PAYLOAD_LEN_V3,
+            _ => PAYLOAD_LEN,
+        };
+        if bytes.len() != expected {
             return Err(TokenError::WrongLength {
-                expected: PAYLOAD_LEN,
+                expected,
                 actual: bytes.len(),
             });
         }
         let version = bytes[0];
-        if version != VERSION {
+        if version != VERSION && version != VERSION_3 {
             return Err(TokenError::UnsupportedVersion(version));
         }
-        let field = |i: usize| -> u64 {
+        // `None` past the end of the payload: only `hot_seq`, and only in a version-3 token.
+        let field = |i: usize| -> Option<u64> {
             let start = 1 + i * 8;
-            // Safe: `bytes.len() == PAYLOAD_LEN == 1 + 8 * 8`, checked above, and `i < 8` for
-            // every call site below, so `start + 8 <= PAYLOAD_LEN` always.
-            u64::from_be_bytes(bytes[start..start + 8].try_into().expect("checked length"))
+            let chunk: [u8; 8] = bytes.get(start..start + 8)?.try_into().ok()?;
+            Some(u64::from_be_bytes(chunk))
+        };
+        let required = |i: usize| -> Result<u64, TokenError> {
+            field(i).ok_or(TokenError::WrongLength {
+                expected,
+                actual: bytes.len(),
+            })
         };
         Ok(Self {
-            feed_seq: field(0),
-            to_device_seq: field(1),
-            device_list_seq: field(2),
-            account_data_seq: field(3),
-            presence_seq: field(4),
-            receipts_seq: field(5),
-            typing_seq: field(6),
-            push_rules_seq: field(7),
+            feed_seq: required(0)?,
+            to_device_seq: required(1)?,
+            device_list_seq: required(2)?,
+            account_data_seq: required(3)?,
+            presence_seq: required(4)?,
+            receipts_seq: required(5)?,
+            typing_seq: required(6)?,
+            push_rules_seq: required(7)?,
+            hot_seq: field(8).unwrap_or(0),
         })
     }
 }
@@ -263,6 +296,40 @@ mod tests {
         assert_eq!(t.receipts_seq, 0);
         assert_eq!(t.typing_seq, 0);
         assert_eq!(t.push_rules_seq, 0);
+        assert_eq!(t.hot_seq, 0);
+    }
+
+    /// A token a client was handed before the upgrade that added `hot_seq` still works: its
+    /// eight fields come back, and `hot_seq` is "none known".
+    #[test]
+    fn a_version_3_token_still_decodes_with_no_hot_position() {
+        let mut buf = vec![VERSION_3];
+        for field in 1..=8u64 {
+            buf.extend_from_slice(&field.to_be_bytes());
+        }
+        let old = format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(buf));
+        let token = SyncToken::decode(&old).unwrap();
+        assert_eq!(
+            token,
+            SyncToken {
+                feed_seq: 1,
+                to_device_seq: 2,
+                device_list_seq: 3,
+                account_data_seq: 4,
+                presence_seq: 5,
+                receipts_seq: 6,
+                typing_seq: 7,
+                push_rules_seq: 8,
+                hot_seq: 0,
+            }
+        );
+        // A version-3 byte on a version-4 length is still malformed.
+        let mut long = vec![VERSION_3];
+        long.extend_from_slice(&[0u8; 72]);
+        assert!(matches!(
+            SyncToken::decode(&format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(long))),
+            Err(TokenError::WrongLength { .. })
+        ));
     }
 
     #[test]
@@ -298,7 +365,7 @@ mod tests {
     #[test]
     fn decode_rejects_unsupported_version() {
         let mut buf = vec![7u8]; // not VERSION
-        buf.extend_from_slice(&[0u8; 64]);
+        buf.extend_from_slice(&[0u8; 72]);
         let s = format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(buf));
         assert_eq!(
             SyncToken::decode(&s),
@@ -317,6 +384,7 @@ mod tests {
             receipts_seq: 5,
             typing_seq: 6,
             push_rules_seq: 7,
+            hot_seq: 8,
         };
         let json = serde_json::to_string(&t).unwrap();
         assert!(json.starts_with('"'));
@@ -345,6 +413,7 @@ mod tests {
             receipts_seq: u64,
             typing_seq: u64,
             push_rules_seq: u64,
+            hot_seq: u64,
         ) {
             let original = SyncToken {
                 feed_seq,
@@ -355,6 +424,7 @@ mod tests {
                 receipts_seq,
                 typing_seq,
                 push_rules_seq,
+                hot_seq,
             };
             let encoded = original.encode();
             let decoded = SyncToken::decode(&encoded).unwrap();
@@ -372,7 +442,7 @@ mod tests {
         /// property that justifies handing this codec directly to an HTTP query parameter without
         /// a separate validation pass. `TokenError` is the *only* way malformed input surfaces.
         #[test]
-        fn decoding_never_panics_on_arbitrary_bytes(bytes in proptest::collection::vec(any::<u8>(), 0..80)) {
+        fn decoding_never_panics_on_arbitrary_bytes(bytes in proptest::collection::vec(any::<u8>(), 0..90)) {
             // Exercise both "not our prefix at all" (raw bytes interpreted as UTF-8-ish text) and
             // "our prefix, arbitrary payload" (the more interesting malformed-payload path),
             // since a `String::from_utf8_lossy` fallback below could otherwise change which

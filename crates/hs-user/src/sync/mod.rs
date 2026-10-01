@@ -8,13 +8,13 @@
 //! # What "changed since a room's baseline" means here
 //!
 //! For every candidate room, this module needs a room-local position to resume the timeline
-//! from. [`crate::store::UserStore::room_pos_as_of`] answers that from the user's durable feed;
-//! when it returns `None` (the room has no feed history at or before the presented token -- true
-//! both for a room the user has never synced before, and for a room that has been "hot"
-//! -- `crate::hub`'s module docs -- since before the user's membership even started), this module
-//! falls back to treating the room exactly like a fresh room in an initial sync: the most recent
-//! `limit` events (newest-first, then reversed to chronological order) plus full current state,
-//! rather than an empty or wrong-baseline forward page. See [`resume_mode`].
+//! from. [`crate::store::UserStore::room_pos_as_of`] answers that from the user's durable feed,
+//! and [`crate::store::UserStore::hot_room_pos_as_of`] from the hot-room stream for a room above
+//! the fan-out threshold (`crate::hub`'s module docs), which has no feed entries; the newer of the
+//! two is the baseline. When neither has one (the room is new to this client since the presented
+//! token), this module treats the room exactly like a fresh room in an initial sync: the most
+//! recent `limit` events (newest-first, then reversed to chronological order) plus full current
+//! state, rather than an empty or wrong-baseline forward page. See [`resume_mode`].
 //!
 //! # `m.typing` and `m.presence` (`crate::typing`, `crate::presence`)
 //!
@@ -174,6 +174,13 @@ enum ResumeMode {
 
 /// `handle` is the room as this sync already loaded it, read again here rather than loaded a
 /// second time: a room deleted in between would otherwise fail the sync.
+///
+/// The room's position as of the token is the newer of two: its newest feed entry at or before
+/// the token's `feed_seq` (a room at or below the fan-out threshold, `crate::hub`'s module
+/// docs), and its newest position on the hot-room stream at or before the token's `hot_seq` (a
+/// room above it, which gets no feed entries). Each is what a batch for that token was bounded
+/// by while the room was on that side of the threshold, so the newer of the two is where the
+/// client's copy of the room ends, whichever side it was on then.
 async fn resume_mode<B: KvBackend + 'static, R: RoomSource<B>>(
     hub: &SessionHub<B, R>,
     handle: &hs_room::actor::RoomActorHandle<B>,
@@ -190,17 +197,23 @@ async fn resume_mode<B: KvBackend + 'static, R: RoomSource<B>>(
         // `shared` history visibility).
         return Ok(ResumeMode::FreshRoom);
     }
-    if let Some(pos) = hub
+    let from_feed = hub
         .store()
         .room_pos_as_of(user_id, room_id, baseline.feed_seq)
-        .await?
-    {
+        .await?;
+    let from_hot = hub
+        .store()
+        .hot_room_pos_as_of(room_id, baseline.hot_seq)
+        .await?;
+    if let Some(pos) = from_feed.max(from_hot) {
         // A position to resume from is not the same as having been *in* the room at it. Somebody
         // who was invited and has now accepted, or who left and has come back, has feed history
         // from before they were joined; resumed from there, all they are sent is their own join,
         // with no state -- so no `m.room.encryption`, and Element offered to send plain text
         // into an encrypted room. They are new to the room and get it whole. Only worth asking
-        // the room when their membership has changed since that position at all.
+        // the room when their membership has changed since that position at all. The same
+        // question settles somebody who joined a hot room after the token: the position the
+        // hot-room stream gives is the room's, from before they were in it.
         if membership.membership == "join" && membership.room_pos > pos {
             let user = user_id.to_owned();
             let was_joined = handle
@@ -212,27 +225,28 @@ async fn resume_mode<B: KvBackend + 'static, R: RoomSource<B>>(
         }
         return Ok(ResumeMode::Incremental(pos));
     }
-    // No feed history at or before the token for this room. There are two ways to get here, and
-    // they want opposite things.
-    //
-    // A room that is *new to this client* -- created, or joined, after the token was issued. It
+    // No position at or before the token for this room, in the feed or on the hot-room stream:
+    // a room that is *new to this client* -- created, or joined, after the token was issued. It
     // needs the fresh-room treatment: the room's state and its recent history, as if it had
     // turned up in an initial sync. Resuming "incrementally" from the user's own membership
     // position instead starts at or after their own join, so the create event, the power levels
     // and that join were in no timeline at all. That went unnoticed for as long as every
     // incremental sync also carried the room's whole state.
     //
-    // A room that has been "hot" (`crate::hub`'s module docs) for as long as the user has been a
-    // member. A hot room never gets feed entries, so it has no feed history *ever*, and cannot be
-    // told from a new one by looking for some. For those, `membership.room_pos` (the position of
-    // this user's own last membership-changing event, set regardless of hot/cold -- see
-    // `crate::hub::SessionHub::process_room_update`) is the baseline: resuming forward from it
-    // can only ever *repeat* events the client already received, never skip real ones. The cost
-    // is that a hot room joined after the token is resumed from that join rather than sent
-    // whole; the client recovers the rest from `/state` and `/messages`, and it is the rarer
-    // case by a wide margin.
-    if membership.hot_room && membership.room_pos > 0 {
-        return Ok(ResumeMode::Incremental(membership.room_pos));
+    // A hot room used to be resumed from the user's own membership position here instead, the
+    // feed having nothing for it: which sent a hot room joined after the token as nothing but
+    // the join, and every later incremental sync everything since that join again (and woke
+    // every long-poll at once), for as long as the room stayed hot. The hot-room stream is what
+    // tells the two apart now. One case is left: a hot room that has had no update since that
+    // stream began (a server upgraded from before it) has no entry on it at all. Nothing has
+    // happened in it that the client could have missed, so it is resumed from where it is.
+    if membership.hot_room
+        && hub.store().latest_hot_seq_of_room(room_id).await?.is_none()
+        && let Some(head) = handle
+            .query(|actor| actor.head_update().map(|update| update.room_pos))
+            .await
+    {
+        return Ok(ResumeMode::Incremental(head));
     }
     Ok(ResumeMode::FreshRoom)
 }
@@ -749,6 +763,9 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     // read every room to its live end, so an event that landed during assembly was in this
     // batch *and*, being past the token, in the next one.
     let new_feed_seq = store.latest_feed_seq(user_id).await?.max(baseline.feed_seq);
+    // The same point of the hot-room stream, for the rooms above the fan-out threshold, which
+    // have no feed entries (`resume_mode`).
+    let new_hot_seq = store.latest_hot_seq().await?.max(baseline.hot_seq);
     let new_account_data_seq = store
         .latest_account_data_seq(user_id)
         .await?
@@ -891,9 +908,11 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         // taken, so that on a replica reading the room through a mirror (`SessionHub::room`)
         // the snapshot validated next is at least as new as this bound. A hot room has no feed
         // entries to bound it by (a stale one from before it went hot would hide everything
-        // since) and is read live, as `resume_mode` documents.
+        // since): it is bounded by its position on the hot-room stream as of `new_hot_seq`
+        // instead, the same point of that stream the token records. Only a hot room with no
+        // entry on that stream yet (`resume_mode`) is read live.
         let token_bound = if membership.hot_room {
-            None
+            store.hot_room_pos_as_of(room_id, new_hot_seq).await?
         } else {
             store
                 .room_pos_at_token(user_id, room_id, new_feed_seq)
@@ -1376,6 +1395,7 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
 
     let next_token = SyncToken {
         feed_seq: new_feed_seq,
+        hot_seq: new_hot_seq,
         account_data_seq: new_account_data_seq,
         to_device_seq: new_to_device_seq,
         device_list_seq: new_device_list_seq,
@@ -1475,36 +1495,24 @@ async fn has_new_data<B: KvBackend + 'static, R: RoomSource<B>>(
         return Ok(true);
     }
     // Hot rooms never advance the feed on write (`crate::hub`'s module docs), so their
-    // possible new activity would otherwise never wake a long-poll. Check each one directly.
+    // possible new activity would otherwise never wake a long-poll: each one's newest position
+    // on the hot-room stream is checked against the token's. (This used to ask whether the room
+    // had anything after the user's own membership event -- which, once anybody had spoken
+    // since they joined, was true for ever, and every long-poll returned at once.)
     // While walking every joined/invited/knocked room anyway, also check typing: unlike
     // to-device/device-list activity, `crate::hub::SessionHub::set_typing` *does* call this hub's
     // waker directly, but a lazy expiry (`crate::typing::TypingRegistry::current`'s pruning) has
     // no explicit wake call at all, so it still needs this same periodic re-check to be noticed.
     let memberships = store.list_memberships(user_id).await?;
     for m in &memberships {
-        if m.hot_room && matches!(m.membership.as_str(), "join" | "invite" | "knock") {
-            let handle = match hub.room(&m.room_id).await {
-                Ok(handle) => handle,
-                // Deleted while this record still names it: nothing more will happen there.
-                Err(error) if error.is_room_not_found() => continue,
-                Err(error) => return Err(error),
-            };
-            // Copied out before the closure: `query` requires a `'static` closure, so it may not
-            // borrow a field of this loop's membership row.
-            let room_pos = m.room_pos;
-            let has_more = handle
-                .query(move |actor| {
-                    let (events, _) = actor.paginate(
-                        Some(PaginationToken::new(room_pos, Direction::Forward)),
-                        Direction::Forward,
-                        1,
-                    );
-                    !events.is_empty()
-                })
-                .await;
-            if has_more {
-                return Ok(true);
-            }
+        if m.hot_room
+            && matches!(m.membership.as_str(), "join" | "invite" | "knock")
+            && store
+                .latest_hot_seq_of_room(&m.room_id)
+                .await?
+                .is_some_and(|seq| seq > baseline.hot_seq)
+        {
+            return Ok(true);
         }
         if m.membership == "join" {
             let (_, typing_seq) = hub.typing_users(&m.room_id).await;
@@ -4548,6 +4556,259 @@ mod tests {
             serde_json::json!([alice.as_str()]),
             "{response}"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Hot rooms: above the fan-out threshold, no feed entries, the hot-room stream instead.
+    // ---------------------------------------------------------------------------------------
+
+    /// A hub whose fan-out threshold is one member: any room with two is hot.
+    fn hot_hub() -> Arc<TestHub> {
+        let rooms = registry("sync.test");
+        let store: DynUserStore = Arc::new(TablesUserStore::open(MemoryBackend::new()).unwrap());
+        let hub = Arc::new(SessionHub::new(store, rooms, 1));
+        std::mem::forget(hub.watch_all(hub.rooms().subscribe_global()));
+        hub
+    }
+
+    fn device_params(since: Option<SyncToken>, device: &str) -> SyncParams {
+        let mut p = params(since);
+        p.device_id = Some(device.into());
+        p
+    }
+
+    /// Syncs with a long-poll timeout and says how long the answer took.
+    async fn timed_sync(
+        hub: &TestHub,
+        e2e: &Arc<dyn E2eStore>,
+        user: &UserId,
+        since: SyncToken,
+        device: &str,
+        timeout: Duration,
+    ) -> (Value, SyncToken, Duration) {
+        let mut p = device_params(Some(since), device);
+        p.timeout = timeout;
+        let started = Instant::now();
+        let (response, token) = build(hub, e2e, user, p).await.unwrap();
+        (response, token, started.elapsed())
+    }
+
+    /// The known gap "a hot room joined after the token is resumed from the join, not sent
+    /// whole": somebody with a token joins a room above the fan-out threshold, and their next
+    /// incremental sync carried their own join and what followed it -- no `m.room.create`, no
+    /// name, no power levels, nobody else's membership. It carries the room as an initial sync
+    /// would now, and from then on only what is new.
+    #[tokio::test]
+    async fn a_hot_room_joined_after_the_token_arrives_whole() {
+        let hub = hot_hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let carol = user_id!("@carol:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    name: Some("Big".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        handle
+            .membership(carol.clone(), Action::Join, carol.clone(), json!({}), 2)
+            .await
+            .unwrap();
+        say(&handle, &alice, "before bob", 3).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (_, token) = build(&hub, &e2e, &bob, device_params(None, "BOB"))
+            .await
+            .unwrap();
+
+        handle
+            .membership(bob.clone(), Action::Join, bob.clone(), json!({}), 4)
+            .await
+            .unwrap();
+        say(&handle, &alice, "after bob", 5).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let record = hub
+            .store()
+            .get_membership(&bob, &room_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            record.hot_room,
+            "the room is above the threshold: {record:?}"
+        );
+
+        let (response, token, _) =
+            timed_sync(&hub, &e2e, &bob, token, "BOB", Duration::from_millis(50)).await;
+        let room = &response["rooms"]["join"][room_id.as_str()];
+        let known = state_known_to_client(room);
+        for event_type in [
+            "m.room.create",
+            "m.room.power_levels",
+            "m.room.join_rules",
+            "m.room.name",
+        ] {
+            assert!(
+                known.contains(&(event_type.to_owned(), String::new())),
+                "{event_type} never reached bob: {response}"
+            );
+        }
+        for member in [&alice, &carol, &bob] {
+            assert!(
+                known.contains(&("m.room.member".to_owned(), member.to_string())),
+                "{member}'s membership never reached bob: {response}"
+            );
+        }
+        assert!(
+            all_bodies(room).contains(&"after bob".to_owned()),
+            "{response}"
+        );
+        // The people in it are people whose keys bob now needs.
+        let changed = response["device_lists"]["changed"].as_array().unwrap();
+        assert!(changed.contains(&json!(alice.as_str())), "{response}");
+
+        // From then on, what is new and nothing else.
+        say(&handle, &alice, "welcome", 6).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (response, token, _) =
+            timed_sync(&hub, &e2e, &bob, token, "BOB", Duration::from_millis(50)).await;
+        let room = &response["rooms"]["join"][room_id.as_str()];
+        assert_eq!(
+            bodies(&room["timeline"]),
+            vec!["welcome".to_owned()],
+            "{response}"
+        );
+        assert_eq!(room["timeline"]["limited"], false, "{response}");
+        assert!(
+            room["state"]["events"].as_array().unwrap().is_empty(),
+            "{response}"
+        );
+        let (response, _, _) =
+            timed_sync(&hub, &e2e, &bob, token, "BOB", Duration::from_millis(50)).await;
+        assert!(
+            response["rooms"]["join"].get(room_id.as_str()).is_none(),
+            "{response}"
+        );
+    }
+
+    /// Found closing the gap above, and worse than it: a member of a hot room was sent, on every
+    /// incremental sync, everything since their own membership event again -- the room had no
+    /// feed entries, so it was resumed from there every time -- and their long-poll returned at
+    /// once, every time, because "the room has something after their membership" stayed true.
+    /// A client in any room over the threshold (500 members by default) span on `/sync`.
+    #[tokio::test]
+    async fn a_hot_room_sends_each_event_once_and_lets_a_long_poll_wait() {
+        let hub = hot_hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        handle
+            .membership(bob.clone(), Action::Join, bob.clone(), json!({}), 2)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (_, token) = build(&hub, &e2e, &bob, device_params(None, "BOB"))
+            .await
+            .unwrap();
+
+        let poll = Duration::from_millis(300);
+        for (ts, body) in [(3, "one"), (4, "two")] {
+            say(&handle, &alice, body, ts).await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        let (response, token, _) = timed_sync(&hub, &e2e, &bob, token, "BOB", poll).await;
+        assert_eq!(
+            all_bodies(&response["rooms"]["join"][room_id.as_str()]),
+            vec!["one".to_owned(), "two".to_owned()],
+            "{response}"
+        );
+
+        let (response, token, took) = timed_sync(&hub, &e2e, &bob, token, "BOB", poll).await;
+        assert!(
+            response["rooms"]["join"].get(room_id.as_str()).is_none(),
+            "nothing is repeated: {response}"
+        );
+        assert!(
+            took >= poll - Duration::from_millis(50),
+            "the long-poll waited: {took:?}"
+        );
+
+        say(&handle, &alice, "three", 5).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (response, _, _) = timed_sync(&hub, &e2e, &bob, token, "BOB", poll).await;
+        assert_eq!(
+            all_bodies(&response["rooms"]["join"][room_id.as_str()]),
+            vec!["three".to_owned()],
+            "{response}"
+        );
+    }
+
+    /// A hot room with nothing on the hot-room stream -- what a server upgraded from before the
+    /// stream existed has, until the room's next event -- is not sent again either.
+    #[tokio::test]
+    async fn a_hot_room_from_before_the_stream_is_not_repeated() {
+        let hub = hub();
+        let e2e = e2e_store();
+        std::mem::forget(hub.watch_all(hub.rooms().subscribe_global()));
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        say(&handle, &alice, "old news", 2).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // The record a server from before the stream left: hot, resumed from alice's join.
+        let joined_at = hub
+            .store()
+            .get_membership(&alice, &room_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .room_pos;
+        hub.store()
+            .set_membership(&alice, &room_id, "join", joined_at, true)
+            .await
+            .unwrap();
+        let (_, token) = build(&hub, &e2e, &alice, device_params(None, "ALICE"))
+            .await
+            .unwrap();
+        let poll = Duration::from_millis(300);
+        let (response, _, took) = timed_sync(&hub, &e2e, &alice, token, "ALICE", poll).await;
+        assert!(
+            response["rooms"]["join"].get(room_id.as_str()).is_none(),
+            "{response}"
+        );
+        assert!(took >= poll - Duration::from_millis(50), "{took:?}");
     }
 
     /// Complement caught this one (`TestLeaveEventInviteRejection`, and "Invited user can reject

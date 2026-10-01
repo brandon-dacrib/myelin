@@ -9,10 +9,12 @@
 //! [`SessionHub::fan_out_threshold`] members or fewer, every active member gets a
 //! [`crate::store::UserStore::append_feed_entry`] call per update (fan-out on write); above the
 //! threshold, this hub records the room as `hot` (`crate::store::MembershipRecord::hot_room`) and
-//! *stops* writing feed entries for it, leaning on `crate::sync`'s incremental-sync path to check
-//! a hot room's live position directly (fan-out on read) instead of trusting the feed to have
-//! recorded it. A room's `hot`-ness is recomputed on every update from its live member count, so
-//! it can flip in either direction without an explicit migration step.
+//! *stops* writing feed entries for it. Instead each update to a hot room is one entry on the
+//! server-wide hot-room stream ([`crate::store::UserStore::append_hot_position`]: the room and
+//! its new position, one write however many members it has), and `crate::sync` reads a hot
+//! room's position as of a token from there (fan-out on read). A room's `hot`-ness is
+//! recomputed on every update from its live member count, so it can flip in either direction
+//! without an explicit migration step.
 //!
 //! # The discovery gap
 //!
@@ -148,12 +150,19 @@ impl hs_room::registry::GlobalTokenResolver for FeedTokenResolver {
             return Ok(None); // Not one of ours either -- let the caller report the real error.
         };
         let to_internal = |e: crate::store::StoreError| hs_room::RoomError::Internal(e.to_string());
-        if let Some(pos) = self
+        // The feed's position and the hot-room stream's, whichever is newer: the same baseline
+        // `crate::sync::resume_mode` takes.
+        let from_feed = self
             .store
             .room_pos_as_of(user_id, room_id, token.feed_seq)
             .await
-            .map_err(to_internal)?
-        {
+            .map_err(to_internal)?;
+        let from_hot = self
+            .store
+            .hot_room_pos_as_of(room_id, token.hot_seq)
+            .await
+            .map_err(to_internal)?;
+        if let Some(pos) = from_feed.max(from_hot) {
             return Ok(Some(Some(pos)));
         }
         if let Some(membership) = self
@@ -1388,6 +1397,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             }
         }
 
+        let mut flipped = 0usize;
         for (user_id, membership) in &targets {
             let changed_now = update
                 .membership_deltas
@@ -1401,6 +1411,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             // member whose record still said "cold" for a room that had gone hot was never
             // sent anything from it again (no entries, and not a candidate without them).
             let hot_flipped = existing.as_ref().is_some_and(|m| m.hot_room != hot);
+            flipped += usize::from(hot_flipped);
             if changed_now || missing || hot_flipped {
                 // A membership record's `room_pos` is a resume baseline, and `hs_room`'s forward
                 // pagination is *exclusive* of it: whatever sits at that position counts as
@@ -1427,6 +1438,29 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
                     .append_feed_entry(user_id, &update.room_id, update.room_pos)
                     .await?;
             }
+        }
+        if flipped > 0 {
+            tracing::info!(
+                room_id = %update.room_id,
+                member_count,
+                threshold = self.fan_out_threshold,
+                hot,
+                records = flipped,
+                "a room crossed the fan-out threshold; its members' records now say so"
+            );
+        }
+        // A hot room's position goes on the hot-room stream once, whatever its size: what
+        // `/sync` resumes it from and bounds it by (`crate::sync`'s `resume_mode`). Written
+        // after the membership records, so that a sync which sees this position also sees the
+        // membership the update made -- the other way round, a sync could resume a member who
+        // has only just joined from their own join, and send them nothing of the room.
+        if hot {
+            self.store
+                .append_hot_position(&update.room_id, update.room_pos)
+                .await?;
+        }
+        // And everyone is woken last, once everything a woken `/sync` will read is written.
+        for user_id in targets.keys() {
             self.wake(user_id).await;
         }
 

@@ -255,6 +255,49 @@ pub trait UserStore: Send + Sync {
     /// Returns [`StoreError`] on a storage failure.
     async fn max_device_cursor(&self, user_id: &ruma::UserId) -> Result<u64, StoreError>;
 
+    /// Records that hot room `room_id` (one above the fan-out threshold, `crate::hub`'s module
+    /// docs) reached `room_pos`, at the next position of the server-wide hot-room stream, and
+    /// returns that position. One write per update to a hot room, whatever its size -- the
+    /// fan-out-on-read counterpart of a feed entry per member. A token's
+    /// [`crate::token::SyncToken::hot_seq`] is this stream's position when it was issued, which
+    /// is what lets a hot room be resumed from where that token left it
+    /// ([`UserStore::hot_room_pos_as_of`]).
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn append_hot_position(
+        &self,
+        room_id: &ruma::RoomId,
+        room_pos: i64,
+    ) -> Result<u64, StoreError>;
+
+    /// The newest position of the hot-room stream, `0` if nothing was ever appended to it.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn latest_hot_seq(&self) -> Result<u64, StoreError>;
+
+    /// The newest position hot room `room_id` was recorded at with a stream position at or
+    /// before `as_of_hot_seq`; `None` if it has none that early.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn hot_room_pos_as_of(
+        &self,
+        room_id: &ruma::RoomId,
+        as_of_hot_seq: u64,
+    ) -> Result<Option<i64>, StoreError>;
+
+    /// The stream position of `room_id`'s newest hot-room entry; `None` if it has never had
+    /// one (it has never been hot, or has had no update since this stream was introduced).
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn latest_hot_seq_of_room(
+        &self,
+        room_id: &ruma::RoomId,
+    ) -> Result<Option<u64>, StoreError>;
+
     /// The current value of this user's account-data change counter (shared by global and
     /// room-scoped account data -- see [`UserStore::put_global_account_data`]'s doc comment),
     /// `0` if no account data has ever been written. What a sync response's `account_data_seq`

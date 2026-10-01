@@ -20,7 +20,8 @@
 //! | `hs_user.presence` | `user_id` | each user's latest presence |
 //! | `hs_user.receipt_stream` | `(pos: u64,)` | the server-wide receipt stream: one entry per receipt written, for appservice delivery |
 //! | `hs_user.presence_stream` | `(pos: u64,)` | the server-wide presence stream: one entry per presence change (a new stamp), for appservice delivery |
-//! | `hs_user.ephemeral_counters` | `receipt_stream` / `presence_stream` (raw `atomic_add` keys) | the two streams' position counters |
+//! | `hs_user.hot_positions` | `(room_id, hot_seq)` | the server-wide hot-room stream: one entry per update to a room above the fan-out threshold, its `room_pos` -- `crate::token`'s `hot_seq` indexes here |
+//! | `hs_user.ephemeral_counters` | `receipt_stream` / `presence_stream` / `hot_positions` (raw `atomic_add` keys) | the three streams' position counters |
 //!
 //! # The coalescing invariant, precisely
 //!
@@ -89,6 +90,13 @@ struct AccountDataValue {
     changed_seq: u64,
 }
 
+fn decode_i64(bytes: &[u8]) -> Result<i64, StoreError> {
+    let arr: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| StoreError::Codec("expected an 8-byte room position".to_owned()))?;
+    Ok(i64::from_be_bytes(arr))
+}
+
 fn json_decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, StoreError> {
     serde_json::from_slice(bytes).map_err(|e| StoreError::Codec(e.to_string()))
 }
@@ -114,8 +122,12 @@ pub struct TablesUserStore<B: KvBackend> {
     presence: TypedKeyspace<B::Keyspace, (String,)>,
     receipt_stream: TypedKeyspace<B::Keyspace, (u64,)>,
     presence_stream: TypedKeyspace<B::Keyspace, (u64,)>,
+    hot_positions: TypedKeyspace<B::Keyspace, (String, u64)>,
     ephemeral_counters: B::Keyspace,
 }
+
+/// The `hs_user.ephemeral_counters` key of the hot-room stream's position counter.
+const HOT_POSITIONS_COUNTER: &[u8] = b"hot_positions";
 
 /// A `hs_user.receipt_stream` row.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +177,7 @@ impl<B: KvBackend> TablesUserStore<B> {
             presence: TypedKeyspace::new(open("hs_user.presence")?),
             receipt_stream: TypedKeyspace::new(open("hs_user.receipt_stream")?),
             presence_stream: TypedKeyspace::new(open("hs_user.presence_stream")?),
+            hot_positions: TypedKeyspace::new(open("hs_user.hot_positions")?),
             ephemeral_counters: open("hs_user.ephemeral_counters")?,
             backend,
         })
@@ -386,6 +399,72 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
     async fn max_device_cursor(&self, user_id: &UserId) -> Result<u64, StoreError> {
         let snap = self.backend.snapshot();
         self.max_device_cursor_txn(&snap, user_id.as_ref())
+    }
+
+    async fn append_hot_position(
+        &self,
+        room_id: &RoomId,
+        room_pos: i64,
+    ) -> Result<u64, StoreError> {
+        let rid = room_id.to_string();
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            // The counter and the row in one serializable transaction: a reader that sees the
+            // counter at `n` sees every row up to `n` (`atomic_add` conflicts rather than
+            // interleaves), which is what lets a token's `hot_seq` bound a batch.
+            let seq = txn
+                .atomic_add(&self.ephemeral_counters, HOT_POSITIONS_COUNTER, 1)
+                .map_err(to_kv)?;
+            #[allow(clippy::cast_sign_loss, reason = "atomic_add never goes negative here")]
+            let seq = seq as u64;
+            self.hot_positions
+                .put(txn, &(rid.clone(), seq), &room_pos.to_be_bytes())
+                .map_err(to_kv)?;
+            Ok(seq)
+        })
+        .map_err(StoreError::Kv)
+    }
+
+    async fn latest_hot_seq(&self) -> Result<u64, StoreError> {
+        let snap = self.backend.snapshot();
+        read_counter(&snap, &self.ephemeral_counters, HOT_POSITIONS_COUNTER)
+    }
+
+    async fn hot_room_pos_as_of(
+        &self,
+        room_id: &RoomId,
+        as_of_hot_seq: u64,
+    ) -> Result<Option<i64>, StoreError> {
+        let rid = room_id.to_string();
+        let snap = self.backend.snapshot();
+        let lower = Bytes::from(hs_tables::key::encode(&(rid.clone(), 0u64)));
+        let upper = Bytes::from(hs_tables::key::encode(&(rid, as_of_hot_seq)));
+        let mut spec = RangeSpec::new(
+            std::ops::Bound::Included(lower),
+            std::ops::Bound::Included(upper),
+        );
+        spec.reverse = true;
+        spec.limit = Some(1);
+        match self.hot_positions.range(&snap, spec).next() {
+            Some(item) => {
+                let (_, value) = item.map_err(StoreError::Table)?;
+                Ok(Some(decode_i64(&value)?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn latest_hot_seq_of_room(&self, room_id: &RoomId) -> Result<Option<u64>, StoreError> {
+        let snap = self.backend.snapshot();
+        let mut spec = TypedKeyspace::<B::Keyspace, (String, u64)>::prefix(&(room_id.to_string(),));
+        spec.reverse = true;
+        spec.limit = Some(1);
+        match self.hot_positions.range(&snap, spec).next() {
+            Some(item) => {
+                let ((_, seq), _) = item.map_err(StoreError::Table)?;
+                Ok(Some(seq))
+            }
+            None => Ok(None),
+        }
     }
 
     async fn latest_account_data_seq(&self, user_id: &UserId) -> Result<u64, StoreError> {
@@ -1009,6 +1088,34 @@ mod tests {
                 .feed_seq,
             seq3
         );
+    }
+
+    /// The hot-room stream is one server-wide sequence across rooms, and a room's position as
+    /// of a stream position is its newest entry at or before it.
+    #[tokio::test]
+    async fn the_hot_room_stream_answers_a_rooms_position_as_of_any_point() {
+        let s = store();
+        let a = room_id!("!a:example.org");
+        let b = room_id!("!b:example.org");
+        assert_eq!(s.latest_hot_seq().await.unwrap(), 0);
+        assert_eq!(s.latest_hot_seq_of_room(a).await.unwrap(), None);
+        assert_eq!(s.hot_room_pos_as_of(a, 10).await.unwrap(), None);
+
+        let a1 = s.append_hot_position(a, 5).await.unwrap();
+        let b1 = s.append_hot_position(b, 40).await.unwrap();
+        let a2 = s.append_hot_position(a, 7).await.unwrap();
+        assert_eq!((a1, b1, a2), (1, 2, 3));
+        assert_eq!(s.latest_hot_seq().await.unwrap(), 3);
+        assert_eq!(s.latest_hot_seq_of_room(a).await.unwrap(), Some(3));
+        assert_eq!(s.latest_hot_seq_of_room(b).await.unwrap(), Some(2));
+
+        assert_eq!(s.hot_room_pos_as_of(a, 0).await.unwrap(), None);
+        assert_eq!(s.hot_room_pos_as_of(a, 1).await.unwrap(), Some(5));
+        assert_eq!(s.hot_room_pos_as_of(a, 2).await.unwrap(), Some(5));
+        assert_eq!(s.hot_room_pos_as_of(a, 3).await.unwrap(), Some(7));
+        assert_eq!(s.hot_room_pos_as_of(a, u64::MAX).await.unwrap(), Some(7));
+        assert_eq!(s.hot_room_pos_as_of(b, 1).await.unwrap(), None);
+        assert_eq!(s.hot_room_pos_as_of(b, 2).await.unwrap(), Some(40));
     }
 
     #[tokio::test]
