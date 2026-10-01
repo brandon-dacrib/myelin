@@ -2015,12 +2015,10 @@ impl<B: KvBackend> RoomActor<B> {
         &self,
         anchor_sn: EventSn,
         batch: &[Event],
-        fallback: &BTreeMap<(String, String), OwnedEventId>,
-    ) -> Result<Vec<BTreeMap<(String, String), OwnedEventId>>, RoomError> {
-        let mut state: BTreeMap<(String, String), OwnedEventId> =
-            self.state_before_for_backfill(anchor_sn)?;
-        let mut states_before: Vec<BTreeMap<(String, String), OwnedEventId>> =
-            Vec::with_capacity(batch.len());
+        fallback: &history::StateMap,
+    ) -> Result<Vec<history::StateMap>, RoomError> {
+        let mut state: history::StateMap = self.state_before_for_backfill(anchor_sn)?;
+        let mut states_before: Vec<history::StateMap> = Vec::with_capacity(batch.len());
         for (i, event) in batch.iter().enumerate().rev() {
             if let Some(state_key) = event.header().state_key.as_deref() {
                 let event_type = event.header().event_type.as_str();

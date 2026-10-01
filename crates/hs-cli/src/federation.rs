@@ -20,8 +20,13 @@
 //! - **`/openid/userinfo` answers nothing** (below) is now the only such case here. `/state` and
 //!   `/state_ids` used to refuse every event but the newest, because `hs-room` exposed no
 //!   historical state query and answering about the past with the present would have handed a
-//!   remote state it could not detect was wrong. `hs_room::actor::RoomActor::state_at_event`
-//!   lifted that: both endpoints now answer for any event this server holds.
+//!   remote state it could not detect was wrong. `hs_room::actor::RoomActor::state_before_event`
+//!   lifted that: both endpoints now answer for any event this server holds in its timeline,
+//!   with the state *before* the event, as the spec and Synapse (`get_state_ids_for_pdu`) do --
+//!   what a server backfilling from this one derives the state at a batch from
+//!   (`crate::backfill`). They answered with the state *after* it until 2026-09-30, which
+//!   differs whenever the event is itself a state event. An outlier this server has not placed
+//!   in its timeline has no known state and is `404`, as in Synapse.
 //! - **`/openid/userinfo` answers nothing**, because no OpenID token is ever issued: the
 //!   client-side `POST /user/{userId}/openid/request_token` endpoint does not exist yet, so there
 //!   is no token this could resolve and every call is an invalid token.
@@ -399,30 +404,11 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
     ) -> Result<(Vec<EventJson>, Vec<EventJson>), RoomSourceError> {
         let at = at_event_id.to_owned();
         self.with_visible_room(room_id, requesting_server, move |actor| {
-            let event_id = ruma::EventId::parse(&at).map_err(|_| RoomSourceError::NotFound)?;
-            let at_state = actor
-                .state_at_event(&event_id)
-                .map_err(|_| RoomSourceError::NotFound)?
-                .ok_or(RoomSourceError::NotFound)?;
-
-            let pdus: Vec<Value> = at_state.state.iter().map(full_pdu).collect();
-            // `/state`'s `auth_chain` conventionally includes the state events themselves -- they
-            // are what the recipient has to authenticate -- while
-            // `RoomActor::state_at_event`'s `auth_chain` is strictly the ancestors. Adding the
-            // state back is what makes the two agree; see that method's doc, which names this
-            // call site.
-            let mut chain: Vec<Value> = at_state.auth_chain.iter().map(full_pdu).collect();
-            let already: HashSet<String> = at_state
-                .auth_chain
-                .iter()
-                .map(|event| event.event_id().to_string())
-                .collect();
-            for (event, rendered) in at_state.state.iter().zip(pdus.iter()) {
-                if !already.contains(&event.event_id().to_string()) {
-                    chain.push(rendered.clone());
-                }
-            }
-            Ok((pdus, chain))
+            let (state, chain) = state_before_with_chain(actor, &at)?;
+            Ok((
+                state.iter().map(full_pdu).collect(),
+                chain.iter().map(full_pdu).collect(),
+            ))
         })
         .await
     }
@@ -433,10 +419,18 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
         at_event_id: &str,
         requesting_server: &str,
     ) -> Result<(Vec<String>, Vec<String>), RoomSourceError> {
-        let (state, auth_chain) = self
-            .state_at(room_id, at_event_id, requesting_server)
-            .await?;
-        Ok((event_ids_of(&state), event_ids_of(&auth_chain)))
+        // From the events, not their rendered PDUs: a PDU of room version 3 or later carries
+        // no `event_id` (it is derived from the event's hash), so reading it back out of the
+        // JSON answered every such room with two empty lists until 2026-09-30.
+        let at = at_event_id.to_owned();
+        self.with_visible_room(room_id, requesting_server, move |actor| {
+            let (state, chain) = state_before_with_chain(actor, &at)?;
+            let ids = |events: &[hs_model::Event]| -> Vec<String> {
+                events.iter().map(|e| e.event_id().to_string()).collect()
+            };
+            Ok((ids(&state), ids(&chain)))
+        })
+        .await
     }
 
     async fn auth_chain(
@@ -771,16 +765,30 @@ fn joined_servers<B: KvBackend>(actor: &RoomActor<B>) -> Vec<String> {
 /// The `event_id` of every event in a rendered PDU list. Federation PDUs for room version 3+ do
 /// not carry `event_id`, so this recomputes nothing: it is only used on lists this adapter built
 /// from events it holds, where the ID is already known.
-fn event_ids_of(events: &[Value]) -> Vec<String> {
-    events
+/// The room's state immediately before `at` (`RoomActor::state_before_event`) and that state's
+/// auth chain *with the state events themselves in it*: `/state`'s `auth_chain` conventionally
+/// includes them -- they are what the recipient has to authenticate -- while
+/// `RoomActor::state_before_event`'s is strictly their ancestors.
+fn state_before_with_chain<B: KvBackend>(
+    actor: &RoomActor<B>,
+    at: &str,
+) -> Result<(Vec<hs_model::Event>, Vec<hs_model::Event>), RoomSourceError> {
+    let event_id = ruma::EventId::parse(at).map_err(|_| RoomSourceError::NotFound)?;
+    let at_state = actor
+        .state_before_event(&event_id)
+        .map_err(|_| RoomSourceError::NotFound)?
+        .ok_or(RoomSourceError::NotFound)?;
+    let mut chain = at_state.auth_chain;
+    let already: HashSet<ruma::OwnedEventId> = chain
         .iter()
-        .filter_map(|event| {
-            event
-                .get("event_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .collect()
+        .map(|event| event.event_id().to_owned())
+        .collect();
+    for event in &at_state.state {
+        if !already.contains(event.event_id()) {
+            chain.push(event.clone());
+        }
+    }
+    Ok((at_state.state, chain))
 }
 
 /// [`hs_federation::inbound::RoomWriteSink`] over `hs-room`'s [`RoomRegistry`].

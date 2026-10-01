@@ -681,3 +681,74 @@ async fn messages_read_on_past_a_gap_that_cannot_be_filled() {
     );
     assert_eq!(hook.gap_fetches.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn a_gap_filled_with_the_state_asked_of_the_resident_has_its_state_at_every_event() {
+    use hs_room::backfill::{FetchedState, HistoryKind, StateSource};
+
+    let mut r = rejoined(5);
+    let top = r
+        .joiner
+        .timeline_position(r.rejoin.event_id())
+        .expect("the rejoin is in the timeline");
+    let anchor = r.joiner.gap_anchor(top).expect("open");
+    // Four back from alice's last word: three messages and the rename.
+    let batch = resident_backfill(&r.resident, &anchor.from, 4);
+    let kind = HistoryKind::Gap { top };
+    let plan = r
+        .joiner
+        .plan_history(kind, &batch)
+        .expect("plan")
+        .expect("something to place");
+    assert_eq!(
+        Some(plan.oldest.clone()),
+        r.while_out
+            .iter()
+            .find(|e| e.header().event_type == "m.room.name")
+            .map(|e| e.event_id().to_owned()),
+        "the oldest of the four is the rename"
+    );
+
+    // The resident's `/state_ids` at the rename, and whatever of it b.example lacks.
+    let StateAtEvent { state, auth_chain } = r
+        .resident
+        .state_before_event(&plan.oldest)
+        .expect("lookup")
+        .expect("known");
+    let state_ids: Vec<OwnedEventId> = state.iter().map(|e| e.event_id().to_owned()).collect();
+    let mut wanted = state_ids.clone();
+    wanted.extend(auth_chain.iter().map(|e| e.event_id().to_owned()));
+    let events = r
+        .joiner
+        .events_not_held(&wanted)
+        .iter()
+        .filter_map(|id| r.resident.event_by_id(id).cloned())
+        .collect();
+    let outcome = r
+        .joiner
+        .accept_history(
+            kind,
+            batch.clone(),
+            Some(FetchedState {
+                at: plan.oldest,
+                state_ids,
+                events,
+            }),
+        )
+        .expect("placed");
+    assert_eq!(outcome.state, StateSource::Fetched);
+    assert_eq!(outcome.added, 4);
+    assert_eq!(outcome.rejected, 0);
+    assert!(!outcome.gap_closed, "two messages are still missing");
+
+    // The state at each placed event is the resident's: bob is out, the room renamed from the
+    // rename on.
+    for event in &batch {
+        assert_eq!(
+            state_at(&r.joiner, event),
+            state_at(&r.resident, event),
+            "state at {}",
+            event.event_id()
+        );
+    }
+}

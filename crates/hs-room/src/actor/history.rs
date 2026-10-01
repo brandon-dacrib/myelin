@@ -409,13 +409,30 @@ impl<B: KvBackend> RoomActor<B> {
         };
         let mut derived: Option<StateMap> = None;
         let mut walked: Vec<StateMap> = Vec::new();
-        match fetched {
-            Some(fetched) => {
-                outcome.state_events_stored = self.store_fetched_state_events(fetched.events)?;
-                derived = Some(self.state_map_from_ids(&fetched.state_ids));
+        if let Some(fetched) = fetched {
+            outcome.state_events_stored = self.store_fetched_state_events(fetched.events)?;
+            let state = self.state_map_from_ids(&fetched.state_ids);
+            // Only the create event has no state before it. A state without one -- an empty
+            // answer, every event of it failing verification -- would reject the whole batch on
+            // the server's mistake, so it is not used.
+            let starts_the_room = batch
+                .first()
+                .is_some_and(|e| e.header().event_type == "m.room.create");
+            if starts_the_room || state.contains_key(&("m.room.create".into(), String::new())) {
+                derived = Some(state);
                 outcome.state = StateSource::Fetched;
+            } else {
+                tracing::warn!(
+                    room_id = %self.room_id,
+                    %oldest,
+                    entries = state.len(),
+                    kind = kind.label(),
+                    "the state fetched at a backfilled event has no create event; walking instead"
+                );
             }
-            None => walked = self.walk_history_states(anchor_sn, &batch, &walk_fallback)?,
+        }
+        if derived.is_none() {
+            walked = self.walk_history_states(anchor_sn, &batch, &walk_fallback)?;
         }
 
         // Authorize, oldest first, deriving the state forward as each event is accepted.

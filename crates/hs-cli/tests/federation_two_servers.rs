@@ -684,6 +684,187 @@ async fn a_user_joins_a_room_on_another_server_and_messages_flow_both_ways() {
     b.handle.shutdown().await;
 }
 
+/// The value of the counter line in `exposition` that starts with `prefix`, `0` if absent.
+fn counter(exposition: &str, prefix: &str) -> u64 {
+    exposition
+        .lines()
+        .find(|line| line.starts_with(prefix))
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+async fn set_topic(client: &reqwest::Client, base: &str, token: &str, room_id: &str, topic: &str) {
+    let response: Value = client
+        .put(format!(
+            "{base}/_matrix/client/v3/rooms/{room_id}/state/m.room.topic"
+        ))
+        .bearer_auth(token)
+        .json(&json!({"topic": topic}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(response["event_id"].is_string(), "{response}");
+}
+
+/// Bob joins late and reads back past a topic change; the state at history fetched from A is
+/// A's, including a topic set before anything B fetched: B asked A for the state at the oldest
+/// event of the batch (`/state_ids`, then `/event` for the old topic, which B never held)
+/// rather than walking back from what it held, where that topic does not exist.
+#[tokio::test]
+async fn the_state_at_fetched_history_is_asked_of_the_server_that_sent_it() {
+    let port_a = reserve_port();
+    let port_b = reserve_port();
+    let a = start(port_a).await;
+    let b = start(port_b).await;
+    let client = reqwest::Client::new();
+
+    let (_alice, alice_token) = register(&client, &a.base, "alice").await;
+    let (_bob, bob_token) = register(&client, &b.base, "bob").await;
+    let created: Value = client
+        .post(format!("{}/_matrix/client/v3/createRoom", a.base))
+        .bearer_auth(&alice_token)
+        .json(&json!({"preset": "public_chat", "room_version": "11"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let room_id = created["room_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("createRoom failed: {created}"))
+        .to_owned();
+
+    // The first topic, ten messages, the second topic, then 95 messages: a backfill batch of
+    // 100 from bob's join reaches the second topic and three messages before it, never the
+    // first topic.
+    set_topic(&client, &a.base, &alice_token, &room_id, "first topic").await;
+    let mut before = Vec::new();
+    for i in 1..=10 {
+        before.push(
+            send_message(
+                &client,
+                &a.base,
+                &alice_token,
+                &room_id,
+                &format!("before the second topic {i}"),
+            )
+            .await,
+        );
+    }
+    set_topic(&client, &a.base, &alice_token, &room_id, "second topic").await;
+    for i in 1..=95 {
+        send_message(
+            &client,
+            &a.base,
+            &alice_token,
+            &room_id,
+            &format!("after the second topic {i}"),
+        )
+        .await;
+    }
+
+    let join = client
+        .post(format!(
+            "{}/_matrix/client/v3/join/{room_id}?server_name={}",
+            b.base, a.name
+        ))
+        .bearer_auth(&bob_token)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(join.status(), 200);
+    let bob_sync = sync_until(&client, &b.base, &bob_token, |s| {
+        s["rooms"]["join"].get(&room_id).is_some()
+    })
+    .await;
+    let prev_batch = bob_sync["rooms"]["join"][&room_id]["timeline"]["prev_batch"]
+        .as_str()
+        .expect("a prev_batch")
+        .to_owned();
+
+    // One page back reaches the join's edge and fetches one batch from A.
+    let page: Value = client
+        .get(format!(
+            "{}/_matrix/client/v3/rooms/{room_id}/messages?dir=b&limit=50&from={prev_batch}",
+            b.base
+        ))
+        .bearer_auth(&bob_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        page["chunk"].as_array().map(Vec::len),
+        Some(50),
+        "a full page of fetched history: {page}"
+    );
+
+    // The tenth message before the second topic is in that batch; the state at it, as B's
+    // `/context` shows it, has the first topic -- set before the batch, held by B only because
+    // B asked A for the state there.
+    let topic_at = |base: String, token: String, event_id: String| {
+        let client = client.clone();
+        let room_id = room_id.clone();
+        async move {
+            let context: Value = client
+                .get(format!(
+                    "{base}/_matrix/client/v3/rooms/{room_id}/context/{event_id}?limit=0"
+                ))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let state = context["state"]
+                .as_array()
+                .unwrap_or_else(|| panic!("no state in /context: {context}"))
+                .clone();
+            state
+                .iter()
+                .find(|e| e["type"] == "m.room.topic")
+                .and_then(|e| e["content"]["topic"].as_str())
+                .map(str::to_owned)
+        }
+    };
+    let tenth = before.last().expect("ten messages").clone();
+    assert_eq!(
+        topic_at(a.base.clone(), alice_token.clone(), tenth.clone()).await,
+        Some("first topic".to_owned()),
+        "A's own state at the event"
+    );
+    assert_eq!(
+        topic_at(b.base.clone(), bob_token.clone(), tenth).await,
+        Some("first topic".to_owned()),
+        "B's state at the fetched event has the topic set before the batch"
+    );
+
+    // And the batch was counted as placed with a fetched state.
+    let mut registry = prometheus_client::registry::Registry::default();
+    hs_cli::backfill::register_metrics(&mut registry);
+    let mut exposition = String::new();
+    prometheus_client::encoding::text::encode(&mut exposition, &registry).unwrap();
+    assert!(
+        counter(
+            &exposition,
+            "hs_room_backfill_batches_total{kind=\"before_oldest\",outcome=\"state_fetched\"}"
+        ) >= 1,
+        "{exposition}"
+    );
+
+    a.handle.shutdown().await;
+    b.handle.shutdown().await;
+}
+
 #[tokio::test]
 async fn joining_through_a_server_that_does_not_know_the_room_is_not_found() {
     let port_a = reserve_port();
