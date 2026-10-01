@@ -71,7 +71,8 @@ impl fmt::Display for Generation {
     }
 }
 
-/// The fencing token of a shard: incremented on every acquisition.
+/// The fencing token of a shard: incremented on every acquisition and every release (decision
+/// 0023), so a [`crate::Fence`] fails once its holder no longer owns the shard.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Epoch(pub u64);

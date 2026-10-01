@@ -6,12 +6,15 @@
 //! that reads a key and later commits successfully is a guarantee the key did not change out from
 //! under it. [`Fence::check`] reads the shard's ownership row inside the *caller's* transaction
 //! (adding it to that transaction's read set) and compares the epoch to the one this [`Fence`]
-//! was issued for. If a different replica has since acquired the shard, [`crate::store::ClusterStore::acquire_shard`]
-//! already wrote a new epoch to that row, so either:
+//! was issued for. If a different replica has since acquired the shard, or the holder has since
+//! released it, [`crate::store::ClusterStore::acquire_shard`] or
+//! [`crate::store::ClusterStore::release_shard`] already wrote a new epoch to that row (decision
+//! 0023: a release advances the epoch too, so a fence fails in the ownerless interval between
+//! a release and the next acquisition, not only after it), so either:
 //!
 //! - the comparison here already sees the new epoch and fails immediately, or
 //! - the two transactions race and this one's commit conflicts (`hs_kv::Conflict`), because the
-//!   acquire's write and this read are on the same key.
+//!   acquire's (or release's) write and this read are on the same key.
 //!
 //! Either way the stale owner cannot commit a write against data it no longer owns. No separate
 //! fencing primitive exists, and none is needed: `docs/rfcs/0001-cluster-ownership.md` section 6.
@@ -62,8 +65,8 @@ impl Fence {
     /// outside the transaction is not fencing.
     ///
     /// # Errors
-    /// Returns [`FenceError::Fenced`] if the epoch no longer matches (a new owner has since
-    /// acquired the shard), or a store error if the read itself failed. This method does not
+    /// Returns [`FenceError::Fenced`] if the epoch no longer matches (the shard has since been
+    /// released, or acquired by a new owner), or a store error if the read itself failed. This method does not
     /// commit or roll back `txn`; the caller still must call the backend's commit and handle
     /// [`hs_kv::Conflict`] there as it would for any other transaction.
     pub fn check<K, T>(&self, txn: &T, keyspace: &K) -> Result<(), FenceError>
@@ -153,6 +156,42 @@ mod tests {
         let snap = backend.snapshot();
         let err = fence.check(&snap, store.shard_keyspace()).unwrap_err();
         assert!(matches!(err, FenceError::Fenced { .. }));
+    }
+
+    /// Decision 0023: a fence from before an ordinary release (a handoff to a live peer, or
+    /// convergence giving a shard back) fails as soon as the shard is released, while nobody
+    /// owns it yet -- not only once the next owner acquires it. Before, the release left the
+    /// epoch where it was, so the old owner's fence still passed against the ownerless row and
+    /// a write it had in flight could land in the gap.
+    #[test]
+    fn a_stale_fence_fails_while_the_released_shard_has_no_owner() {
+        let backend = MemoryBackend::new();
+        let store = ClusterStore::open(backend.clone()).unwrap();
+        let shard = ShardId::new(ShardKind::Room, 0);
+        let me = ReplicaId::new("hs-0");
+        let rec = store
+            .acquire_shard(shard, &me, Generation(1), |_| false)
+            .unwrap()
+            .unwrap();
+        let fence = Fence::clustered(shard, rec.epoch);
+
+        store.release_shard(shard, &me, Generation(1)).unwrap();
+        assert_eq!(store.get_shard(shard).unwrap().owner, None, "ownerless");
+
+        let snap = backend.snapshot();
+        let err = fence.check(&snap, store.shard_keyspace()).unwrap_err();
+        assert!(
+            matches!(err, FenceError::Fenced { held, current: Some(current), .. }
+                if held == rec.epoch && current > held),
+            "got {err:?}"
+        );
+        // A write transaction that checks the fence fails too, not only a snapshot read.
+        let write = transact(&backend, TransactConfig::default(), |txn| {
+            fence
+                .check(txn, store.shard_keyspace())
+                .map_err(hs_kv::KvError::backend)
+        });
+        assert!(write.is_err(), "a stale owner's write must not commit");
     }
 
     #[test]

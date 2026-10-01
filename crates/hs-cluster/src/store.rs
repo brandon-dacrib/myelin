@@ -448,7 +448,15 @@ impl<B: KvBackend> ClusterStore<B> {
         .map_err(ClusterError::Store)
     }
 
-    /// Releases `shard`, but only if `me` at `my_generation` is still the recorded owner.
+    /// Releases `shard` and advances its epoch, but only if `me` at `my_generation` is still the
+    /// recorded owner. Returns the released row's new epoch, or `None` (changing nothing) when
+    /// `me` was not the owner.
+    ///
+    /// The epoch advances on release, not only on the next acquisition (decision 0023): a
+    /// fence issued to `me` for the shard fails from the moment the release commits, so a write
+    /// the old owner still has in flight cannot land while the shard has no owner. A handoff
+    /// therefore moves the epoch twice, once here and once when the new owner acquires; epochs
+    /// only need to grow.
     ///
     /// # Errors
     /// Returns a store error.
@@ -457,22 +465,22 @@ impl<B: KvBackend> ClusterStore<B> {
         shard: ShardId,
         me: &ReplicaId,
         my_generation: Generation,
-    ) -> Result<(), ClusterError> {
+    ) -> Result<Option<Epoch>, ClusterError> {
         transact(&self.backend, TransactConfig::default(), |txn| {
             let key = shard_key(shard);
             let current = match txn.get(&self.shards, &key)? {
-                None => return Ok(()),
+                None => return Ok(None),
                 Some(bytes) => decode_kv::<ShardRecord>("ShardRecord", &bytes)?,
             };
             if current.owner.as_ref().map(|(o, g)| (o, *g)) != Some((me, my_generation)) {
-                return Ok(());
+                return Ok(None);
             }
             let released = ShardRecord {
-                epoch: current.epoch,
+                epoch: current.epoch.next(),
                 owner: None,
             };
             txn.put(&self.shards, &key, &encode(&released))?;
-            Ok(())
+            Ok(Some(released.epoch))
         })
         .map_err(ClusterError::Store)
     }
@@ -667,14 +675,20 @@ mod tests {
         assert_eq!(taken.epoch, Epoch(2));
         assert_eq!(taken.owner.unwrap().0, other);
 
-        s.release_shard(shard, &other, Generation(1)).unwrap();
+        // Releasing advances the epoch too (decision 0023), so a fence held from before the
+        // release fails while the shard has no owner, not only once the next owner acquires.
+        let new_epoch = s.release_shard(shard, &other, Generation(1)).unwrap();
         let released = s.get_shard(shard).unwrap();
         assert_eq!(released.owner, None);
-        assert_eq!(
-            released.epoch,
-            Epoch(2),
-            "release must not change the epoch"
-        );
+        assert_eq!(released.epoch, Epoch(3), "release advances the epoch");
+        assert_eq!(new_epoch, Some(Epoch(3)), "and answers the new one");
+
+        // The next acquisition advances it again: epochs only grow.
+        let again = s
+            .acquire_shard(shard, &me, Generation(2), |_| false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.epoch, Epoch(4));
     }
 
     #[test]
@@ -722,14 +736,22 @@ mod tests {
         let s = store();
         let shard = ShardId::new(ShardKind::Room, 1);
         let me = ReplicaId::new("hs-0");
-        s.acquire_shard(shard, &me, Generation(1), |_| false)
+        let held = s
+            .acquire_shard(shard, &me, Generation(1), |_| false)
+            .unwrap()
             .unwrap();
-        s.release_shard(shard, &ReplicaId::new("hs-1"), Generation(1))
+        let released = s
+            .release_shard(shard, &ReplicaId::new("hs-1"), Generation(1))
             .unwrap();
-        assert!(
-            s.get_shard(shard).unwrap().owner.is_some(),
-            "wrong replica must not release"
+        assert_eq!(released, None, "nothing was released");
+        assert_eq!(
+            s.get_shard(shard).unwrap(),
+            held,
+            "wrong replica must not release, nor move the epoch"
         );
+        // Nor the right replica at an older generation (a previous process of it).
+        assert_eq!(s.release_shard(shard, &me, Generation(0)).unwrap(), None);
+        assert_eq!(s.get_shard(shard).unwrap(), held);
     }
 
     #[test]

@@ -55,7 +55,8 @@ admin API's room long tail).
 >   replicas on PostgreSQL) now also upgrades six rooms (to 12 and 11) through the replica that
 >   does not own them: each replacement is on a shard of the old room's owner, the tombstone
 >   names it, it takes a message through the other replica, and each replica's
->   `hs_room_upgrades_total` counts the upgrades of the rooms it owns.
+>   `hs_room_upgrades_total` counts the upgrades of the rooms it owns (passed, 282 s, against a
+>   private `postgres:17`; not run without the fix).
 > - **How to verify.** `cargo test -p hs-room --lib upgrade`; `cargo test -p hs-cli --test
 >   room_upgrade`; `HS_CLUSTER_TEST_POSTGRES_DSN=... cargo test -p hs-cli --test
 >   cluster_create_room`.

@@ -120,6 +120,39 @@ Closes the known gap "In-process server cannot be restarted over its data direct
 Left: a clustered in-process server has not been checked for cycles (the mesh, the sync
 cluster's mirror); its components report would name any. Verify:
 `cargo test -p hs-cli --test in_process_restart`.
+## 2026-10-01: a release advances the fencing epoch (branch `agent/room-cluster-small`)
+
+Closes the known gap "A released shard keeps its fencing epoch until the next owner acquires
+it" (noticed in the entry below). **Decision 0023**: `ClusterStore::release_shard` now writes
+the ownerless row at `epoch + 1` in the same transaction that clears the owner, and answers
+the new epoch (`Some`) or `None` when the caller was not the owner and nothing changed. A fence
+the old owner still holds fails from the moment the release commits, instead of passing
+against the ownerless row until the next acquisition; a handoff now moves the epoch twice
+(release, then acquire). RFC 0001 sections 3 and 6 are amended to say so; the `Epoch` and
+`Fence` docs too. `KvOwnership::release` logs each release with its new epoch at `debug`
+(the count is `hs_cluster_ownership_changes_total{reason="release"}`).
+
+- `fence::tests::a_stale_fence_fails_while_the_released_shard_has_no_owner` (new): acquire,
+  release, then the old fence fails both a snapshot check and a write transaction while the
+  row has no owner. Fails on the old behaviour (the check passes).
+- `store::tests::acquire_then_release_round_trips_epoch` states the new contract (release
+  advances 2 to 3 and answers it; the next acquisition makes 4);
+  `release_by_a_non_owner_is_a_no_op` now also asserts the epoch did not move, for another
+  replica and for the same replica at an older generation.
+- `ownership::tests::a_shard_taken_while_held_is_dropped_and_taken_back_once_released` (the one test that
+  released and then looked at the epoch) expects the loss to be reported at the release's
+  epoch.
+- The handoff path (decision 0017: a write fenced mid-handoff is a `503` the edge sends on to
+  the new owner) still holds. Against a private `postgres:17` on :5477, on a machine at load
+  10-16: `chaos.rs` (5 tests) passes; `crates/hs-cli/tests/cluster_admin.rs` passes both tests
+  (53 s: a replica drained through the other hands off every shard and comes back, and the
+  last replica stops at once); `cluster_create_room.rs` passes (282 s, forty rooms written and
+  six upgraded across the two replicas). One earlier run of `cluster_create_room.rs` failed
+  before the test did anything: replica 2 timed out connecting to PostgreSQL at boot.
+
+**How to verify.** `cargo test -p hs-cluster`; with a PostgreSQL of your own,
+`HS_CLUSTER_TEST_POSTGRES_DSN=postgres://postgres:hspg@127.0.0.1:5477/postgres cargo test -p
+hs-cli --test cluster_admin --test cluster_create_room`.
 
 ## 2026-09-30: two known gaps closed (branch `agent/cluster-gaps`)
 

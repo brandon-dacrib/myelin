@@ -53,7 +53,7 @@ This RFC fixes the parts of that design that other tracks build against: the sha
 
 - **Replica**: one `hs serve` process. Identified by a `ReplicaId` (string; the pod name on Kubernetes, `HOSTNAME` otherwise) and a `Generation` (`u64`, strictly increasing per replica id across restarts).
 - **Shard**: the unit of ownership. `ShardId { kind, index }`. Kinds: `Room`, `User`, `Federation` (outbound destination queues), `Appservice` (outbound transaction queues), `Global` (exactly one shard; singletons and background jobs). Rooms and users map to a shard by a stable hash of their identifier.
-- **Epoch**: a `u64` per shard, stored in the data store, incremented every time ownership of the shard is acquired. The fencing token.
+- **Epoch**: a `u64` per shard, stored in the data store, incremented every time ownership of the shard is acquired, and every time it is released (decision 0023). The fencing token.
 - **Owner**: the replica named in the shard's store row, holding the current epoch.
 - **Desired owner**: the replica that rendezvous hashing selects for a shard over the current live membership. The desired owner and the owner differ transiently; the system converges.
 - **Lease**: a replica's registry row with a heartbeat. A replica whose heartbeat has not advanced for `lease_ttl` is dead as far as ownership is concerned.
@@ -117,14 +117,14 @@ Every shard has a row `cluster/shard/<kind>/<index>`:
 
 ```
 ShardRecord {
-  epoch: u64,                          // fencing token; increases on every acquire
+  epoch: u64,                          // fencing token; increases on every acquire and release (decision 0023)
   owner: Option<(ReplicaId, Generation)>,  // None = released
 }
 ```
 
 **Ownership is changed only by a compare-and-swap on this row**, which every backend supports (a serializable transaction that reads the row and writes it; on Fjall and FoundationDB natively, on PostgreSQL under `SERIALIZABLE`, on SlateDB within the global shard's writer). Because it is a single-key CAS it is linearizable per shard, so two replicas can never both believe they own a shard at the same epoch. This is the "confirmed through the store" step of `PLAN.md` 7.3.
 
-Acquire (by replica R, which must currently be the desired owner): read the row; require `owner == None` or `owner` dead by section 4's rule (this is R's judgement and not a store-side check, which is why the epoch exists); write `{ epoch: epoch + 1, owner: (R, R.generation) }`. Release (by the owner): read; require `owner == (R, gen)`; write `{ epoch, owner: None }`. Both fail with `Conflict` if the row changed, and the ownership loop re-reads and re-decides.
+Acquire (by replica R, which must currently be the desired owner): read the row; require `owner == None` or `owner` dead by section 4's rule (this is R's judgement and not a store-side check, which is why the epoch exists); write `{ epoch: epoch + 1, owner: (R, R.generation) }`. Release (by the owner): read; require `owner == (R, gen)`; write `{ epoch: epoch + 1, owner: None }` (amended by decision 0023: the epoch advances on release too, so a fence from before the release fails while the shard has no owner). Both fail with `Conflict` if the row changed, and the ownership loop re-reads and re-decides.
 
 **Fencing rule (mandatory).** Every transaction that an owner runs against a shard's data reads that shard's row inside the transaction and aborts with `Fenced` if `epoch` is not the epoch the owner holds. On serializable backends this makes a stale owner unable to commit: its transaction has the epoch key in its read set, the new owner's acquire wrote that key, and the two cannot both commit in an order that lets the stale write land after the takeover. If they serialize with the stale write first, the write is durable before the new owner's acquire and the new owner's cold load sees it, which is correct. PostgreSQL SSI implements exactly this (the SIREAD lock on the epoch row detects the rw-conflict); Fjall's optimistic transactions validate the read set at commit; FoundationDB validates read conflict ranges. On SlateDB the rule composes with manifest fencing: opening the shard's database as the new writer fences the old process at the storage layer as well, and the epoch is what the new owner records in its manifest open.
 

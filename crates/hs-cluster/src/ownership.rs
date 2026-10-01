@@ -710,7 +710,18 @@ impl<B: KvBackend> KvOwnership<B> {
         let generation = self.generation;
         let result =
             tokio::task::spawn_blocking(move || store.release_shard(shard, &me, generation)).await;
-        if matches!(result, Ok(Ok(()))) {
+        if let Ok(Ok(released)) = result {
+            if let Some(epoch) = released {
+                // Per shard, and a handoff releases many: `debug`, with the release counted in
+                // `hs_cluster_ownership_changes_total{reason="release"}`.
+                tracing::debug!(
+                    replica = %self.me,
+                    %shard,
+                    epoch = epoch.0,
+                    "released a shard; its epoch advanced, so a fence from before the release \
+                     fails (decision 0023)"
+                );
+            }
             self.forget_released(shard);
         }
     }
@@ -1117,8 +1128,12 @@ mod tests {
             .acquire_shard(shard, &thief, Generation(1), |_| true)
             .unwrap()
             .unwrap();
-        store.release_shard(shard, &thief, Generation(1)).unwrap();
+        let released = store
+            .release_shard(shard, &thief, Generation(1))
+            .unwrap()
+            .expect("the thief owned the shard it released");
         assert!(stolen.epoch > held);
+        assert!(released > stolen.epoch, "a release advances the epoch");
 
         // hs-0 notices, reports the loss, and owns the shard again at a newer epoch -- in the
         // store, not only in its own memory.
@@ -1136,12 +1151,12 @@ mod tests {
         let mut lost = false;
         while let Ok(event) = events.try_recv() {
             if let OwnershipEvent::Lost { shard: s, epoch } = event {
-                assert_eq!((s, epoch), (shard, stolen.epoch));
+                assert_eq!((s, epoch), (shard, released));
                 lost = true;
             }
         }
         assert!(lost, "the loss was never announced");
-        assert!(mgr.fence(shard).unwrap().epoch.unwrap() > stolen.epoch);
+        assert!(mgr.fence(shard).unwrap().epoch.unwrap() > released);
     }
 
     #[tokio::test(start_paused = true)]
