@@ -242,7 +242,7 @@ in `federation_two_servers.rs` (a topic set before the fetched batch is in B's `
 fails with the fetch switched off). Left: within one batch the derivation is linear; the walk
 stays the fallback when the sender cannot answer; Complement not rerun for it.
 
-**A version-12 room is built by the owner of its shard** (`agent/room-gaps` at `312caba`, not merged yet;
+**A version-12 room is built by the owner of its shard** (`agent/room-gaps` at `691060e`, not merged yet;
 status 04 session 14; decision 0020; known gap "A v12 room's id cannot be pre-assigned"
 closed; completes RFC 0019). A version-12 room's id is its create event's hash, so the shard
 gate's pre-assigned id was ignored and the room was built wherever the gate sent the request.
