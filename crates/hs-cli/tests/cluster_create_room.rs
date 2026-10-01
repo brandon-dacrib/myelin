@@ -113,6 +113,25 @@ impl HsProcess {
 
 impl Drop for HsProcess {
     fn drop(&mut self) {
+        // On a failure, what the replica said about its shards and its peers since boot: an
+        // ownership flap under load (a late heartbeat, a peer judged dead, a shard taken and
+        // given back) is otherwise invisible in the test's output.
+        if std::thread::panicking() {
+            let pid = self.child.id();
+            let said: Vec<String> = self
+                .lines
+                .try_iter()
+                .filter(|line| {
+                    let lower = line.to_ascii_lowercase();
+                    lower.contains("warn") || lower.contains("shard") || lower.contains("dead")
+                })
+                .collect();
+            let tail = said.len().saturating_sub(200);
+            eprintln!("--- hs (pid {pid}): its warnings and shard lines ---");
+            for line in &said[tail..] {
+                eprintln!("{line}");
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -185,7 +204,10 @@ impl Drop for Database {
 }
 
 /// One replica: its client listener on `port`, its mesh on `mesh_port`, both named
-/// `server_name`.
+/// `server_name`. The heartbeat and lease are the production defaults (1 s, 3 s): with a 500 ms
+/// heartbeat a replica gives up its shards when one tick runs a second late, which a debug
+/// build on a loaded machine does often enough to fail this test, and this test is about where
+/// rooms are built, not about failover.
 fn replica_config(
     db: &Database,
     dir: &std::path::Path,
@@ -199,7 +221,7 @@ fn replica_config(
          storage:\n  backend: postgres\n  host: {host}\n  port: {pg_port}\n  database: {name}\n  user: {user}\n  password: {password}\n  tls: false\n  pool_size: 8\n\
          media:\n  storage:\n    backend: local\n    path: {media:?}\n\
          auth:\n  enable_registration: true\n\
-         cluster:\n  single_node: false\n  room_shards: 4\n  user_shards: 4\n  heartbeat_interval: 500ms\n  lease_ttl: 3s\n  mesh:\n    port: {mesh_port}\n    advertise_address: \"127.0.0.1:{mesh_port}\"\n    shared_secret: cluster-create-room-test-secret\n",
+         cluster:\n  single_node: false\n  room_shards: 4\n  user_shards: 4\n  heartbeat_interval: 1s\n  lease_ttl: 3s\n  mesh:\n    port: {mesh_port}\n    advertise_address: \"127.0.0.1:{mesh_port}\"\n    shared_secret: cluster-create-room-test-secret\n",
         keys = dir.join("keys"),
         media = dir.join(format!("media-{port}")),
         host = db.host,
@@ -291,6 +313,31 @@ async fn room_shard_owners(
     (owners.len() == 2).then_some(rooms)
 }
 
+/// Two mesh ports whose replicas (a replica's id is its mesh address) each own at least one of
+/// `layout`'s room shards once both are live. Ownership is rendezvous hashing over the replica
+/// ids, so with four room shards about one pair of ports in eight hands all four to one
+/// replica: a correct, stable map in which this test has nothing to measure, and in which it
+/// used to wait out its minute for a split that never comes and fail ("two replicas never
+/// settled sharing the room shards").
+fn mesh_ports_that_split_the_room_shards(layout: hs_cluster::ShardLayout) -> (u16, u16) {
+    loop {
+        let (mesh_1, mesh_2) = (reserve_port(), reserve_port());
+        let ids = [
+            hs_cluster::ReplicaId::new(format!("127.0.0.1:{mesh_1}")),
+            hs_cluster::ReplicaId::new(format!("127.0.0.1:{mesh_2}")),
+        ];
+        let firsts = (0..layout.rooms)
+            .filter(|i| {
+                let shard = hs_cluster::ShardId::new(hs_cluster::ShardKind::Room, *i);
+                hs_cluster::hash::desired_owner(shard, &ids) == Some(&ids[0])
+            })
+            .count();
+        if firsts > 0 && firsts < layout.rooms as usize {
+            return (mesh_1, mesh_2);
+        }
+    }
+}
+
 const SAMPLE: &str = "hs_room_create_room_id_attempts_count";
 const ROOMS_PER_REPLICA: usize = 20;
 
@@ -302,7 +349,12 @@ async fn every_v12_room_is_built_by_the_owner_of_its_shard_whichever_replica_too
     let dir = tempfile::tempdir().unwrap();
     let client = reqwest::Client::new();
     let (port_1, port_2) = (reserve_port(), reserve_port());
-    let (mesh_1, mesh_2) = (reserve_port(), reserve_port());
+    let layout = hs_cluster::ShardLayout {
+        rooms: 4,
+        users: 4,
+        ..hs_cluster::ShardLayout::default()
+    };
+    let (mesh_1, mesh_2) = mesh_ports_that_split_the_room_shards(layout);
     let name = format!("127.0.0.1:{port_1}");
 
     // Replica 1 first (it makes the signing key and the schema), then replica 2.
@@ -355,7 +407,8 @@ async fn every_v12_room_is_built_by_the_owner_of_its_shard_whichever_replica_too
         .to_owned();
 
     // Both replicas own room shards, and the map stays put for a few heartbeats.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // Generous: two debug replicas on a loaded machine can take minutes to converge.
+    let deadline = Instant::now() + Duration::from_secs(180);
     let owners = loop {
         if Instant::now() >= deadline {
             let page: Value = client
@@ -385,11 +438,6 @@ async fn every_v12_room_is_built_by_the_owner_of_its_shard_whichever_replica_too
         before.push(metric(&client, base, SAMPLE).await);
     }
 
-    let layout = hs_cluster::ShardLayout {
-        rooms: 4,
-        users: 4,
-        ..hs_cluster::ShardLayout::default()
-    };
     let mut rooms: Vec<(String, String)> = Vec::new();
     for (_, base) in &replicas {
         for _ in 0..ROOMS_PER_REPLICA {

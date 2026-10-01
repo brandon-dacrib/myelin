@@ -264,7 +264,13 @@ async fn handle_forward(req: Request<Incoming>, deps: &Arc<MeshDeps>) -> Respons
     let shard = env.shard;
     let key = env.idempotency_key;
     let reply = deps.handler.handle(env, fence).await;
-    deps.idempotency.put(shard, key, reply.clone());
+    // A `503` is a refusal that did nothing (`hs-room`'s fence answers it when ownership moved
+    // under the write), and the forwarder retries it with this same key: remembering it would
+    // answer every retry from the cache, so a write fenced once would fail until the deadline
+    // even after the handler could do it. Only replies that stand for work done are kept.
+    if reply.status != 503 {
+        deps.idempotency.put(shard, key, reply.clone());
+    }
     reply_response(reply)
 }
 

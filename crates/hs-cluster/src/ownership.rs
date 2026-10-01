@@ -422,8 +422,48 @@ impl<B: KvBackend> KvOwnership<B> {
         let row = self.heartbeat_row(state);
         let store = self.store.clone();
         let row_for_hb = row.clone();
+        let previous_ok = *self
+            .last_heartbeat_ok
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let hb_started = Instant::now();
         let hb_result = tokio::task::spawn_blocking(move || store.heartbeat(&row_for_hb)).await;
         let heartbeat_ok = matches!(hb_result, Ok(Ok(())));
+        match &hb_result {
+            Ok(Err(e)) => tracing::warn!(
+                replica = %self.me,
+                error = %e,
+                "this replica's heartbeat failed; a tick more than twice heartbeat_interval \
+                 after the last good one gives up its shards, and after lease_ttl it stops \
+                 acting as their owner"
+            ),
+            Err(e) => tracing::warn!(
+                replica = %self.me,
+                error = %e,
+                "this replica's heartbeat task failed"
+            ),
+            Ok(Ok(())) => {}
+        }
+        // A late heartbeat costs this replica its shards silently: a tick whose last good
+        // heartbeat is `2 * heartbeat_interval` old does not want them and releases them
+        // (`converge`), and past `lease_ttl` `Ownership::is_mine` refuses them at read time
+        // (self-suspicion). Say afterwards that it happened, and for how long, so an operator
+        // can match the `421`s and fenced writes of that window to a cause.
+        if heartbeat_ok
+            && let Some(previous) = previous_ok
+            && previous.elapsed() >= self.config.heartbeat_interval * 2
+        {
+            tracing::warn!(
+                replica = %self.me,
+                since_last_heartbeat_ms = previous.elapsed().as_millis() as u64,
+                this_heartbeat_ms = hb_started.elapsed().as_millis() as u64,
+                heartbeat_interval_ms = self.config.heartbeat_interval.as_millis() as u64,
+                lease_ttl_ms = self.config.lease_ttl.as_millis() as u64,
+                "this replica went more than twice heartbeat_interval without a heartbeat: a \
+                 tick in that gap gives up its shards, and past lease_ttl it refuses to act as \
+                 their owner"
+            );
+        }
         if heartbeat_ok {
             self.metrics.set_heartbeat_seq(row.heartbeat_seq);
             *self

@@ -67,6 +67,12 @@ use hs_kv::KvBackend;
 /// misbehaving peer.
 const MAX_PROXIED_BODY_BYTES: usize = 10 * 1024 * 1024;
 
+/// How many times [`RoomShardGate::run_create_room`] makes a `/createRoom` that `hs-room`'s fence
+/// refused here (ownership moved while it ran) before refusing it to the client. Each attempt
+/// chooses afresh, so the second normally forwards to the new owner; all of them together stay
+/// inside the gate's request deadline.
+const MAX_CREATE_ROOM_ATTEMPTS: u32 = 4;
+
 /// Errors starting the cluster.
 #[derive(Debug, thiserror::Error)]
 pub enum ClusterSetupError {
@@ -1098,26 +1104,98 @@ impl RoomShardGate {
             return next.run(req).await;
         };
 
+        // At the edge the request is kept so that a create fenced here can be made again.
+        let (parts, body) = req.into_parts();
+        let body = match to_bytes(body, MAX_PROXIED_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(error) => {
+                return hs_http::error::MatrixError::custom(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    hs_http::error::MatrixErrorCode::TooLarge,
+                    format!("reading the request body: {error}"),
+                )
+                .into_response();
+            }
+        };
+        let started = std::time::Instant::now();
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let req = Request::from_parts(parts.clone(), Body::from(body.clone()));
+            let (response, fenced_here) = self
+                .create_room_once(req, next.clone(), server_name, forwarder)
+                .await;
+            let Some(fenced_shard) = fenced_here else {
+                return response;
+            };
+            // The room's shard (or, for a version-12 room, every shard this replica could
+            // place it on) moved away between the gate's ownership check and the handler's
+            // fenced write, or this replica stopped believing it owns anything: nothing was
+            // committed past the point the fence refused. Choose again from the current
+            // ownership, which forwards the create when the shard is now elsewhere.
+            let wait = Duration::from_millis(100 * u64::from(attempt));
+            if attempt >= MAX_CREATE_ROOM_ATTEMPTS
+                || started.elapsed() + wait >= self.default_deadline
+            {
+                tracing::warn!(
+                    attempts = attempt,
+                    "a /createRoom was fenced on every attempt here; refusing it so that the \
+                     client retries"
+                );
+                return self.refuse(
+                    fenced_shard,
+                    "the room's shard kept moving while it was being created; ownership did \
+                     not settle in time",
+                );
+            }
+            tracing::info!(
+                attempt,
+                "a /createRoom was fenced here because ownership moved while it ran; creating \
+                 it again against the current ownership"
+            );
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    /// One attempt at an edge `/createRoom` (see [`Self::run_create_room`]): mints an id, runs
+    /// the handler here if this replica owns the id's shard and forwards the request otherwise.
+    /// The second value names the shard when the handler ran here and answered `503` --
+    /// `hs-room`'s fence refused the creation because ownership moved under it -- so the caller
+    /// may try again.
+    async fn create_room_once(
+        &self,
+        mut req: Request,
+        next: Next,
+        server_name: &ruma::ServerName,
+        forwarder: &Forwarder,
+    ) -> (Response, Option<ShardId>) {
         let room_id = ruma::RoomId::new_v1(server_name).to_string();
         let shard = self.layout.room_shard(&room_id);
         if self.ownership.is_mine(shard) {
             req.extensions_mut()
                 .insert(PreassignedRoomId(room_id.clone()));
             let response = next.run(req).await;
-            return self.check_created_room(response, &room_id).await;
+            if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+                return (response, Some(shard));
+            }
+            return (self.check_created_room(response, &room_id).await, None);
         }
 
         let Ok(value) = http::HeaderValue::from_str(&room_id) else {
             // A freshly minted `!localpart:server` is always a valid header value; this arm is
             // unreachable in practice and kept only so the gate cannot panic.
-            return self.refuse(shard, "the minted room id is not a valid header value");
+            return (
+                self.refuse(shard, "the minted room id is not a valid header value"),
+                None,
+            );
         };
         req.headers_mut().insert(PREASSIGNED_ROOM_ID_HEADER, value);
         tracing::debug!(%room_id, %shard, "forwarding /createRoom to the shard's owner");
-        match self.forward(forwarder, shard, req).await {
+        let response = match self.forward(forwarder, shard, req).await {
             Ok(response) => response,
             Err(reason) => self.refuse(shard, &reason),
-        }
+        };
+        (response, None)
     }
 
     /// Reads the `room_id` out of a successful `/createRoom` response and warns if it is not the
@@ -2265,5 +2343,102 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
         assert!(String::from_utf8_lossy(&bytes).contains("M_LIMIT_EXCEEDED"));
+    }
+
+    /// A `/createRoom` handler that answers as `hs-room` does when its fence refuses the
+    /// creation, and counts its calls; `flip`, if given, gives the shard away first.
+    fn fenced_create_room_router(
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        flip: Option<Arc<Flipping>>,
+    ) -> axum::Router {
+        axum::Router::new().route(
+            "/_matrix/client/v3/createRoom",
+            axum::routing::post(move || {
+                let (calls, flip) = (calls.clone(), flip.clone());
+                async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(flip) = flip {
+                        flip.give_away();
+                    }
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(serde_json::json!({
+                            "errcode": "M_UNKNOWN",
+                            "error": "fenced: this replica no longer owns shard ShardId(room/1)"
+                        })),
+                    )
+                }
+            }),
+        )
+    }
+
+    /// Ownership of the room's shard moves away while `/createRoom` runs here, and the fence
+    /// refuses the creation: the gate makes it again against the current ownership, which
+    /// forwards it to the new owner, and the client gets the room. Before, the client got the
+    /// fence's `503 M_UNKNOWN` (seen in `tests/cluster_create_room.rs` under load).
+    #[tokio::test]
+    async fn a_create_room_fenced_here_is_made_again_on_the_new_owner() {
+        let b_addr = format!("127.0.0.1:{}", free_port());
+        let seen_b = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ownership_b: Arc<dyn Ownership> = scripted(&b_addr, true, None);
+        let app_b = gate(ownership_b.clone(), true).layer(create_room_router(seen_b.clone()));
+        let deps = Arc::new(MeshDeps {
+            authenticator: Arc::new(SharedSecretAuthenticator::new(TEST_SECRET)),
+            ownership: ownership_b,
+            handler: Arc::new(ProxyShardHandler { app: app_b }),
+            idempotency: Arc::new(IdempotencyCache::new(Duration::from_secs(5), 16)),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(8)),
+            nudge: None,
+            peers: None,
+        });
+        let server = MeshServer::new(b_addr.clone(), None).unwrap();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            server.serve(deps, shutdown_rx).await.unwrap();
+        });
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(&b_addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let ownership_a = Arc::new(Flipping {
+            me: ReplicaId::new("127.0.0.1:1"),
+            mine: std::sync::atomic::AtomicBool::new(true),
+            owner: ReplicaId::new(b_addr),
+        });
+        let calls_a = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app_a = gate(ownership_a.clone(), true).layer(fenced_create_room_router(
+            calls_a.clone(),
+            Some(ownership_a),
+        ));
+        let response = app_a.oneshot(create_room_request(None)).await.unwrap();
+        let (status, room_id) = room_id_of(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(calls_a.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let calls_b = seen_b.lock().unwrap().clone();
+        assert_eq!(calls_b.len(), 1, "{calls_b:?}");
+        assert!(calls_b[0].via_mesh && calls_b[0].preassigned);
+        assert_eq!(room_id, calls_b[0].room_id);
+    }
+
+    /// A creation fenced on every attempt (ownership never settles) is refused as the gate
+    /// refuses any request it cannot place, `503 M_HS_NOT_SHARD_OWNER`, which a client retries,
+    /// after a bounded number of attempts -- not answered with the fence's `M_UNKNOWN`.
+    #[tokio::test]
+    async fn a_create_room_fenced_on_every_attempt_is_refused_as_not_the_shard_owner() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = gate(scripted("127.0.0.1:1", true, None), true)
+            .layer(fenced_create_room_router(calls.clone(), None));
+        let response = app.oneshot(create_room_request(None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("M_HS_NOT_SHARD_OWNER"), "{text}");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_CREATE_ROOM_ATTEMPTS as usize
+        );
     }
 }

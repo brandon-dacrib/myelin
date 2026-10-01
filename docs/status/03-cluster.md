@@ -1,3 +1,47 @@
+## 2026-10-01: `cluster_create_room.rs` stops flaking (branch `agent/cluster-create-room-flake`)
+
+The two-replica test `crates/hs-cli/tests/cluster_create_room.rs` failed the merge gate on
+`main` in three ways, each traced to its cause:
+
+- **"two replicas never settled sharing the room shards"** (all four `room/*` shards on one
+  replica at epoch 1). Rendezvous hashing of the two mesh addresses (a replica's id) gave all
+  four room shards to one of them: a correct, stable map, which about one random port pair in
+  eight produces with four room shards (613 of 5,000 consecutive pairs, counted with
+  `hash::desired_owner`). The test now picks mesh ports whose map gives each replica a room
+  shard (`mesh_ports_that_split_the_room_shards`), and waits up to 180 s (was 60) for the map
+  to settle and hold for three heartbeats.
+- **A `createRoom` answered `503 M_UNKNOWN` "fenced: this replica no longer owns shard"** (or
+  "no new room id hashed to a room shard this replica owns"). Ownership moved between the
+  gate's check and the handler's fenced write, and the gate handed the fence's `503` to the
+  client: unlike other room requests (decision 0017), an edge `/createRoom` was never made
+  again. Now `RoomShardGate::run_create_room` keeps the body and, when the handler ran here and
+  answered `503`, chooses again from the current ownership (which forwards the create to the
+  new owner), up to `MAX_CREATE_ROOM_ATTEMPTS` (4) inside the request deadline; if every
+  attempt is fenced it answers the gate's own `503 M_HS_NOT_SHARD_OWNER`, which clients retry.
+  `info` per retry, `warn` when it gives up. `hs_room_create_room_id_attempts` now counts a
+  creation once its create event is written, so a fenced attempt is not counted as a room built.
+- **A forwarded write answered `503` until its deadline.** The mesh server cached every reply
+  under the forward's idempotency key, a `503` included, and the forwarder retries a `503` with
+  the same key: once a forwarded write was fenced, every retry got the cached `503` back. A
+  `503` (a refusal that did nothing) is no longer cached.
+
+Why ownership moved at all in a test that does no failover: `converge` releases every shard a
+replica holds in a tick whose last good heartbeat is `2 * heartbeat_interval` old (1 s at the
+test's 500 ms), and `is_mine` refuses them once it is `lease_ttl` old. A debug build on a
+machine at load 15+ is late by that much often enough. Nothing logged it; `tick` now warns when
+a heartbeat fails and, after a good one, when the gap since the previous good one exceeded
+`2 * heartbeat_interval`. The test runs at the production timings (1 s heartbeat, 3 s lease)
+and prints each replica's warning and shard log lines when it fails. Whether one late tick
+should cost a replica every shard is a known gap of its own.
+
+Tests: `mesh_refusal_not_cached.rs::a_forward_fenced_twice_succeeds_once_the_handler_does`
+(fails without the fix: the retries got the cached `503`);
+`cluster::tests::a_create_room_fenced_here_is_made_again_on_the_new_owner` and
+`a_create_room_fenced_on_every_attempt_is_refused_as_not_the_shard_owner` (on the old gate the
+first gets the fence's `503`, the second `M_UNKNOWN`).
+
+Verified: ten runs in a row against a private `postgres:17` with the machine at load 9-20 all passed (167-284 s each); `cluster_admin.rs` (both tests), `cargo test -p hs-cluster` (with `chaos.rs`) and `cargo test -p hs-room` pass.
+
 ## 2026-09-30: a join or knock by alias is shard-gated (branch `agent/cli-small-gaps`)
 
 Closes the known gap "A room alias in `/join/{alias}` or `/knock/{alias}` is not shard-gated"

@@ -566,7 +566,6 @@ impl<B: KvBackend> RoomActor<B> {
                 )));
             }
         };
-        crate::metrics::observe_create_room_id_attempts(attempts);
         if attempts > 1 {
             tracing::debug!(
                 room_id = %final_room_id,
@@ -588,6 +587,10 @@ impl<B: KvBackend> RoomActor<B> {
         );
         actor.set_fencing(fencing);
         actor.persist(create_event)?;
+        // Counted once the create event is written: a create the fence refused (ownership
+        // moved after the id was placed) built no room here, and `hs-cli`'s gate makes it again
+        // wherever the shard now is.
+        crate::metrics::observe_create_room_id_attempts(attempts);
         Ok(actor)
     }
 
