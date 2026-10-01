@@ -1704,8 +1704,64 @@ impl<B: KvBackend> RoomActor<B> {
             )?;
         }
 
+        let redaction = (event.header().event_type == "m.room.redaction")
+            .then(|| (event.header().sender.clone(), extract_redacts(&event)));
+        let redaction_id = event.event_id().to_owned();
         let event_sn = self.persist(event)?;
+        // The importer applies the redactions it copies itself (`import_redaction`).
+        if let Some((sender, Some(target))) = redaction
+            && !self.quiet
+        {
+            self.apply_received_redaction(&sender, &target, &redaction_id);
+        }
         Ok(RemoteEventOutcome::Stored(event_sn))
+    }
+
+    /// Applies a redaction received from another server to the event it names, when this room
+    /// holds that event and the redaction may take effect: the sender's server is the original
+    /// sender's (the spec's rule for room version 3 on, under which the auth rules admit any
+    /// member's redaction), or [`RoomActor::may_redact`] allows it (their own event, or the
+    /// room's redact power level, read from the current power levels). Before 2026-10-01 a
+    /// redaction arriving over federation was stored and never applied, so the redacted
+    /// message kept its content here. A redaction that may not take effect, or whose target is
+    /// not held, is stored and left unapplied; that is logged, not an error, since the
+    /// redaction event itself was accepted.
+    fn apply_received_redaction(
+        &mut self,
+        sender: &UserId,
+        target: &EventId,
+        redaction_id: &EventId,
+    ) {
+        let Some(original) = self.event_by_id(target) else {
+            tracing::debug!(
+                room_id = %self.room_id,
+                redaction = %redaction_id,
+                target = %target,
+                "a received redaction names an event this room does not hold; not applied"
+            );
+            return;
+        };
+        let same_server = original.header().sender.server_name() == sender.server_name();
+        let allowed = same_server || self.may_redact(sender, target).unwrap_or(false);
+        if !allowed {
+            tracing::info!(
+                room_id = %self.room_id,
+                redaction = %redaction_id,
+                target = %target,
+                sender = %sender,
+                "a received redaction is not allowed to take effect; stored, not applied"
+            );
+            return;
+        }
+        if let Err(error) = self.apply_redaction(target) {
+            tracing::warn!(
+                room_id = %self.room_id,
+                redaction = %redaction_id,
+                target = %target,
+                %error,
+                "could not apply a received redaction"
+            );
+        }
     }
 
     /// Imports an event copied from another implementation's database for this same server
@@ -7207,6 +7263,25 @@ mod tests {
         remote_key: &hs_model::signing::SigningKeyPair,
         body: &str,
     ) -> Event {
+        build_remote_event(
+            actor,
+            sender,
+            remote_server,
+            remote_key,
+            "m.room.message",
+            serde_json::json!({"msgtype": "m.text", "body": body}),
+        )
+    }
+
+    /// [`build_remote_message`] for any non-state event type and content.
+    fn build_remote_event(
+        actor: &RoomActor<MemoryBackend>,
+        sender: &UserId,
+        remote_server: &ruma::ServerName,
+        remote_key: &hs_model::signing::SigningKeyPair,
+        event_type: &str,
+        content: serde_json::Value,
+    ) -> Event {
         use hs_model::canonical::{CanonicalJsonObject, CanonicalJsonValue, to_canonical_object};
         use hs_model::{hash, signing};
 
@@ -7225,7 +7300,7 @@ mod tests {
         let depth = prev_refs.iter().map(|r| r.depth).max().map_or(1, |d| d + 1);
 
         let mut object = serde_json::Map::new();
-        object.insert("type".into(), serde_json::json!("m.room.message"));
+        object.insert("type".into(), serde_json::json!(event_type));
         object.insert("sender".into(), serde_json::json!(sender.as_str()));
         object.insert(
             "room_id".into(),
@@ -7233,10 +7308,7 @@ mod tests {
         );
         object.insert("origin_server_ts".into(), serde_json::json!(2_i64));
         object.insert("depth".into(), serde_json::json!(depth));
-        object.insert(
-            "content".into(),
-            serde_json::json!({"msgtype": "m.text", "body": body}),
-        );
+        object.insert("content".into(), content);
         object.insert(
             "prev_events".into(),
             serde_json::json!(
@@ -7321,6 +7393,77 @@ mod tests {
         // (`docs/workstreams/README.md`'s week-8 seam).
         let update = rx.try_recv().unwrap();
         assert_eq!(update.event_id, event_id);
+    }
+
+    /// A redaction received over federation takes effect when its sender is the original
+    /// sender's server (or may redact by power level), and not otherwise: a member of another
+    /// server at power 0 stores a redaction that changes nothing. Before 2026-10-01 no
+    /// received redaction was ever applied (Sytest's "Can receive redactions from regular users
+    /// over federation" in every room version).
+    #[test]
+    fn a_received_redaction_is_applied_only_when_its_sender_may_redact() {
+        let mut actor = room("public_chat");
+        let bob = user_id!("@bob:remote.example");
+        let carol = user_id!("@carol:other.example");
+        for user in [bob, carol] {
+            actor
+                .membership_action(
+                    user.to_owned(),
+                    Action::Join,
+                    user.to_owned(),
+                    serde_json::json!({}),
+                    2,
+                )
+                .unwrap();
+        }
+        let bob_key = hs_model::signing::SigningKeyPair::generate("1");
+        let bob_server = ruma::ServerName::parse("remote.example").unwrap();
+        let carol_key = hs_model::signing::SigningKeyPair::generate("1");
+        let carol_server = ruma::ServerName::parse("other.example").unwrap();
+        let message = build_remote_message(&actor, bob, &bob_server, &bob_key, "secret");
+        let message_id = message.event_id().to_owned();
+        actor.accept_remote_event(message).unwrap();
+
+        let by_carol = build_remote_event(
+            &actor,
+            carol,
+            &carol_server,
+            &carol_key,
+            "m.room.redaction",
+            serde_json::json!({"redacts": message_id.as_str()}),
+        );
+        assert!(matches!(
+            actor.accept_remote_event(by_carol).unwrap(),
+            RemoteEventOutcome::Stored(_)
+        ));
+        assert!(
+            !actor
+                .event_by_id(&message_id)
+                .unwrap()
+                .header()
+                .flags
+                .is_redacted(),
+            "a power-0 member of another server must not redact bob's message"
+        );
+
+        let by_bob = build_remote_event(
+            &actor,
+            bob,
+            &bob_server,
+            &bob_key,
+            "m.room.redaction",
+            serde_json::json!({"redacts": message_id.as_str()}),
+        );
+        actor.accept_remote_event(by_bob).unwrap();
+        assert!(
+            actor
+                .event_by_id(&message_id)
+                .unwrap()
+                .header()
+                .flags
+                .is_redacted(),
+            "bob's own redaction, received over federation, must take effect"
+        );
     }
 
     /// Deliverable 3: receiving the same remote event twice is a no-op, not a duplicate or an
