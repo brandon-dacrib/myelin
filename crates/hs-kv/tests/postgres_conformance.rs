@@ -150,6 +150,10 @@ fn postgres_backend_conformance_breakdown() {
 
     let mut passed = Vec::new();
     let mut failed = Vec::new();
+    // Scenarios that drew a `WARNING` notice from the server, with how many: a well-formed
+    // transaction draws none (a `ROLLBACK` after a failed `COMMIT` drew `there is no transaction
+    // in progress`, many times an hour on a busy cluster).
+    let mut warned = Vec::new();
     // Scenario panics are expected control flow here, so they are not printed; but the hook is
     // process-wide and the other tests in this binary run at the same time, so their panics
     // still go through the previous hook, or a failure elsewhere would be reported with no
@@ -167,7 +171,12 @@ fn postgres_backend_conformance_breakdown() {
     for (name, f) in scenarios {
         let schema = fresh_schema_name();
         let backend = open_small(&dsn, &schema).expect("open postgres backend");
+        let notices = backend.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(backend)));
+        let warnings = notices.notices_received().warnings;
+        if warnings > 0 {
+            warned.push((*name, warnings));
+        }
         match result {
             Ok(()) => passed.push(*name),
             Err(payload) => {
@@ -202,6 +211,12 @@ fn postgres_backend_conformance_breakdown() {
     // threads hammering one row depends on real wall-clock contention, which varies run to run
     // (see the docs above). Allowed to pass *or* fail without failing this test either way.
     let flaky_under_real_contention = ["atomic_add_under_contention"];
+
+    assert!(
+        warned.is_empty(),
+        "PostgreSQL sent WARNING notices during these scenarios (logged above under the target \
+         hs_kv::postgres): {warned:?}"
+    );
 
     let unexpected: Vec<_> = failed
         .iter()
@@ -486,4 +501,122 @@ async fn postgres_survives_being_opened_and_called_from_inside_a_tokio_runtime()
         return;
     };
     round_trip_body(&dsn, &fresh_schema_name());
+}
+
+/// A `COMMIT` that fails is reported as a conflict and is not followed by a `ROLLBACK`: the failed
+/// `COMMIT` has already ended the transaction, and a `ROLLBACK` after it draws `WARNING: there is
+/// no transaction in progress` from the server -- which the `postgres` crate logged at `INFO`
+/// under `postgres::config`, many times an hour on the two-pod cluster (2026-09-30).
+///
+/// PostgreSQL's SSI fails a `COMMIT` itself only in a narrow window (a pivot doomed between its
+/// last write and its commit), so this makes one fail deterministically instead: a deferred
+/// constraint trigger on the keyspace's table raises `serialization_failure` at commit time for
+/// one key.
+#[test]
+fn a_commit_that_fails_at_commit_time_draws_no_warning() {
+    let Some(dsn) = reachable_dsn() else {
+        return;
+    };
+    use hs_kv::{Conflict, KvBackend as _, KvWrite as _};
+
+    let schema = fresh_schema_name();
+    let backend = open_small(&dsn, &schema).expect("open");
+    let ks = backend.keyspace("t").expect("keyspace");
+    let table = format!("\"{schema}\".\"kv_t\"");
+    let ddl = format!(
+        "CREATE FUNCTION \"{schema}\".fail_at_commit() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN \
+           IF NEW.k = '\\x706f69736f6e'::bytea THEN \
+             RAISE EXCEPTION 'refused at commit' USING ERRCODE = 'serialization_failure'; \
+           END IF; \
+           RETURN NEW; \
+         END $$; \
+         CREATE CONSTRAINT TRIGGER fail_at_commit AFTER INSERT OR UPDATE ON {table} \
+         DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION \"{schema}\".fail_at_commit();"
+    );
+    let raw_dsn = dsn.clone();
+    std::thread::spawn(move || {
+        let mut client = raw_dsn
+            .parse::<postgres::Config>()
+            .unwrap()
+            .connect(postgres::NoTls)
+            .unwrap();
+        client.batch_execute(&ddl).unwrap();
+    })
+    .join()
+    .unwrap();
+
+    let before = backend.notices_received();
+    let mut txn = backend.begin().unwrap();
+    txn.put(&ks, b"fine", b"v").unwrap();
+    assert_eq!(
+        backend.commit(txn).unwrap(),
+        Ok(()),
+        "an ordinary key commits"
+    );
+    let mut txn = backend.begin().unwrap();
+    txn.put(&ks, b"poison", b"v").unwrap();
+    assert_eq!(
+        backend.commit(txn).unwrap(),
+        Err(Conflict),
+        "the COMMIT itself failed with serialization_failure"
+    );
+    // And the connection is fine afterwards: the next transaction on the pool commits.
+    let mut txn = backend.begin().unwrap();
+    txn.put(&ks, b"after", b"v").unwrap();
+    assert_eq!(backend.commit(txn).unwrap(), Ok(()));
+    assert_eq!(
+        backend.notices_received().warnings,
+        before.warnings,
+        "nothing may follow a failed COMMIT: PostgreSQL warned that there was no transaction to roll back"
+    );
+    backend.drop_schema_for_test().expect("cleanup");
+}
+
+/// A transaction whose `COMMIT` fails -- here the second of two write-skewed transactions, which
+/// PostgreSQL's SSI cancels when it commits -- is reported as a conflict and draws no warning from
+/// the server. The backend used to send `ROLLBACK` after any failed commit, and after a failed
+/// `COMMIT` there is no transaction left to roll back: PostgreSQL answered `WARNING: there is no
+/// transaction in progress`, which the `postgres` crate logged at `INFO` under
+/// `postgres::config` (seen many times an hour on the two-pod cluster, 2026-09-30).
+#[test]
+fn a_commit_that_fails_draws_no_warning_from_the_server() {
+    let Some(dsn) = reachable_dsn() else {
+        return;
+    };
+    use hs_kv::{Conflict, KvBackend as _, KvRead as _, KvWrite as _, TransactConfig, transact};
+
+    let backend = open_small(&dsn, &fresh_schema_name()).expect("open");
+    let ks = backend.keyspace("t").expect("keyspace");
+    let mut conflicts = 0;
+    for round in 0..5u8 {
+        transact(&backend, TransactConfig::default(), |txn| {
+            txn.put(&ks, b"a", b"10")?;
+            txn.put(&ks, b"b", b"10")?;
+            Ok(())
+        })
+        .unwrap();
+        let mut tx1 = backend.begin().unwrap();
+        let mut tx2 = backend.begin().unwrap();
+        for key in [b"a", b"b"] {
+            let _ = tx1.get(&ks, key).unwrap();
+            let _ = tx2.get(&ks, key).unwrap();
+        }
+        tx1.put(&ks, b"a", &[round]).unwrap();
+        tx2.put(&ks, b"b", &[round]).unwrap();
+        assert_eq!(backend.commit(tx1).unwrap(), Ok(()));
+        if backend.commit(tx2).unwrap() == Err(Conflict) {
+            conflicts += 1;
+        }
+    }
+    assert_eq!(
+        conflicts, 5,
+        "every second commit is a write skew SSI must refuse"
+    );
+    assert_eq!(
+        backend.notices_received().warnings,
+        0,
+        "a failed commit must not be followed by a ROLLBACK the server has nothing to apply to"
+    );
+    backend.drop_schema_for_test().expect("cleanup");
 }

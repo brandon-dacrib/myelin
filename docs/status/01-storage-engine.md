@@ -1,5 +1,48 @@
 # 01 Storage engine: status
 
+## No `ROLLBACK` after a failed `COMMIT`, and PostgreSQL's notices at their own level (2026-09-30, branch `agent/cli-small-gaps`)
+
+Closes the known gap "The PostgreSQL backend logs `WARNING: there is no transaction in progress`
+at INFO", seen many times an hour in `hs-0`'s log on the two-pod cluster.
+
+- **The cause.** `KvBackend::commit` flushed the buffered writes, sent `COMMIT`, and on *any*
+  failure sent `ROLLBACK`. A failed write statement leaves the transaction open and aborted, so a
+  `ROLLBACK` is right there; but a `COMMIT` that fails has already ended the transaction
+  (PostgreSQL rolls it back as part of the failed `COMMIT`), so the `ROLLBACK` after it found no
+  transaction and the server answered with the warning. Under contention SSI can cancel a
+  transaction at its `COMMIT` (a pivot doomed by another commit between its last write and its
+  own commit), which on a busy cluster is often enough to be "many times an hour". Now only a
+  failed flush is rolled back; a failed `COMMIT` is reported (as `Conflict` for `40001`/`40P01`/
+  `55P03`, as before) and nothing follows it. Every other `ROLLBACK` in the backend
+  (`PgTxn::with_conn` after a mid-transaction conflict, both `Drop`s, the race-free `CREATE`)
+  runs while a transaction is open, aborted or not, and was checked.
+- **Notices at their own severity.** The `postgres` crate's default notice callback logs every
+  `NoticeResponse` at `INFO` under the target `postgres::config`, whatever its severity, which is
+  how a stream of warnings went unremarked. `PostgresBackend::open_with` now installs its own on
+  the `postgres::Config` the probe connection and the pool share: a `WARNING` is a `warn`, a
+  `NOTICE`/`INFO` an `info` (except the `42P06`/`42P07` "already exists, skipping" every start
+  draws from this backend's own `CREATE ... IF NOT EXISTS`, which is `debug`), `LOG`/`DEBUG` a
+  `debug`, all under the target `hs_kv::postgres` with the SQLSTATE and detail as fields. They
+  are counted too: `PostgresBackend::notices_received()` returns `NoticesReceived { warnings,
+  others }` since open.
+- **Tests** (`crates/hs-kv/tests/postgres_conformance.rs`, against PostgreSQL 17):
+  `a_commit_that_fails_at_commit_time_draws_no_warning` makes a `COMMIT` itself fail
+  deterministically -- a deferred constraint trigger on the keyspace's table raises
+  `serialization_failure` at commit for one key -- and asserts the commit reports `Conflict`, the
+  pool's next transaction commits, and no warning arrived. With the old `commit` it fails
+  (`left: 1, right: 0`); with the fix it passes. `a_commit_that_fails_draws_no_warning_from_the_server`
+  runs five write skews (SSI cancels those during the flush, so it passed before too; it guards
+  the flush path), and `postgres_backend_conformance_breakdown` now asserts no scenario drew a
+  warning.
+
+Verify: `HS_KV_TEST_POSTGRES_DSN=postgres://postgres:hspg@127.0.0.1:5462/postgres cargo test -p
+hs-kv --test postgres_conformance` (only while no merge gate holds
+`.git/myelin-merge.lock`; the tests use pools of two).
+
+Left: not yet watched on the cluster; the next image on `hs-0` should show no
+`there is no transaction in progress`, and any other warning PostgreSQL sends now appears as a
+`warn` under `hs_kv::postgres`.
+
 ## PostgreSQL TLS, pool size and schema are real (2026-09-30, branch `agent/postgres-tls`)
 
 Closes the "Postgres `tls`/`pool_size`/schema" row of `docs/next-steps.md`'s known gaps, and the

@@ -167,11 +167,12 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
 use bytes::Bytes;
-use postgres::error::SqlState;
+use postgres::error::{DbError, Severity, SqlState};
 use postgres::types::ToSql;
 use r2d2::Pool;
 use r2d2_postgres::PostgresConnectionManager;
@@ -466,6 +467,64 @@ fn describe_target(config: &postgres::Config) -> (String, u16, String) {
     (host, port, database)
 }
 
+/// How many notices (`NoticeResponse`: a `WARNING`, a `NOTICE`, ...) this backend's sessions have
+/// received since it was opened; see [`PostgresBackend::notices_received`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NoticesReceived {
+    /// Notices of severity `WARNING`: something PostgreSQL thinks is wrong with what it was sent,
+    /// such as `there is no transaction in progress` for a `ROLLBACK` outside a transaction.
+    pub warnings: u64,
+    /// Every other notice (`NOTICE`, `INFO`, `LOG`, `DEBUG`), such as `schema "public" already
+    /// exists, skipping` for a `CREATE SCHEMA IF NOT EXISTS`.
+    pub others: u64,
+}
+
+/// The counters behind [`NoticesReceived`], shared by every connection of one backend (the
+/// callback lives in the `postgres::Config` the probe connection and the pool both use).
+#[derive(Debug, Default)]
+struct NoticeCounters {
+    warnings: AtomicU64,
+    others: AtomicU64,
+}
+
+/// Where a session's notices go: to this process's log at the notice's own severity, under the
+/// target `hs_kv::postgres`, and into `counters`. The `postgres` crate's default logs every
+/// notice at `INFO` under `postgres::config`, whatever its severity -- which is how a stream of
+/// `WARNING: there is no transaction in progress` went unremarked on a cluster for days.
+fn record_notice(counters: &NoticeCounters, notice: &DbError) {
+    let code = notice.code().code();
+    let message = notice.message();
+    let detail = notice.detail().unwrap_or_default();
+    match notice.parsed_severity() {
+        Some(Severity::Warning) => {
+            counters.warnings.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(target: "hs_kv::postgres", code, detail, "PostgreSQL warning: {message}");
+        }
+        // Not sent as notices, but harmless to place: they are errors.
+        Some(Severity::Panic | Severity::Fatal | Severity::Error) => {
+            counters.warnings.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(target: "hs_kv::postgres", code, detail, "PostgreSQL error notice: {message}");
+        }
+        // What this backend's own `CREATE ... IF NOT EXISTS` draws when the object is there
+        // already, at every start and for every keyspace: asked for, so not news.
+        Some(Severity::Notice)
+            if *notice.code() == SqlState::DUPLICATE_TABLE
+                || *notice.code() == SqlState::DUPLICATE_SCHEMA =>
+        {
+            counters.others.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(target: "hs_kv::postgres", code, "PostgreSQL notice: {message}");
+        }
+        Some(Severity::Notice | Severity::Info) => {
+            counters.others.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(target: "hs_kv::postgres", code, detail, "PostgreSQL notice: {message}");
+        }
+        Some(Severity::Log | Severity::Debug) | None => {
+            counters.others.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(target: "hs_kv::postgres", code, detail, severity = notice.severity(), "PostgreSQL notice: {message}");
+        }
+    }
+}
+
 /// Asks PostgreSQL whether this session is encrypted. `pg_stat_ssl` has a row for every backend
 /// (since 9.5); `ssl` is `true` for a TLS session.
 fn connection_is_encrypted(conn: &mut postgres::Client) -> Result<bool, postgres::Error> {
@@ -502,6 +561,7 @@ struct Inner {
     hub: Hub,
     tables: Mutex<HashMap<String, Arc<str>>>,
     info: PostgresConnectionInfo,
+    notices: Arc<NoticeCounters>,
 }
 
 impl Drop for Inner {
@@ -639,6 +699,11 @@ impl PostgresBackend {
         }
         let mut config: postgres::Config = dsn.parse().map_err(pg_error)?;
         config.ssl_mode(options.tls.mode.negotiation());
+        let notices = Arc::new(NoticeCounters::default());
+        {
+            let notices = notices.clone();
+            config.notice_callback(move |notice| record_notice(&notices, &notice));
+        }
         let tls_config = postgres_tls::client_config(&options.tls).map_err(KvError::backend)?;
         let connector = RustlsConnector::new(tls_config);
         let ssl_mode = options.tls.mode;
@@ -717,11 +782,24 @@ impl PostgresBackend {
                         hub: Hub::new(),
                         tables: Mutex::new(HashMap::new()),
                         info: info.clone(),
+                        notices,
                     }),
                 },
                 info,
             ))
         })
+    }
+
+    /// How many notices this backend's sessions have received since it was opened, by severity.
+    /// Each was also logged at its own severity (a `WARNING` as `warn`) under the target
+    /// `hs_kv::postgres`. A backend that only sends well-formed transactions receives no
+    /// warnings; the conformance tests check that.
+    #[must_use]
+    pub fn notices_received(&self) -> NoticesReceived {
+        NoticesReceived {
+            warnings: self.inner.notices.warnings.load(Ordering::Relaxed),
+            others: self.inner.notices.others.load(Ordering::Relaxed),
+        }
     }
 
     /// What this backend connected to and how; see [`PostgresConnectionInfo`].
@@ -1263,12 +1341,17 @@ impl KvBackend for PostgresBackend {
         // `postgres` calls — one isolated-thread trip covers the whole sequence.
         let pending = &txn.pending;
         let outcome = run_isolated(move || {
-            let result =
-                flush_pending(&mut conn, pending).and_then(|()| conn.batch_execute("COMMIT"));
-            if result.is_err() {
+            if let Err(error) = flush_pending(&mut conn, pending) {
+                // A failed statement leaves the transaction open, and aborted: end it here.
                 let _ = conn.batch_execute("ROLLBACK");
+                return Err(error);
             }
-            result
+            // A `COMMIT` that fails (a serialization failure detected at commit, the common case
+            // under contention) has already ended the transaction -- PostgreSQL rolls it back as
+            // part of the failed `COMMIT` -- so nothing follows it. A `ROLLBACK` here used to,
+            // and drew `WARNING: there is no transaction in progress` from the server, many times
+            // an hour on a busy cluster.
+            conn.batch_execute("COMMIT")
         });
         match outcome {
             Ok(()) => {
