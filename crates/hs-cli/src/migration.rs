@@ -14,11 +14,23 @@
 //!   SHA-256, as every token here is, so a client's `Authorization: Bearer syt_...` goes on
 //!   working without a new sign-in.
 //! - Account data: `hs-user`'s store (global and per room).
-//! - Rooms: `hs-room`'s registry, each event through `RoomActorHandle::import_event` (authorized
-//!   and stored as an event arriving over federation is, but announced to nobody), then the
-//!   room is announced once, to `hs-user`'s session hub, so its members' `/sync` lists it.
+//! - End-to-end keys, cross-signing keys and key backups: `hs-e2e`'s store, through its own
+//!   operations (an upload, a claim, a backup version created), so the device-list stream and a
+//!   backup's counts move as they would for a client. A device's one-time keys are made the
+//!   same as Synapse's: new ones uploaded, and as many as Synapse handed out since the last pass
+//!   claimed here, oldest first (the order both servers hand them out in).
+//! - Push rules and pushers: `hs-push`'s ruleset and pusher stores; a ruleset is the server
+//!   default with the account's own rules, changed actions and on/off flags applied to it.
+//! - Filters: `hs-user`'s store, under Synapse's ids (`UserStore::import_filter`).
+//! - Rooms: `hs-room`'s registry, a page of events at a time, each through
+//!   `RoomActorHandle::import_event` (authorized and stored as an event arriving over federation
+//!   is, but announced to nobody), then the room is announced once, to `hs-user`'s session hub,
+//!   so its members' `/sync` lists it.
+//! - Receipts: `hs-user`'s receipt store through `SessionHub::import_receipt` (in `/sync`, and
+//!   on the receipt stream appservices read), not sent to other servers again.
 //! - Media: `hs-media`'s object store and metadata, under the same media id.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -26,30 +38,46 @@ use hs_auth::store::{AccessTokenRecord, AuthStore, DeviceRecord, UserRecord};
 use hs_auth::token::TokenHash;
 use hs_compat::migration::model::{
     LogEntry, MigrationRecord, Phase, Stream, SynapseAccessToken, SynapseAccountData,
-    SynapseDevice, SynapseEvent, SynapseMedia, SynapseRoom, SynapseUser,
+    SynapseBackupVersion, SynapseCrossSigning, SynapseDevice, SynapseDeviceKeys, SynapseEvent,
+    SynapseFilter, SynapseMedia, SynapsePushRules, SynapsePusher, SynapseReceipt,
+    SynapseRemoteJoin, SynapseRoom, SynapseRoomKey, SynapseUser,
 };
 use hs_compat::migration::{
-    Imported, MigrationError, MigrationObserver, MigrationStore, MigrationTarget, RoomOutcome,
-    SourceConfigs, TargetError, TargetMedia, TargetRoom, TargetUser,
+    Check, CurrentState, Imported, MigrationError, MigrationObserver, MigrationStore,
+    MigrationTarget, RoomOutcome, RoomStats, SourceConfigs, TargetError, TargetMedia, TargetUser,
 };
 use hs_config::migration::SynapseSourceConfig;
+use hs_e2e::store::{BackupSessionRow, CrossSigningKeyType, E2eStore};
 use hs_kv::{KvBackend, RangeSpec, TransactConfig, transact};
 use hs_media::id::MediaId;
 use hs_media::metadata::MediaRecord;
 use hs_media::repository::{MediaRepository, content_object_key};
+use hs_push::pushers::PusherStore;
+use hs_push::rulesets::tables::TablesRulesetStore;
+use hs_push::rulesets::{CachedRulesetStore, RulesetStore};
 use hs_room::RoomError;
 use hs_room::actor::RemoteEventOutcome;
 use hs_room::registry::RoomRegistry;
 use hs_tables::keyspace::TypedKeyspace;
 use hs_user::hub::SessionHub;
+use hs_user::receipts::ReceiptKind;
 use object_store::ObjectStoreExt;
 use prometheus_client::encoding::EncodeLabelSet;
+use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
+use ruma::push::{
+    Action, NewConditionalPushRule, NewPatternedPushRule, NewPushRule, NewSimplePushRule,
+    PushCondition, RuleKind, Ruleset,
+};
 use serde_json::Value;
 
 /// The session hub a running server has.
 pub type Hub<B> = SessionHub<B, Arc<RoomRegistry<B>>>;
+
+/// A running server's push rules, cached as `hs-push` reads them.
+pub type Rulesets<B> = Arc<CachedRulesetStore<TablesRulesetStore<B>>>;
 
 fn row(e: impl std::fmt::Display) -> TargetError {
     TargetError::row(e.to_string())
@@ -66,6 +94,19 @@ pub struct StoreTarget<B: KvBackend> {
     hub: Arc<Hub<B>>,
     rooms: Arc<RoomRegistry<B>>,
     media: Arc<MediaRepository<B>>,
+    e2e: Arc<dyn E2eStore>,
+    rulesets: Rulesets<B>,
+    pushers: Arc<dyn PusherStore>,
+}
+
+/// The stores a [`StoreTarget`] writes, beyond accounts, rooms and media.
+pub struct SessionStores<B: KvBackend> {
+    /// End-to-end keys, cross-signing keys and key backups.
+    pub e2e: Arc<dyn E2eStore>,
+    /// Push rules.
+    pub rulesets: Rulesets<B>,
+    /// Pushers.
+    pub pushers: Arc<dyn PusherStore>,
 }
 
 impl<B: KvBackend + 'static> StoreTarget<B> {
@@ -77,6 +118,7 @@ impl<B: KvBackend + 'static> StoreTarget<B> {
         hub: Arc<Hub<B>>,
         rooms: Arc<RoomRegistry<B>>,
         media: Arc<MediaRepository<B>>,
+        sessions: SessionStores<B>,
     ) -> Self {
         Self {
             server_name: server_name.into(),
@@ -84,12 +126,178 @@ impl<B: KvBackend + 'static> StoreTarget<B> {
             hub,
             rooms,
             media,
+            e2e: sessions.e2e,
+            rulesets: sessions.rulesets,
+            pushers: sessions.pushers,
         }
+    }
+
+    /// `raw` as a user id of this server whose account was copied: `Err(Skipped)` with why not.
+    async fn local_account(
+        &self,
+        raw: &str,
+    ) -> Result<Result<ruma::OwnedUserId, Imported>, TargetError> {
+        let id = user_id(raw)?;
+        if id.server_name().as_str() != self.server_name {
+            return Ok(Err(Imported::Skipped(format!(
+                "an account of another server ({})",
+                id.server_name()
+            ))));
+        }
+        if self.auth.get_user(&id).await.map_err(fatal)?.is_none() {
+            return Ok(Err(Imported::Skipped(
+                "its account was not copied".to_owned(),
+            )));
+        }
+        Ok(Ok(id))
+    }
+
+    /// The room `room` is imported into: the one here, or a new shell for it.
+    async fn import_handle(
+        &self,
+        room: &SynapseRoom,
+    ) -> Result<(hs_room::actor::RoomActorHandle<B>, ruma::RoomVersionId), TargetError> {
+        let room_id = ruma::OwnedRoomId::try_from(room.room_id.as_str())
+            .map_err(|e| row(format!("{:?} is not a room id: {e}", room.room_id)))?;
+        let version = ruma::RoomVersionId::try_from(room.room_version.as_str())
+            .map_err(|e| row(format!("room version {:?}: {e}", room.room_version)))?;
+        match self.rooms.import_shell(&room_id, version.clone()).await {
+            Ok(handle) => Ok((handle, version)),
+            Err(RoomError::UnsupportedRoomVersion(v)) => {
+                Err(row(format!("room version {v} is not supported here")))
+            }
+            Err(e) => Err(fatal(e)),
+        }
+    }
+
+    /// The push rules `rules` describe, applied to the server default.
+    fn ruleset_for(user: &ruma::UserId, rules: &SynapsePushRules) -> (Ruleset, Vec<String>) {
+        let mut ruleset = hs_push::rulesets::default_ruleset(user);
+        let mut notes = Vec::new();
+        // Lowest priority first: each newly inserted rule becomes its kind's highest.
+        for (kind, rule) in rules.custom.iter().rev() {
+            match new_push_rule(kind, rule) {
+                Ok(new) => {
+                    if let Err(e) = ruleset.insert(new, None, None) {
+                        notes.push(format!("{kind} rule {}: {e}", rule["rule_id"]));
+                    }
+                }
+                Err(why) => notes.push(format!("{kind} rule {}: {why}", rule["rule_id"])),
+            }
+        }
+        for (kind, id, actions) in &rules.default_actions {
+            let actions: Vec<Action> = match serde_json::from_value(actions.clone()) {
+                Ok(actions) => actions,
+                Err(e) => {
+                    notes.push(format!("the actions of {kind} rule {id}: {e}"));
+                    continue;
+                }
+            };
+            if ruleset
+                .set_actions(RuleKind::from(kind.as_str()), id, actions)
+                .is_err()
+            {
+                notes.push(format!(
+                    "{kind} rule {id}: Synapse has this server-default rule, and this server does \
+                     not (it was retired from the specification)"
+                ));
+            }
+        }
+        for (kind, id, enabled) in &rules.enabled {
+            if ruleset
+                .set_enabled(RuleKind::from(kind.as_str()), id, *enabled)
+                .is_err()
+            {
+                notes.push(format!(
+                    "{kind} rule {id} was turned {} in Synapse, and there is no such rule here",
+                    if *enabled { "on" } else { "off" }
+                ));
+            }
+        }
+        (ruleset, notes)
+    }
+
+    /// One-time-key counts per algorithm of a device's Synapse keys.
+    fn synapse_otk_counts(keys: &SynapseDeviceKeys) -> BTreeMap<String, u64> {
+        let mut counts = BTreeMap::new();
+        for (id, _) in &keys.one_time_keys {
+            let algorithm = id.split_once(':').map_or(id.as_str(), |(a, _)| a);
+            *counts.entry(algorithm.to_owned()).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    /// The fallback-key algorithms Synapse has an unused key for.
+    fn synapse_unused_fallback(keys: &SynapseDeviceKeys) -> BTreeSet<String> {
+        keys.fallback_keys
+            .iter()
+            .filter(|(_, _, used)| !used)
+            .map(|(id, _, _)| {
+                id.split_once(':')
+                    .map_or(id.as_str(), |(a, _)| a)
+                    .to_owned()
+            })
+            .collect()
     }
 }
 
 fn user_id(raw: &str) -> Result<ruma::OwnedUserId, TargetError> {
     ruma::OwnedUserId::try_from(raw).map_err(|e| row(format!("{raw:?} is not a user id: {e}")))
+}
+
+/// A rule as `PUT /pushrules/global/{kind}/{ruleId}` would make it.
+fn new_push_rule(kind: &str, rule: &Value) -> Result<NewPushRule, String> {
+    let id = rule["rule_id"].as_str().ok_or("no rule_id")?.to_owned();
+    let actions: Vec<Action> =
+        serde_json::from_value(rule["actions"].clone()).map_err(|e| format!("actions: {e}"))?;
+    let conditions = || -> Result<Vec<PushCondition>, String> {
+        serde_json::from_value(rule["conditions"].clone()).map_err(|e| format!("conditions: {e}"))
+    };
+    Ok(match kind {
+        "override" => {
+            NewPushRule::Override(NewConditionalPushRule::new(id, conditions()?, actions))
+        }
+        "underride" => {
+            NewPushRule::Underride(NewConditionalPushRule::new(id, conditions()?, actions))
+        }
+        "content" => {
+            let pattern = rule["pattern"].as_str().ok_or("no pattern")?.to_owned();
+            NewPushRule::Content(NewPatternedPushRule::new(id, pattern, actions))
+        }
+        "room" => NewPushRule::Room(NewSimplePushRule::new(
+            ruma::OwnedRoomId::try_from(id.as_str()).map_err(|e| e.to_string())?,
+            actions,
+        )),
+        "sender" => NewPushRule::Sender(NewSimplePushRule::new(
+            ruma::OwnedUserId::try_from(id.as_str()).map_err(|e| e.to_string())?,
+            actions,
+        )),
+        other => return Err(format!("no {other} rules here")),
+    })
+}
+
+/// A pusher as `POST /pushers/set` would make it.
+fn pusher_record(pusher: &SynapsePusher) -> Result<ruma::api::client::push::Pusher, String> {
+    let mut record = serde_json::json!({
+        "pushkey": pusher.pushkey,
+        "kind": pusher.kind,
+        "app_id": pusher.app_id,
+        "app_display_name": pusher.app_display_name,
+        "device_display_name": pusher.device_display_name,
+        "lang": pusher.lang.clone().unwrap_or_else(|| "en".to_owned()),
+        "data": pusher.data,
+    });
+    if let Some(tag) = &pusher.profile_tag {
+        record["profile_tag"] = Value::String(tag.clone());
+    }
+    serde_json::from_value(record).map_err(|e| e.to_string())
+}
+
+fn same_json<T: serde::Serialize>(a: &T, b: &T) -> bool {
+    match (serde_json::to_value(a), serde_json::to_value(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 #[async_trait]
@@ -284,22 +492,437 @@ impl<B: KvBackend + 'static> MigrationTarget for StoreTarget<B> {
         }
     }
 
-    async fn import_room(
+    async fn import_device_keys(&self, keys: &SynapseDeviceKeys) -> Result<Imported, TargetError> {
+        let id = match self.local_account(&keys.user_id).await? {
+            Ok(id) => id,
+            Err(skipped) => return Ok(skipped),
+        };
+        let device: ruma::OwnedDeviceId = keys.device_id.as_str().into();
+        if self
+            .auth
+            .get_device(&id, &device)
+            .await
+            .map_err(fatal)?
+            .is_none()
+        {
+            return Ok(Imported::Skipped("its device was not copied".to_owned()));
+        }
+        let mut created = false;
+        let mut changed = false;
+        if let Some(identity) = &keys.keys {
+            match self
+                .e2e
+                .get_device_keys(&id, &device)
+                .await
+                .map_err(fatal)?
+            {
+                Some(here) if here.keys == *identity => {}
+                here => {
+                    self.e2e
+                        .upload_device_keys(&id, &device, identity.clone())
+                        .await
+                        .map_err(fatal)?;
+                    if here.is_some() {
+                        changed = true;
+                    } else {
+                        created = true;
+                    }
+                }
+            }
+        }
+        // One-time keys: Synapse's that are not here are added (one already here, or already
+        // handed out here, is left as it is), then as many as Synapse has handed out since the
+        // last pass are claimed here, oldest first.
+        let before = self
+            .e2e
+            .count_one_time_keys(&id, &device)
+            .await
+            .map_err(fatal)?;
+        if !keys.one_time_keys.is_empty() {
+            self.e2e
+                .upload_one_time_keys(&id, &device, keys.one_time_keys.iter().cloned().collect())
+                .await
+                .map_err(fatal)?;
+        }
+        let theirs = Self::synapse_otk_counts(keys);
+        let after = self
+            .e2e
+            .count_one_time_keys(&id, &device)
+            .await
+            .map_err(fatal)?;
+        let mut claimed = false;
+        for (algorithm, here) in &after {
+            let surplus = here.saturating_sub(theirs.get(algorithm).copied().unwrap_or(0));
+            for _ in 0..surplus {
+                self.e2e
+                    .claim_one_time_key(&id, &device, algorithm)
+                    .await
+                    .map_err(fatal)?;
+                claimed = true;
+            }
+        }
+        if after != before || claimed {
+            if keys.keys.is_none() && before.is_empty() {
+                created = true;
+            } else {
+                changed = true;
+            }
+        }
+        // Fallback keys: there is no reading one back, so Synapse's are uploaded again on every
+        // pass (an upload replaces the one of its algorithm), and one Synapse has handed out is
+        // handed out here too, which is what marks it used.
+        if !keys.fallback_keys.is_empty() {
+            let unused_before: BTreeSet<String> = self
+                .e2e
+                .unused_fallback_key_algorithms(&id, &device)
+                .await
+                .map_err(fatal)?
+                .into_iter()
+                .collect();
+            self.e2e
+                .upload_fallback_keys(
+                    &id,
+                    &device,
+                    keys.fallback_keys
+                        .iter()
+                        .map(|(key_id, key, _)| (key_id.clone(), key.clone()))
+                        .collect(),
+                )
+                .await
+                .map_err(fatal)?;
+            for (key_id, _, used) in &keys.fallback_keys {
+                if *used {
+                    let algorithm = key_id.split_once(':').map_or(key_id.as_str(), |(a, _)| a);
+                    self.e2e
+                        .claim_fallback_key(&id, &device, algorithm)
+                        .await
+                        .map_err(fatal)?;
+                }
+            }
+            if unused_before != Self::synapse_unused_fallback(keys) && !created {
+                changed = true;
+            }
+        }
+        Ok(if created {
+            Imported::Created
+        } else if changed {
+            Imported::Updated
+        } else {
+            Imported::AlreadyThere
+        })
+    }
+
+    async fn import_cross_signing(
+        &self,
+        keys: &SynapseCrossSigning,
+    ) -> Result<Imported, TargetError> {
+        let id = match self.local_account(&keys.user_id).await? {
+            Ok(id) => id,
+            Err(skipped) => return Ok(skipped),
+        };
+        let mut had_any = false;
+        let mut changed = false;
+        for (kind, key) in [
+            (CrossSigningKeyType::Master, &keys.master),
+            (CrossSigningKeyType::SelfSigning, &keys.self_signing),
+            (CrossSigningKeyType::UserSigning, &keys.user_signing),
+        ] {
+            let Some(key) = key else { continue };
+            let here = self
+                .e2e
+                .get_cross_signing_key(&id, kind)
+                .await
+                .map_err(fatal)?;
+            had_any |= here.is_some();
+            if here.as_ref() == Some(key) {
+                continue;
+            }
+            self.e2e
+                .put_cross_signing_key(&id, kind, key.clone())
+                .await
+                .map_err(fatal)?;
+            changed = true;
+        }
+        if !changed {
+            return Ok(Imported::AlreadyThere);
+        }
+        // As an upload does: other servers and clients learn of the new keys through the
+        // device-list stream.
+        self.e2e
+            .record_device_list_change(&id)
+            .await
+            .map_err(fatal)?;
+        Ok(if had_any {
+            Imported::Updated
+        } else {
+            Imported::Created
+        })
+    }
+
+    async fn import_backup_version(
+        &self,
+        version: &SynapseBackupVersion,
+    ) -> Result<Imported, TargetError> {
+        let id = match self.local_account(&version.user_id).await? {
+            Ok(id) => id,
+            Err(skipped) => return Ok(skipped),
+        };
+        if let Some((_, here)) = self
+            .e2e
+            .get_version(&id, Some(version.version))
+            .await
+            .map_err(fatal)?
+        {
+            if here.algorithm != version.algorithm {
+                return Err(row(format!(
+                    "version {} here is a {} backup, and Synapse's is {}",
+                    version.version, here.algorithm, version.algorithm
+                )));
+            }
+            if here.deleted {
+                return if version.deleted {
+                    Ok(Imported::AlreadyThere)
+                } else {
+                    Err(row(format!(
+                        "version {} was deleted here and not in Synapse",
+                        version.version
+                    )))
+                };
+            }
+            let mut changed = false;
+            if here.auth_data != version.auth_data {
+                self.e2e
+                    .update_version_auth_data(&id, version.version, version.auth_data.clone())
+                    .await
+                    .map_err(fatal)?;
+                changed = true;
+            }
+            if version.deleted {
+                self.e2e
+                    .delete_version(&id, version.version)
+                    .await
+                    .map_err(fatal)?;
+                changed = true;
+            }
+            return Ok(if changed {
+                Imported::Updated
+            } else {
+                Imported::AlreadyThere
+            });
+        }
+        // Versions are numbered here as in Synapse, from 1 up and never reused: a number Synapse
+        // no longer has (it pruned a deleted version) is made and deleted again, so that this
+        // version gets its own number.
+        loop {
+            let made = self
+                .e2e
+                .create_version(&id, version.algorithm.clone(), version.auth_data.clone())
+                .await
+                .map_err(fatal)?;
+            if made == version.version {
+                break;
+            }
+            self.e2e.delete_version(&id, made).await.map_err(fatal)?;
+            if made > version.version {
+                return Err(row(format!(
+                    "this server already numbers {}'s backups past {}",
+                    version.user_id, version.version
+                )));
+            }
+        }
+        if version.deleted {
+            self.e2e
+                .delete_version(&id, version.version)
+                .await
+                .map_err(fatal)?;
+        }
+        Ok(Imported::Created)
+    }
+
+    async fn import_backup_keys(
+        &self,
+        user: &str,
+        version: u64,
+        keys: &[SynapseRoomKey],
+    ) -> Result<u64, TargetError> {
+        let id = user_id(user)?;
+        let mut stored = 0;
+        for key in keys {
+            let row_here = BackupSessionRow {
+                first_message_index: key.first_message_index,
+                forwarded_count: key.forwarded_count,
+                is_verified: key.is_verified,
+                session_data: key.session_data.clone(),
+            };
+            if self
+                .e2e
+                .get_session(&id, version, &key.room_id, &key.session_id)
+                .await
+                .map_err(fatal)?
+                .as_ref()
+                == Some(&row_here)
+            {
+                continue;
+            }
+            if self
+                .e2e
+                .put_session(&id, version, &key.room_id, &key.session_id, row_here)
+                .await
+                .map_err(fatal)?
+            {
+                stored += 1;
+            }
+        }
+        Ok(stored)
+    }
+
+    async fn import_push_rules(&self, rules: &SynapsePushRules) -> Result<Imported, TargetError> {
+        let id = match self.local_account(&rules.user_id).await? {
+            Ok(id) => id,
+            Err(skipped) => return Ok(skipped),
+        };
+        let (ruleset, notes) = Self::ruleset_for(&id, rules);
+        for note in &notes {
+            tracing::warn!(user_id = %id, "a push rule from Synapse was not carried over: {note}");
+        }
+        let here = self
+            .rulesets
+            .store()
+            .get_ruleset(&id)
+            .await
+            .map_err(fatal)?;
+        if here.as_ref().is_some_and(|h| same_json(h, &ruleset)) {
+            return Ok(Imported::AlreadyThere);
+        }
+        self.rulesets
+            .set_ruleset(&id, &ruleset)
+            .await
+            .map_err(fatal)?;
+        Ok(if here.is_some() {
+            Imported::Updated
+        } else {
+            Imported::Created
+        })
+    }
+
+    async fn import_pusher(&self, pusher: &SynapsePusher) -> Result<Imported, TargetError> {
+        let id = match self.local_account(&pusher.user_id).await? {
+            Ok(id) => id,
+            Err(skipped) => return Ok(skipped),
+        };
+        if !pusher.enabled {
+            return Ok(Imported::Skipped(
+                "turned off in Synapse, and this server keeps only pushers that push".to_owned(),
+            ));
+        }
+        let record = pusher_record(pusher).map_err(|e| row(format!("unreadable pusher: {e}")))?;
+        let here = self.pushers.get_pushers(&id).await.map_err(fatal)?;
+        let same_ids = |p: &ruma::api::client::push::Pusher| {
+            p.ids.app_id == record.ids.app_id && p.ids.pushkey == record.ids.pushkey
+        };
+        let existing = here.iter().find(|p| same_ids(p));
+        if existing.is_some_and(|p| same_json(p, &record)) {
+            return Ok(Imported::AlreadyThere);
+        }
+        let was_there = existing.is_some();
+        self.pushers.set_pusher(&id, record).await.map_err(fatal)?;
+        Ok(if was_there {
+            Imported::Updated
+        } else {
+            Imported::Created
+        })
+    }
+
+    async fn import_filter(&self, filter: &SynapseFilter) -> Result<Imported, TargetError> {
+        let id = match self.local_account(&filter.user_id).await? {
+            Ok(id) => id,
+            Err(skipped) => return Ok(skipped),
+        };
+        let store = self.hub.store();
+        let here = store
+            .get_filter(&id, &filter.filter_id)
+            .await
+            .map_err(fatal)?;
+        if here.as_ref() == Some(&filter.filter) {
+            return Ok(Imported::AlreadyThere);
+        }
+        store
+            .import_filter(&id, &filter.filter_id, filter.filter.clone())
+            .await
+            .map_err(fatal)?;
+        Ok(if here.is_some() {
+            Imported::Updated
+        } else {
+            Imported::Created
+        })
+    }
+
+    async fn begin_room(&self, room: &SynapseRoom) -> Result<(), TargetError> {
+        self.import_handle(room).await.map(|_| ())
+    }
+
+    async fn import_remote_join(
         &self,
         room: &SynapseRoom,
-        events: &[&SynapseEvent],
-    ) -> Result<RoomOutcome, TargetError> {
-        let room_id = ruma::OwnedRoomId::try_from(room.room_id.as_str())
-            .map_err(|e| row(format!("{:?} is not a room id: {e}", room.room_id)))?;
-        let version = ruma::RoomVersionId::try_from(room.room_version.as_str())
-            .map_err(|e| row(format!("room version {:?}: {e}", room.room_version)))?;
-        let handle = match self.rooms.import_shell(&room_id, version.clone()).await {
-            Ok(handle) => handle,
-            Err(RoomError::UnsupportedRoomVersion(v)) => {
-                return Err(row(format!("room version {v} is not supported here")));
+        join: &SynapseRemoteJoin,
+    ) -> Result<Imported, TargetError> {
+        let (handle, version) = self.import_handle(room).await?;
+        let join_id = ruma::OwnedEventId::try_from(join.join.event_id.as_str())
+            .map_err(|e| row(format!("{:?} is not an event id: {e}", join.join.event_id)))?;
+        if handle
+            .query(move |a| a.event_by_id(&join_id).is_some())
+            .await
+        {
+            return Ok(Imported::AlreadyThere);
+        }
+        let parse = |event: &SynapseEvent| -> Result<hs_model::Event, TargetError> {
+            let parsed = hs_model::Event::parse(&event.json, version.clone())
+                .map_err(|e| row(format!("event {} is unreadable: {e}", event.event_id)))?;
+            if parsed.event_id().as_str() != event.event_id {
+                return Err(row(format!(
+                    "event {} hashes to {}, not to its id",
+                    event.event_id,
+                    parsed.event_id()
+                )));
             }
-            Err(e) => return Err(fatal(e)),
+            Ok(parsed)
         };
+        let state = join
+            .state
+            .iter()
+            .map(parse)
+            .collect::<Result<Vec<_>, _>>()?;
+        let auth_chain = join
+            .auth_chain
+            .iter()
+            .map(parse)
+            .collect::<Result<Vec<_>, _>>()?;
+        let join_event = parse(&join.join)?;
+        match handle
+            .import_remote_join(state, auth_chain, join_event)
+            .await
+        {
+            Ok(RemoteEventOutcome::Stored(_)) => Ok(Imported::Created),
+            Ok(RemoteEventOutcome::AlreadyKnown) => Ok(Imported::AlreadyThere),
+            Err(RoomError::Store(e)) => Err(fatal(e)),
+            Err(e) => {
+                if let Ok(room_id) = ruma::OwnedRoomId::try_from(room.room_id.as_str()) {
+                    self.rooms.discard_import_shell(&room_id, &handle).await;
+                }
+                Err(row(format!(
+                    "its join {} could not be taken as where it starts here: {e}",
+                    join.join.event_id
+                )))
+            }
+        }
+    }
+
+    async fn import_room_events(
+        &self,
+        room: &SynapseRoom,
+        events: &[SynapseEvent],
+    ) -> Result<RoomOutcome, TargetError> {
+        let (handle, version) = self.import_handle(room).await?;
         let mut outcome = RoomOutcome::default();
         for event in events {
             let parsed = match hs_model::Event::parse(&event.json, version.clone()) {
@@ -321,21 +944,29 @@ impl<B: KvBackend + 'static> MigrationTarget for StoreTarget<B> {
             match handle.import_event(parsed).await {
                 Ok(RemoteEventOutcome::Stored(_)) => outcome.stored += 1,
                 Ok(RemoteEventOutcome::AlreadyKnown) => outcome.already_there += 1,
+                Err(RoomError::MissingAncestors(_)) => outcome.waiting.push(event.event_id.clone()),
                 Err(RoomError::Store(e)) => return Err(fatal(e)),
                 Err(e) => outcome
                     .refused
                     .push((event.event_id.clone(), e.to_string())),
             }
         }
+        Ok(outcome)
+    }
+
+    async fn finish_room(&self, room: &SynapseRoom) -> Result<RoomOutcome, TargetError> {
+        let (handle, _) = self.import_handle(room).await?;
+        let room_id = ruma::OwnedRoomId::try_from(room.room_id.as_str())
+            .map_err(|e| row(format!("{:?} is not a room id: {e}", room.room_id)))?;
         let held = handle.query(|a| a.head_update().is_some()).await;
         if !held {
             self.rooms.discard_import_shell(&room_id, &handle).await;
-            let why = outcome.refused.first().map_or_else(
-                || "it has no events".to_owned(),
-                |(id, why)| format!("{id}: {why}"),
-            );
-            return Err(row(format!("its first event was refused ({why})")));
+            return Err(row(
+                "none of its events could be stored, its m.room.create first (see the refusals \
+                 above)",
+            ));
         }
+        let mut outcome = RoomOutcome::default();
         for (redaction, target) in &room.redactions {
             let (Ok(redaction), Ok(target)) = (
                 ruma::OwnedEventId::try_from(redaction.as_str()),
@@ -395,6 +1026,40 @@ impl<B: KvBackend + 'static> MigrationTarget for StoreTarget<B> {
             self.hub.process_room_update(head).await.map_err(row)?;
         }
         Ok(outcome)
+    }
+
+    async fn import_receipt(&self, receipt: &SynapseReceipt) -> Result<Imported, TargetError> {
+        let Some(kind) = ReceiptKind::parse(&receipt.receipt_type) else {
+            return Ok(Imported::Skipped(format!(
+                "a {} receipt is not kept here",
+                receipt.receipt_type
+            )));
+        };
+        let user = user_id(&receipt.user_id)?;
+        let room_id = ruma::OwnedRoomId::try_from(receipt.room_id.as_str())
+            .map_err(|e| row(format!("{:?} is not a room id: {e}", receipt.room_id)))?;
+        let event_id = ruma::OwnedEventId::try_from(receipt.event_id.as_str())
+            .map_err(|e| row(format!("{:?} is not an event id: {e}", receipt.event_id)))?;
+        match self.rooms.get_or_load(&room_id).await {
+            Ok(_) => {}
+            Err(RoomError::RoomNotFound(_)) => {
+                return Ok(Imported::Skipped("its room was not copied".to_owned()));
+            }
+            Err(e) => return Err(fatal(e)),
+        }
+        let check = self.verify_receipt(receipt).await?;
+        if check == Check::Same {
+            return Ok(Imported::AlreadyThere);
+        }
+        self.hub
+            .import_receipt(&room_id, &user, kind, event_id, receipt.ts)
+            .await
+            .map_err(row)?;
+        Ok(if check == Check::Missing {
+            Imported::Created
+        } else {
+            Imported::Updated
+        })
     }
 
     async fn import_media(
@@ -527,7 +1192,7 @@ impl<B: KvBackend + 'static> MigrationTarget for StoreTarget<B> {
         }
     }
 
-    async fn room(&self, room_id_raw: &str) -> Result<Option<TargetRoom>, TargetError> {
+    async fn room_state(&self, room_id_raw: &str) -> Result<Option<CurrentState>, TargetError> {
         let Ok(room_id) = ruma::OwnedRoomId::try_from(room_id_raw) else {
             return Ok(None);
         };
@@ -536,15 +1201,9 @@ impl<B: KvBackend + 'static> MigrationTarget for StoreTarget<B> {
             Err(RoomError::RoomNotFound(_)) => return Ok(None),
             Err(e) => return Err(fatal(e)),
         };
-        let room = handle
-            .query(|a| -> Result<TargetRoom, RoomError> {
-                let event_ids = a
-                    .events_after(0, usize::MAX)
-                    .into_iter()
-                    .map(|(_, e)| e.event_id().to_string())
-                    .collect();
-                let current_state = a
-                    .full_state()?
+        let state = handle
+            .query(|a| -> Result<CurrentState, RoomError> {
+                Ok(a.full_state()?
                     .into_iter()
                     .map(|e| {
                         (
@@ -555,15 +1214,37 @@ impl<B: KvBackend + 'static> MigrationTarget for StoreTarget<B> {
                             e.event_id().to_string(),
                         )
                     })
-                    .collect();
-                Ok(TargetRoom {
-                    event_ids,
-                    current_state,
-                })
+                    .collect())
             })
             .await
             .map_err(fatal)?;
-        Ok(Some(room))
+        Ok(Some(state))
+    }
+
+    async fn missing_events(
+        &self,
+        room_id_raw: &str,
+        event_ids: &[String],
+    ) -> Result<Vec<String>, TargetError> {
+        let Ok(room_id) = ruma::OwnedRoomId::try_from(room_id_raw) else {
+            return Ok(event_ids.to_vec());
+        };
+        let handle = match self.rooms.get_or_load(&room_id).await {
+            Ok(handle) => handle,
+            Err(RoomError::RoomNotFound(_)) => return Ok(event_ids.to_vec()),
+            Err(e) => return Err(fatal(e)),
+        };
+        let ids = event_ids.to_vec();
+        Ok(handle
+            .query(move |a| {
+                ids.into_iter()
+                    .filter(|id| {
+                        ruma::EventId::parse(id.as_str())
+                            .map_or(true, |parsed| a.event_by_id(&parsed).is_none())
+                    })
+                    .collect()
+            })
+            .await)
     }
 
     async fn media(&self, media_id: &str) -> Result<Option<TargetMedia>, TargetError> {
@@ -593,8 +1274,205 @@ impl<B: KvBackend + 'static> MigrationTarget for StoreTarget<B> {
             bytes,
         }))
     }
-}
 
+    async fn verify_device_keys(&self, keys: &SynapseDeviceKeys) -> Result<Check, TargetError> {
+        let id = user_id(&keys.user_id)?;
+        let device: ruma::OwnedDeviceId = keys.device_id.as_str().into();
+        let here = self
+            .e2e
+            .get_device_keys(&id, &device)
+            .await
+            .map_err(fatal)?;
+        let mut differs = Vec::new();
+        match (&keys.keys, here) {
+            (Some(_), None) => return Ok(Check::Missing),
+            (Some(theirs), Some(ours)) if *theirs != ours.keys => differs.push("identity keys"),
+            _ => {}
+        }
+        let counts = self
+            .e2e
+            .count_one_time_keys(&id, &device)
+            .await
+            .map_err(fatal)?;
+        if counts != Self::synapse_otk_counts(keys) {
+            differs.push("one-time key counts");
+        }
+        let unused: BTreeSet<String> = self
+            .e2e
+            .unused_fallback_key_algorithms(&id, &device)
+            .await
+            .map_err(fatal)?
+            .into_iter()
+            .collect();
+        if unused != Self::synapse_unused_fallback(keys) {
+            differs.push("unused fallback keys");
+        }
+        Ok(if differs.is_empty() {
+            Check::Same
+        } else {
+            Check::Differs(format!("{} differ", differs.join(", ")))
+        })
+    }
+
+    async fn verify_cross_signing(&self, keys: &SynapseCrossSigning) -> Result<Check, TargetError> {
+        let id = user_id(&keys.user_id)?;
+        let mut missing = 0;
+        let mut differs = Vec::new();
+        for (kind, key) in [
+            (CrossSigningKeyType::Master, &keys.master),
+            (CrossSigningKeyType::SelfSigning, &keys.self_signing),
+            (CrossSigningKeyType::UserSigning, &keys.user_signing),
+        ] {
+            let Some(key) = key else { continue };
+            match self
+                .e2e
+                .get_cross_signing_key(&id, kind)
+                .await
+                .map_err(fatal)?
+            {
+                None => missing += 1,
+                Some(here) if here != *key => differs.push(kind.as_str()),
+                Some(_) => {}
+            }
+        }
+        Ok(if missing > 0 && differs.is_empty() {
+            Check::Missing
+        } else if missing > 0 || !differs.is_empty() {
+            Check::Differs(format!(
+                "{missing} keys missing, {} differ",
+                if differs.is_empty() {
+                    "none".to_owned()
+                } else {
+                    differs.join(", ")
+                }
+            ))
+        } else {
+            Check::Same
+        })
+    }
+
+    async fn verify_backup_version(
+        &self,
+        version: &SynapseBackupVersion,
+        key_count: u64,
+    ) -> Result<Check, TargetError> {
+        let id = user_id(&version.user_id)?;
+        let Some((_, here)) = self
+            .e2e
+            .get_version(&id, Some(version.version))
+            .await
+            .map_err(fatal)?
+        else {
+            return Ok(Check::Missing);
+        };
+        let mut differs = Vec::new();
+        if here.deleted != version.deleted {
+            differs.push("deleted or not".to_owned());
+        }
+        if !here.deleted && here.auth_data != version.auth_data {
+            differs.push("auth_data".to_owned());
+        }
+        if here.algorithm != version.algorithm {
+            differs.push("algorithm".to_owned());
+        }
+        if !here.deleted && here.count != key_count {
+            differs.push(format!(
+                "{} room keys here, {key_count} in Synapse",
+                here.count
+            ));
+        }
+        Ok(if differs.is_empty() {
+            Check::Same
+        } else {
+            Check::Differs(differs.join(", "))
+        })
+    }
+
+    async fn verify_push_rules(&self, rules: &SynapsePushRules) -> Result<Check, TargetError> {
+        let id = user_id(&rules.user_id)?;
+        let Some(here) = self
+            .rulesets
+            .store()
+            .get_ruleset(&id)
+            .await
+            .map_err(fatal)?
+        else {
+            return Ok(Check::Missing);
+        };
+        let (theirs, _) = Self::ruleset_for(&id, rules);
+        Ok(if same_json(&here, &theirs) {
+            Check::Same
+        } else {
+            Check::Differs("the rules differ".to_owned())
+        })
+    }
+
+    async fn verify_pusher(&self, pusher: &SynapsePusher) -> Result<Check, TargetError> {
+        let id = user_id(&pusher.user_id)?;
+        let here = self.pushers.get_pushers(&id).await.map_err(fatal)?;
+        let found = here
+            .iter()
+            .find(|p| p.ids.app_id == pusher.app_id && p.ids.pushkey == pusher.pushkey);
+        if !pusher.enabled {
+            return Ok(if found.is_none() {
+                Check::Same
+            } else {
+                Check::Differs("turned off in Synapse, and pushing here".to_owned())
+            });
+        }
+        let Some(found) = found else {
+            return Ok(Check::Missing);
+        };
+        let theirs = pusher_record(pusher).map_err(row)?;
+        Ok(if same_json(found, &theirs) {
+            Check::Same
+        } else {
+            Check::Differs("the pusher differs".to_owned())
+        })
+    }
+
+    async fn verify_filter(&self, filter: &SynapseFilter) -> Result<Check, TargetError> {
+        let id = user_id(&filter.user_id)?;
+        Ok(
+            match self
+                .hub
+                .store()
+                .get_filter(&id, &filter.filter_id)
+                .await
+                .map_err(fatal)?
+            {
+                None => Check::Missing,
+                Some(here) if here == filter.filter => Check::Same,
+                Some(_) => Check::Differs("the filter differs".to_owned()),
+            },
+        )
+    }
+
+    async fn verify_receipt(&self, receipt: &SynapseReceipt) -> Result<Check, TargetError> {
+        let user = user_id(&receipt.user_id)?;
+        let Ok(room_id) = ruma::OwnedRoomId::try_from(receipt.room_id.as_str()) else {
+            return Ok(Check::Missing);
+        };
+        let (content, _) = self.hub.receipt_content_for(&room_id, &user).await;
+        let mine = content
+            .as_object()
+            .into_iter()
+            .flatten()
+            .find_map(|(event_id, by_type)| {
+                by_type
+                    .get(&receipt.receipt_type)
+                    .and_then(|users| users.get(user.as_str()))
+                    .map(|r| (event_id.clone(), r.get("ts").and_then(Value::as_u64)))
+            });
+        Ok(match mine {
+            None => Check::Missing,
+            Some((event_id, ts)) if event_id == receipt.event_id && ts == Some(receipt.ts) => {
+                Check::Same
+            }
+            Some((event_id, _)) => Check::Differs(format!("here it is at {event_id}")),
+        })
+    }
+}
 // -------------------------------------------------------------------------------------------
 // The durable record and log.
 // -------------------------------------------------------------------------------------------
@@ -756,7 +1634,10 @@ struct StatusLabels {
 
 /// The migration's Prometheus families: `hs_migration_rows_copied`, `_rows_skipped`,
 /// `_rows_failed` and `_rows_source` per stream, and `hs_migration_status` (1 for the current
-/// status, 0 for the others).
+/// status, 0 for the others); and the room copy's throughput: `hs_migration_events_read_total`,
+/// `hs_migration_events_stored_total`, `hs_migration_event_bytes_read_total`,
+/// `hs_migration_room_seconds` (a histogram, one observation per room) and
+/// `hs_migration_peak_rss_bytes` (this process's peak memory when the last room was done).
 #[derive(Clone)]
 pub struct MigrationMetrics {
     copied: Family<StreamLabels, Gauge>,
@@ -764,6 +1645,11 @@ pub struct MigrationMetrics {
     failed: Family<StreamLabels, Gauge>,
     source: Family<StreamLabels, Gauge>,
     status: Family<StatusLabels, Gauge>,
+    events_read: Counter,
+    events_stored: Counter,
+    event_bytes: Counter,
+    room_seconds: Histogram,
+    peak_rss: Gauge,
 }
 
 impl MigrationMetrics {
@@ -776,8 +1662,38 @@ impl MigrationMetrics {
             failed: Family::default(),
             source: Family::default(),
             status: Family::default(),
+            events_read: Counter::default(),
+            events_stored: Counter::default(),
+            event_bytes: Counter::default(),
+            room_seconds: Histogram::new(exponential_buckets(0.01, 4.0, 10)),
+            peak_rss: Gauge::default(),
         };
         metrics.with_registry(|registry| {
+            registry.register(
+                "hs_migration_events_read",
+                "Events of rooms read from Synapse by the migration",
+                this.events_read.clone(),
+            );
+            registry.register(
+                "hs_migration_events_stored",
+                "Events of rooms newly stored here by the migration",
+                this.events_stored.clone(),
+            );
+            registry.register(
+                "hs_migration_event_bytes_read",
+                "Bytes of events read from Synapse by the migration, as Synapse stored them",
+                this.event_bytes.clone(),
+            );
+            registry.register(
+                "hs_migration_room_seconds",
+                "How long the migration took to copy each room",
+                this.room_seconds.clone(),
+            );
+            registry.register(
+                "hs_migration_peak_rss_bytes",
+                "This process's peak resident memory when the migration last finished a room",
+                this.peak_rss.clone(),
+            );
             registry.register(
                 "hs_migration_rows_copied",
                 "Rows of each stream of the migration from Synapse that are here",
@@ -809,6 +1725,16 @@ impl MigrationMetrics {
 }
 
 impl MigrationObserver for MigrationMetrics {
+    fn room_copied(&self, stats: &RoomStats) {
+        self.events_read.inc_by(stats.events_read);
+        self.events_stored.inc_by(stats.events_stored);
+        self.event_bytes.inc_by(stats.bytes);
+        self.room_seconds.observe(stats.elapsed.as_secs_f64());
+        if let Some(peak) = stats.peak_rss_bytes {
+            self.peak_rss.set(i64::try_from(peak).unwrap_or(i64::MAX));
+        }
+    }
+
     fn observe(&self, record: &MigrationRecord) {
         for phase in Phase::ALL {
             self.status
@@ -857,6 +1783,8 @@ pub struct MigrationParts<'a, B: KvBackend> {
     pub rooms: Arc<RoomRegistry<B>>,
     /// Media.
     pub media: Arc<MediaRepository<B>>,
+    /// End-to-end keys, push rules and pushers.
+    pub sessions: SessionStores<B>,
     /// Where the migration's steps run.
     pub tasks: Arc<hs_admin::tasks::TaskRegistry>,
     /// The admin API's event stream.
@@ -881,6 +1809,7 @@ pub fn build<B: KvBackend + 'static>(
         parts.hub,
         parts.rooms,
         parts.media,
+        parts.sessions,
     ));
     Ok(hs_compat::migration::Migrator::new(
         hs_compat::migration::engine::MigratorParts {

@@ -1827,6 +1827,11 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         hub: migration_hub,
         rooms: rooms.clone(),
         media: migration_media,
+        sessions: crate::migration::SessionStores {
+            e2e: e2e_state.store.clone(),
+            rulesets: push_state.rulesets.clone(),
+            pushers: push_state.pushers.clone(),
+        },
         tasks: migration_tasks,
         events: admin.events.clone(),
         metrics: &metrics,

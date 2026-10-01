@@ -1,15 +1,18 @@
 //! The migration engine against a real Synapse database (`tests/fixtures/synapse-small`, see its
 //! README), with this server's stores stood in for by an in-memory target: the reader, the
 //! copy, pausing and resuming, abandoning, carrying on after a restart, verification that
-//! notices a difference, and a cutover.
+//! notices a difference, and a cutover. And a room's copy a page at a time, with events out of
+//! order, against no database at all.
 //!
 //! `crates/hs-cli/tests/migration.rs` runs the same fixture through the real `hs` binary.
 //!
 //! Needs PostgreSQL (`HS_MIGRATION_TEST_POSTGRES_DSN`, or the local
-//! `postgres://postgres:hspg@127.0.0.1:5439/postgres`); every test skips, saying so, without one.
+//! `postgres://postgres:hspg@127.0.0.1:5439/postgres`); every test that reads the fixture skips,
+//! saying so, without one.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,16 +23,20 @@ use hs_admin::sources::SourceError;
 use hs_admin::tasks::TaskRegistry;
 use hs_compat::migration::engine::MigratorParts;
 use hs_compat::migration::model::{
-    MigrationRecord, Phase, Stream, SynapseAccessToken, SynapseAccountData, SynapseDevice,
-    SynapseEvent, SynapseMedia, SynapseRoom, SynapseUser,
+    MigrationRecord, Phase, Stream, SynapseAccessToken, SynapseAccountData, SynapseBackupVersion,
+    SynapseCrossSigning, SynapseDevice, SynapseDeviceKeys, SynapseEvent, SynapseFilter,
+    SynapseMedia, SynapsePushRules, SynapsePusher, SynapseReceipt, SynapseRemoteJoin, SynapseRoom,
+    SynapseRoomKey, SynapseUser,
 };
-use hs_compat::migration::order::replay_order;
+use hs_compat::migration::rooms::{EventPages, copy_room};
+use hs_compat::migration::source::EventKey;
 use hs_compat::migration::{
-    Imported, InMemoryMigrationStore, MigrationStore, MigrationTarget, Migrator, RoomOutcome,
-    SourceConfigs, SynapseSource, TargetError, TargetMedia, TargetRoom, TargetUser,
+    Check, CurrentState, Imported, InMemoryMigrationStore, MigrationError, MigrationStore,
+    MigrationTarget, Migrator, RoomOutcome, SourceConfigs, SynapseSource, TargetError, TargetMedia,
+    TargetUser,
 };
 use hs_config::migration::{SynapseDatabaseConfig, SynapseSourceConfig};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 
 fn fixture_dir() -> PathBuf {
@@ -45,6 +52,18 @@ struct Fixture {
 
 impl Fixture {
     async fn load() -> Option<Self> {
+        Self::load_from(fixture_dir()).await
+    }
+
+    /// `tests/fixtures/synapse-federated`: a Synapse that joined two rooms of another server.
+    async fn federated() -> Option<Self> {
+        Self::load_from(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/synapse-federated"),
+        )
+        .await
+    }
+
+    async fn load_from(dir: PathBuf) -> Option<Self> {
         let admin_dsn = std::env::var("HS_MIGRATION_TEST_POSTGRES_DSN")
             .unwrap_or_else(|_| "postgres://postgres:hspg@127.0.0.1:5439/postgres".to_owned());
         let parsed: tokio_postgres::Config = admin_dsn.parse().ok()?;
@@ -78,7 +97,7 @@ impl Fixture {
         let (client, connection) = db.connect(tokio_postgres::NoTls).await.unwrap();
         tokio::spawn(connection);
         for file in ["schema.sql", "data.sql"] {
-            let sql = std::fs::read_to_string(fixture_dir().join(file)).unwrap();
+            let sql = std::fs::read_to_string(dir.join(file)).unwrap();
             client.batch_execute(&sql).await.unwrap();
         }
         let host = match parsed.get_hosts().first() {
@@ -95,7 +114,7 @@ impl Fixture {
                     .into_owned()
                     .into(),
             },
-            media_store_path: Some(fixture_dir().join("media_store")),
+            media_store_path: Some(dir.join("media_store")),
             batch_size: 2,
         };
         Some(Self {
@@ -150,22 +169,79 @@ impl SourceConfigs for Configs {
 /// `(user, room, type)`.
 type AccountDataKey = (String, Option<String>, String);
 
+/// A room as the in-memory target holds it.
+#[derive(Default, Clone)]
+struct MemoryRoom {
+    event_ids: HashSet<String>,
+    state: CurrentState,
+    finished: bool,
+}
+
 /// This server's stores, in memory. Accounts can be held up (`gate`) to catch a copy part way.
 #[derive(Default)]
 struct MemoryTarget {
+    /// The server name it answers; `fixture.test` when unset.
+    name: Option<String>,
     users: Mutex<HashMap<String, TargetUser>>,
     devices: Mutex<HashMap<(String, String), Option<String>>>,
     tokens: Mutex<HashMap<String, (String, Option<String>)>>,
     account_data: Mutex<HashMap<AccountDataKey, Value>>,
-    rooms: Mutex<HashMap<String, TargetRoom>>,
+    device_keys: Mutex<HashMap<(String, String), SynapseDeviceKeys>>,
+    cross_signing: Mutex<HashMap<String, SynapseCrossSigning>>,
+    backups: Mutex<HashMap<(String, u64), (SynapseBackupVersion, HashMap<String, SynapseRoomKey>)>>,
+    push_rules: Mutex<HashMap<String, SynapsePushRules>>,
+    pushers: Mutex<HashMap<(String, String, String), SynapsePusher>>,
+    filters: Mutex<HashMap<(String, String), Value>>,
+    receipts: Mutex<HashMap<(String, String, String), (String, u64)>>,
+    rooms: Mutex<HashMap<String, MemoryRoom>>,
     media: Mutex<HashMap<String, TargetMedia>>,
+    /// The most events any one call to `import_room_events` was given.
+    largest_page: AtomicUsize,
     gate: Option<Arc<Semaphore>>,
+}
+
+/// What an event cites: its `prev_events` and `auth_events`.
+fn cited(event: &SynapseEvent) -> Vec<String> {
+    let mut ids = Vec::new();
+    for key in ["prev_events", "auth_events"] {
+        for item in event.json[key].as_array().into_iter().flatten() {
+            match item {
+                Value::String(id) => ids.push(id.clone()),
+                Value::Array(pair) => {
+                    if let Some(Value::String(id)) = pair.first() {
+                        ids.push(id.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    ids
+}
+
+fn upsert<K: std::hash::Hash + Eq, V: PartialEq>(
+    map: &Mutex<HashMap<K, V>>,
+    key: K,
+    value: V,
+) -> Imported {
+    match map.lock().unwrap().insert(key, value) {
+        None => Imported::Created,
+        Some(_) => Imported::Updated,
+    }
+}
+
+fn check<V: PartialEq>(here: Option<&V>, theirs: &V) -> Check {
+    match here {
+        None => Check::Missing,
+        Some(here) if here == theirs => Check::Same,
+        Some(_) => Check::Differs("differs".to_owned()),
+    }
 }
 
 #[async_trait]
 impl MigrationTarget for MemoryTarget {
     fn server_name(&self) -> &str {
-        "fixture.test"
+        self.name.as_deref().unwrap_or("fixture.test")
     }
 
     async fn import_user(&self, user: &SynapseUser) -> Result<Imported, TargetError> {
@@ -231,29 +307,174 @@ impl MigrationTarget for MemoryTarget {
         Ok(Imported::Created)
     }
 
-    async fn import_room(
+    async fn import_device_keys(&self, keys: &SynapseDeviceKeys) -> Result<Imported, TargetError> {
+        Ok(upsert(
+            &self.device_keys,
+            (keys.user_id.clone(), keys.device_id.clone()),
+            keys.clone(),
+        ))
+    }
+
+    async fn import_cross_signing(
+        &self,
+        keys: &SynapseCrossSigning,
+    ) -> Result<Imported, TargetError> {
+        Ok(upsert(
+            &self.cross_signing,
+            keys.user_id.clone(),
+            keys.clone(),
+        ))
+    }
+
+    async fn import_backup_version(
+        &self,
+        version: &SynapseBackupVersion,
+    ) -> Result<Imported, TargetError> {
+        let mut backups = self.backups.lock().unwrap();
+        let entry = backups
+            .entry((version.user_id.clone(), version.version))
+            .or_insert_with(|| (version.clone(), HashMap::new()));
+        entry.0 = version.clone();
+        Ok(Imported::Created)
+    }
+
+    async fn import_backup_keys(
+        &self,
+        user_id: &str,
+        version: u64,
+        keys: &[SynapseRoomKey],
+    ) -> Result<u64, TargetError> {
+        let mut backups = self.backups.lock().unwrap();
+        let (_, held) = backups
+            .get_mut(&(user_id.to_owned(), version))
+            .ok_or_else(|| TargetError::row("no such version"))?;
+        let mut stored = 0;
+        for key in keys {
+            if held.insert(key.session_id.clone(), key.clone()).as_ref() != Some(key) {
+                stored += 1;
+            }
+        }
+        Ok(stored)
+    }
+
+    async fn import_push_rules(&self, rules: &SynapsePushRules) -> Result<Imported, TargetError> {
+        Ok(upsert(
+            &self.push_rules,
+            rules.user_id.clone(),
+            rules.clone(),
+        ))
+    }
+
+    async fn import_pusher(&self, pusher: &SynapsePusher) -> Result<Imported, TargetError> {
+        Ok(upsert(
+            &self.pushers,
+            (
+                pusher.user_id.clone(),
+                pusher.app_id.clone(),
+                pusher.pushkey.clone(),
+            ),
+            pusher.clone(),
+        ))
+    }
+
+    async fn import_filter(&self, filter: &SynapseFilter) -> Result<Imported, TargetError> {
+        Ok(upsert(
+            &self.filters,
+            (filter.user_id.clone(), filter.filter_id.clone()),
+            filter.filter.clone(),
+        ))
+    }
+
+    async fn import_remote_join(
         &self,
         room: &SynapseRoom,
-        events: &[&SynapseEvent],
+        join: &SynapseRemoteJoin,
+    ) -> Result<Imported, TargetError> {
+        let mut rooms = self.rooms.lock().unwrap();
+        let held = rooms.entry(room.room_id.clone()).or_default();
+        if held.event_ids.contains(&join.join.event_id) {
+            return Ok(Imported::AlreadyThere);
+        }
+        for event in join.auth_chain.iter().chain(&join.state) {
+            held.event_ids.insert(event.event_id.clone());
+        }
+        for event in join.state.iter().chain(std::iter::once(&join.join)) {
+            if let Some(key) = event.json.get("state_key").and_then(Value::as_str) {
+                let kind = event.json["type"].as_str().unwrap_or_default().to_owned();
+                held.state
+                    .insert((kind, key.to_owned()), event.event_id.clone());
+            }
+        }
+        held.event_ids.insert(join.join.event_id.clone());
+        Ok(Imported::Created)
+    }
+
+    async fn begin_room(&self, room: &SynapseRoom) -> Result<(), TargetError> {
+        self.rooms
+            .lock()
+            .unwrap()
+            .entry(room.room_id.clone())
+            .or_default();
+        Ok(())
+    }
+
+    async fn import_room_events(
+        &self,
+        room: &SynapseRoom,
+        events: &[SynapseEvent],
     ) -> Result<RoomOutcome, TargetError> {
+        self.largest_page.fetch_max(events.len(), Ordering::Relaxed);
         let mut rooms = self.rooms.lock().unwrap();
         let held = rooms.entry(room.room_id.clone()).or_default();
         let mut outcome = RoomOutcome::default();
         for event in events {
-            if !held.event_ids.insert(event.event_id.clone()) {
+            if held.event_ids.contains(&event.event_id) {
                 outcome.already_there += 1;
                 continue;
             }
+            if cited(event).iter().any(|id| !held.event_ids.contains(id)) {
+                outcome.waiting.push(event.event_id.clone());
+                continue;
+            }
+            held.event_ids.insert(event.event_id.clone());
             outcome.stored += 1;
             if let Some(key) = event.json.get("state_key").and_then(Value::as_str) {
                 let kind = event.json["type"].as_str().unwrap_or_default().to_owned();
-                held.current_state
+                held.state
                     .insert((kind, key.to_owned()), event.event_id.clone());
             }
         }
-        outcome.redactions = room.redactions.len() as u64;
-        outcome.aliases = room.aliases.len() as u64;
         Ok(outcome)
+    }
+
+    async fn finish_room(&self, room: &SynapseRoom) -> Result<RoomOutcome, TargetError> {
+        let mut rooms = self.rooms.lock().unwrap();
+        let held = rooms.entry(room.room_id.clone()).or_default();
+        if held.event_ids.is_empty() {
+            rooms.remove(&room.room_id);
+            return Err(TargetError::row("none of its events could be stored"));
+        }
+        held.finished = true;
+        Ok(RoomOutcome {
+            redactions: room.redactions.len() as u64,
+            aliases: room.aliases.len() as u64,
+            ..RoomOutcome::default()
+        })
+    }
+
+    async fn import_receipt(&self, receipt: &SynapseReceipt) -> Result<Imported, TargetError> {
+        if !self.rooms.lock().unwrap().contains_key(&receipt.room_id) {
+            return Ok(Imported::Skipped("its room was not copied".to_owned()));
+        }
+        Ok(upsert(
+            &self.receipts,
+            (
+                receipt.room_id.clone(),
+                receipt.user_id.clone(),
+                receipt.receipt_type.clone(),
+            ),
+            (receipt.event_id.clone(), receipt.ts),
+        ))
     }
 
     async fn import_media(
@@ -316,12 +537,104 @@ impl MigrationTarget for MemoryTarget {
             .cloned())
     }
 
-    async fn room(&self, room_id: &str) -> Result<Option<TargetRoom>, TargetError> {
-        Ok(self.rooms.lock().unwrap().get(room_id).cloned())
+    async fn room_state(&self, room_id: &str) -> Result<Option<CurrentState>, TargetError> {
+        Ok(self
+            .rooms
+            .lock()
+            .unwrap()
+            .get(room_id)
+            .map(|r| r.state.clone()))
+    }
+
+    async fn missing_events(
+        &self,
+        room_id: &str,
+        event_ids: &[String],
+    ) -> Result<Vec<String>, TargetError> {
+        let rooms = self.rooms.lock().unwrap();
+        let held = rooms.get(room_id).map(|r| &r.event_ids);
+        Ok(event_ids
+            .iter()
+            .filter(|id| !held.is_some_and(|h| h.contains(*id)))
+            .cloned()
+            .collect())
     }
 
     async fn media(&self, media_id: &str) -> Result<Option<TargetMedia>, TargetError> {
         Ok(self.media.lock().unwrap().get(media_id).cloned())
+    }
+
+    async fn verify_device_keys(&self, keys: &SynapseDeviceKeys) -> Result<Check, TargetError> {
+        Ok(check(
+            self.device_keys
+                .lock()
+                .unwrap()
+                .get(&(keys.user_id.clone(), keys.device_id.clone())),
+            keys,
+        ))
+    }
+
+    async fn verify_cross_signing(&self, keys: &SynapseCrossSigning) -> Result<Check, TargetError> {
+        Ok(check(
+            self.cross_signing.lock().unwrap().get(&keys.user_id),
+            keys,
+        ))
+    }
+
+    async fn verify_backup_version(
+        &self,
+        version: &SynapseBackupVersion,
+        key_count: u64,
+    ) -> Result<Check, TargetError> {
+        let backups = self.backups.lock().unwrap();
+        Ok(
+            match backups.get(&(version.user_id.clone(), version.version)) {
+                None => Check::Missing,
+                Some((here, keys)) if here == version && keys.len() as u64 == key_count => {
+                    Check::Same
+                }
+                Some(_) => Check::Differs("differs".to_owned()),
+            },
+        )
+    }
+
+    async fn verify_push_rules(&self, rules: &SynapsePushRules) -> Result<Check, TargetError> {
+        Ok(check(
+            self.push_rules.lock().unwrap().get(&rules.user_id),
+            rules,
+        ))
+    }
+
+    async fn verify_pusher(&self, pusher: &SynapsePusher) -> Result<Check, TargetError> {
+        Ok(check(
+            self.pushers.lock().unwrap().get(&(
+                pusher.user_id.clone(),
+                pusher.app_id.clone(),
+                pusher.pushkey.clone(),
+            )),
+            pusher,
+        ))
+    }
+
+    async fn verify_filter(&self, filter: &SynapseFilter) -> Result<Check, TargetError> {
+        Ok(check(
+            self.filters
+                .lock()
+                .unwrap()
+                .get(&(filter.user_id.clone(), filter.filter_id.clone())),
+            &filter.filter,
+        ))
+    }
+
+    async fn verify_receipt(&self, receipt: &SynapseReceipt) -> Result<Check, TargetError> {
+        Ok(check(
+            self.receipts.lock().unwrap().get(&(
+                receipt.room_id.clone(),
+                receipt.user_id.clone(),
+                receipt.receipt_type.clone(),
+            )),
+            &(receipt.event_id.clone(), receipt.ts),
+        ))
     }
 }
 
@@ -383,11 +696,17 @@ fn copied(record: &MigrationRecord, stream: Stream) -> u64 {
     record.stream(stream).map_or(0, |s| s.copied)
 }
 
+fn facts() -> Value {
+    serde_json::from_str(&std::fs::read_to_string(fixture_dir().join("facts.json")).unwrap())
+        .unwrap()
+}
+
 #[tokio::test]
 async fn the_reader_sees_what_synapse_holds() {
     let Some(fixture) = Fixture::load().await else {
         return;
     };
+    let facts = facts();
     let source = SynapseSource::connect(&fixture.config).await.unwrap();
     assert_eq!(
         source.server_name().await.unwrap().as_deref(),
@@ -422,14 +741,39 @@ async fn the_reader_sees_what_synapse_holds() {
         .unwrap();
     assert_eq!(first.len() + rest.len(), 4);
 
+    // A room's history, a page at a time, the create event first, every page after the last.
     for room_id in source.room_ids(None, 10).await.unwrap() {
         let room = source.room(&room_id).await.unwrap().unwrap();
         assert_eq!(room.room_version, "11");
-        let plan = replay_order(&room).unwrap();
-        assert_eq!(plan.events.len(), room.events.len(), "{room_id}");
-        assert_eq!(
-            plan.events[0].json["type"], "m.room.create",
-            "the create event goes first"
+        let shape = source.room_shape(&room_id).await.unwrap();
+        assert!(shape.has_create, "{room_id}");
+        assert_eq!(shape.outliers + shape.rejected, 0, "{room_id}");
+        let mut after = None;
+        let mut seen: Vec<SynapseEvent> = Vec::new();
+        loop {
+            let page = source.room_events(&room_id, after, 3, None).await.unwrap();
+            assert!(page.len() <= 3);
+            let Some((_, last)) = page.last() else { break };
+            after = Some(*last);
+            seen.extend(page.into_iter().map(|(e, _)| e));
+        }
+        assert_eq!(seen.len() as u64, shape.history, "{room_id}");
+        assert_eq!(seen[0].json["type"], "m.room.create");
+        // Each event comes after every event it cites.
+        let mut before = HashSet::new();
+        for event in &seen {
+            for id in cited(event) {
+                assert!(
+                    before.contains(&id),
+                    "{} cites {id} before it",
+                    event.event_id
+                );
+            }
+            before.insert(event.event_id.clone());
+        }
+        assert!(
+            seen.iter()
+                .all(|e| e.json_bytes > 0 && e.json.get("unsigned").is_none())
         );
     }
     let data = source.account_data(None, 100).await.unwrap();
@@ -444,6 +788,120 @@ async fn the_reader_sees_what_synapse_holds() {
         let bytes = source.media_bytes(&item.media_id).await.unwrap().unwrap();
         assert_eq!(Some(bytes.len() as u64), item.length);
     }
+
+    // End-to-end keys: alice's phone with her self-signing key's signature merged in, its five
+    // one-time keys and its fallback key; bob's laptop.
+    let devices = source.e2e_device_keys(None, 10).await.unwrap();
+    let ids: Vec<(&str, &str)> = devices
+        .iter()
+        .map(|d| (d.user_id.as_str(), d.device_id.as_str()))
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            ("@alice:fixture.test", "ALICEPHONE"),
+            ("@bob:fixture.test", "BOBLAPTOP")
+        ]
+    );
+    let phone = &devices[0];
+    let ssk = format!(
+        "ed25519:{}",
+        facts["alice_self_signing_key"].as_str().unwrap()
+    );
+    let signatures = &phone.keys.as_ref().unwrap()["signatures"]["@alice:fixture.test"];
+    assert!(
+        signatures.get("ed25519:ALICEPHONE").is_some(),
+        "{signatures}"
+    );
+    assert!(signatures.get(&ssk).is_some(), "{signatures}");
+    assert_eq!(phone.one_time_keys.len(), 5);
+    assert_eq!(phone.fallback_keys.len(), 1);
+    assert_eq!(devices[1].one_time_keys.len(), 3);
+    // Paging carries on after a device.
+    let rest = source
+        .e2e_device_keys(Some(("@alice:fixture.test", "ALICEPHONE")), 10)
+        .await
+        .unwrap();
+    assert_eq!(rest.len(), 1);
+
+    // Cross-signing: bob's master key carries alice's signature (she verified him).
+    let cross = source.cross_signing(None, 10).await.unwrap();
+    assert_eq!(cross.len(), 2);
+    let bob = cross
+        .iter()
+        .find(|c| c.user_id == "@bob:fixture.test")
+        .unwrap();
+    assert!(bob.self_signing.is_some() && bob.user_signing.is_some());
+    assert!(
+        bob.master.as_ref().unwrap()["signatures"]["@alice:fixture.test"]
+            .as_object()
+            .is_some_and(|s| s.len() == 1),
+        "{bob:?}"
+    );
+
+    // Key backups: version 1 deleted, version 2 with three room keys.
+    let versions = source.backup_versions(None, 10).await.unwrap();
+    assert_eq!(
+        versions
+            .iter()
+            .map(|v| (v.version, v.deleted))
+            .collect::<Vec<_>>(),
+        [(1, true), (2, false)]
+    );
+    assert_eq!(
+        source
+            .backup_key_count("@alice:fixture.test", 2)
+            .await
+            .unwrap(),
+        3
+    );
+    let first = source
+        .backup_keys("@alice:fixture.test", 2, None, 2)
+        .await
+        .unwrap();
+    let last = first.last().unwrap();
+    let more = source
+        .backup_keys(
+            "@alice:fixture.test",
+            2,
+            Some((&last.room_id, &last.session_id)),
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.len() + more.len(), 3);
+
+    // Push rules, a pusher, receipts and filters.
+    let rules = source.push_rules(None, 10).await.unwrap();
+    assert_eq!(rules.len(), 1);
+    let rules = &rules[0];
+    assert_eq!(rules.custom.len(), 3, "{rules:?}");
+    assert!(rules.unreadable.is_empty(), "{rules:?}");
+    assert_eq!(rules.default_actions.len(), 1);
+    assert!(
+        rules
+            .enabled
+            .contains(&("override".into(), ".m.rule.suppress_notices".into(), false))
+    );
+    let pushers = source.pushers(None, 10).await.unwrap();
+    assert_eq!(pushers.len(), 1);
+    assert_eq!(pushers[0].pushkey, "alice-pushkey");
+    let receipts = source.receipts(None, 10).await.unwrap();
+    assert_eq!(
+        receipts
+            .iter()
+            .map(|r| (r.receipt_type.as_str(), r.event_id.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("m.read", facts["first_message"].as_str().unwrap()),
+            ("m.read.private", facts["private_receipt"].as_str().unwrap())
+        ]
+    );
+    let filters = source.filters(None, 10, "fixture.test").await.unwrap();
+    assert_eq!(filters.len(), 2);
+    assert_eq!(filters[0].0.user_id, "@alice:fixture.test");
+    assert_eq!(filters[0].0.filter_id, "0");
+    assert_eq!(filters[0].0.filter["room"]["timeline"]["limit"], 20);
 }
 
 #[tokio::test]
@@ -451,6 +909,7 @@ async fn a_copy_is_verified_and_cut_over_and_nothing_can_follow_it() {
     let Some(fixture) = Fixture::load().await else {
         return;
     };
+    let facts = facts();
     let rig = rig(Some(fixture.config.clone()), MemoryTarget::default(), None);
     let change = rig
         .migrator
@@ -464,9 +923,69 @@ async fn a_copy_is_verified_and_cut_over_and_nothing_can_follow_it() {
     assert_eq!(copied(&record, Stream::Devices), 6);
     assert_eq!(copied(&record, Stream::AccessTokens), 6);
     assert_eq!(copied(&record, Stream::AccountData), 3);
+    assert_eq!(copied(&record, Stream::E2eKeys), 2);
+    assert_eq!(copied(&record, Stream::CrossSigning), 2);
+    assert_eq!(copied(&record, Stream::KeyBackups), 2);
+    assert_eq!(copied(&record, Stream::PushRules), 1);
+    assert_eq!(copied(&record, Stream::Pushers), 1);
+    assert_eq!(copied(&record, Stream::Filters), 2);
     assert_eq!(copied(&record, Stream::Rooms), 2);
+    assert_eq!(copied(&record, Stream::Receipts), 2);
     assert_eq!(copied(&record, Stream::Media), 2);
     assert!(record.streams.iter().all(|s| s.done && s.failed == 0));
+
+    // What landed: the keys, the backup's three room keys, the rules, the receipt.
+    let target = &rig.target;
+    let phone = target.device_keys.lock().unwrap()
+        [&("@alice:fixture.test".to_owned(), "ALICEPHONE".to_owned())]
+        .clone();
+    assert_eq!(phone.one_time_keys.len(), 5);
+    assert_eq!(
+        target.backups.lock().unwrap()[&("@alice:fixture.test".to_owned(), 2)]
+            .1
+            .len(),
+        3
+    );
+    assert_eq!(
+        target.backups.lock().unwrap()[&("@alice:fixture.test".to_owned(), 1)]
+            .1
+            .len(),
+        0,
+        "a deleted version's keys are not copied"
+    );
+    let lobby = facts["lobby"].as_str().unwrap();
+    assert_eq!(
+        target.receipts.lock().unwrap()[&(
+            lobby.to_owned(),
+            "@bob:fixture.test".to_owned(),
+            "m.read".to_owned()
+        )]
+            .0,
+        facts["first_message"].as_str().unwrap()
+    );
+    // The rooms were written a page (`batch_size`, 2) at a time.
+    let largest = target.largest_page.load(Ordering::Relaxed);
+    assert!(largest > 0 && largest <= 2, "{largest}");
+
+    // The log says what each stream carried and how fast the rooms went.
+    let log = rig.store.log().await.unwrap();
+    assert!(
+        log.iter()
+            .any(|e| e.stream == "e2e_keys" && e.message.contains("8 one-time keys")),
+        "{log:#?}"
+    );
+    assert!(
+        log.iter()
+            .any(|e| e.stream == "key_backups" && e.message.contains("3 room keys stored")),
+        "{log:#?}"
+    );
+    assert!(
+        log.iter().any(|e| e.stream == "rooms"
+            && e.message.starts_with("throughput: 2 rooms")
+            && e.message.contains("events/s")
+            && e.message.contains("peak memory")),
+        "{log:#?}"
+    );
 
     // Verification passes, and then notices a difference.
     rig.migrator.verify(&operator()).await.unwrap();
@@ -479,6 +998,22 @@ async fn a_copy_is_verified_and_cut_over_and_nothing_can_follow_it() {
             .iter()
             .any(|s| s.name == "events" && s.source_count > 30)
     );
+    for (name, count) in [
+        ("e2e_keys", 2),
+        ("cross_signing", 2),
+        ("key_backups", 2),
+        ("push_rules", 1),
+        ("pushers", 1),
+        ("filters", 2),
+        ("receipts", 2),
+    ] {
+        let stream = report.streams.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(
+            (stream.source_count, stream.target_count),
+            (count, count),
+            "{stream:?}"
+        );
+    }
     rig.target
         .users
         .lock()
@@ -486,6 +1021,11 @@ async fn a_copy_is_verified_and_cut_over_and_nothing_can_follow_it() {
         .get_mut("@bob:fixture.test")
         .unwrap()
         .password_hash = Some("tampered".to_owned());
+    rig.target
+        .filters
+        .lock()
+        .unwrap()
+        .insert(("@bob:fixture.test".to_owned(), "0".to_owned()), json!({}));
     rig.migrator.verify(&operator()).await.unwrap();
     // Verifying, then back to where it was.
     let record = loop {
@@ -495,7 +1035,8 @@ async fn a_copy_is_verified_and_cut_over_and_nothing_can_follow_it() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    let users = &record.verification.unwrap().streams[0];
+    let report = record.verification.unwrap();
+    let users = &report.streams[0];
     assert!(
         users
             .mismatches
@@ -504,8 +1045,13 @@ async fn a_copy_is_verified_and_cut_over_and_nothing_can_follow_it() {
             || users.sampled < 4,
         "{users:?}"
     );
+    let filters = report.streams.iter().find(|s| s.name == "filters").unwrap();
+    assert_eq!(
+        filters.mismatches,
+        ["@bob:fixture.test's filter 0: differs"]
+    );
 
-    // The cutover's final pass brings bob's password back, verifies, and completes.
+    // The cutover's final pass brings bob's password and filter back, verifies, and completes.
     rig.migrator.cutover(&operator()).await.unwrap();
     let record = reaches(&rig.store, Phase::Completed).await;
     assert!(record.verification.as_ref().unwrap().passed);
@@ -534,6 +1080,103 @@ async fn a_copy_is_verified_and_cut_over_and_nothing_can_follow_it() {
     );
 }
 
+/// A room's events, served a page at a time from memory, in the order given.
+struct Pages {
+    events: Vec<SynapseEvent>,
+    requests: AtomicUsize,
+}
+
+#[async_trait]
+impl EventPages for Pages {
+    async fn page(
+        &self,
+        after: Option<EventKey>,
+        limit: i64,
+    ) -> Result<Vec<(SynapseEvent, EventKey)>, MigrationError> {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        let start = after.map_or(0, |(_, i)| usize::try_from(i).unwrap() + 1);
+        Ok(self
+            .events
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(usize::try_from(limit).unwrap())
+            .map(|(i, e)| (e.clone(), (0, i64::try_from(i).unwrap())))
+            .collect())
+    }
+}
+
+fn event(id: &str, kind: &str, prev: &[&str]) -> SynapseEvent {
+    let json = json!({"type": kind, "state_key": "", "prev_events": prev, "auth_events": []});
+    SynapseEvent {
+        event_id: id.to_owned(),
+        json_bytes: json.to_string().len() as u64,
+        json,
+        depth: 0,
+        stream_ordering: 0,
+        outlier: false,
+        rejected: false,
+    }
+}
+
+#[tokio::test]
+async fn a_room_is_copied_a_page_at_a_time_and_an_event_before_its_parent_waits_for_it() {
+    let room = SynapseRoom {
+        room_id: "!r:fixture.test".into(),
+        room_version: "11".into(),
+        is_public: false,
+        aliases: Vec::new(),
+        redactions: Vec::new(),
+    };
+    // 1,000 events in a chain, except that `$late` (which `$early` cites) comes 500 events
+    // after it, and `$orphan` cites an event the room does not have.
+    let mut events = vec![event("$create", "m.room.create", &[])];
+    for i in 1..1000 {
+        let prev = format!("$e{}", i - 1);
+        let prev = if i == 1 { "$create" } else { prev.as_str() };
+        events.push(event(&format!("$e{i}"), "m.room.message", &[prev]));
+    }
+    events.insert(10, event("$early", "m.room.message", &["$late"]));
+    events.insert(510, event("$late", "m.room.message", &["$e300"]));
+    events.push(event("$orphan", "m.room.message", &["$nowhere"]));
+    let pages = Pages {
+        events,
+        requests: AtomicUsize::new(0),
+    };
+    let target = MemoryTarget::default();
+    let copy = copy_room(&pages, &target, &room, 50, &|| false)
+        .await
+        .unwrap();
+    assert!(!copy.stopped);
+    assert_eq!(copy.outcome.stored, 1002, "{:?}", copy.outcome.refused);
+    assert_eq!(
+        copy.outcome
+            .refused
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        ["$orphan"]
+    );
+    assert!(copy.outcome.waiting.is_empty());
+    // Never more than a page, or the few held aside, at once.
+    let largest = target.largest_page.load(Ordering::Relaxed);
+    assert!(largest <= 50, "{largest}");
+    assert!(pages.requests.load(Ordering::Relaxed) >= 1003 / 50);
+    assert_eq!(copy.stats.events_read, 1003);
+    assert!(copy.stats.bytes > 1003 * 40);
+    assert!(target.rooms.lock().unwrap()["!r:fixture.test"].finished);
+
+    // A cancelled copy stops before its next page and leaves the room unfinished.
+    let target = MemoryTarget::default();
+    let calls = AtomicUsize::new(0);
+    let cancel_after_two = || calls.fetch_add(1, Ordering::Relaxed) >= 2;
+    let copy = copy_room(&pages, &target, &room, 50, &cancel_after_two)
+        .await
+        .unwrap();
+    assert!(copy.stopped);
+    assert_eq!(copy.stats.events_read, 100);
+    assert!(!target.rooms.lock().unwrap()["!r:fixture.test"].finished);
+}
 #[tokio::test]
 async fn a_paused_copy_resumes_where_it_stopped_and_an_abort_leaves_what_was_copied() {
     let Some(fixture) = Fixture::load().await else {
@@ -670,75 +1313,14 @@ async fn a_start_is_refused_without_a_source_or_for_another_server() {
     let Some(fixture) = Fixture::load().await else {
         return;
     };
-    struct Elsewhere(MemoryTarget);
-    #[async_trait]
-    impl MigrationTarget for Elsewhere {
-        fn server_name(&self) -> &str {
-            "other.example"
-        }
-        async fn import_user(&self, u: &SynapseUser) -> Result<Imported, TargetError> {
-            self.0.import_user(u).await
-        }
-        async fn import_device(&self, d: &SynapseDevice) -> Result<Imported, TargetError> {
-            self.0.import_device(d).await
-        }
-        async fn import_access_token(
-            &self,
-            t: &SynapseAccessToken,
-        ) -> Result<Imported, TargetError> {
-            self.0.import_access_token(t).await
-        }
-        async fn import_account_data(
-            &self,
-            d: &SynapseAccountData,
-        ) -> Result<Imported, TargetError> {
-            self.0.import_account_data(d).await
-        }
-        async fn import_room(
-            &self,
-            r: &SynapseRoom,
-            e: &[&SynapseEvent],
-        ) -> Result<RoomOutcome, TargetError> {
-            self.0.import_room(r, e).await
-        }
-        async fn import_media(
-            &self,
-            m: &SynapseMedia,
-            b: Option<Vec<u8>>,
-        ) -> Result<Imported, TargetError> {
-            self.0.import_media(m, b).await
-        }
-        async fn user(&self, u: &str) -> Result<Option<TargetUser>, TargetError> {
-            self.0.user(u).await
-        }
-        async fn device(&self, u: &str, d: &str) -> Result<Option<Option<String>>, TargetError> {
-            self.0.device(u, d).await
-        }
-        async fn access_token(
-            &self,
-            t: &str,
-        ) -> Result<Option<(String, Option<String>)>, TargetError> {
-            self.0.access_token(t).await
-        }
-        async fn account_data(
-            &self,
-            u: &str,
-            r: Option<&str>,
-            t: &str,
-        ) -> Result<Option<Value>, TargetError> {
-            self.0.account_data(u, r, t).await
-        }
-        async fn room(&self, r: &str) -> Result<Option<TargetRoom>, TargetError> {
-            self.0.room(r).await
-        }
-        async fn media(&self, m: &str) -> Result<Option<TargetMedia>, TargetError> {
-            self.0.media(m).await
-        }
-    }
+    let elsewhere = MemoryTarget {
+        name: Some("other.example".to_owned()),
+        ..MemoryTarget::default()
+    };
     let store = Arc::new(InMemoryMigrationStore::new());
     let migrator = Migrator::new(MigratorParts {
         store: store.clone(),
-        target: Arc::new(Elsewhere(MemoryTarget::default())),
+        target: Arc::new(elsewhere),
         configs: Arc::new(Configs(Some(fixture.config.clone()))),
         tasks: TaskRegistry::in_memory(),
         events: None,
@@ -767,4 +1349,130 @@ async fn a_start_is_refused_without_a_source_or_for_another_server() {
         matches!(&refused, SourceError::Invalid(d) if d.contains("could not connect")),
         "{refused:?}"
     );
+}
+
+#[tokio::test]
+async fn rooms_joined_over_federation_are_held_from_the_join_and_verified() {
+    let Some(fixture) = Fixture::federated().await else {
+        return;
+    };
+    let facts: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/synapse-federated/facts.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let elsewhere = facts["elsewhere"].as_str().unwrap();
+    let faraway = facts["faraway"].as_str().unwrap();
+    let source = SynapseSource::connect(&fixture.config).await.unwrap();
+
+    // "Elsewhere" was read back to its beginning, so Synapse holds it whole: it is replayed from
+    // its create event like a room made here. "Faraway" was not: Synapse holds it from hana's
+    // join, with the state the remote server answered the join with.
+    assert!(source.room_shape(elsewhere).await.unwrap().has_create);
+    let shape = source.room_shape(faraway).await.unwrap();
+    assert!(!shape.has_create, "{shape:?}");
+    let join = source.remote_join(faraway).await.unwrap().unwrap();
+    assert_eq!(join.join.json["state_key"], "@hana:127.0.0.1:18301");
+    assert_eq!(join.join.json["content"]["membership"], "join");
+    let state_types: HashSet<&str> = join
+        .state
+        .iter()
+        .map(|e| e.json["type"].as_str().unwrap())
+        .collect();
+    for kind in [
+        "m.room.create",
+        "m.room.power_levels",
+        "m.room.join_rules",
+        "m.room.topic",
+    ] {
+        assert!(
+            state_types.contains(kind),
+            "{kind} missing from {state_types:?}"
+        );
+    }
+    assert!(
+        !join
+            .state
+            .iter()
+            .any(|e| e.json["state_key"] == "@hana:127.0.0.1:18301"),
+        "the state before the join holds no membership for hana"
+    );
+    // Everything the state and the join cite is in the state or its chain.
+    let held: HashSet<&str> = join
+        .state
+        .iter()
+        .chain(&join.auth_chain)
+        .map(|e| e.event_id.as_str())
+        .collect();
+    for event in join.state.iter().chain(std::iter::once(&join.join)) {
+        for id in event.json["auth_events"].as_array().unwrap() {
+            assert!(held.contains(id.as_str().unwrap()), "{id} is not held");
+        }
+    }
+    // Its history after the join: rita's welcome, hana's hello, the topic change, hugo's join
+    // and two messages.
+    assert_eq!(
+        source
+            .history_since(faraway, join.join_key.1)
+            .await
+            .unwrap(),
+        6
+    );
+
+    let target = MemoryTarget {
+        name: Some("127.0.0.1:18301".to_owned()),
+        ..MemoryTarget::default()
+    };
+    let rig = rig(Some(fixture.config.clone()), target, None);
+    rig.migrator
+        .start(&MigrationStartRequest::default(), &operator())
+        .await
+        .unwrap();
+    let record = reaches(&rig.store, Phase::ReadyForCutover).await;
+    let rooms = record.stream(Stream::Rooms).unwrap();
+    assert_eq!(
+        (rooms.copied, rooms.skipped, rooms.failed),
+        (2, 0, 0),
+        "{record:#?}\n{:#?}",
+        rig.store.log().await.unwrap()
+    );
+    assert_eq!(copied(&record, Stream::Receipts), 2);
+    {
+        let held = rig.target.rooms.lock().unwrap();
+        let faraway_held = &held[faraway];
+        assert!(faraway_held.event_ids.contains(&join.join.event_id));
+        assert!(
+            faraway_held
+                .event_ids
+                .contains(facts["faraway_last"].as_str().unwrap())
+        );
+        assert!(faraway_held.state.contains_key(&(
+            "m.room.member".to_owned(),
+            "@hugo:127.0.0.1:18301".to_owned()
+        )));
+    }
+    let log = rig.store.log().await.unwrap();
+    assert!(
+        log.iter().any(|e| e.message.starts_with(&format!(
+            "{faraway}: joined over federation by @hana:127.0.0.1:18301"
+        ))),
+        "{log:#?}"
+    );
+
+    // Verification compares each room's history from where it starts here, and its state.
+    rig.migrator.verify(&operator()).await.unwrap();
+    let record = loop {
+        let record = reaches(&rig.store, Phase::ReadyForCutover).await;
+        if record.verification.is_some() {
+            break record;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let report = record.verification.unwrap();
+    assert!(report.passed, "{report:#?}");
+    let rooms = report.streams.iter().find(|s| s.name == "rooms").unwrap();
+    assert_eq!((rooms.source_count, rooms.target_count), (2, 2));
 }

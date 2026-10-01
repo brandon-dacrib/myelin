@@ -27,5 +27,6 @@ axum = { workspace = true }
 tower = { workspace = true }
 http-body-util = { workspace = true }
 time = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]

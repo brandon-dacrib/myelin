@@ -1,20 +1,22 @@
 //! Where the importer writes: [`MigrationTarget`], implemented by `hs-cli` over this server's
-//! own stores (accounts, devices and tokens in `hs-auth`, account data in `hs-user`, rooms in
-//! `hs-room`, media in `hs-media`).
+//! own stores (accounts, devices and tokens in `hs-auth`; account data, filters and receipts in
+//! `hs-user`; end-to-end keys and key backups in `hs-e2e`; push rules and pushers in `hs-push`;
+//! rooms in `hs-room`; media in `hs-media`).
 //!
 //! Every write is idempotent: importing a row that is already here answers
 //! [`Imported::AlreadyThere`] (or [`Imported::Updated`], when Synapse's copy has changed since),
 //! which is what lets a copy stop anywhere and resume, and a cutover make a final pass over
 //! everything.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use serde_json::Value;
 
 use super::model::{
-    SynapseAccessToken, SynapseAccountData, SynapseDevice, SynapseEvent, SynapseMedia, SynapseRoom,
-    SynapseUser,
+    SynapseAccessToken, SynapseAccountData, SynapseBackupVersion, SynapseCrossSigning,
+    SynapseDevice, SynapseDeviceKeys, SynapseEvent, SynapseFilter, SynapseMedia, SynapsePushRules,
+    SynapsePusher, SynapseReceipt, SynapseRemoteJoin, SynapseRoom, SynapseRoomKey, SynapseUser,
 };
 
 /// What importing one row did.
@@ -61,7 +63,7 @@ impl TargetError {
     }
 }
 
-/// What importing a room did.
+/// What importing a page of a room's events, or finishing the room, did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoomOutcome {
     /// Events newly stored.
@@ -70,10 +72,37 @@ pub struct RoomOutcome {
     pub already_there: u64,
     /// Events this server's authorization refused, with why.
     pub refused: Vec<(String, String)>,
+    /// Events not stored yet because they cite an event this server does not hold yet: the
+    /// importer offers them again once more of the room is in, and refuses them only if what
+    /// they cite never arrives.
+    pub waiting: Vec<String>,
     /// Redactions applied.
     pub redactions: u64,
     /// Aliases created.
     pub aliases: u64,
+}
+
+impl RoomOutcome {
+    /// Adds `other`'s counts and lists to this one's.
+    pub fn absorb(&mut self, other: RoomOutcome) {
+        self.stored += other.stored;
+        self.already_there += other.already_there;
+        self.refused.extend(other.refused);
+        self.waiting.extend(other.waiting);
+        self.redactions += other.redactions;
+        self.aliases += other.aliases;
+    }
+}
+
+/// What verification found for one row: here as in Synapse, not here, or here but different.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Check {
+    /// Here, and the same as in Synapse.
+    Same,
+    /// Not here.
+    Missing,
+    /// Here, but different; what differs.
+    Differs(String),
 }
 
 /// An account as this server holds it, for verification.
@@ -91,14 +120,8 @@ pub struct TargetUser {
     pub deactivated: bool,
 }
 
-/// A room as this server holds it, for verification.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TargetRoom {
-    /// Every event id held.
-    pub event_ids: HashSet<String>,
-    /// Current state: `(type, state_key) -> event_id`.
-    pub current_state: BTreeMap<(String, String), String>,
-}
+/// A room's current state: `(type, state_key) -> event_id`.
+pub type CurrentState = BTreeMap<(String, String), String>;
 
 /// A media item as this server holds it, for verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,14 +150,58 @@ pub trait MigrationTarget: Send + Sync + 'static {
     /// Imports one piece of account data.
     async fn import_account_data(&self, data: &SynapseAccountData)
     -> Result<Imported, TargetError>;
-    /// Imports a room: `events` (already in an order in which each one's ancestors come first,
-    /// see [`crate::migration::order`]), then `room.redactions`, `room.aliases` and its
-    /// directory listing. Its members see it in `/sync` once it is in.
-    async fn import_room(
+    /// Imports one device's end-to-end keys: its identity keys, and its one-time and fallback
+    /// keys made the same as Synapse's.
+    async fn import_device_keys(&self, keys: &SynapseDeviceKeys) -> Result<Imported, TargetError>;
+    /// Imports one account's cross-signing keys.
+    async fn import_cross_signing(
+        &self,
+        keys: &SynapseCrossSigning,
+    ) -> Result<Imported, TargetError>;
+    /// Imports one key backup version (under the same number; a deleted one stays deleted).
+    async fn import_backup_version(
+        &self,
+        version: &SynapseBackupVersion,
+    ) -> Result<Imported, TargetError>;
+    /// Imports room keys into a backup version [`MigrationTarget::import_backup_version`]
+    /// imported; how many were stored (new, or better than the one here).
+    async fn import_backup_keys(
+        &self,
+        user_id: &str,
+        version: u64,
+        keys: &[SynapseRoomKey],
+    ) -> Result<u64, TargetError>;
+    /// Imports one account's push rules.
+    async fn import_push_rules(&self, rules: &SynapsePushRules) -> Result<Imported, TargetError>;
+    /// Imports a pusher.
+    async fn import_pusher(&self, pusher: &SynapsePusher) -> Result<Imported, TargetError>;
+    /// Imports a sync filter, under its id.
+    async fn import_filter(&self, filter: &SynapseFilter) -> Result<Imported, TargetError>;
+    /// Makes ready to import a room: [`MigrationTarget::import_room_events`] follows, a page at
+    /// a time, then [`MigrationTarget::finish_room`].
+    async fn begin_room(&self, room: &SynapseRoom) -> Result<(), TargetError>;
+    /// Makes a room this server's users joined over federation held here, as the join made it
+    /// held in Synapse: from the join, the state before it and that state's auth chain (what
+    /// the resident server's `send_join` answered). Its history after the join follows through
+    /// [`MigrationTarget::begin_room`] and the rest, as a room made here does.
+    async fn import_remote_join(
         &self,
         room: &SynapseRoom,
-        events: &[&SynapseEvent],
+        join: &SynapseRemoteJoin,
+    ) -> Result<Imported, TargetError>;
+    /// Imports a page of a room's events, in an order in which each one's ancestors come first
+    /// (an event citing one that is not here yet is answered in [`RoomOutcome::waiting`]).
+    async fn import_room_events(
+        &self,
+        room: &SynapseRoom,
+        events: &[SynapseEvent],
     ) -> Result<RoomOutcome, TargetError>;
+    /// Finishes a room once all its events are in: `room.redactions`, `room.aliases` and its
+    /// directory listing, and its members see it in `/sync`. A room none of whose events could
+    /// be stored is not left behind, and is a failure of the room.
+    async fn finish_room(&self, room: &SynapseRoom) -> Result<RoomOutcome, TargetError>;
+    /// Imports a read receipt, into a room imported before it.
+    async fn import_receipt(&self, receipt: &SynapseReceipt) -> Result<Imported, TargetError>;
     /// Imports a local media item, with its bytes when the media store is mounted.
     async fn import_media(
         &self,
@@ -162,8 +229,33 @@ pub trait MigrationTarget: Send + Sync + 'static {
         room_id: Option<&str>,
         data_type: &str,
     ) -> Result<Option<Value>, TargetError>;
-    /// A room, for verification.
-    async fn room(&self, room_id: &str) -> Result<Option<TargetRoom>, TargetError>;
+    /// A room's current state, or `None` when the room is not here, for verification.
+    async fn room_state(&self, room_id: &str) -> Result<Option<CurrentState>, TargetError>;
+    /// Which of `event_ids` (all of one room) are not here, for verification.
+    async fn missing_events(
+        &self,
+        room_id: &str,
+        event_ids: &[String],
+    ) -> Result<Vec<String>, TargetError>;
     /// A local media item, for verification.
     async fn media(&self, media_id: &str) -> Result<Option<TargetMedia>, TargetError>;
+    /// Whether one device's end-to-end keys are here as in Synapse (identity keys the same,
+    /// as many one-time keys of each algorithm, the fallback keys there).
+    async fn verify_device_keys(&self, keys: &SynapseDeviceKeys) -> Result<Check, TargetError>;
+    /// Whether one account's cross-signing keys are here as in Synapse.
+    async fn verify_cross_signing(&self, keys: &SynapseCrossSigning) -> Result<Check, TargetError>;
+    /// Whether a backup version is here as in Synapse, holding `key_count` room keys.
+    async fn verify_backup_version(
+        &self,
+        version: &SynapseBackupVersion,
+        key_count: u64,
+    ) -> Result<Check, TargetError>;
+    /// Whether one account's push rules are here as in Synapse.
+    async fn verify_push_rules(&self, rules: &SynapsePushRules) -> Result<Check, TargetError>;
+    /// Whether a pusher is here as in Synapse.
+    async fn verify_pusher(&self, pusher: &SynapsePusher) -> Result<Check, TargetError>;
+    /// Whether a filter is here as in Synapse.
+    async fn verify_filter(&self, filter: &SynapseFilter) -> Result<Check, TargetError>;
+    /// Whether a receipt is here as in Synapse.
+    async fn verify_receipt(&self, receipt: &SynapseReceipt) -> Result<Check, TargetError>;
 }

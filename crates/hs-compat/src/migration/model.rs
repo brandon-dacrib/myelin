@@ -19,9 +19,27 @@ pub enum Stream {
     /// Global and per-room account data, and room tags (`account_data`, `room_account_data`,
     /// `room_tags`).
     AccountData,
+    /// Each device's end-to-end identity keys, one-time keys and fallback keys, with the
+    /// cross-signing signatures made on them (`e2e_device_keys_json`, `e2e_one_time_keys_json`,
+    /// `e2e_fallback_keys_json`, `e2e_cross_signing_signatures`). One row per device.
+    E2eKeys,
+    /// Each account's cross-signing keys, with the signatures made on them
+    /// (`e2e_cross_signing_keys`, `e2e_cross_signing_signatures`). One row per account.
+    CrossSigning,
+    /// Server-side key backups: each version and the room keys in it (`e2e_room_keys_versions`,
+    /// `e2e_room_keys`). One row per version.
+    KeyBackups,
+    /// Each account's push rules (`push_rules`, `push_rules_enable`). One row per account.
+    PushRules,
+    /// Pushers (`pushers`).
+    Pushers,
+    /// Sync filters, under the ids Synapse gave them (`user_filters`).
+    Filters,
     /// Rooms: every event of each room, its aliases and its directory listing (`rooms`,
     /// `events`, `event_json`, `redactions`, `room_aliases`).
     Rooms,
+    /// Read receipts, public and private (`receipts_linearized`). After the rooms they are in.
+    Receipts,
     /// Local media: the records and, when the media store is mounted, the files
     /// (`local_media_repository`, `media_store_path/local_content`).
     Media,
@@ -29,12 +47,19 @@ pub enum Stream {
 
 impl Stream {
     /// Every stream, in copy order.
-    pub const ALL: [Stream; 6] = [
+    pub const ALL: [Stream; 13] = [
         Stream::Users,
         Stream::Devices,
         Stream::AccessTokens,
         Stream::AccountData,
+        Stream::E2eKeys,
+        Stream::CrossSigning,
+        Stream::KeyBackups,
+        Stream::PushRules,
+        Stream::Pushers,
+        Stream::Filters,
         Stream::Rooms,
+        Stream::Receipts,
         Stream::Media,
     ];
 
@@ -46,7 +71,14 @@ impl Stream {
             Stream::Devices => "devices",
             Stream::AccessTokens => "access_tokens",
             Stream::AccountData => "account_data",
+            Stream::E2eKeys => "e2e_keys",
+            Stream::CrossSigning => "cross_signing",
+            Stream::KeyBackups => "key_backups",
+            Stream::PushRules => "push_rules",
+            Stream::Pushers => "pushers",
+            Stream::Filters => "filters",
             Stream::Rooms => "rooms",
+            Stream::Receipts => "receipts",
             Stream::Media => "media",
         }
     }
@@ -166,9 +198,15 @@ pub struct SynapseEvent {
     pub outlier: bool,
     /// Synapse rejected it.
     pub rejected: bool,
+    /// The size of the event as Synapse stored it (`event_json.json`), in bytes: what the
+    /// importer's throughput is measured in.
+    #[serde(default)]
+    pub json_bytes: u64,
 }
 
-/// A room, with everything the importer copies of it.
+/// A room, with everything the importer copies of it except its events, which are read and
+/// written a page at a time ([`crate::migration::source::SynapseSource::room_events`]) so that
+/// a room of any size is copied in bounded memory.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SynapseRoom {
     /// Its id.
@@ -180,10 +218,180 @@ pub struct SynapseRoom {
     pub is_public: bool,
     /// Its aliases, each with who made it.
     pub aliases: Vec<(String, Option<String>)>,
-    /// Its events, in the order Synapse stored them.
-    pub events: Vec<SynapseEvent>,
     /// `(redaction event id, redacted event id)` for each redaction Synapse accepted.
     pub redactions: Vec<(String, String)>,
+}
+
+/// How a room's history is held in Synapse: which events are part of it, and whether its
+/// `m.room.create` is one of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomShape {
+    /// Events of the room's history: neither outliers nor rejected.
+    pub history: u64,
+    /// Events Synapse holds outside the room's history (state and auth events fetched for a
+    /// join over federation, invites from other servers).
+    pub outliers: u64,
+    /// Events Synapse rejected.
+    pub rejected: u64,
+    /// Its `m.room.create` is part of its history here: a room made on this server.
+    pub has_create: bool,
+}
+
+/// How a room this server's users joined over federation came to be held: what the importer
+/// starts such a room from, as a resident server's `send_join` answer starts a join here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SynapseRemoteJoin {
+    /// The first join of one of this server's accounts that is part of the room's history.
+    pub join: SynapseEvent,
+    /// The join's `(topological_ordering, stream_ordering)`: the room's history is copied from
+    /// what Synapse stored after it.
+    pub join_key: (i64, i64),
+    /// The room's state before the join.
+    pub state: Vec<SynapseEvent>,
+    /// The rest of the auth chain of that state and of the join.
+    pub auth_chain: Vec<SynapseEvent>,
+}
+
+/// One device's end-to-end keys, as a client uploaded them to Synapse.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SynapseDeviceKeys {
+    /// Whose device.
+    pub user_id: String,
+    /// The device.
+    pub device_id: String,
+    /// The `device_keys` object as uploaded, with every cross-signing signature Synapse holds
+    /// on it (`e2e_cross_signing_signatures`) merged into its `signatures`, which is how
+    /// `/keys/query` answers it there and here. `None` for a device that uploaded one-time keys
+    /// but no identity keys.
+    pub keys: Option<Value>,
+    /// One-time keys still unclaimed, as `("<algorithm>:<key id>", key)`, oldest first: the
+    /// order they are handed out in.
+    pub one_time_keys: Vec<(String, Value)>,
+    /// Fallback keys, one per algorithm, as `("<algorithm>:<key id>", key, used)`.
+    pub fallback_keys: Vec<(String, Value, bool)>,
+}
+
+/// One account's cross-signing keys, as uploaded to Synapse, each with the signatures Synapse
+/// holds on it merged into its `signatures` (another user's user-signing key on a master key,
+/// for one).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCrossSigning {
+    /// Whose keys.
+    pub user_id: String,
+    /// The master key.
+    pub master: Option<Value>,
+    /// The self-signing key.
+    pub self_signing: Option<Value>,
+    /// The user-signing key.
+    pub user_signing: Option<Value>,
+}
+
+/// One version of an account's server-side key backup (`e2e_room_keys_versions`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SynapseBackupVersion {
+    /// Whose backup.
+    pub user_id: String,
+    /// The version number, as clients name it.
+    pub version: u64,
+    /// The backup algorithm.
+    pub algorithm: String,
+    /// The algorithm's public data.
+    pub auth_data: Value,
+    /// Deleted by its owner: kept, so that its number is not used again.
+    pub deleted: bool,
+}
+
+/// One room key in a backup (`e2e_room_keys`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SynapseRoomKey {
+    /// The room the session is for.
+    pub room_id: String,
+    /// The megolm session.
+    pub session_id: String,
+    /// The first message index the key can decrypt.
+    pub first_message_index: u64,
+    /// How many times the key was forwarded.
+    pub forwarded_count: u64,
+    /// Whether the device that backed it up had verified its sender.
+    pub is_verified: bool,
+    /// The encrypted session, opaque to the server.
+    pub session_data: Value,
+}
+
+/// One account's push rules, read out of Synapse's rows into the client-server API's terms.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SynapsePushRules {
+    /// Whose rules.
+    pub user_id: String,
+    /// The rules the user made, as `(kind, rule)`: `kind` is `override`, `content`, `room`,
+    /// `sender` or `underride`, `rule` is shaped as `PUT /pushrules/global/{kind}/{ruleId}`
+    /// shows it (`rule_id`, `actions`, and `conditions` or `pattern` as the kind has). Within a
+    /// kind, the highest priority comes first.
+    pub custom: Vec<(String, Value)>,
+    /// Server-default rules whose actions the user changed: `(kind, rule id, actions)`.
+    pub default_actions: Vec<(String, String, Value)>,
+    /// Rules the user turned on or off, server-default or their own: `(kind, rule id, enabled)`.
+    pub enabled: Vec<(String, String, bool)>,
+    /// Rows that cannot be carried over, with why (an unknown kind, unreadable JSON).
+    pub unreadable: Vec<String>,
+}
+
+/// A pusher (`pushers`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SynapsePusher {
+    /// Synapse's row id: the stream's checkpoint.
+    pub id: i64,
+    /// Whose pusher.
+    pub user_id: String,
+    /// `http` or `email`.
+    pub kind: String,
+    /// The application.
+    pub app_id: String,
+    /// The application's name.
+    pub app_display_name: String,
+    /// The device's name.
+    pub device_display_name: String,
+    /// The push key.
+    pub pushkey: String,
+    /// The profile tag, if any.
+    pub profile_tag: Option<String>,
+    /// The language notifications are in.
+    pub lang: Option<String>,
+    /// The kind's data (`url`, `format`, ...).
+    pub data: Value,
+    /// Turned off (MSC3881); Synapse keeps such a pusher without pushing to it.
+    pub enabled: bool,
+}
+
+/// A read receipt (`receipts_linearized`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseReceipt {
+    /// Synapse's stream position: the checkpoint, and the order receipts happened in.
+    pub stream_id: i64,
+    /// The room.
+    pub room_id: String,
+    /// `m.read` or `m.read.private`.
+    pub receipt_type: String,
+    /// Whose receipt (an account of this server or of another).
+    pub user_id: String,
+    /// The event read up to.
+    pub event_id: String,
+    /// The thread it is for: `None` for the room as a whole, `main` for the room's main
+    /// timeline, an event id for a thread.
+    pub thread_id: Option<String>,
+    /// When it was sent, in milliseconds.
+    pub ts: u64,
+}
+
+/// A sync filter (`user_filters`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SynapseFilter {
+    /// Whose filter.
+    pub user_id: String,
+    /// Its id, as the client was given it (Synapse's are decimal numbers).
+    pub filter_id: String,
+    /// The filter.
+    pub filter: Value,
 }
 
 /// A local media item (`local_media_repository`), and where its file is in the media store.

@@ -43,10 +43,15 @@ struct SynapseDatabase {
     admin_dsn: String,
     name: String,
     config: postgres::Config,
+    dir: PathBuf,
 }
 
 impl SynapseDatabase {
     fn create() -> Option<Self> {
+        Self::create_from(fixture_dir())
+    }
+
+    fn create_from(dir: PathBuf) -> Option<Self> {
         let admin_dsn = std::env::var("HS_MIGRATION_TEST_POSTGRES_DSN")
             .unwrap_or_else(|_| "postgres://postgres:hspg@127.0.0.1:5439/postgres".to_owned());
         let config: postgres::Config = admin_dsn.parse().ok()?;
@@ -65,7 +70,10 @@ impl SynapseDatabase {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let name = format!("synapse_fixture_{}_{nanos}", std::process::id());
+        // Two tests of this file run at once: the counter keeps their databases apart.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!("synapse_fixture_{}_{nanos}_{n}", std::process::id());
         admin
             .batch_execute(&format!(
                 "CREATE DATABASE {name} ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0"
@@ -75,13 +83,14 @@ impl SynapseDatabase {
         db_config.dbname(&name);
         let mut client = db_config.connect(postgres::NoTls).unwrap();
         for file in ["schema.sql", "data.sql"] {
-            let sql = std::fs::read_to_string(fixture_dir().join(file)).unwrap();
+            let sql = std::fs::read_to_string(dir.join(file)).unwrap();
             client.batch_execute(&sql).unwrap();
         }
         Some(Self {
             admin_dsn,
             name,
             config,
+            dir,
         })
     }
 
@@ -91,7 +100,7 @@ impl SynapseDatabase {
             Some(postgres::config::Host::Tcp(host)) => host.clone(),
             _ => "127.0.0.1".to_owned(),
         };
-        json!({
+        let mut source = json!({
             "synapse": {
                 "database": {
                     "host": host,
@@ -100,10 +109,13 @@ impl SynapseDatabase {
                     "user": self.config.get_user().unwrap_or("postgres"),
                     "password": String::from_utf8_lossy(self.config.get_password().unwrap_or_default()),
                 },
-                "media_store_path": fixture_dir().join("media_store").canonicalize().unwrap(),
                 "batch_size": 2,
             }
-        })
+        });
+        if let Ok(media) = self.dir.join("media_store").canonicalize() {
+            source["synapse"]["media_store_path"] = json!(media);
+        }
+        source
     }
 }
 
@@ -420,6 +432,18 @@ async fn a_synapse_database_is_migrated_verified_and_cut_over_through_the_admin_
     assert_eq!(stream("rooms")["failed_count"], 0, "{ready}");
     assert_eq!(stream("media")["copied_count"], 2);
     assert_eq!(stream("account_data")["copied_count"], 3);
+    for (name, count) in [
+        ("e2e_keys", 2),
+        ("cross_signing", 2),
+        ("key_backups", 2),
+        ("push_rules", 1),
+        ("pushers", 1),
+        ("filters", 2),
+        ("receipts", 2),
+    ] {
+        assert_eq!(stream(name)["copied_count"], count, "{name}: {ready}");
+        assert_eq!(stream(name)["failed_count"], 0, "{name}: {ready}");
+    }
 
     // A restart: the migration is where it was.
     hs.stop();
@@ -467,6 +491,20 @@ async fn a_synapse_database_is_migrated_verified_and_cut_over_through_the_admin_
         StatusCode::CONFLICT,
     )
     .await;
+    // The cutover's final pass read every room again, and this process measured it.
+    let (_, metrics) = nobody.bytes("/metrics").await;
+    let metrics = String::from_utf8(metrics).unwrap();
+    let counter = |name: &str| {
+        metrics
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{name} ")))
+            .and_then(|n| n.trim().parse::<f64>().ok())
+            .unwrap_or_else(|| panic!("no {name}: {metrics}"))
+    };
+    assert!(counter("hs_migration_events_read_total") > 30.0);
+    assert!(counter("hs_migration_event_bytes_read_total") > 10_000.0);
+    assert!(counter("hs_migration_room_seconds_count") >= 2.0);
+    assert!(counter("hs_migration_peak_rss_bytes") > 1_000_000.0);
 
     hs.stop();
     let mut hs = HsProcess::serve(&config_path);
@@ -585,6 +623,155 @@ async fn a_synapse_database_is_migrated_verified_and_cut_over_through_the_admin_
     .unwrap();
     assert_eq!(bytes, original);
 
+    // End-to-end keys: alice's phone as her client uploaded it to Synapse, signed by her
+    // self-signing key; her cross-signing keys; bob's master key with her signature on it.
+    let alice_id = "@alice:fixture.test";
+    let bob_id = "@bob:fixture.test";
+    let queried = alice
+        .expect(
+            Method::POST,
+            "/_matrix/client/v3/keys/query",
+            Some(json!({"device_keys": {alice_id: [], bob_id: []}})),
+            StatusCode::OK,
+        )
+        .await;
+    let phone = &queried["device_keys"][alice_id]["ALICEPHONE"];
+    assert_eq!(phone["device_id"], "ALICEPHONE", "{queried}");
+    let self_signing = format!(
+        "ed25519:{}",
+        facts["alice_self_signing_key"].as_str().unwrap()
+    );
+    assert!(
+        phone["signatures"][alice_id].get(&self_signing).is_some(),
+        "{phone}"
+    );
+    assert!(
+        queried["device_keys"][bob_id].get("BOBLAPTOP").is_some(),
+        "{queried}"
+    );
+    let alice_master = facts["alice_master_key"].as_str().unwrap();
+    assert!(
+        queried["master_keys"][alice_id]["keys"]
+            .get(format!("ed25519:{alice_master}"))
+            .is_some(),
+        "{queried}"
+    );
+    assert!(
+        queried["self_signing_keys"].get(alice_id).is_some(),
+        "{queried}"
+    );
+    assert!(
+        queried["user_signing_keys"].get(alice_id).is_some(),
+        "{queried}"
+    );
+    assert!(
+        queried["master_keys"][bob_id]["signatures"]
+            .get(alice_id)
+            .is_some(),
+        "alice's verification of bob was lost: {queried}"
+    );
+    // One of the one-time keys alice's phone uploaded to Synapse, oldest first, and her
+    // fallback key once those run out.
+    let claimed = nobody
+        .with(facts["bob_token"].as_str().unwrap())
+        .expect(
+            Method::POST,
+            "/_matrix/client/v3/keys/claim",
+            Some(json!({"one_time_keys": {alice_id: {"ALICEPHONE": "signed_curve25519"}}})),
+            StatusCode::OK,
+        )
+        .await;
+    let one_time = claimed["one_time_keys"][alice_id]["ALICEPHONE"]
+        .as_object()
+        .unwrap_or_else(|| panic!("no one-time key: {claimed}"));
+    assert!(
+        one_time.contains_key("signed_curve25519:AAAAA0"),
+        "{claimed}"
+    );
+    // The backup: version 2 (version 1 was deleted in Synapse), holding three room keys.
+    let backup = alice.get("/_matrix/client/v3/room_keys/version").await;
+    assert_eq!(backup["version"], facts["backup_version"], "{backup}");
+    assert_eq!(backup["count"], 3, "{backup}");
+    assert!(backup["auth_data"].get("public_key").is_some(), "{backup}");
+    let (status, _) = alice
+        .call(Method::GET, "/_matrix/client/v3/room_keys/version/1", None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let room_keys = alice
+        .get("/_matrix/client/v3/room_keys/keys?version=2")
+        .await;
+    assert_eq!(
+        room_keys["rooms"][lobby]["sessions"]
+            .as_object()
+            .map(serde_json::Map::len),
+        Some(2),
+        "{room_keys}"
+    );
+
+    // Push rules and the pusher.
+    let rules = alice.get("/_matrix/client/v3/pushrules/").await;
+    let global = &rules["global"];
+    let find = |kind: &str, id: &str| -> Value {
+        global[kind]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["rule_id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {kind} rule {id}: {rules}"))
+    };
+    assert_eq!(find("content", "lobbyword")["pattern"], "lobby");
+    assert_eq!(find("room", dm)["actions"], json!([]));
+    assert_eq!(find("override", "fixture.quiet_bots")["actions"], json!([]));
+    assert_eq!(
+        find("override", ".m.rule.suppress_notices")["enabled"],
+        false
+    );
+    assert_eq!(
+        find("underride", ".m.rule.message")["actions"],
+        json!(["notify", {"set_tweak": "sound", "value": "default"}])
+    );
+    let pushers = alice.get("/_matrix/client/v3/pushers").await;
+    assert_eq!(
+        pushers["pushers"][0]["pushkey"], "alice-pushkey",
+        "{pushers}"
+    );
+    assert_eq!(
+        pushers["pushers"][0]["data"]["url"],
+        "https://push.fixture.test/_matrix/push/v1/notify"
+    );
+
+    // Filter 0, under the id Synapse gave it.
+    let filter = alice
+        .get("/_matrix/client/v3/user/%40alice%3Afixture.test/filter/0")
+        .await;
+    assert_eq!(filter["room"]["timeline"]["limit"], 20, "{filter}");
+
+    // Receipts: bob's read receipt in the lobby, and alice's private one in the direct chat.
+    let receipt_in = |sync: &Value, room: &str| -> Value {
+        sync["rooms"]["join"][room]["ephemeral"]["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|e| e["type"] == "m.receipt")
+            .map(|e| e["content"].clone())
+            .unwrap_or(Value::Null)
+    };
+    let lobby_receipts = receipt_in(&sync, lobby);
+    let first = facts["first_message"].as_str().unwrap();
+    assert!(
+        lobby_receipts[first]["m.read"].get(bob_id).is_some(),
+        "{lobby_receipts}"
+    );
+    let dm_receipts = receipt_in(&sync, dm);
+    let private = facts["private_receipt"].as_str().unwrap();
+    assert!(
+        dm_receipts[private]["m.read.private"]
+            .get(alice_id)
+            .is_some(),
+        "{dm_receipts}"
+    );
+
     // The record: each step audited, the log kept, the metrics.
     let audit = ops.get("/api/v1/audit-log?limit=200").await;
     let actions: Vec<&str> = audit["items"]
@@ -618,6 +805,16 @@ async fn a_synapse_database_is_migrated_verified_and_cut_over_through_the_admin_
             .join("\n")
     );
     assert!(metrics.contains("hs_migration_status{status=\"completed\"} 1"));
+    assert!(
+        metrics.contains("hs_migration_rows_copied{stream=\"e2e_keys\"} 2"),
+        "{metrics}"
+    );
+    assert!(
+        log["items"].as_array().unwrap().iter().any(|e| e["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("throughput: 2 rooms"))),
+        "{log}"
+    );
     let _ = hs.log();
     hs.stop();
 }
@@ -627,4 +824,213 @@ fn urlencode(s: &str) -> String {
         .replace(':', "%3A")
         .replace('#', "%23")
         .replace('@', "%40")
+}
+
+/// `crates/hs-compat/tests/fixtures/synapse-federated`: a real Synapse 1.161 (`127.0.0.1:18301`)
+/// whose two accounts joined two rooms of another Synapse (`127.0.0.1:18302`) over federation.
+/// "Elsewhere" Synapse backfilled whole; "Faraway" it holds only from hana's join. Both are
+/// migrated into the real binary and served: their history, their state, the receipt, and a new
+/// message goes into the one held from the join.
+#[tokio::test]
+async fn rooms_joined_over_federation_are_migrated_and_served() {
+    let dir =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../hs-compat/tests/fixtures/synapse-federated");
+    let fixture = dir.clone();
+    let Some(db) = tokio::task::spawn_blocking(move || SynapseDatabase::create_from(fixture))
+        .await
+        .unwrap()
+    else {
+        return;
+    };
+    let facts: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("facts.json")).unwrap()).unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let keys = work.path().join("keys");
+    std::fs::create_dir_all(&keys).unwrap();
+    std::fs::copy(
+        dir.join("signing.key"),
+        keys.join("127.0.0.1:18301.signing.key"),
+    )
+    .unwrap();
+    let port = free_port();
+    std::fs::write(
+        work.path().join("hs.yaml"),
+        format!(
+            "server:\n  server_name: \"127.0.0.1:18301\"\n  signing_key_path: {keys:?}\n\
+             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, federation, media, admin, health, metrics]\n\
+             storage:\n  backend: embedded\n  data_dir: {:?}\n\
+             media:\n  storage:\n    backend: local\n    path: {:?}\n\
+             rate_limits:\n  enabled: false\n",
+            work.path().join("db"),
+            work.path().join("media"),
+        ),
+    )
+    .unwrap();
+    let mut hs = HsProcess::serve(&work.path().join("hs.yaml"));
+    let setup_line = hs.wait_for("setup_link=");
+    let setup_token = setup_line
+        .rsplit_once("#token=")
+        .unwrap()
+        .1
+        .trim()
+        .to_owned();
+    let nobody = Caller {
+        base: format!("http://127.0.0.1:{port}"),
+        token: None,
+    };
+    let created = nobody
+        .expect(
+            Method::POST,
+            "/api/v1/setup",
+            Some(json!({"setup_token": setup_token, "username": "ops", "password": "ops-password-1"})),
+            StatusCode::CREATED,
+        )
+        .await;
+    let ops = nobody.with(created["access_token"].as_str().unwrap());
+    ops.expect(
+        Method::PATCH,
+        "/api/v1/config/migration",
+        Some(db.source()),
+        StatusCode::OK,
+    )
+    .await;
+    ops.expect(
+        Method::POST,
+        "/api/v1/migration/start",
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    let ready = ops.migration_reaches("ready_for_cutover").await;
+    let rooms = ready["streams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "rooms")
+        .cloned()
+        .unwrap();
+    let log = ops.get("/api/v1/migration/log?limit=500").await;
+    assert_eq!(rooms["copied_count"], 2, "{ready}\n{log}");
+    assert_eq!(rooms["skipped_count"], 0, "{ready}\n{log}");
+    assert_eq!(rooms["failed_count"], 0, "{ready}\n{log}");
+    let faraway = facts["faraway"].as_str().unwrap();
+    let elsewhere = facts["elsewhere"].as_str().unwrap();
+    assert!(
+        log["items"].as_array().unwrap().iter().any(|e| e["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with(&format!("{faraway}: joined over federation")))),
+        "{log}"
+    );
+
+    // Verification: every room's history from where it starts here, and its current state,
+    // against Synapse's.
+    let task = ops
+        .expect(
+            Method::POST,
+            "/api/v1/migration/verify",
+            None,
+            StatusCode::ACCEPTED,
+        )
+        .await;
+    let ended = ops.task_ends(task["id"].as_str().unwrap()).await;
+    assert_eq!(ended["status"], "succeeded", "{ended}");
+    let verified = ops.get("/api/v1/migration").await;
+    assert_eq!(verified["verification"]["passed"], true, "{verified}");
+
+    // hana's Synapse session: both rooms in her `/sync`, with her receipt in Faraway.
+    let hana = nobody.with(facts["hana_token"].as_str().unwrap());
+    let sync = hana.get("/_matrix/client/v3/sync").await;
+    let joined = &sync["rooms"]["join"];
+    assert!(
+        joined.get(faraway).is_some() && joined.get(elsewhere).is_some(),
+        "{sync}"
+    );
+    let last = facts["faraway_last"].as_str().unwrap();
+    let receipts = joined[faraway]["ephemeral"]["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|e| e["type"] == "m.receipt")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert!(
+        receipts["content"][last]["m.read"]
+            .get("@hana:127.0.0.1:18301")
+            .is_some(),
+        "{receipts}"
+    );
+
+    // Faraway: its history since hana joined, its state as the other server left it.
+    let messages = hana
+        .get(&format!(
+            "/_matrix/client/v3/rooms/{}/messages?dir=b&limit=6",
+            urlencode(faraway)
+        ))
+        .await;
+    let bodies: Vec<&str> = messages["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["content"]["body"].as_str())
+        .collect();
+    for body in [
+        "faraway: welcome, hana",
+        "faraway: hello from home",
+        "faraway: hugo here too",
+        "faraway: the last word, from elsewhere",
+    ] {
+        assert!(bodies.contains(&body), "{body} is missing: {bodies:?}");
+    }
+    let topic = hana
+        .get(&format!(
+            "/_matrix/client/v3/rooms/{}/state/m.room.topic",
+            urlencode(faraway)
+        ))
+        .await;
+    assert_eq!(topic["topic"], "Faraway, on another server, with guests");
+    let members = hana
+        .get(&format!(
+            "/_matrix/client/v3/rooms/{}/joined_members",
+            urlencode(faraway)
+        ))
+        .await;
+    for member in [
+        "@rita:127.0.0.1:18302",
+        "@hana:127.0.0.1:18301",
+        "@hugo:127.0.0.1:18301",
+    ] {
+        assert!(members["joined"].get(member).is_some(), "{members}");
+    }
+    // It is a room here, not a copy of one: hana can talk in it.
+    hana.expect(
+        Method::PUT,
+        &format!(
+            "/_matrix/client/v3/rooms/{}/send/m.room.message/after-migration",
+            urlencode(faraway)
+        ),
+        Some(json!({"msgtype": "m.text", "body": "Hello from Myelin"})),
+        StatusCode::OK,
+    )
+    .await;
+
+    // Elsewhere, which Synapse held whole: its history from the beginning.
+    let messages = hana
+        .get(&format!(
+            "/_matrix/client/v3/rooms/{}/messages?dir=b&limit=100",
+            urlencode(elsewhere)
+        ))
+        .await;
+    let bodies: Vec<&str> = messages["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["content"]["body"].as_str())
+        .collect();
+    assert!(
+        bodies.contains(&"elsewhere: before anyone from home joined, 1")
+            && bodies.contains(&"elsewhere: the last word, from elsewhere"),
+        "{bodies:?}"
+    );
+    let _ = hs.log();
+    hs.stop();
 }

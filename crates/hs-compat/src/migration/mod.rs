@@ -3,13 +3,20 @@
 //!
 //! # What is copied
 //!
-//! Six streams, in order ([`model::Stream`]): accounts with their password hashes and profiles,
-//! devices, access tokens (so that signed-in clients stay signed in), account data and room
-//! tags, rooms (every event of each room, replayed in order through this server's own
-//! authorization, then its aliases and directory listing), and local media (records and files).
-//! The mapping, table by table, is `docs/compat/synapse-importer-mapping.md`; what is not copied
-//! yet (end-to-end keys and backups, push rules, receipts, remote media, rooms this server's users
-//! joined over federation) is listed in `docs/compat/synapse-migration-runbook.md`.
+//! Thirteen streams, in order ([`model::Stream`]): accounts with their password hashes and
+//! profiles, devices, access tokens (so that signed-in clients stay signed in), account data and
+//! room tags, each device's end-to-end keys (identity, one-time and fallback keys), cross-signing
+//! keys with the signatures on them, server-side key backups, push rules, pushers, sync filters
+//! (under the ids Synapse gave them), rooms (every event of each room, replayed in order through
+//! this server's own authorization a page at a time, then its aliases and directory listing),
+//! read receipts, and local media (records and files). The mapping, table by table, is
+//! `docs/compat/synapse-importer-mapping.md`; what is not copied (rooms this server's users
+//! joined over federation, remote media, presence) is listed in
+//! `docs/compat/synapse-migration-runbook.md`.
+//!
+//! A room is copied in bounded memory ([`rooms`]), and each room's and the whole copy's
+//! throughput -- events and bytes per second, and the process's peak memory -- is logged and
+//! measured ([`throughput`]).
 //!
 //! # How it runs
 //!
@@ -31,18 +38,22 @@
 
 pub mod engine;
 pub mod model;
-pub mod order;
+pub mod rooms;
+pub mod rows;
 pub mod source;
 pub mod store;
 pub mod target;
+pub mod throughput;
 
 pub use engine::{MigrationObserver, Migrator, SourceConfigs};
 pub use model::{LogEntry, LogLevel, MigrationRecord, Phase, Stream, VerificationReport};
 pub use source::SynapseSource;
 pub use store::{InMemoryMigrationStore, MigrationStore};
 pub use target::{
-    Imported, MigrationTarget, RoomOutcome, TargetError, TargetMedia, TargetRoom, TargetUser,
+    Check, CurrentState, Imported, MigrationTarget, RoomOutcome, TargetError, TargetMedia,
+    TargetUser,
 };
+pub use throughput::{ImportStats, RoomStats, peak_rss_bytes};
 
 /// Why a migration step could not go on.
 #[derive(Debug, thiserror::Error)]

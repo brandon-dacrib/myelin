@@ -22,12 +22,14 @@ use super::model::{
     LogEntry, LogLevel, MigrationRecord, Phase, Stream, StreamProgress, StreamVerification,
     VerificationReport,
 };
-use super::order::replay_order;
+use super::rooms::{RoomFailure, SynapseRoomPages, copy_room};
 use super::source::{
-    SynapseSource, account_data_key, device_key, parse_account_data_key, parse_device_key,
+    SynapseSource, account_data_key, device_key, device_pair_key, pair_key, parse_account_data_key,
+    parse_device_key, parse_pair_key,
 };
 use super::store::MigrationStore;
-use super::target::{Imported, MigrationTarget, TargetError};
+use super::target::{Check, Imported, MigrationTarget, TargetError};
+use super::throughput::{ImportStats, RoomStats, peak_rss_bytes};
 
 /// The task actions each step runs under.
 pub const COPY_ACTION: &str = "migration.copy";
@@ -36,7 +38,8 @@ pub const VERIFY_ACTION: &str = "migration.verify";
 /// See [`COPY_ACTION`].
 pub const CUTOVER_ACTION: &str = "migration.cutover";
 
-/// Rooms read per batch: each room is read whole, so far fewer than rows of other streams.
+/// Rooms per batch: each room's events are read a page of `batch_size` at a time, so a room is
+/// far more than a row of another stream.
 const ROOMS_PER_BATCH: i64 = 10;
 /// Refused events logged per room; the rest are counted.
 const REFUSALS_LOGGED_PER_ROOM: usize = 20;
@@ -55,10 +58,14 @@ pub trait SourceConfigs: Send + Sync + 'static {
     async fn source(&self, pointer: &str) -> Result<Option<SynapseSourceConfig>, String>;
 }
 
-/// Told about every change to the record, for metrics.
+/// Told about every change to the record, and about each room copied, for metrics.
 pub trait MigrationObserver: Send + Sync + 'static {
     /// The record as it now is.
     fn observe(&self, record: &MigrationRecord);
+
+    /// A room has been copied: how many events, how many bytes, how long, and the process's
+    /// peak memory then.
+    fn room_copied(&self, _stats: &RoomStats) {}
 }
 
 struct NoObserver;
@@ -197,9 +204,17 @@ struct Batch {
     next: Option<String>,
     log: Vec<LogEntry>,
     fatal: Option<String>,
+    /// Things counted inside rows (one-time keys of a device, room keys of a backup), by name.
+    detail: BTreeMap<&'static str, u64>,
+    /// Each room copied.
+    rooms: Vec<RoomStats>,
 }
 
 impl Batch {
+    fn count(&mut self, what: &'static str, n: u64) {
+        *self.detail.entry(what).or_default() += n;
+    }
+
     fn tally(&mut self, stream: Stream, key: &str, outcome: Result<Imported, TargetError>) {
         self.handled += 1;
         match outcome {
@@ -498,6 +513,7 @@ impl Migrator {
 
     /// Copies every stream not yet done, from its checkpoint.
     async fn copy(&self, run: u64, ctx: &TaskContext) -> Result<Copied, MigrationError> {
+        let copy_started = std::time::Instant::now();
         let record = self.store.load().await?;
         let pointer = record
             .source_ref
@@ -549,6 +565,8 @@ impl Migrator {
             )])
             .await;
             let mut checkpoint = progress.checkpoint.clone();
+            let mut detail: BTreeMap<&'static str, u64> = BTreeMap::new();
+            let mut rooms = ImportStats::default();
             loop {
                 let batch = self
                     .copy_batch(
@@ -571,15 +589,26 @@ impl Migrator {
                         .stream(stream)
                         .cloned()
                         .unwrap_or_else(|| StreamProgress::new(stream));
-                    self.write_log(vec![entry(
-                        stream.as_str(),
-                        LogLevel::Info,
-                        format!(
-                            "done: {} copied, {} not copied on purpose, {} failed",
-                            s.copied, s.skipped, s.failed
-                        ),
-                    )])
-                    .await;
+                    let mut done = format!(
+                        "done: {} copied, {} not copied on purpose, {} failed",
+                        s.copied, s.skipped, s.failed
+                    );
+                    if !detail.is_empty() {
+                        let parts: Vec<String> = detail
+                            .iter()
+                            .map(|(what, n)| format!("{n} {what}"))
+                            .collect();
+                        done.push_str(&format!(" ({} in this run)", parts.join(", ")));
+                    }
+                    let mut lines = vec![entry(stream.as_str(), LogLevel::Info, done)];
+                    if rooms.rooms > 0 {
+                        lines.push(entry(
+                            stream.as_str(),
+                            LogLevel::Info,
+                            format!("throughput: {}", rooms.summary()),
+                        ));
+                    }
+                    self.write_log(lines).await;
                     break;
                 }
                 let Batch {
@@ -590,7 +619,16 @@ impl Migrator {
                     next,
                     log,
                     fatal,
+                    detail: batch_detail,
+                    rooms: batch_rooms,
                 } = batch;
+                for (what, n) in batch_detail {
+                    *detail.entry(what).or_default() += n;
+                }
+                for room in &batch_rooms {
+                    rooms.add(room);
+                    self.observer.room_copied(room);
+                }
                 self.write_log(log).await;
                 let now = now_ms();
                 let Some(record) = self
@@ -638,6 +676,20 @@ impl Migrator {
                 .await;
             }
         }
+        #[allow(clippy::cast_precision_loss)]
+        let peak = peak_rss_bytes().map_or_else(
+            || "unknown".to_owned(),
+            |b| format!("{:.1} MiB", b as f64 / (1024.0 * 1024.0)),
+        );
+        self.write_log(vec![entry(
+            "migration",
+            LogLevel::Info,
+            format!(
+                "this pass over Synapse took {:.1} s; this server's peak memory so far is {peak}",
+                copy_started.elapsed().as_secs_f64()
+            ),
+        )])
+        .await;
         Ok(Copied::Finished)
     }
 
@@ -732,80 +784,321 @@ impl Migrator {
                     }
                 }
             }
+            Stream::E2eKeys => {
+                let after = after.and_then(parse_device_key);
+                let after = after.as_ref().map(|(u, d)| (u.as_str(), d.as_str()));
+                for keys in source.e2e_device_keys(after, limit).await? {
+                    if ctx.is_cancelled() {
+                        break;
+                    }
+                    let key = format!("{}'s device {}", keys.user_id, keys.device_id);
+                    let outcome = self.target.import_device_keys(&keys).await;
+                    if outcome.is_ok() {
+                        batch.count("devices with identity keys", u64::from(keys.keys.is_some()));
+                        batch.count("one-time keys", keys.one_time_keys.len() as u64);
+                        batch.count("fallback keys", keys.fallback_keys.len() as u64);
+                    }
+                    batch.tally(stream, &key, outcome);
+                    batch.next = Some(device_pair_key(&keys.user_id, &keys.device_id));
+                    if batch.fatal.is_some() {
+                        break;
+                    }
+                }
+            }
+            Stream::CrossSigning => {
+                for keys in source.cross_signing(after, limit).await? {
+                    if ctx.is_cancelled() {
+                        break;
+                    }
+                    let key = format!("{}'s cross-signing keys", keys.user_id);
+                    let outcome = self.target.import_cross_signing(&keys).await;
+                    batch.tally(stream, &key, outcome);
+                    batch.next = Some(keys.user_id.clone());
+                    if batch.fatal.is_some() {
+                        break;
+                    }
+                }
+            }
+            Stream::KeyBackups => {
+                let after = after.and_then(parse_pair_key);
+                let after = after.as_ref().map(|(u, v)| (u.as_str(), *v));
+                for version in source.backup_versions(after, limit).await? {
+                    if ctx.is_cancelled() {
+                        break;
+                    }
+                    let key = format!("{}'s key backup {}", version.user_id, version.version);
+                    let mut outcome = self.target.import_backup_version(&version).await;
+                    if !version.deleted
+                        && matches!(
+                            outcome,
+                            Ok(Imported::Created | Imported::Updated | Imported::AlreadyThere)
+                        )
+                    {
+                        let mut after_key: Option<(String, String)> = None;
+                        loop {
+                            let keys = source
+                                .backup_keys(
+                                    &version.user_id,
+                                    version.version,
+                                    after_key.as_ref().map(|(r, s)| (r.as_str(), s.as_str())),
+                                    limit,
+                                )
+                                .await?;
+                            let Some(last) = keys.last() else { break };
+                            after_key = Some((last.room_id.clone(), last.session_id.clone()));
+                            match self
+                                .target
+                                .import_backup_keys(&version.user_id, version.version, &keys)
+                                .await
+                            {
+                                Ok(stored) => {
+                                    batch.count("room keys read", keys.len() as u64);
+                                    batch.count("room keys stored", stored);
+                                    if stored > 0 && outcome == Ok(Imported::AlreadyThere) {
+                                        outcome = Ok(Imported::Updated);
+                                    }
+                                }
+                                Err(e) => {
+                                    outcome = Err(e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    batch.tally(stream, &key, outcome);
+                    batch.next = Some(pair_key(
+                        &version.user_id,
+                        i64::try_from(version.version).unwrap_or(i64::MAX),
+                    ));
+                    if batch.fatal.is_some() {
+                        break;
+                    }
+                }
+            }
+            Stream::PushRules => {
+                for rules in source.push_rules(after, limit).await? {
+                    if ctx.is_cancelled() {
+                        break;
+                    }
+                    for why in &rules.unreadable {
+                        batch.log.push(entry(
+                            stream.as_str(),
+                            LogLevel::Warning,
+                            format!("{}: a push rule was not copied: {why}", rules.user_id),
+                        ));
+                    }
+                    let key = format!("{}'s push rules", rules.user_id);
+                    let outcome = self.target.import_push_rules(&rules).await;
+                    if outcome.is_ok() {
+                        batch.count("rules of their own", rules.custom.len() as u64);
+                        batch.count(
+                            "server-default rules changed",
+                            (rules.default_actions.len() + rules.enabled.len()) as u64,
+                        );
+                    }
+                    batch.tally(stream, &key, outcome);
+                    batch.next = Some(rules.user_id.clone());
+                    if batch.fatal.is_some() {
+                        break;
+                    }
+                }
+            }
+            Stream::Pushers => {
+                let after = after.and_then(|a| a.parse::<i64>().ok());
+                for pusher in source.pushers(after, limit).await? {
+                    if ctx.is_cancelled() {
+                        break;
+                    }
+                    let key = format!(
+                        "{}'s pusher for {} ({})",
+                        pusher.user_id, pusher.app_id, pusher.device_display_name
+                    );
+                    let outcome = self.target.import_pusher(&pusher).await;
+                    batch.tally(stream, &key, outcome);
+                    batch.next = Some(pusher.id.to_string());
+                    if batch.fatal.is_some() {
+                        break;
+                    }
+                }
+            }
+            Stream::Filters => {
+                let after = after.and_then(parse_pair_key);
+                let after = after.as_ref().map(|(u, i)| (u.as_str(), *i));
+                let server_name = self.target.server_name().to_owned();
+                for (filter, (localpart, id)) in source.filters(after, limit, &server_name).await? {
+                    if ctx.is_cancelled() {
+                        break;
+                    }
+                    let key = format!("{}'s filter {}", filter.user_id, filter.filter_id);
+                    let outcome = self.target.import_filter(&filter).await;
+                    batch.tally(stream, &key, outcome);
+                    batch.next = Some(pair_key(&localpart, id));
+                    if batch.fatal.is_some() {
+                        break;
+                    }
+                }
+            }
+            Stream::Receipts => {
+                let after = after.and_then(|a| a.parse::<i64>().ok());
+                for receipt in source.receipts(after, limit).await? {
+                    if ctx.is_cancelled() {
+                        break;
+                    }
+                    let key = format!(
+                        "{}'s {} receipt in {}",
+                        receipt.user_id, receipt.receipt_type, receipt.room_id
+                    );
+                    let outcome = match receipt_not_copied(&receipt) {
+                        Some(why) => Ok(Imported::Skipped(why)),
+                        None => self.target.import_receipt(&receipt).await,
+                    };
+                    batch.tally(stream, &key, outcome);
+                    batch.next = Some(receipt.stream_id.to_string());
+                    if batch.fatal.is_some() {
+                        break;
+                    }
+                }
+            }
             Stream::Rooms => {
                 for room_id in source.room_ids(after, limit.min(ROOMS_PER_BATCH)).await? {
                     if ctx.is_cancelled() {
                         break;
                     }
-                    batch.next = Some(room_id.clone());
                     let Some(room) = source.room(&room_id).await? else {
+                        batch.next = Some(room_id);
                         continue;
                     };
-                    let plan = match replay_order(&room) {
-                        Ok(plan) => plan,
-                        Err(why) => {
-                            batch.tally(stream, &room_id, Ok(Imported::Skipped(why)));
-                            continue;
+                    let shape = source.room_shape(&room_id).await?;
+                    // A room made on another server, which this server's users joined over
+                    // federation: held here from the join, as the join made it held in Synapse,
+                    // then its history after the join is copied as any room's is.
+                    let mut since = None;
+                    let mut before_join = 0;
+                    if !shape.has_create {
+                        let join = match source.remote_join(&room_id).await? {
+                            Ok(join) => join,
+                            Err(why) => {
+                                batch.tally(stream, &room_id, Ok(Imported::Skipped(why)));
+                                batch.next = Some(room_id);
+                                continue;
+                            }
+                        };
+                        match self.target.import_remote_join(&room, &join).await {
+                            Ok(Imported::Skipped(why)) => {
+                                batch.tally(stream, &room_id, Ok(Imported::Skipped(why)));
+                                batch.next = Some(room_id);
+                                continue;
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                batch.tally(stream, &room_id, Err(e));
+                                batch.next = Some(room_id);
+                                if batch.fatal.is_some() {
+                                    break;
+                                }
+                                continue;
+                            }
                         }
-                    };
-                    match self.target.import_room(&room, &plan.events).await {
-                        Ok(outcome) => {
-                            let mut message = format!(
-                                "{room_id}: {} events stored, {} already here",
-                                outcome.stored, outcome.already_there
-                            );
-                            if outcome.redactions > 0 {
-                                message.push_str(&format!(
-                                    ", {} redactions applied",
-                                    outcome.redactions
-                                ));
-                            }
-                            if outcome.aliases > 0 {
-                                message.push_str(&format!(", {} aliases", outcome.aliases));
-                            }
-                            if !plan.skipped.is_empty() {
-                                message.push_str(&format!(
-                                    ", {} left out (rejected by Synapse, or outliers)",
-                                    plan.skipped.len()
-                                ));
-                            }
-                            if !outcome.refused.is_empty() {
-                                message.push_str(&format!(
-                                    ", {} refused by this server's authorization",
-                                    outcome.refused.len()
-                                ));
-                            }
-                            let level = if outcome.refused.is_empty() {
-                                LogLevel::Info
-                            } else {
-                                LogLevel::Warning
-                            };
-                            batch.log.push(entry(stream.as_str(), level, message));
-                            for (event_id, why) in
-                                outcome.refused.iter().take(REFUSALS_LOGGED_PER_ROOM)
-                            {
-                                batch.log.push(entry(
-                                    stream.as_str(),
-                                    LogLevel::Warning,
-                                    format!("{room_id}: event {event_id} was refused: {why}"),
-                                ));
-                            }
-                            let stored_any = outcome.stored > 0;
-                            batch.tally(
-                                stream,
-                                &room_id,
-                                Ok(if stored_any {
-                                    Imported::Created
-                                } else {
-                                    Imported::AlreadyThere
-                                }),
-                            );
-                        }
-                        Err(e) => batch.tally(stream, &room_id, Err(e)),
+                        let after_join = source.history_since(&room_id, join.join_key.1).await?;
+                        before_join = shape.history.saturating_sub(after_join + 1);
+                        batch.log.push(entry(
+                            stream.as_str(),
+                            LogLevel::Info,
+                            format!(
+                                "{room_id}: joined over federation by {}; held from that join with \
+                                 the {} events of its state then and {} more of their auth chain",
+                                join.join.json["state_key"].as_str().unwrap_or_default(),
+                                join.state.len(),
+                                join.auth_chain.len()
+                            ),
+                        ));
+                        since = Some(join.join_key.1);
                     }
-                    if batch.fatal.is_some() {
+                    let pages = SynapseRoomPages {
+                        source,
+                        room_id: &room_id,
+                        since,
+                    };
+                    let cancelled = || ctx.is_cancelled();
+                    let copy =
+                        match copy_room(&pages, self.target.as_ref(), &room, limit, &cancelled)
+                            .await
+                        {
+                            Ok(copy) => copy,
+                            Err(RoomFailure::Source(e)) => return Err(e),
+                            Err(RoomFailure::Target(e)) => {
+                                batch.tally(stream, &room_id, Err(e));
+                                batch.next = Some(room_id);
+                                if batch.fatal.is_some() {
+                                    break;
+                                }
+                                continue;
+                            }
+                        };
+                    if copy.stopped {
+                        // Not finished: the room is copied again when the copy resumes.
                         break;
                     }
+                    let outcome = &copy.outcome;
+                    let mut message = format!(
+                        "{room_id}: {} events stored, {} already here",
+                        outcome.stored, outcome.already_there
+                    );
+                    if outcome.redactions > 0 {
+                        message.push_str(&format!(", {} redactions applied", outcome.redactions));
+                    }
+                    if outcome.aliases > 0 {
+                        message.push_str(&format!(", {} aliases", outcome.aliases));
+                    }
+                    let left_out = shape.outliers + shape.rejected;
+                    if left_out > 0 {
+                        message.push_str(&format!(
+                            ", {left_out} left out (rejected by Synapse, or outliers)"
+                        ));
+                    }
+                    if before_join > 0 {
+                        message.push_str(&format!(
+                            ", {before_join} from before this server's users joined left to \
+                             backfill (Synapse fetched them from other servers, and so will this \
+                             one when someone reads back)"
+                        ));
+                    }
+                    if !outcome.refused.is_empty() {
+                        message.push_str(&format!(
+                            ", {} refused by this server's authorization",
+                            outcome.refused.len()
+                        ));
+                    }
+                    let level = if outcome.refused.is_empty() {
+                        LogLevel::Info
+                    } else {
+                        LogLevel::Warning
+                    };
+                    batch.log.push(entry(stream.as_str(), level, message));
+                    for (event_id, why) in outcome.refused.iter().take(REFUSALS_LOGGED_PER_ROOM) {
+                        batch.log.push(entry(
+                            stream.as_str(),
+                            LogLevel::Warning,
+                            format!("{room_id}: event {event_id} was refused: {why}"),
+                        ));
+                    }
+                    batch.log.push(entry(
+                        stream.as_str(),
+                        LogLevel::Info,
+                        format!("throughput: {}", copy.stats.summary()),
+                    ));
+                    let stored_any = outcome.stored > 0;
+                    batch.tally(
+                        stream,
+                        &room_id,
+                        Ok(if stored_any {
+                            Imported::Created
+                        } else {
+                            Imported::AlreadyThere
+                        }),
+                    );
+                    batch.rooms.push(copy.stats);
+                    batch.next = Some(room_id);
                 }
             }
             Stream::Media => {
@@ -932,7 +1225,7 @@ impl Migrator {
     ) -> Result<VerificationReport, MigrationError> {
         let target_err = |e: TargetError| MigrationError::Target(e.message);
         let mut streams = Vec::new();
-        let steps = 7;
+        let steps = 8;
 
         // Accounts: all looked up, a sample compared.
         let mut users = StreamVerification::new(Stream::Users.as_str());
@@ -1122,9 +1415,162 @@ impl Migrator {
         )
         .await;
 
-        // Rooms, their events, and each room's current state.
+        // End-to-end keys of each device.
+        let mut device_keys = StreamVerification::new(Stream::E2eKeys.as_str());
+        let mut after: Option<(String, String)> = None;
+        loop {
+            let page = source
+                .e2e_device_keys(after.as_ref().map(|(u, d)| (u.as_str(), d.as_str())), 500)
+                .await?;
+            let Some(last) = page.last() else { break };
+            after = Some((last.user_id.clone(), last.device_id.clone()));
+            for keys in &page {
+                let check = self
+                    .target
+                    .verify_device_keys(keys)
+                    .await
+                    .map_err(target_err)?;
+                device_keys.checked(
+                    &format!("{}'s device {} keys", keys.user_id, keys.device_id),
+                    check,
+                );
+            }
+        }
+        streams.push(device_keys);
+
+        // Cross-signing keys of each account.
+        let mut cross = StreamVerification::new(Stream::CrossSigning.as_str());
+        let mut after: Option<String> = None;
+        loop {
+            let page = source.cross_signing(after.as_deref(), 500).await?;
+            let Some(last) = page.last() else { break };
+            after = Some(last.user_id.clone());
+            for keys in &page {
+                let check = self
+                    .target
+                    .verify_cross_signing(keys)
+                    .await
+                    .map_err(target_err)?;
+                cross.checked(&format!("{}'s cross-signing keys", keys.user_id), check);
+            }
+        }
+        streams.push(cross);
+
+        // Key backups: each version, and how many room keys it holds.
+        let mut backups = StreamVerification::new(Stream::KeyBackups.as_str());
+        let mut after: Option<(String, i64)> = None;
+        loop {
+            let page = source
+                .backup_versions(after.as_ref().map(|(u, v)| (u.as_str(), *v)), 500)
+                .await?;
+            let Some(last) = page.last() else { break };
+            after = Some((
+                last.user_id.clone(),
+                i64::try_from(last.version).unwrap_or(i64::MAX),
+            ));
+            for version in &page {
+                let count = if version.deleted {
+                    0
+                } else {
+                    source
+                        .backup_key_count(&version.user_id, version.version)
+                        .await?
+                };
+                let check = self
+                    .target
+                    .verify_backup_version(version, count)
+                    .await
+                    .map_err(target_err)?;
+                backups.checked(
+                    &format!("{}'s key backup {}", version.user_id, version.version),
+                    check,
+                );
+            }
+        }
+        streams.push(backups);
+        ctx.progress(
+            5,
+            Some(steps),
+            Some("streams"),
+            Some("end-to-end keys checked"),
+        )
+        .await;
+
+        // Push rules, pushers and filters.
+        let mut rules = StreamVerification::new(Stream::PushRules.as_str());
+        let mut after: Option<String> = None;
+        loop {
+            let page = source.push_rules(after.as_deref(), 500).await?;
+            let Some(last) = page.last() else { break };
+            after = Some(last.user_id.clone());
+            for user_rules in &page {
+                let check = self
+                    .target
+                    .verify_push_rules(user_rules)
+                    .await
+                    .map_err(target_err)?;
+                rules.checked(&format!("{}'s push rules", user_rules.user_id), check);
+            }
+        }
+        streams.push(rules);
+        let mut pushers = StreamVerification::new(Stream::Pushers.as_str());
+        let mut after: Option<i64> = None;
+        loop {
+            let page = source.pushers(after, 500).await?;
+            let Some(last) = page.last() else { break };
+            after = Some(last.id);
+            for pusher in &page {
+                let check = self
+                    .target
+                    .verify_pusher(pusher)
+                    .await
+                    .map_err(target_err)?;
+                pushers.checked(
+                    &format!("{}'s pusher {}", pusher.user_id, pusher.pushkey),
+                    check,
+                );
+            }
+        }
+        streams.push(pushers);
+        let mut filters = StreamVerification::new(Stream::Filters.as_str());
+        let mut after: Option<(String, i64)> = None;
+        let server_name = self.target.server_name().to_owned();
+        loop {
+            let page = source
+                .filters(
+                    after.as_ref().map(|(u, i)| (u.as_str(), *i)),
+                    500,
+                    &server_name,
+                )
+                .await?;
+            let Some((_, last)) = page.last() else { break };
+            after = Some(last.clone());
+            for (filter, _) in &page {
+                let check = self
+                    .target
+                    .verify_filter(filter)
+                    .await
+                    .map_err(target_err)?;
+                filters.checked(
+                    &format!("{}'s filter {}", filter.user_id, filter.filter_id),
+                    check,
+                );
+            }
+        }
+        streams.push(filters);
+        ctx.progress(
+            6,
+            Some(steps),
+            Some("streams"),
+            Some("push rules and filters checked"),
+        )
+        .await;
+
+        // Rooms, their events, and each room's current state. A room's events are compared a
+        // page at a time, as they were copied.
         let mut rooms = StreamVerification::new(Stream::Rooms.as_str());
         let mut events = StreamVerification::new("events");
+        let mut rooms_not_copied = std::collections::HashSet::new();
         let mut after: Option<String> = None;
         loop {
             let ids = source.room_ids(after.as_deref(), 100).await?;
@@ -1132,43 +1578,73 @@ impl Migrator {
                 break;
             }
             for room_id in &ids {
-                let Some(room) = source.room(room_id).await? else {
-                    continue;
-                };
-                let plan = match replay_order(&room) {
-                    Ok(plan) => plan,
-                    Err(_) => {
-                        rooms.skipped_count += 1;
-                        continue;
+                let shape = source.room_shape(room_id).await?;
+                // A room joined over federation is held from its join: its history after it is
+                // compared, and what came before is left to backfill, as the copy left it.
+                let mut since = None;
+                let mut history = shape.history;
+                let mut join_id = None;
+                if !shape.has_create {
+                    match source.remote_join(room_id).await? {
+                        Ok(join) => {
+                            let after = source.history_since(room_id, join.join_key.1).await?;
+                            events.skipped_count += shape.history.saturating_sub(after + 1);
+                            history = after + 1;
+                            since = Some(join.join_key.1);
+                            join_id = Some(join.join.event_id);
+                        }
+                        Err(_) => {
+                            rooms.skipped_count += 1;
+                            rooms_not_copied.insert(room_id.clone());
+                            continue;
+                        }
                     }
-                };
+                }
                 rooms.source_count += 1;
-                events.source_count += plan.events.len() as u64;
-                events.skipped_count += plan.skipped.len() as u64;
-                let Some(here) = self.target.room(room_id).await.map_err(target_err)? else {
+                events.source_count += history;
+                events.skipped_count += shape.outliers + shape.rejected;
+                let Some(state) = self.target.room_state(room_id).await.map_err(target_err)? else {
                     rooms.mismatch(format!("{room_id} is missing"));
                     continue;
                 };
                 rooms.target_count += 1;
-                let present = plan
-                    .events
-                    .iter()
-                    .filter(|e| here.event_ids.contains(&e.event_id))
-                    .count() as u64;
-                events.target_count += present;
-                if present < plan.events.len() as u64 {
+                let mut missing = 0_u64;
+                let mut after_event = None;
+                loop {
+                    let page = source
+                        .room_event_ids(room_id, after_event, 1000, since)
+                        .await?;
+                    let Some((_, last)) = page.last() else { break };
+                    after_event = Some(*last);
+                    let ids: Vec<String> = page.into_iter().map(|(id, _)| id).collect();
+                    missing += self
+                        .target
+                        .missing_events(room_id, &ids)
+                        .await
+                        .map_err(target_err)?
+                        .len() as u64;
+                }
+                if let Some(join_id) = join_id {
+                    missing += self
+                        .target
+                        .missing_events(room_id, &[join_id])
+                        .await
+                        .map_err(target_err)?
+                        .len() as u64;
+                }
+                events.target_count += history.saturating_sub(missing);
+                if missing > 0 {
                     events.mismatch(format!(
-                        "{room_id}: {} of {} events are missing",
-                        plan.events.len() as u64 - present,
-                        plan.events.len()
+                        "{room_id}: {missing} of {} events are missing",
+                        history
                     ));
                 }
                 rooms.sampled += 1;
                 let theirs = source.current_state(room_id).await?;
-                if theirs != here.current_state {
+                if theirs != state {
                     rooms.mismatch(format!(
                         "{room_id}: current state differs ({})",
-                        state_difference(&theirs, &here.current_state)
+                        state_difference(&theirs, &state)
                     ));
                 }
             }
@@ -1176,7 +1652,37 @@ impl Migrator {
         }
         streams.push(rooms);
         streams.push(events);
-        ctx.progress(6, Some(steps), Some("streams"), Some("rooms checked"))
+
+        // Read receipts, in the rooms.
+        let mut receipts = StreamVerification::new(Stream::Receipts.as_str());
+        let mut after: Option<i64> = None;
+        loop {
+            let page = source.receipts(after, 500).await?;
+            let Some(last) = page.last() else { break };
+            after = Some(last.stream_id);
+            for receipt in &page {
+                if receipt_not_copied(receipt).is_some()
+                    || rooms_not_copied.contains(&receipt.room_id)
+                {
+                    receipts.skipped_count += 1;
+                    continue;
+                }
+                let check = self
+                    .target
+                    .verify_receipt(receipt)
+                    .await
+                    .map_err(target_err)?;
+                receipts.checked(
+                    &format!(
+                        "{}'s {} receipt in {}",
+                        receipt.user_id, receipt.receipt_type, receipt.room_id
+                    ),
+                    check,
+                );
+            }
+        }
+        streams.push(receipts);
+        ctx.progress(7, Some(steps), Some("streams"), Some("rooms checked"))
             .await;
 
         // Media: each here; a sample's bytes compared.
@@ -1222,7 +1728,7 @@ impl Migrator {
             after = page.last().map(|(m, _)| m.media_id.clone());
         }
         streams.push(media);
-        ctx.progress(7, Some(steps), Some("streams"), Some("media checked"))
+        ctx.progress(8, Some(steps), Some("streams"), Some("media checked"))
             .await;
 
         let passed = streams
@@ -1342,6 +1848,27 @@ impl Migrator {
     }
 }
 
+/// Why a receipt is not copied, or `None` when it is: this server keeps one `m.read` and one
+/// `m.read.private` receipt per person in a room, for the room as a whole. A receipt for the
+/// room's main timeline (`thread_id` `main`) is taken as one for the room; one in a thread is
+/// left out.
+#[must_use]
+pub fn receipt_not_copied(receipt: &super::model::SynapseReceipt) -> Option<String> {
+    if !matches!(receipt.receipt_type.as_str(), "m.read" | "m.read.private") {
+        return Some(format!(
+            "a {} receipt: this server keeps m.read and m.read.private receipts",
+            receipt.receipt_type
+        ));
+    }
+    match receipt.thread_id.as_deref() {
+        None | Some("main") => None,
+        Some(thread) => Some(format!(
+            "a receipt in thread {thread}: this server keeps one receipt per person and type in \
+             a room, for the room as a whole"
+        )),
+    }
+}
+
 impl StreamVerification {
     fn new(name: &str) -> Self {
         Self {
@@ -1357,6 +1884,17 @@ impl StreamVerification {
     fn mismatch(&mut self, line: String) {
         if self.mismatches.len() < MISMATCHES_KEPT {
             self.mismatches.push(line);
+        }
+    }
+
+    /// Counts one row of Synapse's that is meant to be here, and what was found.
+    fn checked(&mut self, label: &str, check: Check) {
+        self.source_count += 1;
+        self.sampled += 1;
+        match check {
+            Check::Same => self.target_count += 1,
+            Check::Missing => self.mismatch(format!("{label} is missing")),
+            Check::Differs(what) => self.mismatch(format!("{label}: {what}")),
         }
     }
 }
