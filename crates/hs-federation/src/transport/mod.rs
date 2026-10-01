@@ -441,6 +441,72 @@ mod tests {
         assert!(!checked.contains(&"other"), "{checked:?}");
     }
 
+    /// An event ID with a `/` in it (room version 3's base64), sent the way this server's client
+    /// now sends it (`crate::client::encode_path_segment`), reaches the handler whole and the
+    /// signature over the encoded path verifies. Unencoded, the `/` split the path and the route
+    /// did not match (`404`), for half of a version-3 room's invites, joins and leaves.
+    #[tokio::test]
+    async fn an_event_id_with_a_slash_is_routed_whole_when_encoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
+        struct FixedFetcher(serde_json::Value);
+        #[async_trait]
+        impl KeyServerFetcher for FixedFetcher {
+            async fn fetch_server_key(&self, _server_name: &str) -> Option<serde_json::Value> {
+                Some(self.0.clone())
+            }
+        }
+        let origin = "them.example.org";
+        let doc = build_server_key_response(origin, &keys, &[], 3600).unwrap();
+        let key_cache: Arc<DynRemoteKeyCache> = Arc::new(RemoteKeyCache::new(
+            Box::new(FixedFetcher(doc)) as Box<dyn KeyServerFetcher>,
+        ));
+        let ctx = Arc::new(XMatrixContext {
+            own_server_name: "us.example.org".to_string(),
+            key_cache,
+        });
+        let event_id = "$Ab/cd+ef";
+        let mut rooms = InMemoryRoomSource::new();
+        rooms.insert_room(
+            "!r:us.example.org",
+            crate::room_source::FakeRoom {
+                world_readable: true,
+                events: [(
+                    event_id.to_owned(),
+                    serde_json::json!({"event_id": event_id, "type": "m.room.message"}),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+        );
+        let mut state = test_state();
+        state.rooms = Arc::new(rooms);
+        let (router, _) = router(state, ctx);
+        let path = format!("/event/{}", crate::client::encode_path_segment(event_id));
+        assert_eq!(path, "/event/$Ab%2Fcd+ef");
+        let header =
+            xmatrix::sign_request("GET", &path, origin, "us.example.org", None, keys.primary())
+                .unwrap();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(&path)
+                    .header(axum::http::header::AUTHORIZATION, header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["pdus"][0]["event_id"], event_id);
+    }
+
     #[tokio::test]
     async fn version_endpoint_works_when_properly_signed() {
         let dir = tempfile::tempdir().unwrap();

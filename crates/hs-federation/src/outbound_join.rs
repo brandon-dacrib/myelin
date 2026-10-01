@@ -193,7 +193,11 @@ pub async fn join_room_with_content(
     .await?;
     let event_id = join_event.event_id().to_string();
 
-    let send_join_path = format!("/_matrix/federation/v2/send_join/{room_id}/{event_id}");
+    let send_join_path = format!(
+        "/_matrix/federation/v2/send_join/{}/{}",
+        crate::client::encode_path_segment(room_id),
+        crate::client::encode_path_segment(&event_id)
+    );
     let send_join_response = client
         .send(destination, "PUT", &send_join_path, Some(&signed_value))
         .await
@@ -305,11 +309,17 @@ pub(crate) async fn make_and_sign(
             .map(|v| format!("ver={v}"))
             .collect();
         format!(
-            "/_matrix/federation/v1/{step}/{room_id}/{user_id}?{}",
+            "/_matrix/federation/v1/{step}/{}/{}?{}",
+            crate::client::encode_path_segment(room_id),
+            crate::client::encode_path_segment(user_id),
             supported_versions.join("&")
         )
     } else {
-        format!("/_matrix/federation/v1/{step}/{room_id}/{user_id}")
+        format!(
+            "/_matrix/federation/v1/{step}/{}/{}",
+            crate::client::encode_path_segment(room_id),
+            crate::client::encode_path_segment(user_id)
+        )
     };
     let make_join_response = client
         .send(destination, "GET", &template_path, None)

@@ -70,8 +70,9 @@ pub async fn leave_room(
     .await?;
     check_membership(&event, "leave", destination)?;
     let path = format!(
-        "/_matrix/federation/v2/send_leave/{room_id}/{}",
-        event.event_id()
+        "/_matrix/federation/v2/send_leave/{}/{}",
+        crate::client::encode_path_segment(room_id),
+        crate::client::encode_path_segment(event.event_id().as_str())
     );
     submit(client, destination, "send_leave", &path, &value).await?;
     Ok(RemoteMembershipOutcome {
@@ -115,8 +116,9 @@ pub async fn knock_room(
     .await?;
     check_membership(&event, "knock", destination)?;
     let path = format!(
-        "/_matrix/federation/v1/send_knock/{room_id}/{}",
-        event.event_id()
+        "/_matrix/federation/v1/send_knock/{}/{}",
+        crate::client::encode_path_segment(room_id),
+        crate::client::encode_path_segment(event.event_id().as_str())
     );
     let body = submit(client, destination, "send_knock", &path, &value).await?;
     let room_state = body
@@ -153,8 +155,9 @@ pub async fn send_invite(
     })?;
     let room_id = pdu.get("room_id").and_then(Value::as_str).unwrap_or("");
     let path = format!(
-        "/_matrix/federation/v2/invite/{room_id}/{}",
-        event.event_id()
+        "/_matrix/federation/v2/invite/{}/{}",
+        crate::client::encode_path_segment(room_id),
+        crate::client::encode_path_segment(event.event_id().as_str())
     );
     let body = json!({
         "room_version": room_version.as_str(),

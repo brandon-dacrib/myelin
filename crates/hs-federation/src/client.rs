@@ -165,6 +165,41 @@ pub enum ClientError {
     },
 }
 
+/// `segment` (a room, event or user ID) made safe to put in one path segment of a federation
+/// request: every byte that is not an RFC 3986 `pchar` is percent-encoded. The characters Matrix
+/// IDs ordinarily carry (`!`, `$`, `@`, `:`, `+`, `=`) stay as they are, but an event ID of room
+/// version 3 is standard base64 and can contain `/`, which unencoded split the path in two: the
+/// other server answered `404 M_UNRECOGNIZED`, about half the time, for every invite, join and
+/// leave in such a room (Sytest's "User can invite remote user to room with version 3").
+#[must_use]
+pub fn encode_path_segment(segment: &str) -> String {
+    percent_encode(segment, |b| {
+        b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@".contains(&b)
+    })
+}
+
+/// [`encode_path_segment`] for a query-string value: `&`, `=`, `+` and `#` are encoded too, so
+/// an event ID's `+` is not read back as a space nor its `/` or `=` as anything but itself.
+#[must_use]
+pub fn encode_query_value(value: &str) -> String {
+    percent_encode(value, |b| {
+        b.is_ascii_alphanumeric() || b"-._~!$:@".contains(&b)
+    })
+}
+
+fn percent_encode(raw: &str, keep: impl Fn(u8) -> bool) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(raw.len());
+    for &b in raw.as_bytes() {
+        if keep(b) {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
 /// The body of a non-success response, cut to what a log line can carry.
 fn rejection_body(body: &serde_json::Value) -> String {
     let text = body.to_string();
@@ -561,10 +596,13 @@ impl FederationClient {
         from_event_ids: &[String],
         limit: usize,
     ) -> Result<Vec<serde_json::Value>, ClientError> {
-        let mut path = format!("/_matrix/federation/v1/backfill/{room_id}?limit={limit}");
+        let mut path = format!(
+            "/_matrix/federation/v1/backfill/{}?limit={limit}",
+            encode_path_segment(room_id)
+        );
         for id in from_event_ids {
             path.push_str("&v=");
-            path.push_str(id);
+            path.push_str(&encode_query_value(id));
         }
         let response = self.send(destination, "GET", &path, None).await?;
         if response.status / 100 != 2 {
@@ -617,7 +655,11 @@ impl FederationClient {
         room_id: &str,
         event_id: &str,
     ) -> Result<(Vec<String>, Vec<String>), ClientError> {
-        let path = format!("/_matrix/federation/v1/state_ids/{room_id}?event_id={event_id}");
+        let path = format!(
+            "/_matrix/federation/v1/state_ids/{}?event_id={}",
+            encode_path_segment(room_id),
+            encode_query_value(event_id)
+        );
         let body = self.get_ok(destination, &path).await?;
         let ids = |field: &str| -> Result<Vec<String>, ClientError> {
             body.get(field)
@@ -655,7 +697,11 @@ impl FederationClient {
         room_id: &str,
         event_id: &str,
     ) -> Result<(Vec<Value>, Vec<Value>), ClientError> {
-        let path = format!("/_matrix/federation/v1/state/{room_id}?event_id={event_id}");
+        let path = format!(
+            "/_matrix/federation/v1/state/{}?event_id={}",
+            encode_path_segment(room_id),
+            encode_query_value(event_id)
+        );
         let body = self.get_ok(destination, &path).await?;
         let events = |field: &str| -> Result<Vec<Value>, ClientError> {
             body.get(field)
@@ -678,7 +724,10 @@ impl FederationClient {
     /// # Errors
     /// See [`ClientError`]; an answer with no PDU is [`ClientError::BadResponseJson`].
     pub async fn event(&self, destination: &str, event_id: &str) -> Result<Value, ClientError> {
-        let path = format!("/_matrix/federation/v1/event/{event_id}");
+        let path = format!(
+            "/_matrix/federation/v1/event/{}",
+            encode_path_segment(event_id)
+        );
         let body = self.get_ok(destination, &path).await?;
         body.get("pdus")
             .and_then(Value::as_array)
@@ -708,8 +757,10 @@ impl FederationClient {
         room_id: &str,
         suggested_only: bool,
     ) -> Result<serde_json::Value, ClientError> {
-        let path =
-            format!("/_matrix/federation/v1/hierarchy/{room_id}?suggested_only={suggested_only}");
+        let path = format!(
+            "/_matrix/federation/v1/hierarchy/{}?suggested_only={suggested_only}",
+            encode_path_segment(room_id)
+        );
         let response = self.send(destination, "GET", &path, None).await?;
         if response.status / 100 != 2 {
             return Err(ClientError::Rejected {
@@ -738,7 +789,10 @@ impl FederationClient {
         limit: usize,
         min_depth: i64,
     ) -> Result<Vec<serde_json::Value>, ClientError> {
-        let path = format!("/_matrix/federation/v1/get_missing_events/{room_id}");
+        let path = format!(
+            "/_matrix/federation/v1/get_missing_events/{}",
+            encode_path_segment(room_id)
+        );
         let body = serde_json::json!({
             "earliest_events": earliest_events,
             "latest_events": latest_events,
@@ -961,6 +1015,23 @@ mod tests {
     use crate::discovery::WellKnownOutcome;
     use async_trait::async_trait;
     use hs_testkit::fake_federation::FakeFederationPeer;
+
+    /// A room-version-3 event ID is standard base64 and may carry `/`, `+` and `=`: in a path
+    /// segment only the `/` (and anything else outside `pchar`) is encoded; in a query value `+`
+    /// and `=` are too, so neither is read back as a space or a separator.
+    #[test]
+    fn ids_are_encoded_for_paths_and_queries() {
+        assert_eq!(
+            encode_path_segment("$Ab/cd+ef=:x.org"),
+            "$Ab%2Fcd+ef=:x.org"
+        );
+        assert_eq!(
+            encode_path_segment("!room:example.org"),
+            "!room:example.org"
+        );
+        assert_eq!(encode_path_segment("@a b#?%"), "@a%20b%23%3F%25");
+        assert_eq!(encode_query_value("$Ab/cd+ef="), "$Ab%2Fcd%2Bef%3D");
+    }
     use std::net::{Ipv4Addr, SocketAddr as StdSocketAddr};
     use tokio::net::TcpListener;
 

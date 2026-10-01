@@ -235,6 +235,51 @@ async fn a_version_1_room_is_joined_over_federation_and_messages_cross() {
     joined.b.handle.shutdown().await;
 }
 
+/// A room of version 3, whose event IDs are standard base64 and so about half the time carry a
+/// `/`: six invites from A to users of B all go through. Before the client percent-encoded the
+/// IDs in its request paths, the `/` split the path, B answered `404 M_UNRECOGNIZED`, and each
+/// invite failed with even odds (Sytest's "User can invite remote user to room with version 3"
+/// passed or failed from one run to the next); six in a row all succeeding was about 1 in 60.
+#[tokio::test]
+async fn invites_in_a_version_3_room_reach_another_server_whatever_their_event_ids() {
+    let a = start(reserve_port()).await;
+    let b = start(reserve_port()).await;
+    let client = reqwest::Client::new();
+    let (_, alice_token) = register(&client, &a.base, "alice").await;
+    let created: Value = client
+        .post(format!("{}/_matrix/client/v3/createRoom", a.base))
+        .bearer_auth(&alice_token)
+        .json(&json!({"preset": "private_chat", "room_version": "3"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let room_id = created["room_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("createRoom failed: {created}"))
+        .to_owned();
+    for i in 0..6 {
+        let (invitee, _) = register(&client, &b.base, &format!("guest{i}")).await;
+        let response = client
+            .post(format!(
+                "{}/_matrix/client/v3/rooms/{room_id}/invite",
+                a.base
+            ))
+            .bearer_auth(&alice_token)
+            .json(&json!({"user_id": invitee}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: Value = response.json().await.unwrap_or(Value::Null);
+        assert_eq!(status, 200, "inviting {invitee} failed: {body}");
+    }
+    a.handle.shutdown().await;
+    b.handle.shutdown().await;
+}
+
 /// Bob, on B, redacts his own message; on A, where the redaction arrives over federation, the
 /// message's content is gone. Before the fix the redaction was stored on A and the message kept
 /// its body there (Sytest's "Can receive redactions from regular users over federation").
