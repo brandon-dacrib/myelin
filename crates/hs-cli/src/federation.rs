@@ -239,7 +239,19 @@ fn content_str<'a>(event: &'a Event, key: &str) -> Option<&'a str> {
 /// adds `event_id` -- a remote server cannot verify an event whose signature material has been
 /// removed, and (for every room version this server creates) must not be sent an `event_id` field
 /// at all, since it is not part of the signed object.
+///
+/// A redacted event is served in its redacted form -- still hashed and signed, still a PDU the
+/// requester can verify (its content hash then fails, and the spec has the receiver redact it,
+/// which it already is) -- as Synapse serves it: another server is not handed what was taken
+/// back. The redacted form keeps no `unsigned`, so the redaction this server names in it for its
+/// own clients (`unsigned.redacted_because`, `hs_room::actor::redactions`) never leaves either;
+/// Synapse strips both from a PDU too. Until 2026-10-01 a redacted event went out whole.
 fn full_pdu(event: &Event) -> Value {
+    if event.header().flags.is_redacted()
+        && let Ok(redacted) = event.redacted_json()
+    {
+        return canonical_to_json(&redacted);
+    }
     canonical_to_json(event.json())
 }
 
@@ -316,17 +328,32 @@ fn event_by_str<'a, B: KvBackend>(actor: &'a RoomActor<B>, event_id: &str) -> Op
     actor.event_by_id(&parsed)
 }
 
-/// The transitive closure of `roots`' `auth_events`, breadth-first, excluding the roots
-/// themselves and bounded by [`MAX_AUTH_CHAIN`]. Events the actor does not hold (an auth event
+/// The transitive closure of `roots`' `auth_events`, breadth-first and bounded by
+/// [`MAX_AUTH_CHAIN`]: every event reachable through an `auth_events` edge, a root only when
+/// another root reaches it. Events the actor does not hold (an auth event
 /// this server never received) are skipped rather than failing the whole call: a partial auth
 /// chain is what the requesting server would have to reconstruct anyway, and refusing the whole
 /// response because one link is missing helps nobody.
 fn auth_chain_from<B: KvBackend>(actor: &RoomActor<B>, roots: &[String]) -> Vec<Value> {
-    let mut seen: HashSet<String> = roots.iter().cloned().collect();
-    let mut queue: VecDeque<String> = roots.iter().cloned().collect();
+    // Every event reached through an `auth_events` edge from a root is in the chain -- a root
+    // included, when another root cites it. The roots are the events being asked *about*, so
+    // one that no root cites is not its own ancestor and stays out; but a room's state is
+    // mostly its own auth events (the create event, the power levels, the creator's join), and
+    // leaving every root out answered `send_join` with an empty auth chain for a room whose auth
+    // events were all current state (Sytest's "Inbound federation can receive v1/v2
+    // /send_join", until 2026-10-01). Synapse's `get_auth_chain_ids` answers the same set.
+    let mut reached: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = roots
+        .iter()
+        .filter_map(|id| event_by_str(actor, id))
+        .flat_map(auth_event_ids)
+        .collect();
     let mut chain = Vec::new();
 
     while let Some(id) = queue.pop_front() {
+        if !reached.insert(id.clone()) {
+            continue;
+        }
         if chain.len() >= MAX_AUTH_CHAIN {
             tracing::warn!(
                 room_id = %actor.room_id(),
@@ -337,16 +364,12 @@ fn auth_chain_from<B: KvBackend>(actor: &RoomActor<B>, roots: &[String]) -> Vec<
         let Some(event) = event_by_str(actor, &id) else {
             continue;
         };
-        for next in auth_event_ids(event) {
-            if seen.insert(next.clone()) {
-                queue.push_back(next);
-            }
-        }
-        // The roots are the events being asked *about*; their auth chain is everything they
-        // reach, not including themselves.
-        if !roots.contains(&id) {
-            chain.push(full_pdu(event));
-        }
+        queue.extend(
+            auth_event_ids(event)
+                .into_iter()
+                .filter(|next| !reached.contains(next)),
+        );
+        chain.push(full_pdu(event));
     }
     chain
 }
@@ -1273,8 +1296,12 @@ pub fn build_mount<B: KvBackend + 'static>(
     // destination that is down survives a restart of this process, and
     // `crate::federation_sender::OutboundFederation::start` resumes it.
     let outbound_store: Arc<dyn hs_federation::outbound_store::OutboundStore> = Arc::new(
-        hs_federation::outbound_store::KvOutboundStore::open(backend)?,
+        hs_federation::outbound_store::KvOutboundStore::open(backend.clone())?,
     );
+    // Other servers' key responses, kept: the notary answers for a server that is down after a
+    // restart, and keys verify without being fetched again (`hs_federation::key_store`).
+    let held_keys: Arc<dyn hs_federation::key_store::HeldKeyStore> =
+        Arc::new(hs_federation::key_store::KvHeldKeyStore::open(backend)?);
     let well_known = Arc::new(hs_federation::discovery::CachingWellKnownFetcher::new(
         hs_federation::discovery::HttpWellKnownFetcher::new(),
     ));
@@ -1290,10 +1317,12 @@ pub fn build_mount<B: KvBackend + 'static>(
         addr,
     ));
 
-    let key_cache: Arc<hs_federation::keys::DynRemoteKeyCache> = Arc::new(
-        hs_federation::keys::RemoteKeyCache::new(Box::new(ClientKeyFetcher::new(client.clone()))
-            as Box<dyn hs_federation::keys::KeyServerFetcher>),
-    );
+    let key_cache: Arc<hs_federation::keys::DynRemoteKeyCache> =
+        Arc::new(hs_federation::keys::RemoteKeyCache::with_store(
+            Box::new(ClientKeyFetcher::new(client.clone()))
+                as Box<dyn hs_federation::keys::KeyServerFetcher>,
+            held_keys,
+        ));
 
     // The same client again: a transaction to a destination that is backing off waits for the
     // same `retry_at` every other outbound call to it does, and an administrator's reset of that

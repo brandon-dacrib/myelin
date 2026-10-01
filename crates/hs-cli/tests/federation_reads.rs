@@ -104,12 +104,15 @@ impl Harness {
             key_cache,
         });
 
-        let (router, _manifest) = hs_federation::transport::router(state, ctx);
+        let (router, _manifest) = hs_federation::transport::router(state.clone(), ctx.clone());
+        let (router_v2, _manifest) = hs_federation::transport::router_v2(state, ctx);
         // Mounted exactly where `hs serve` mounts it, prefix and all. That is not incidental:
         // `axum::Router::nest` rewrites the URI the inner layers see, so a verifier that signs
         // over the rewritten path disagrees with every real sender. Driving the router at the
         // root here would hide that.
-        let router = axum::Router::new().nest("/_matrix/federation/v1", router);
+        let router = axum::Router::new()
+            .nest("/_matrix/federation/v1", router)
+            .nest("/_matrix/federation/v2", router_v2);
         Self {
             router,
             remote_key,
@@ -165,6 +168,64 @@ impl Harness {
             .unwrap();
         let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         (status, body)
+    }
+
+    /// Sends a PUT as the remote server would, to `/_matrix/federation/{version}{path}`.
+    async fn signed_put(&self, version: &str, path: &str, body: Value) -> (StatusCode, Value) {
+        let uri = format!("/_matrix/federation/{version}{path}");
+        let auth = hs_federation::xmatrix::sign_request(
+            "PUT",
+            &uri,
+            REMOTE,
+            US,
+            Some(&body),
+            &self.remote_key,
+        )
+        .expect("signing");
+        let request = Request::builder()
+            .method("PUT")
+            .uri(&uri)
+            .header("Authorization", auth)
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let response = self.router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 22)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    /// Signs a membership template the way the remote server would: `event_id` of its own making
+    /// (rooms of version 1 and 2), the content hash, then the signature over the redacted form.
+    fn sign_as_remote(&self, template: &Value, room_version: &ruma::RoomVersionId) -> Value {
+        use hs_model::canonical::{CanonicalJsonObject, CanonicalJsonValue, to_canonical_object};
+        let rules = hs_model::room_version::rules_for(room_version).unwrap();
+        let mut object = to_canonical_object(template, rules.strict_canonical_json).unwrap();
+        let remote = ruma::ServerName::parse(REMOTE).unwrap();
+        if rules.event_format_requires_event_id {
+            object.insert(
+                "event_id".to_owned(),
+                CanonicalJsonValue::String(ruma::EventId::new_v1(&remote).to_string()),
+            );
+        }
+        let hash = hs_model::hash::content_hash_base64(&object);
+        object.insert(
+            "hashes".to_owned(),
+            CanonicalJsonValue::Object(CanonicalJsonObject::from([(
+                "sha256".to_owned(),
+                CanonicalJsonValue::String(hash),
+            )])),
+        );
+        let mut redacted = hs_model::redaction::redact(&object, &rules.redaction).unwrap();
+        hs_model::signing::sign_object(&mut redacted, &remote, &self.remote_key).unwrap();
+        object.insert(
+            "signatures".to_owned(),
+            redacted.remove("signatures").unwrap(),
+        );
+        serde_json::from_slice(&CanonicalJsonValue::Object(object).to_canonical_bytes()).unwrap()
     }
 
     /// The room's `m.room.create` event ID, read from the room itself. It cannot be read off a
@@ -302,6 +363,9 @@ async fn a_world_readable_room_serves_its_events_as_full_pdus() {
 
     let (status, body) = harness.signed_get(&format!("/event/{event_id}")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    // The spec's `Transaction`: who answered, and when (missing until 2026-10-01).
+    assert_eq!(body["origin"], US, "{body}");
+    assert!(body["origin_server_ts"].as_u64().is_some(), "{body}");
 
     let pdu = &body["pdus"][0];
     assert_eq!(pdu["room_id"], room_id);
@@ -425,6 +489,8 @@ async fn backfill_walks_the_timeline_backwards_from_the_live_end() {
         .signed_get(&format!("/backfill/{room_id}?limit=10"))
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["origin"], US, "{body}");
+    assert!(body["origin_server_ts"].as_u64().is_some(), "{body}");
     let pdus = body["pdus"].as_array().expect("pdus");
     assert!(
         pdus.iter().any(|e| e["type"] == "m.room.message"),
@@ -438,6 +504,120 @@ async fn backfill_walks_the_timeline_backwards_from_the_live_end() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let pdus = body["pdus"].as_array().expect("pdus");
     assert!(pdus.len() <= 3, "the server-side limit must be honoured");
+}
+
+/// A version-1 room joined the way Sytest's "Inbound federation can receive v1/v2 /send_join"
+/// joins it: `make_join`, sign, `send_join`. Both spellings answer the room's state with an auth
+/// chain that is the state's own -- every event reached through `auth_events`, the create event,
+/// the power levels and the creator's join among them -- and from which every event of the chain
+/// can be authorised in turn. The chain was empty until 2026-10-01: every one of those events is
+/// current state, and the walk left the state events out.
+#[tokio::test]
+async fn send_join_answers_the_auth_chain_of_the_rooms_state() {
+    let harness = Harness::new().await;
+    let creator = ruma::UserId::parse(format!("@alice:{US}")).unwrap();
+    let handle = harness
+        .rooms
+        .create_room(
+            creator,
+            hs_room::actor::CreateRoomRequest {
+                room_version: Some(ruma::RoomVersionId::V1),
+                preset: Some("public_chat".to_owned()),
+                ..Default::default()
+            },
+            1_000,
+        )
+        .await
+        .expect("room creation");
+    let room_id = handle.query(|actor| actor.room_id().to_string()).await;
+
+    for (version, user) in [("v1", "bob"), ("v2", "carol")] {
+        let user_id = format!("@{user}:{REMOTE}");
+        let (status, made) = harness
+            .signed_get(&format!("/make_join/{room_id}/{user_id}"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{made}");
+        assert_eq!(made["room_version"], "1");
+        let signed = harness.sign_as_remote(&made["event"], &ruma::RoomVersionId::V1);
+        let event_id = signed["event_id"].as_str().unwrap().to_owned();
+        let (status, answer) = harness
+            .signed_put(version, &format!("/send_join/{room_id}/{event_id}"), signed)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{version}: {answer}");
+        let answer = if version == "v1" {
+            assert_eq!(answer[0], 200, "{answer}");
+            answer[1].clone()
+        } else {
+            answer
+        };
+        let chain = answer["auth_chain"].as_array().expect("auth_chain");
+        for wanted in ["m.room.create", "m.room.power_levels", "m.room.member"] {
+            assert!(
+                chain.iter().any(|e| e["type"] == wanted),
+                "{version}: the auth chain has no {wanted}: {chain:?}"
+            );
+        }
+        // Closed under `auth_events`: every event a chain event cites is in the chain.
+        let ids: std::collections::HashSet<&str> = chain
+            .iter()
+            .filter_map(|e| e["event_id"].as_str())
+            .collect();
+        for event in chain {
+            for cited in event["auth_events"].as_array().unwrap() {
+                let cited = cited[0].as_str().unwrap();
+                assert!(
+                    ids.contains(cited),
+                    "{version}: {cited} is cited but not in the chain"
+                );
+            }
+        }
+        assert!(!answer["state"].as_array().unwrap().is_empty());
+    }
+}
+
+/// `make_join` refuses a user of another server than the one asking -- this server's own, here
+/// -- with `403 M_FORBIDDEN`, and a room no user of this server is in any more with
+/// `404 M_NOT_FOUND`. Both were answered with a template until 2026-10-01 (Sytest's "Inbound
+/// /v1/make_join rejects remote attempts to join local users to rooms" and "Inbound /make_join
+/// rejects attempts to join rooms where all users have left").
+#[tokio::test]
+async fn make_join_refuses_another_servers_user_and_a_room_this_server_has_left() {
+    let harness = Harness::new().await;
+    let (room_id, _) = harness.room_with_a_message(false).await;
+
+    let (status, body) = harness
+        .signed_get(&format!("/make_join/{room_id}/@mallory:{US}?ver=11&ver=12"))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["errcode"], "M_FORBIDDEN");
+
+    let path = format!("/make_join/{room_id}/@bob:{REMOTE}?ver=11&ver=12");
+    let (status, body) = harness.signed_get(&path).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "before the last local member leaves: {body}"
+    );
+
+    let parsed = ruma::RoomId::parse(&room_id).unwrap();
+    let alice = ruma::UserId::parse(format!("@alice:{US}")).unwrap();
+    harness
+        .rooms
+        .get_or_load(&parsed)
+        .await
+        .unwrap()
+        .membership(
+            alice.clone(),
+            hs_room::membership::Action::Leave,
+            alice,
+            serde_json::json!({}),
+            9_000,
+        )
+        .await
+        .expect("alice leaves");
+    let (status, body) = harness.signed_get(&path).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["errcode"], "M_NOT_FOUND");
 }
 
 #[tokio::test]
