@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ipnet::IpNet;
+use serde_json::Value;
 use tokio::sync::Semaphore;
 
 use crate::destination_store::DestinationStore;
@@ -579,6 +580,116 @@ impl FederationClient {
             .and_then(serde_json::Value::as_array)
             .cloned()
             .unwrap_or_default())
+    }
+
+    /// A signed `GET` of `path` on `destination` whose answer must be a `2xx`: the body, or
+    /// [`ClientError::Rejected`] with what the server said.
+    async fn get_ok(&self, destination: &str, path: &str) -> Result<Value, ClientError> {
+        let response = self.send(destination, "GET", path, None).await?;
+        if response.status / 100 != 2 {
+            return Err(ClientError::Rejected {
+                destination: destination.to_owned(),
+                status: response.status,
+                body: rejection_body(&response.body),
+            });
+        }
+        Ok(response.body)
+    }
+
+    /// The outbound half of `GET /state_ids/{roomId}?event_id=`: the IDs of the room's state
+    /// *before* `event_id` (the spec's "state at the event", which a spec-conforming server --
+    /// Synapse's `get_state_ids_for_pdu`, and this one's `crate::transport::read_routes` -- does
+    /// not include the event itself in), and of that state's auth chain, as
+    /// `(pdu_ids, auth_chain_ids)`. Nothing is fetched beyond the IDs: what the caller does not
+    /// hold it asks for with [`FederationClient::event`], or all at once with
+    /// [`FederationClient::room_state`].
+    ///
+    /// `hs_cli::backfill` is the caller: the state at the oldest event of a backfilled batch,
+    /// from which the state at every other event of the batch is derived.
+    ///
+    /// # Errors
+    /// See [`ClientError`]; a non-`2xx` (an event the server does not know, or a room it will not
+    /// show this server) is [`ClientError::Rejected`], and an answer without the two lists is
+    /// [`ClientError::BadResponseJson`].
+    pub async fn state_ids(
+        &self,
+        destination: &str,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<(Vec<String>, Vec<String>), ClientError> {
+        let path = format!("/_matrix/federation/v1/state_ids/{room_id}?event_id={event_id}");
+        let body = self.get_ok(destination, &path).await?;
+        let ids = |field: &str| -> Result<Vec<String>, ClientError> {
+            body.get(field)
+                .and_then(Value::as_array)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .ok_or_else(|| {
+                    ClientError::BadResponseJson(
+                        destination.to_owned(),
+                        format!("/state_ids answered without `{field}`"),
+                    )
+                })
+        };
+        Ok((ids("pdu_ids")?, ids("auth_chain_ids")?))
+    }
+
+    /// The outbound half of `GET /state/{roomId}?event_id=`: [`FederationClient::state_ids`]
+    /// with the events themselves, as `(pdus, auth_chain)`. Heavier -- every state event of the
+    /// room, whether the caller holds it or not -- so it is the fallback for when `/state_ids`
+    /// fails, or when so much of the state is missing that one request beats one
+    /// [`FederationClient::event`] per event.
+    ///
+    /// The returned events are **not verified**; the caller runs each through
+    /// `crate::inbound::verify_pdu` before trusting it.
+    ///
+    /// # Errors
+    /// See [`ClientError`] and [`FederationClient::state_ids`].
+    pub async fn room_state(
+        &self,
+        destination: &str,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<(Vec<Value>, Vec<Value>), ClientError> {
+        let path = format!("/_matrix/federation/v1/state/{room_id}?event_id={event_id}");
+        let body = self.get_ok(destination, &path).await?;
+        let events = |field: &str| -> Result<Vec<Value>, ClientError> {
+            body.get(field)
+                .and_then(Value::as_array)
+                .cloned()
+                .ok_or_else(|| {
+                    ClientError::BadResponseJson(
+                        destination.to_owned(),
+                        format!("/state answered without `{field}`"),
+                    )
+                })
+        };
+        Ok((events("pdus")?, events("auth_chain")?))
+    }
+
+    /// The outbound half of `GET /event/{eventId}`: one PDU by ID (the first of the answer's
+    /// `pdus`). **Not verified**; the caller runs it through `crate::inbound::verify_pdu`, and
+    /// checks it is the event it asked for.
+    ///
+    /// # Errors
+    /// See [`ClientError`]; an answer with no PDU is [`ClientError::BadResponseJson`].
+    pub async fn event(&self, destination: &str, event_id: &str) -> Result<Value, ClientError> {
+        let path = format!("/_matrix/federation/v1/event/{event_id}");
+        let body = self.get_ok(destination, &path).await?;
+        body.get("pdus")
+            .and_then(Value::as_array)
+            .and_then(|pdus| pdus.first())
+            .cloned()
+            .ok_or_else(|| {
+                ClientError::BadResponseJson(
+                    destination.to_owned(),
+                    "/event answered without a PDU".to_owned(),
+                )
+            })
     }
 
     /// The outbound half of `GET /hierarchy/{roomId}` (MSC2946): asks `destination` to describe

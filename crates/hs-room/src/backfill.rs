@@ -30,6 +30,7 @@
 //! [`RoomActor::accept_backfilled_events`]: crate::actor::RoomActor::accept_backfilled_events
 
 use async_trait::async_trait;
+use hs_model::Event;
 use ruma::{OwnedEventId, RoomId};
 
 use crate::error::RoomError;
@@ -105,4 +106,101 @@ pub struct GapFill {
     pub added: usize,
     /// Whether the gap is closed now: nothing more will be fetched for it.
     pub closed: bool,
+}
+
+/// Which history a batch is: where it goes in the timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryKind {
+    /// Before the oldest event held: a room joined elsewhere, read back past the join.
+    BeforeOldest,
+    /// Inside the gap below timeline position `top`: what happened between a leave and the
+    /// rejoin at `top` (`crate::actor::gaps`).
+    Gap {
+        /// The position of the event the gap sits below.
+        top: i64,
+    },
+}
+
+impl HistoryKind {
+    /// The `kind` label of `hs_room_backfilled_events_total` and its siblings: `before_oldest`
+    /// or `rejoin_gap`.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::BeforeOldest => "before_oldest",
+            Self::Gap { .. } => "rejoin_gap",
+        }
+    }
+}
+
+/// What a fetch needs to know about a batch before it is placed: which of its events is the
+/// oldest that will be placed (the state is asked for at that one) and which events it cites
+/// as `auth_events` that are neither held nor in the batch. Produced by
+/// `crate::actor::RoomActor::plan_history`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryPlan {
+    /// The oldest event of the batch that would be placed: what `/state_ids?event_id=` names.
+    pub oldest: OwnedEventId,
+    /// `auth_events` the batch's events cite that this server does not hold and the batch does
+    /// not contain. Fetched alongside the state, so every event can be authorized.
+    pub missing_auth: Vec<OwnedEventId>,
+}
+
+/// The state at the oldest event of a batch, as the server that sent the batch answered it:
+/// what lets the state at every event of the batch be *derived forward* rather than walked
+/// back from what is held (`crate::actor::RoomActor::accept_history`).
+#[derive(Debug, Clone)]
+pub struct FetchedState {
+    /// The event the state was asked at: [`HistoryPlan::oldest`]. A batch whose oldest event
+    /// turns out to be another one is placed with the walk instead.
+    pub at: OwnedEventId,
+    /// The room's state *before* `at`, as event IDs (`/state_ids`' `pdu_ids`, or the IDs of
+    /// `/state`'s `pdus`).
+    pub state_ids: Vec<OwnedEventId>,
+    /// Events this server did not hold that the state, its auth chain or the batch's
+    /// `auth_events` name, fetched (`/event/{eventId}`, or `/state`) and verified by the caller
+    /// (hashes and signatures). Each is authorized against its own `auth_events` and stored as
+    /// an outlier; one that fails is left out, and so is its place in the state.
+    pub events: Vec<Event>,
+}
+
+/// Where the state at a placed batch's events came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateSource {
+    /// Asked for: the state at the batch's oldest event from the server that sent it
+    /// ([`FetchedState`]), and every later event's state derived forward from it.
+    Fetched,
+    /// Walked back from the state held at the event the batch sits below, because nothing was
+    /// fetched (the server could not answer, or this is a caller with no federation).
+    Walked,
+}
+
+impl StateSource {
+    /// The `outcome` label of `hs_room_backfill_batches_total`: `state_fetched` or
+    /// `state_walked`.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fetched => "state_fetched",
+            Self::Walked => "state_walked",
+        }
+    }
+}
+
+/// What `crate::actor::RoomActor::accept_history` did with one batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryOutcome {
+    /// How many events were newly placed in the timeline, placed outliers included.
+    pub added: usize,
+    /// How many failed authorization at their position and were not placed.
+    pub rejected: usize,
+    /// How many were placed without an authorization check because their `auth_events` were
+    /// out of reach (only when the state was walked, not fetched).
+    pub unchecked: usize,
+    /// How many events the state fetch brought were stored as outliers.
+    pub state_events_stored: usize,
+    /// Where the state at the placed events came from.
+    pub state: StateSource,
+    /// For a gap: whether it is closed now. Always `false` for history before the oldest event.
+    pub gap_closed: bool,
 }

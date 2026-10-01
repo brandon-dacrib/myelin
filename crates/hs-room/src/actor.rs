@@ -31,6 +31,7 @@ use crate::timeline::{Direction, PaginationToken};
 
 pub mod admin_ops;
 pub mod gaps;
+mod history;
 
 fn to_kv(e: hs_tables::keyspace::TableError) -> hs_kv::KvError {
     match e {
@@ -323,6 +324,18 @@ pub struct RoomActor<B: KvBackend> {
     /// positions reserved for history this server was not in the room for (`gaps`'s module
     /// docs). Usually empty; one per rejoin through another server.
     gaps: BTreeMap<i64, gaps::Gap>,
+    /// The state after each outlier that backfill has since placed in the timeline
+    /// (`history`): the store's own `state_at` for an outlier is meaningless
+    /// ([`RoomActor::feed_store_outlier`]) and cannot be replaced (the store takes an event
+    /// once), so the state computed for it at placement -- durable as its
+    /// `Tables::state_snapshots` row -- is held here as a root and read in its place
+    /// ([`RoomActor::root_after`]).
+    placed_outlier_roots: HashMap<EventSn, <ProductionStateStore<B> as StateStore>::Root>,
+    /// History events another server sent that failed authorization at their position
+    /// (`history`): never stored, and never again counted as missing from a timeline gap.
+    /// In-memory only; after a reload a gap that cites one asks for it once more and rejects it
+    /// again.
+    rejected_history: HashSet<OwnedEventId>,
     /// `target_event_id -> [child EventSn]`, insertion order, for `crate::relations`.
     relations_by_target: HashMap<OwnedEventId, Vec<EventSn>>,
     /// `(sender, device_id-or-empty, txn_id) -> event_id`: transaction-ID deduplication for
@@ -502,6 +515,8 @@ impl<B: KvBackend> RoomActor<B> {
             timeline: BTreeMap::new(),
             next_room_pos: 1,
             gaps: BTreeMap::new(),
+            placed_outlier_roots: HashMap::new(),
+            rejected_history: HashSet::new(),
             relations_by_target: HashMap::new(),
             txn_dedup: HashMap::new(),
             event_txn: HashMap::new(),
@@ -673,9 +688,13 @@ impl<B: KvBackend> RoomActor<B> {
         for (room_pos, event_sn) in entries {
             // An outlier placed in the timeline by backfill
             // (`RoomActor::accept_backfilled_events`) was absorbed with the outliers above and
-            // stays what it was; here it only gets its position.
+            // stays what it was; here it gets its position, and the state computed for it at
+            // placement (its `state_snapshots` row) is what reads of the state after it see.
             if actor.events.contains_key(&event_sn) {
                 actor.timeline.insert(room_pos, event_sn);
+                if let Some(state) = explicit_states.remove(&event_sn) {
+                    actor.record_placed_outlier_state(event_sn, &state)?;
+                }
                 continue;
             }
             let Some((event, purged)) = read_event_row(event_sn)? else {
@@ -925,8 +944,12 @@ impl<B: KvBackend> RoomActor<B> {
         let root = if prev_sns.is_empty() {
             self.store.empty_root()
         } else {
+            let roots: Vec<_> = prev_sns
+                .iter()
+                .map(|sn| self.root_after(*sn))
+                .collect::<Result<_, _>>()?;
             self.store
-                .current_state(&self.room_version, prev_sns)
+                .resolve(&self.room_version, &roots)
                 .map_err(|e| RoomError::State(e.to_string()))?
         };
         Ok(RoomStateView {
@@ -942,6 +965,69 @@ impl<B: KvBackend> RoomActor<B> {
         self.state_view(&self.forward_extremities_vec())
     }
 
+    /// The state store's root for the room's state immediately after the event `sn`: the store's
+    /// own `state_at`, except for an outlier backfill has placed in the timeline, whose state
+    /// is the one computed for it at placement ([`RoomActor::placed_outlier_roots`]).
+    ///
+    /// # Errors
+    /// [`RoomError::State`] if the store does not know `sn`.
+    fn root_after(
+        &self,
+        sn: EventSn,
+    ) -> Result<<ProductionStateStore<B> as StateStore>::Root, RoomError> {
+        if let Some(root) = self.placed_outlier_roots.get(&sn) {
+            return Ok(*root);
+        }
+        self.store
+            .state_at(sn)
+            .map_err(|e| RoomError::State(e.to_string()))
+    }
+
+    /// A root holding exactly the state events `state` (one per `(type, state_key)`, a later
+    /// entry winning), then `plus` over them. Entries this actor does not hold, or that are
+    /// not state events, are skipped.
+    ///
+    /// # Errors
+    /// [`RoomError::State`] if the store fails.
+    fn root_from_sns(
+        &self,
+        state: &[EventSn],
+        plus: Option<EventSn>,
+    ) -> Result<<ProductionStateStore<B> as StateStore>::Root, RoomError> {
+        let mut diff = hs_state::api::StateDiff::default();
+        for sn in state.iter().chain(plus.iter()) {
+            let Some(event) = self.events.get(sn) else {
+                continue;
+            };
+            let Some(state_key) = event.header().state_key.as_deref() else {
+                continue;
+            };
+            let key = self
+                .store
+                .intern_state_key(&event.header().event_type, state_key)
+                .map_err(|e| RoomError::State(e.to_string()))?;
+            diff.added.insert(key, *sn);
+        }
+        self.store
+            .apply(self.store.empty_root(), &diff)
+            .map_err(|e| RoomError::State(e.to_string()))
+    }
+
+    /// Records the state after an outlier placed in the timeline: `state_before` with the
+    /// outlier itself over it.
+    ///
+    /// # Errors
+    /// [`RoomError::State`] if the store fails.
+    fn record_placed_outlier_state(
+        &mut self,
+        sn: EventSn,
+        state_before: &[EventSn],
+    ) -> Result<(), RoomError> {
+        let root = self.root_from_sns(state_before, Some(sn))?;
+        self.placed_outlier_roots.insert(sn, root);
+        Ok(())
+    }
+
     /// A [`RoomStateView`] over the state as of immediately *after* one specific event (not
     /// necessarily the timeline head), via [`hs_state::api::StateStore::state_at`]. Used by
     /// [`RoomActor::event_visible_to`] -- the same primitive `RoomActor::state_at_event` already
@@ -951,10 +1037,7 @@ impl<B: KvBackend> RoomActor<B> {
         &self,
         sn: EventSn,
     ) -> Result<RoomStateView<'_, ProductionStateStore<B>>, RoomError> {
-        let root = self
-            .store
-            .state_at(sn)
-            .map_err(|e| RoomError::State(e.to_string()))?;
+        let root = self.root_after(sn)?;
         Ok(RoomStateView {
             store: &self.store,
             root,
@@ -1859,8 +1942,10 @@ impl<B: KvBackend> RoomActor<B> {
 
     /// Stores one batch of the room's history from before the oldest event this actor holds, as
     /// fetched from another server by `crate::backfill` and verified by its caller (hashes and
-    /// signatures; this method checks neither, and runs no authorization rules -- see "What is
-    /// trusted" below).
+    /// signatures; this method checks neither), with the state at each event **walked** rather
+    /// than fetched: exactly [`RoomActor::accept_history`] with [`HistoryKind::BeforeOldest`]
+    /// and no fetched state. `crate::backfill`'s implementation calls `accept_history` itself,
+    /// with the state it asked the sending server for; this is what is left when there is none.
     ///
     /// # Where the events go
     /// Into the timeline, at negative positions: the newest of the batch just below the lowest
@@ -1873,38 +1958,32 @@ impl<B: KvBackend> RoomActor<B> {
     /// which are also part of the room's history and turn up in the batch once it reaches them
     /// -- are *placed* in the timeline at their position and otherwise left as they are: still
     /// flagged outliers, still readable by whoever may read the room's current state
-    /// ([`RoomActor::event_visible_to`]), their state in the store still the meaningless outlier
-    /// one ([`RoomActor::feed_store_outlier`]; the store cannot take an event twice). An event
-    /// with a `depth` above the anchor's is not earlier history and is dropped, so that an event
-    /// which will also arrive live is never filed as history first and then found "already
-    /// known" when it does.
+    /// ([`RoomActor::event_visible_to`]); the state computed for their position is what
+    /// [`RoomActor::state_at_event`] answers for them from then on
+    /// ([`RoomActor::root_after`]). An event with a `depth` above the anchor's is not earlier
+    /// history and is dropped, so that an event which will also arrive live is never filed as
+    /// history first and then found "already known" when it does.
     ///
     /// # The state at a backfilled event
     /// Not derivable from the store: a backfilled event's `prev_events` are the next older
-    /// events in the batch (not yet held when it is fed), outliers (whose state is meaningless),
-    /// or events older than the batch (not held at all). So each is fed with an **explicit**
-    /// state ([`RoomActor::feed_store_with_state`], durable in `Tables::state_snapshots` exactly
-    /// as the join's own is, so [`RoomActor::load`] reproduces it), computed by walking the
-    /// batch backwards from the anchor: the state before the anchor is known (the join's own
-    /// snapshot; for a later batch, what the walk that placed the previous batch's oldest event
-    /// wrote for it), and passing a state event on the way back reverts its `(type, state_key)`
-    /// to the previous event for that key in the batch, or removes the key when the batch holds
-    /// none. Exact whenever the room's history is linear and the previous event for a reverted
-    /// key is within reach; where it is not, the state at events older than a key's oldest
-    /// fetched setting says the key was unset -- right when the key was first set there, one
-    /// batch behind when it was not. What reads it: history visibility (the room's
-    /// `m.room.history_visibility` and the reader's own membership at the event, which for a
-    /// user of this server reading a room joined elsewhere are the room's setting and "not yet
-    /// a member" throughout, and come out right), `unsigned.prev_content`, and the
-    /// authorization of a late event citing a backfilled one as its ancestor, which is where an
-    /// inexact state would show. Asking the resident for the state at each batch boundary
-    /// (`/state_ids`) is the exact version, and the noted next step.
+    /// events in the batch (not yet held when it is fed), outliers, or events older than the
+    /// batch (not held at all). So each is fed with an **explicit** state
+    /// ([`RoomActor::feed_store_with_state`], durable in `Tables::state_snapshots` exactly as
+    /// the join's own is, so [`RoomActor::load`] reproduces it). Here it is computed by walking
+    /// the batch backwards from the anchor: the state before the anchor is known (the join's
+    /// own snapshot; for a later batch, what was computed for the previous batch's oldest
+    /// event), and passing a state event on the way back reverts its `(type, state_key)` to the
+    /// previous event for that key in the batch, or removes the key when the batch holds none.
+    /// Exact whenever the room's history is linear and the previous event for a reverted key
+    /// is within reach; where it is not, the state at events older than a key's oldest fetched
+    /// setting says the key was unset. The exact way -- the state at the batch's oldest event
+    /// asked of the server that sent it (`/state_ids`), then derived forward -- is
+    /// [`RoomActor::accept_history`] with a [`crate::backfill::FetchedState`].
     ///
-    /// # What is trusted
-    /// The same as the join snapshot: the events are signed by their senders' servers (the
-    /// caller verified that) and the resident says they are the room's history. No auth check
-    /// runs, because a backfilled event's `auth_events` are as likely to be beyond the batch as
-    /// its `prev_events`; fetching them is the same next step as the state above.
+    /// # What is checked
+    /// Each event's `auth_events` must be the right ones and allow it (`history`'s module
+    /// docs); one that fails is not placed. One whose `auth_events` are beyond the batch and
+    /// not held is placed unchecked, because without a fetch they are out of reach.
     ///
     /// # What does not happen
     /// No [`RoomUpdate`] is published -- history is not news, so nothing reaches `/sync`, push,
@@ -1918,94 +1997,17 @@ impl<B: KvBackend> RoomActor<B> {
     /// [`RoomError::Internal`] if this actor holds no timeline at all; [`RoomError::Store`],
     /// [`RoomError::Fenced`] or [`RoomError::State`] from persistence.
     pub fn accept_backfilled_events(&mut self, events: Vec<Event>) -> Result<usize, RoomError> {
-        let Some((&anchor_pos, &anchor_sn)) = self.timeline.iter().next() else {
-            return Err(RoomError::Internal(
-                "a room with no timeline cannot be backfilled".into(),
-            ));
-        };
-        let anchor_depth = self
-            .events
-            .get(&anchor_sn)
-            .ok_or_else(|| RoomError::Internal("oldest timeline event not in hot cache".into()))?
-            .header()
-            .depth;
-
-        // Select: one copy per ID, for this room, nothing already in the timeline, nothing
-        // newer than the anchor.
-        let in_timeline: HashSet<EventSn> = self.timeline.values().copied().collect();
-        let mut seen: HashSet<OwnedEventId> = HashSet::new();
-        let mut batch: Vec<Event> = Vec::with_capacity(events.len());
-        for event in events {
-            if !seen.insert(event.event_id().to_owned()) {
-                continue;
-            }
-            let room_id = event
-                .json()
-                .get("room_id")
-                .and_then(CanonicalJsonValue::as_str);
-            if room_id != Some(self.room_id.as_str()) {
-                tracing::warn!(
-                    room_id = %self.room_id,
-                    event_id = %event.event_id(),
-                    claimed_room = room_id.unwrap_or("<none>"),
-                    "dropping a backfilled event that is for another room"
-                );
-                continue;
-            }
-            if self
-                .event_id_index
-                .get(event.event_id())
-                .is_some_and(|sn| in_timeline.contains(sn))
-            {
-                continue;
-            }
-            if event.header().depth > anchor_depth {
-                tracing::warn!(
-                    room_id = %self.room_id,
-                    event_id = %event.event_id(),
-                    depth = event.header().depth,
-                    anchor_depth,
-                    "dropping a backfilled event newer than the event it was fetched from"
-                );
-                continue;
-            }
-            batch.push(event);
-        }
-        if batch.is_empty() {
-            return Ok(0);
-        }
-        batch.sort_by(|a, b| topological_order(b, a)); // newest first
-
-        // The walk: the state before each event, newest first, from the state before the
-        // anchor; a key the batch sets no earlier value for is unset before its oldest setting.
-        let states_before = self.walk_history_states(anchor_sn, &batch, &BTreeMap::new())?;
-        let first_pos = anchor_pos.min(0) - 1;
-        let planned: Vec<PlannedHistory> = batch
-            .into_iter()
-            .zip(states_before)
-            .zip(0i64..)
-            .map(|((event, state_before), i)| PlannedHistory {
-                held_as: self.event_id_index.get(event.event_id()).copied(),
-                event,
-                room_pos: first_pos - i,
-                state_before,
-            })
-            .collect();
-        let added = self.place_history(planned)?;
-        tracing::debug!(
-            room_id = %self.room_id,
-            added,
-            oldest_position = self.timeline.keys().next().copied(),
-            "placed backfilled history in the timeline"
-        );
-        Ok(added)
+        Ok(self
+            .accept_history(crate::backfill::HistoryKind::BeforeOldest, events, None)?
+            .added)
     }
 
-    /// The state before each event of `batch` (newest first, one history batch), walking back
-    /// from the state before the timeline event `anchor_sn`: passing a state event reverts its
-    /// `(type, state_key)` to the previous event for that key in the batch, or -- when the batch
-    /// holds none -- to `fallback`'s entry for the key, or removes the key when `fallback` has
-    /// none either. See [`RoomActor::accept_backfilled_events`] for how exact that is.
+    /// The state before each event of `batch` (oldest first, one history batch), walking back
+    /// from the state before the timeline event `anchor_sn` the batch sits below: passing a
+    /// state event reverts its `(type, state_key)` to the previous event for that key in the
+    /// batch, or -- when the batch holds none -- to `fallback`'s entry for the key, or removes
+    /// the key when `fallback` has none either. See [`RoomActor::accept_backfilled_events`] for
+    /// how exact that is. Returned oldest first, one per event of `batch`.
     ///
     /// # Errors
     /// [`RoomError::Store`] or [`RoomError::State`] reading the state before the anchor.
@@ -2014,16 +2016,18 @@ impl<B: KvBackend> RoomActor<B> {
         anchor_sn: EventSn,
         batch: &[Event],
         fallback: &BTreeMap<(String, String), OwnedEventId>,
-    ) -> Result<Vec<Vec<OwnedEventId>>, RoomError> {
+    ) -> Result<Vec<BTreeMap<(String, String), OwnedEventId>>, RoomError> {
         let mut state: BTreeMap<(String, String), OwnedEventId> =
             self.state_before_for_backfill(anchor_sn)?;
-        let mut states_before: Vec<Vec<OwnedEventId>> = Vec::with_capacity(batch.len());
-        for (i, event) in batch.iter().enumerate() {
+        let mut states_before: Vec<BTreeMap<(String, String), OwnedEventId>> =
+            Vec::with_capacity(batch.len());
+        for (i, event) in batch.iter().enumerate().rev() {
             if let Some(state_key) = event.header().state_key.as_deref() {
                 let event_type = event.header().event_type.as_str();
                 let key = (event_type.to_owned(), state_key.to_owned());
-                let predecessor = batch[i + 1..]
+                let predecessor = batch[..i]
                     .iter()
+                    .rev()
                     .find(|older| {
                         older.header().event_type == event_type
                             && older.header().state_key.as_deref() == Some(state_key)
@@ -2039,14 +2043,16 @@ impl<B: KvBackend> RoomActor<B> {
                     }
                 }
             }
-            states_before.push(state.values().cloned().collect());
+            states_before.push(state.clone());
         }
+        states_before.reverse();
         Ok(states_before)
     }
 
     /// Places planned history in the timeline: each event at its position, durably, with its
     /// explicit state (`Tables::state_snapshots`) and its relation indexed; an outlier already
-    /// held is only given its position. `planned` is newest first, as the walk produced it; it
+    /// held is given its position and its explicit state, which is what the state after it
+    /// reads as from then on ([`RoomActor::record_placed_outlier_state`]). `planned` is newest first, as the walk produced it; it
     /// is persisted oldest first, so that everything an event's explicit state names is held
     /// and ingested before the event is. Publishes nothing. Returns how many were placed.
     ///
@@ -2118,9 +2124,6 @@ impl<B: KvBackend> RoomActor<B> {
                         .timeline
                         .put(txn, &(room_sn, p.room_pos), &sn.to_be_bytes())
                         .map_err(to_kv)?;
-                    if p.held_as.is_some() {
-                        continue;
-                    }
                     let state_sns: Vec<EventSn> = p
                         .state_before
                         .iter()
@@ -2135,6 +2138,9 @@ impl<B: KvBackend> RoomActor<B> {
                         .state_snapshots
                         .put(txn, &(room_sn, sn), &encode_event_sns(&state_sns))
                         .map_err(to_kv)?;
+                    if p.held_as.is_some() {
+                        continue;
+                    }
                     if let Some(rel) = relation {
                         let target_sn = self
                             .tables
@@ -2155,16 +2161,17 @@ impl<B: KvBackend> RoomActor<B> {
             })?;
 
             for ((p, _, relation), sn) in prepared.into_iter().zip(sns) {
-                if p.held_as.is_some() {
-                    self.timeline.insert(p.room_pos, sn);
-                    added += 1;
-                    continue;
-                }
                 let state_sns: Vec<EventSn> = p
                     .state_before
                     .iter()
                     .filter_map(|id| self.event_id_index.get(id).copied())
                     .collect();
+                if p.held_as.is_some() {
+                    self.timeline.insert(p.room_pos, sn);
+                    self.record_placed_outlier_state(sn, &state_sns)?;
+                    added += 1;
+                    continue;
+                }
                 self.event_id_index
                     .insert(p.event.event_id().to_owned(), sn);
                 self.timeline.insert(p.room_pos, sn);
@@ -2197,10 +2204,7 @@ impl<B: KvBackend> RoomActor<B> {
         let sns: Vec<EventSn> = match explicit {
             Some(sns) => sns,
             None => {
-                let root = self
-                    .store
-                    .state_at(sn)
-                    .map_err(|e| RoomError::State(e.to_string()))?;
+                let root = self.root_after(sn)?;
                 let diff = self
                     .store
                     .diff(self.store.empty_root(), root)
@@ -3939,10 +3943,56 @@ impl<B: KvBackend> RoomActor<B> {
         let Some(&sn) = self.event_id_index.get(event_id) else {
             return Ok(None);
         };
-        let root = self
-            .store
-            .state_at(sn)
-            .map_err(|e| RoomError::State(e.to_string()))?;
+        let root = self.root_after(sn)?;
+        self.state_and_auth_chain(root).map(Some)
+    }
+
+    /// The room's state immediately *before* `event_id` -- what the federation `/state` and
+    /// `/state_ids` endpoints answer for `?event_id=` (the spec's "state at the event", which
+    /// does not include the event itself; Synapse's `get_state_ids_for_pdu` likewise) -- plus
+    /// that state's auth chain. For an event held with an explicit state (a join through
+    /// another server, a backfilled event, an outlier backfill placed) it is that state; for
+    /// any other timeline event, the state after its `prev_events`, resolved. `Ok(None)` if this
+    /// actor does not know `event_id`, or holds it only as an outlier no backfill has placed
+    /// (whose state is not known here, as Synapse answers too).
+    ///
+    /// # Errors
+    /// [`RoomError::State`] or [`RoomError::Store`] reading the state.
+    pub fn state_before_event(
+        &self,
+        event_id: &EventId,
+    ) -> Result<Option<StateAtEvent>, RoomError> {
+        let Some(&sn) = self.event_id_index.get(event_id) else {
+            return Ok(None);
+        };
+        let Some(event) = self.events.get(&sn) else {
+            return Ok(None);
+        };
+        let explicit = self
+            .tables
+            .state_snapshots
+            .get(&self.backend.snapshot(), &(self.room_sn, sn))?
+            .and_then(|bytes| decode_event_sns(bytes.as_ref()));
+        let root = match explicit {
+            Some(state) => self.root_from_sns(&state, None)?,
+            None if event.header().flags.is_outlier() => return Ok(None),
+            None => {
+                let prev_sns: Vec<EventSn> =
+                    pipeline::decode_event_ids(event.json().get("prev_events"))
+                        .iter()
+                        .filter_map(|id| self.event_id_index.get(id).copied())
+                        .collect();
+                self.state_view(&prev_sns)?.root
+            }
+        };
+        self.state_and_auth_chain(root).map(Some)
+    }
+
+    /// The events of the state at `root`, and that state's auth chain: [`StateAtEvent`].
+    fn state_and_auth_chain(
+        &self,
+        root: <ProductionStateStore<B> as StateStore>::Root,
+    ) -> Result<StateAtEvent, RoomError> {
         let diff = self
             .store
             .diff(self.store.empty_root(), root)
@@ -3962,7 +4012,7 @@ impl<B: KvBackend> RoomActor<B> {
             .filter_map(|s| self.events.get(s).cloned())
             .collect();
 
-        Ok(Some(StateAtEvent { state, auth_chain }))
+        Ok(StateAtEvent { state, auth_chain })
     }
 
     /// The room-local short ID this actor holds `event_id` under, if it holds it at all: what
@@ -5578,6 +5628,41 @@ impl<B: KvBackend> RoomActorHandle<B> {
         B: 'static,
     {
         self.with_actor(move |actor| actor.accept_backfilled_events(events))
+            .await
+    }
+
+    /// What a state fetch for a batch of history needs to know. See
+    /// [`RoomActor::plan_history`]; `crate::backfill`'s implementation is the caller.
+    ///
+    /// # Errors
+    /// As [`RoomActor::plan_history`].
+    pub async fn plan_history(
+        &self,
+        kind: crate::backfill::HistoryKind,
+        events: Vec<Event>,
+    ) -> Result<Option<crate::backfill::HistoryPlan>, RoomError>
+    where
+        B: 'static,
+    {
+        self.query(move |actor| actor.plan_history(kind, &events))
+            .await
+    }
+
+    /// Stores a verified batch of history with the state fetched for it, if any. See
+    /// [`RoomActor::accept_history`]; `crate::backfill`'s implementation is the caller.
+    ///
+    /// # Errors
+    /// As [`RoomActor::accept_history`].
+    pub async fn accept_history(
+        &self,
+        kind: crate::backfill::HistoryKind,
+        events: Vec<Event>,
+        fetched: Option<crate::backfill::FetchedState>,
+    ) -> Result<crate::backfill::HistoryOutcome, RoomError>
+    where
+        B: 'static,
+    {
+        self.with_actor(move |actor| actor.accept_history(kind, events, fetched))
             .await
     }
 

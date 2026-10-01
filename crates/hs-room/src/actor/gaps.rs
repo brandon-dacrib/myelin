@@ -51,13 +51,13 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use hs_kv::{KvBackend, TransactConfig, transact};
 use hs_model::Event;
-use hs_model::canonical::CanonicalJsonValue;
 use hs_model::ids::EventSn;
 use hs_state::api::StateStore;
 use ruma::OwnedEventId;
 
-use super::{PlannedHistory, RoomActor, to_kv, topological_order};
-use crate::backfill::{GapAnchor, GapFill};
+use super::history::GapSelection;
+use super::{RoomActor, to_kv};
+use crate::backfill::{GapAnchor, GapFill, HistoryKind};
 use crate::error::RoomError;
 use crate::persist::TimelineGapRecord;
 use crate::pipeline;
@@ -71,14 +71,14 @@ const MAX_FETCH_FROM: usize = 20;
 pub(crate) struct Gap {
     /// The newest timeline position held when the gap opened. Gap positions are strictly above
     /// it and strictly below the gap's top.
-    below: i64,
+    pub(super) below: i64,
     /// The lowest position held in `(below, top]`: the top itself until something is placed.
-    filled_to: i64,
+    pub(super) filled_to: i64,
     /// Event IDs the gap's events (its top included) cite as `prev_events` that are not in the
     /// timeline: where the next fetch walks back from.
-    missing: BTreeSet<OwnedEventId>,
+    pub(super) missing: BTreeSet<OwnedEventId>,
     /// Nothing more will be fetched for it.
-    closed: bool,
+    pub(super) closed: bool,
 }
 
 /// A gap in a room's timeline, as [`RoomActor::timeline_gaps`] reports it.
@@ -242,8 +242,9 @@ impl<B: KvBackend> RoomActor<B> {
 
     /// Stores one batch of the history a gap lacks, as fetched from another server by
     /// `crate::backfill` and verified by its caller (hashes and signatures; nothing here checks
-    /// either, and no authorization runs -- the same trust as
-    /// [`RoomActor::accept_backfilled_events`] and for the same reasons).
+    /// either), with the state at each event walked rather than fetched: exactly
+    /// [`RoomActor::accept_history`] with [`HistoryKind::Gap`] and no fetched state, which is
+    /// what `crate::backfill`'s implementation calls when it can ask for the state.
     ///
     /// # Where the events go
     /// Inside the gap below position `top`: the newest of the batch just below the lowest
@@ -253,19 +254,22 @@ impl<B: KvBackend> RoomActor<B> {
     /// deeper than the event the gap sits above (`below`'s) -- history from before the leave,
     /// which is either held already or older than this server's first join and belongs below
     /// the timeline. Outliers -- the state the rejoin brought, a rename made while this server
-    /// was out -- are placed and otherwise left as they are. When the batch is larger than the
-    /// positions left, the newest that fit are placed and the gap is closed.
+    /// was out -- are placed, keep their outlier flag, and get the state computed for their
+    /// position. When the batch is larger than the positions left, the newest that fit are
+    /// placed and the gap is closed. An event that fails authorization is not placed
+    /// (`super::history`).
     ///
     /// # The state at each event
     /// Walked back from the state before the lowest filled event (the rejoin's own explicit
     /// snapshot, for the first batch), exactly as [`RoomActor::accept_backfilled_events`] does,
     /// except that a key the batch holds no earlier setting for reverts to its value in the
     /// state after the `below` event (the room as this server last had it) rather than to
-    /// nothing. Exact when the gap is filled in one batch and the room's history is linear.
+    /// nothing. Exact when the gap is filled in one batch and the room's history is linear; the
+    /// exact way is the fetched state ([`RoomActor::accept_history`]).
     ///
     /// # Closing
-    /// The gap is closed, durably, when every event it cites is in the timeline, when the
-    /// batch held nothing new, or when its positions ran out.
+    /// The gap is closed, durably, when every event it cites is in the timeline (or was
+    /// rejected), when the batch held nothing new, or when its positions ran out.
     ///
     /// # What does not happen
     /// No [`crate::protocol::RoomUpdate`] is published, and neither the forward extremities
@@ -279,130 +283,34 @@ impl<B: KvBackend> RoomActor<B> {
         top: i64,
         events: Vec<Event>,
     ) -> Result<GapFill, RoomError> {
-        let Some(gap) = self.gaps.get(&top).cloned() else {
-            return Err(RoomError::Internal(format!(
-                "no timeline gap below position {top} in {}",
-                self.room_id
-            )));
-        };
-        if gap.closed {
-            return Ok(GapFill {
-                added: 0,
-                closed: true,
-            });
-        }
-        let depth_at = |pos: i64| -> Option<i64> {
-            self.timeline
-                .get(&pos)
-                .and_then(|sn| self.events.get(sn))
-                .map(|e| e.header().depth)
-        };
-        let top_depth = depth_at(top).ok_or_else(|| {
-            RoomError::Internal("the event above a timeline gap is not held".into())
-        })?;
-        let below_depth = depth_at(gap.below).unwrap_or(i64::MIN);
-        let anchor_sn = *self
-            .timeline
-            .get(&gap.filled_to)
-            .ok_or_else(|| RoomError::Internal("a timeline gap's lowest filled event".into()))?;
+        let outcome = self.accept_history(HistoryKind::Gap { top }, events, None)?;
+        Ok(GapFill {
+            added: outcome.added,
+            closed: outcome.gap_closed,
+        })
+    }
 
-        // Select.
-        let in_timeline = self.timeline_sns();
-        let mut seen: HashSet<OwnedEventId> = HashSet::new();
-        let mut older_than_gap: HashSet<OwnedEventId> = HashSet::new();
-        let mut batch: Vec<Event> = Vec::with_capacity(events.len());
-        for event in events {
-            if !seen.insert(event.event_id().to_owned()) {
-                continue;
-            }
-            let room_id = event
-                .json()
-                .get("room_id")
-                .and_then(CanonicalJsonValue::as_str);
-            if room_id != Some(self.room_id.as_str()) {
-                tracing::warn!(
-                    room_id = %self.room_id,
-                    event_id = %event.event_id(),
-                    claimed_room = room_id.unwrap_or("<none>"),
-                    "dropping a gap event that is for another room"
-                );
-                continue;
-            }
-            if self
-                .event_id_index
-                .get(event.event_id())
-                .is_some_and(|sn| in_timeline.contains(sn))
-            {
-                continue;
-            }
-            let depth = event.header().depth;
-            if depth > top_depth {
-                tracing::warn!(
-                    room_id = %self.room_id,
-                    event_id = %event.event_id(),
-                    depth,
-                    top_depth,
-                    "dropping a gap event newer than the event the gap sits below"
-                );
-                continue;
-            }
-            if depth <= below_depth {
-                older_than_gap.insert(event.event_id().to_owned());
-                continue;
-            }
-            batch.push(event);
-        }
-        if batch.is_empty() {
-            self.close_gap(top)?;
-            tracing::debug!(room_id = %self.room_id, top, "a timeline gap is closed: the answer held nothing new");
-            return Ok(GapFill {
-                added: 0,
-                closed: true,
-            });
-        }
-        batch.sort_by(|a, b| topological_order(b, a)); // newest first
-        let room_left = usize::try_from(gap.filled_to - gap.below - 1).unwrap_or(0);
-        let exhausted = batch.len() > room_left;
-        if exhausted {
-            tracing::warn!(
-                room_id = %self.room_id,
-                top,
-                fetched = batch.len(),
-                room_left,
-                "a timeline gap has run out of positions; the oldest of its history is left on the other server"
-            );
-            batch.truncate(room_left);
-        }
-
-        // The walk, with the room as this server last had it as the fallback for keys the batch
-        // does not set earlier.
-        let fallback = match self.timeline.get(&gap.below) {
-            Some(&below_sn) => self.state_map_after(below_sn)?,
-            None => BTreeMap::new(),
-        };
-        let states_before = self.walk_history_states(anchor_sn, &batch, &fallback)?;
-        let mut cited: BTreeSet<OwnedEventId> = gap.missing.clone();
-        for event in &batch {
-            cited.extend(pipeline::decode_event_ids(event.json().get("prev_events")));
-        }
-        let placed = batch.len();
-        let planned: Vec<PlannedHistory> = batch
-            .into_iter()
-            .zip(states_before)
-            .zip(1i64..)
-            .map(|((event, state_before), i)| PlannedHistory {
-                held_as: self.event_id_index.get(event.event_id()).copied(),
-                event,
-                room_pos: gap.filled_to - i,
-                state_before,
-            })
-            .collect();
-        let added = self.place_history(planned)?;
-
+    /// Records what placing a batch in a gap did to it: how far it is filled, what it still
+    /// lacks (`cited`, the `prev_events` of what was placed, plus what it lacked before, less
+    /// what is in the timeline now, what was rejected, and what is older than the gap), and
+    /// whether it is closed. Returns whether it is.
+    pub(super) fn finish_gap_fill(
+        &mut self,
+        selection: GapSelection,
+        mut cited: BTreeSet<OwnedEventId>,
+        placed: usize,
+        exhausted: bool,
+    ) -> Result<bool, RoomError> {
+        let GapSelection {
+            top,
+            gap,
+            older_than_gap,
+        } = selection;
+        cited.extend(gap.missing.iter().cloned());
         let in_timeline = self.timeline_sns();
         let missing: BTreeSet<OwnedEventId> = cited
             .into_iter()
-            .filter(|id| !older_than_gap.contains(id))
+            .filter(|id| !older_than_gap.contains(id) && !self.rejected_history.contains(id))
             .filter(|id| {
                 !self
                     .event_id_index
@@ -427,16 +335,16 @@ impl<B: KvBackend> RoomActor<B> {
         tracing::debug!(
             room_id = %self.room_id,
             top,
-            added,
+            placed,
             filled_to,
             closed,
             "placed history from a timeline gap"
         );
-        Ok(GapFill { added, closed })
+        Ok(closed)
     }
 
     /// Marks the gap below `top` closed, in memory and durably.
-    fn close_gap(&mut self, top: i64) -> Result<(), RoomError> {
+    pub(super) fn close_gap(&mut self, top: i64) -> Result<(), RoomError> {
         let Some(gap) = self.gaps.get_mut(&top) else {
             return Ok(());
         };
@@ -459,14 +367,11 @@ impl<B: KvBackend> RoomActor<B> {
 
     /// The room's state immediately after the timeline event `sn` (that event included), keyed
     /// by `(type, state_key)`, as event IDs.
-    fn state_map_after(
+    pub(super) fn state_map_after(
         &self,
         sn: EventSn,
     ) -> Result<BTreeMap<(String, String), OwnedEventId>, RoomError> {
-        let root = self
-            .store
-            .state_at(sn)
-            .map_err(|e| RoomError::State(e.to_string()))?;
+        let root = self.root_after(sn)?;
         let diff = self
             .store
             .diff(self.store.empty_root(), root)
