@@ -864,6 +864,8 @@ async fn run_serve(args: &ServeArgs) -> i32 {
         media_bulk_pause: std::time::Duration::ZERO,
         live_config: Some(live_config),
     };
+    let setup_link_hint =
+        crate::serve::setup_link_host_hint(config.server.public_baseurl.as_deref());
     let handle = match crate::serve::spawn_serve_with_storage(booted.storage, config, options).await
     {
         Ok(h) => h,
@@ -891,6 +893,10 @@ async fn run_serve(args: &ServeArgs) -> i32 {
             setup_link = %link,
             "this server has no administrator yet: open the setup link to create one. It works once, for whoever opens it first"
         );
+        // Same level, so a deployment that sees the link sees why its host may be wrong.
+        if let Some(hint) = setup_link_hint {
+            tracing::warn!("{hint}");
+        }
     }
 
     wait_for_shutdown_signal().await;

@@ -85,7 +85,9 @@ WARN this server has no administrator yet: open the setup link to create one. It
 Open it, choose a username and a password, and you are signed in to the admin interface as the
 server's administrator. The link is offered at every start until somebody uses it and never
 again after; only someone who can read the server's log can use it. Behind a reverse proxy, set
-`HS__SERVER__PUBLIC_BASEURL` and the link is rooted there instead of at `localhost`.
+`HS__SERVER__PUBLIC_BASEURL` and the link is rooted there instead of at `localhost`. Without it,
+the link names the address the server listens on, and the line after it says so: open it with
+the host replaced by wherever you reach the server, since the token is what matters.
 
 Locked out later, with nobody able to sign in as an administrator? `docker exec myelin hs
 recover` prints a one-time link that resets an administrator's password and signs you in. It

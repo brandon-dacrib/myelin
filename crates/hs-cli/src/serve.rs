@@ -1796,8 +1796,11 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
 /// The first-run setup link for `token`.
 ///
 /// Rooted at `server.public_baseurl` when the operator has said what this server is called from
-/// outside, and otherwise at `localhost` on the first bound port -- which is right for a first
-/// run on a laptop or behind `docker run -p`, the cases where nothing has been configured yet.
+/// outside, and otherwise at the first listener's own bound address ([`link_base`]) -- which is
+/// right for a first run on a laptop or behind `docker run -p` with the same port, the cases
+/// where nothing has been configured yet. Behind a proxy or a remapped port the guess is wrong,
+/// but only the host is: the token is checked on whatever host the browser used, so the operator
+/// can replace the host and keep the fragment (`hs serve` says so after the link).
 ///
 /// The token is in the *fragment*. Browsers do not send a fragment to the server, so the token
 /// cannot land in an access log, a reverse proxy's log or a `Referer` header on its way to the
@@ -1810,14 +1813,19 @@ fn setup_link(public_baseurl: Option<&str>, addrs: &[SocketAddr], token: &str) -
 }
 
 /// Where the setup and recovery links are rooted: `server.public_baseurl` without its trailing
-/// slash, or `http://localhost:<first bound port>`.
+/// slash, or else the first listener's bound address -- `http://localhost:<port>` for a wildcard
+/// bind (`0.0.0.0`, `::`), `http://<ip>:<port>` for a listener bound to one address.
 fn link_base(public_baseurl: Option<&str>, addrs: &[SocketAddr]) -> String {
-    match public_baseurl.map(str::trim).filter(|s| !s.is_empty()) {
+    match configured_public_baseurl(public_baseurl) {
         Some(url) => url.trim_end_matches('/').to_owned(),
-        None => format!(
-            "http://localhost:{}",
-            addrs.first().map_or(8008, SocketAddr::port)
-        ),
+        None => match addrs.first() {
+            None => "http://localhost:8008".to_owned(),
+            Some(addr) if addr.ip().is_unspecified() => {
+                format!("http://localhost:{}", addr.port())
+            }
+            // `SocketAddr`'s `Display` brackets an IPv6 address, as a URL needs.
+            Some(addr) => format!("http://{addr}"),
+        },
     }
 }
 
@@ -2069,6 +2077,28 @@ mod tests {
         assert!(paths.contains(&"/_matrix/client/versions"));
         assert!(paths.contains(&"/_matrix/client/v3/capabilities"));
         assert!(paths.contains(&"/_matrix/client/r0/capabilities"));
+/// `server.public_baseurl` when it says something: unset and blank are the same.
+fn configured_public_baseurl(public_baseurl: Option<&str>) -> Option<&str> {
+    public_baseurl.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// What `hs serve` logs after the setup link when it had to guess the link's host, because
+/// `server.public_baseurl` is unset. `None` when the operator configured it.
+///
+/// The guess is the listener's own address, which is wrong behind a reverse proxy or a remapped
+/// port; but the setup token is checked on whatever host the browser used (the page reads it from
+/// the fragment and sends it in the body of `POST /api/v1/setup`), so the link still works with
+/// its host replaced.
+#[must_use]
+pub fn setup_link_host_hint(public_baseurl: Option<&str>) -> Option<&'static str> {
+    if configured_public_baseurl(public_baseurl).is_some() {
+        return None;
+    }
+    Some(
+        "the setup link's host is this server's own listener, because server.public_baseurl is not set: open this link from wherever you reach this server, replacing the host if needed (the token after #token= is what matters). Behind a reverse proxy or a remapped port, set HS__SERVER__PUBLIC_BASEURL to the address clients use and the link is rooted there",
+    )
+}
+
         assert!(paths.contains(&"/_matrix/client/v3/login"));
         assert!(paths.contains(&"/_matrix/client/r0/login"));
         assert!(paths.contains(&"/health/live"));
@@ -2082,3 +2112,33 @@ mod tests {
         assert_eq!(normalize_bind_address("[::1]", 8008), "[::1]:8008");
     }
 }
+
+    #[test]
+    fn the_link_is_rooted_at_public_baseurl_or_the_first_listener() {
+        let any_v4: SocketAddr = "0.0.0.0:8008".parse().unwrap();
+        let any_v6: SocketAddr = "[::]:9000".parse().unwrap();
+        let one_v4: SocketAddr = "192.0.2.7:18008".parse().unwrap();
+        let one_v6: SocketAddr = "[2001:db8::1]:8448".parse().unwrap();
+        assert_eq!(link_base(None, &[any_v4]), "http://localhost:8008");
+        assert_eq!(link_base(None, &[any_v6]), "http://localhost:9000");
+        assert_eq!(link_base(None, &[one_v4, any_v4]), "http://192.0.2.7:18008");
+        assert_eq!(link_base(None, &[one_v6]), "http://[2001:db8::1]:8448");
+        assert_eq!(link_base(Some("  "), &[one_v4]), "http://192.0.2.7:18008");
+        assert_eq!(
+            link_base(Some("https://matrix.example.org/"), &[one_v4]),
+            "https://matrix.example.org"
+        );
+        assert_eq!(
+            setup_link(None, &[any_v4], "abc"),
+            "http://localhost:8008/admin/setup#token=abc"
+        );
+    }
+
+    #[test]
+    fn the_host_hint_is_given_only_when_the_host_was_guessed() {
+        let hint = setup_link_host_hint(None).unwrap();
+        assert!(hint.contains("HS__SERVER__PUBLIC_BASEURL"));
+        assert!(hint.contains("replacing the host"));
+        assert!(setup_link_host_hint(Some(" ")).is_some());
+        assert!(setup_link_host_hint(Some("https://matrix.example.org")).is_none());
+    }

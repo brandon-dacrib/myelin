@@ -2,13 +2,47 @@
 
 Track brief: `docs/workstreams/07-auth-and-identity.md`. Owner crate: `hs-auth`.
 
-Last updated: 2026-09-28 (session 9: devices, 3PIDs, external ids, below). Session 7 (2026-09-19)
+Last updated: 2026-09-30 (session 10: the setup link without `public_baseurl`, below; session 9:
+devices, 3PIDs, external ids). Session 7 (2026-09-19)
 audited the login handshake against a real browser client
 (Element Web was being pointed at this server for the first time in the same integration window),
 found and fixed a real case-sensitivity bug in `POST /login`, re-confirmed `/capabilities` is still
 unfixed (held by another track this session), checked for Element-Web findings in
 `docs/status/16-management-web-interface.md` (none landed as of this write-up), and designed
 (without implementing) a UIA session-correlation scheme left open at the end of session 5).
+
+## Session 10 (2026-09-30, branch `agent/cli-small-gaps`): the setup link without `public_baseurl`
+
+Closes the known gap "Setup link assumes `localhost:<bound port>` without `public_baseurl`".
+The change is in `hs-cli` (where the link is rooted and logged); nothing in this crate needed
+to change, because the token check never looked at the host:
+`hs_auth::setup::FirstRunSetup::create_first_admin` compares the token from the body of
+`POST /api/v1/setup`, the page reads it from the fragment, and nothing on the way checks `Host`
+or `Origin`.
+
+- **Rooted at the listener that is really there.** With `server.public_baseurl` unset (or
+  blank), the setup and recovery links are rooted at the first listener's bound address:
+  `http://localhost:<port>` for a wildcard bind (`0.0.0.0`, `::` -- the default, the chart and
+  `docker run`, so their links are unchanged), `http://<ip>:<port>` for a listener bound to one
+  address (`hs_cli::serve::link_base`). It used to say `localhost` whatever the bind.
+- **The log says the host is a guess.** Right after the setup link, at the same `warn` level,
+  `hs serve` logs `hs_cli::serve::setup_link_host_hint`: the link's host is this server's own
+  listener because `server.public_baseurl` is not set; open it from wherever you reach this
+  server, replacing the host if needed (the token after `#token=` is what matters); behind a
+  reverse proxy or a remapped port, set `HS__SERVER__PUBLIC_BASEURL`. Not logged when
+  `public_baseurl` is set.
+- **Tests.** `crates/hs-cli/tests/setup_link.rs`, two real `hs` binaries: a listener on
+  `127.0.0.1` and a port that is never 8008, no `public_baseurl` -- the logged link is
+  `http://127.0.0.1:<port>/admin/setup#token=...`, the next line is the hint, and the setup page,
+  `GET /api/v1/setup` and the `POST` that creates the administrator all answer on a `Host` the
+  link never named (`matrix.elsewhere.example:4443`); and with `public_baseurl:
+  https://matrix.example.org/` the link is `https://matrix.example.org/admin/setup#token=...`
+  and no hint follows. Before the change the first test failed at its first assertion (the link
+  said `localhost`) and had no hint line to find. Unit tests in `serve.rs` cover IPv4, IPv6,
+  wildcard and blank-`public_baseurl` roots.
+
+Verify: `cargo test -p hs-cli --test setup_link` and
+`cargo test -p hs-cli --lib -- the_link_is_rooted the_host_hint`.
 
 ## Session 9 (2026-09-28): a user's devices, 3PIDs, external ids and experimental features
 
