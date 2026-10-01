@@ -395,8 +395,13 @@ impl<B: KvBackend + 'static> RoomMirror<B> {
     /// the update) -- so that the long-polls the wake is about read a current copy. A wake the
     /// copy already covers reads nothing. A room this mirror holds no copy of is left alone:
     /// nobody here has read it lately. Failures are logged at `debug` and leave the next read
-    /// to try again.
+    /// to try again. With incremental catch-up off ([`RoomMirror::set_incremental`]) this does
+    /// nothing: the mirror then behaves as it did before decision 0022, reloading on the next
+    /// read only.
     pub async fn prefetch(&self, room_id: &RoomId, room_pos: i64) {
+        if !self.incremental.load(Ordering::Relaxed) {
+            return;
+        }
         {
             let rooms = self.rooms.lock().await;
             match rooms.get(room_id) {

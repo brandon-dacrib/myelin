@@ -65,6 +65,11 @@ const PEER_POSITIONS_DEADLINE: Duration = Duration::from_millis(250);
 const MIRROR_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const MIRROR_MAX_IDLE: Duration = Duration::from_secs(600);
 
+/// How long [`SessionHub::receive_wakes`] waits for the mirror to catch up on the rooms a batch
+/// names before it wakes the batch's users anyway (decision 0022). Well under the mesh's wake
+/// deadline (`hs-cli`'s `sync_cluster`, two seconds).
+const PREFETCH_WAIT: Duration = Duration::from_millis(250);
+
 fn membership_of(event: &Event) -> Option<String> {
     event
         .json()
@@ -546,13 +551,29 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         }
         // The copies of the rooms that moved are advanced before anyone is woken, so the
         // long-polls released below read them current rather than each paying for the catch-up
-        // (decision 0022). A room this replica owns is never in the mirror.
+        // (decision 0022). A room this replica owns is never in the mirror. Each catch-up runs
+        // as a task of its own and is waited for at most `PREFETCH_WAIT`: a catch-up is a few
+        // point reads, but one that turns into a whole reload of a big room must neither hold
+        // the peer's request past its deadline (which would cancel it, and these wakes with
+        // it) nor delay the wakes; it finishes on its own, and a long-poll that reads the room
+        // first waits for it on the room's lock.
         if let Some(link) = self.cluster.get() {
+            let mut prefetches = tokio::task::JoinSet::new();
             for wake in &batch.wakes {
                 if !link.cluster.owns_room(&wake.room_id) {
-                    link.mirror.prefetch(&wake.room_id, wake.room_pos).await;
+                    let mirror = Arc::clone(&link.mirror);
+                    let (room_id, room_pos) = (wake.room_id.clone(), wake.room_pos);
+                    prefetches.spawn(async move { mirror.prefetch(&room_id, room_pos).await });
                 }
             }
+            let all = async { while prefetches.join_next().await.is_some() {} };
+            if tokio::time::timeout(PREFETCH_WAIT, all).await.is_err() {
+                tracing::debug!(
+                    from = %batch.from,
+                    "room mirror catch-up on a wake is still running; waking without it"
+                );
+            }
+            prefetches.detach_all();
         }
         for wake in &batch.wakes {
             for user in &wake.users {
