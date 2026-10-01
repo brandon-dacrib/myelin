@@ -45,12 +45,22 @@ fn main() {
         None if local_build.join("index.html").is_file() => (local_build, "built"),
         None => (placeholder, "placeholder"),
     };
-    // Watched whichever was chosen, so that building the interface later is noticed: cargo
-    // re-runs this when a watched path appears, changes or disappears.
-    println!(
-        "cargo:rerun-if-changed={}",
-        manifest_dir.join("../../web/dist").display()
-    );
+    // Watched whichever was chosen, so that building the interface later is noticed. A path that
+    // does not exist must not be watched: cargo treats a missing `rerun-if-changed` path as
+    // always stale, so watching an absent `web/dist` re-ran this script, and recompiled this
+    // crate and everything that depends on it, on every cargo invocation in a checkout without
+    // a built interface (found 2026-10-01, when each fuzz run of an hs-federation target spent
+    // minutes rebuilding). While it is absent, `web/` itself is watched instead: creating
+    // `web/dist` changes it, so the first `npm run build` is still noticed.
+    let local_dist = manifest_dir.join("../../web/dist");
+    let watched = if local_dist.exists() {
+        local_dist
+    } else {
+        manifest_dir.join("../../web")
+    };
+    if watched.exists() {
+        println!("cargo:rerun-if-changed={}", watched.display());
+    }
     println!("cargo:rerun-if-changed={}", source.display());
     println!("cargo:rustc-env=HS_ADMIN_WEB_UI={kind}");
 
