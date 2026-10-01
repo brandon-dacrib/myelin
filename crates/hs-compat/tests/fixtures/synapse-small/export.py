@@ -1,9 +1,11 @@
 """Writes data.sql: the rows of a populated Synapse database that the importer reads, as
 column-named INSERT statements for the tables and columns schema.sql declares.
 
-    <synapse venv>/bin/python export.py 'dbname=synapse_fixture host=127.0.0.1 port=5439 user=postgres password=hspg'
+    <synapse venv>/bin/python export.py 'dbname=synapse_fixture host=127.0.0.1 port=5439 user=postgres password=hspg' [fixture directory]
 
-Run it against a Synapse that populate.py has filled and then stopped (see README.md).
+Run it against a Synapse that populate.py has filled and then stopped (see README.md). The
+fixture directory (the one holding schema.sql, where data.sql is written) is this one unless
+given: `../synapse-federated` uses this script too.
 """
 import json
 import re
@@ -12,8 +14,12 @@ from pathlib import Path
 
 import psycopg2
 
-HERE = Path(__file__).parent
+HERE = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(__file__).parent
 ORDER = {
+    "event_to_state_groups": "event_id",
+    "state_groups_state": "state_group, type, state_key",
+    "state_group_edges": "state_group, prev_state_group",
+    "partial_state_rooms": "room_id",
     "users": "name",
     "profiles": "user_id",
     "devices": "user_id, device_id",
@@ -29,6 +35,18 @@ ORDER = {
     "redactions": "event_id",
     "current_state_events": "room_id, type, state_key",
     "local_media_repository": "media_id",
+    "e2e_device_keys_json": "user_id, device_id",
+    "e2e_one_time_keys_json": "user_id, device_id, algorithm, key_id",
+    "e2e_fallback_keys_json": "user_id, device_id, algorithm",
+    "e2e_cross_signing_keys": "user_id, keytype, stream_id",
+    "e2e_cross_signing_signatures": "user_id, target_user_id, target_device_id",
+    "e2e_room_keys_versions": "user_id, version",
+    "e2e_room_keys": "user_id, version, room_id, session_id",
+    "push_rules": "user_name, rule_id",
+    "push_rules_enable": "user_name, rule_id",
+    "pushers": "id",
+    "receipts_linearized": "stream_id",
+    "user_filters": "full_user_id, filter_id",
 }
 
 
@@ -51,6 +69,8 @@ def literal(value):
         return "true" if value else "false"
     if isinstance(value, int):
         return str(value)
+    if isinstance(value, memoryview):
+        return "'\\x" + bytes(value).hex() + "'"
     return "'" + str(value).replace("'", "''") + "'"
 
 

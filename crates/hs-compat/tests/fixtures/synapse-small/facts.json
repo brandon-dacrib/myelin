@@ -1,8 +1,16 @@
 {
-  "lobby": "!ccMTlvQfPDLxAZiJuG:fixture.test",
-  "dm": "!fdxVOXMNOWWvRGCcFL:fixture.test",
-  "alice_token": "syt_YWxpY2U_gGOcnzIcccBIZKhHBMFb_4YUguo",
-  "bob_token": "syt_Ym9i_GXXKiwumdcGWLPXAnFzP_4etDz3",
-  "avatar": "mxc://fixture.test/QRfDgyLujIkTamUPGRmOJeRy",
-  "picture": "mxc://fixture.test/tEQMNTeOFtmsNCFGJnWMiBIg"
+  "lobby": "!uNhvnjDrEOeHakWJfZ:fixture.test",
+  "dm": "!OmzEnxpjzwuvtvJQPE:fixture.test",
+  "alice_token": "syt_YWxpY2U_NLhHuAXpHXOxzkZKJedw_1qYPiK",
+  "bob_token": "syt_Ym9i_LKtJFNPcOqKtufvfENZe_3F9XAj",
+  "avatar": "mxc://fixture.test/uMIJmiukzSJbleXZNJbuTmus",
+  "picture": "mxc://fixture.test/SKiaEVOECXKelEXuYONTEKlH",
+  "first_message": "$b1bnN03Z4RrABXHOUyrLjPJ3twSCNIUb2XEFpNOaS7g",
+  "private_receipt": "$nix7kIRvmrAFghalvbZ-8o7hzhTuExPbIyEMsm9Nee8",
+  "alice_filter": "0",
+  "bob_filter": "0",
+  "backup_version": "2",
+  "alice_master_key": "IWEeNJ0ivbzB/gnZgHJiOzX4fRbEHfh1l7hK9jAnMVY",
+  "bob_master_key": "5o2aNmMjNaOcCt9PNGuHS+Iu8WOzIFzjNBUEvM0ES1s",
+  "alice_self_signing_key": "aZOp/zQkWrbG/7lUc3c2JDyZEFl+z9mzsMWHxfA8A34"
 }
