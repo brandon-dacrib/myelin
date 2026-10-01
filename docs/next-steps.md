@@ -44,8 +44,7 @@ keep-both conflict with `room-cluster-small` in `crates/hs-room/src/metrics.rs`)
 `web-admin-ui` (built on `config-hot`; rebase after it lands), `admin-scopes`, `boot-time`,
 `room-cluster-small`. Three agents were still working when this session stopped and their
 branches hold whatever they had pushed: `rfc-0018` (9 commits, the non-owner `/sync` mirror;
-unknown how far), `sytest-client` (18 commits: guest access, 3PID invites, the legacy `/events`
-stream; unknown how far), `complement-remeasure` (3 commits, docs only: csapi and federation
+unknown how far), `sytest-client` (done, see its row), `complement-remeasure` (3 commits, docs only: csapi and federation
 package numbers against tonight's `main`; it had not finished its second runs). Read each
 branch's last commit and its status entry before deciding whether it is done; a branch whose
 agent did not report is not done until its own checks have been run.
@@ -62,7 +61,7 @@ agent did not report is not done until its own checks have been run.
 | `agent/boot-time` | `22757ca` | cold boot 9 s → 0.6 s: one shared Fjall keyspace with name prefixes (decision 0024), `hs_boot_duration_seconds` | failed once on the create-room race; in the running queue |
 | `agent/room-cluster-small` | `84c8589` | v12 upgrades make a real replacement (every 11→12 upgrade had failed 403 after writing the tombstone), a release advances the fencing epoch (decision 0023); based on the flake branch | failed once on the race; in the running queue |
 | `agent/rfc-0018` | `51f63b5` | in progress when the session stopped | not run |
-| `agent/sytest-client` | `51c0b68` | in progress when the session stopped | not run |
+| `agent/sytest-client` | `a0c33c8` | **done** (reported 18:20): guest access (`auth.allow_guest_access`, default off, hot; the spec's guest table in `hs-auth`; Sytest guests 0 → 23/24), 3PID invites (`auth.identity_servers`, default empty; `onbind`; 3 → 10/19, the three over-federation ones need `exchange_third_party_invite`), the legacy `GET /events`, `/initialSync` and `/rooms/{id}/initialSync` (client-server group 319 → 362); whole suite 407 → 458 with no regressions. Also fixed, overlapping other branches: the v12 room-id collision (its own fix in `create_placed`; expect a conflict with `room-id-uniqueness`, keep the transactional claim) and `/messages?dir=b` from a sync token skipping the newest event (also fixed on `federation-sytest-2`; keep one). Built on `config-hot` with `main` merged in; rebase after `config-hot` lands | not run |
 | `agent/complement-remeasure` | `b70559f` | in progress; docs only | not run |
 
 **What is next, in order, after those merge:**
