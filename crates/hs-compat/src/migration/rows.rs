@@ -331,7 +331,7 @@ pub fn push_rules(user_id: &str, rule_rows: &[Value], enable_rows: &[Value]) -> 
             rule,
         ));
     }
-    custom.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+    custom.sort_by_key(|a| std::cmp::Reverse((a.0, a.1)));
     out.custom = custom
         .into_iter()
         .map(|(_, _, kind, rule)| (kind, rule))

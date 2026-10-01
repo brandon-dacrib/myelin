@@ -169,6 +169,12 @@ impl SourceConfigs for Configs {
 /// `(user, room, type)`.
 type AccountDataKey = (String, Option<String>, String);
 
+/// A backup version and its room keys by session, under `(user, version)`.
+type Backups = HashMap<(String, u64), (SynapseBackupVersion, HashMap<String, SynapseRoomKey>)>;
+
+/// `(room, user, receipt type) -> (event, ts)`.
+type Receipts = HashMap<(String, String, String), (String, u64)>;
+
 /// A room as the in-memory target holds it.
 #[derive(Default, Clone)]
 struct MemoryRoom {
@@ -188,11 +194,11 @@ struct MemoryTarget {
     account_data: Mutex<HashMap<AccountDataKey, Value>>,
     device_keys: Mutex<HashMap<(String, String), SynapseDeviceKeys>>,
     cross_signing: Mutex<HashMap<String, SynapseCrossSigning>>,
-    backups: Mutex<HashMap<(String, u64), (SynapseBackupVersion, HashMap<String, SynapseRoomKey>)>>,
+    backups: Mutex<Backups>,
     push_rules: Mutex<HashMap<String, SynapsePushRules>>,
     pushers: Mutex<HashMap<(String, String, String), SynapsePusher>>,
     filters: Mutex<HashMap<(String, String), Value>>,
-    receipts: Mutex<HashMap<(String, String, String), (String, u64)>>,
+    receipts: Mutex<Receipts>,
     rooms: Mutex<HashMap<String, MemoryRoom>>,
     media: Mutex<HashMap<String, TargetMedia>>,
     /// The most events any one call to `import_room_events` was given.
