@@ -2709,8 +2709,8 @@ async fn a_join_is_in_the_very_next_sync_every_time() {
     let mut config = test_config(0, dir.path());
     config.rate_limits.enabled = false;
     let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
-    .await
-    .expect("server should boot");
+        .await
+        .expect("server should boot");
     let base = handle.base_url();
     let client = reqwest::Client::new();
     let mut tokens = Vec::new();

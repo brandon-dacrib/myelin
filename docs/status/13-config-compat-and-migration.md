@@ -206,6 +206,8 @@ the upload limit and gets `413` (and `m.upload.size` follows); sets `public_base
 client `.well-known` appears -- each with `reloaded_sections: [section]` and nothing waiting for a
 restart, and every one of those assertions fails on `main` before this branch.
 
+**Also changed.** `e2e.rs::a_join_is_in_the_very_next_sync_every_time` makes thirty joins as one user in seconds, past `joins_local`'s default (ten, then one per ten seconds, Synapse's); it now switches rate limits off, as Complement's configuration does. A harness that joins, logs in or registers faster than people do from a non-loopback address (SyTest in a container, the differential harness) needs `rate_limits: {enabled: false}` too. The whole `hs-cli` suite passed with this branch (PostgreSQL tests skipped without their DSNs).
+
 **Left.** In cluster mode every bucket is per replica (as `message`). No `invites` or media-upload
 bucket exists in the schema (Synapse's `rc_invites`, `rc_media_create`); presence, push gateway,
 retention defaults and trusted key servers have no setting at all yet. The settings read by
