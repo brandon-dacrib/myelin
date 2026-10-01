@@ -5152,12 +5152,54 @@ impl<B: KvBackend> RoomActor<B> {
         Ok(event)
     }
 
-    /// Sends a `{txnId}`-suffixed redaction (`PUT .../redact/{eventId}/{txnId}`) and applies its
-    /// effect, deduplicating on `(sender, device, txnId)` the same way
-    /// [`RoomActor::send_event_txn`] does.
+    /// Whether `user` may redact `target`: their own event, or anybody's with at least the room's
+    /// `redact` power level (a privileged creator always may).
+    ///
+    /// From room version 3 the auth rules admit any member's `m.room.redaction` into the room and
+    /// leave this check to whoever applies it, so it is the only thing standing between a member
+    /// at power 0 and every other member's messages. Until 2026-10-01 nothing made it, and such a
+    /// member's redaction emptied the content for everyone (found by Sytest's
+    /// `tests/30rooms/10redactions.pl`). An event this room does not hold is left to
+    /// [`RoomActor::apply_redaction`], which refuses it.
     ///
     /// # Errors
-    /// See [`RoomActor::send_event`] and [`RoomActor::apply_redaction`].
+    /// Returns [`RoomError::Internal`] if the room's power levels cannot be read.
+    pub fn may_redact(&self, user: &UserId, target: &EventId) -> Result<bool, RoomError> {
+        let Some(original) = self.event_by_id(target) else {
+            return Ok(true);
+        };
+        if original.header().sender == user {
+            return Ok(true);
+        }
+        let rules = room_version::rules_for(self.room_version())
+            .ok_or_else(|| RoomError::Internal("unknown room version".into()))?;
+        let creators = self.room_creators(&rules)?;
+        let Some(event) = self.state_event("m.room.power_levels", "")? else {
+            // No power levels yet: the spec's defaults, 100 for a creator, 0 for everybody else,
+            // against a redact level of 50.
+            return Ok(creators.iter().any(|c| c == user));
+        };
+        let content = event
+            .json()
+            .get("content")
+            .and_then(CanonicalJsonValue::as_object)
+            .ok_or_else(|| RoomError::Internal("power levels have no content".into()))?;
+        let levels = hs_model::power_levels::PowerLevels::parse(content, &rules)
+            .map_err(|e| RoomError::Internal(e.to_string()))?;
+        let effective =
+            hs_model::power_levels::EffectivePowerLevels::new(&levels, &rules, creators);
+        Ok(effective.user_power(user) >= levels.redact)
+    }
+
+    /// Sends a `{txnId}`-suffixed redaction (`PUT .../redact/{eventId}/{txnId}`) and applies its
+    /// effect, deduplicating on `(sender, device, txnId)` the same way
+    /// [`RoomActor::send_event_txn`] does. A redaction the sender may not make
+    /// ([`RoomActor::may_redact`]) is refused before anything is sent.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::Forbidden`] for a redaction of somebody else's event without the
+    /// `redact` power level; otherwise see [`RoomActor::send_event`] and
+    /// [`RoomActor::apply_redaction`].
     pub fn redact_txn(
         &mut self,
         sender: OwnedUserId,
@@ -5169,6 +5211,12 @@ impl<B: KvBackend> RoomActor<B> {
     ) -> Result<Event, RoomError> {
         if let Some(existing) = self.dedup_lookup(&sender, device_id, txn_id) {
             return Ok(existing.clone());
+        }
+        if !self.may_redact(&sender, &target)? {
+            return Err(RoomError::Forbidden(
+                "you may redact your own events, or others' with the room's redact power level"
+                    .into(),
+            ));
         }
         let mut content = serde_json::json!({});
         if let Some(reason) = &reason {
@@ -6548,6 +6596,95 @@ mod tests {
 
     /// A retried `send`/`redact` with the same transaction ID must return the same event, not
     /// create a duplicate -- the correctness gap this session closed.
+    /// Sytest's "PUT /rooms/:room_id/redact/:event_id/:txn_id as random user does not redact
+    /// message": a member at power 0 redacting somebody else's message is refused and the
+    /// message keeps its content; their own message, and the creator's power, still redact.
+    #[test]
+    fn a_member_without_redact_power_cannot_redact_another_members_message() {
+        let mut actor = room("public_chat");
+        let alice = user_id!("@alice:hs1").to_owned();
+        let mallory = user_id!("@mallory:hs1").to_owned();
+        actor
+            .membership_action(
+                mallory.clone(),
+                Action::Join,
+                mallory.clone(),
+                serde_json::json!({}),
+                2,
+            )
+            .unwrap();
+        let alices = actor
+            .send_event_txn(
+                alice.clone(),
+                None,
+                "a-1",
+                "m.room.message".to_owned(),
+                serde_json::json!({"msgtype": "m.text", "body": "alice's words"}),
+                3,
+            )
+            .unwrap();
+        let before = actor
+            .paginate(None, Direction::Backward, usize::MAX)
+            .0
+            .len();
+
+        let refused = actor.redact_txn(
+            mallory.clone(),
+            None,
+            "m-1",
+            alices.event_id().to_owned(),
+            None,
+            4,
+        );
+        assert!(
+            matches!(refused, Err(RoomError::Forbidden(_))),
+            "{refused:?}"
+        );
+        assert!(
+            !actor
+                .event_by_id(alices.event_id())
+                .unwrap()
+                .header()
+                .flags
+                .is_redacted()
+        );
+        assert_eq!(
+            actor
+                .paginate(None, Direction::Backward, usize::MAX)
+                .0
+                .len(),
+            before,
+            "a refused redaction must not be sent either"
+        );
+
+        let mallorys = actor
+            .send_event_txn(
+                mallory.clone(),
+                None,
+                "m-2",
+                "m.room.message".to_owned(),
+                serde_json::json!({"msgtype": "m.text", "body": "mine"}),
+                5,
+            )
+            .unwrap();
+        actor
+            .redact_txn(
+                mallory,
+                None,
+                "m-3",
+                mallorys.event_id().to_owned(),
+                None,
+                6,
+            )
+            .unwrap();
+        actor
+            .redact_txn(alice, None, "a-2", alices.event_id().to_owned(), None, 7)
+            .unwrap();
+        for id in [mallorys.event_id(), alices.event_id()] {
+            assert!(actor.event_by_id(id).unwrap().header().flags.is_redacted());
+        }
+    }
+
     #[test]
     fn transaction_id_is_deduplicated_on_send_and_redact() {
         let mut actor = room("public_chat");
