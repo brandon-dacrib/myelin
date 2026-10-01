@@ -459,8 +459,9 @@ jobs:
   # this same workflow run has just published, so a chart and the image it pulls always come
   # from one commit. `helm install --devel` picks the newest of them. A plain `helm install`
   # picks releases only, so the day `v0.1.0` is tagged the pre-releases stop being what an
-  # operator gets by default -- and Chart.yaml's version has to move on (to 0.2.0) for `--devel`
-  # to see `main` again, since `0.1.0-main.N` sorts below `0.1.0`.
+  # operator gets by default. `--devel` keeps seeing `main` after that without a Chart.yaml
+  # bump: once a tag has released Chart.yaml's version, `<version>` is the patch after the
+  # newest tag (`0.1.1-main.N` sorts above `0.1.0`; deploy/helm/hs/ci/chart-version.sh).
   #
   # It waits for the manifest list rather than the gate so the image it points at exists before
   # anything can pull the chart that names it. That the chart *installs* was already proven by
@@ -501,20 +502,20 @@ jobs:
           diff -u deploy/crds/bridge.yaml deploy/helm/hs/crds/bridge.yaml
 
       - name: Work out the chart version and the image it pulls
+        # deploy/helm/hs/ci/chart-version.sh has the rule and why: a tag publishes its version;
+        # `main` publishes `<base>-main.<run>.g<sha>`, where `<base>` moves past the newest `v*`
+        # tag by itself, so `--devel` keeps picking `main` after a release without anybody
+        # having to bump Chart.yaml. Its self-test runs first, so a broken rule fails here
+        # before anything is pushed.
         id: version
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            version="${GITHUB_REF_NAME#v}"
-            app_version="$version"
-          else
-            base="$(helm show chart deploy/helm/hs | sed -n 's/^version: *//p')"
-            version="${base}-main.${GITHUB_RUN_NUMBER}.g${GITHUB_SHA::7}"
-            app_version="sha-${GITHUB_SHA}"
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "app_version=$app_version" >> "$GITHUB_OUTPUT"
-          echo "chart $version, pulling image tag $app_version"
+          deploy/helm/hs/ci/chart-version.sh --self-test
+          git fetch --tags --force --quiet origin
+          chart="$(helm show chart deploy/helm/hs | sed -n 's/^version: *//p')"
+          # shellcheck disable=SC2046
+          deploy/helm/hs/ci/chart-version.sh "$GITHUB_REF" "$GITHUB_RUN_NUMBER" "$GITHUB_SHA" \
+            "$chart" $(git tag -l 'v*') | tee -a "$GITHUB_OUTPUT"
 
       - name: Package and push
         env:
