@@ -1,5 +1,24 @@
 # 06 Federation: status
 
+## 2026-10-01 (track 14, branch `agent/complement-remeasure`): the whole federation package re-measured
+
+Complement's `tests` package on an image of `main` at `2a0b362`, twice: **225 / 314 assertions,
+50 / 90 tests** (run 8), and 224 / 314, 49 / 90 (run 9); on 2026-09-26 it was 75 / 250 and 14 /
+88. 36 tests went FAIL -> PASS and none PASS -> FAIL: invites, leaves, knocks and the `send_*`
+checks (13), restricted joins (8, plus two NoCreators that won their race), `/hierarchy` (5),
+media (3), typing, presence and device lists across servers (3), version 12 (2). The two extra
+tests are Complement's (its 2026-09-30 checkout split one `TestMSC4311*` test into three, all
+failing). The restricted-rooms, invites and knocks set of the fourteenth session is 17 / 18 in
+both runs (`TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11` lost the race both times).
+Between the two identical runs only `TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11`
+moved: the race of the fourteenth session's item 3. What is left, by family: `/timestamp_to_event`;
+version 12's MSC4289/4291/4297/4311 tests (14); `/get_missing_events`, auth chains and outbound
+`/send` (7); thumbnails and a filename-less remote download (4); device lists, key upload and
+to-device over federation (4); profile queries (2); server ACLs (2); `/room_summary`, the notary
+`/_matrix/key/v2/query`, Unicode remote aliases, Complement's appservice user (4). Every name,
+the families and how it was run: status 14, session 6; the baseline is
+`docs/status/complement-federation-results.txt` (run 8).
+
 ## Fifteenth session (2026-09-30): a destination down past its queue is caught up from the rooms
 
 **Branch:** `agent/federation-catchup` (not merged). Closes the known gap "A destination down
