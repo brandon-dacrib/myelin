@@ -13,8 +13,9 @@
 //!
 //! ## Keyspaces
 //!
-//! A keyspace ([`KvBackend::keyspace`]) is an independently ordered namespace: one Fjall
-//! partition, one PostgreSQL table, one in-memory `BTreeMap`. Keyspace names are chosen by
+//! A keyspace ([`KvBackend::keyspace`]) is an independently ordered namespace: a
+//! name prefix in Fjall's one shared keyspace (see [`fjall_backend`]), one PostgreSQL table, one
+//! in-memory `BTreeMap`. Keyspace names are chosen by
 //! `hs-tables`, not derived from user data; they are ASCII, non-empty, and backends may cap their
 //! length (Fjall: 255 bytes). Keys are ordered only *within* a keyspace; there is no cross-keyspace
 //! ordering guarantee, so multi-table iteration is the caller's job.
@@ -77,7 +78,8 @@
 //! ## Size limits
 //!
 //! - [`MAX_KEY_BYTES`] (64 KiB): the hard limit on an encoded key, inherited from Fjall's own
-//!   limit so the same key always fits every backend. Keys should be far smaller in practice —
+//!   limit so the same key always fits every backend (on Fjall a key is stored behind its
+//!   keyspace's name, so there it may be at most 65,535 bytes less one byte and the name). Keys should be far smaller in practice —
 //!   `hs-tables`'s interned short IDs exist specifically to keep hot-path keys under a few dozen
 //!   bytes.
 //! - [`MAX_VALUE_BYTES`] (32 MiB): a documented, enforced ceiling per value. Values larger than a
@@ -128,7 +130,7 @@
 //! - [`memory::MemoryBackend`]: the reference implementation (this crate). Full SSI, no
 //!   persistence. Used by the conformance suite and by every other track's unit tests.
 //! - [`fjall_backend::FjallBackend`]: the embedded, single-node production backend (Fjall 3,
-//!   optimistic serializable transactions, one keyspace per table, LZ4 compression, optional
+//!   optimistic serializable transactions, every keyspace a prefix in one Fjall keyspace, LZ4 compression, optional
 //!   key-value separation for large values).
 //! - [`postgres_backend::PostgresBackend`]: the clustered production backend (one table per
 //!   keyspace, `SERIALIZABLE` transactions, `REPEATABLE READ READ ONLY` snapshots). See that

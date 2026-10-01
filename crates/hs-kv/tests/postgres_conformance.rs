@@ -120,6 +120,7 @@ fn postgres_backend_conformance_breakdown() {
             "range_boundaries_inclusive_exclusive_reverse_limit",
             c::range_boundaries_inclusive_exclusive_reverse_limit,
         ),
+        ("keyspaces_are_independent", c::keyspaces_are_independent),
         (
             "snapshot_visibility_is_repeatable_read",
             c::snapshot_visibility_is_repeatable_read,

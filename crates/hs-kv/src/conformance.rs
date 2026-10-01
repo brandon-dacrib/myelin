@@ -36,6 +36,7 @@ pub fn run_conformance_suite<B: KvBackend>(make: impl Fn() -> B) {
     get_put_delete_roundtrip(make());
     multi_get_preserves_order_and_absence(make());
     range_boundaries_inclusive_exclusive_reverse_limit(make());
+    keyspaces_are_independent(make());
     snapshot_visibility_is_repeatable_read(make());
     lost_update_is_prevented(make());
     write_skew_is_prevented(make());
@@ -173,6 +174,77 @@ pub fn range_boundaries_inclusive_exclusive_reverse_limit<B: KvBackend>(backend:
         collect(RangeSpec::new(Bound::Included(b("f")), Bound::Unbounded)),
         Vec::<String>::new(),
         "a range past the end is empty, not an error"
+    );
+}
+
+/// Keyspaces are independent namespaces, including keyspaces whose names are prefixes of one
+/// another (a backend that stores several keyspaces in one structure behind a name prefix, as
+/// the Fjall backend does, must keep them apart): a key written in one is absent from the
+/// others, and every kind of range over one sees only its own keys.
+pub fn keyspaces_are_independent<B: KvBackend>(backend: B) {
+    let t = backend.keyspace("t").expect("keyspace");
+    let t2 = backend.keyspace("t2").expect("keyspace");
+    let tt = backend.keyspace("tt").expect("keyspace");
+    transact(&backend, TransactConfig::default(), |txn| {
+        txn.put(&t, b"a", b"t")?;
+        txn.put(&t, b"b", b"t")?;
+        txn.put(&t2, b"a", b"t2")?;
+        txn.put(&t2, b"\x00", b"t2")?;
+        txn.put(&tt, &[0xff], b"tt")
+    })
+    .unwrap();
+
+    let snap = backend.snapshot();
+    assert_eq!(snap.get(&t, b"a").unwrap(), Some(b("t")), "own key");
+    assert_eq!(
+        snap.get(&t2, b"a").unwrap(),
+        Some(b("t2")),
+        "same key, other keyspace"
+    );
+    assert_eq!(
+        snap.get(&t, b"\x00").unwrap(),
+        None,
+        "another keyspace's key"
+    );
+    assert_eq!(snap.get(&tt, b"a").unwrap(), None, "another keyspace's key");
+    let collect = |ks: &B::Keyspace, spec: RangeSpec| -> Vec<Bytes> {
+        snap.range(ks, spec).map(|r| r.unwrap().0).collect()
+    };
+    assert_eq!(
+        collect(&t, RangeSpec::full()),
+        vec![b("a"), b("b")],
+        "full range"
+    );
+    assert_eq!(
+        collect(&t, RangeSpec::full().reverse()),
+        vec![b("b"), b("a")],
+        "full reverse range"
+    );
+    assert_eq!(
+        collect(&t2, RangeSpec::full()),
+        vec![b("\u{0}"), b("a")],
+        "full range of a keyspace whose name extends another's"
+    );
+    assert_eq!(
+        collect(&tt, RangeSpec::full()),
+        vec![Bytes::from_static(&[0xff])],
+        "full range"
+    );
+    assert_eq!(
+        collect(
+            &t,
+            RangeSpec::new(Bound::Excluded(b("a")), Bound::Unbounded)
+        ),
+        vec![b("b")],
+        "a range open at the top ends with its keyspace"
+    );
+    assert_eq!(
+        collect(
+            &t2,
+            RangeSpec::new(Bound::Unbounded, Bound::Included(b("a"))).reverse()
+        ),
+        vec![b("a"), b("\u{0}")],
+        "a range open at the bottom starts with its keyspace"
     );
 }
 
