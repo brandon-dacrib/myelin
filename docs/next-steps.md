@@ -1838,7 +1838,7 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | The Synapse importer leaves some things behind | `hs-compat`, `hs-cli` | end-to-end keys and key backups, push rules and pushers, receipts, filters, remote media, and rooms this server's users joined over federation (skipped and logged; their members rejoin) are not copied (`docs/compat/synapse-migration-runbook.md`, "What does not move yet") |
 | The Synapse importer has only met a small Synapse | `hs-compat`, `hs-cli` | verified end to end against a real Synapse 1.161 with four accounts and two rooms; a room is replayed whole, in memory, so a very large room will be slow and memory-hungry, and nothing measures throughput yet |
 | Sytest never run | `tests/sytest` | CPAN dependencies absent |
-| `cargo fuzz` never executed | `fuzz/` | no nightly toolchain |
+| ~~`cargo fuzz` never executed~~ | `crates/*/fuzz`, `tests/fuzz` | **Closed** 2026-10-01 (`agent/test-infra-gaps`, status 14 session 5): nightly and `cargo-fuzz` installed; all eight targets (five `hs-federation`, three `hs-media`) built and run ten minutes each with `tests/fuzz/run_all.sh 600`: 18.7 million executions, no crash, so no artifact or regression test. `ci.yml`'s new `fuzz` job runs each for 60 s on every push, outside `ci-ok` (nightly can break on its own). Found and fixed on the way: `hs-admin`'s build script made every cargo invocation without `web/dist` recompile `hs-admin` and its dependents. Left: ten minutes is not saturation (every target still found new features at the end); no target covers the client-server JSON bodies, canonical JSON or event auth |
 
 ## Conventions worth keeping
 

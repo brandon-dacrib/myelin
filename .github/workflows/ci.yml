@@ -124,6 +124,40 @@ jobs:
           path: web/playwright-report/
           retention-days: 7
 
+  # Every cargo-fuzz target (crates/hs-federation/fuzz, crates/hs-media/fuzz) built on nightly and
+  # run for 60 s each from its checked-in seed corpus (tests/fuzz/run_all.sh; status 14 has the
+  # 10-minute baseline). Deliberately not in `ci-ok`'s needs: a nightly toolchain can break the
+  # build for reasons that are not this repository's, and a minute of random inputs is not a
+  # deterministic gate. It still fails red (no `continue-on-error`), and a crash's input is
+  # uploaded, so a finding is seen on the commit that exposed it.
+  fuzz:
+    name: fuzz (60 s per target)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            crates/hs-federation/fuzz
+            crates/hs-media/fuzz
+      - run: tests/fuzz/run_all.sh 60
+        env:
+          FUZZ_OUT: ${{ runner.temp }}/fuzz-runs
+          FUZZ_REQUIRE: "1"
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: |
+            crates/*/fuzz/artifacts/
+            ${{ runner.temp }}/fuzz-runs/**/fuzz.log
+          retention-days: 14
+
   # A single job that must pass for a PR to merge, independent of how the matrix jobs above are
   # split or renamed later (a GitHub required-status-check list has to name jobs individually
   # otherwise, which silently stops blocking merges when a job is renamed or the matrix changes).

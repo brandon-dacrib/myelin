@@ -11,6 +11,63 @@ one-minute recount. After: five full `e2e-real` runs in a row, 22/22 each. For C
 (`retain-on-failure-and-retries`) and sets `failOnFlakyTests`, so a test that only passes on
 retry fails the `web` job and its report, traces included, is uploaded.
 
+## Session 5 (2026-10-01, branch `agent/test-infra-gaps`): `cargo fuzz` executed, Sytest run
+
+Two rows of `docs/next-steps.md`'s known gaps: "`cargo fuzz` never executed" and "Sytest never
+run".
+
+### `cargo fuzz`: every target built and run, no crash
+
+Nightly (`cargo 1.101.0-nightly f3865b2a4 2026-09-29`) and `cargo-fuzz 0.13.2` installed with
+rustup and `cargo install --locked`. The workspace has eight targets in two fuzz crates, each its
+own cargo workspace: `crates/hs-federation/fuzz` (five) and `crates/hs-media/fuzz` (three). Their
+`Cargo.lock` files were stale -- neither had resolved since the crates gained dependencies, which
+is what "never executed" looked like -- and are updated here.
+
+`tests/fuzz/run_all.sh [seconds] [filter]` builds each fuzz crate once and runs every target in
+turn from its checked-in seed corpus plus a scratch corpus under `target/fuzz-runs/` (so new
+inputs never land in the repository), one process each, `-rss_limit_mb=2048`; it prints a TSV
+row per target and exits 1 if any target crashed, after running the rest. The baseline, ten
+minutes per target, sequentially, on the shared desktop (default `cargo fuzz` build: release with
+debug assertions and overflow checks):
+
+| crate | target | execs | exec/s | edges (cov) | features (ft) | corpus | peak RSS | result |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| hs-federation | edu_parse | 1,918,566 | 3,192 | 1,460 | 6,043 | 1,447 | 82 MB | ok |
+| hs-federation | key_server_response_parse | 2,765,525 | 4,578 | 1,294 | 5,603 | 1,389 | 224 MB | ok |
+| hs-federation | pdu_parse | 3,891,772 | 6,475 | 1,876 | 7,454 | 1,711 | 343 MB | ok |
+| hs-federation | well_known_body_parse | 2,670,949 | 4,444 | 1,127 | 3,376 | 1,361 | 109 MB | ok |
+| hs-federation | xmatrix_header_parse | 2,326,356 | 3,870 | 300 | 1,072 | 266 | 128 MB | ok |
+| hs-media | decode_image | 1,336,325 | 2,176 | 5,695 | 17,529 | 2,147 | 305 MB | ok |
+| hs-media | multipart_parse | 1,085,721 | 1,806 | 227 | 1,272 | 414 | 113 MB | ok |
+| hs-media | thumbnail_generate | 2,710,248 | 4,487 | 1,011 | 4,031 | 621 | 70 MB | ok |
+
+18.7 million executions in 80 minutes on macOS arm64 under AddressSanitizer (`cargo fuzz`'s default), **no crash, no sanitizer report, no timeout, no OOM**; nothing
+to minimise, so no artifact and no regression test. Every target was still finding new
+features at the end (the `new_units` column of the TSV: 2,067 to 10,225), so ten minutes is a
+smoke test, not saturation.
+
+Found on the way, fixed: **`hs-admin`'s build script made every cargo invocation recompile
+`hs-admin` and everything above it** in a checkout without a built web interface (every agent
+worktree and every CI Rust job). It emitted `cargo:rerun-if-changed=web/dist` whether or not
+`web/dist` existed, and cargo treats a missing watched path as always stale ("Dirty hs-admin: the
+file `web/dist` is missing"). Each `cargo fuzz run` of an `hs-federation` target spent five to
+twenty minutes rebuilding before it fuzzed. It now watches `web/dist` when it exists and `web/`
+when it does not (so the first `npm run build` is still noticed); checked before/after with
+`cargo check -p hs-admin -v` (Dirty → Fresh), and that creating `web/dist` and removing it each
+rerun the script once. Commit `823bf5c`. `run_all.sh` also runs the built fuzzer binaries
+directly rather than through `cargo fuzz run`, which re-invokes cargo per target.
+
+CI: `ci.yml` has a `fuzz` job (nightly via `dtolnay/rust-toolchain@nightly`, `cargo-fuzz` via
+`taiki-e/install-action`, `rust-cache` on the two fuzz workspaces) that runs
+`tests/fuzz/run_all.sh 60` on every push and uploads `crates/*/fuzz/artifacts/` and the logs when
+it fails. `FUZZ_REQUIRE=1` makes a missing toolchain a failure rather than the script's local
+clean skip. **It is not in `ci-ok`'s needs**: a nightly toolchain can break for reasons outside
+this repository, and a minute of random input is not a deterministic gate; it has no
+`continue-on-error`, so a crash shows red on the commit that exposed it. Promote it into `ci-ok`
+once it has been green on nightly for a few weeks. `actionlint` clean; the job has not run on
+GitHub yet (it runs on this branch's first push to a PR or `main`).
+
 ## Re-measurement (2026-09-25/26, session 4): two-way federation, and what the suite found underneath it
 
 The day's code: `POST /join` reaching a room hosted elsewhere through the real handshake, the
