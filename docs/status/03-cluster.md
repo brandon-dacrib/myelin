@@ -150,6 +150,20 @@ against the ownerless row until the next acquisition; a handoff now moves the ep
   six upgraded across the two replicas). One earlier run of `cluster_create_room.rs` failed
   before the test did anything: replica 2 timed out connecting to PostgreSQL at boot.
 
+**The merge gate's failure, and why it was not this change.** This branch's first gate failed
+`cluster_create_room.rs` with "two replicas never settled sharing the room shards": all four
+`room/*` shards on one replica at epoch 1. Epoch 1 means those shards were never released, so
+the release's epoch could not be involved; rendezvous hashing of the two mesh addresses gave
+that replica all four (`hash::desired_owner`), a stable map that about one port pair in eight
+produces. That and the test's other two failure modes (a create fenced by an ownership move,
+and a fenced forward answered from the idempotency cache) were on `main` too, and are fixed on
+`agent/cluster-create-room-flake`, which this branch is now on top of. Neither of the two
+ownership rules that move shards in that test (release after a late heartbeat, self-suspicion
+after `lease_ttl`) reads an epoch. On top of that branch, five runs at load 10-13: four passed
+(199-300 s); the first failed before the test did anything, a replica's boot timing out on its
+PostgreSQL connection pool (the cold-boot row). `cluster_admin.rs`, `room_upgrade.rs`, `cargo
+test -p hs-cluster` and `cargo test -p hs-room` pass.
+
 **How to verify.** `cargo test -p hs-cluster`; with a PostgreSQL of your own,
 `HS_CLUSTER_TEST_POSTGRES_DSN=postgres://postgres:hspg@127.0.0.1:5477/postgres cargo test -p
 hs-cli --test cluster_admin --test cluster_create_room`.
