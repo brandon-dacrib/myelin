@@ -449,7 +449,17 @@ pub async fn get_messages<B: KvBackend + 'static>(
                         // One of the resolver's own tokens, but no position for this room --
                         // treat exactly like an absent `from` (see the trait doc comment).
                         Some(None) => None,
-                        Some(Some(pos)) => Some(PaginationToken::new(pos, direction)),
+                        // A sync token covers its room *through* `pos` (the newest event the
+                        // sync had handed out), while a page excludes its `from` position. So a
+                        // backward page starts just above it -- the events the sync showed are
+                        // the first a client paging back from it sees, as the spec and every
+                        // client expect -- and a forward page starts after it.
+                        Some(Some(pos)) => Some(match direction {
+                            Direction::Backward => {
+                                PaginationToken::new(pos.saturating_add(1), direction)
+                            }
+                            Direction::Forward => PaginationToken::new(pos, direction),
+                        }),
                     }
                 }
                 None => return Err(RoomError::InvalidPaginationToken),
@@ -1072,6 +1082,87 @@ mod tests {
         let total = handle.query(|actor| actor.events_after(0, 100).len()).await;
         assert_eq!(seen, total);
         assert_eq!(pages, total.div_ceil(2));
+    }
+
+    /// A resolver that knows one token, `synctok`, standing for a sync that covered the room
+    /// through `pos`.
+    struct OneToken {
+        pos: i64,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::registry::GlobalTokenResolver for OneToken {
+        async fn resolve(
+            &self,
+            _user_id: &ruma::UserId,
+            _room_id: &ruma::RoomId,
+            raw: &str,
+        ) -> Result<Option<Option<i64>>, RoomError> {
+            Ok((raw == "synctok").then_some(Some(self.pos)))
+        }
+    }
+
+    /// Sync, then page back from its `next_batch` (what Sytest's `matrix_get_room_messages` and
+    /// most clients do): the newest event the sync handed out is the first one the page shows.
+    /// It was left out -- the page started below it -- so a message a sync had just shown was
+    /// missing from `/messages` (Sytest's "Guest users can send messages to guest_access rooms if
+    /// joined", for any sender).
+    #[tokio::test]
+    async fn a_backward_page_from_a_sync_token_starts_with_the_newest_event_the_sync_showed() {
+        let state = app();
+        let alice = user_id!("@alice:hs1");
+        let handle = state
+            .rooms
+            .create_room(
+                alice.to_owned(),
+                crate::actor::CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|actor| actor.room_id().to_owned()).await;
+        let hello = handle
+            .send_event(
+                alice.to_owned(),
+                "m.room.message".to_owned(),
+                None,
+                json!({"msgtype": "m.text", "body": "hello"}),
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        let id = hello.event_id().to_owned();
+        let pos = handle
+            .query(move |actor| actor.timeline_position(&id))
+            .await
+            .unwrap();
+        state
+            .rooms
+            .install_global_token_resolver(Arc::new(OneToken { pos }));
+        let page = |dir: &str| {
+            get_messages::<MemoryBackend>(
+                State(state.clone()),
+                Path(room_id.to_string()),
+                Query(MessagesQuery {
+                    from: Some("synctok".to_owned()),
+                    dir: Some(dir.to_owned()),
+                    limit: Some(1),
+                }),
+                requester(alice),
+            )
+        };
+        let back = json_body(page("b").await.unwrap()).await;
+        assert_eq!(
+            back["chunk"][0]["event_id"],
+            hello.event_id().as_str(),
+            "{back}"
+        );
+        let forward = json_body(page("f").await.unwrap()).await;
+        assert!(forward["chunk"].as_array().unwrap().is_empty(), "{forward}");
     }
 
     /// `GET /rooms/{roomId}/initialSync`: a member sees their membership, the room's state and

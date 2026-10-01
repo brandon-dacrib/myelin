@@ -446,8 +446,12 @@ async fn messages_accepts_a_token_minted_by_sync_in_both_directions() {
         forward.json
     );
 
-    // dir=b from the token minted *after* "newer message": walking backward must find "older
-    // message" (older than the token), not re-return "newer message" (already covered by it).
+    // dir=b from the token minted *after* "newer message": walking backward starts with the
+    // newest event that sync handed out, "newer message", then "older message" -- a `/sync`
+    // token marks the point *after* the events it covered, so paging back from it begins with
+    // them, as Synapse does and as Sytest's `matrix_get_room_messages` (sync, then page back from
+    // `next_batch`) counts on. (This test used to assert the opposite, and a message a sync had
+    // just shown was missing from the page.)
     let backward = s
         .send(
             Some("alice"),
@@ -468,11 +472,9 @@ async fn messages_accepts_a_token_minted_by_sync_in_both_directions() {
         "paginating backward from a post-message /sync token should find the earlier message: {}",
         backward.json
     );
-    assert!(
-        !backward_chunk
-            .iter()
-            .any(|e| e["content"]["body"] == "newer message"),
-        "backward pagination must not re-return the message already covered by the token: {}",
+    assert_eq!(
+        backward_chunk[0]["content"]["body"], "newer message",
+        "backward pagination from a sync token starts with the newest event the sync showed: {}",
         backward.json
     );
 
