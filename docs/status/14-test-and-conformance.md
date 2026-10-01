@@ -2,16 +2,111 @@
 
 ## Session 6 (2026-10-01, branch `agent/complement-remeasure`): Complement re-measured on `main`
 
-**In progress.** Both whole packages, twice each, from one image built from `main` at
-`2a0b362`, compared by name with `tools/complement_triage.py` against the 2026-09-26 baselines
-(csapi run 12, federation run 7, both `63c226f`).
+Both whole packages, twice each, from one image built from `main` at `2a0b362` (everything of
+the night: `/search`, the rejoin-gap fill, backfilled state through `/state_ids` with auth
+checks, federation catch-up, version-12 placement, the hot-room sync fix, the user-directory
+index, the redaction permission fix, `/state` and `/state_ids` answering the state before the
+event, and the importer). Compared by name with `tools/complement_triage.py` against the
+2026-09-26 baselines (csapi run 12, federation run 7, both `63c226f`), and run against run.
 
-| Run | Package | Assertions | Top-level | Against 09-26 |
+| Run | Package | Assertions | Top-level | Against 2026-09-26, by name |
 |---|---|---|---|---|
-| csapi 1 | `tests/csapi/...` | 343 / 384 | 82 / 106 | `TestDeviceListUpdates`, `TestMessagesOverFederation`, `TestSearch`, `TestServerNotices` FAIL -> PASS; nothing PASS -> FAIL |
-| federation 1 | `tests` | 225 / 314 | 50 / 90 (1 skipped) | 36 FAIL -> PASS (invites, leaves, knocks, restricted joins, `/hierarchy`, media, typing and presence over federation, version 12); nothing PASS -> FAIL; Complement's checkout replaced `TestMSC4311FullCreateEventOnStrippedState` with three new `TestMSC4311*` tests, which fail |
-| csapi 2 | `tests/csapi/...` | 340 / 384 | 81 / 106 | the same four FAIL -> PASS; `TestRoomState` PASS -> FAIL (one subtest, `GET /joined_rooms lists newly-created room`: `/joined_rooms` read before the session hub wrote the new room; a flap, see below) |
-| federation 2 | | | | |
+| csapi 13 | `tests/csapi/...` | **343 / 384** | **82 / 106** | 4 FAIL -> PASS: `TestDeviceListUpdates`, `TestMessagesOverFederation`, `TestSearch`, `TestServerNotices`; nothing PASS -> FAIL |
+| csapi 14 | `tests/csapi/...` | 340 / 384 | 81 / 106 | the same 4 FAIL -> PASS; `TestRoomState` PASS -> FAIL (a flap, below) |
+| federation 8 | `tests` | **225 / 314** | **50 / 90** (1 skipped) | 36 FAIL -> PASS, nothing PASS -> FAIL |
+| federation 9 | `tests` | 224 / 314 | 49 / 90 (1 skipped) | 35 FAIL -> PASS (the 36 less `TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11`), nothing PASS -> FAIL |
+
+Was 317 / 384 and 78 / 106 (csapi), 75 / 250 and 14 / 88 (federation). The federation package
+has 90 tests now, not 88, because the Complement checkout is newer than 09-26's (`61af675`,
+cloned 2026-09-30, the one the 09-30 targeted runs used): `TestMSC4311FullCreateEventOnStrippedState`
+became `TestMSC4311FullEventsOnStrippedStateFederation`, `TestMSC4311RejectInvalidStrippedStateFederation`
+and `TestMSC4311StrippedStateClientAPI`, all three failing. The assertion total grew from 250 to
+314 mostly because tests that used to stop at a refused join or invite now reach their later
+subtests. csapi's 106 names are unchanged. The baselines
+(`docs/status/complement-{csapi,federation}-results.txt`) are now runs 13 and 8.
+
+**What moved, and why.** csapi: `TestSearch` (`POST /search`, `agent/room-gaps`),
+`TestMessagesOverFederation` (the rejoin gap filled, `agent/rejoin-gap`), `TestServerNotices`
+(server notices, `1366d2f`), `TestDeviceListUpdates` (its remote halves: invites and
+device-list updates over federation, `e6d4a71`, `e4543e4`). Federation, by family:
+
+- invites over federation (4): `TestFederationRoomsInvite`, `TestFederationRejectInvite`,
+  `TestIsDirectFlagFederation`, `TestUnbanViaInvite` (`e6d4a71`, `ea990cb`);
+- leaves, knocks and the `send_*` checks (9): `TestCannotSendNon{Join,Leave}ViaSend{Join,Leave}{V1,V2}`,
+  `TestCannotSendNonKnockViaSendKnock`, `TestCannotSendKnockViaSendKnockInMSC3787Room`,
+  `TestKnocking`, `TestKnockingInMSC3787Room`, and `TestEventAuth`, which needs a remote leave
+  (`e6d4a71`, `0414dde`);
+- restricted joins (8, plus 2 NoCreators that won their race in run 8):
+  `TestRestrictedRoomsLocalJoin{,InMSC3787Room}`, `TestRestrictedRoomsRemoteJoin{,InMSC3787Room}`,
+  `TestRestrictedRoomsRemoteJoinLocalUser{,InMSC3787Room}`,
+  `TestRestrictedRoomsRemoteJoinFailOver{,InMSC3787Room}` (`719a856`, the via change, and the
+  `hs-state` timestamp tie-break of status 06 session 14);
+- `/hierarchy` (5): `TestClientSpacesSummary`, `TestClientSpacesSummaryJoinRules`,
+  `TestFederatedClientSpaces`, `TestRestrictedRoomsSpacesSummary{Local,Federation}` (`agent/hierarchy`);
+- media over federation (3): `TestContentMediaV1`, `TestMediaFilenames`,
+  `TestMediaWithoutFileNameCSMediaV1` (status 09 session 6);
+- typing, presence and device lists across servers (3): `TestRemoteTyping`, `TestRemotePresence`,
+  `TestUserAppearsInChangedDeviceListOnJoinOverFederation` (`e4543e4`);
+- version 12 (2): `TestComplementCanCreateValidV12Rooms`,
+  `TestMSC4291RoomIDAsHashOfCreateEvent_AuthEventsOmitsCreateEvent` (`57726a1`).
+
+**No test moved PASS -> FAIL since 09-26 in both runs of a package.** One did in one run:
+`TestRoomState` in csapi 14, which is the flap below and has a row in `docs/next-steps.md`.
+
+**Run against run (the `TestThreadsEndpoint` row graded).** `TestThreadsEndpoint` passed in
+both csapi runs. Two tests did move between identical runs, every other name (subtests
+included) matched:
+
+1. **`TestRoomState`**, csapi, PASS then FAIL. One subtest, `GET /joined_rooms lists
+   newly-created room`: `apidoc_room_state_test.go:187: failed to find room with id`. The test
+   creates a room and asks `GET /joined_rooms` at once (here 1 ms apart). `hs_user::routes::rooms::get_joined_rooms`
+   lists the user store's membership records, which the session hub writes off the registry's
+   stream a moment after the room accepted the join, and it does not wait for the hub
+   (`SessionHub::settle_before_read`, as `/sync` does and as `/typing` and `/receipt` were made
+   to on 2026-09-30, status 05 session 10). A read-your-writes bug in `hs-user`, not noise:
+   a client that creates a room and lists its rooms can be told it is not in it.
+2. **`TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11`**, federation, PASS then
+   FAIL, at `restricted_rooms_test.go:554` (the sync for charlie's join authorised by bob times
+   out): charlie's join through hs2 was answered `403` 12 ms after alice's power-levels change,
+   which hs2 had not received yet. The test race of status 06 session 14, item 3. Its three
+   siblings sit on the same helper and the same race: `TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11`
+   and `TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12` failed in both runs,
+   `TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12` passed in both; all four failed in
+   all four runs of 2026-09-30. Machine load decides them.
+
+**What is left, by family** (federation run 8's 40 failures; csapi's 24 all failed on 09-26
+too): `/timestamp_to_event` (`TestJumpToDateEndpoint`, 404); version 12 and its MSCs (14:
+`TestMSC4289*` ×6, `TestMSC4291*` ×3, `TestMSC4297*` ×2, the three new `TestMSC4311*`);
+`/get_missing_events`, auth chains and outbound `/send` (7: `TestInboundCanReturnMissingEvents`,
+`TestCorruptedAuthChain`, `TestInboundFederationRejectsEventsWithRejectedAuthEvents`,
+`TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6`, `TestOutboundFederationSend`,
+`TestFederationRedactSendsWithoutEvent`, `TestSyncOmitsStateChangeOnFilteredEvents`);
+thumbnails (`400`) and a remote download without a filename (`502`) (4); device lists, key
+upload and to-device over federation (4); profile queries over federation (2); server ACLs
+(2); `/room_summary` (404), the notary `/_matrix/key/v2/query` (404 where 405 is expected),
+remote aliases in Unicode, Complement's appservice user (`401`) (4); and the NoCreators race (2).
+
+**Rate limits.** `tests/complement/startup.sh` writes `rate_limits: {enabled: false}`. On
+`agent/config-hot` (not merged), every new bucket (login, registration, joins local and remote,
+admin redaction in `hs_auth::ratelimit::ServerLimits::apply`; federation transactions through
+`live_config::bucket_limit`) is `None` unless `rate_limits.enabled`, so these runs should not
+change when it merges.
+
+**How it was run.** Image `complement-hs-remeasure:2a0b362` from `tests/complement/build.sh` in
+this worktree, with `DOCKER_HOST` at OrbStack's socket, `DOCKER_BUILDKIT=0` and a `DOCKER_CONFIG`
+whose `credsStore` is a no-op helper; `rust:1.98-slim` and `debian:trixie-slim` were already
+local, so nothing was pulled. The release build took 121m52s (thin LTO, `--jobs 4`, rustup in
+the image installing stable 1.99.0 for `rust-toolchain.toml`), at load averages of 10 to 35 with
+another session's workspace tests and a Sytest build running. Then, in `refs/complement`,
+`COMPLEMENT_BASE_IMAGE=complement-hs-remeasure:2a0b362 COMPLEMENT_SPAWN_HS_TIMEOUT_SECS=120 go
+test -v -count=1 -p 1 -timeout 30m ./tests/csapi/...` (or `./tests`), interleaved csapi, federation,
+csapi, federation, 17:02 to 18:18 EDT: csapi 1203 s and 904 s, federation 1151 s and 1222 s;
+one-minute load 35 at the first start, 7 at the last end. No run hit the timeout or panicked.
+Logs are scratch (not committed).
+
+**Left for this track:** nothing from this measurement; the two rows it opened in
+`docs/next-steps.md` belong to tracks 05 (`/joined_rooms`) and 06/14 (the NoCreators race: a
+wait in Complement's test, upstream or patched here).
 
 ## 2026-10-01: two browser-suite flakes were the harness (branch `agent/web-gaps`)
 

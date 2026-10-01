@@ -1,7 +1,7 @@
 # Complement tests/csapi, top-level results. One line per test so that two runs can be compared
 # by name: a change is worth something when it moves a *named* test and that survives a re-run.
 # Written and read by tools/complement_triage.py (--write-baseline, --diff).
-# Run 12, 2026-09-26, 63c226f: 317 of 384 assertions, 78 of 106 top-level (0 skipped).
+# Run 13, 2026-10-01, 2a0b362 (run 14, same image: TestRoomState failed once, a flap): 343 of 384 assertions, 82 of 106 top-level (0 skipped).
 PASS TestAddAccountData
 PASS TestArchivedRoomsHistory
 PASS TestAsyncUpload
@@ -16,7 +16,7 @@ PASS TestContentCSAPIMediaV1
 PASS TestCumulativeJoinLeaveJoinSync
 PASS TestDeactivateAccount
 PASS TestDemotingUsersViaUsersDefault
-FAIL TestDeviceListUpdates
+PASS TestDeviceListUpdates
 FAIL TestDeviceManagement
 PASS TestDisplayNameUpdate
 PASS TestE2EKeyBackupReplaceRoomKeyRules
@@ -48,7 +48,7 @@ PASS TestLogout
 PASS TestMediaConfig
 PASS TestMembersLocal
 FAIL TestMembershipOnEvents
-FAIL TestMessagesOverFederation
+PASS TestMessagesOverFederation
 PASS TestNotPresentUserCannotBanOthers
 PASS TestOlderLeftRoomsNotInLeaveSection
 PASS TestPowerLevels
@@ -83,11 +83,11 @@ PASS TestRoomSpecificUsernameChange
 PASS TestRoomState
 PASS TestRoomSummary
 PASS TestRoomsInvite
-FAIL TestSearch
+PASS TestSearch
 PASS TestSendAndFetchMessage
 PASS TestSendMessageWithTxn
 FAIL TestServerCapabilities
-FAIL TestServerNotices
+PASS TestServerNotices
 FAIL TestSync
 PASS TestSyncFilter
 PASS TestSyncLeaveSection
