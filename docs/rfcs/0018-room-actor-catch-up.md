@@ -1,7 +1,20 @@
 # 0018. A non-owner's room snapshot needs an incremental catch-up, not a reload
 
-Status: proposed, 2026-09-27. Author: track 05 (sync). Owner of the change: track 04 (room and
-events). Affects: `crates/hs-room/src/actor.rs`, `crates/hs-room/src/registry.rs`.
+Status: **implemented**, 2026-10-01 (branch `agent/rfc-0018`; decision 0022). Proposed
+2026-09-27. Author: track 05 (sync). Owner of the change: track 04 (room and events). Affects:
+`crates/hs-room/src/actor.rs`, `crates/hs-room/src/actor/catch_up.rs` (new),
+`crates/hs-room/src/persist.rs`, `crates/hs-user/src/cluster.rs`.
+
+**As built.** `RoomActor::catch_up(&mut self) -> Result<CatchUp, RoomError>` (not
+`Result<usize, _>`): it answers `CatchUp::Advanced { events, pending_redactions }`, or
+`CatchUp::Reload(reason)` without changing the actor when the copy cannot be advanced from new
+rows. The open question -- how a copy learns that rows it already read were changed (backfill,
+outliers, purges, gaps, pruned extremities) -- is answered by a per-room rewrite counter
+(`room_rewrites`) bumped in those transactions; redactions are applied by the copy itself.
+`RoomActorHandle::catch_up` is the async wrapper. The mirror catches up on every read whose
+durable-head check says the store is ahead, and on each wake for a room it holds. Measurements
+and what is left: decision 0022 and `docs/status/05-sync.md`, session 12. The text below is the
+proposal as written.
 
 ## The problem
 
