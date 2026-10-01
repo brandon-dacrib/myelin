@@ -724,6 +724,14 @@ const properties: Record<string, JsonSchemaNode> = {
         $ref: "#/$defs/Duration",
         description: "Ceiling on the exponential backoff applied to a failing destination.",
       },
+      max_queued_pdus_per_destination: {
+        type: "integer",
+        format: "uint32",
+        minimum: 0,
+        default: 10000,
+        description:
+          "How many events the outbound queue holds for one destination before it is dropped and the destination, once it answers again, is caught up with the latest event of each room it is behind in instead (it fetches the rest itself). Bounds what a server that is down for days costs this one's database. Corresponds to Synapse's catch-up mode (destination_rooms), which Synapse enters on the first failure; Synapse has no setting for it. At least 1.",
+      },
       allow_public_rooms_over_federation: {
         type: "boolean",
         default: false,
@@ -1144,6 +1152,7 @@ export const configValues: Record<string, Record<string, JsonValue>> = {
     trust_os_root_store: false,
     client_timeout: "45s",
     max_retry_backoff: "1d",
+    max_queued_pdus_per_destination: 10000,
     allow_public_rooms_over_federation: false,
     allow_device_name_lookup_over_federation: false,
   },

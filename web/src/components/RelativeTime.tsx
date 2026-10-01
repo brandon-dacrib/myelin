@@ -19,6 +19,13 @@ export function RelativeTime({ at }: { at: string | null | undefined }) {
 function formatRelative(diffMs: number, date: Date): string {
   const diffSec = Math.round(diffMs / 1000);
   const sevenDaysSec = 7 * 24 * 3600;
+  // A time still to come (a destination's next attempt): "in 4 min", not "just now".
+  if (diffSec <= -60 && -diffSec < sevenDaysSec) {
+    const ahead = -diffSec;
+    if (ahead < 3600) return `in ${Math.round(ahead / 60)} min`;
+    if (ahead < 86_400) return `in ${Math.round(ahead / 3600)} h`;
+    return `in ${Math.round(ahead / 86_400)} d`;
+  }
   if (diffSec < sevenDaysSec) {
     if (diffSec < 60) return "just now";
     if (diffSec < 3600) return `${Math.round(diffSec / 60)} min ago`;

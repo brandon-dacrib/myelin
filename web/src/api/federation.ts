@@ -2,6 +2,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, newIdempotencyKey } from "./client";
 import { unwrap } from "./problem";
+import { useConfigSection } from "./config";
+import { DEFAULT_MAX_QUEUED_PDUS, MAX_QUEUED_PDUS_SETTING } from "@/lib/federation";
 import { rememberTask } from "./task-cache";
 import type { components } from "./schema";
 
@@ -109,4 +111,16 @@ export function useRefreshRemoteKeys() {
       void qc.invalidateQueries({ queryKey: ["tasks"] });
     },
   });
+}
+
+/**
+ * The queue limit this server runs with: the configured value when the `federation` section
+ * can be read, else the default.
+ */
+export function useFederationQueueLimit(): { limit: number; configured: boolean } {
+  const { data } = useConfigSection("federation");
+  const value = data?.section.values?.[MAX_QUEUED_PDUS_SETTING];
+  return typeof value === "number"
+    ? { limit: value, configured: value !== DEFAULT_MAX_QUEUED_PDUS }
+    : { limit: DEFAULT_MAX_QUEUED_PDUS, configured: false };
 }

@@ -10,16 +10,10 @@ import { ForbiddenState } from "@/components/ui/error-state/ErrorState";
 import { QueryProblemState } from "@/components/QueryProblemState";
 import { RelativeTime } from "@/components/RelativeTime";
 import { hasScope } from "@/lib/auth";
+import { destinationHealth, destinationSeverity } from "@/lib/federation";
+import { useFederationQueueLimit } from "@/api/federation";
+import { CatchUpBadge } from "./federation/CatchUp";
 import { OwnKeysPanel } from "./federation/FederationPanels";
-
-function destinationStatus(d: Destination): {
-  status: "success" | "warning" | "danger";
-  label: string;
-} {
-  if (d.failing_since) return { status: "danger", label: "Failing" };
-  if (d.retry_interval_ms) return { status: "warning", label: "Backing off" };
-  return { status: "success", label: "Healthy" };
-}
 
 /** `/federation` — flows.md flow 4: watch federation health. */
 export function FederationPage() {
@@ -29,12 +23,10 @@ export function FederationPage() {
 
   const rows = useMemo(() => {
     const items = data?.items ?? [];
-    // Attention-first: failing, then backing off, then healthy.
-    const severity = { danger: 0, warning: 1, success: 2 } as const;
-    return [...items].sort(
-      (a, b) => severity[destinationStatus(a).status] - severity[destinationStatus(b).status],
-    );
+    // Attention first: failing, then catching up or backing off, then healthy.
+    return [...items].sort((a, b) => destinationSeverity(a) - destinationSeverity(b));
   }, [data]);
+  const catchingUp = rows.filter((d) => d.catch_up_since).length;
 
   const columns: Column<Destination>[] = [
     {
@@ -57,10 +49,18 @@ export function FederationPage() {
       header: "Status",
       priority: 1,
       render: (d) => {
-        const meta = destinationStatus(d);
-        return <Badge status={meta.status}>{meta.label}</Badge>;
+        const meta = destinationHealth(d);
+        return (
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Badge status={meta.status}>{meta.label}</Badge>
+            <CatchUpBadge since={d.catch_up_since} />
+          </div>
+        );
       },
-      renderCompact: (d) => destinationStatus(d).label,
+      renderCompact: (d) =>
+        d.catch_up_since
+          ? `${destinationHealth(d).label}, catching up`
+          : destinationHealth(d).label,
     },
     {
       key: "last_successful_at",
@@ -70,10 +70,15 @@ export function FederationPage() {
     },
     {
       key: "pending",
-      header: "Pending",
+      header: "Waiting to send",
       priority: 3,
       align: "end",
-      render: (d) => (d.pending_pdu_count ?? 0) + (d.pending_edu_count ?? 0),
+      render: (d) =>
+        d.catch_up_since ? (
+          <span className="text-text-muted">not queued</span>
+        ) : (
+          (d.pending_pdu_count ?? 0) + (d.pending_edu_count ?? 0)
+        ),
     },
   ];
 
@@ -89,6 +94,13 @@ export function FederationPage() {
   return (
     <div className="mx-auto max-w-[90rem] p-6">
       <h1 className="text-xl text-text">Federation</h1>
+      <p className="mt-1 max-w-3xl text-sm text-text-muted">
+        The other Matrix servers this one sends to: every server with a user in a room your users
+        are in. Each row says whether sending to it works now; open one for its shared rooms, its
+        signing keys and its retry state.
+      </p>
+
+      <StatusKey catchingUp={catchingUp} />
 
       {isError && (
         <div className="mt-6">
@@ -128,5 +140,61 @@ export function FederationPage() {
 
       <OwnKeysPanel />
     </div>
+  );
+}
+
+/**
+ * What each status means, once, above the table: an operator should not need the docs to read
+ * a badge. Catch-up is explained in full when a destination is in it.
+ */
+function StatusKey({ catchingUp }: { catchingUp: number }) {
+  const { limit } = useFederationQueueLimit();
+  return (
+    <details className="mt-3 max-w-3xl text-sm text-text-muted" open={catchingUp > 0}>
+      <summary className="cursor-pointer text-accent hover:underline">
+        What the statuses mean
+        {catchingUp > 0 &&
+          ` (${catchingUp} ${catchingUp === 1 ? "server is" : "servers are"} catching up)`}
+      </summary>
+      <dl className="mt-2 grid gap-2 sm:grid-cols-[10rem_1fr]">
+        {(["success", "warning", "danger"] as const).map((status) => {
+          const sample = destinationHealth(
+            status === "danger"
+              ? { failing_since: "x" }
+              : status === "warning"
+                ? { retry_interval_ms: 1 }
+                : {},
+          );
+          return (
+            <div key={status} className="contents">
+              <dt>
+                <Badge status={sample.status}>{sample.label}</Badge>
+              </dt>
+              <dd>{sample.explanation}</dd>
+            </div>
+          );
+        })}
+        <div className="contents">
+          <dt>
+            <Badge status="info" hideIcon>
+              Catching up
+            </Badge>
+          </dt>
+          <dd>
+            The server was unreachable for longer than its queue holds (
+            {limit.toLocaleString("en-US")} events), so this server stopped queuing for it. When it
+            answers, it is sent the latest event of each room it is behind in and fetches the rest
+            itself. Nothing is lost.
+          </dd>
+        </div>
+        <div className="contents">
+          <dt className="text-text">Waiting to send</dt>
+          <dd>
+            Events (PDUs) and other messages (EDUs: typing, read receipts, presence, device updates)
+            queued for the server, sent as soon as it answers.
+          </dd>
+        </div>
+      </dl>
+    </details>
   );
 }

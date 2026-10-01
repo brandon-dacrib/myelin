@@ -16,7 +16,7 @@ export const statisticsOverview: StatisticsOverview = {
   media_bytes: 38 * 1024 * 1024 * 1024,
   daily_active_users: 214,
   monthly_active_users: 580,
-  federation_destinations_failing_count: 1,
+  federation_destinations_failing_count: 2,
   pending_reports_count: 2,
 };
 
@@ -73,5 +73,18 @@ export const federationDestinations: Destination[] = [
     retry_interval_ms: 300_000,
     pending_pdu_count: 42,
     pending_edu_count: 3,
+    catch_up_since: null,
+  },
+  {
+    // Down for two days: its queue overflowed, so nothing more is queued for it and it is
+    // caught up with each room's latest event when it answers (`catch_up_since`).
+    server_name: "kde.org",
+    last_successful_at: iso(2 * 86_400_000),
+    failing_since: iso(2 * 86_400_000 - 60_000),
+    retry_last_at: iso(40 * 60_000),
+    retry_interval_ms: 3_600_000,
+    pending_pdu_count: 0,
+    pending_edu_count: 0,
+    catch_up_since: iso(26 * 3_600_000),
   },
 ];
