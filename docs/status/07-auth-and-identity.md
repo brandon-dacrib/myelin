@@ -2,7 +2,8 @@
 
 Track brief: `docs/workstreams/07-auth-and-identity.md`. Owner crate: `hs-auth`.
 
-Last updated: 2026-09-30 (session 10: the setup link without `public_baseurl`, below; session 9:
+Last updated: 2026-10-01 (session 11: guest access and third-party invites, below; session 10: the
+setup link without `public_baseurl`; session 9:
 devices, 3PIDs, external ids). Session 7 (2026-09-19)
 audited the login handshake against a real browser client
 (Element Web was being pointed at this server for the first time in the same integration window),
@@ -10,6 +11,143 @@ found and fixed a real case-sensitivity bug in `POST /login`, re-confirmed `/cap
 unfixed (held by another track this session), checked for Element-Web findings in
 `docs/status/16-management-web-interface.md` (none landed as of this write-up), and designed
 (without implementing) a UIA session-correlation scheme left open at the end of session 5).
+
+## Session 11 (2026-10-01, branch `agent/sytest-client`): guest access, third-party invites
+
+Two rows Sytest's first run opened (`docs/next-steps.md`, "Known gaps").
+
+**Guest access can be switched on.** `auth.allow_guest_access` (`hs-config`, default `false`,
+hot: `POST /register?kind=guest` reads it per request; Synapse's `allow_guest_access` is
+translated to it) maps onto `hs_auth::config::AuthConfig::guest_registration_enabled`, which
+existed with no key. With it off, a guest registration is `403 M_GUEST_ACCESS_FORBIDDEN` (was
+`M_FORBIDDEN`). With it on, a guest gets a random `@<12 letters>:server`, a device and a token,
+no password.
+
+- **What a guest may call** is one table, `hs_auth::guest::GUEST_ENDPOINTS` (method and path
+  after the client-API version, `*` one segment, `**` any): the spec's guest access module's
+  list, plus Synapse's `allow_guest=True` extras a guest in a room needs (`/join/{alias}`,
+  typing, receipts, read markers, presence, `/voip/turnServer`, `/capabilities`,
+  `/joined_rooms`, `/publicRooms`, relations, hierarchy, `/keys/changes`). The `Requester`
+  extractor (`middleware.rs`) consults it for a guest, reading the full path from axum's
+  `OriginalUri` (a nested router's own URI has lost its prefix); every other endpoint is
+  `403 M_GUEST_ACCESS_FORBIDDEN`. `AllowGuest` stays for `/whoami` and `/logout`. One table
+  rather than a choice of extractor in every crate's every handler: the guest surface is
+  auditable in one place and a handler written for full accounts stays closed to guests.
+- **Joins** (`hs-room`, `routes/membership.rs`): a guest's join carries `kind: guest` and is
+  refused `403` unless the room's `m.room.guest_access` is `can_join`; through another server,
+  the check runs once the room's state is known (after the join) and the guest leaves at once.
+  A guest may not send `m.room.member` as plain state (`PUT /state`), which would skip the check.
+- **Revocation** (`hs-room`, `RoomActor::local_guests_to_remove`/`remove_guests_after`): when
+  an `m.room.guest_access` that does not say `can_join` is stored -- sent here or received over
+  federation -- each of this server's guests joined or invited (by `kind: guest`) leaves.
+- **Upgrade** (`routes/register.rs`): `POST /register` with `guest_access_token` and the
+  guest's own localpart as `username` runs the ordinary flow and then
+  `UserStore::upgrade_guest` (new store method, both backends, shared store test) clears
+  `is_guest` and sets the password in one write. Another guest's token, a full account's, or
+  another name is `403`.
+- **Admin**: `AdminUser.is_guest` (OpenAPI `User.is_guest`), mapped from the record; the mock's
+  `guests` filter honours it. The Users page shows a "Guest" badge explaining what a guest is;
+  the user page's "User type" says guest.
+- **Observability**: `hs_auth_guest_registrations_total{outcome="created"|"refused"}`,
+  `hs_auth_guest_requests_refused_total`, `hs_auth_guest_upgrades_total`,
+  `hs_room_guest_joins_refused_total`; an info line per guest registered, upgraded, or made to
+  leave a room.
+
+Tests that fail without the change: `guest::tests` (the table), `middleware::tests::
+a_guest_is_admitted_by_requester_to_the_endpoints_guests_may_use`, `routes::register::tests::
+{guest_registration_respects_config_flag (errcode), guest_registration_succeeds_when_enabled,
+a_guest_upgrades_to_a_full_account_with_its_own_localpart,
+a_guest_cannot_upgrade_another_guest_or_a_full_account}`, the shared store test
+`upgrading_a_guest_clears_the_flag_and_sets_the_password`, `config::tests::
+try_from_maps_guest_access_off_by_default_and_on_when_set`; `hs-room`'s
+`a_guest_joins_only_while_guest_access_is_can_join_and_leaves_when_it_is_withdrawn` and
+`a_guest_joined_through_another_server_to_a_room_without_guest_access_leaves_it`; the web's
+"Users page: guests"; and the real binary, `hs-cli/tests/guest_access.rs`: refused while off,
+switched on through `PATCH /api/v1/config/auth` with nothing waiting for a restart, a guest
+registers, reads a world-readable room, is refused it until `can_join`, joins, talks, syncs,
+sets its display name, is refused `createRoom` and uploads, leaves when the room withdraws
+guest access, shows `is_guest` in the admin API, upgrades, and every counter says so.
+
+Sytest's guest group ("Guest APIs" in `are-we-synapse-yet`): **0 of 24 → 23 of 24**
+(`docs/status/sytest/2026-10-01b-*`, the whole suite at `51c0b68`). With this row's commit alone
+(`9b2dda0`, the guest and history-visibility files): 22 of the 23 it runs (the 24th, "Events come
+down the correct room", lives in another file and needs `/events`). The failure that held on
+through two whole-suite runs, "Guest users can send messages to guest_access rooms if joined",
+was not about guests: Sytest pages `/messages` back from a `/sync` `next_batch`, and that page
+left out the newest event the sync had shown, whoever sent it (`hs-room` `get_messages`, fixed
+below under "found on the way"); it passes now. "...kicked ... over federation" passed in one of
+three whole-suite runs; in the others the guest's join timed out (10 s) under load, before the
+revocation was ever sent -- not investigated further.
+
+Found on the way, no row: **(a)** two `createRoom`s by one user in one millisecond produced one
+room ID (room version 12 derives it from the create event) and the second was written over the
+first -- Sytest's "GET /publicRooms lists rooms" got two of its five rooms back as one; fixed in
+`RoomActor::create_placed` (`intern_new_room` claims the ID in one transaction, a taken ID moves
+the create a millisecond earlier), `registry::tests::two_identical_creations_in_one_millisecond_
+make_two_rooms` fails without it. **(b)** A backward `/messages` page from a `/sync` token
+started *below* the newest event the sync covered; `hs-user`'s `sync_scenario.rs` asserted that
+behaviour, against the spec, Synapse and Sytest, and now asserts the opposite;
+`query::tests::a_backward_page_from_a_sync_token_starts_with_the_newest_event_the_sync_showed`
+fails without the fix. A forward page from the same token is unchanged (Complement's
+`TestSendAndFetchMessage`).
+
+**Third-party (3PID) invites are invites by address** (`hs-room`'s new
+`third_party_invite` module, `hs-cli`'s `identity_service`). Before, `POST /invite` with
+`id_server`/`medium`/`address` and no `user_id` was read as an invite of the inviter, refused
+"Invite is not a valid transition from Join".
+
+- **`auth.identity_servers`** (`hs-config`, default empty, hot): the identity servers this
+  server may contact, as `host` (any port) or `host:port`. Empty refuses every 3PID invite
+  `403 M_THREEPID_DENIED`, saying an administrator can add the server; so does an identity server
+  the list does not name. Synapse contacts whatever `id_server` a client names; an allowlist
+  keeps a client from making this server send requests anywhere. The Configuration page shows it
+  from the schema like any other setting.
+- **Invite** (`POST /rooms/{roomId}/invite` and `createRoom`'s `invite_3pid`): v2 `hash_details`
+  then `lookup` (sha256, else plain) with the client's `id_access_token`. Bound: an ordinary
+  invite of the owner (over federation for another server's user). Unbound: `store-invite`, then
+  an `m.room.third_party_invite` from the inviter, `state_key` the token, content
+  `display_name`, `key_validity_url`, `public_key`, `public_keys`.
+- **Exchange** (`third_party_invite::exchange`): the stored keys are first checked with the
+  identity server (`key_validity_url`, `isvalid`; only on an allowed host); none valid, or the
+  server unreachable, refuses. Then an `m.room.member` invite of `signed.mxid`, sent by whoever
+  sent the `m.room.third_party_invite`, with `third_party_invite: {display_name, signed}`; the
+  existing `hs_state::auth` `third_party_invite` step checks the signature against the room's
+  keys (it already did; nothing sent such an event). Reached two ways: **`PUT` (and `POST`, which
+  Sytest's identity server sends) `/_matrix/federation/v1/3pid/onbind`**, unauthenticated as the
+  spec has it and so mounted by `hs-cli` outside the federation router's `X-Matrix` layer (its
+  seam in `hs-federation` removed), mounted with federation off too; and a **join with
+  `third_party_signed`**, which exchanges first (only for the joiner's own `mxid`) and then
+  joins.
+- `HS_TEST_INSECURE_IDENTITY_SERVER_TLS=1` (environment, not a setting; logged as a warning)
+  turns off certificate checks for identity servers: Sytest's fake one has a self-signed
+  certificate with no subjectAltName. The Sytest plugin sets it and
+  `identity_servers: [localhost, 127.0.0.1]`.
+- Counted in `hs_room_third_party_invites_total{outcome}` (`invited`, `stored`, `exchanged`,
+  `refused`); an info line per invite, exchange and refusal.
+- Not done: an exchange for a room this server does not hold -- the invitee's server should
+  forward it to the room's with `PUT /_matrix/federation/v1/exchange_third_party_invite/{roomId}`,
+  still a seam in `hs-federation` -- so the over-federation 3PID tests stay failing. `/account/3pid`
+  binding through an identity server (`/bind`, `/unbind`) is a different row.
+
+Tests that fail without the change: `hs-room`'s `third_party_invite::tests` (refused without an
+allowed identity server; a bound address invites its owner; an unbound one is stored, an
+impostor's signature is refused by the auth rules, the identity server's own through `onbind`
+invites; a key no longer vouched for refuses), `hs-cli`'s `identity_service::tests` (allowlist
+matching, the spec's lookup-hash example, a validity URL's host, the list swapped while running),
+and the real binary, `hs-cli/tests/third_party_invites.rs`: a fake identity server over TLS in
+the test; refused `M_THREEPID_DENIED` while the list is empty, allowed once `PATCH
+/api/v1/config/auth` names it (no restart), a bound address invites bob, an unbound one is stored
+and held in the room, `onbind` invites carol with `third_party_invite`, carol joins, the counters
+say so.
+
+Sytest's 3PID group ("Third-Party ID APIs"): **3 of 19 → 10 of 19**, and the 3 that passed
+before passed only because every 3PID invite failed: "3pid invite join ... are rejected" waits
+for `onbind` to fail or the join to be refused, and the first all-rows run failed all three
+until `onbind` answered the refusal (Synapse does; `cf26485`). Passing now: existing 3PID
+(invite, no ops, in `createRoom`), unbound (invite, no ops, after the inviter leaves),
+`/join` with `third_party_signed`, and the three rejections. Still failing: the three over
+federation (`exchange_third_party_invite`), "Can login with 3pid", and the six `/account/3pid`
+bind/unbind tests (no identity-server binding from the homeserver; another row).
 
 ## Session 10 (2026-09-30, branch `agent/cli-small-gaps`): the setup link without `public_baseurl`
 

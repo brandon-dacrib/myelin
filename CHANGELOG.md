@@ -472,6 +472,32 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   real binary with twenty identical creates sent at once (twenty rooms, every one in
   `/joined_rooms`; the first burst found 11 ids taken), and by Sytest: the three files holding
   the tests that failed from it went from 8-9 of 11 to 11 of 11, three runs in a row.
+- **Guest access can be switched on** (2026-10-01): `auth.allow_guest_access` (off by default,
+  applies at once from the Configuration page) lets a client ask for a guest account
+  (`POST /register?kind=guest`). A guest may read world-readable rooms, join rooms whose guest
+  access is "can join", and talk there, and nothing the spec does not list -- no `createRoom`,
+  no invites, no uploads (`403 M_GUEST_ACCESS_FORBIDDEN`). A room that withdraws guest access
+  sees this server's guests leave it. A guest becomes a full account by registering with its
+  guest token and its own name. Guests are marked in the admin API (`is_guest`) and on the
+  Users page. Verified against the real binary and by Sytest's guest tests (0 → 23 of 24).
+- **Inviting by email address works** (2026-10-01) once an administrator names the identity
+  servers this server may use (`auth.identity_servers`, empty by default, which refuses such
+  invites `M_THREEPID_DENIED`). An address its owner has bound is an ordinary invite of them; an
+  unbound one is stored with the identity server and held in the room, and becomes an invite --
+  checked against the identity server's signature and keys -- when the address is bound
+  (`/3pid/onbind`) or claimed with `third_party_signed` on a join. Verified against the real
+  binary with a fake identity server, and by Sytest (3PID group 3 → 10 of 19). Not yet: a bound
+  invitation for a room on another server.
+- **The deprecated event stream answers** (2026-10-01): `GET /events`, `GET /initialSync` and
+  `GET /rooms/{roomId}/initialSync`, read from the same feed as `/sync`, were 404; Sytest's
+  helpers wait on `/events` in tests about other things (client-server group 319 → 362, whole
+  suite 407 → 458 of 772 with guest access, 3PID invites and the two fixes below).
+- **Paging back from a sync token starts with what the sync showed** (2026-10-01): a backward
+  `/messages` page from a `/sync` `next_batch` left out the newest event the sync had just
+  shown; Sytest pages that way.
+- **Two rooms created in the same millisecond are two rooms** (2026-10-01): from room version
+  12 a room ID is the create event's hash, and one user creating two rooms with the same
+  settings at once got one ID, the second written over the first.
 - Sync: `/sync` v2 with filters that honour event-type and sender rules, lazy-loaded members, room
   summaries with heroes, typing, presence, read receipts and `m.fully_read`, to-device messages,
   device lists, one-time-key counts, and push rules as account data.

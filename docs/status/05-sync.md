@@ -129,6 +129,68 @@ the rewrite counter (decision 0022 says so). The two-pod run has not seen this y
 **Decisions made.** Decision 0022 (the rewrite counter rather than enumerating changes;
 redactions applied by the copy; the wake's existing `room_pos` as the head; 1,024 copies; the
 escape hatch).
+Last updated: 2026-10-01 (session 12: the legacy event stream. Session 11: three known gaps and a
+hot-room bug. Session 10,
+session 9, session 8, session 7 and the integration note follow; sessions 1-6 are preserved
+unchanged further down.)
+
+## Session 12 (2026-10-01, branch `agent/sytest-client`): the legacy event stream
+
+Row "The legacy `GET /events` stream is unimplemented" (Sytest's first run: 21 fixture
+failures, its helpers wait on `/events` even with `--exclude-deprecated`).
+
+- **`GET /events?from=&timeout=&room_id=`** (`hs_user::routes::events::get_events`) is an
+  incremental `/sync` (`sync::build`) from `from`, flattened by `events_chunk` into one `chunk`:
+  every joined room's new timeline events, typing and receipts, the caller's own invites (the
+  `m.room.member` of `invite_state`) and left rooms' timelines, each with `room_id`, then
+  presence (with the old `content.user_id`). `start` is `from`, `end` the sync's `next_batch`,
+  so `/events` and `/sync` tokens are interchangeable. It long-polls up to `timeout` (default 0,
+  at most 60 s); a `timeout` that is not a number is `400 M_INVALID_PARAM`. No `from`, or a
+  `from` that is not a stream token, starts from now (an empty initial sync's token). Up to 100
+  events per room per answer.
+- **`GET /initialSync?limit=&archived=`** (`get_initial_sync`) is an initial sync rearranged by
+  `initial_sync_body`: `rooms` (joined, invited with `invite`, and left with `archived=true`),
+  each with `membership`, `messages {chunk, start, end}` and `state` (the state before the
+  timeline, then the timeline's state events, latest per key), plus `presence`,
+  `account_data` and `end`.
+- **`GET /rooms/{roomId}/initialSync`** is `hs-room`'s (`routes::query::get_room_initial_sync`):
+  `membership`, `state` through `full_state_for_reader`, the newest `limit` messages oldest first
+  through the same page `/messages` reads, `visibility` from the directory; a member, a past
+  member, or anyone for a `world_readable` room, otherwise `403`.
+- Both build the sync **with no device**: `/events` takes nothing from a device's to-device
+  queue and moves no device's position, so Sytest's helpers polling `/events` beside `/sync` lose
+  nothing. The stream records its own feed cursor under `\u{1}hs-user:legacy-events` (session
+  11's reason: without a cursor the feed coalesces the entry a token points at, and the next
+  read sees nothing).
+- Not done: `GET /events?room_id=` for a room the caller is not in (the old "peek" at a
+  `world_readable` room) answers an empty `chunk`; a deprecated Sytest test or two expect events.
+
+Tests: `routes::events::tests` (the flattening, the old initial-sync shape, a number that is not
+one, and through the real feed: each new message once, with its room, and `/initialSync`
+listing the room), `hs-room`'s `room_initial_sync_answers_members_and_world_readable_strangers_only`,
+and the real binary, `hs-cli/tests/legacy_events.rs`: `/events` with no `from`, a message after
+it with its room, a long poll that returns when a message is sent rather than at its timeout,
+`timeout=hello` refused, `/initialSync` and the room's `/initialSync`. All were 404 before.
+
+Sytest, the whole client-server group: **319 of 542 → 362 of 543** (the grouping script counts one
+more test now), and the whole suite **407 → 458 of 772**, with all three of the branch's rows and
+its two fixes (`docs/status/sytest/2026-10-01b-*`, at `51c0b68`; nothing that passed before
+fails). The 21 "fixture failed ... 404 /events" failures are gone. Of the 51 gained, 23 are the
+guest group and 7 the 3PID group (status 07, session 11); the others are
+tests about something else whose fixtures or waits read `/events` (`local_user_fixture(with_events
+=> 1)`, `await_event_for`): typing (four, "Typing notifications don't leak" among them),
+presence (five), "Events come down the correct room", two inbound-federation tests, three
+appservice ones, "Rooms can be created with an initial invite list (SYN-205)", a device-list
+rejoin and a v3 invite rejection over federation. `/events` and `/initialSync` themselves are
+deprecated and excluded (`--exclude-deprecated`), so none of their own tests ran.
+
+Found on the way: a backward `/messages` page from a `/sync` `next_batch` started below the
+newest event the sync covered (`hs-room`'s `get_messages`, for a token the global resolver maps);
+Sytest's `matrix_get_room_messages` does exactly that and so missed a message the sync had just
+shown. Fixed: a backward page from a resolved sync position starts just above it, a forward one
+after it (unchanged). `tests/sync_scenario.rs::messages_accepts_a_token_minted_by_sync_in_both_
+directions` had asserted the old behaviour and now asserts that the page begins with "newer
+message".
 
 ## Session 11 (2026-09-30, branch `agent/user-gaps`): three known gaps, and hot rooms that repeated themselves
 
