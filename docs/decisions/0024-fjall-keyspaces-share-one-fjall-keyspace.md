@@ -1,4 +1,4 @@
-# 0022: Every `hs-kv` keyspace on Fjall shares one Fjall keyspace (2026-10-01)
+# 0024: Every `hs-kv` keyspace on Fjall shares one Fjall keyspace (2026-10-01)
 
 Status: accepted (track 01). Closes the `docs/next-steps.md` gap "A first boot over an empty
 data directory takes about five seconds".

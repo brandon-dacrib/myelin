@@ -3,7 +3,7 @@
 //!
 //! A cold boot used to take about five seconds on this project's desktop (a debug build, longer
 //! under load), nearly all of it creating eighty-odd Fjall keyspaces one fsynced creation at a
-//! time; every hs-kv keyspace now lives in one shared Fjall keyspace (decision 0022).
+//! time; every hs-kv keyspace now lives in one shared Fjall keyspace (decision 0024).
 //!
 //! What is a regression guard and what is timing:
 //!

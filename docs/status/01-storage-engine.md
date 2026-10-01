@@ -45,7 +45,7 @@ Left: not yet watched on the cluster; the next image on `hs-0` should show no
 ## A first boot is as quick as any other: one shared Fjall keyspace (2026-10-01, branch `agent/boot-time`)
 
 Closes the `docs/next-steps.md` known gap "A first boot over an empty data directory takes about
-five seconds" (the measurement is the 2026-09-27 section below). Decision 0022.
+five seconds" (the measurement is the 2026-09-27 section below). Decision 0024.
 
 ### What changed
 
@@ -1080,7 +1080,7 @@ None.
 - **2026-10-01, additive**: `hs_kv::fjall_backend::{SHARED_KEYSPACE, FjallBackend::created_fresh,
   FjallBackend::fjall_keyspaces_created, FjallBackend::keyspaces_opened}` and
   `hs_kv::conformance::keyspaces_are_independent`. Behavioral: on Fjall every keyspace is a
-  prefix in one Fjall keyspace (decision 0022); the `KvBackend` contract is unchanged, and
+  prefix in one Fjall keyspace (decision 0024); the `KvBackend` contract is unchanged, and
   `SHARED_KEYSPACE` is refused as a keyspace name.
 - `hs-kv` trait v0 (frozen session 1, matching the week-2 seam in `docs/workstreams/README.md`):
   `KvBackend`, `KvRead`, `KvWrite`, `RangeSpec`, `transact`, `Hub`/`Watch` — signatures unchanged
@@ -1123,7 +1123,7 @@ None.
 ## Decisions made
 
 - **On Fjall, every `hs-kv` keyspace shares one Fjall keyspace behind a `[len][name]` prefix**
-  (2026-10-01, decision 0022). Creating a Fjall keyspace is several fsyncs under a global lock,
+  (2026-10-01, decision 0024). Creating a Fjall keyspace is several fsyncs under a global lock,
   and a server opens over a hundred; sharing one made a first boot as quick as a later one.
   Old directories are read in their per-table layout, unmigrated.
 - **TLS to PostgreSQL is `rustls` with a crate-local adapter, and the modes are libpq's five.**

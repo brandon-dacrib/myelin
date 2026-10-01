@@ -482,7 +482,7 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 - **A first boot is as quick as any other.** Over an empty data directory the embedded backend
   used to create one Fjall keyspace per table, 109 of them, each several fsyncs under a global
-  lock; every table now lives behind a prefix in one shared Fjall keyspace (decision 0022), so a
+  lock; every table now lives behind a prefix in one shared Fjall keyspace (decision 0024), so a
   first boot creates one. Measured 2026-10-01 on the project's desktop under load, launch to
   `listening`, five runs each: debug 8.8 s to 0.72 s, release 9.4 s to 0.62 s; a later
   boot was and is about half a second. Existing data directories keep their layout and need

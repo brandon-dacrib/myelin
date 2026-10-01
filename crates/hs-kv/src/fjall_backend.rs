@@ -19,7 +19,7 @@
 //! configuration ingested into Fjall's meta keyspace as a new table, and the meta keyspace
 //! compacted. That was about sixty milliseconds each on the 2026-09-27 measurement, so the
 //! eighty-odd keyspaces `hs serve` opens cost a first boot about five seconds
-//! (`docs/status/01-storage-engine.md`; decision 0022). With one shared keyspace a fresh store
+//! (`docs/status/01-storage-engine.md`; decision 0024). With one shared keyspace a fresh store
 //! creates one Fjall keyspace whatever the number of tables, and opening a logical keyspace
 //! writes nothing at all. Fjall offers no batched creation and serializes creations under its
 //! lock, so neither one sync for many keyspaces nor creating them in parallel was available.
