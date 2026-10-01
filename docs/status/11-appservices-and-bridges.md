@@ -1,8 +1,59 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-09-30 (ephemeral, to-device and device-list delivery, below); before that
+Last updated: 2026-10-01 (the `cluster` runtime run on kind, below); before that 2026-09-30
+(ephemeral, to-device and device-list delivery); before that
 2026-09-27 (RFC 0017 run against the real binary), 2026-09-27 (the bridge manager) and
 2026-09-25.
+
+## 2026-10-01 (branch `agent/platform-gaps`, track 12): RFC 0017's `cluster` runtime has run
+
+The known gap "RFC 0017's `cluster` runtime has never run" is closed: on a kind cluster with the
+chart installed (`bridges.enabled`, its default, so the operator runs and the server gets
+`MYELIN_BRIDGES_NAMESPACE` and `MYELIN_BRIDGES_HOMESERVER_URL`), the server deployed a real
+heisenbridge through the operator and walked it to `ready`. No change to `hs-bridges` was
+needed. `deploy/operator/ci/kind-smoke.sh --heisenbridge` does the walk; the transcript is
+`docs/status/transcripts/operator-kind-smoke-2026-10-01.txt` (image built from the branch's
+tree), and it went the same way twice before that by hand and with the published
+`sha-a01c1e0` image.
+
+The calls, as an administrator who claimed the server through its setup link:
+
+- `GET /api/v1/bridge-deployment-target` →
+  `{"available":true,"namespace":"hs-op-smoke-19d26e","homeserver_url":"http://myelin-hs.hs-op-smoke-19d26e.svc:8008","reason":null}`.
+- `PUT /api/v1/bridge-offerings/heisenbridge {"runtime":"cluster"}` → the shared offering,
+  `runtime: cluster`, image `hif1/heisenbridge:latest` from the catalogue, `instances:
+  {"requested":1}`.
+- Then `GET .../instances/_` every quarter second. The manager's own log (to the millisecond):
+
+  | state | at (UTC) | since the `PUT` |
+  |---|---|---|
+  | requested → registered | 05:38:59.138 | 0.0 s |
+  | registered → deploying ("waiting for the pod") | 05:38:59.501 | 0.4 s |
+  | deploying → starting ("waiting for the bridge to answer this server") | 05:39:45.843 | 46.7 s |
+  | starting → ready (the bridge answered the ping) | 05:39:46.255 | 47.1 s |
+
+  In `deploying` the instance's `deployment` carried the operator's own words as they changed:
+  `Pending` "waiting for the pod", then "waiting for the pod: PodInitializing", then `Ready`
+  "the bridge is accepting connections on port 9898". Final: `state: ready`, `health:
+  healthy`, `deployment.name: bridge-19a1359c`, `service_url:
+  http://bridge-19a1359c.hs-op-smoke-19d26e.svc:9898`, **pod
+  `bridge-19a1359c-7c8c8964c7-9rhgf`**, image `hif1/heisenbridge:latest` (pulled by the kind
+  node from Docker Hub), `Bridge` `bridge-19a1359c` `Ready`. heisenbridge's log ends "Init done
+  with 0 networks connecting, bridge is now running!", and `@heisenbridge:smoke.invalid` is a
+  user with `appservice_id: heisenbridge` (it registered its bot through the server with the
+  instance's own token).
+- `DELETE .../instances/_` → 204; the `Bridge`, its files Secret, Deployment, Service, claim and
+  pod were gone in 34 s. `DELETE /api/v1/bridge-offerings/heisenbridge` → 204.
+
+In the two earlier runs `deploying` lasted 81 s (hand run, 02:49Z) and 82 s (published image,
+03:09Z) on a more loaded machine; the 46 s here is mostly the pod's two image pulls (the init
+container and the bridge each pull `:latest`, because the runtime sets no pull policy and
+Kubernetes defaults `:latest` to `Always`) and the claim's first binding.
+
+Left: a per-user offering (mautrix-whatsapp, which needs a real account to sign in) has not
+been deployed this way; nothing has run on a multi-node cluster or with a StorageClass other
+than kind's `local-path`; the walk is not in CD (it pulls someone else's `:latest`), so it is a
+by-hand check: `deploy/operator/ci/kind-smoke.sh <image> --kind <cluster> --heisenbridge`.
 
 ## Session 2026-09-30 (branch `agent/as-ephemeral`): bridges are sent everything but events, too
 
