@@ -54,10 +54,11 @@ describe("normalizeConfigSchema", () => {
 
   it("reads the shipped settings[] rows, including the server's own editable answer", () => {
     // `ConfigSettingInfo` in crates/hs-admin/openapi/openapi.yaml.
+    // Hot since 2026-10-01: the auth routes read it through the live configuration.
     expect(schema.settings["auth.enable_registration"]).toEqual({
       origin: "database",
       secret: false,
-      reloadable: false,
+      reloadable: true,
       bootstrap: false,
       editable: true,
     });

@@ -74,9 +74,19 @@ describe("ConfigSectionPage", () => {
   });
 
   it("warns that a non-reloadable section waits for a restart", async () => {
-    renderSection("auth");
+    // Every administered `cluster` setting is read once, at startup.
+    renderSection("cluster");
     expect(
       await screen.findByText("Changes here take effect at the next restart"),
+    ).toBeInTheDocument();
+  });
+
+  it("says which settings of a mixed section apply at once", async () => {
+    // `auth`: registration, the directory, token lifetimes and the password policy are hot; the
+    // session secret and upstream providers wait for a restart.
+    renderSection("auth");
+    expect(
+      await screen.findByText("Most changes here take effect at the next restart"),
     ).toBeInTheDocument();
   });
 

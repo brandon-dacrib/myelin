@@ -61,9 +61,9 @@ describe("ConfigurationPage", () => {
     renderIndex();
     await screen.findByRole("link", { name: "Rate limits" });
 
-    // What a running server re-reads throughout: `rate_limits` and `migration`. `storage` and
-    // `listeners` are set at install.
-    expect(screen.getAllByText("Reloadable")).toHaveLength(2);
+    // Every administered setting re-read by a running server: `server`, `rate_limits` and
+    // `migration` (from the schema's `x-applies`). `storage` and `listeners` are set at install.
+    expect(screen.getAllByText("Reloadable")).toHaveLength(3);
     expect(screen.getAllByText("Bootstrap only")).toHaveLength(2);
     expect(screen.getAllByText("Restart required").length).toBeGreaterThan(0);
   });
@@ -110,7 +110,7 @@ describe("ConfigurationPage", () => {
     ).toBeInTheDocument();
     await user.click(dialog.getByRole("button", { name: "Re-read files" }));
 
-    expect(await screen.findByText("Reloaded 2 sections")).toBeInTheDocument();
+    expect(await screen.findByText("Reloaded 3 sections")).toBeInTheDocument();
     await waitFor(() => expect(configLastReloaded.rate_limits).not.toBeNull());
   });
 });

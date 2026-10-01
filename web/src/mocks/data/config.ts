@@ -20,6 +20,7 @@
  */
 import type { ConfigOrigin, JsonSchemaNode, JsonValue } from "@/api/config-schema";
 import type { AuditEntry } from "@/api/config";
+import realSchema from "@/test/fixtures/hs-config-schema.json";
 
 const secretString: JsonSchemaNode = {
   type: "string",
@@ -932,38 +933,87 @@ const SECRET_POINTERS = [
   "/migration/synapse/database/password",
 ];
 
+/** When a change to a setting takes effect (`hs_config::reload::Applies`). */
+type Applies = "bootstrap" | "hot" | "restart";
+
 /**
- * `hs_config::reload::HOT_SETTINGS`: what a running server re-reads when it changes. A pointer
- * covers everything beneath it; the sections hot throughout are `RELOADABLE`.
+ * Every classified setting and when a change to it applies, read from the
+ * `x-applies` annotations of the real configuration schema (the fixture is
+ * `hs_config::schema::json_schema()` verbatim, and a Rust test keeps it so) --
+ * not a copy of the server's table that could drift from it. A pointer covers
+ * everything beneath it.
  */
-export const HOT_SETTINGS = [
-  "/rate_limits",
-  "/migration",
-  "/federation/domain_allowlist",
-  "/federation/ip_range_blocklist",
-  "/federation/ip_range_allowlist",
-  "/telemetry/logging/level",
-];
-const RELOADABLE = new Set(["rate_limits", "migration"]);
+export const SETTING_APPLIES: ReadonlyMap<string, Applies> = (() => {
+  const out = new Map<string, Applies>();
+  const schema = realSchema as unknown as Record<string, unknown>;
+  const defs = (schema.$defs ?? {}) as Record<string, Record<string, unknown>>;
+  const walk = (node: unknown, pointer: string, seen: string[]): void => {
+    if (typeof node !== "object" || node === null) return;
+    const record = node as Record<string, unknown>;
+    const applies = record["x-applies"];
+    if (applies === "bootstrap" || applies === "hot" || applies === "restart") {
+      out.set(pointer, applies);
+      return;
+    }
+    const ref = typeof record.$ref === "string" ? record.$ref.replace("#/$defs/", "") : null;
+    if (ref && !seen.includes(ref)) walk(defs[ref], pointer, [...seen, ref]);
+    for (const keyword of ["anyOf", "oneOf", "allOf"]) {
+      const branches = record[keyword];
+      if (Array.isArray(branches)) branches.forEach((b) => walk(b, pointer, seen));
+    }
+    const properties = record.properties;
+    if (typeof properties === "object" && properties !== null) {
+      for (const [key, child] of Object.entries(properties)) {
+        walk(child, `${pointer}/${key}`, seen);
+      }
+    }
+  };
+  walk(schema, "", []);
+  return out;
+})();
+
+function settingsOfKind(kind: Applies): string[] {
+  return [...SETTING_APPLIES].filter(([, applies]) => applies === kind).map(([p]) => p);
+}
+
+/** `hs_config::reload::HOT_SETTINGS`: what a running server re-reads when it changes. */
+export const HOT_SETTINGS = settingsOfKind("hot");
+
+/** When a change to the setting at `pointer` takes effect: its own entry's, or "restart". */
+export function appliesTo(pointer: string): Applies {
+  for (const [entry, applies] of SETTING_APPLIES) {
+    if (pointer === entry || pointer.startsWith(`${entry}/`)) return applies;
+  }
+  return "restart";
+}
 
 /** Whether the setting at `pointer` takes effect without a restart. */
 export function isHotSetting(pointer: string): boolean {
-  return HOT_SETTINGS.some((hot) => pointer === hot || pointer.startsWith(`${hot}/`));
+  return appliesTo(pointer) === "hot";
 }
+
+/** `hs_config::reload::RELOADABLE_SECTIONS`: every administered setting in them is hot. */
+const RELOADABLE = new Set(
+  [...new Set([...SETTING_APPLIES.keys()].map((p) => p.split("/")[1]))].filter((section) => {
+    const administered = [...SETTING_APPLIES].filter(
+      ([p, applies]) => p.startsWith(`/${section}/`) && applies !== "bootstrap",
+    );
+    return administered.length > 0 && administered.every(([, applies]) => applies === "hot");
+  }),
+);
+
 /** `hs_config::store::BOOTSTRAP_SECTIONS`: bootstrap as a whole (decision 0010). */
-const BOOTSTRAP = new Set(["storage", "listeners"]);
+const BOOTSTRAP = new Set(
+  settingsOfKind("bootstrap")
+    .filter((p) => p.split("/").length === 2)
+    .map((p) => p.slice(1)),
+);
 
 /**
  * `hs_config::bootstrap::BOOTSTRAP_SETTINGS` inside administered sections: set at install, never
  * stored in the database. A pointer at or under one of these is a bootstrap setting.
  */
-const BOOTSTRAP_SETTINGS = [
-  "/server/server_name",
-  "/server/signing_key_path",
-  "/cluster/single_node",
-  "/cluster/mesh",
-  "/appservices/registration_files",
-];
+const BOOTSTRAP_SETTINGS = settingsOfKind("bootstrap").filter((p) => p.split("/").length > 2);
 
 function isBootstrapPointer(pointer: string): boolean {
   const section = pointer.split("/")[1];
@@ -1019,7 +1069,8 @@ const settingInfos = [
       section,
       origin,
       secret: SECRET_POINTERS.includes(pointer),
-      reloadable: RELOADABLE.has(section) || isHotSetting(pointer),
+      reloadable: isHotSetting(pointer),
+      applies: appliesTo(pointer),
       bootstrap,
       // The server's own answer to "would config.update take this?". False
       // for a bootstrap setting and for anything an HS__ variable pins.
