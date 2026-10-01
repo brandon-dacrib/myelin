@@ -591,8 +591,12 @@ impl<B: KvBackend> SearchIndex<B> {
 }
 
 /// Reads `room_id` from its cursor to its head into the index, a page at a time. The number of
-/// events indexed.
-async fn index_room<B: KvBackend + 'static>(
+/// events indexed. What the indexer does for each room it is told about, and what a search does
+/// first for each room it reads, so that a message sent a moment ago is found.
+///
+/// # Errors
+/// [`RoomError`] if the room cannot be loaded or the index cannot be written.
+pub(crate) async fn index_room<B: KvBackend + 'static>(
     rooms: &RoomRegistry<B>,
     room_id: &RoomId,
 ) -> Result<u64, RoomError> {

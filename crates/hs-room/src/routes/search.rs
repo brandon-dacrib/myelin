@@ -472,6 +472,16 @@ async fn search<B: KvBackend + 'static>(
         }
     }
 
+    // Read-your-writes: a room this replica owns whose newest events the indexer has not reached
+    // yet (a message sent a moment ago) is brought up to date before the index is read.
+    for room_id in rooms.values() {
+        if state.rooms.owns_room(room_id)
+            && let Err(error) = crate::search::index_room(&state.rooms, room_id).await
+        {
+            tracing::warn!(%error, %room_id, "search: could not bring a room's index up to date");
+        }
+    }
+
     let room_set: HashSet<RoomSn> = rooms.keys().copied().collect();
     let query = {
         let (index, terms, fields) = (
@@ -534,7 +544,9 @@ async fn search<B: KvBackend + 'static>(
         None => visible,
     };
     let page: Vec<Visible> = remaining.iter().take(criteria.limit).cloned().collect();
-    let next = (remaining.len() > page.len())
+    // A full page has a `next_batch`, whether or not anything is left (as Synapse, and as
+    // Complement's `TestSearch` expects); the page after the last is empty and has none.
+    let next = (!page.is_empty() && page.len() == criteria.limit)
         .then(|| {
             page.last()
                 .map(|v| batch_token(order, sort_key(&v.candidate, order)))

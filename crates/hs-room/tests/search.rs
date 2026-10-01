@@ -360,3 +360,31 @@ async fn after_a_restart_the_index_resumes_from_its_cursors() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(restarted.search_index().documents().unwrap(), 7);
 }
+
+/// A message is found by a search made the moment after it was sent, with no indexer having
+/// run at all: a search brings the rooms it reads up to date first. A full page has a
+/// `next_batch`, and the page after the last is empty and has none (Complement's `TestSearch`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_is_found_the_moment_after_it_is_sent() {
+    let (router, _registry) = app(MemoryBackend::new());
+    let mut s = Scenario::new(router);
+    s.register("alice", "alice", "correct horse battery staple")
+        .await
+        .assert_ok();
+    let room = create(&mut s, "alice", json!({"preset": "private_chat"})).await;
+    let sent = say(&mut s, "alice", &room, "hello, world").await;
+    let criteria = json!({"search_term": "hello", "filter": {"limit": 1}});
+    let found = search(&mut s, "alice", criteria.clone(), None).await;
+    assert_eq!(found["count"], 1);
+    assert_eq!(ids(&found), [sent]);
+    let token = found["next_batch"]
+        .as_str()
+        .expect("a full page has a next_batch")
+        .to_owned();
+    let last = search(&mut s, "alice", criteria, Some(&token)).await;
+    assert_eq!(last["count"], 1);
+    assert!(
+        ids(&last).is_empty() && last.get("next_batch").is_none(),
+        "{last}"
+    );
+}
