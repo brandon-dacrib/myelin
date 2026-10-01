@@ -42,6 +42,106 @@ hs-kv --test postgres_conformance` (only while no merge gate holds
 Left: not yet watched on the cluster; the next image on `hs-0` should show no
 `there is no transaction in progress`, and any other warning PostgreSQL sends now appears as a
 `warn` under `hs_kv::postgres`.
+## A first boot is as quick as any other: one shared Fjall keyspace (2026-10-01, branch `agent/boot-time`)
+
+Closes the `docs/next-steps.md` known gap "A first boot over an empty data directory takes about
+five seconds" (the measurement is the 2026-09-27 section below). Decision 0022.
+
+### What changed
+
+- **`crates/hs-kv/src/fjall_backend.rs`: every `hs-kv` keyspace is a prefix in one Fjall
+  keyspace, `_hs_kv_shared`.** A key `k` of keyspace `n` is stored as `[len(n)][n][k]`;
+  reads, writes and ranges are translated (a range is bounded to the prefix at whichever end the
+  caller left open, so neither the scan nor the optimistic transaction's conflict tracking
+  touches another keyspace), and results come back without the prefix. Opening an `hs-kv`
+  keyspace writes nothing; a fresh store creates one Fjall keyspace instead of one per table
+  (109 today). A data directory from before keeps its per-table Fjall keyspaces, opened
+  unprefixed as before; only keyspaces that do not exist yet go into the shared one, so nothing
+  is migrated. A key that would be longer than Fjall's 65,535 bytes once prefixed is refused as
+  `KeyTooLarge` (and reads as absent).
+- Why this option, in the brief's order: (1) one sync for many creations does not exist in
+  Fjall 3.1.10 (`Database::keyspace` creates a tree, ingests its configuration into the meta
+  keyspace as a table and compacts the meta keyspace, each with its own fsyncs, and there is no
+  batch form); (2) parallel creation is serialized by Fjall's keyspace write lock; (3) lazy
+  opening only moves the cost to each table's first request; (4) sharing a keyspace behind a
+  prefix needed no change in `hs-tables` or any consuming crate, since `KvBackend::Keyspace` is
+  opaque. Durability is Fjall's journal, as before: nothing about commits changed, and the one
+  keyspace creation is Fjall's own, fsynced.
+- `FjallBackend::created_fresh()`, `fjall_keyspaces_created()`, `keyspaces_opened()`,
+  `SHARED_KEYSPACE` (new, additive).
+- `hs_kv::conformance::keyspaces_are_independent` (new scenario, run for every backend,
+  including the PostgreSQL breakdown): keyspaces whose names are prefixes of one another keep
+  their keys apart in point reads and every kind of range.
+- `hs-cli`: the `listening` line now says `boot_ms`, `cold` and, on the embedded backend,
+  `keyspaces_created` and `keyspaces_opened` (`crate::boot`); `hs_boot_duration_seconds{cold}`
+  is a gauge on `/metrics`. `cold` is "this process created the store": Fjall found no database
+  in the data directory, or PostgreSQL held no configuration yet (`Booted::cold`). `boot_ms` is
+  measured from the start of `hs serve`'s command to every listener bound.
+
+### Before and after, measured
+
+`hs serve -c homeserver.yaml` (embedded, one listener on an ephemeral port), launched by a
+script that times process launch to the `listening` line, once over an empty directory (cold)
+and once again over the same directory after a `SIGKILL` (warm), five times per binary; the
+binary was exec'd once beforehand (macOS scans a freshly written binary on its first exec,
+which took 23 to 49 s for a 300 MB debug build and would otherwise land in the first cold
+boot). On this desktop, with other agents building: the debug pair and the first release
+"before" run back to back at 08:20 (load average 14 to 18), the release "after" run and the
+second release "before" run back to back at 09:48 (load 11 to 13, but the old layout's
+fsyncs met other agents' disk traffic). Every number is an upper bound.
+
+| build | tree | cold, mean (min-max) | warm, mean (min-max) | Fjall keyspace dirs after |
+|---|---|---|---|---|
+| debug | before (`5d17e4c`) | 8.76 s (7.75-9.78) | 0.80 s (0.49-1.16) | 110 |
+| debug | after | **0.72 s** (0.62-1.04) | 0.53 s (0.42-0.67) | 2 |
+| release | before (`5d17e4c`) | 9.39 s (7.90-11.32) | 0.72 s (0.49-0.94) | 110 |
+| release | before (`5d17e4c`), second run | 20.73 s (16.24-25.23) | 2.26 s (1.13-3.71) | 110 |
+| release | after | **0.62 s** (0.46-0.72) | 0.38 s (0.37-0.40) | 2 |
+
+The "after" lines say `cold=true keyspaces_created=1 keyspaces_opened=109` (cold) and
+`cold=false keyspaces_created=0` (warm). The cold boot is now within a few hundred
+milliseconds of a warm one; what is left is the database creation itself, the signing key, the
+configuration seed and the one shared keyspace. In-crate (`fjall_keyspace_creation`'s ignored
+timing test, debug, same load): ninety keyspaces as Fjall keyspaces of their own 13.1 s; shared
+0.24 s cold (0.09 s of it opening the database), 0.02 s warm. Under a heavier load (a release
+link running) the old debug cold boot took 18.5 to 49 s and the new one 1.3 to 2.7 s.
+
+### Tests
+
+- Regression guards: `crates/hs-kv/tests/fjall_keyspace_creation.rs`:
+  `a_fresh_store_creates_one_fjall_keyspace_however_many_keyspaces_open` (ninety keyspaces,
+  one Fjall keyspace created, two directories under `keyspaces/`; the old layout made 91),
+  `keyspaces_in_the_shared_fjall_keyspace_are_independent` (also: a scan of one keyspace does
+  not conflict with writes to another, and does with a phantom in its own),
+  `the_shared_keyspace_name_and_overlong_keys_are_refused`,
+  `a_store_written_one_fjall_keyspace_per_table_is_still_read` (a directory written by Fjall
+  directly, the old layout, read and extended), and
+  `a_crash_right_after_a_first_boot_loses_no_committed_write` (the test binary re-runs itself,
+  opens a fresh store, commits to ninety keyspaces and `abort`s; the parent reopens and finds
+  every write). `crates/hs-cli/tests/boot_time.rs`: the real binary's cold `listening` line says
+  `cold=true keyspaces_created=1` and the warm one `cold=false keyspaces_created=0`; an account
+  registered on the cold boot is signed in after a `SIGKILL` and a reboot;
+  `hs_boot_duration_seconds{cold="true"}` is on `/metrics`.
+- Timing (generous bounds, not guards): `boot_time.rs` wants the cold `listening` line within
+  10 s and the warm boot no slower than the cold one plus a second (with the fix the two are
+  close, so "strictly faster" would flip on a loaded machine);
+  `opening_a_boots_worth_of_keyspaces_over_an_empty_directory_is_fast` (ignored; under 1 s).
+
+### The startup probe
+
+The chart's `startupProbe` (`deploy/helm/hs/values.yaml`: `periodSeconds: 5`,
+`failureThreshold: 30`, no initial delay) already tolerates a first boot: it allows 150 s, and
+the first boot now takes about as long as any other. Left unchanged. The very first probe can
+still be refused, because the kubelet sends it as the container starts, before any process
+could have bound a port; that is one `Startup probe failed` event inside the budget, not a
+restart, and the next probe five seconds later finds the server up.
+
+### Not done
+
+- Old data directories keep their per-table Fjall keyspaces (by design; no migration). A
+  table that a later version adds to such a directory goes into the shared keyspace.
+- Not run on the cluster or in the container; the kind numbers in status 12 are from the old
+  layout.
 
 ## PostgreSQL TLS, pool size and schema are real (2026-09-30, branch `agent/postgres-tls`)
 
@@ -977,6 +1077,11 @@ None.
 
 ## Interfaces provided
 
+- **2026-10-01, additive**: `hs_kv::fjall_backend::{SHARED_KEYSPACE, FjallBackend::created_fresh,
+  FjallBackend::fjall_keyspaces_created, FjallBackend::keyspaces_opened}` and
+  `hs_kv::conformance::keyspaces_are_independent`. Behavioral: on Fjall every keyspace is a
+  prefix in one Fjall keyspace (decision 0022); the `KvBackend` contract is unchanged, and
+  `SHARED_KEYSPACE` is refused as a keyspace name.
 - `hs-kv` trait v0 (frozen session 1, matching the week-2 seam in `docs/workstreams/README.md`):
   `KvBackend`, `KvRead`, `KvWrite`, `RangeSpec`, `transact`, `Hub`/`Watch` — signatures unchanged
   this session. Three backends now: `hs_kv::memory::MemoryBackend`,
@@ -1017,6 +1122,10 @@ None.
 
 ## Decisions made
 
+- **On Fjall, every `hs-kv` keyspace shares one Fjall keyspace behind a `[len][name]` prefix**
+  (2026-10-01, decision 0022). Creating a Fjall keyspace is several fsyncs under a global lock,
+  and a server opens over a hundred; sharing one made a first boot as quick as a later one.
+  Old directories are read in their per-table layout, unmigrated.
 - **TLS to PostgreSQL is `rustls` with a crate-local adapter, and the modes are libpq's five.**
   (2026-09-30.) The workspace's TLS stack is `rustls`/`ring` everywhere else; an adapter over
   `tokio-rustls` for the synchronous `postgres` crate is under a hundred lines, so no

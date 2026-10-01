@@ -145,6 +145,16 @@ sees it take effect; new series `hs_rate_limited_total{bucket}` and
 `hs_config_settings_applied_total{setting,outcome}`. Decision 0016 amended; status 13 has the
 lists. Touches `hs-http`, `hs-auth`, `hs-room` (join and redaction limits), `hs-federation`,
 `hs-media`, `hs-appservice`, `hs-bridges`, `hs-admin`, `hs-cli` (`serve.rs`) and `web/`.
+**Branch `agent/boot-time` (2026-10-01, track 01; not merged when written): a first boot is
+as quick as any other.** The known gap "A first boot over an empty data directory takes about
+five seconds" is closed: on Fjall every `hs-kv` keyspace is now a prefix in one shared Fjall
+keyspace (decision 0022), so a fresh store creates one Fjall keyspace rather than 109. Debug
+cold boot 8.8 s → 0.72 s, release 9.4 s → 0.62 s (load 11-18); old data directories
+keep their layout and are read as before. `listening` now carries `boot_ms`, `cold`,
+`keyspaces_created`, and `/metrics` has `hs_boot_duration_seconds{cold}`. Touches
+`crates/hs-cli/src/{cli,serve,bootstrap}.rs` in a few lines (a `boot_metric` field and
+`ServeHandle::record_boot`), so expect a small rebase against the serve-runtime branch. Status 01
+has the table and the tests. Not yet run in a container or on the cluster.
 
 **Branch `agent/platform-gaps` (2026-10-01, track 12; not merged when written): four
 platform gap rows closed by running them.** The operator ran against a real API server for the
@@ -1889,9 +1899,9 @@ defect found while fixing the first; see the chart's commit). What is left there
   and at `http://localhost:<first bound port>` otherwise, which is wrong behind `-p 9000:8008`
   or any proxy that has not been described to the server. Correct for the quickstart; the
   operator has to edit the port otherwise.
-- **A first boot takes about five seconds in the container**, nearly all of it between generating
-  the signing key and binding the listener. Unmeasured; opening ~60 keyspaces with a synchronous
-  flush each is the suspect.
+- ~~**A first boot takes about five seconds in the container.**~~ Done 2026-10-01
+  (`agent/boot-time`): it was creating a Fjall keyspace per table; they now share one, and a
+  first boot is within a few hundred milliseconds of a later one (status 01).
 
 ### 4. Federation: after the join
 
@@ -1995,7 +2005,7 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | ~~`/sync` can repeat an event across two consecutive incremental batches~~ | `hs-user` | **Closed** (91c116f): the token's feed position was fixed before the batch was read, but each room's timeline was read to its live end, so an event landing during assembly was in that batch and, being past the token, in the next one too (initial batches included). A batch now carries the rooms with a feed entry at or before its token and each room's timeline stops at the position its entry had then (`UserStore::room_pos_at_token`). `sync::tests::an_event_that_arrives_during_assembly_is_in_exactly_one_batch` races a 300-event writer against a syncing device: 159 of 300 repeated on the old code, none now, none lost. `bridge_offerings.rs`'s client no longer de-duplicates and fails on a repeat. Before: an event that arrives while the earlier batch is being assembled appears in it and in the next one (seen with appservice-sent notices, 2026-09-27); clients dedupe by event id, and the bridge test does too |
 | The demo still runs a shared WhatsApp registration | demo | RFC 0017 section 6 says an offering replaces it; not done |
 | The bridge manager runs on one replica only | `hs-cli` | gated to the owner of the global shard, so a handoff pauses provisioning for a tick; never watched on a cluster |
-| A first boot over an empty data directory takes about five seconds | `hs-cli`, `hs-kv` | measured (1fe1db1, status 01): creating the Fjall keyspaces, fsynced and serialized; a warm boot is 0.4 s; the first startup probe of a fresh install is refused |
+| ~~A first boot over an empty data directory takes about five seconds~~ | `hs-cli`, `hs-kv` | **Closed** 2026-10-01 (`agent/boot-time`, status 01, decision 0022): every `hs-kv` keyspace on Fjall is a `[len][name]` prefix in one shared Fjall keyspace, so a fresh store creates one Fjall keyspace instead of 109 (Fjall has no batched creation and serializes creations under a lock); old data directories are read in their per-table layout, unmigrated. Launch to `listening`, five runs, load 11-18: debug cold 8.8 s → 0.72 s, release cold 9.4 s (20.7 s in a second, busier run) → 0.62 s, warm 0.4 to 0.8 s. The `listening` line says `boot_ms`, `cold`, `keyspaces_created`; `hs_boot_duration_seconds{cold}`. Guards: `hs-kv/tests/fjall_keyspace_creation.rs` (one Fjall keyspace for ninety tables; a crash right after a first boot loses nothing; the old layout still read) and `hs-cli/tests/boot_time.rs` (the real binary, `SIGKILL` after the first boot, account still there). The chart's startup probe (150 s budget) already tolerated it and is unchanged; its very first probe can still be refused as the container starts, one event inside the budget |
 | ~~User-directory scope is computed by walking rooms on every search~~ | `hs-user` | **Closed** 2026-09-30 (`agent/user-gaps`, status 05 session 11): a search reads `hs_user.room_members` (each room's joined members, kept by the session hub from the room updates it already applies) for the searcher's joined rooms and the public ones, and loads no room; a room the index has nothing for (last updated before it existed) is read once and indexed, counted by `SessionHub::directory_rooms_walked` and logged. Same answers (`e2e.rs`'s directory test unchanged). Timing, one public room of 5,001 members, release, in-memory: 2.7 ms from the index against 2.3 ms reading a resident room and 125 ms loading one -- the win is never loading or queuing on a room, not a resident room's read. Left: `users_sharing_room_with` (every `/sync`'s presence and device-list scope) still reads rooms |
 | ~~`TestThreadsEndpoint` flapped between runs~~ | `hs-room` | **Graded** 2026-10-01 (`agent/complement-remeasure`, status 14 session 6): `TestThreadsEndpoint` passed in both whole-package csapi runs from one image of `main` (`2a0b362`). Two other tests did move between those identical runs, each with its own row below: `TestRoomState` (csapi; a real read-your-writes bug in `/joined_rooms`) and `TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11` (federation; the known race in the test). Every other name, subtests included, matched run to run. Before: an ordering tie on a millisecond timestamp, fixed 2026-09-21 |
 | `TestRoomState` flaps: a room just created can be missing from `/joined_rooms` | `hs-user` | found 2026-10-01 (status 14 session 6): PASS in csapi run 13, FAIL in run 14 from the same image, and so PASS -> FAIL against 2026-09-26 in one run of two. Subtest `GET /joined_rooms lists newly-created room`, failing assertion `apidoc_room_state_test.go:187: failed to find room with id: !rpTZ1hl3asiID13ycE:hs1` (the test asks `GET /joined_rooms` the moment its `createRoom` returns). `hs_user::routes::rooms::get_joined_rooms` lists `UserStore::list_memberships`, which the session hub writes off the registry's stream a moment after the room accepted the join, without the bounded wait `/sync`, `/typing`, `/receipt` and `/read_markers` make (`SessionHub::settle_before_read`, `READ_YOUR_WRITES_WAIT`; status 05 session 10 said nothing else gated on store membership, but this lists it). Likely one line: settle before the read. Any other route that answers from the hub's store has the same window |

@@ -480,6 +480,16 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Operations
 
+- **A first boot is as quick as any other.** Over an empty data directory the embedded backend
+  used to create one Fjall keyspace per table, 109 of them, each several fsyncs under a global
+  lock; every table now lives behind a prefix in one shared Fjall keyspace (decision 0022), so a
+  first boot creates one. Measured 2026-10-01 on the project's desktop under load, launch to
+  `listening`, five runs each: debug 8.8 s to 0.72 s, release 9.4 s to 0.62 s; a later
+  boot was and is about half a second. Existing data directories keep their layout and need
+  nothing. The `listening` line says `boot_ms`, `cold` and `keyspaces_created`, and
+  `hs_boot_duration_seconds{cold}` is on `/metrics`. Verified with the real binary, including a
+  `SIGKILL` right after the first boot and a restart that finds the account registered before
+  it.
 - **Two pods on a real cluster, and what is between them crosses.** Two replicas ran as pods
   on the owner's cluster on 2026-09-28 with a CloudNativePG database and SeaweedFS media: a
   client's `/sync` from either pod, rooms handed between them during a rolling update and a
