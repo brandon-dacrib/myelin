@@ -1,5 +1,86 @@
 # 12. Platform and Kubernetes
 
+## 2026-10-01 (branch `agent/platform-gaps`): the operator has run against an API server
+
+Until today neither controller in `hs operator` had met a real API server: the `Bridge`
+reconciler was unit-tested, the `Homeserver` reconciler tested against an in-memory cluster and
+`helm template`. Now `deploy/operator/ci/kind-smoke.sh` runs both on a kind cluster, and CD's
+amd64 image leg runs it (with `--homeserver`) after the install smoke, before `manifest`.
+
+**Transcript:** `docs/status/transcripts/operator-kind-smoke-2026-10-01.txt` -- a fresh kind
+cluster (`kindest/node:v1.37.0`, pulled through `mirror.gcr.io`), the image built from this
+branch's tree (`docker buildx build -f deploy/Dockerfile`, 66 minutes on the loaded desktop),
+`--homeserver --heisenbridge`, **PASSED in 326 s**. Without `--heisenbridge` (what CD runs) it
+is about four minutes here. What it showed:
+
+- **The chart's bridge operator and a hand-written `Bridge`** (nginx standing in, `sh` for the
+  init container, port 80): `Pending` (`WaitingForPod`, then `PodInitializing`) → `Ready` in
+  27 s; the claim `smoke-data`, Deployment `smoke` and Service `smoke` exist, each with a
+  controller owner reference to the `Bridge`; the init container logged
+  `wrote /data/config.yaml`; the Service has a ready endpoint. A missing image tag →
+  `Degraded`, reason `ErrImagePull`, with the kubelet's message, in 9 s; the tag put back →
+  `Ready` again in 19 s. `kubectl delete bridge` → all four objects gone in 12 s (garbage
+  collection through the owner references; the pod's 30 s grace dominates when it is busy).
+- **`hs operator --homeservers`** (`deploy/operator/`, the kustomization as written, namespace
+  and image substituted) **and a single-node `Homeserver`**: `Pending` → `Ready` in 15 s;
+  StatefulSet `hs`, Services `hs` and `hs-headless`, ConfigMap `hs-config` and ServiceAccount
+  `hs`, all owned by the `Homeserver`; `/health/ready` 200 through `svc/hs`. An image change
+  (`tag: smoke-roll`): partition 1 → 0, pod `hs-0` replaced (new uid, new image), partition
+  back to 1, `Ready` in 8 s. Deletion: every owned object gone in 4 s, the data claim kept (a
+  StatefulSet claim, as with the chart).
+- **The server deploying heisenbridge itself** (row 2; `docs/status/11-appservices-and-bridges.md`).
+
+**What the `Homeserver` reconciler does today, exactly** (the row said "reconciles to a status
+only", which was out of date since 2026-09-28): it applies the chart's objects for the spec
+(ConfigMap, two Services, ServiceAccount, StatefulSet, and in cluster mode with more than one
+replica a PodDisruptionBudget), owned by the resource, by server-side apply; it owns the
+StatefulSet's `replicas` and update `partition` and lowers the partition one pod at a time; it
+writes `phase`, `readyReplicas` and five conditions (`SpecValid`, `DrainAvailable`,
+`Progressing`, `Ready`, `Draining`); with `spec.adminApi` and more than one replica it drains a
+replica through the admin API before its pod goes and puts the `hs.matrix.org/undrain`
+finalizer on the resource. **Verified on a cluster:** single node -- apply, `Ready`, an image
+roll through the partition, deletion. **Not yet on a cluster:** cluster mode (PostgreSQL,
+the mesh, the PodDisruptionBudget), scaling, and the drain-before-evict protocol with the
+finalizer -- tested only against the in-memory cluster in `homeserver/tests.rs`. Those need a
+PostgreSQL in the kind cluster, a mesh secret, an admin token and two or three replicas; the
+2026-09-28 "first cluster run" steps below still apply. It does not install the bridge operator
+or the CRDs, and with embedded storage `replicas` is always 1.
+
+**Found and fixed on the way** (commit `85d52d7`):
+
+- **The `Bridge` controller took a `Homeserver`'s pods for a `Bridge`'s.** Its watches selected
+  only `app.kubernetes.io/managed-by=myelin-operator`, which the `Homeserver`'s objects carry
+  too, and its pod watch maps a pod to the `Bridge` named by `app.kubernetes.io/instance`. With
+  both controllers in one namespace (what `deploy/operator/` runs), every change to the
+  `Homeserver` `hs`'s pod queued a reconcile of a nonexistent `Bridge` `hs`: 35 warnings in the
+  first run with the published image `sha-a01c1e0`. Now the watches select
+  `app.kubernetes.io/name=myelin-bridge` as well (`controller::watch_selector`); the test
+  `the_watches_see_a_bridges_objects_and_not_a_homeservers` builds both kinds' objects and
+  fails without the fix, and the smoke counts log lines about a `Bridge` named `hs` at debug
+  level: 0.
+- **A deleted resource's terminating pods were logged as failed reconciles.** kube-runtime
+  reports a watched object that maps to a resource no longer in the store as
+  `ObjectNotFound`; every deleted bridge left three to ten "bridge reconcile failed ... not
+  found in local store" warnings. Both controllers log that at debug now
+  (`controller::is_stale_trigger`, tested).
+- **`kubectl apply` of `deploy/crds/homeserver.yaml` warned `unrecognized format "uint64"`**
+  (and `uint32`): schemars' unsigned formats. `crds::all_crds` rewrites them to `int64` (the
+  `minimum: 0` beside them stays); test `every_integer_format_is_one_kubernetes_knows`.
+
+**Seen, not changed:** the scheduler's transient `Operation cannot be fulfilled on
+persistentvolumeclaims ... the object has been modified` (or `out of sync`) while
+`local-path` binds a new claim reaches the `Bridge`'s message for a second or two; it clears
+itself. On the loaded desktop a first attempt lost the kind API server altogether (load average
+70 inside the VM, with an unrelated container at 640 % CPU); the script now restarts a
+port-forward that dies with the API server's connection instead of reporting the instance as
+stuck. The server's own liveness probe killed `myelin-hs-0` once under that load.
+
+`kind` was installed with Homebrew (0.33.0); `docker pull` of `kindest/node` and
+`hif1/heisenbridge` from Docker Hub fails in agent sessions (the keychain credential helper),
+and works through `mirror.gcr.io/...` with a `DOCKER_CONFIG` whose `credsStore` is a no-op
+helper (an empty config is not enough on macOS: the CLI then picks `osxkeychain` itself).
+Inside kind, the node pulled `hif1/heisenbridge:latest` from Docker Hub without trouble.
+
 ## 2026-10-01 (branch `agent/platform-gaps`): the release binaries ran, and a release no longer hides `main`'s chart
 
 Two rows of the known-gaps table, closed by running them.

@@ -179,8 +179,12 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   tokens, the bot opening a direct chat with the sign-in steps, `@whatsappbot` answering a
   real invitation and `@bridges` taking commands, and a real heisenbridge started from the
   rendered registration reaching ready; the interface's offerings flow passes as a browser
-  test against the real server. What has not run is the in-cluster runtime, which needs a
-  Kubernetes API server. The paragraph below describes the design. An
+  test against the real server. **On 2026-10-01 the in-cluster runtime ran too**: on a kind
+  cluster with the chart, a heisenbridge offering made through the admin API with the
+  `cluster` runtime went from requested to ready in 47 seconds with a real pod the operator
+  deployed, its bot registered through the server, and removing it removed the pod, volume,
+  Service and Secret (`deploy/operator/ci/kind-smoke.sh --heisenbridge`). The paragraph below
+  describes the design. An
   administrator offers a bridge type (WhatsApp, with an image tag, who may use it, and whether
   it runs in this cluster or somewhere else); each person gets their own instance, with its own
   registration, ghosts, process and volume, by messaging the bridge's familiar address
@@ -522,6 +526,12 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 - CD publishes multi-architecture images with an SBOM and build provenance, and **refuses to
   publish an image that has not booted and answered `/health/live` and `/_matrix/client/versions`
   on both architectures**. Releases are gated on CI being green for that exact commit.
+- **CD runs the operator against a real API server before tagging an image.** After the chart
+  install smoke, the amd64 image leg runs `deploy/operator/ci/kind-smoke.sh --homeserver` on
+  the same kind cluster: a `Bridge` through Ready, Degraded (a missing image, with the
+  kubelet's reason), Ready again and deletion, and a single-node `Homeserver` through Ready,
+  an image roll and deletion. Its first run (2026-10-01) found the `Bridge` controller taking
+  a `Homeserver`'s pods for a bridge's when both ran in one namespace; fixed.
 - **Binaries for Linux (amd64, arm64) and Apple silicon have been built and booted.** They are
   attached to a release on a `v*` tag, and since 2026-10-01 a manual dispatch of CD with
   `binaries=true images=false` runs the same matrix as a dry run (no tag, no release, archives

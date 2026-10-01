@@ -1,0 +1,240 @@
+$ kind create cluster --name hs-operator-smoke-61351 --image mirror.gcr.io/kindest/node:v1.37.0@sha256:a1ed56cf...
+ • Waiting ≤ 3m0s for control-plane = Ready ⏳  ...
+ ✓ Waiting ≤ 3m0s for control-plane = Ready ⏳
+ • Ready after 32s 💚
+image under test: myelin:platform-gaps sha256:9dfb8e438524b2b94ae76439a350085304565145e5245e0d646405ac300cda2a
+$ time deploy/operator/ci/kind-smoke.sh myelin:platform-gaps --kind hs-operator-smoke-61351 --homeserver --heisenbridge
+
+== The chart with bridges.enabled (its default), image myelin:platform-gaps
+context kind-hs-operator-smoke-61351, namespace hs-op-smoke-19d26e
+$ kind load docker-image myelin:platform-gaps --name hs-operator-smoke-61351
+Image: "myelin:platform-gaps" with ID "sha256:9dfb8e438524b2b94ae76439a350085304565145e5245e0d646405ac300cda2a" not yet present on node "hs-operator-smoke-61351-control-plane", loading...
+$ kc create namespace hs-op-smoke-19d26e
+namespace/hs-op-smoke-19d26e created
++ 49s  helm install --wait returned
+$ kubectl -n hs-op-smoke-19d26e get deploy/myelin-hs-bridges-operator sts/myelin-hs
+NAME                                         READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/myelin-hs-bridges-operator   1/1     1            1           46s
+
+NAME                         READY   AGE
+statefulset.apps/myelin-hs   1/1     46s
+the bridge operator says: bridge operator starting (namespace hs-op-smoke-19d26e)
+
+== A Bridge running a stand-in (public.ecr.aws/docker/library/nginx:alpine, port 80)
+Image: "public.ecr.aws/docker/library/nginx:alpine" with ID "sha256:a2b80c421aaa02ba1ef4ef2d3c991112674e676f9db05fd42d456f2529b83a86" not yet present on node "hs-operator-smoke-61351-control-plane", loading...
+$ kubectl create secret generic smoke-files --from-literal=config.yaml=...
+  apiVersion: hs.matrix.org/v1alpha1
+  kind: Bridge
+  metadata:
+    name: smoke
+  spec:
+    bridgeType: stand-in
+    appserviceId: smoke-stand-in
+    image:
+      repository: public.ecr.aws/docker/library/nginx
+      tag: "alpine"
+      pullPolicy: IfNotPresent
+    port: 80
+    filesSecret: smoke-files
+    storage:
+      size: 64Mi
++  0s   : 
++  2s  Pending WaitingForPod: waiting for the pod
++  3s  Pending WaitingForPod: waiting for the pod: running Reserve plugin "VolumeBinding": "hs-op-smoke-19d26e/smoke-data" is out of sync (stored: 837, assume: 822)
++ 15s  Pending WaitingForPod: waiting for the pod: PodInitializing
++ 19s  Pending WaitingForPod: waiting for the pod
++ 27s  Ready Ready: the bridge is accepting connections on port 80
+
+== What the operator made for it
+$ kubectl -n hs-op-smoke-19d26e get deploy/smoke svc/smoke pvc/smoke-data
+NAME                    READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/smoke   1/1     1            1           26s
+
+NAME            TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)   AGE
+service/smoke   ClusterIP   10.96.43.136   <none>        80/TCP    26s
+
+NAME                               STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+persistentvolumeclaim/smoke-data   Bound    pvc-e86a8781-7129-4b27-95a5-99e726625232   64Mi       RWO            standard       <unset>                 26s
+deploy/smoke is owned by Bridge/smoke controller=true
+svc/smoke is owned by Bridge/smoke controller=true
+pvc/smoke-data is owned by Bridge/smoke controller=true
+init container 'files': wrote /data/config.yaml
+svc/smoke endpoints: 10.244.0.9
+status: {"conditions":[{"lastTransitionTime":"2026-10-01T05:38:14Z","message":"the bridge is accepting connections on port 80","observedGeneration":1,"reason":"Ready","status":"True","type":"Available"}],"observedGeneration":1,"phase":"Ready","readyReplicas":1}
+
+== An image that does not exist: Degraded, with the kubelet's reason
+$ kubectl patch bridge smoke: image tag no-such-tag-myelin-smoke
++  1s  Ready Ready: the bridge is accepting connections on port 80
++  2s  Pending WaitingForPod: waiting for the pod
++  6s  Pending WaitingForPod: waiting for the pod: PodInitializing
++  9s  Degraded ErrImagePull: files: ErrImagePull: rpc error: code = NotFound desc = failed to pull and unpack image "public.ecr.aws/docker/library/nginx:no-such-tag-myelin-smoke": failed to resolve reference "public.ecr.aws/docker/library/nginx:no-such-tag-myelin-smoke": public.ecr.aws/docker/library/nginx:no-such-tag-myelin-smoke: not found
+
+== The image put back: Ready again
+$ kubectl patch bridge smoke: image tag alpine
++  0s  Degraded ErrImagePull: files: ErrImagePull: rpc error: code = NotFound desc = failed to pull and unpack image "public.ecr.aws/docker/library/nginx:no-such-tag-myelin-smoke": failed to resolve reference "public.ecr.aws/docker/library/nginx:no-such-tag-myelin-smoke": public.ecr.aws/docker/library/nginx:no-such-tag-myelin-smoke: not found
++  1s  Pending WaitingForPod: waiting for the pod: PodInitializing
++ 15s  Pending WaitingForPod: waiting for the pod
++ 19s  Ready Ready: the bridge is accepting connections on port 80
+
+== Deleting the Bridge removes what was built from it
+$ kubectl -n hs-op-smoke-19d26e delete bridge smoke --wait=true
+bridge.hs.matrix.org "smoke" deleted
++  1s  4 objects left
++  5s  2 objects left
++ 12s  0 objects left
+
+== heisenbridge offered with the cluster runtime, through the admin API
+POST /api/v1/setup: signed in as @smoke:smoke.invalid
+GET /api/v1/bridge-deployment-target: {"available":true,"namespace":"hs-op-smoke-19d26e","homeserver_url":"http://myelin-hs.hs-op-smoke-19d26e.svc:8008","reason":null}
+PUT /api/v1/bridge-offerings/heisenbridge {"runtime":"cluster"}: {"type":"heisenbridge","name":"IRC (heisenbridge)","mode":"shared","enabled":true,"runtime":"cluster","image":"hif1/heisenbridge:latest","image_tag":"latest","front_door":null,"access":{"all_local_users":true,"users":[]},"options":{},"instances":{"requested":1},"created_at":"2026-10-01T05:38:59.017Z"}
++  1s  registered | - | - | - | 
++  4s  deploying | bridge-19a1359c | Pending | - | 
++  5s  deploying | bridge-19a1359c | Pending | waiting for the pod | 
++  7s  deploying | bridge-19a1359c | Pending | waiting for the pod | waiting for the pod
++ 15s  deploying | bridge-19a1359c | Pending | waiting for the pod: PodInitializing | waiting for the pod
++ 16s  deploying | bridge-19a1359c | Pending | waiting for the pod: PodInitializing | waiting for the pod: PodInitializing
++ 39s  deploying | bridge-19a1359c | Pending | waiting for the pod | waiting for the pod: PodInitializing
++ 41s  deploying | bridge-19a1359c | Pending | waiting for the pod | waiting for the pod
++ 45s  deploying | bridge-19a1359c | Ready | the bridge is accepting connections on port 9898 | waiting for the pod
++ 47s  starting | bridge-19a1359c | Ready | the bridge is accepting connections on port 9898 | waiting for the bridge to answer this server
++ 48s  ready | bridge-19a1359c | Ready | the bridge is accepting connections on port 9898 | 
+{
+  "type": "heisenbridge",
+  "user_id": null,
+  "state": "ready",
+  "reason": null,
+  "appservice_id": "heisenbridge",
+  "bot": "@heisenbridge:smoke.invalid",
+  "deployment": {
+    "namespace": "hs-op-smoke-19d26e",
+    "name": "bridge-19a1359c",
+    "image": "hif1/heisenbridge:latest",
+    "service_url": "http://bridge-19a1359c.hs-op-smoke-19d26e.svc:9898",
+    "phase": "Ready",
+    "ready": true,
+    "message": "the bridge is accepting connections on port 9898"
+  },
+  "health": "healthy",
+  "last_ping_at": "2026-10-01T05:39:45.848Z",
+  "last_error": null,
+  "created_at": "2026-10-01T05:38:59.116Z",
+  "ready_at": "2026-10-01T05:39:45.843Z"
+}
+the bridge manager's own account of it (the server's log; it has each step to the millisecond):
+  2026-10-01T05:38:59.138264Z bridge instance moved: requested -> registered
+  2026-10-01T05:38:59.500958Z bridge instance moved: registered -> deploying (waiting for the pod)
+  2026-10-01T05:39:45.843407Z bridge instance moved: deploying -> starting (waiting for the bridge to answer this server)
+  2026-10-01T05:39:46.255023Z bridge instance answered this server: ready
+$ kubectl -n hs-op-smoke-19d26e get bridge bridge-19a1359c
+NAME              PHASE   BRIDGETYPE     APPSERVICE     READY
+bridge-19a1359c   Ready   heisenbridge   heisenbridge   1
+the bridge runs in pod bridge-19a1359c-7c8c8964c7-9rhgf, image hif1/heisenbridge:latest
+  Heisenbridge v0.0.0
+  Fetching joined rooms...
+  Bridge is in 0 rooms, initializing them...
+  All valid rooms initialized, connecting network rooms...
+  Init done with 0 networks connecting, bridge is now running!
+its bot, registered through the server with its own token: {"user_id":"@heisenbridge:smoke.invalid","appservice_id":"heisenbridge"}
+
+== Removing the instance and the offering
+DELETE .../instances/_: 204
++  1s  3 objects left
++  2s  2 objects left
++ 34s  0 objects left
+DELETE /api/v1/bridge-offerings/heisenbridge: 204
+
+== hs operator --homeservers (deploy/operator) in hs-op-smoke-19d26e-hs
+$ kc apply --server-side -f /Users/brandon/myelin/.claude/worktrees/agent-ab04b9fcaa49813a3/deploy/crds/homeserver.yaml
+customresourcedefinition.apiextensions.k8s.io/homeservers.hs.matrix.org serverside-applied
+$ kc create namespace hs-op-smoke-19d26e-hs
+namespace/hs-op-smoke-19d26e-hs created
+$ kubectl kustomize deploy/operator | <namespace hs-op-smoke-19d26e-hs, image docker.io/library/myelin:platform-gaps, pullPolicy Never> | kubectl apply -f -
+$ kubectl -n hs-op-smoke-19d26e-hs rollout status deploy/myelin-operator --timeout=300s
+Waiting for deployment "myelin-operator" rollout to finish: 0 out of 1 new replicas have been updated...
+Waiting for deployment "myelin-operator" rollout to finish: 0 out of 1 new replicas have been updated...
+Waiting for deployment "myelin-operator" rollout to finish: 0 out of 1 new replicas have been updated...
+Waiting for deployment "myelin-operator" rollout to finish: 0 out of 1 new replicas have been updated...
+Waiting for deployment "myelin-operator" rollout to finish: 0 out of 1 new replicas have been updated...
+Waiting for deployment "myelin-operator" rollout to finish: 0 of 1 updated replicas are available...
+deployment "myelin-operator" successfully rolled out
+signing key Secret hs-signing-key made with hs generate-signing-key (ed25519 a_KXV4Ha ...)
+  apiVersion: hs.matrix.org/v1alpha1
+  kind: Homeserver
+  metadata:
+    name: hs
+  spec:
+    serverName: hs-smoke.invalid
+    image:
+      repository: docker.io/library/myelin
+      tag: "platform-gaps"
+      pullPolicy: Never
+    storage:
+      backend: embedded
+      embedded:
+        size: 1Gi
+    signingKeySecretRef:
+      name: hs-signing-key
+      key: signing.key
++  0s   ready= 
++  1s  Pending ready=0 SpecValid=True DrainAvailable=False Progressing=False Ready=False Draining=False 
++ 15s  Ready ready=1 SpecValid=True DrainAvailable=False Progressing=False Ready=True Draining=False 
+
+== What the operator made for it
+$ kubectl -n hs-op-smoke-19d26e-hs get sts/hs svc/hs svc/hs-headless cm/hs-config sa/hs pvc/data-hs-0
+NAME                  READY   AGE
+statefulset.apps/hs   1/1     15s
+
+NAME                  TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)                      AGE
+service/hs            ClusterIP   10.96.252.76   <none>        8008/TCP,8448/TCP,9090/TCP   15s
+service/hs-headless   ClusterIP   None           <none>        8008/TCP                     15s
+
+NAME                  DATA   AGE
+configmap/hs-config   1      15s
+
+NAME                AGE
+serviceaccount/hs   15s
+
+NAME                              STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+persistentvolumeclaim/data-hs-0   Bound    pvc-bcbb5420-372a-4ade-9faa-c1d90c0dbe83   1Gi        RWO            standard       <unset>                 15s
+sts/hs is owned by Homeserver/hs
+svc/hs is owned by Homeserver/hs
+svc/hs-headless is owned by Homeserver/hs
+cm/hs-config is owned by Homeserver/hs
+sa/hs is owned by Homeserver/hs
+finalizers on the Homeserver: none (it has no adminApi, so there is no drain to undo on deletion)
+  SpecValid=True Valid: 
+  DrainAvailable=False SingleNode: embedded storage runs one replica; there is nothing to hand shards to
+  Progressing=False Stable: 
+  Ready=True AllReplicasReady: 1 of 1 ready
+  Draining=False NoDrain: 
+GET /health/ready through svc/hs: 200
+
+== An image change, rolled through the StatefulSet's partition
+$ docker tag myelin:platform-gaps docker.io/library/myelin:smoke-roll
+Image with ID: sha256:9dfb8e438524b2b94ae76439a350085304565145e5245e0d646405ac300cda2a already present on the node hs-operator-smoke-61351-control-plane but is missing the tag docker.io/library/myelin:smoke-roll. re-tagging...
+$ kubectl patch homeserver hs: image tag smoke-roll
++  0s  Ready ready=1 SpecValid=True DrainAvailable=False Progressing=False Ready=True Draining=False | partition=1 pod=15dada63-b4f9-4220-8c2f-61507ee5c0a5 docker.io/library/myelin:platform-gaps ready=True
++  1s  Pending ready=1 SpecValid=True DrainAvailable=False Progressing=True Ready=False Draining=False | partition=0 pod=15dada63-b4f9-4220-8c2f-61507ee5c0a5 docker.io/library/myelin:platform-gaps ready=True
++  2s  Pending ready=0 SpecValid=True DrainAvailable=False Progressing=True Ready=False Draining=False | partition=1 pod=1fa09004-026c-46c0-abe2-189de88ec032 docker.io/library/myelin:smoke-roll ready=False
++  3s  Pending ready=0 SpecValid=True DrainAvailable=False Progressing=False Ready=False Draining=False | partition=1 pod=1fa09004-026c-46c0-abe2-189de88ec032 docker.io/library/myelin:smoke-roll ready=False
++  8s  Ready ready=1 SpecValid=True DrainAvailable=False Progressing=False Ready=True Draining=False | partition=1 pod=1fa09004-026c-46c0-abe2-189de88ec032 docker.io/library/myelin:smoke-roll ready=True
+pod hs-0 was 15dada63-b4f9-4220-8c2f-61507ee5c0a5, is 1fa09004-026c-46c0-abe2-189de88ec032
+
+== Deleting the Homeserver
+$ kubectl -n hs-op-smoke-19d26e-hs delete homeserver hs --wait=true --timeout=300s
+homeserver.hs.matrix.org "hs" deleted
++  0s  1 objects left
++  4s  0 objects left
+the data claim outlives it, as with the chart: data-hs-0 Bound
+operator log lines (debug and up) about a Bridge named hs: 0
+
+== All checks passed
+
+== Cleaning up
+namespace "hs-op-smoke-19d26e" deleted
+namespace "hs-op-smoke-19d26e-hs" deleted
+customresourcedefinition.apiextensions.k8s.io "homeservers.hs.matrix.org" deleted
+
+== PASSED
+kind-smoke.sh exited 0 after 326s
+rc=0

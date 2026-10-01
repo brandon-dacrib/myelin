@@ -346,10 +346,21 @@ if [ "$HEISENBRIDGE" -eq 1 ]; then
   # A quarter-second poll: `starting` can last less than a second once the pod is Ready.
   deadline=$((SECONDS + TIMEOUT * 2)); seen=""
   while :; do
+    [ "$SECONDS" -lt "$deadline" ] || fail "the instance is still '$seen' after $((TIMEOUT * 2))s"
     now="$(instance_state 2>/dev/null || true)"
+    if [ -z "$now" ]; then
+      # A port-forward dies with the API server's connection (an overloaded kind node drops
+      # it); start another rather than report the instance as stuck.
+      if ! curl -sf -o /dev/null "$BASE/health/live"; then
+        stamp "(the port-forward is gone; starting another)"
+        stop_port_forwards
+        port_forward "$NAMESPACE" "$RELEASE-hs"
+      fi
+      sleep 1
+      continue
+    fi
     if [ "$now" != "$seen" ]; then stamp "$now"; seen="$now"; fi
     case "$now" in ready*) break ;; failed*) fail "the instance failed: $now" ;; esac
-    [ "$SECONDS" -lt "$deadline" ] || fail "the instance is still '$now' after $((TIMEOUT * 2))s"
     sleep 0.25
   done
   instance="$(api "$BASE/api/v1/bridge-offerings/heisenbridge/instances/_")"
