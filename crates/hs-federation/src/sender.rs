@@ -1688,9 +1688,20 @@ impl Shared {
 /// `counter -= n`, stopping at zero: a count that is only ever an operator's number must never
 /// wrap.
 fn sub_saturating(counter: &AtomicUsize, n: usize) {
-    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-        Some(current.saturating_sub(n))
-    });
+    // A compare-exchange loop rather than `fetch_update`, which Rust 1.99 deprecates in favour of
+    // `try_update`; this spells the same thing on every toolchain CI and the desktop run.
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        match counter.compare_exchange_weak(
+            current,
+            current.saturating_sub(n),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return,
+            Err(seen) => current = seen,
+        }
+    }
 }
 
 fn now_ms() -> u64 {
