@@ -1,10 +1,105 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-09-30, end of day (eight gaps closed; nothing unmerged). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-01, 18:10 EDT (the all-gaps night wrapped up; twelve branches unmerged, listed first). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-09-30, end of day
+## Resume here: 2026-10-01, 18:10 EDT -- the wrap-up of the all-gaps night
+
+**Where `main` is.** `66d99e0`, **2,534 Rust tests**, 88 commits since 2026-09-30 18:00, every
+code commit through the full gate with both PostgreSQL servers. CI on `main` was red from
+`627fab0` to `4a4ebcc` (GitHub's `stable` Rust moved past the desktop's 1.98 and deprecated
+`AtomicUsize::fetch_update`; fixed) and then red once more because the new `fuzz` job's nightly
+build broke and `cd`'s "require green ci" reads the whole `ci` run; fuzzing is its own workflow
+since `66d99e0`. **The first green `cd` run at or after `66d99e0` is the image to roll the demo
+to**; the demo runs `sha-025ef65` (rolled by the owner at ~21:00Z, revision 7). The owner's
+standing rule from this evening, now in "Conventions worth keeping": sane defaults, all
+administration in the web UI, explained there.
+
+**Merged tonight, in order** (each a paragraph further down): `ci-flakes` `a01c1e0`, `rejoin-gap`
+`083b58e`, `federation-catchup` `611ea59`, `backfill-state` `ed3ad77`, `cluster-gaps` `9cde6e9`,
+`user-gaps` `dfae9a3`, `platform-gaps` `4d869a2`, `web-gaps` `45f560a`, `room-gaps` `5d17e4c`,
+`bridge-logins` `025ef65`, `cli-small-gaps` `4edbee0`, `test-infra-gaps` `c11668a`,
+`importer-gaps` `2a0b362`, `ci-clippy` `4a4ebcc`, plus the demo rolls, the README and changelog
+refresh, and the `.gitattributes` union merge for `docs/next-steps.md`, `docs/status/*.md` and
+`CHANGELOG.md` (every conflict there had been keep-both).
+
+**Twelve branches are unmerged, all pushed, all with status entries and a paragraph below.** A
+merge-queue process started at 16:30 (`nohup tools/merge-queue.sh ...`, log in the session's
+scratchpad as `merge-batch10.log`) is still running the rest of its list -- `federation-sytest`,
+`config-hot`, `web-admin-ui`, `admin-scopes`, `boot-time`, `room-cluster-small` -- one 60–80
+minute gate each; **check `git branch -r --no-merged origin/main` first thing**, since it may
+have merged some of them by then. Two things it will get wrong, which the next coordinator
+corrects: (a) `agent/cluster-create-room-flake` passed its gate at 17:20 but was left because
+`main` moved with a README commit (the script counts anything outside `docs/` as code) -- it
+has not merged, so `main` still has the `cluster_create_room` race that fails three gates in
+four on a loaded machine; **merge it first** (`tools/merge-queue.sh agent/cluster-create-room-flake`,
+with the six `HS_*_TEST_POSTGRES_*` variables; the trust anchor is the test CA, see below), then
+everything else; (b) `federation-sytest` is superseded by `federation-sytest-2`, which carries
+its commits -- merge `-2` and delete `-1`.
+
+The order that avoids conflicts, after the flake fix: `federation-sytest-2` (Sytest federation
+15 → 73/105, whole suite 407 → 486), `room-id-uniqueness` (on top of the flake branch; one
+keep-both conflict with `room-cluster-small` in `crates/hs-room/src/metrics.rs`), `config-hot`,
+`web-admin-ui` (built on `config-hot`; rebase after it lands), `admin-scopes`, `boot-time`,
+`room-cluster-small`. Three agents were still working when this session stopped and their
+branches hold whatever they had pushed: `rfc-0018` (9 commits, the non-owner `/sync` mirror;
+unknown how far), `sytest-client` (18 commits: guest access, 3PID invites, the legacy `/events`
+stream; unknown how far), `complement-remeasure` (3 commits, docs only: csapi and federation
+package numbers against tonight's `main`; it had not finished its second runs). Read each
+branch's last commit and its status entry before deciding whether it is done; a branch whose
+agent did not report is not done until its own checks have been run.
+
+| Branch | Tip | What it holds | Gate |
+|---|---|---|---|
+| `agent/cluster-create-room-flake` | `f671785` | a fenced `/createRoom` is retried against current ownership (decision 0017 style), a fenced forward's `503` is no longer cached, the test picks ports that split the shards and waits for convergence; a new row on one late heartbeat costing a replica every shard | **passed 17:20, left for "main moved"** |
+| `agent/federation-sytest-2` | `429242b` | carries `federation-sytest`: key server `/server/{keyId}` + notary, server ACLs on every room-scoped route and per PDU/EDU, `{}` for auth-rejected PDUs, v1/v2 rooms, federation redactions applied and rendered (`redacted_because`), event IDs percent-encoded (half of v3 invites 404'd), `send_join` auth chain, `origin` on served PDUs, `make_join` refusals, the 502s through Sytest's server, pending redactions, rejected events stored, notary responses persisted | not run |
+| `agent/federation-sytest` | `8a01fb5` | superseded by `-2`; delete after `-2` merges | in the running queue; will be left (main moved) |
+| `agent/room-id-uniqueness` | `9e9ae53` | two v12 creates in one millisecond got one room id; the id is claimed in the create's transaction (Sytest 8–9/11 → 11/11 on the affected files); based on the flake branch | not run |
+| `agent/config-hot` | `231988d` | every setting classified bootstrap/hot/restart (7/39/25) with `x-applies` in the schema, every rate-limit bucket enforced, `Live<T>` handles | failed once on fmt after a bad rebase replay, fixed; in the running queue |
+| `agent/web-admin-ui` | `4d4b20b` | the UI for tonight's API additions: catch-up state, migration streams named, `applies` badges and explanations, sign-in state on offerings, Reactivate, words for wire values; built on `config-hot` with `main` merged in | in the running queue (rebase onto `config-hot`'s merge first) |
+| `agent/admin-scopes` | `ae27a71` | 28 operations enforced the wrong scope; contract test over all 154; sidebar-vs-document test | in the running queue |
+| `agent/boot-time` | `22757ca` | cold boot 9 s → 0.6 s: one shared Fjall keyspace with name prefixes (decision 0024), `hs_boot_duration_seconds` | failed once on the create-room race; in the running queue |
+| `agent/room-cluster-small` | `84c8589` | v12 upgrades make a real replacement (every 11→12 upgrade had failed 403 after writing the tombstone), a release advances the fencing epoch (decision 0023); based on the flake branch | failed once on the race; in the running queue |
+| `agent/rfc-0018` | `51f63b5` | in progress when the session stopped | not run |
+| `agent/sytest-client` | `51c0b68` | in progress when the session stopped | not run |
+| `agent/complement-remeasure` | `b70559f` | in progress; docs only | not run |
+
+**What is next, in order, after those merge:**
+
+1. **Roll the demo** to the first green `cd` image at or after `66d99e0` (it carries the
+   redaction fix): `helm --kube-context admin@dacrib0 get values myelin -n myelin -o yaml >
+   /tmp/myelin-values.yaml && helm --kube-context admin@dacrib0 upgrade myelin
+   /Users/brandon/myelin/deploy/helm/hs -n myelin -f /tmp/myelin-values.yaml --set
+   image.tag=sha-<full sha> --wait --timeout 10m`, from the owner's own shell while the macOS
+   Local Network permission keeps Homebrew `kubectl`/`helm` from the API server in agent
+   sessions ("no route to host" since 14:41Z; Apple's `nc` connects). Then watch the first
+   `fuzz` workflow run and fix its nightly build (`cfg-if` under the sanitizer flags).
+2. **The two-pod cluster run** with that image (item 2 of the 2026-09-30 list below), now
+   also to watch: the last-replica drain, catch-up, the search indexer per replica, the
+   fenced-create retry, and whether one late heartbeat at load costs a replica every shard
+   (the new row). Needs the owner's terminal or the permission.
+3. **The rows the night opened**, by track: Sytest's client-server leftovers (whatever
+   `sytest-client` did not finish: guest access, 3PID invites, legacy `/events`; then
+   federation profile/directory queries, device-list resync, soft failure), the web audit list
+   in status 16 (user edit, bridge edit and test-connection, a health panel, exact lookup and
+   live username check, upgrade successor and guest access on the room page, paging past 50
+   destinations, cluster/search-lag fields in the admin API), a narrower admin token than a
+   full administrator's (RFC 0004 §8.1; without it the scope fixes only matter to tests), the
+   hot-room stream and feed pruning, `users_sharing_room_with` on the member index, `PLAN.md`
+   §6.5 (still says one keyspace per table), placed outliers before `ed3ad77` having no state
+   row, bans not carried by a room upgrade, `may_redact` at the redaction's time.
+4. **Then the table**, as before: rows that need a phone (a message across mautrix), a release
+   tag, or the cluster are reported, not closed.
+
+**For the merge queue:** `tools/merge-queue.sh <branches...>` from the main checkout with the six
+`HS_*_TEST_POSTGRES_*` variables; the TLS trust anchor is the test CA at
+`/private/tmp/claude-501/-Users-brandon-myelin/e6e0b427-10a1-457d-8bde-b166a507435f/scratchpad/pgtls/ca.crt`
+(a copy as `ca.crt` in the 2026-10-01 session's scratchpad); never push to `main` while a gate
+runs unless the change is under `docs/`; a branch the script leaves for "main moved (code)" has
+passed its gate and only needs the next run.
+
+## Earlier: 2026-09-30, end of day, and the night's log
 
 **Where `main` is.** `2a0b362` plus this document, **2,534 Rust tests**, gate green with both
 PostgreSQL servers (plain and TLS) in use; the demo runs `sha-a01c1e0` (the `sha-025ef65`
