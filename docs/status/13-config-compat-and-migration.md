@@ -4,6 +4,103 @@ Track brief: `docs/workstreams/13-config-compat-and-migration.md`. Owner
 crates/files: `crates/hs-config`, `crates/hs-compat`,
 `tools/synapse_inventory.py`, `docs/synapse-inventory.md`.
 
+## 2026-10-01: the importer leaves nothing a migrating user needs behind, and copies a room in bounded memory (branch `agent/importer-gaps`)
+
+Closes the two importer rows of `docs/next-steps.md`'s Known gaps, as far as was real tonight.
+
+**Copied now** (each through its owning crate's store API, each verified field by field, each
+with a stream of its own so its counts, log lines and `hs_migration_rows_*{stream}` metrics are
+its own):
+
+1. **End-to-end keys** (`e2e_keys`, one row per device): identity keys with Synapse's separately
+   held cross-signing signatures merged in (as `/keys/query` shows them), unclaimed one-time keys
+   uploaded in upload order and, on a later pass, as many claimed here as Synapse handed out
+   since (oldest first: `hs-e2e` tombstones a claimed key, so the pool is made equal by count),
+   fallback keys uploaded each pass and claimed once if Synapse marked them used.
+   **Cross-signing** (`cross_signing`, per account): the newest key of each type, with the
+   signatures on it (alice's user-signing signature on bob's master key). **Key backups**
+   (`key_backups`, per version): same version numbers (numbers Synapse no longer has are made and
+   deleted again), deleted versions stay deleted, room keys a page at a time.
+2. **Push rules** (`push_rules`, per account): Synapse's rows read into the client-server API's
+   shapes (`hs_compat::migration::rows::push_rules`: kind by `priority_class`, highest priority
+   first, `global/<kind>/.m.rule.*` rows as changed default actions, `push_rules_enable` as on/off
+   flags) and applied to this server's default ruleset; **pushers** (`pushers`; turned-off ones
+   left out).
+3. **Receipts** (`receipts`, after rooms): `m.read` and `m.read.private`, thread `main` as the
+   room's, other threads left out and logged; through the new `SessionHub::import_receipt`
+   (durable, members woken, replicas told, not sent to other servers again).
+4. **Filters** (`filters`): under Synapse's ids, through the new `UserStore::import_filter`.
+5. **Rooms joined over federation**: a room whose create event is not part of its history is
+   started from the first join of a local account, with the state before it (Synapse's state
+   group after the join, followed along `state_group_edges`, with the joiner's membership put
+   back as the join's `auth_events` cite it) and that state's auth chain, through the new quiet
+   `RoomActorHandle::import_remote_join` (as `bootstrap_from_remote_join` takes a `send_join`
+   answer, but nothing is published, so the federation sender does not send the old join
+   again); then its history after the join is copied as any room's. A room Synapse backfilled to
+   its create event is simply replayed whole. Skipped and logged: a room still partial-state
+   (faster join), a room the local users were only invited to or have left.
+6. **Remote media**: struck from the list as by design (a cache, fetched again on first use).
+
+**A room a page at a time.** `rooms::copy_room` reads a room's events in pages of `batch_size` in
+`(topological_ordering, stream_ordering)` order (Synapse's own `events_order_room` index; the
+query uses it) and writes each page before reading the next; an event that cites one not yet
+held (`RoomError::MissingAncestors`) waits, at most 1,000 per room, and is offered again after
+each page that stored something. The whole-room in-memory `order::replay_order` is gone.
+Verification pages through a room's ids the same way (`missing_events`).
+
+**Throughput, measured** (`throughput.rs`): each room's and the copy's events/s, bytes/s and the
+process's peak resident memory (`getrusage`; the one `unsafe` block, justified and tested) are
+logged (`throughput: ...`) and exported (`hs_migration_events_read_total`,
+`_events_stored_total`, `_event_bytes_read_total`, `hs_migration_room_seconds`,
+`hs_migration_peak_rss_bytes`). Measured on one room of 100,000 events and 2,000 members (below).
+
+**Verified by:**
+
+- `cargo test -p hs-cli --test migration` (2 tests, the real binary): the small fixture
+  (regenerated from a real Synapse 1.161 with e2e keys, cross-signing, a key backup, push rules,
+  a pusher, receipts and filters) is copied, restarted, verified, cut over, restarted; then
+  `/keys/query` has alice's phone with her self-signing signature, her three cross-signing keys
+  and bob's master key with her signature; `/keys/claim` hands out `signed_curve25519:AAAAA0`;
+  `/room_keys/version` is `2` with 3 keys, version 1 is `404`; `/pushrules/` has the keyword, the
+  muted room, the override, `.m.rule.suppress_notices` off and `.m.rule.message`'s new actions;
+  `/pushers` has the pusher; `/user/@alice/filter/0` is her filter; `/sync` carries bob's read
+  receipt in the lobby and alice's private one in the DM; the throughput metrics after the
+  cutover's pass. And the new federated fixture (two real Synapses federating over TLS on one
+  machine): both remote rooms copied and verified, hana's `/sync` has both with her receipt,
+  Faraway (held from her join) serves its history since, its topic and its three members, and
+  takes a new message; Elsewhere (backfilled whole) serves its history from the beginning.
+- `cargo test -p hs-compat` (61 unit, 7 corpus, 7 engine): the row readers against rows as the
+  real Synapse wrote them; the engine copying, verifying, catching a tampered filter, cutting
+  over; the federated fixture's join, state and auth chain; a 1,000-event room copied 50 at a
+  time with an event 500 ahead of its parent waiting for it and one citing nothing held
+  refused; a cancelled copy stopping before its next page.
+- `cargo test -p hs-user --lib imported` (the imported filter).
+
+**Measured** (one room of 100,000 events, 2,000 joined members, 5,163 of them Synapse's own and
+the rest written by `extend_big.py` with Synapse's signing code; `crates/hs-compat/tests/
+fixtures/synapse-big/`; release builds, embedded store, on the owner's desktop under other
+agents' load): see the table below.
+
+MEASUREMENTS_TABLE
+
+**Left:** a backed-up room key deleted in Synapse after an earlier pass is not deleted here; a
+one-time key pool is made equal by count, which removes the oldest here (both servers hand them
+out oldest first, so these are the ones Synapse handed out); history from before a federated
+join is left to backfill; the room actor itself still holds every event of a room in memory
+(`RoomActor::events`), so the importer's bounded memory is the importer's, not the room's; no
+`hs import` command line (the migration is the admin API's); the web page's stream labels
+(`web/src/lib/migration.ts`) do not name the seven new streams (it shows their wire names).
+
+**Decisions made:** a stream per kind rather than one "keys" stream (counts, checkpoints and
+metrics stay per kind); push rules are applied to this server's default ruleset rather than
+copied as rows; Synapse's filter ids are kept (a new `import_filter`), because clients cache
+them; an imported receipt and an imported remote join are quiet (old news to everyone else); a
+federated room starts from the first local join, not from Synapse's current state, so that every
+later event is authorized here as it was there.
+
+**Shared dependencies added:** `libc = "0.2"` in `[workspace.dependencies]` (already in the lock,
+transitively), used by `hs-compat` for `getrusage`.
+
 ## 2026-09-29: configuration history and hot reload merged
 
 History/revert (`eedb090`) and hot reload (`12a19eb`) are on pushed `main`. Saves and reverts
