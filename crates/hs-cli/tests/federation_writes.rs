@@ -666,17 +666,26 @@ async fn send_join_v2_persists_the_join_and_it_is_readable_afterwards() {
         "the remote's own signature must survive storage byte-for-byte: {fetched}"
     );
 
-    // And it is state, not just a timeline entry: the room's current state names bob as joined.
+    // And it is state, not just a timeline entry. `/state?event_id=` is the state *before* the
+    // named event (the spec's meaning, and Synapse's `get_state_for_pdu`, which reverts the
+    // event's own state key), so asked at bob's join it holds the room alice made and not bob;
+    // the join itself is readable above, and `/make_join` for a third user would see it.
     let (status, state) = harness
         .signed_get(&format!("/state/{room_id}?event_id={joined_event_id}"))
         .await;
     assert_eq!(status, StatusCode::OK, "{state}");
-    let has_bob = state["pdus"].as_array().unwrap().iter().any(|pdu| {
-        pdu["type"] == "m.room.member"
-            && pdu["state_key"] == format!("@bob:{REMOTE}")
-            && pdu["content"]["membership"] == "join"
-    });
-    assert!(has_bob, "bob's join should be in the room's state: {state}");
+    let pdus = state["pdus"].as_array().unwrap();
+    assert!(
+        pdus.iter().any(|pdu| pdu["type"] == "m.room.create"),
+        "the state before bob's join is the room alice made: {state}"
+    );
+    let has_bob = pdus
+        .iter()
+        .any(|pdu| pdu["type"] == "m.room.member" && pdu["state_key"] == format!("@bob:{REMOTE}"));
+    assert!(
+        !has_bob,
+        "the state before bob's join must not already contain it: {state}"
+    );
 }
 
 /// Binds a minimal "remote federation server" to a real loopback TCP port: an axum catch-all that
