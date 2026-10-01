@@ -75,12 +75,16 @@ admin API's room long tail).
 >   searches the moment after sending (so a search now brings its rooms' index up to date first)
 >   and expects a `next_batch` on every full page; both were changed before the image was built.
 > - **Cluster mode.** The index is in the shared store, so it is one index for every replica;
->   each replica indexes the rooms whose shard it owns. Not yet run with two replicas.
+>   each replica indexes the rooms whose shard it owns, and a room another replica owns is read
+>   by a fresh load. `crates/hs-cli/tests/cluster_create_room.rs` (two `hs` processes on
+>   PostgreSQL) ends with a search through each replica that finds the messages of all forty
+>   rooms, twenty owned by each.
 > - **Left.** Backfilled history and a rejoin's gap are not indexed (the cursor only moves
 >   forward); no stemming, and a script without spaces is matched by the start of a run only; a
 >   word with more than 50,000 postings reads the first 50,000 (`count` a lower bound, logged);
->   `include_profile` is the member's current profile, not the one at the event; no two-replica
->   run; Element Web not yet tried in a browser (no Element image on this machine, and Docker Hub
+>   `include_profile` is the member's current profile, not the one at the event; a search on a
+>   replica that does not own a room reloads that room from the store each time (RFC 0018's
+>   cost, here too); Element Web not yet tried in a browser (no Element image on this machine, and Docker Hub
 >   pulls fail in agent sessions).
 
 > **2026-09-30, session 14: a version-12 room is built by the owner of its shard** (branch

@@ -11,7 +11,8 @@
 //! one PostgreSQL. Twenty version-12 rooms are created through each. Each replica's
 //! `hs_room_create_room_id_attempts_count` counts the rooms it built; it must equal the number
 //! of rooms whose shard it owns, and every room then takes a message through the replica that
-//! did not build it.
+//! did not build it. A search through either replica then finds all forty messages: the search
+//! index is in the shared store, each replica indexing the rooms it owns.
 //!
 //! Runs when a PostgreSQL server is reachable, and prints a skip message otherwise:
 //!
@@ -460,6 +461,36 @@ async fn every_v12_room_is_built_by_the_owner_of_its_shard_whichever_replica_too
             status.0,
             status.1
         );
+    }
+
+    // The search index is in the shared store: each replica indexes the rooms it owns, and a
+    // search through either replica finds the messages of all forty rooms (decision 0021).
+    for (_, base) in &replicas {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let found: Value = client
+                .post(format!("{base}/_matrix/client/v3/search"))
+                .bearer_auth(&alice)
+                .json(&json!({"search_categories": {"room_events": {
+                    "search_term": "message", "keys": ["content.body"],
+                    "filter": {"limit": 100}}}}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let count = found["search_categories"]["room_events"]["count"].as_u64();
+            if count == Some(rooms.len() as u64) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a search through {base} counted {count:?} of {} messages",
+                rooms.len()
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
 
     drop(replica_2);
