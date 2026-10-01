@@ -65,9 +65,10 @@ left open how a copy learns that something other than an append happened.
 
 ## Consequences
 
-- A non-owner's work per event is the event's, not the room's: 3.4 ms against 989 ms per event
-  in a room of 2,000 messages and 53 members, and 4.2 ms against 45.7 ms in a small one (release
-  build, three real replicas; `docs/status/05-sync.md`, session 12).
+- A non-owner's work per event is the event's, not the room's: 4.9 ms against 2,054 ms per
+  event in a room of 2,000 messages and 303 members, 3.4 ms against 989 ms with 53 members, and
+  3.7-4.2 ms against 44-46 ms in a small one (release build, three real replicas;
+  `docs/status/05-sync.md`, session 12).
 - Every new code path that rewrites a room's existing rows, or places rows below its head, must
   call `actor::catch_up::bump_rewrites` in its transaction. A path that forgets leaves other
   replicas' copies stale until they are evicted or the next rewrite; the module docs of

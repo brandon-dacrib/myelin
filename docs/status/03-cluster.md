@@ -46,8 +46,8 @@ Verified: ten runs in a row against a private `postgres:17` with the machine at 
 Not a change to `hs-cluster`, but to what a cluster costs: a replica answering `/sync` for a
 room another replica owns no longer reloads the whole room from the store per event. Its copy
 (`hs_user::cluster::RoomMirror`) is advanced by `hs_room::actor::RoomActor::catch_up`, which
-reads only the timeline rows past it (3.4 ms per event against 989 ms for a whole reload of a
-2,000-message room, release build); a per-room rewrite counter (`room_rewrites`) tells it when
+reads only the timeline rows past it (4.9 ms per event against 2,054 ms for a whole reload of
+a room of 2,000 messages and 303 members, release build); a per-room rewrite counter (`room_rewrites`) tells it when
 something other than an append happened (backfill, purge, outliers, ...) and it then reloads,
 logged with the reason. The `user.wake` batch's existing `room_pos` drives it: a copy is caught
 up (for at most 250 ms) before the long-polls the wake is for are woken -- a catch-up awaited

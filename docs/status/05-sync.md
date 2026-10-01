@@ -80,25 +80,23 @@ per event is the
 B2 loaded no room whole in either phase and its cost per event barely moves with the room's
 size; B1's grows with it.
 
-**The 2,000-event room, release build** (PostgreSQL in Docker with `fsync=off`; the desktop
-quieter than above), 100 messages per phase:
+**The 2,000-event rooms, release build** (PostgreSQL 17 in Docker with `fsync=off`; the desktop
+quieter than above), 100 messages per phase, two runs:
 
 | Room | B1, whole reload (before) | B2, incremental (after) |
 |---|---|---|
-| small (3 members) | 45.7 ms/event; sync p50 281 ms, p95 387 ms | 4.2 ms/event; p50 246 ms, p95 365 ms |
+| small (3 members) | 45.7 / 43.9 ms/event; sync p50 281 / 259 ms | 4.2 / 3.7 ms/event; p50 246 / 228 ms |
 | 2,000 messages, 53 members | 989 ms/event; sync p50 2.26 s, p95 2.69 s | 3.4 ms/event; p50 1.54 s, p95 1.83 s |
+| **2,000 messages, 303 members** (the brief's room) | **2,054 ms/event**; sync p50 9.57 s, p95 15.4 s | **4.9 ms/event**; p50 8.25 s, p95 11.8 s |
 
-B2 loaded no room whole (100 catch-ups of 100 events in each phase); its work per event is the
-same in both rooms, B1's is 22 times larger in the big one. What is left of the latency in the
-big room on B2 is the owner: its hub writes 53 members' records and feed entries before it
-sends the wake (the owner's fan-out, below). Session 7's ~150 ms was a two-member room.
-
-**300 members.** The brief's room (2,000 messages and 300 members) was built twice, but its
-100-message phase did not finish on this machine while it was loaded: the owner's hub needed
-about a minute per update once 300 members had joined (five hours for the joins alone). The
-reader's side of it was measured all the same: B1's whole load of that room -- what every new
-event in it cost a non-owner before -- took 26 s and 39 s (two runs, release build).
-MEASURE-BIG
+B2 loaded no room whole (100 catch-ups of 100 events in every phase), and its work per event
+is the same, 3.4-4.9 ms, whatever the room's size; B1's grows with the room, to 420 times B2's
+in the 303-member room. What is left of the latency on B2 is the owner: its hub writes every
+member's record and feed entry, one at a time, before it sends the wake -- about 1.5 s for 53
+members and 8 s for 303 (the owner's fan-out, below). Session 7's ~150 ms was a two-member room.
+Earlier attempts at the 303-member room on the loaded desktop never reached the message phase
+(the owner's hub needed about a minute per update after the joins); on the quieter machine it
+needed 32 minutes to catch up after the 300 joins.
 
 **Found with no row: the owner's fan-out.** In the debug run the write-to-woken-sync latency
 was the same on B1 and B2 (p50 2.6-2.8 s in the small room, 14 s in the 33-member room): what
