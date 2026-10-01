@@ -7,11 +7,15 @@ import { server } from "@/mocks/node";
 import { signIn, signOut } from "@/lib/auth";
 import { BridgeSignInState } from "./BridgeSignInState";
 
-function renderState(appserviceId: string, defaultUserId?: string) {
+function renderState(
+  appserviceId: string,
+  defaultUserId?: string,
+  extra: { bridgeUrl?: string | null; canWrite?: boolean } = {},
+) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={client}>
-      <BridgeSignInState appserviceId={appserviceId} defaultUserId={defaultUserId} />
+      <BridgeSignInState appserviceId={appserviceId} defaultUserId={defaultUserId} {...extra} />
     </QueryClientProvider>,
   );
 }
@@ -29,6 +33,36 @@ beforeEach(async () => {
 afterEach(() => signOut());
 
 describe("Who has signed in to a bridge", () => {
+  it("offers to add the provisioning secret a registration made before 2026-10-01 lacks", async () => {
+    const patches: unknown[] = [];
+    server.events.on("request:start", async ({ request }) => {
+      if (request.method === "PATCH") patches.push(await request.clone().json());
+    });
+    renderState("telegram", "@alice:example.org", {
+      bridgeUrl: "http://mautrix-telegram.bridges.svc:29317",
+      canWrite: true,
+    });
+    expect(await screen.findByText(/it needs the bridge's provisioning secret/)).toBeVisible();
+    expect(screen.getByText("provisioning.shared_secret")).toBeVisible();
+    const input = screen.getByLabelText("Provisioning secret");
+    expect(input).toHaveAttribute("type", "password");
+    await userEvent.type(input, "0123abcd");
+    await userEvent.click(screen.getByRole("button", { name: "Save secret" }));
+    // Saved as a merge patch of the one key; the server can then ask, and does.
+    expect(await screen.findByText(/Many people can use this bridge/)).toBeInTheDocument();
+    expect(patches).toEqual([{ "io.myelin.provisioning_secret": "0123abcd" }]);
+    server.events.removeAllListeners();
+  });
+
+  it("says adding the secret needs bridges:write to an operator who may only read", async () => {
+    renderState("telegram", undefined, {
+      bridgeUrl: "http://mautrix-telegram.bridges.svc:29317",
+      canWrite: false,
+    });
+    expect(await screen.findByText(/Adding it needs/)).toBeInTheDocument();
+    expect(screen.queryByLabelText("Provisioning secret")).not.toBeInTheDocument();
+  });
+
   it("asks a shared bridge about the operator first, and says who is signed in as what", async () => {
     renderState("whatsapp", "@alice:example.org");
     // A shared bridge has to be told whom to ask about; the box starts with the operator.

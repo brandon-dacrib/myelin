@@ -7697,7 +7697,14 @@ components:
           type: string
     AppServiceUpdate:
       type: object
-      description: Everything but id and sender_localpart, as a JSON Merge Patch (RFC 7396).
+      description: Everything but id and sender_localpart, as a JSON Merge Patch (RFC 7396). A top-level key the registration format does not define is kept with the registration, and null removes it.
+      properties:
+        io.myelin.provisioning_secret:
+          type:
+          - string
+          - 'null'
+          description: The bridge's provisioning.shared_secret (from its config.yaml), with which the server asks a mautrix bridge who has signed in (appservices.logins). A registration made before the server kept one has none; setting it here lets the server ask. null removes it.
+      additionalProperties: true
     AppServiceTokens:
       type: object
       properties:

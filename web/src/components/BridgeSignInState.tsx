@@ -1,5 +1,12 @@
 import { useState, type FormEvent } from "react";
-import { useAppserviceLogins, type BridgeLogin } from "@/api/bridges";
+import {
+  useAppserviceLogins,
+  useSetProvisioningSecret,
+  type BridgeLogin,
+  type BridgeLogins,
+} from "@/api/bridges";
+import { MutationError } from "@/components/MutationError";
+import { toast } from "@/components/ui/toast/toast-store";
 import { ApiProblemError } from "@/api/problem";
 import { Badge } from "@/components/ui/badge/Badge";
 import { Button } from "@/components/ui/button/Button";
@@ -50,14 +57,27 @@ function LoginLine({ login }: { login: BridgeLogin }) {
 export function BridgeSignInState({
   appserviceId,
   defaultUserId,
+  bridgeUrl,
+  canWrite = false,
 }: {
   appserviceId: string;
   /** What the "whose sign-in" box starts with: the operator's own Matrix ID, usually. */
   defaultUserId?: string;
+  /**
+   * Where the server reaches the bridge (the registration's `url`). A mautrix bridge the server
+   * cannot ask, with a url, is missing only its provisioning secret, which can be added here.
+   */
+  bridgeUrl?: string | null;
+  /** The operator may change the registration (`bridges:write`). */
+  canWrite?: boolean;
 }) {
   const [userId, setUserId] = useState<string | undefined>(undefined);
   const [draft, setDraft] = useState(defaultUserId ?? "");
-  const { data, error, isLoading, isFetching } = useAppserviceLogins(appserviceId, userId);
+  const query = useAppserviceLogins(appserviceId, userId);
+  const { error, isLoading, isFetching } = query;
+  // A refetch that failed (a `400` asking whom to ask about, after the secret was added) is the
+  // answer now; the earlier success it keeps is not.
+  const data = error ? undefined : query.data;
 
   const problem = error instanceof ApiProblemError ? error.problem : undefined;
   const userError = problem?.errors?.find((e) => e.pointer === "/user_id");
@@ -72,6 +92,8 @@ export function BridgeSignInState({
   let body;
   if (isLoading) {
     body = <SkeletonText lines={1} />;
+  } else if (data && needsProvisioningSecret(data, bridgeUrl)) {
+    body = <AddProvisioningSecret appserviceId={appserviceId} canWrite={canWrite} />;
   } else if (data && !data.supported) {
     body = (
       <>
@@ -152,5 +174,91 @@ export function BridgeSignInState({
         </p>
       )}
     </section>
+  );
+}
+
+/**
+ * A mautrix bridge (it has the provisioning API that reports sign-ins) that the server still
+ * cannot ask, although it knows where the bridge is: its registration was made before the
+ * server kept the bridge's provisioning secret (`appservices.logins`' reason says so).
+ */
+function needsProvisioningSecret(data: BridgeLogins, bridgeUrl: string | null | undefined) {
+  return data.provisioning_api === "mautrix_v3" && !data.supported && Boolean(bridgeUrl);
+}
+
+/**
+ * The fix for a registration made before the server kept a bridge's provisioning secret: paste
+ * the secret from the bridge's own `config.yaml`, and the server keeps it in the registration
+ * (`PATCH /appservices/{id}`, `io.myelin.provisioning_secret`) and can ask from then on. No
+ * merge patch to write by hand.
+ */
+function AddProvisioningSecret({
+  appserviceId,
+  canWrite,
+}: {
+  appserviceId: string;
+  canWrite: boolean;
+}) {
+  const [secret, setSecret] = useState("");
+  const save = useSetProvisioningSecret();
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    const value = secret.trim();
+    if (!value) return;
+    save.mutate(
+      { id: appserviceId, secret: value },
+      {
+        onSuccess: () => {
+          setSecret("");
+          toast({
+            title: "Provisioning secret saved",
+            description: "The server asks the bridge with it from now on.",
+          });
+        },
+      },
+    );
+  };
+  return (
+    <div className="max-w-2xl">
+      <p className="text-sm text-text">
+        The server can ask this bridge who has signed in, but not yet: it needs the bridge&apos;s
+        provisioning secret.
+      </p>
+      <p className="mt-1 text-sm text-text-muted">
+        A bridge added since 1 October 2026 gets one automatically. This one was added before, so
+        its registration has none. The bridge has its own: it is{" "}
+        <code className="font-identifier">provisioning.shared_secret</code> in the bridge&apos;s{" "}
+        <code className="font-identifier">config.yaml</code>. Paste it here and the server keeps it
+        with the registration; nothing about the bridge changes, and it does not need a restart.
+      </p>
+      {canWrite ? (
+        <form onSubmit={submit} className="mt-3 flex max-w-xl items-end gap-2">
+          <div className="flex-1">
+            <Field
+              label="Provisioning secret"
+              hint="Stored with the registration and never shown again."
+            >
+              {(props) => (
+                <Input
+                  {...props}
+                  type="password"
+                  autoComplete="off"
+                  value={secret}
+                  onChange={(e) => setSecret(e.target.value)}
+                />
+              )}
+            </Field>
+          </div>
+          <Button type="submit" disabled={!secret.trim() || save.isPending}>
+            {save.isPending ? "Saving…" : "Save secret"}
+          </Button>
+        </form>
+      ) : (
+        <p className="mt-2 text-sm text-text-muted">
+          Adding it needs <code className="font-identifier">bridges:write</code>.
+        </p>
+      )}
+      {save.isError && <MutationError error={save.error} action="save the secret" />}
+    </div>
   );
 }

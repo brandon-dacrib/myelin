@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { useParams, useNavigate, Link } from "@tanstack/react-router";
+import { useParams, useNavigate, useRouterState, Link } from "@tanstack/react-router";
 import { Root, List, Trigger, Content } from "radix-ui/tabs";
 import { ExternalLink, Eye, EyeOff, ChevronLeft } from "lucide-react";
 import {
@@ -54,7 +54,11 @@ export function BridgeDetailPage() {
   const { bridgeId } = useParams({ from: "/bridges/$bridgeId" });
   const navigate = useNavigate();
   const [revealTokens, setRevealTokens] = useState(false);
-  const [activeTab, setActiveTab] = useState<(typeof TABS)[number]>("overview");
+  // `#sign-in` (from the offering page) opens that tab.
+  const hash = useRouterState({ select: (s) => s.location.hash });
+  const [activeTab, setActiveTab] = useState<(typeof TABS)[number]>(
+    (TABS as readonly string[]).includes(hash) ? (hash as (typeof TABS)[number]) : "overview",
+  );
   const { data: bridge, isLoading, isError, error, refetch } = useAppservice(bridgeId);
   const { data: health } = useAppserviceHealth(bridgeId);
   const { data: types } = useBridgeTypes();
@@ -289,7 +293,12 @@ export function BridgeDetailPage() {
         </Content>
 
         <Content value="sign-in" className="py-6">
-          <BridgeSignInState appserviceId={id} defaultUserId={getSession()?.operator.subject} />
+          <BridgeSignInState
+            appserviceId={id}
+            defaultUserId={getSession()?.operator.subject}
+            bridgeUrl={bridge.url}
+            canWrite={canWrite}
+          />
           <BridgeSignInGuide type={type} botId={botId} />
           {bridge.links?.login_url && (
             <a

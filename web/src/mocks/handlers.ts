@@ -6,6 +6,7 @@ import {
   appserviceRegistration,
   appserviceLogins,
   findAppservice,
+  patchAppservice,
 } from "./data/appservices";
 import { bridgeTypes } from "./data/bridge-types";
 import {
@@ -14,6 +15,7 @@ import {
   deploymentTarget,
   findOffering,
   getInstance,
+  instanceByAppservice,
   instanceFiles,
   instancesOf,
   listOfferings,
@@ -860,6 +862,17 @@ export const handlers = [
     return HttpResponse.json(appservice);
   }),
 
+  http.patch(`${API}/appservices/:id`, async ({ params, request }) => {
+    const patch = (await request.json()) as Record<string, unknown>;
+    const appservice = patchAppservice(String(params.id), patch ?? {});
+    if (!appservice)
+      return HttpResponse.json(
+        { type: "urn:hs:problem:not-found", title: "Appservice not found", status: 404 },
+        { status: 404 },
+      );
+    return HttpResponse.json(appservice);
+  }),
+
   http.delete(`${API}/appservices/:id`, ({ params }) => {
     const id = String(params.id);
     const idx = appservices.findIndex((a) => a.id === id);
@@ -887,8 +900,20 @@ export const handlers = [
   http.get(`${API}/appservices/:id/logins`, ({ params, request }) => {
     const id = String(params.id);
     const userId = new URL(request.url).searchParams.get("user_id");
-    const type = bridgeTypes.find((t) => t.id === findAppservice(id)?.bridge_type);
-    const { status, body } = appserviceLogins(id, userId, type);
+    // A person's bridge from an offering is registered too; ask it about its owner.
+    const instance = findAppservice(id) ? undefined : instanceByAppservice(id);
+    const bridgeType = findAppservice(id)?.bridge_type ?? instance?.type;
+    const type = bridgeTypes.find((t) => t.id === bridgeType);
+    const { status, body } = appserviceLogins(
+      id,
+      userId,
+      type,
+      instance && {
+        bridge_type: instance.type,
+        health: instance.health ?? null,
+        owner: instance.user_id,
+      },
+    );
     return HttpResponse.json(body as never, { status });
   }),
 

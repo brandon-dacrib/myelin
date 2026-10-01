@@ -143,6 +143,56 @@ export function findAppservice(id: string): AppService | undefined {
   return appservices.find((a) => a.id === id);
 }
 
+/** The registration key a bridge's provisioning secret is kept under (`hs_admin::bridge_types`). */
+export const PROVISIONING_SECRET_KEY = "io.myelin.provisioning_secret";
+
+/**
+ * Registrations made before the server kept a bridge's provisioning secret (2026-10-01): the
+ * Telegram bridge, so the Sign in tab's "add the secret" action can be seen. A `PATCH` that sets
+ * {@link PROVISIONING_SECRET_KEY} takes it off this list.
+ */
+const WITHOUT_SECRET = new Set<string>();
+
+function seedWithoutSecret(): void {
+  WITHOUT_SECRET.clear();
+  WITHOUT_SECRET.add("telegram");
+}
+seedWithoutSecret();
+
+/** Puts the registrations' secrets back as they started (Vitest calls this between tests). */
+export function resetAppserviceSecrets(): void {
+  seedWithoutSecret();
+}
+
+/**
+ * `PATCH /appservices/{id}` in the mock: an RFC 7396 merge patch of the registration. Only the
+ * provisioning secret and the plain fields the interface sends are kept; `null` removes the
+ * secret.
+ */
+export function patchAppservice(
+  id: string,
+  patch: Record<string, unknown>,
+): AppService | undefined {
+  const appservice = findAppservice(id);
+  if (!appservice) return undefined;
+  if (PROVISIONING_SECRET_KEY in patch) {
+    const secret = patch[PROVISIONING_SECRET_KEY];
+    if (typeof secret === "string" && secret !== "") WITHOUT_SECRET.delete(id);
+    else WITHOUT_SECRET.add(id);
+  }
+  if (typeof patch.url === "string" || patch.url === null) appservice.url = patch.url;
+  if (typeof patch.rate_limited === "boolean") appservice.rate_limited = patch.rate_limited;
+  return appservice;
+}
+
+/** A bridge instance of an offering, as `appserviceLogins` needs it (`./bridge-offerings`). */
+export interface LoginsSubject {
+  bridge_type: string | null;
+  health: string | null;
+  /** The person a per-user instance belongs to; asked about when no user is named. */
+  owner: string | null;
+}
+
 /**
  * What `GET /appservices/{id}/logins` answers in the mock, the way the real server does for each
  * case: a mautrix bridge asked about `@alice:example.org` (signed in to WhatsApp), anyone else
@@ -151,15 +201,25 @@ export function findAppservice(id: string): AppService | undefined {
  */
 export function appserviceLogins(
   id: string,
-  userId: string | null,
+  requestedUser: string | null,
   provisioning: Pick<BridgeType, "provisioning_api" | "provisioning_note"> | undefined,
+  instance?: LoginsSubject,
 ): { status: number; body: unknown } {
-  const appservice = findAppservice(id);
+  const registered = findAppservice(id);
+  const appservice: LoginsSubject | undefined = registered
+    ? {
+        bridge_type: registered.bridge_type ?? null,
+        health: registered.health ?? null,
+        owner: null,
+      }
+    : instance;
   if (!appservice)
     return {
       status: 404,
       body: { type: "urn:hs:problem:not-found", title: "Not found", status: 404 },
     };
+  // A per-user instance is asked about its owner when nobody is named.
+  const userId = requestedUser ?? appservice.owner;
   const api = provisioning?.provisioning_api ?? "none";
   const base = {
     appservice_id: id,
@@ -178,6 +238,15 @@ export function appserviceLogins(
         reason:
           provisioning?.provisioning_note ??
           "This appservice was not added from the bridge catalogue, so the server does not know whether it has a provisioning API; the bridge keeps who has signed in itself.",
+      },
+    };
+  if (WITHOUT_SECRET.has(id))
+    return {
+      status: 200,
+      body: {
+        ...base,
+        supported: false,
+        reason: `The registration carries no provisioning secret: it was made before the server kept one. Put the bridge's provisioning.shared_secret (from its config.yaml) in the registration's ${PROVISIONING_SECRET_KEY} key with a merge patch, and the server can ask it.`,
       },
     };
   if (!userId) {

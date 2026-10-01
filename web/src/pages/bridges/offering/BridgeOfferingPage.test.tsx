@@ -38,6 +38,17 @@ beforeEach(async () => {
 afterEach(() => signOut());
 
 describe("Bridge offering page", () => {
+  it("says whether each person has signed in to their bridge", async () => {
+    renderOffering("mautrix-whatsapp");
+    const alice = await rowFor("@alice:example.org");
+    expect(await alice.findByText("+1 555-123-4567")).toBeInTheDocument();
+    const ops = await rowFor("@ops:example.org");
+    expect(await ops.findByText("Not signed in")).toBeInTheDocument();
+    // A bridge that is not ready yet is not asked.
+    const carol = await rowFor("@carol:example.org");
+    expect(carol.getByText("Once it is ready")).toBeInTheDocument();
+  });
+
   it("says what to tell people and shows everybody's bridge, failed first", async () => {
     renderOffering("mautrix-whatsapp");
     expect(await screen.findByRole("heading", { name: "WhatsApp" })).toBeInTheDocument();

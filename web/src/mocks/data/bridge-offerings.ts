@@ -284,6 +284,16 @@ function findInstance(type: string, userSegment: string): MockInstance | undefin
   return (state.instances[type] ?? []).find((i) => i.user_id === userId);
 }
 
+/** The instance registered under `appserviceId`, for `GET /appservices/{id}/logins`. */
+export function instanceByAppservice(appserviceId: string): BridgeInstance | undefined {
+  for (const [type, instances] of Object.entries(state.instances)) {
+    const offering = findOffering(type);
+    const instance = instances.find((i) => i.appservice_id === appserviceId);
+    if (offering && instance) return publicInstance(advance(offering, instance));
+  }
+  return undefined;
+}
+
 export function getInstance(type: string, userSegment: string): BridgeInstance | undefined {
   const offering = findOffering(type);
   const instance = findInstance(type, userSegment);

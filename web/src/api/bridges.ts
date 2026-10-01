@@ -163,6 +163,35 @@ export function useAppserviceLogins(id: string | undefined, userId: string | und
   });
 }
 
+/**
+ * The registration key a bridge's provisioning secret is kept under
+ * (`hs_admin::bridge_types::PROVISIONING_SECRET_KEY`): the secret the server asks a mautrix
+ * bridge who has signed in with.
+ */
+export const PROVISIONING_SECRET_KEY = "io.myelin.provisioning_secret";
+
+/**
+ * Puts a bridge's provisioning secret in its registration (`PATCH /appservices/{id}`, a merge
+ * patch of that one key), for a registration made before the server kept one. The server can
+ * then ask the bridge who has signed in, so the answer is fetched again.
+ */
+export function useSetProvisioningSecret() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id, secret }: { id: string; secret: string }) => {
+      const result = await api.PATCH("/appservices/{id}", {
+        params: { path: { id } },
+        body: { [PROVISIONING_SECRET_KEY]: secret },
+      });
+      return unwrap(result);
+    },
+    onSuccess: (_data, { id }) => {
+      void qc.invalidateQueries({ queryKey: ["appservice-logins", id] });
+      void qc.invalidateQueries({ queryKey: ["appservice", id] });
+    },
+  });
+}
+
 export function useBridgeTypes() {
   return useQuery({
     queryKey: ["bridge-types"],

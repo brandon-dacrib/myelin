@@ -1,3 +1,4 @@
+import { InstanceSignIn } from "./InstanceSignIn";
 import { useMemo, useState, type ReactNode } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import { ChevronLeft, Users } from "lucide-react";
@@ -213,6 +214,13 @@ export function BridgeOfferingPage() {
       header: "Ping",
       priority: 2,
       render: (i) => <HealthCell health={i.health} />,
+    },
+    {
+      key: "sign-in",
+      header: `Signed in to ${name}`,
+      priority: 2,
+      interactive: true,
+      render: (i) => <InstanceSignIn instance={i} />,
     },
     {
       key: "deployment",
@@ -614,6 +622,20 @@ function SharedInstancePanel({
           {instance.ready_at ? <RelativeTime at={instance.ready_at} /> : "Not yet"}
         </Detail>
       </dl>
+      {instance.appservice_id && (
+        <p className="mt-3 text-sm text-text-muted">
+          Many people use this bridge, so who has signed in is asked one person at a time:{" "}
+          <Link
+            to="/bridges/$bridgeId"
+            params={{ bridgeId: instance.appservice_id }}
+            hash="sign-in"
+            className="text-accent underline hover:no-underline"
+          >
+            ask the bridge about someone
+          </Link>
+          .
+        </p>
+      )}
     </div>
   );
 }

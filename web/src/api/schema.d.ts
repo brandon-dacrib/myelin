@@ -2504,8 +2504,13 @@ export interface components {
             as_token?: string;
             hs_token?: string;
         };
-        /** @description Everything but id and sender_localpart, as a JSON Merge Patch (RFC 7396). */
-        AppServiceUpdate: Record<string, never>;
+        /** @description Everything but id and sender_localpart, as a JSON Merge Patch (RFC 7396). A top-level key the registration format does not define is kept with the registration, and null removes it. */
+        AppServiceUpdate: {
+            /** @description The bridge's provisioning.shared_secret (from its config.yaml), with which the server asks a mautrix bridge who has signed in (appservices.logins). A registration made before the server kept one has none; setting it here lets the server ask. null removes it. */
+            "io.myelin.provisioning_secret"?: string | null;
+        } & {
+            [key: string]: unknown;
+        };
         AuditEntry: {
             /** @description <resource>.<verb> operation id. */
             action: string;
