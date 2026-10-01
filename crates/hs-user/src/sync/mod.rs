@@ -150,8 +150,11 @@ enum ResumeMode {
     FreshRoom,
 }
 
+/// `handle` is the room as this sync already loaded it, read again here rather than loaded a
+/// second time: a room deleted in between would otherwise fail the sync.
 async fn resume_mode<B: KvBackend + 'static, R: RoomSource<B>>(
     hub: &SessionHub<B, R>,
+    handle: &hs_room::actor::RoomActorHandle<B>,
     user_id: &UserId,
     room_id: &RoomId,
     baseline: &SyncToken,
@@ -177,7 +180,6 @@ async fn resume_mode<B: KvBackend + 'static, R: RoomSource<B>>(
         // into an encrypted room. They are new to the room and get it whole. Only worth asking
         // the room when their membership has changed since that position at all.
         if membership.membership == "join" && membership.room_pos > pos {
-            let handle = hub.room(room_id).await?;
             let user = user_id.to_owned();
             let was_joined = handle
                 .query(move |actor| actor.was_joined_at(&user, pos))
@@ -870,7 +872,38 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             (departed, bound) => departed.or(bound),
         };
 
-        let handle = hub.room(room_id).await?;
+        let handle = match hub.room(room_id).await {
+            Ok(handle) => handle,
+            Err(error) if error.is_room_not_found() => {
+                // The room is gone -- an administrator deleted and purged it -- while this
+                // user's records still name it: a feed entry for the leave the deletion made,
+                // or a membership the hub had not yet seen end. One gone room must not fail
+                // the whole sync (it answered `404` for the room, every time, until the records
+                // moved on). Nothing of it can be shown, and nothing of it is the user's any
+                // more: in an incremental sync it is reported as left, with nothing in it, so a
+                // client that still lists the room drops it; an initial sync leaves it out
+                // unless the filter asks for left rooms.
+                tracing::debug!(
+                    %user_id,
+                    %room_id,
+                    membership = %membership.membership,
+                    "a room in this sync no longer exists; reporting it as left"
+                );
+                if is_initial && !params.filter.include_leave() {
+                    continue;
+                }
+                leave.insert(
+                    room_id.to_string(),
+                    json!({
+                        "state": {"events": []},
+                        "timeline": {"events": [], "limited": false},
+                        "account_data": {"events": []},
+                    }),
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let room_id_owned = room_id.clone();
         let membership_value = membership.membership.clone();
         let full_state_requested = params.full_state;
@@ -909,11 +942,20 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             _ => {}
         }
 
-        let resume = resume_mode(hub, user_id, room_id, &baseline, is_initial, &membership).await?;
+        let resume = resume_mode(
+            hub,
+            &handle,
+            user_id,
+            room_id,
+            &baseline,
+            is_initial,
+            &membership,
+        )
+        .await?;
         let force_full_state = full_state_requested || matches!(resume, ResumeMode::FreshRoom);
         let fresh_room = matches!(resume, ResumeMode::FreshRoom);
         if !is_initial && fresh_room && membership.membership == "join" {
-            let members = hub.joined_member_ids(room_id).await?;
+            let members = hub.joined_member_ids_if_present(room_id).await?;
             // Bounded, because a room can have tens of thousands of members and this is one
             // response. Past the bound the client still learns about people as they do things.
             newly_visible.extend(members.iter().take(NEWLY_JOINED_PRESENCE_LIMIT).cloned());
@@ -1029,7 +1071,7 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                 // produced a `device_lists.left` at all, and a client went on trusting a device
                 // list it was no longer being kept up to date on.
                 if matches!(membership, Some("leave") | Some("ban")) {
-                    left_candidates.extend(hub.joined_member_ids(room_id).await?);
+                    left_candidates.extend(hub.joined_member_ids_if_present(room_id).await?);
                 }
                 continue;
             }
@@ -1056,7 +1098,7 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         // in the room is named instead -- more than the minimum, and the direction that costs a
         // key query rather than a message nobody can read.
         if !is_initial && !fresh_room && timeline.limited && membership.membership == "join" {
-            newly_shared.extend(hub.joined_member_ids(room_id).await?);
+            newly_shared.extend(hub.joined_member_ids_if_present(room_id).await?);
         }
 
         // Only a joined room can have typing or receipt activity (both maps above are only ever
@@ -1409,7 +1451,12 @@ async fn has_new_data<B: KvBackend + 'static, R: RoomSource<B>>(
     let memberships = store.list_memberships(user_id).await?;
     for m in &memberships {
         if m.hot_room && matches!(m.membership.as_str(), "join" | "invite" | "knock") {
-            let handle = hub.room(&m.room_id).await?;
+            let handle = match hub.room(&m.room_id).await {
+                Ok(handle) => handle,
+                // Deleted while this record still names it: nothing more will happen there.
+                Err(error) if error.is_room_not_found() => continue,
+                Err(error) => return Err(error),
+            };
             // Copied out before the closure: `query` requires a `'static` closure, so it may not
             // borrow a field of this loop's membership row.
             let room_pos = m.room_pos;
@@ -1605,6 +1652,119 @@ mod tests {
             "the message should be in the initial timeline: {events:?}"
         );
         assert!(!room["state"].as_object().unwrap().is_empty());
+    }
+
+    /// What failed CI on a loaded runner: an administrator deletes a room -- every local member
+    /// is made to leave, then the room is purged -- and a member's next `/sync` answered `404`
+    /// for the room. The session hub was a moment behind: it read the leaves only after the room
+    /// was gone, could not load it, and dropped them, so the members' records went on saying
+    /// `join` for a room the registry no longer had. Here the hub's lag is held open by feeding
+    /// it by hand.
+    #[tokio::test]
+    async fn a_deleted_room_does_not_fail_a_members_sync_and_is_reported_as_left() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        handle
+            .membership(bob.clone(), Action::Join, bob.clone(), json!({}), 2)
+            .await
+            .unwrap();
+        // The hub catches up with the room as it stands: both members are recorded as joined.
+        let head = handle.query(|a| a.head_update()).await.unwrap();
+        hub.process_room_update(head).await.unwrap();
+        let (first, token) = build(&hub, &e2e, &bob, params(None)).await.unwrap();
+        assert!(
+            first["rooms"]["join"].get(room_id.as_str()).is_some(),
+            "{first}"
+        );
+        // A device has consumed up to the token, so what comes next is a new feed entry rather
+        // than folded into the one it has already read.
+        hub.store()
+            .record_device_cursor(&bob, "DEV1".into(), token.feed_seq)
+            .await
+            .unwrap();
+
+        // The deletion: bob is made to leave, the room is purged and forgotten, and the hub has
+        // not yet read the leave.
+        let mut stream = hub.rooms().subscribe_global();
+        handle
+            .membership(
+                bob.clone(),
+                Action::Leave,
+                bob.clone(),
+                json!({"reason": "This room has been deleted"}),
+                3,
+            )
+            .await
+            .unwrap();
+        let leave = stream.recv().await.unwrap();
+        assert_eq!(leave.room_id, room_id);
+        handle
+            .administer(|actor| actor.delete_everything())
+            .await
+            .unwrap();
+        hub.rooms().forget_resident(&room_id).await;
+        assert!(hub.rooms().get_or_load(&room_id).await.is_err());
+
+        // Records that still say `join` do not fail anybody's sync, initial or incremental.
+        for user in [&alice, &bob] {
+            let (initial, _) = build(&hub, &e2e, user, params(None))
+                .await
+                .unwrap_or_else(|e| panic!("{user}'s initial sync failed: {e}"));
+            assert!(
+                initial["rooms"]["join"].get(room_id.as_str()).is_none(),
+                "{initial}"
+            );
+        }
+        build(&hub, &e2e, &bob, params(Some(token)))
+            .await
+            .expect("an incremental sync over a deleted room");
+
+        // The hub reads the leave now. The room cannot be loaded, but the update says what
+        // changed: bob's record says he left, and his next sync tells him so.
+        hub.process_room_update(leave)
+            .await
+            .expect("a leave whose room has since been deleted is still applied");
+        let record = hub
+            .store()
+            .get_membership(&bob, &room_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.membership, "leave");
+        let (incremental, next) = build(&hub, &e2e, &bob, params(Some(token)))
+            .await
+            .expect("an incremental sync carrying the deleted room's leave");
+        assert!(
+            incremental["rooms"]["leave"]
+                .get(room_id.as_str())
+                .is_some(),
+            "{incremental}"
+        );
+        assert!(
+            incremental["rooms"]["join"].get(room_id.as_str()).is_none(),
+            "{incremental}"
+        );
+        // Once: the sync after that has nothing more to say about it.
+        let (after, _) = build(&hub, &e2e, &bob, params(Some(next))).await.unwrap();
+        assert!(
+            after["rooms"]["leave"].get(room_id.as_str()).is_none(),
+            "{after}"
+        );
     }
 
     #[tokio::test]

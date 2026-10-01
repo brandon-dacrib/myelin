@@ -787,6 +787,23 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         }
     }
 
+    /// [`SessionHub::joined_member_ids`], with a room that no longer exists (deleted by an
+    /// administrator, while somebody's records still name it) having no members rather than
+    /// failing the caller -- for the walks over a user's rooms (`/sync`, presence audiences, the
+    /// user directory) that one gone room must not break.
+    pub(crate) async fn joined_member_ids_if_present(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<OwnedUserId>, UserError> {
+        match self.joined_member_ids(room_id).await {
+            Err(error) if error.is_room_not_found() => {
+                tracing::debug!(%room_id, "a room named in a user's records no longer exists");
+                Ok(Vec::new())
+            }
+            other => other,
+        }
+    }
+
     /// `room_id`'s current joined members, parsed as user ids (a state key that fails to parse --
     /// should not happen for anything this server itself wrote -- is skipped rather than failing
     /// the whole call). Shared by [`SessionHub::set_typing`] and [`SessionHub::set_presence`]: both
@@ -1136,7 +1153,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             if m.membership != "join" {
                 continue;
             }
-            for member in self.joined_member_ids(&m.room_id).await? {
+            for member in self.joined_member_ids_if_present(&m.room_id).await? {
                 if member.as_str() != user_id.as_str() {
                     shared.insert(member);
                 }
@@ -1161,7 +1178,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     ) -> Result<std::collections::BTreeSet<OwnedUserId>, UserError> {
         let mut visible = self.users_sharing_room_with(user_id).await?;
         for room in self.store.list_public_rooms().await? {
-            for member in self.joined_member_ids(&room.room_id).await? {
+            for member in self.joined_member_ids_if_present(&room.room_id).await? {
                 if member.as_str() != user_id.as_str() {
                     visible.insert(member);
                 }
@@ -1315,7 +1332,13 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         if !self.owns_room(&update.room_id) {
             return Ok(Vec::new());
         }
-        let handle = self.rooms.get_or_load(&update.room_id).await?;
+        let handle = match self.rooms.get_or_load(&update.room_id).await {
+            Ok(handle) => handle,
+            Err(hs_room::RoomError::RoomNotFound(_)) => {
+                return self.apply_update_for_a_gone_room(update).await;
+            }
+            Err(error) => return Err(error.into()),
+        };
         let (active_members, member_count, directory) = handle
             .query(|actor| {
                 let members = actor.members()?;
@@ -1408,6 +1431,53 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         }
 
         Ok(targets.into_keys().collect())
+    }
+
+    /// [`SessionHub::apply_room_update`] for an update whose room no longer exists by the time
+    /// this hub reads it: an administrator's room deletion makes every local member leave and
+    /// then purges the room in one go, and a hub a moment behind finds the leaves' room already
+    /// gone. Those leaves used to be dropped with a warning, so each member's record went on
+    /// saying `join` for a room that was not there, and their next `/sync` failed with `404`.
+    ///
+    /// What the update itself says is still applied -- each membership change it carries, with
+    /// a feed entry so the member's next sync shows the room as left -- and the room's public
+    /// directory entry is removed. Nothing else is: there is no state left to read.
+    async fn apply_update_for_a_gone_room(
+        &self,
+        update: RoomUpdate,
+    ) -> Result<Vec<OwnedUserId>, UserError> {
+        tracing::info!(
+            room_id = %update.room_id,
+            room_pos = update.room_pos,
+            changes = update.membership_deltas.len(),
+            "a room update arrived for a room that no longer exists; applying its membership changes"
+        );
+        self.store.remove_public_room(&update.room_id).await?;
+        let mut woken = Vec::with_capacity(update.membership_deltas.len());
+        for delta in &update.membership_deltas {
+            let hot = self
+                .store
+                .get_membership(&delta.user_id, &update.room_id)
+                .await?
+                .is_some_and(|m| m.hot_room);
+            self.store
+                .set_membership(
+                    &delta.user_id,
+                    &update.room_id,
+                    &delta.membership,
+                    update.room_pos,
+                    hot,
+                )
+                .await?;
+            if !hot {
+                self.store
+                    .append_feed_entry(&delta.user_id, &update.room_id, update.room_pos)
+                    .await?;
+            }
+            self.wake(&delta.user_id).await;
+            woken.push(delta.user_id.clone());
+        }
+        Ok(woken)
     }
 
     /// A room's current member count, for callers (`crate::sync`'s hot-room fallback) that need
