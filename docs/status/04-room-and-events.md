@@ -2,8 +2,84 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
-Last updated: 2026-09-30 (session 11: the client space hierarchy, below). Before that,
-2026-09-28 (session 10: the admin API's room long tail).
+Last updated: 2026-09-30 (session 12: the history between a leave and a rejoin, below). Before
+that, 2026-09-30 (session 11: the client space hierarchy) and 2026-09-28 (session 10: the admin
+API's room long tail).
+
+> **2026-09-30, session 12: a rejoined room's gap is filled** (branch `agent/rejoin-gap`; known
+> gap "A rejoined room's gap is never filled" closed). Bob on B leaves alice's room on A, alice
+> talks while nobody from B is in it, bob rejoins through A (session 9's "a rejoin goes through
+> the room"). B's copy came back with the room's current state but not with what was said
+> meanwhile: timeline positions are a stream order assigned here, and backfill only ever
+> fetched history before the *oldest* held event. `/messages` read back from the rejoin went
+> straight to the leave.
+>
+> - **The mechanism (`crate::actor::gaps`, new).** An event persisted with an explicit state
+>   (`PersistKind::RemoteJoin`: a rejoin, an invite or leave while out) whose `prev_events` are
+>   not all in the timeline, while the timeline holds something, **opens a gap**: it is placed
+>   `timeline::TIMELINE_GAP_SPAN` (2^24) positions beyond the next one, and the skipped
+>   positions are recorded in the same transaction in a new keyspace, `room_timeline_gaps`
+>   (`Tables::timeline_gaps`, `(RoomSn, top) -> TimelineGapRecord { below, closed }`). What
+>   the gap lacks is the set of event IDs its events cite and the timeline does not hold --
+>   at first the rejoin's own `prev_events`. A rejoin whose ancestors are all held opens
+>   nothing.
+> - **Reading it.** `RoomActor::paginate_page` (what `/messages` uses) stops a backward page
+>   at an open gap and says so in the new `Page::gap`; `get_messages` then calls the new
+>   `Backfill::fill_gap(room_id, top)` (a default method returning 0, so other implementors
+>   are unaffected) and pages again. `hs_cli::backfill::FederationBackfill::fill_gap` asks
+>   `/backfill` with `v` = the missing events (`RoomActor::gap_anchor`; the same servers as
+>   for older history, `servers_to_ask_for_history`), verifies every PDU as an inbound one,
+>   and hands the batch to `RoomActor::accept_gap_events`, which places it *inside* the gap:
+>   newest just below the lowest position filled so far, in the resident's order, with the
+>   same state walk as `accept_backfilled_events` (now shared: `walk_history_states`,
+>   `place_history`) except that a key with no earlier setting in the batch falls back to the
+>   room as B last had it (the state after the `below` event), not to nothing. Events no
+>   deeper than the `below` event are not part of the gap (the resident's `/backfill` walks on
+>   past the leave into history that is held already or older than B's first join) and are
+>   dropped. The gap closes when nothing it cites is missing, when an answer holds nothing new,
+>   or when its positions run out (the newest that fit are kept). At most one gap fill and
+>   one older-history fetch per request; when a fill fails or adds nothing the page is read
+>   again across the gap (`paginate_page_across_gaps`), so a client still reaches what was
+>   held before the leave rather than being told the room starts at the rejoin.
+>   `RoomActor::paginate` (`/sync`, federation `/backfill` and `/timestamp_to_event`, admin
+>   reads) walks across gaps as before.
+> - **History, not news.** Nothing is published; extremities and `joined_rooms` are
+>   untouched; `RoomActor::events_after` (appservice delivery's cursor read) skips every
+>   position inside a gap, filled or not. `/sync`'s forward reads start from tokens issued
+>   after the rejoin, above the gap; a rejoined room is a fresh room to `/sync` anyway.
+> - **Durability.** On load the rows say where each gap is and whether it is closed; how far
+>   it is filled and what it lacks are read off the replayed timeline (`restore_gaps`), so a
+>   crash between placing a batch and recording it loses nothing. Room deletion removes the
+>   rows.
+> - **Observability.** `info` when a gap opens (room, event, below, top, missing count) and per
+>   fetch in `hs-cli` (room, server asked, top, received, unverifiable, placed, closed);
+>   `warn` when a server cannot be asked or a gap runs out of positions. New counter
+>   `hs_room_backfilled_events_total{kind}` (`before_oldest`, `rejoin_gap`), registered by
+>   `hs_cli::backfill::register_metrics` in `serve`; there was no backfill metric before.
+> - **Tests.** `crates/hs-room/tests/rejoin_gap.rs` (6): the gap opens below a rejoin and not
+>   below one whose ancestors are held; a backward page stops at it with a token while
+>   `paginate` crosses; one batch fills it in the resident's order with the resident's state
+>   at each message, nothing older placed, nothing published, `events_after` skipping it, a
+>   repeat adding nothing, and a reload identical; a gap filled four at a time survives a
+>   reload half-filled; an answer with nothing new closes it; and through `get_messages` with
+>   a fake hook, a client reading back three at a time gets the rejoin, the nine missed events
+>   and then what was held (three fetches, none on a second read), and with the resident
+>   unreachable still reads on past the gap. `crates/hs-cli/tests/federation_two_servers.rs`
+>   (two real servers): alice sends 130 messages and renames the room while bob is out; after
+>   his rejoin, `/messages` backwards in pages of 50 returns his rejoin, the rename, the 130
+>   messages newest first, his leave, the exchange from before he left, the 120 messages from
+>   before his first join and the create event, his next incremental sync has none of it, and
+>   `hs_room_backfilled_events_total{kind="rejoin_gap"}` counts more than 130. With the gap
+>   fill switched off that test fails at the ordering assertion (checked by hand).
+> - **Verified (Complement):** COMPLEMENT_RESULTS
+> - **Left.** A *forward* page across an open gap does not fill it (it reads on); a state
+>   event the rejoin brought as an outlier (the rename) is placed but keeps an outlier's state
+>   (as in `accept_backfilled_events`), so its own `state_at_event` is just itself; the state
+>   at a gap event is walked, not asked for (`/state_ids`), and no auth check runs on one --
+>   the existing gap row "The state at a backfilled event is walked, not asked for" covers
+>   both kinds; in a room with forks, an event concurrent with the leave and no deeper than it
+>   is taken for older history and left out of the gap; more than 2^24 missed events keeps
+>   only the newest 2^24.
 
 > **2026-09-30, session 11: `GET /_matrix/client/v1/rooms/{roomId}/hierarchy`** (MSC2946, spec
 > 1.2), branch `agent/hierarchy`. It answered `404 M_UNRECOGNIZED`; Complement's two

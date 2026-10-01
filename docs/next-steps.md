@@ -84,8 +84,7 @@ hub wait that runs out is a `warn` line now. Left: merge it, and watch the next 
    CloudNativePG. Needs the owner's terminal for `kubectl`/`helm` and port-forwards.
 3. **Next known gaps, one agent at a time**, in this suggested order (each is a row in the table
    at the bottom; pick one that does not touch crates another running agent is in):
-   - "A rejoined room's gap is never filled" (`hs-room`): topological pagination for the
-     leave-to-rejoin gap; Complement's `TestMessagesOverFederation` "re-joining" subtest.
+   - ~~"A rejoined room's gap is never filled"~~ done on `agent/rejoin-gap` (paragraph below).
    - "The state at a backfilled event is walked, not asked for" (`hs-room`): `/state_ids` and an
      auth check on backfilled events; closes the two together.
    - "A destination down for longer than its queue is not caught up" (`hs-federation`): Synapse's
@@ -134,6 +133,25 @@ counts, the ephemeral data and an `m.room_key_request` handed to its Olm machine
 cost one device listing per interesting user per transaction; a never-syncing bot device's
 to-device queue is not pruned (pushed to-device is not deleted, as Synapse); no cluster run of
 the ephemeral pump.
+
+**A rejoined room's gap is filled** (`agent/rejoin-gap`, commit not yet known, not merged;
+status 04 session 12; known gap "A rejoined room's gap is never filled" closed). Bob leaves a
+room hosted elsewhere, alice talks, bob rejoins through her server: B's copy came back with the
+current state but `/messages` from the rejoin went straight to the leave. Now an event taken
+with an explicit state whose `prev_events` are not in the timeline opens a gap of 2^24 reserved
+positions below it (`hs_room::actor::gaps`, keyspace `room_timeline_gaps`); a backward
+`/messages` page stops at an open gap, `Backfill::fill_gap` (implemented in `hs_cli::backfill`)
+asks `/backfill` from the events the gap lacks, and `RoomActor::accept_gap_events` places the
+batch between the leave and the rejoin in the resident's order, with the state walked back from
+the rejoin's snapshot -- published nowhere, skipped by `events_after`, durable across reload. A
+fill that fails or adds nothing reads on across the gap, so the client still reaches the
+history from before the leave. Verified by `crates/hs-room/tests/rejoin_gap.rs` (6, two of them
+through `get_messages`) and `crates/hs-cli/tests/federation_two_servers.rs` (130 messages and a
+rename made while bob was out, read back in order, then the 120 from before his first join down
+to the create event; the test fails with the fill switched off). COMPLEMENT_RESUME New
+counter `hs_room_backfilled_events_total{kind}` (`before_oldest`, `rejoin_gap`). Left: a forward
+page does not fill a gap; a state event the rejoin brought as an outlier keeps an outlier's
+state; the state at gap events is walked, not asked for (the next queue item covers both kinds).
 
 ## Earlier on 2026-09-30: the merges, in order
 
@@ -1631,8 +1649,8 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | Gap | Where | Consequence |
 |---|---|---|
 | ~~A local user's join to a restricted room is refused~~ | `hs-room` | **Closed** (cafb74d): `RoomActor::restricted_join` names the authoriser, and the join goes through another server when nobody here may invite; `federation_membership.rs::a_local_user_joins_a_restricted_room_without_naming_an_authoriser`. Complement's `TestRestrictedRooms*` not re-measured yet |
-| A rejoined room's gap is never filled | `hs-room` | history is fetched before the oldest held event; what happened between a leave and a rejoin stays on the resident |
-| The state at a backfilled event is walked, not asked for | `hs-room` | exact while the history is linear and the previous event for each reverted key is within reach; a key set before the fetched history reads as unset until that history arrives; no auth check runs on backfilled events |
+| ~~A rejoined room's gap is never filled~~ | `hs-room`, `hs-cli` | **Closed** 2026-09-30 (`agent/rejoin-gap`, status 04 session 12): a rejoin through another server whose `prev_events` are not held opens a gap of 2^24 reserved positions below it (`hs_room::actor::gaps`, keyspace `room_timeline_gaps`); a backward `/messages` page stops there, `Backfill::fill_gap` fetches `/backfill` from the events the gap lacks, and `RoomActor::accept_gap_events` places them between the leave and the rejoin in the resident's order -- published nowhere, skipped by `events_after`, durable across reload. Two real servers: 130 messages and a rename made while bob was out read back in order, then the history from before. Counter `hs_room_backfilled_events_total{kind}`. COMPLEMENT_ROW. Left: a forward page does not fill a gap; a state event the rejoin brought as an outlier keeps an outlier's state; in a forked room an event concurrent with the leave and no deeper than it is left out |
+| The state at a backfilled event is walked, not asked for | `hs-room` | exact while the history is linear and the previous event for each reverted key is within reach; a key set before the fetched history reads as unset until that history arrives; no auth check runs on backfilled events (both before the oldest held event and, since 2026-09-30, in a rejoin's gap, where an unset key falls back to the state at the leave) |
 | A destination down for longer than its queue is not caught up from the room | `hs-federation` | what was queued survives a restart and is sent; what was never queued because the destination was already known failing is not re-derived (Synapse's `destination_rooms`) |
 | ~~EDUs are dropped for a destination another replica sends for~~ | `hs-federation`, `hs-cli` | **Closed** (`da97adc`, merged 2026-09-30): an EDU taken by a replica that does not send for its destination is forwarded over the mesh to the one that does; `hs-cli/tests/cluster_edus.rs` runs two replicas on PostgreSQL. Not yet watched on the cluster. Before that: single-node was complete: typing, receipts, presence, device lists, signing-key updates and to-device cross servers both ways (e4543e4, 649302e, `hs-cli/tests/federation_edus.rs`); in cluster mode `FederationSender::enqueue_edu` drops an EDU whose destination shard another replica owns, so it needs a mesh forward to the owner (status 06, twelfth session) |
 | ~~Invites, leaves and knocks over federation are seams~~ | `hs-federation` | **Closed** (e6d4a71, 249fcee, ea990cb): `transport/membership.rs` serves make/send leave, make/send knock and invite v1/v2, and `hs-cli/tests/federation_membership.rs` drives each between two servers. Not yet measured against Complement |
