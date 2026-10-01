@@ -1,3 +1,35 @@
+## 2026-09-30: a join or knock by alias is shard-gated (branch `agent/cli-small-gaps`)
+
+Closes the known gap "A room alias in `/join/{alias}` or `/knock/{alias}` is not shard-gated"
+(the follow-up 2026-09-27's "`/join/{roomId}`" section below left open).
+
+- **The gate resolves the alias first.** `RoomShardGate` takes an `AliasResolver`
+  (`hs_cli::cluster`); `serve.rs` gives it `RoomAliasResolver`, built from the room routes'
+  own `RoomState`: a local alias is read from the store (`RoomRegistry::resolve_alias`, which
+  loads no room), an alias on another server is asked of that server's directory through the
+  same `RemoteJoin` the handler uses. On a clustered replica, `/join/{alias}` and
+  `/knock/{alias}` are rewritten to name the room id, with the directory's servers (and the
+  alias's server) appended as `server_name` after the client's own, in the order the handler
+  would have tried them; then the gate routes it like a join by id -- here if this replica owns
+  the room, forwarded to the owner otherwise -- and the owner does not resolve it again. An
+  alias that names no room passes through to the handler, which answers the client's `404`.
+  Single-node mode resolves nothing. Each resolution is an `info` line ("resolved a join or knock
+  by alias ahead of the shard gate", with `alias`, `room_id`, `shard`, `owned_here`); a forward
+  counts in `hs_cluster_forward_latency_seconds{route="forward"}` as any other.
+- **Tests.** Unit, in `cluster.rs` with a scripted ownership and a real mesh listener: a join and
+  a knock by alias on a non-owner reach the owner over the mesh as `/join/!room` with the
+  servers appended, and never the local handler; on the owner it runs here, rewritten; an unknown
+  alias passes through untouched; single-node mode never asks. Two real replicas on PostgreSQL 17,
+  `crates/hs-cli/tests/cluster_alias_join.rs`: alice creates `#lobby` (public) and `#door`
+  (knock) through A; bob joins the one and knocks on the other by alias through whichever
+  replica does not own each; the non-owner's forward count rises and its log has the line with
+  `owned_here=false`; the owner's state has bob's `join`/`knock`; bob's next message is taken.
+  With the gate built without the resolver the join fails: `fenced: this replica no longer owns
+  shard ShardId(room/0)` (the write fence refusing it on the non-owner, as the gap row said).
+
+Verify: `HS_CLUSTER_TEST_POSTGRES_DSN=postgres://postgres:hspg@127.0.0.1:5462/postgres cargo
+test -p hs-cli --test cluster_alias_join`, and `cargo test -p hs-cli --lib -- cluster::`.
+
 ## 2026-09-30: two known gaps closed (branch `agent/cluster-gaps`)
 
 **The last replica of a cluster no longer waits out its drain deadline.** `Drainable::drain`

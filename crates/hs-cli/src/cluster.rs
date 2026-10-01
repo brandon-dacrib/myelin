@@ -676,9 +676,9 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
 /// `.../rooms/{roomId}/...`, or `.../join/{roomId}` and `.../knock/{roomId}` when what follows
 /// is a room id (`!...`) rather than an alias. Returns `None` for any other path — every route
 /// this module does not need to gate (`/sync`, `/login`, `/media/...`, ...) and the alias forms
-/// of `/join` and `/knock`, whose room id is only known once the handler has resolved the alias
-/// (see `docs/status/03-cluster.md`, 2026-09-27, for that gap). `/createRoom` has no room id in
-/// its path either and is gated separately, by [`is_create_room`] and
+/// of `/join` and `/knock`, whose room id is only known once the alias is resolved: the gate
+/// does that itself first ([`extract_alias`], [`AliasResolver`]). `/createRoom` has no room id
+/// in its path either and is gated separately, by [`is_create_room`] and
 /// [`RoomShardGate::run_create_room`].
 fn extract_room_id(path: &str) -> Option<String> {
     let mut segments = path.split('/');
@@ -699,6 +699,158 @@ fn extract_room_id(path: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The alias in `.../join/{alias}` or `.../knock/{alias}`, percent-decoded, when the segment is an
+/// alias (`#...`) rather than a room id. `None` for every other path.
+fn extract_alias(path: &str) -> Option<String> {
+    let mut segments = path.split('/');
+    while let Some(segment) = segments.next() {
+        if matches!(segment, "join" | "knock") {
+            let decoded = percent_decode(segments.next()?);
+            return decoded.starts_with('#').then_some(decoded);
+        }
+        if segment == "rooms" {
+            return None;
+        }
+    }
+    None
+}
+
+/// `path` and `query` with the alias segment after `join`/`knock` replaced by `room_id`, and
+/// each of `via` appended as a `server_name` parameter after whatever the client sent -- the
+/// order `hs-room`'s join handler would have tried them in had it resolved the alias itself.
+fn alias_rewritten_uri(path: &str, query: Option<&str>, room_id: &str, via: &[String]) -> String {
+    let mut out = String::with_capacity(path.len() + room_id.len());
+    let mut replace_next = false;
+    for (i, segment) in path.split('/').enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        if replace_next {
+            out.push_str(&percent_encode(room_id));
+            replace_next = false;
+            continue;
+        }
+        out.push_str(segment);
+        replace_next = matches!(segment, "join" | "knock");
+    }
+    let mut params: Vec<String> = query
+        .filter(|q| !q.is_empty())
+        .map(|q| vec![q.to_owned()])
+        .unwrap_or_default();
+    params.extend(
+        via.iter()
+            .map(|server| format!("server_name={}", percent_encode(server))),
+    );
+    if !params.is_empty() {
+        out.push('?');
+        out.push_str(&params.join("&"));
+    }
+    out
+}
+
+/// Percent-encodes everything but RFC 3986's unreserved characters, for one path segment or
+/// query value.
+fn percent_encode(raw: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+/// What a room alias in `/join/{alias}` or `/knock/{alias}` resolved to, for [`RoomShardGate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAlias {
+    /// The room the alias names.
+    pub room_id: String,
+    /// Servers to try the join through after any the client named: for an alias on another
+    /// server, the servers its directory named and the alias's own server, as `hs-room`'s join
+    /// handler would add them; empty for a local alias.
+    pub via: Vec<String>,
+}
+
+/// Resolves a room alias for [`RoomShardGate`] before it decides where a `/join/{alias}` or
+/// `/knock/{alias}` runs, so that a join by alias through a replica that does not own the room
+/// is forwarded to the owner exactly as a join by id is.
+#[async_trait::async_trait]
+pub trait AliasResolver: Send + Sync {
+    /// The room `alias` names, or `None` when it names none (or could not be asked); the request
+    /// then goes to the handler as it came, which answers the client's error itself.
+    async fn resolve(&self, alias: &str) -> Option<ResolvedAlias>;
+}
+
+/// [`AliasResolver`] over `hs-room`'s own directory: a local alias is read from the store
+/// (`RoomRegistry::resolve_alias`, which loads no room), an alias on another server is asked of
+/// that server's directory through the same [`hs_room::remote_join::RemoteJoin`] the join
+/// handler uses.
+pub struct RoomAliasResolver<B: KvBackend> {
+    rooms: Arc<hs_room::registry::RoomRegistry<B>>,
+    server_name: ruma::OwnedServerName,
+    remote_join: Option<Arc<dyn hs_room::remote_join::RemoteJoin>>,
+}
+
+impl<B: KvBackend> RoomAliasResolver<B> {
+    /// Resolves through the same registry, identity and federation the room routes use.
+    #[must_use]
+    pub fn new(room: &hs_room::state::RoomState<B>) -> Self {
+        Self {
+            rooms: room.rooms.clone(),
+            server_name: room.identity.server_name.clone(),
+            remote_join: room.remote_join.clone(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<B: KvBackend> AliasResolver for RoomAliasResolver<B> {
+    async fn resolve(&self, alias: &str) -> Option<ResolvedAlias> {
+        let alias = ruma::RoomAliasId::parse(alias).ok()?;
+        match self.rooms.resolve_alias(&alias) {
+            Ok(Some(room_id)) => {
+                return Some(ResolvedAlias {
+                    room_id: room_id.to_string(),
+                    via: Vec::new(),
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%alias, %error, "could not read the alias directory ahead of the shard gate");
+                return None;
+            }
+        }
+        if alias.server_name() == self.server_name {
+            return None;
+        }
+        let remote = self.remote_join.as_ref()?;
+        match remote.resolve_alias(&alias).await {
+            Ok((room_id, servers)) => {
+                let mut via: Vec<String> = Vec::new();
+                for server in servers
+                    .into_iter()
+                    .chain(std::iter::once(alias.server_name().to_string()))
+                {
+                    if !via.contains(&server) {
+                        via.push(server);
+                    }
+                }
+                Some(ResolvedAlias {
+                    room_id: room_id.to_string(),
+                    via,
+                })
+            }
+            Err(error) => {
+                tracing::debug!(%alias, %error, "the alias's server did not resolve it ahead of the shard gate");
+                None
+            }
+        }
+    }
 }
 
 /// Whether a request is `POST /_matrix/client/{version}/createRoom`, the one room request whose
@@ -746,6 +898,10 @@ pub struct RoomShardGate {
     /// For minting a `/createRoom` id ahead of the handler; `None` in single-node mode, where
     /// `/createRoom` passes through untouched.
     server_name: Option<ruma::OwnedServerName>,
+    /// Resolves the alias of `/join/{alias}` and `/knock/{alias}` before the gate decides; `None`
+    /// leaves those to the handler wherever they land (and in single-node mode it is never asked:
+    /// every shard is this replica's).
+    alias_resolver: Option<Arc<dyn AliasResolver>>,
 }
 
 impl RoomShardGate {
@@ -760,7 +916,22 @@ impl RoomShardGate {
             origin_generation: handles.origin_generation,
             default_deadline: handles.default_deadline,
             server_name: handles.server_name.clone(),
+            alias_resolver: None,
         })
+    }
+
+    /// [`RoomShardGate::new`], also resolving the alias of `/join/{alias}` and `/knock/{alias}`
+    /// through `resolver` so that a join by alias is gated as a join by id is.
+    #[must_use]
+    pub fn with_alias_resolver(
+        handles: &ClusterHandles,
+        resolver: Arc<dyn AliasResolver>,
+    ) -> Arc<Self> {
+        let mut gate = Self::new(handles);
+        if let Some(gate) = Arc::get_mut(&mut gate) {
+            gate.alias_resolver = Some(resolver);
+        }
+        gate
     }
 
     /// Wraps `app` with this gate as an `axum` middleware layer. Every request that does not
@@ -780,8 +951,13 @@ impl RoomShardGate {
         if is_create_room(req.method(), req.uri().path()) {
             return self.run_create_room(req, next).await;
         }
-        let Some(room_id) = extract_room_id(req.uri().path()) else {
-            return next.run(req).await;
+        let mut req = req;
+        let room_id = match extract_room_id(req.uri().path()) {
+            Some(room_id) => room_id,
+            None => match self.resolve_alias_ahead(&mut req).await {
+                Some(room_id) => room_id,
+                None => return next.run(req).await,
+            },
         };
         let shard = self.layout.room_shard(&room_id);
         if self.ownership.is_mine(shard) {
@@ -794,6 +970,44 @@ impl RoomShardGate {
             },
             None => self.refuse(shard, "no mesh forwarder is configured on this replica"),
         }
+    }
+
+    /// For `/join/{alias}` and `/knock/{alias}` on a clustered replica: resolves the alias and
+    /// rewrites the request to name the room id instead (plus the `server_name`s the handler
+    /// would have added for an alias on another server), so the gate can route it like a join by
+    /// id and the owner does not resolve it a second time. `None` -- the request is left as it
+    /// came and passes through to the handler -- for every other path, in single-node mode, and
+    /// when the alias names no room (the handler then gives the client its `404`).
+    async fn resolve_alias_ahead(&self, req: &mut Request) -> Option<String> {
+        let resolver = self.alias_resolver.as_ref()?;
+        self.forwarder.as_ref()?;
+        let alias = extract_alias(req.uri().path())?;
+        let Some(resolved) = resolver.resolve(&alias).await else {
+            tracing::debug!(%alias, "the alias names no room; leaving the request to the handler");
+            return None;
+        };
+        let rewritten = alias_rewritten_uri(
+            req.uri().path(),
+            req.uri().query(),
+            &resolved.room_id,
+            &resolved.via,
+        );
+        match rewritten.parse::<http::Uri>() {
+            Ok(uri) => *req.uri_mut() = uri,
+            Err(error) => {
+                tracing::warn!(%alias, room_id = %resolved.room_id, %error, "could not rewrite a request by alias to its room id; leaving it to the handler");
+                return None;
+            }
+        }
+        let shard = self.layout.room_shard(&resolved.room_id);
+        tracing::info!(
+            %alias,
+            room_id = %resolved.room_id,
+            %shard,
+            owned_here = self.ownership.is_mine(shard),
+            "resolved a join or knock by alias ahead of the shard gate"
+        );
+        Some(resolved.room_id)
     }
 
     /// Handles a room request whose shard this replica owned when it arrived. If the shard moves
@@ -1457,6 +1671,7 @@ mod tests {
                     .expect("valid")
                     .to_owned()
             }),
+            alias_resolver: None,
         })
     }
 
@@ -1659,6 +1874,228 @@ mod tests {
         );
         assert_ne!(room_id, "!chosen-by-client:example.org");
         assert!(room_id.ends_with(":example.org"), "{room_id}");
+    }
+
+    // ---- a join or knock by alias ----
+
+    /// Resolves exactly one alias, and counts how often it was asked.
+    struct OneAlias {
+        alias: &'static str,
+        resolved: ResolvedAlias,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AliasResolver for OneAlias {
+        async fn resolve(&self, alias: &str) -> Option<ResolvedAlias> {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (alias == self.alias).then(|| self.resolved.clone())
+        }
+    }
+
+    fn one_alias(via: &[&str]) -> Arc<OneAlias> {
+        Arc::new(OneAlias {
+            alias: "#lobby:example.org",
+            resolved: ResolvedAlias {
+                room_id: "!lobby:example.org".to_owned(),
+                via: via.iter().map(|s| (*s).to_owned()).collect(),
+            },
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn with_resolver(gate: Arc<RoomShardGate>, resolver: Arc<OneAlias>) -> Arc<RoomShardGate> {
+        let mut gate = Arc::into_inner(gate).expect("a fresh gate has one owner");
+        gate.alias_resolver = Some(resolver);
+        Arc::new(gate)
+    }
+
+    /// What a stand-in `/join/{roomIdOrAlias}` or `/knock/...` handler saw: the path and query
+    /// it was called with, and whether the request came over the mesh.
+    fn join_router(seen: Arc<std::sync::Mutex<Vec<(String, bool)>>>) -> axum::Router {
+        let handler = move |req: Request| {
+            let seen = seen.clone();
+            async move {
+                let uri = req
+                    .uri()
+                    .path_and_query()
+                    .map(|pq| pq.as_str().to_owned())
+                    .unwrap_or_default();
+                seen.lock()
+                    .unwrap()
+                    .push((uri, req.extensions().get::<ViaMesh>().is_some()));
+                axum::Json(serde_json::json!({ "room_id": "!lobby:example.org" }))
+            }
+        };
+        axum::Router::new()
+            .route(
+                "/_matrix/client/v3/join/{target}",
+                axum::routing::post(handler.clone()),
+            )
+            .route(
+                "/_matrix/client/v3/knock/{target}",
+                axum::routing::post(handler),
+            )
+    }
+
+    fn post(uri: &str) -> Request {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap()
+    }
+
+    #[test]
+    fn extracts_an_alias_from_join_and_knock_only() {
+        assert_eq!(
+            extract_alias("/_matrix/client/v3/join/%23lobby%3Aexample.org").as_deref(),
+            Some("#lobby:example.org")
+        );
+        assert_eq!(
+            extract_alias("/_matrix/client/r0/knock/#lobby:example.org").as_deref(),
+            Some("#lobby:example.org")
+        );
+        assert_eq!(
+            extract_alias("/_matrix/client/v3/join/!abc:example.org"),
+            None
+        );
+        assert_eq!(extract_alias("/_matrix/client/v3/rooms/!abc:x/join"), None);
+        assert_eq!(extract_alias("/_matrix/client/v3/sync"), None);
+    }
+
+    #[test]
+    fn the_rewritten_uri_names_the_room_and_appends_the_servers_after_the_clients() {
+        assert_eq!(
+            alias_rewritten_uri(
+                "/_matrix/client/v3/join/%23lobby%3Aexample.org",
+                Some("server_name=mine.example"),
+                "!lobby:example.org",
+                &["remote.example".to_owned(), "[::1]:8448".to_owned()],
+            ),
+            "/_matrix/client/v3/join/%21lobby%3Aexample.org?server_name=mine.example&server_name=remote.example&server_name=%5B%3A%3A1%5D%3A8448"
+        );
+        assert_eq!(
+            alias_rewritten_uri("/_matrix/client/v3/knock/%23a%3Ab", None, "!x:b", &[]),
+            "/_matrix/client/v3/knock/%21x%3Ab"
+        );
+        assert_eq!(
+            extract_room_id("/_matrix/client/v3/join/%21lobby%3Aexample.org").as_deref(),
+            Some("!lobby:example.org")
+        );
+    }
+
+    #[tokio::test]
+    async fn on_a_non_owner_a_join_by_alias_is_forwarded_to_the_owner_by_room_id() {
+        // B owns every shard and serves the mesh, as in the `/createRoom` test above.
+        let b_addr = format!("127.0.0.1:{}", free_port());
+        let seen_b = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ownership_b: Arc<dyn Ownership> = scripted(&b_addr, true, None);
+        let app_b = gate(ownership_b.clone(), true).layer(join_router(seen_b.clone()));
+        let deps = Arc::new(MeshDeps {
+            authenticator: Arc::new(SharedSecretAuthenticator::new(TEST_SECRET)),
+            ownership: ownership_b,
+            handler: Arc::new(ProxyShardHandler { app: app_b }),
+            idempotency: Arc::new(IdempotencyCache::new(Duration::from_secs(5), 16)),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(8)),
+            nudge: None,
+            peers: None,
+        });
+        let server = MeshServer::new(b_addr.clone(), None).unwrap();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            server.serve(deps, shutdown_rx).await.unwrap();
+        });
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(&b_addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // A owns nothing and resolves the alias itself.
+        let seen_a = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let resolver = one_alias(&["remote.example"]);
+        let app_a = with_resolver(
+            gate(scripted("127.0.0.1:1", false, Some(&b_addr)), true),
+            resolver.clone(),
+        )
+        .layer(join_router(seen_a.clone()));
+
+        for verb in ["join", "knock"] {
+            let response = app_a
+                .clone()
+                .oneshot(post(&format!(
+                    "/_matrix/client/v3/{verb}/%23lobby%3Aexample.org?server_name=mine.example"
+                )))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{verb}");
+        }
+        assert!(
+            seen_a.lock().unwrap().is_empty(),
+            "the non-owner must never run the handler"
+        );
+        let calls_b = seen_b.lock().unwrap().clone();
+        assert_eq!(
+            calls_b,
+            ["join", "knock"]
+                .map(|verb| (
+                    format!(
+                        "/_matrix/client/v3/{verb}/%21lobby%3Aexample.org?server_name=mine.example&server_name=remote.example"
+                    ),
+                    true
+                ))
+                .to_vec(),
+            "the owner was handed the room id and the servers, over the mesh"
+        );
+        assert_eq!(resolver.asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn on_the_owner_a_join_by_alias_runs_here_and_an_unknown_alias_passes_through() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = with_resolver(gate(scripted("a", true, None), true), one_alias(&[]))
+            .layer(join_router(seen.clone()));
+        for uri in [
+            "/_matrix/client/v3/join/%23lobby%3Aexample.org",
+            "/_matrix/client/v3/join/%23nowhere%3Aexample.org",
+        ] {
+            let response = app.clone().oneshot(post(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![
+                (
+                    "/_matrix/client/v3/join/%21lobby%3Aexample.org".to_owned(),
+                    false
+                ),
+                (
+                    "/_matrix/client/v3/join/%23nowhere%3Aexample.org".to_owned(),
+                    false
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn in_single_node_mode_no_alias_is_resolved() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let resolver = one_alias(&[]);
+        let app = with_resolver(gate(scripted("a", true, None), false), resolver.clone())
+            .layer(join_router(seen.clone()));
+        let response = app
+            .oneshot(post("/_matrix/client/v3/join/%23lobby%3Aexample.org"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(resolver.asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            seen.lock().unwrap()[0].0,
+            "/_matrix/client/v3/join/%23lobby%3Aexample.org"
+        );
     }
 
     // ---- a shard moving away while a request for it runs ----

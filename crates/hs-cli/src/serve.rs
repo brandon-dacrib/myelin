@@ -235,6 +235,10 @@ fn build_router<B: KvBackend>(
     let room_router = room_router.with_state(mounts.room);
     let room_routes = room_manifest.routes;
 
+    // The shard gate resolves `/join/{alias}` and `/knock/{alias}` through the same directory
+    // and federation the room routes use, before the room state moves into the router.
+    let alias_resolver: Arc<dyn crate::cluster::AliasResolver> =
+        Arc::new(crate::cluster::RoomAliasResolver::new(&mounts.room));
     let legacy_media_enabled = mounts.media.legacy_media_enabled;
     let (media_router, media_manifest) = hs_media::router::authenticated_router::<B>();
     let media_router = media_router.with_state(mounts.media.clone());
@@ -491,11 +495,13 @@ fn build_router<B: KvBackend>(
         .layer(middleware::from_fn_with_state(metrics, track_metrics))
         .layer(hs_telemetry::RequestIdLayer::new());
 
-    // Outermost layer: gates every `/rooms/{roomId}/...` request on shard ownership before it
-    // can reach `hs-room`'s registry at all (see `crate::cluster`'s module docs). A no-op in
-    // single-node mode (`is_mine` is always `true`), so this changes nothing about single-node
-    // behavior beyond one cheap path scan per request.
-    let router = crate::cluster::RoomShardGate::new(cluster).layer(router);
+    // Outermost layer: gates every `/rooms/{roomId}/...` request (and `/join` or `/knock` by id,
+    // or by an alias it resolves first) on shard ownership before it can reach `hs-room`'s
+    // registry at all (see `crate::cluster`'s module docs). A no-op in single-node mode
+    // (`is_mine` is always `true`, and no alias is resolved), so this changes nothing about
+    // single-node behavior beyond one cheap path scan per request.
+    let router =
+        crate::cluster::RoomShardGate::with_alias_resolver(cluster, alias_resolver).layer(router);
 
     (router, manifest)
 }
