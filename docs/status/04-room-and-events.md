@@ -4,6 +4,8 @@ Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
 Last updated: 2026-10-01 (session 16: upgrading a room to version 12; session 15: `POST
 /search`, below). Before that, 2026-09-30 (session
+Last updated: 2026-10-01 (session 17: a new room's id is new; session 15: `POST /search`,
+below). Before that, 2026-09-30 (session
 14: a new room's id is placed on a shard the replica building it owns, version 12 included;
 session 13: the state at backfilled history is asked for; session 12: the history between a
 leave and a rejoin; session 11: the client space hierarchy) and 2026-09-28 (session 10: the
@@ -65,6 +67,81 @@ admin API's room long tail).
 > - **Not done.** The replacement gets the spec's recommended transferable state only; bans in
 >   the old room are not carried over (Synapse carries them). Complement's upgrade tests were
 >   not run this session.
+> **2026-10-01, session 17: two version-12 rooms created in one millisecond are two rooms**
+> (branch `agent/room-id-uniqueness`, on `agent/cluster-create-room-flake`; known gap "Two
+> version-12 rooms created by one user in the same millisecond get the same room ID" closed;
+> amends decision 0020). Found by Sytest's third run (status 06 session 17). A version-12 room
+> id is its create event's hash, and the create event holds only the sender, the content and
+> `origin_server_ts`: two `createRoom` calls by one user with the same body in the same
+> millisecond built one create event -- and then identical joins and preset state -- and both
+> were answered with one room, the registry keeping whichever actor it was handed last.
+> `RoomActor::create_placed` never asked whether the id was new.
+>
+> - **The claim (`PersistKind::NewRoom`, new).** The create event's write reads
+>   `Tables::room_meta` for the room inside its own serializable transaction and refuses an id
+>   a room already has (`RoomError::RoomAlreadyExists`, nothing written, the shell unchanged).
+>   Being in the transaction that writes the row, two concurrent creates of one id cannot
+>   both pass it (SSI: one conflicts, re-runs, and finds the row). The check is against the
+>   store, not the registry's memory, so a room another replica built, or one not resident,
+>   counts.
+> - **A taken id is one more attempt** of `create_placed`'s placement loop, under the same
+>   bound (`MAX_ID_ATTEMPTS_PER_SHARD` times the room shards: 4,096 in `hs serve`, which always
+>   installs fencing; 16 with none, this crate's tests) and in the same
+>   `hs_room_create_room_id_attempts` observation. A hash-derived id is rebuilt with its create
+>   event a **random 1-1,024 ms** further back (a placement miss still steps 1 ms): every
+>   identical create walks the same path from the same `now_ms`, so a fixed step makes the
+>   n-th create of a burst try every earlier one's id in turn (checked: with a 1 ms step the
+>   nineteenth of a frozen-clock burst of twenty on one owned shard of four ran out of its 64
+>   attempts, 18 of them taken ids); Synapse perturbs the timestamp
+>   randomly too (`_generate_create_event_for_room_id`, read for behavior). A minted opaque id
+>   is minted again. A **chosen** id (the gate's pre-assigned one, an upgrade's replacement)
+>   is never swapped: taken, it is `400 M_ROOM_IN_USE`.
+> - **Observability.** `hs_room_create_room_id_taken_total` (a counter beside the histogram,
+>   rather than a label on it, so the existing `_count`/`_sum` series and the cluster test that
+>   reads them are unchanged); `info` per taken id ("a new room's id was already a room's ...",
+>   with the id, creator and attempt); the `debug` and `warn` lines carry `ids_taken`.
+> - **Tests**, each failing with the claim switched off (checked, all five and the real-binary
+>   one): `crates/hs-room/src/actor/new_room_ids.rs` (new) -- two v12 rooms by alice at one
+>   frozen millisecond are two rooms, both in `list_all_room_ids` and her joined rooms, the
+>   second create event at most a second earlier, a message in one not in the other, the
+>   taken id counted; twelve such creates concurrently on a multi-threaded runtime are twelve
+>   rooms; two registries over one store (two replicas) do not share a room; twenty at one
+>   frozen millisecond with one room shard of four owned are twenty rooms, all on that shard; a
+>   chosen id a room already has is refused `M_ROOM_IN_USE` and the room keeps its name.
+>   `crates/hs-cli/tests/room_id_uniqueness.rs` (new; the real `hs` binary, rate limits off):
+>   alice sends twenty `{"room_version":"12"}` creates before any is answered, in bursts until
+>   `/metrics` shows an id taken (the first burst took 11 of 20); every burst is twenty new
+>   rooms, `/joined_rooms` lists them all, `_attempts_sum >= _count + taken`, and one `info`
+>   line per taken id.
+> - **Sytest**, the three files holding the affected tests (`tests/sytest/run.sh
+>   tests/30rooms/40joinedapis.pl tests/31sync/09archived.pl tests/90jira/SYN-627.pl`, image
+>   `myelin-sytest:9cde6e9`, Sytest `7473158`), three runs each. **Before** (the image's own
+>   `hs`, `9cde6e9`): 8, 9 and 8 of 11. "Events come down the correct room" (thirty creates at
+>   once) and "Previously left rooms don't appear in the leave section of sync" (the user
+>   "joined" the same room twice) failed 3 of 3; "Newly left rooms appear in the leave section
+>   of gapped sync" failed 2 of 3 (`403 sender's membership is not join`: its two rooms were one,
+>   and the user had left it) -- the same bug, with no row of its own; "/joined_rooms returns
+>   only joined rooms" passed 3 of 3 here (its two creates did not share a millisecond; it
+>   failed in status 06's run). **After** (`SYTEST_HS_BINARY` = this branch's `hs`, built for
+>   bookworm in Docker): **11 of 11, three runs in a row**, the server logging 9, 7 and 10 taken
+>   ids. Results in `target/sytest/{before-image-9cde6e9,before-2,before-3,after-1,after-2,after-3}`.
+> - **How to verify.** `cargo test -p hs-room --lib new_room_ids`; `cargo test -p hs-cli --test
+>   room_id_uniqueness`; `HS_CLUSTER_TEST_POSTGRES_DSN=... cargo test -p hs-cli --test
+>   cluster_create_room`.
+> - **Checks run:** `cargo fmt --all --check`; `cargo clippy -p hs-room -p hs-cli --all-targets
+>   -- -D warnings`; `cargo test -p hs-room` (all green, 139 unit); `cargo test -p hs-user` (a
+>   heavy user of `RoomRegistry::create_room`; 169 green); `cargo test -p hs-cli --test
+>   room_id_uniqueness` (twice: 11 and 10 ids taken in the first burst); `cargo test -p hs-cli
+>   --test cluster_create_room` against a private `postgres:17` (passed, 109 s). Not the
+>   workspace gate.
+> - **Interfaces.** No signature changed. `create_placed` (and so `create`, `create_room`,
+>   `create_room_placed`, `RoomRegistry::create_room`) can now answer
+>   `RoomError::RoomAlreadyExists` for a chosen id; new metric
+>   `hs_room_create_room_id_taken_total`, registered by `hs_room::metrics::register_metrics`.
+> - **Left.** A version-12 room created after a collision has a create event up to about a
+>   second (one per further collision) older than its creation; nothing reads it. A minted
+>   opaque id that collides has never been seen (102 bits), so that branch is covered by the
+>   chosen-id test's path, not by a forced collision.
 
 > **2026-10-01, session 15: `POST /search` finds room events** (branch `agent/room-gaps`; known
 > gap "`/search` unimplemented" closed; decision 0021). Element's search box answered

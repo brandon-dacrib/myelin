@@ -464,6 +464,14 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   a message is found the moment after it is sent. Verified against the real binary with two
   users and three rooms, across a restart, and by Complement's `TestSearch` (all six subtests). Not yet: history fetched from other servers after
   joining is not searchable, and words are not stemmed.
+- **Rooms created at once are as many rooms** (2026-10-01): a version-12 room's id is the hash of
+  its first event, and two `createRoom` calls by one user with the same request in the same
+  millisecond built the same first event, so both were answered with one room -- the user was in
+  one room where they had asked for two. Found by Sytest. The server now refuses an id a room
+  already has when it writes the room's first event and builds another. Verified against the
+  real binary with twenty identical creates sent at once (twenty rooms, every one in
+  `/joined_rooms`; the first burst found 11 ids taken), and by Sytest: the three files holding
+  the tests that failed from it went from 8-9 of 11 to 11 of 11, three runs in a row.
 - Sync: `/sync` v2 with filters that honour event-type and sender rules, lazy-loaded members, room
   summaries with heroes, typing, presence, read receipts and `m.fully_read`, to-device messages,
   device lists, one-time-key counts, and push rules as account data.

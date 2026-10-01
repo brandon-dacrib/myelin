@@ -52,3 +52,25 @@ handoff.
 - Upgrading a room *to* version 12 is not covered: `/rooms/{roomId}/upgrade` names the
   replacement room's id in the tombstone before the room exists, which a hash-derived id cannot
   satisfy. That is a separate gap.
+
+## Amendment (2026-10-01): the id must also be new
+
+Sytest found two version-12 `createRoom` calls by one user with the same body in the same
+millisecond answered with one room: the two create events were identical, so their hash was,
+and nothing asked whether a room already had the id (status 04 session 17).
+
+- **The create event's write claims the id.** It reads `Tables::room_meta` for the room inside
+  its own serializable transaction and refuses an id a room already has
+  (`RoomError::RoomAlreadyExists`, nothing written). Two concurrent creates of one id cannot
+  both pass: one conflicts, re-runs, and finds the row. The check is against the shared store,
+  so a room another replica built counts.
+- **A taken id is one more attempt** of the loop above, under the same bound and in the same
+  histogram. With no fencing installed (this crate's tests; `hs serve` always installs it) the
+  bound is `MAX_ID_ATTEMPTS_PER_SHARD` itself.
+- **After a taken id the create event goes back a random 1-1,024 ms**, not one: every identical
+  create walks the same path from the same `now_ms`, so a fixed step makes each create of a
+  burst try every earlier one's id in turn. A placement miss still steps one millisecond. A
+  minted opaque id is minted again; a chosen one is refused (`M_ROOM_IN_USE`), never swapped.
+- **Observable.** `hs_room_create_room_id_taken_total` and an `info` line per taken id.
+
+The "few milliseconds older" consequence above becomes "up to about a second per collision".
