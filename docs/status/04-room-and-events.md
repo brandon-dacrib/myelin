@@ -71,7 +71,27 @@ API's room long tail).
 >   before his first join and the create event, his next incremental sync has none of it, and
 >   `hs_room_backfilled_events_total{kind="rejoin_gap"}` counts more than 130. With the gap
 >   fill switched off that test fails at the ordering assertion (checked by hand).
-> - **Verified (Complement):** COMPLEMENT_RESULTS
+> - **Verified (Complement):** `TestMessagesOverFederation`, all subtests. Before, on image
+>   `complement-hs-hier:c31f95a` (nothing this change touches differs between it and
+>   `origin/main`): **0/1 top-level, 2 of 3 leaf subtests** -- the re-joining subtest failed
+>   with "expected 20 events in timeline (got 0 relevant events filtered down from 9 events)".
+>   After, on `complement-hs-gap:6759970` built from this branch: **1/1, 3 of 3**, three runs
+>   in a row. (The 300-message rejoin variant is commented out upstream as needing MSC3871
+>   gappy timelines; it is not run.) Because an invite or leave taken while out now opens a
+>   gap too, the federation membership set from status 06 (`TestRestrictedRooms*`,
+>   `TestFederationRoomsInvite*`, `TestKnocking*`, `TestKnockRooms*`,
+>   `TestFederationRejectInvite`) was rerun on the new image: **16/18 top-level, 96/98 with
+>   subtests**, the same as its `c31f95a` baseline, the two failures being the known
+>   `NoCreatorsUsesPowerLevels{V11,V12}` races. Invocation: `go test -v -count=1 -p 1 -run
+>   '^TestMessagesOverFederation$' ./tests/csapi/` in `refs/complement` with `DOCKER_HOST`
+>   at OrbStack's socket, a `DOCKER_CONFIG` holding only `{}`,
+>   `COMPLEMENT_SPAWN_HS_TIMEOUT_SECS=120` and `COMPLEMENT_BASE_IMAGE` set; the image by
+>   `DOCKER_BUILDKIT=0 tests/complement/build.sh <tag>`.
+> - **Checks run:** `cargo fmt --all --check`, `cargo clippy -p hs-room -p hs-cli --all-targets
+>   -- -D warnings`, `cargo test -p hs-room`, `cargo test -p hs-user --tests`, `cargo test -p
+>   hs-cli --lib`, and `cargo test -p hs-cli --test federation_two_servers --test
+>   federation_membership --test federation_edus --test space_hierarchy --test admin_rooms`.
+>   Not the workspace gate (the coordinator's, under the merge lock).
 > - **Left.** A *forward* page across an open gap does not fill it (it reads on); a state
 >   event the rejoin brought as an outlier (the rename) is placed but keeps an outlier's state
 >   (as in `accept_backfilled_events`), so its own `state_at_event` is just itself; the state
