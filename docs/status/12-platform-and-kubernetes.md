@@ -46,7 +46,8 @@ PostgreSQL in the kind cluster, a mesh secret, an admin token and two or three r
 2026-09-28 "first cluster run" steps below still apply. It does not install the bridge operator
 or the CRDs, and with embedded storage `replicas` is always 1.
 
-**Found and fixed on the way** (commit `85d52d7`):
+**Found and fixed on the way** (commit "The operator runs against a real API server, and CD
+proves it before tagging"):
 
 - **The `Bridge` controller took a `Homeserver`'s pods for a `Bridge`'s.** Its watches selected
   only `app.kubernetes.io/managed-by=myelin-operator`, which the `Homeserver`'s objects carry
