@@ -121,6 +121,23 @@ pub enum RoomError {
     /// gives the same failure. The text names no handshake; the detail says which one failed.
     #[error("could not complete the request through another server: {0}")]
     RemoteJoinFailed(String),
+    /// [`crate::remote_join::RemoteJoin`]: the other server answered a step of the handshake
+    /// with a client error of its own (a `4xx` with a Matrix `errcode`), which is passed through
+    /// to the client as it came -- status, `errcode`, `error` and any other fields, such as
+    /// `M_INCOMPATIBLE_ROOM_VERSION`'s `room_version` -- as Synapse does. Until 2026-10-01 it was
+    /// a `502 M_UNKNOWN` naming the other server's answer in its text (Sytest's "Outbound
+    /// federation passes make_join failures through to the client").
+    #[error("{error}")]
+    RemoteRefused {
+        /// The other server's HTTP status, a `4xx`.
+        status: u16,
+        /// The other server's `errcode`.
+        errcode: String,
+        /// The other server's `error`, or a description when it gave none.
+        error: String,
+        /// Every other field of the other server's error body.
+        extra: serde_json::Map<String, serde_json::Value>,
+    },
     /// [`crate::backfill::Backfill`]: a room's history from before the oldest event this server
     /// holds could not be fetched: no server in the room could be reached, or none answered with
     /// a usable batch. `502 M_UNKNOWN` like [`RoomError::RemoteJoinFailed`], though
@@ -233,6 +250,21 @@ impl RoomError {
                 MatrixErrorCode::Other("M_MISSING_PREV_EVENTS".to_owned()),
                 self.to_string(),
             ),
+            Self::RemoteRefused {
+                status,
+                errcode,
+                error,
+                extra,
+            } => {
+                let status = axum::http::StatusCode::from_u16(*status)
+                    .ok()
+                    .filter(axum::http::StatusCode::is_client_error)
+                    .unwrap_or(axum::http::StatusCode::BAD_REQUEST);
+                let mut matrix =
+                    MatrixError::custom(status, MatrixErrorCode::Other(errcode.clone()), error);
+                matrix.extra.extend(extra.clone());
+                matrix
+            }
             Self::RemoteJoinFailed(_) | Self::BackfillFailed(_) => MatrixError::custom(
                 axum::http::StatusCode::BAD_GATEWAY,
                 MatrixErrorCode::Unknown,

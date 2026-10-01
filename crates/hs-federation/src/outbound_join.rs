@@ -120,7 +120,8 @@ pub struct RemoteJoinOutcome {
 ///
 /// Performs, in order: `GET /_matrix/federation/v1/make_join/{room_id}/{user_id}`; local
 /// hash-redact-sign of the returned template (per the spec's real signing order -- see the module
-/// doc); `PUT /_matrix/federation/v2/send_join/{room_id}/{event_id}`; verification of every event
+/// doc); `PUT /_matrix/federation/v2/send_join/{room_id}/{event_id}` (the v1 spelling when the
+/// resident does not answer v2: `put_v2_falling_back_to_v1`); verification of every event
 /// the response returns. `client` provides discovery, TLS/CA trust and outbound `X-Matrix` request
 /// signing (the *transport* layer's signature, distinct from the *event*'s own signature this
 /// function computes); `own_server_name`/`signing_key` are the joining user's own homeserver's
@@ -193,26 +194,18 @@ pub async fn join_room_with_content(
     .await?;
     let event_id = join_event.event_id().to_string();
 
-    let send_join_path = format!(
-        "/_matrix/federation/v2/send_join/{}/{}",
-        crate::client::encode_path_segment(room_id),
-        crate::client::encode_path_segment(&event_id)
-    );
-    let send_join_response = client
-        .send(destination, "PUT", &send_join_path, Some(&signed_value))
-        .await
-        .map_err(|source| OutboundJoinError::Client {
-            destination: destination.to_owned(),
-            source,
-        })?;
-    if send_join_response.status / 100 != 2 {
-        return Err(OutboundJoinError::Rejected {
-            destination: destination.to_owned(),
-            step: "send_join",
-            status: send_join_response.status,
-            body: send_join_response.body,
-        });
-    }
+    let send_join_response = put_v2_falling_back_to_v1(
+        client,
+        destination,
+        "send_join",
+        &format!(
+            "send_join/{}/{}",
+            crate::client::encode_path_segment(room_id),
+            crate::client::encode_path_segment(&event_id)
+        ),
+        &signed_value,
+    )
+    .await?;
 
     let state = verify_array(
         &send_join_response.body,
@@ -275,6 +268,68 @@ pub async fn join_room_with_content(
         auth_chain,
         members_omitted,
     })
+}
+
+/// `PUT /_matrix/federation/v2/{path}` with `body`, and when `destination` does not know the v2
+/// spelling -- `404`, or `400 M_UNRECOGNIZED` -- the same request to `/_matrix/federation/v1/{path}`,
+/// whose `[200, {...}]` answer is unwrapped to its object. Synapse falls back the same way for
+/// `send_join` and `send_leave`. The answer to whichever was asked last is returned when it is a
+/// 2xx; [`OutboundJoinError::Rejected`] naming `step` otherwise.
+///
+/// Until 2026-10-01 only v2 was asked, and a server without it (Sytest's own server answers v2
+/// `404` in its "Outbound federation can query v1 /send_join") could not be joined through.
+///
+/// # Errors
+/// [`OutboundJoinError::Client`] if a request fails, [`OutboundJoinError::Rejected`] for a
+/// non-2xx answer.
+pub(crate) async fn put_v2_falling_back_to_v1(
+    client: &FederationClient,
+    destination: &str,
+    step: &'static str,
+    path: &str,
+    body: &Value,
+) -> Result<crate::client::FederationResponse, OutboundJoinError> {
+    let put = |version: &'static str| {
+        let full = format!("/_matrix/federation/{version}/{path}");
+        async move {
+            client
+                .send(destination, "PUT", &full, Some(body))
+                .await
+                .map_err(|source| OutboundJoinError::Client {
+                    destination: destination.to_owned(),
+                    source,
+                })
+        }
+    };
+    let mut response = put("v2").await?;
+    let unrecognized = response.status == 404
+        || (response.status == 400
+            && response.body.get("errcode").and_then(Value::as_str) == Some("M_UNRECOGNIZED"));
+    if unrecognized {
+        tracing::info!(
+            destination,
+            step,
+            status = response.status,
+            "the other server does not answer the v2 spelling; asking v1"
+        );
+        response = put("v1").await?;
+        if response.status / 100 == 2
+            && let Value::Array(pair) = &mut response.body
+            && pair.len() == 2
+        {
+            let inner = pair.pop().unwrap_or(Value::Null);
+            response.body = inner;
+        }
+    }
+    if response.status / 100 != 2 {
+        return Err(OutboundJoinError::Rejected {
+            destination: destination.to_owned(),
+            step,
+            status: response.status,
+            body: response.body,
+        });
+    }
+    Ok(response)
 }
 
 /// A membership template a resident handed out, signed by this server: the JSON to submit, the
@@ -369,17 +424,20 @@ pub(crate) async fn make_and_sign(
             }
         }
     }
-    let room_version_str = make_join_response
-        .body
-        .get("room_version")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            OutboundJoinError::MalformedTemplate(
+    // "If not provided, the room version is assumed to be either "1" or "2"" (the spec's
+    // `make_join`, `make_leave` and `make_knock` responses); the two share an event format, and
+    // Synapse reads a missing one as "1". Refusing the template instead failed every join
+    // through Sytest's own server, which leaves it out (502 to the client until 2026-10-01).
+    let room_version_str = match make_join_response.body.get("room_version") {
+        None | Some(Value::Null) => "1".to_owned(),
+        Some(Value::String(version)) => version.clone(),
+        Some(other) => {
+            return Err(OutboundJoinError::MalformedTemplate(
                 destination.to_owned(),
-                "missing `room_version`".to_owned(),
-            )
-        })?
-        .to_owned();
+                format!("`room_version` is not a string: {other}"),
+            ));
+        }
+    };
     let room_version = RoomVersionId::try_from(room_version_str.as_str()).map_err(|_| {
         OutboundJoinError::MalformedTemplate(
             destination.to_owned(),
@@ -917,6 +975,99 @@ mod tests {
                 }
             ),
             "unexpected error: {err}"
+        );
+    }
+
+    /// A resident shaped like Sytest's own federation server: its `make_join` answer has no
+    /// `room_version` (the spec: then version 1 or 2) and it answers the v2 `send_join` `404`,
+    /// so only v1 (`[200, {...}]`) completes the join. Both broke every join through it with a
+    /// 502 until 2026-10-01: "the membership template ... was malformed: missing
+    /// `room_version`", and with that fixed, a v2 `404`.
+    #[tokio::test]
+    async fn a_template_without_a_room_version_and_a_resident_without_v2_send_join_still_join() {
+        use axum::routing::{get, put};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let resident = format!("sytest.example.org:{port}");
+        let room_id = format!("!4:{resident}");
+        let v2_asked = Arc::new(AtomicUsize::new(0));
+        let v1_body: Arc<std::sync::Mutex<Option<Value>>> = Arc::default();
+
+        let template = serde_json::json!({
+            "type": "m.room.member",
+            "room_id": room_id,
+            "sender": "@bob:joiner.example.org",
+            "state_key": "@bob:joiner.example.org",
+            "content": {"membership": "join"},
+            "depth": 3,
+            "origin_server_ts": 1,
+            "prev_events": [[format!("$10:{resident}"), {"sha256": "AQnpUtoiUgT0E3RsD9DZHUvje901wxHZgyt62fqexbE"}]],
+            "auth_events": [[format!("$8:{resident}"), {"sha256": "nM8kHXePWZh+fKbo4qkHpTcLjz+8YsmXm1wjyFp0iB8"}]],
+        });
+        let app = axum::Router::new()
+            .route(
+                "/_matrix/federation/v1/make_join/{room}/{user}",
+                get(move || {
+                    let template = template.clone();
+                    async move { axum::Json(serde_json::json!({ "event": template })) }
+                }),
+            )
+            .route(
+                "/_matrix/federation/v2/send_join/{room}/{event}",
+                put({
+                    let v2_asked = v2_asked.clone();
+                    move || {
+                        v2_asked.fetch_add(1, Ordering::SeqCst);
+                        async { axum::http::StatusCode::NOT_FOUND }
+                    }
+                }),
+            )
+            .route(
+                "/_matrix/federation/v1/send_join/{room}/{event}",
+                put({
+                    let v1_body = v1_body.clone();
+                    move |axum::Json(body): axum::Json<Value>| {
+                        *v1_body.lock().unwrap() = Some(body);
+                        async {
+                            axum::Json(serde_json::json!([200, {"state": [], "auth_chain": []}]))
+                        }
+                    }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        let joiner_signing_key = own_signing_key();
+        let client = make_client("joiner.example.org", joiner_signing_key.clone());
+        let unused_keys = OwnSigningKeys::from_keys(vec![own_signing_key()]);
+        let outcome = join_room(
+            &client,
+            &key_cache(&unused_keys, &resident),
+            &resident,
+            &room_id,
+            "@bob:joiner.example.org",
+            &ServerName::parse("joiner.example.org").unwrap(),
+            &joiner_signing_key,
+        )
+        .await
+        .expect("a version-1 template and a v1-only send_join must still make a join");
+
+        assert_eq!(outcome.room_version, RoomVersionId::V1);
+        assert_eq!(v2_asked.load(Ordering::SeqCst), 1, "v2 is asked first");
+        let submitted = v1_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("v1 send_join was asked");
+        // A version-1 event carries the ID its server chose for it.
+        assert_eq!(
+            submitted["event_id"].as_str(),
+            Some(outcome.join_event.event_id().as_str())
         );
     }
 

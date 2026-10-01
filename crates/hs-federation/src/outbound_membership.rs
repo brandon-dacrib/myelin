@@ -2,12 +2,14 @@
 //! leaving and knocking on a room hosted elsewhere, and inviting a user of another server into a
 //! room here.
 //!
-//! - [`leave_room`]: `make_leave`, sign, `send_leave` (v2). What a user of this server does to
+//! - [`leave_room`]: `make_leave`, sign, `send_leave` (v2, then v1 for a server that does not
+//!   answer v2). What a user of this server does to
 //!   reject an invite, or withdraw a knock, in a room this server is not in: there is no copy of
 //!   the room here to author the leave against, so a server that is in it builds the template.
 //! - [`knock_room`]: `make_knock`, sign, `send_knock`. The answer carries the room's stripped
 //!   state (`knock_room_state`), which is what the knocking user's client shows.
-//! - [`send_invite`]: `PUT /v2/invite` with an invite this server built and signed, for a user of
+//! - [`send_invite`]: `PUT /v2/invite` (`/v1/invite` for a server that does not answer v2) with
+//!   an invite this server built and signed, for a user of
 //!   `destination`. The answer is the same event co-signed by `destination`, verified here
 //!   before it is handed back: same event ID, both signatures.
 //!
@@ -38,7 +40,8 @@ pub struct RemoteMembershipOutcome {
 }
 
 /// Leaves `room_id` as `user_id` through `destination`, a server in the room: `GET make_leave`,
-/// sign, `PUT /v2/send_leave`. `content` (a `reason`) is merged into the template.
+/// sign, `PUT /v2/send_leave` (`/v1/send_leave` when the server does not answer v2). `content`
+/// (a `reason`) is merged into the template.
 ///
 /// # Errors
 /// See [`OutboundJoinError`].
@@ -70,11 +73,18 @@ pub async fn leave_room(
     .await?;
     check_membership(&event, "leave", destination)?;
     let path = format!(
-        "/_matrix/federation/v2/send_leave/{}/{}",
+        "send_leave/{}/{}",
         crate::client::encode_path_segment(room_id),
         crate::client::encode_path_segment(event.event_id().as_str())
     );
-    submit(client, destination, "send_leave", &path, &value).await?;
+    crate::outbound_join::put_v2_falling_back_to_v1(
+        client,
+        destination,
+        "send_leave",
+        &path,
+        &value,
+    )
+    .await?;
     Ok(RemoteMembershipOutcome {
         room_version,
         event,
@@ -154,8 +164,8 @@ pub async fn send_invite(
         OutboundJoinError::Signing(format!("the invite does not round-trip to JSON: {e}"))
     })?;
     let room_id = pdu.get("room_id").and_then(Value::as_str).unwrap_or("");
-    let path = format!(
-        "/_matrix/federation/v2/invite/{}/{}",
+    let segments = format!(
+        "{}/{}",
         crate::client::encode_path_segment(room_id),
         crate::client::encode_path_segment(event.event_id().as_str())
     );
@@ -164,7 +174,50 @@ pub async fn send_invite(
         "event": pdu,
         "invite_room_state": invite_room_state,
     });
-    let answer = submit(client, destination, "invite", &path, &body).await?;
+    let answer = match submit(
+        client,
+        destination,
+        "invite",
+        &format!("/_matrix/federation/v2/invite/{segments}"),
+        &body,
+    )
+    .await
+    {
+        // A server that does not know the v2 spelling (`404`, or `400 M_UNRECOGNIZED`) is sent
+        // the v1 one: the event alone, the stripped state in its `unsigned`, the answer
+        // `[200, {"event": ...}]` (unwrapped by `submit`). As Synapse falls back; Sytest's
+        // "Outbound federation can send invites via v1 API" answers v2 `404`.
+        Err(OutboundJoinError::Rejected {
+            status,
+            body: refusal,
+            ..
+        }) if status == 404
+            || (status == 400
+                && refusal.get("errcode").and_then(Value::as_str) == Some("M_UNRECOGNIZED")) =>
+        {
+            tracing::info!(
+                destination,
+                status,
+                "the other server does not answer the v2 invite; sending v1"
+            );
+            let mut v1 = pdu.clone();
+            if let Some(object) = v1.as_object_mut() {
+                let unsigned = object.entry("unsigned").or_insert_with(|| json!({}));
+                if let Some(unsigned) = unsigned.as_object_mut() {
+                    unsigned.insert("invite_room_state".to_owned(), json!(invite_room_state));
+                }
+            }
+            submit(
+                client,
+                destination,
+                "invite",
+                &format!("/_matrix/federation/v1/invite/{segments}"),
+                &v1,
+            )
+            .await?
+        }
+        other => other?,
+    };
     let returned = answer.get("event").ok_or_else(|| {
         OutboundJoinError::MalformedResponse(destination.to_owned(), "missing `event`".to_owned())
     })?;
@@ -245,4 +298,191 @@ async fn submit(
         Value::Array(mut pair) if pair.len() == 2 => pair.pop().unwrap_or(Value::Null),
         other => other,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::destination_store::InMemoryDestinationStore;
+    use crate::discovery::{AddrResolver, SrvResolver, WellKnownFetcher, WellKnownOutcome};
+    use crate::keys::{
+        KeyServerFetcher, OwnSigningKeys, RemoteKeyCache, build_server_key_response,
+    };
+    use async_trait::async_trait;
+    use hs_model::canonical::{CanonicalJsonObject, CanonicalJsonValue, to_canonical_object};
+    use std::collections::HashMap;
+    use std::net::IpAddr;
+    use std::sync::Arc;
+
+    struct Loopback;
+    #[async_trait]
+    impl AddrResolver for Loopback {
+        async fn resolve_addr(&self, _hostname: &str) -> Vec<IpAddr> {
+            vec!["127.0.0.1".parse().unwrap()]
+        }
+    }
+    #[async_trait]
+    impl SrvResolver for Loopback {
+        async fn lookup_srv(&self, _service: &str, _hostname: &str) -> Vec<(String, u16)> {
+            Vec::new()
+        }
+    }
+    struct NoWellKnown;
+    #[async_trait]
+    impl WellKnownFetcher for NoWellKnown {
+        async fn fetch(&self, _hostname: &str) -> WellKnownOutcome {
+            panic!("a destination with an explicit port never asks .well-known")
+        }
+    }
+    struct Keys(HashMap<String, Value>);
+    #[async_trait]
+    impl KeyServerFetcher for Keys {
+        async fn fetch_server_key(&self, server_name: &str) -> Option<Value> {
+            self.0.get(server_name).cloned()
+        }
+    }
+
+    /// Signs `object`'s redacted form as `server` and adds the signature to `object`.
+    fn add_signature(object: &mut CanonicalJsonObject, server: &str, keys: &OwnSigningKeys) {
+        let rules = hs_model::room_version::rules_for(&RoomVersionId::V11).unwrap();
+        let mut redacted = hs_model::redaction::redact(object, &rules.redaction).unwrap();
+        redacted.remove("signatures");
+        let name = ruma::ServerName::parse(server).unwrap();
+        hs_model::signing::sign_object(&mut redacted, &name, keys.primary()).unwrap();
+        let Some(CanonicalJsonValue::Object(mut new)) = redacted.remove("signatures") else {
+            panic!("sign_object adds signatures");
+        };
+        match object.get_mut("signatures") {
+            Some(CanonicalJsonValue::Object(existing)) => existing.append(&mut new),
+            _ => {
+                object.insert("signatures".to_owned(), CanonicalJsonValue::Object(new));
+            }
+        }
+    }
+
+    /// A destination that does not answer the v2 `invite` (`404`, as Sytest's own server in
+    /// "Outbound federation can send invites via v1 API") is sent the v1 one -- the event with
+    /// the stripped state in its `unsigned` -- and its co-signed answer, `[200, {"event": ..}]`,
+    /// is verified and returned. Until 2026-10-01 the invite failed with a `502` to the client.
+    #[tokio::test]
+    async fn an_invite_goes_by_v1_to_a_server_without_v2() {
+        let dir = tempfile::tempdir().unwrap();
+        let inviter_keys = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let invitee_keys = Arc::new(OwnSigningKeys::load_or_generate(dir2.path()).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let invitee = format!(
+            "invitee.example.org:{}",
+            listener.local_addr().unwrap().port()
+        );
+
+        let mut object = to_canonical_object(
+            &json!({
+                "type": "m.room.member",
+                "room_id": "!r:inviter.example.org",
+                "sender": "@alice:inviter.example.org",
+                "state_key": format!("@bob:{invitee}"),
+                "content": {"membership": "invite"},
+                "origin_server_ts": 1,
+                "depth": 5,
+                "prev_events": ["$prev"],
+                "auth_events": ["$create"],
+            }),
+            true,
+        )
+        .unwrap();
+        let hash = hs_model::hash::content_hash_base64(&object);
+        object.insert(
+            "hashes".to_owned(),
+            CanonicalJsonValue::Object(CanonicalJsonObject::from([(
+                "sha256".to_owned(),
+                CanonicalJsonValue::String(hash),
+            )])),
+        );
+        add_signature(&mut object, "inviter.example.org", &inviter_keys);
+        let value: Value =
+            serde_json::from_slice(&CanonicalJsonValue::Object(object).to_canonical_bytes())
+                .unwrap();
+        let event = Event::parse(&value, RoomVersionId::V11).unwrap();
+
+        let received: Arc<std::sync::Mutex<Option<Value>>> = Arc::default();
+        let app = axum::Router::new()
+            .route(
+                "/_matrix/federation/v2/invite/{room}/{event}",
+                axum::routing::put(|| async { axum::http::StatusCode::NOT_FOUND }),
+            )
+            .route(
+                "/_matrix/federation/v1/invite/{room}/{event}",
+                axum::routing::put({
+                    let received = received.clone();
+                    let invitee = invitee.clone();
+                    let keys = invitee_keys.clone();
+                    move |axum::Json(body): axum::Json<Value>| {
+                        *received.lock().unwrap() = Some(body.clone());
+                        let mut object = to_canonical_object(&body, true).unwrap();
+                        object.remove("unsigned");
+                        add_signature(&mut object, &invitee, &keys);
+                        let cosigned: Value = serde_json::from_slice(
+                            &CanonicalJsonValue::Object(object).to_canonical_bytes(),
+                        )
+                        .unwrap();
+                        async move { axum::Json(json!([200, {"event": cosigned}])) }
+                    }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        let client = FederationClient::new(
+            "inviter.example.org".to_owned(),
+            inviter_keys.primary().clone(),
+            crate::client::ClientConfig {
+                scheme: "http",
+                ip_policy: crate::client::IpPolicy::from_cidrs(&[], &[]),
+                ..Default::default()
+            },
+            Arc::new(InMemoryDestinationStore::default()),
+            Arc::new(NoWellKnown),
+            Arc::new(Loopback),
+            Arc::new(Loopback),
+        );
+        let key_docs: HashMap<String, Value> = [
+            (
+                "inviter.example.org".to_owned(),
+                build_server_key_response("inviter.example.org", &inviter_keys, &[], 3600).unwrap(),
+            ),
+            (
+                invitee.clone(),
+                build_server_key_response(&invitee, &invitee_keys, &[], 3600).unwrap(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let cache = RemoteKeyCache::new(Box::new(Keys(key_docs)) as Box<dyn KeyServerFetcher>);
+        let stripped = vec![json!({
+            "type": "m.room.name", "state_key": "", "content": {"name": "n"},
+            "sender": "@alice:inviter.example.org",
+        })];
+
+        let cosigned = send_invite(
+            &client,
+            &cache,
+            &invitee,
+            &RoomVersionId::V11,
+            &event,
+            &stripped,
+        )
+        .await
+        .expect("the invite goes by v1");
+        assert_eq!(cosigned.event_id(), event.event_id());
+        let sent = received.lock().unwrap().clone().expect("v1 was asked");
+        assert_eq!(sent["unsigned"]["invite_room_state"], json!(stripped));
+        assert!(
+            sent.get("room_version").is_none(),
+            "v1 carries the event alone"
+        );
+    }
 }

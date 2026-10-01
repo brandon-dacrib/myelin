@@ -86,7 +86,10 @@ impl<B: KvBackend + 'static> FederationRemoteJoin<B> {
                         }
                         other => other,
                     };
-                    if matches!(mapped, RoomError::Forbidden(_)) {
+                    if matches!(
+                        mapped,
+                        RoomError::Forbidden(_) | RoomError::RemoteRefused { .. }
+                    ) {
                         return Err(mapped);
                     }
                     last_error = Some(mapped);
@@ -177,9 +180,13 @@ impl<B: KvBackend + 'static> FederationRemoteJoin<B> {
                     }
                     other => other,
                 };
-                // The room itself saying no is the answer, whoever relays it; keep trying
-                // other servers only for failures that are about the server, not the room.
-                if matches!(mapped, RoomError::Forbidden(_)) {
+                // The room itself saying no is the answer, whoever relays it, and so is the
+                // other server's own client error, passed through; keep trying other servers
+                // only for failures that are about the server, not the room.
+                if matches!(
+                    mapped,
+                    RoomError::Forbidden(_) | RoomError::RemoteRefused { .. }
+                ) {
                     Err(JoinAttempt::Fatal(mapped))
                 } else {
                     Err(JoinAttempt::Next { error: mapped })
@@ -190,8 +197,12 @@ impl<B: KvBackend + 'static> FederationRemoteJoin<B> {
 }
 
 /// What one sponsoring server's refusal means for the client: a `403` is the room refusing the
-/// join and worth reporting as such; a `404` is that server not knowing the room; anything else
-/// is a failure to complete the handshake.
+/// join and worth reporting as such; a `404` is that server not knowing the room; any other
+/// `4xx` with a Matrix `errcode` is the other server's own answer, passed through to the client
+/// as it came (`M_INCOMPATIBLE_ROOM_VERSION` with its `room_version`, say) and not asked of the
+/// next server, as Synapse does -- except `M_UNABLE_TO_AUTHORISE_JOIN`, which says another
+/// server might vouch for the join and so is a reason to ask the next one; anything else is a
+/// failure to complete the handshake.
 fn map_outbound_error(error: &OutboundJoinError) -> RoomError {
     match error {
         OutboundJoinError::Rejected {
@@ -204,6 +215,31 @@ fn map_outbound_error(error: &OutboundJoinError) -> RoomError {
         ),
         OutboundJoinError::Rejected { status: 404, .. } => {
             RoomError::RoomNotFound(error.to_string())
+        }
+        OutboundJoinError::Rejected {
+            status: status @ 400..=499,
+            body,
+            ..
+        } if body
+            .get("errcode")
+            .and_then(Value::as_str)
+            .is_some_and(|code| code != "M_UNABLE_TO_AUTHORISE_JOIN") =>
+        {
+            let mut extra = body.as_object().cloned().unwrap_or_default();
+            let errcode = extra
+                .remove("errcode")
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let message = extra
+                .remove("error")
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_else(|| error.to_string());
+            RoomError::RemoteRefused {
+                status: *status,
+                errcode,
+                error: message,
+                extra,
+            }
         }
         other => RoomError::RemoteJoinFailed(other.to_string()),
     }
@@ -442,6 +478,50 @@ mod tests {
         let broken = OutboundJoinError::MalformedTemplate("x".into(), "no event".into());
         assert!(matches!(
             map_outbound_error(&broken),
+            RoomError::RemoteJoinFailed(_)
+        ));
+    }
+
+    /// Another server's own client error reaches the client as it came: status, `errcode`,
+    /// `error` and the rest of its body. Until 2026-10-01 it was `502 M_UNKNOWN` with the
+    /// answer in the text (Sytest's "Outbound federation passes make_join failures through to
+    /// the client" and "Outbound federation correctly handles unsupported room versions").
+    /// `M_UNABLE_TO_AUTHORISE_JOIN` is still a reason to ask the next server.
+    #[test]
+    fn another_servers_client_error_is_passed_through_to_the_client() {
+        let incompatible = OutboundJoinError::Rejected {
+            destination: "x".into(),
+            step: "make_join",
+            status: 400,
+            body: serde_json::json!({
+                "errcode": "M_INCOMPATIBLE_ROOM_VERSION",
+                "error": "y u no upgrade",
+                "room_version": "sytest-room-ver",
+            }),
+        };
+        let error = map_outbound_error(&incompatible).to_matrix_error();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(error.errcode.as_str(), "M_INCOMPATIBLE_ROOM_VERSION");
+        assert_eq!(error.error, "y u no upgrade");
+        assert_eq!(error.extra["room_version"], "sytest-room-ver");
+
+        let custom = OutboundJoinError::Rejected {
+            destination: "x".into(),
+            step: "make_join",
+            status: 400,
+            body: serde_json::json!({"errcode": "M_TEST_ERROR_CODE", "error": "denied!"}),
+        };
+        let error = map_outbound_error(&custom).to_matrix_error();
+        assert_eq!(error.errcode.as_str(), "M_TEST_ERROR_CODE");
+
+        let unable = OutboundJoinError::Rejected {
+            destination: "x".into(),
+            step: "make_join",
+            status: 400,
+            body: serde_json::json!({"errcode": "M_UNABLE_TO_AUTHORISE_JOIN", "error": "no"}),
+        };
+        assert!(matches!(
+            map_outbound_error(&unable),
             RoomError::RemoteJoinFailed(_)
         ));
     }
