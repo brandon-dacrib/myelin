@@ -908,6 +908,8 @@ pub struct ServeHandle {
     /// What `/health/ready` reads. `true` from the moment the listeners are bound;
     /// [`ServeHandle::withdraw_readiness`] makes it `false`, and nothing makes it `true` again.
     ready: Arc<AtomicBool>,
+    /// `hs_boot_duration_seconds`, set by [`ServeHandle::record_boot`].
+    boot_metric: crate::boot::BootMetric,
     /// The parts the graceful shutdown stops in order; taken by [`ServeHandle::shutdown`].
     running: Option<Running>,
     /// The runtime every one of the server's tasks runs on; `None` only once shut down.
@@ -1017,6 +1019,12 @@ type ReleaseLongPolls =
 const CLUSTER_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 impl ServeHandle {
+    /// Records how long this process took to boot, measured by the caller from wherever its
+    /// boot began, into `hs_boot_duration_seconds{cold}` (`crate::boot`).
+    pub fn record_boot(&self, elapsed: std::time::Duration, cold: bool) {
+        self.boot_metric.record(elapsed, cold);
+    }
+
     /// Answers `/health/ready` with `503` from now on, while everything else keeps serving.
     ///
     /// This is the first thing [`ServeHandle::shutdown`] does, and it is separate so a test can
@@ -1301,6 +1309,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     let server_name = identity.server_name.clone();
 
     let metrics = Arc::new(Metrics::new());
+    let boot_metric = crate::boot::BootMetric::register(&metrics);
     // Writes refused, swallowed or throttled because an administrator suspended, shadow-banned
     // or rate-limited the account (decision 0014).
     metrics.with_registry(hs_room::moderation::register_metrics);
@@ -2144,6 +2153,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         runtime: None,
         components,
         storage: Some(Box::new(backend.clone())),
+        boot_metric,
     })
 }
 

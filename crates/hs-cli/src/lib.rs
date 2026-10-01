@@ -12,6 +12,7 @@ pub mod appservices;
 pub mod audit;
 pub mod auth_manifest;
 pub mod backfill;
+pub mod boot;
 pub mod bootstrap;
 pub mod bridges;
 pub mod capabilities;

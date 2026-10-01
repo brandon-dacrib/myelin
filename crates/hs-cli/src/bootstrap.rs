@@ -173,6 +173,10 @@ pub struct Booted {
     pub meta: ConfigMeta,
     /// `Some(label)` when *this* boot seeded the store, i.e. this was the first run.
     pub seeded: Option<String>,
+    /// This process created the store: the very first boot over a data directory (the embedded
+    /// backend found no database there) or over a database (PostgreSQL held no configuration
+    /// yet). What `cold` means in the `listening` line and `hs_boot_duration_seconds`.
+    pub cold: bool,
     /// Things worth telling the operator once telemetry is up: a `--server-name` the database
     /// disagrees with, a file whose settings the database now overrides.
     pub notes: Vec<String>,
@@ -657,6 +661,10 @@ pub fn boot_with_env(
         ));
     }
     let mut stored = store.load()?;
+    let cold = match &storage {
+        OpenedStorage::Embedded(backend) => backend.created_fresh(),
+        OpenedStorage::Postgres(_) => stored.meta.revision == 0,
+    };
     let mut seeded = None;
     let seedable = declared
         .as_object()
@@ -722,6 +730,7 @@ pub fn boot_with_env(
         store,
         meta: stored.meta,
         seeded,
+        cold,
         notes,
     })
 }
@@ -773,10 +782,12 @@ mod tests {
         {
             let booted =
                 boot_with_env(&options(dir.path(), Some("example.org")), Vec::new()).unwrap();
+            assert!(booted.cold, "the first boot created the store");
             drop(booted);
         }
         let booted = boot_with_env(&options(dir.path(), None), Vec::new()).unwrap();
         assert!(booted.seeded.is_none(), "the store was already seeded");
+        assert!(!booted.cold, "the second boot found it");
         assert_eq!(
             booted.resolve().unwrap().config.server.server_name,
             "example.org"

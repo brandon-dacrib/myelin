@@ -721,6 +721,8 @@ async fn run_register(args: &RegisterArgs) -> i32 {
 /// layer that outranks the file. That is what makes a setting changed in the web interface
 /// survive a restart while a `homeserver.yaml` nobody remembers is mounted still says otherwise.
 async fn run_serve(args: &ServeArgs) -> i32 {
+    // The boot is timed from here to every listener bound (`crate::boot`).
+    let boot_started = std::time::Instant::now();
     let source = if let Some(synapse_path) = &args.synapse_config {
         match crate::synapse_serve::load_synapse_config(
             synapse_path,
@@ -866,6 +868,13 @@ async fn run_serve(args: &ServeArgs) -> i32 {
     };
     let setup_link_hint =
         crate::serve::setup_link_host_hint(config.server.public_baseurl.as_deref());
+    // A second handle on the embedded store, read once the server has opened every keyspace
+    // and dropped straight after: what this boot cost the store, for the `listening` line.
+    let embedded = match &booted.storage {
+        crate::storage::OpenedStorage::Embedded(backend) => Some(backend.clone()),
+        crate::storage::OpenedStorage::Postgres(_) => None,
+    };
+    let cold = booted.cold;
     let handle = match crate::serve::spawn_serve_with_storage(booted.storage, config, options).await
     {
         Ok(h) => h,
@@ -874,8 +883,12 @@ async fn run_serve(args: &ServeArgs) -> i32 {
             return 1;
         }
     };
+    let boot_elapsed = boot_started.elapsed();
+    let store_boot = crate::boot::StoreBoot::read(embedded.as_ref(), cold);
+    drop(embedded);
+    handle.record_boot(boot_elapsed, cold);
     for addr in &handle.addrs {
-        tracing::info!(%addr, "listening");
+        crate::boot::log_listening(addr, boot_elapsed, &store_boot);
     }
     if hs_admin::assets::EMBEDDED_UI == hs_admin::assets::EmbeddedUi::Placeholder {
         // Said once, here, rather than left for an operator to discover by opening /admin/ and
