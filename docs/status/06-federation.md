@@ -18,6 +18,103 @@ to-device over federation (4); profile queries (2); server ACLs (2); `/room_summ
 `/_matrix/key/v2/query`, Unicode remote aliases, Complement's appservice user (4). Every name,
 the families and how it was run: status 14, session 6; the baseline is
 `docs/status/complement-federation-results.txt` (run 8).
+## Sixteenth session (2026-10-01): what Sytest's first run found between servers
+
+**Branch:** `agent/federation-sytest`, from `agent/test-infra-gaps` (`a649509`; the Sytest
+harness and the redaction fix). Closes five rows of the known-gaps table that the first Sytest
+run opened, each in its own commit (hashes are left out: the merge queue rebases them).
+
+1. **The key server** (the branch's first commit). `hs_federation::transport::key_server` is a router fragment
+   mounted at `/_matrix/key/v2`, outside the `X-Matrix` layer: `GET /server`, the deprecated
+   `GET /server/{keyId}` (the same document; Sytest's federation client asks it first, so 21
+   tests never started), and the notary: `POST /query` and `GET /query/{serverName}` (plus the
+   old `/query/{serverName}/{keyId}`). The notary answers from `RemoteKeyCache`, which now keeps
+   every self-signed response it accepts, as published, per `(server, key id)` -- expired ones
+   too -- and co-signs each with this server's key (`wrap_for_notary`); for this server itself
+   it answers its own fresh response. A key held valid until `minimum_valid_until_ts` (default
+   now) is answered from the cache; otherwise the server is asked again first, and if that fails
+   the last response held is the answer. A response that lists another key does not displace one
+   held for a key it no longer lists (Synapse 5305). At most 100 servers per query (400
+   `M_LIMIT_EXCEEDED` past that). `hs_federation_notary_queries_total{outcome}`.
+   `hs_cli::federation::key_server_state` builds it; `serve.rs` mounts it in place of the inline
+   handler.
+2. **Server ACLs** (second commit). Nothing enforced `m.room.server_acl` anywhere. Now one check,
+   `hs_federation::acl::check_origin` (the room's ACL from the new
+   `RoomDataSource::server_acl`, overridden in `hs-cli` with one state lookup), applied two
+   ways: as a route layer (`acl::enforce_on_room_routes`) over both federation routers, so every
+   route whose path names a `{roomId}` -- `make_join`, `send_join` v1/v2, `make_leave`,
+   `send_leave` v1/v2, `make_knock`, `send_knock`, `invite` v1/v2, `state`, `state_ids`,
+   `backfill`, `event_auth`, `get_missing_events`, `hierarchy`, `timestamp_to_event` and the
+   seams -- answers `403 M_FORBIDDEN` before its handler for a denied server, and a route added
+   later is covered without anyone listing it; and per PDU in `/send` (once per room per
+   transaction, before verification, `{"error": ...}` under the event's ID). `is_allowed` now
+   matches the host without its port (the spec's "excluding any port information"; Sytest bans
+   `localhost:<port>` as `localhost`), and `acl_from_content` reads a malformed ACL as Synapse
+   does. Counted in `hs_federation_acl_refusals_total{endpoint}` (a fixed label set) and logged
+   at `info`.
+3. **A rejected PDU is `{}` in `/send`** (third and fourth commits). `WriteRejected::auth_rejected`
+   (`WriteRejected::auth`), set by `hs-cli`'s sink for `RoomError::Forbidden`; `/send` answers
+   `{}` for it (logged at `info`) and an error for everything else (unparsable, unplaceable,
+   the store failing, missing ancestors not fetched). The event is still not stored.
+4. **Rooms of version 1 and 2 over federation** (fifth commit). Three things: `make_join`
+   refused to cite events by `[id, {"sha256": reference hash}]` -- it now reads each cited
+   event's body through the new `RoomDataSource::event_for_reference` (overridden in `hs-cli`)
+   and hashes it; the *joining* side never gave its join an `event_id`, which versions 1 and 2
+   carry in the event, so the signed event did not parse (`sign_join_template` now mints
+   `$<opaque>:<server>`); and `make_join` without `ver` now means `["1"]`, as the spec says.
+   Also: `M_INCOMPATIBLE_ROOM_VERSION` carries `room_version`, v1 `send_join` answers
+   `[200, {...}]` as the spec documents (v2 unchanged), and the "unsupported room version"
+   message no longer repeats itself.
+5. **Received redactions** (`hs-room`, sixth commit). Nothing applied a redaction that
+   arrived over federation. `RoomActor::accept_remote_event` now applies a stored
+   `m.room.redaction` to its target when the room holds the target and the redaction's sender
+   is on the original sender's server (the spec's rule from version 3) or
+   `RoomActor::may_redact` allows it (own event or redact power, current power levels); one
+   that may not take effect is stored and logged, unapplied. Not for the importer, which applies
+   its own.
+
+**Verified.**
+
+- `cargo test -p hs-federation` (200): new `transport::key_server::tests` (7: the key-id
+  spelling, both notary spellings co-signed and still origin-signed with one fetch for three
+  requests, the notary for itself, Sytest's expired-key and must-not-overwrite sequences, an
+  unreachable server left out, a malformed query), `transport::tests::every_room_scoped_route_refuses_a_server_the_room_acl_denies`
+  (iterates both manifests; every `{roomId}` route 403s with the ACL message and is counted
+  under a named endpoint), `inbound::tests::a_pdu_from_a_server_the_room_acl_denies_is_refused`,
+  `inbound::tests::a_pdu_rejected_by_auth_is_answered_with_an_empty_result`,
+  `acl::tests::{the_port_is_not_part_of_the_match, a_malformed_acl_is_read_leniently,
+  endpoint_labels_are_a_fixed_set}`,
+  `join::tests::make_join_cites_events_by_reference_hash_in_a_version_1_room`,
+  `outbound_join::tests::a_version_1_template_is_given_an_event_id_of_this_servers_making`.
+  Each fails without its change (the routes and the notary answered 404, the ACL layer let the
+  handler run, the auth rejection was an error, `make_join` answered `UnsupportedRoomVersion`,
+  `Event::parse` refused the template).
+- `cargo test -p hs-room` (all pass): new
+  `actor::tests::a_received_redaction_is_applied_only_when_its_sender_may_redact` (a power-0
+  member of a third server stores a redaction that changes nothing; the sender's own applies).
+- Real binaries: `cargo test -p hs-cli --test federation_keys` (A's `/server/{keyId}` is its
+  `/server`; A's notary answers B's keys signed by both; an unreachable server is left out),
+  `--test federation_room_versions` (a version-1 room created on A is joined from B and
+  messages cross both ways -- failed with "signed make_join event does not parse: missing
+  `event_id`" before the joining side's fix; bob's redaction on B empties the message on A),
+  `--test federation_writes` (the auth-rejected PDU is now `{}` and `/event` does not find it),
+  `--test federation_membership`, `--test federation_two_servers`: pass.
+- `cargo clippy -p hs-federation -p hs-room -p hs-cli --all-targets -- -D warnings`, `cargo fmt
+  --all --check`: clean. Not run: the workspace gate.
+- Sytest: being re-run (the release build in Docker is under way); numbers to follow.
+
+**Left.**
+
+- A redaction that arrives before the event it redacts is never applied when the event comes;
+  `may_redact` reads the current power levels, not those at the redaction.
+- No event renders `unsigned.redacted_because` / `redacted_by` (Sytest's "Can receive
+  redactions from regular users over federation" checks `redacted_by`, so it still fails in
+  every version though the redaction now applies) -- `hs-room`/`hs-user`'s client format, no row
+  yet.
+- Server ACLs are not applied to EDUs (typing, receipts; Synapse does, MSC4163).
+- A PDU the auth rules reject is answered `{}` but still not stored as rejected, so a later
+  event citing it meets "missing ancestors"; soft failure is still a hard rejection.
+- The notary's held responses are in memory only (lost on restart) and are never pruned.
 
 ## Fifteenth session (2026-09-30): a destination down past its queue is caught up from the rooms
 

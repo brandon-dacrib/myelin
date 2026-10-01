@@ -319,6 +319,16 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Federation
 
+- **What Sytest's first run found between servers is fixed.** The key server answers the
+  deprecated `/_matrix/key/v2/server/{keyId}` and acts as a notary (`/_matrix/key/v2/query`,
+  both spellings): another server's keys from the cache inbound verification fills, co-signed,
+  the last held response answered when the origin is down. A room's `m.room.server_acl` is
+  enforced -- it was not, anywhere -- on every room-scoped federation endpoint and on each PDU
+  in `/send`, counted in `hs_federation_acl_refusals_total{endpoint}`. A PDU the auth rules
+  reject is answered `{}` in `/send`. Rooms of version 1 and 2 are joined over federation, from
+  either side, and a redaction that arrives over federation is applied. Verified 2026-10-01
+  with two real binaries (`federation_keys.rs`, `federation_room_versions.rs`) and Sytest:
+  re-run pending.
 - **Restricted rooms, invites, leaves and knocks cross servers, and so do the ephemeral
   things.** A local user joins a restricted room without naming an authoriser, and through
   another server when nobody here may invite; invites (v1 and v2), leaves and knocks are served
