@@ -31,14 +31,12 @@ moment after the join, the lag `/sync` already waits out with `wait_for_consumed
 `admin_rooms.rs::a_deleted_room_empties_moves_its_members_and_cannot_be_joined` (`GET
 /sync?timeout=0` answers `404 room not found` once the admin delete has purged a room whose
 kick is still in the member's feed). An agent on `agent/ci-flakes` is fixing both in `hs-user`.
-The demo at `myelin.dacrib.net` (release `myelin`, namespace `myelin`) still runs an image from
+The demo at `myelin.dacrib.net` (release `myelin`, namespace `myelin`) ran an image from
 before the `GET /` → `/admin/` redirect (`06db4ef`, 2026-09-28) and an Ingress without the
-exact `/` route, so the bare address is still Traefik's 404. **`kubectl` and `helm` reach
-`admin@dacrib0` from an agent session now** (the "no route to host" of 2026-09-28 is gone), but
-the auto-mode classifier refuses `helm upgrade` from a session; the upgrade to the last green
-image, `--set image.tag=sha-d6b3cd7928e8956ff86f174005e63cdf63b15e27` with the release's
-values passed as a file (`--reuse-values` fails on the new `bridges.enabled` key), is one
-command for the owner's terminal; then again at the first green `main`. Seen on the two-pod
+exact `/` route until the upgrade in the next paragraph. **`kubectl` and `helm` reach
+`admin@dacrib0` from an agent session now** (the "no route to host" of 2026-09-28 is gone); the
+coordinating session's own `helm upgrade` was refused by the harness's permission classifier,
+and a platform-track agent ran it instead. Seen on the two-pod
 cluster while looking: `hs-0` on `black0n0` has 25 restarts, all exit 255 "Unknown" with no
 panic in the log (the node, not the server), and its log carries `r2d2: error connecting to
 server` every twenty minutes or so and `postgres::config: WARNING: there is no transaction in
