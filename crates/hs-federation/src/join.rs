@@ -36,11 +36,11 @@
 //!   revisited, at which point `make_join`'s `prev_events` should cite every current extremity, not
 //!   just the one this session's `RoomDataSource::forward_extremities` implementations happen to
 //!   return.
-//! - **`EventsReferenceFormat::V1WithHash` room versions (1 and 2) are not supported by this
-//!   module**: computing a `[event_id, {"sha256": ...}]` reference pair for a forward extremity
-//!   needs that event's full body, which `forward_extremities` does not carry (only
-//!   `(event_id, depth)`). This server's own default room version is 11 (`V2IdOnly`, bare event
-//!   ID strings), so this is a narrow, explicitly-declared gap, not a silent one.
+//! - **Room versions 1 and 2** (`EventsReferenceFormat::V1WithHash`) cite each prev and auth
+//!   event with its reference hash, so `make_join` reads each cited event's body
+//!   ([`crate::room_source::RoomDataSource::event_for_reference`]) to compute it. Until
+//!   2026-10-01 they were refused here (`M_UNSUPPORTED_ROOM_VERSION`), and no server could join
+//!   this server's version-1 or -2 rooms (Sytest's room-version join tests).
 
 use std::collections::HashMap;
 
@@ -198,14 +198,37 @@ impl StateFetch for FlatState {
     }
 }
 
-/// One entry in `prev_events`/`auth_events`, encoded per the room version's reference format. Only
-/// [`EventsReferenceFormat::V2IdOnly`] is supported -- see the module doc.
-fn encode_ref(event_id: &str, format: EventsReferenceFormat) -> Result<Value, JoinError> {
-    match format {
+/// One entry in `prev_events`/`auth_events`, encoded per the room version's reference format:
+/// the bare event ID (room version 3 and up), or `[event_id, {"sha256": reference hash}]`
+/// (versions 1 and 2), for which the referenced event's body is read through
+/// [`RoomDataSource::event_for_reference`].
+async fn encode_ref(
+    rooms: &dyn RoomDataSource,
+    room_id: &str,
+    event_id: &str,
+    room_version: &RoomVersionId,
+    rules: &hs_model::room_version::RoomVersionRules,
+) -> Result<Value, JoinError> {
+    match rules.events_reference_format {
         EventsReferenceFormat::V2IdOnly => Ok(Value::String(event_id.to_owned())),
-        EventsReferenceFormat::V1WithHash => Err(JoinError::UnsupportedRoomVersion(
-            "room versions 1-2 (V1WithHash event references) are not supported by the join handshake".to_owned(),
-        )),
+        EventsReferenceFormat::V1WithHash => {
+            let body = rooms
+                .event_for_reference(room_id, event_id)
+                .await
+                .ok_or_else(|| {
+                    JoinError::Store(format!("the cited event {event_id} is not held"))
+                })?;
+            let event = hs_model::Event::parse(&body, room_version.clone()).map_err(|e| {
+                JoinError::Store(format!("the cited event {event_id} does not parse: {e}"))
+            })?;
+            let hash = event.reference_hash().map_err(|e| {
+                JoinError::Store(format!("the cited event {event_id} cannot be hashed: {e}"))
+            })?;
+            Ok(serde_json::json!([
+                event_id,
+                { "sha256": hs_model::hash::encode_reference_hash(&hash, rules) }
+            ]))
+        }
     }
 }
 
@@ -441,10 +464,10 @@ pub async fn make_membership(
         ));
     }
     let depth = extremities.iter().map(|(_, d)| *d).max().unwrap_or(0) + 1;
-    let prev_events = extremities
-        .iter()
-        .map(|(id, _)| encode_ref(id, rules.events_reference_format))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut prev_events = Vec::with_capacity(extremities.len());
+    for (id, _) in &extremities {
+        prev_events.push(encode_ref(rooms, room_id, id, &room_version, &rules).await?);
+    }
 
     let state = rooms.state_for_join(room_id).await.map_err(source_err)?;
     let flat = FlatState::build(&state.state);
@@ -517,7 +540,7 @@ pub async fn make_membership(
     let mut auth_events = Vec::new();
     for (event_type, state_key) in &wanted_auth_types {
         if let Some(id) = flat.event_id_for(event_type, state_key) {
-            auth_events.push(encode_ref(id, rules.events_reference_format)?);
+            auth_events.push(encode_ref(rooms, room_id, id, &room_version, &rules).await?);
         }
     }
 
@@ -879,6 +902,64 @@ mod tests {
             },
         );
         (rooms, room_id, "11".to_owned())
+    }
+
+    /// A version-1 room: `make_join` cites the extremity and each auth event as
+    /// `[event_id, {"sha256": reference hash}]`, the hash computed from the cited event's body.
+    /// Until 2026-10-01 it answered `M_UNSUPPORTED_ROOM_VERSION` instead.
+    #[tokio::test]
+    async fn make_join_cites_events_by_reference_hash_in_a_version_1_room() {
+        let (fixture, room_id, _) = room_with_creator();
+        let (_, mut room) = fixture.rooms_for_test().into_iter().next().unwrap();
+        let mut depth = 0;
+        for event in &mut room.state {
+            depth += 1;
+            let id = event["event_id"].as_str().unwrap().to_owned();
+            event["event_id"] = Value::String(format!("{id}:resident.example.org"));
+            event["origin"] = Value::String("resident.example.org".to_owned());
+            event["origin_server_ts"] = serde_json::json!(1);
+            event["depth"] = serde_json::json!(depth);
+            event["prev_events"] = serde_json::json!([]);
+            event["auth_events"] = serde_json::json!([]);
+            event["hashes"] = serde_json::json!({"sha256": "aGFzaA"});
+            event["signatures"] = serde_json::json!({});
+            if event["type"] == "m.room.create" {
+                event["content"]["room_version"] = Value::String("1".to_owned());
+            }
+        }
+        room.room_version = Some("1".to_owned());
+        room.extremities = vec![("$creatorjoin:resident.example.org".to_owned(), depth)];
+        let state = room.state.clone();
+        let mut rooms = InMemoryRoomSource::new();
+        rooms.insert_room(&room_id, room);
+
+        let template = make_join(
+            &rooms,
+            &room_id,
+            "@bob:joiner.example.org",
+            &["1".to_owned()],
+            "resident.example.org",
+        )
+        .await
+        .unwrap();
+        let expected_ref = |id: &str| {
+            let body = state.iter().find(|e| e["event_id"] == id).unwrap();
+            let event = hs_model::Event::parse(body, RoomVersionId::V1).unwrap();
+            let rules = hs_model::room_version::rules_for(&RoomVersionId::V1).unwrap();
+            serde_json::json!([
+                id,
+                {"sha256": hs_model::hash::encode_reference_hash(
+                    &event.reference_hash().unwrap(), &rules)}
+            ])
+        };
+        assert_eq!(
+            template.event["prev_events"],
+            serde_json::json!([expected_ref("$creatorjoin:resident.example.org")])
+        );
+        let auth = template.event["auth_events"].as_array().unwrap();
+        assert!(auth.contains(&expected_ref("$create:resident.example.org")));
+        assert!(auth.contains(&expected_ref("$power:resident.example.org")));
+        assert_eq!(template.room_version, "1");
     }
 
     /// Stores everything: what `hs-cli`'s real sink does for a valid, new join.

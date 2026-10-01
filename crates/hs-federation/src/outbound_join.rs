@@ -425,6 +425,14 @@ fn sign_join_template(
     canonical
         .entry("origin".to_owned())
         .or_insert_with(|| CanonicalJsonValue::String(own_server_name.to_string()));
+    // Room versions 1 and 2 carry the event's ID in the event, chosen by the server that makes
+    // it (`$<opaque>:<server>`), not derived from its hash; without one the joining event does
+    // not even parse, and no version-1 or -2 room could be joined from here.
+    if rules.event_format_requires_event_id {
+        canonical.entry("event_id".to_owned()).or_insert_with(|| {
+            CanonicalJsonValue::String(ruma::EventId::new_v1(own_server_name).to_string())
+        });
+    }
     let content_hash = hs_model::hash::content_hash_base64(&canonical);
     canonical.insert(
         "hashes".to_owned(),
@@ -990,6 +998,31 @@ mod tests {
         );
         assert_eq!(signed["origin"], "joiner.example.org");
         Event::parse(&signed, RoomVersionId::V11).expect("the completed event parses");
+    }
+
+    /// A template for a version-1 room gets an event ID of this server's making before it is
+    /// hashed and signed: those versions carry it in the event, and without it the join event
+    /// did not parse and no version-1 room could be joined from here.
+    #[test]
+    fn a_version_1_template_is_given_an_event_id_of_this_servers_making() {
+        let keys = OwnSigningKeys::from_keys(vec![own_signing_key()]);
+        let server_name = ServerName::parse("joiner.example.org").unwrap();
+        let rules = hs_model::room_version::rules_for(&RoomVersionId::V1).unwrap();
+        let template = serde_json::json!({
+            "type": "m.room.member",
+            "room_id": "!room:resident.example.org",
+            "sender": "@alice:joiner.example.org",
+            "state_key": "@alice:joiner.example.org",
+            "content": {"membership": "join"},
+            "prev_events": [["$prev:resident.example.org", {"sha256": "aGFzaA"}]],
+            "auth_events": [["$create:resident.example.org", {"sha256": "aGFzaA"}]],
+            "depth": 4,
+        });
+        let signed = sign_join_template(&template, &rules, &server_name, keys.primary()).unwrap();
+        let event_id = signed["event_id"].as_str().unwrap();
+        assert!(event_id.starts_with('$') && event_id.ends_with(":joiner.example.org"));
+        let event = Event::parse(&signed, RoomVersionId::V1).expect("the event parses");
+        assert_eq!(event.event_id().as_str(), event_id);
     }
 
     /// One event with its signatures stripped does not sink the join: it is dropped, the rest

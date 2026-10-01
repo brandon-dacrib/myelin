@@ -289,6 +289,12 @@ impl InMemoryRoomSource {
     pub fn insert_room(&mut self, room_id: impl Into<String>, room: FakeRoom) {
         self.rooms.insert(room_id.into(), room);
     }
+
+    /// The rooms inserted, for a test that builds on another test's fixture.
+    #[cfg(test)]
+    pub(crate) fn rooms_for_test(self) -> HashMap<String, FakeRoom> {
+        self.rooms
+    }
 }
 
 #[async_trait]
@@ -531,6 +537,17 @@ impl RoomDataSource for InMemoryRoomSource {
         Ok(StateForJoin {
             state,
             auth_chain: room.join_auth_chain.clone(),
+        })
+    }
+
+    async fn event_for_reference(&self, room_id: &str, event_id: &str) -> Option<Value> {
+        let room = self.rooms.get(room_id)?;
+        if let Some(event) = room.events.get(event_id) {
+            return Some(event.clone());
+        }
+        room.state.iter().find_map(|event| {
+            (event_id_for_fixture(event, room.room_version.as_deref()).as_deref() == Some(event_id))
+                .then(|| event.clone())
         })
     }
 

@@ -67,11 +67,15 @@ async fn make_join(
     if let Err(err) = requesting_server(&headers) {
         return (*err).into_response();
     }
-    let versions: Vec<String> = pairs
+    let mut versions: Vec<String> = pairs
         .into_iter()
         .filter(|(k, _)| k == "ver")
         .map(|(_, v)| v)
         .collect();
+    // The spec's default: a server that names no version supports version 1 only.
+    if versions.is_empty() {
+        versions.push("1".to_owned());
+    }
 
     match join::make_join(
         state.rooms.as_ref(),
@@ -154,14 +158,15 @@ async fn send_join(
                 "origin": ctx.own_server_name,
             });
             if v2 {
-                // v1's `send_join` historically returned `[200, {...}]` (a two-element array);
-                // this server never served v1 for real before this session, so there is no
-                // deployed caller to keep compatible, and the current spec documents the bare
-                // object for both versions -- `event`/`members_omitted` are v2-only additions.
+                // `event`/`members_omitted` are v2-only additions.
                 body["event"] = result.event;
                 body["members_omitted"] = serde_json::json!(result.members_omitted);
+                axum::Json(body).into_response()
+            } else {
+                // v1 answers `[200, {...}]`, as the spec documents it (MSC1802 is why v2
+                // exists), and as v1 `send_leave` does; Sytest's v1 `send_join` checks it.
+                axum::Json(serde_json::json!([200, body])).into_response()
             }
-            axum::Json(body).into_response()
         }
         Err(e) => join_error_response(&e),
     }
@@ -170,16 +175,24 @@ async fn send_join(
 pub(super) fn join_error_response(e: &JoinError) -> Response {
     match e {
         JoinError::RoomNotFound => MatrixError::not_found("unknown room").into_response(),
-        JoinError::IncompatibleRoomVersion { room_version } => MatrixError::custom(
-            StatusCode::BAD_REQUEST,
-            MatrixErrorCode::IncompatibleRoomVersion,
-            format!("this room is room version {room_version}"),
-        )
-        .into_response(),
+        JoinError::IncompatibleRoomVersion { room_version } => {
+            // The spec's `M_INCOMPATIBLE_ROOM_VERSION` names the room's version, so the
+            // joining server can tell its user which version it lacks.
+            let mut error = MatrixError::custom(
+                StatusCode::BAD_REQUEST,
+                MatrixErrorCode::IncompatibleRoomVersion,
+                format!("this room is room version {room_version}"),
+            );
+            error.extra.insert(
+                "room_version".to_owned(),
+                Value::String(room_version.clone()),
+            );
+            error.into_response()
+        }
         JoinError::UnsupportedRoomVersion(v) => MatrixError::custom(
             StatusCode::BAD_REQUEST,
             MatrixErrorCode::UnsupportedRoomVersion,
-            format!("room version {v} is not supported"),
+            format!("room version {v} is not supported by this server"),
         )
         .into_response(),
         JoinError::MalformedUserId(msg) | JoinError::MalformedEvent(msg) => MatrixError::custom(
