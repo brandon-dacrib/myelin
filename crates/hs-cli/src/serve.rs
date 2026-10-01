@@ -1274,6 +1274,10 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         // Every EDU sent and received is counted (`hs_federation::metrics`).
         let edu_metrics = metrics.with_registry(hs_federation::metrics::EduMetrics::register);
         mount.sender.install_edu_metrics(edu_metrics.clone());
+        // A destination caught up from the rooms after its queue overflowed is counted too.
+        mount.sender.install_catch_up_metrics(
+            metrics.with_registry(hs_federation::metrics::CatchUpMetrics::register),
+        );
         mount.state.edu_sink = Some(Arc::new(crate::edus::EduDispatcher::new(
             user_state.hub.clone(),
             e2e_state.clone(),

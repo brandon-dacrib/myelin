@@ -93,15 +93,35 @@ impl DestinationStoreSource {
         }
     }
 
+    /// When each destination in catch-up mode entered it, by destination; empty without a
+    /// sender, or when its store cannot be read (logged).
+    fn catch_up_since(&self) -> BTreeMap<String, u64> {
+        let Some(sender) = &self.sender else {
+            return BTreeMap::new();
+        };
+        match sender.catch_up_marks() {
+            Ok(marks) => marks
+                .into_iter()
+                .map(|(name, mark)| (name, mark.since_ms))
+                .collect(),
+            Err(error) => {
+                tracing::error!(%error, "cannot read the outbound sender's catch-up marks");
+                BTreeMap::new()
+            }
+        }
+    }
+
     async fn all(&self) -> Vec<AdminDestination> {
-        // One row per destination, from whichever of the three sources knows it: the client's
-        // backoff records, the sender's retry states, the sender's queues.
+        // One row per destination, from whichever of the four sources knows it: the client's
+        // backoff records, the sender's retry states, its catch-up marks, its queues.
         let mut names: BTreeSet<String> = BTreeSet::new();
         let client_states: BTreeMap<String, DestinationState> =
             self.destinations.list().await.into_iter().collect();
         names.extend(client_states.keys().cloned());
         let outbound_states = self.outbound_states();
         names.extend(outbound_states.keys().cloned());
+        let catch_up = self.catch_up_since();
+        names.extend(catch_up.keys().cloned());
         if let Some(sender) = &self.sender {
             names.extend(
                 sender
@@ -120,6 +140,7 @@ impl DestinationStoreSource {
                     client_states.get(&name),
                     outbound_states.get(&name),
                     pending,
+                    catch_up.get(&name).copied(),
                 )
             })
             .collect()
@@ -151,6 +172,7 @@ fn view(
     client: Option<&DestinationState>,
     outbound: Option<&OutboundDestinationState>,
     pending_pdu_count: u64,
+    catch_up_since_ms: Option<u64>,
 ) -> AdminDestination {
     let default_client = DestinationState::default();
     let default_outbound = OutboundDestinationState::default();
@@ -178,6 +200,7 @@ fn view(
         retry_interval_ms,
         pending_pdu_count,
         pending_edu_count: 0,
+        catch_up_since: rfc3339(catch_up_since_ms),
     }
 }
 
@@ -279,6 +302,7 @@ impl FederationSource for DestinationStoreSource {
             Some(&state),
             outbound.get(server_name),
             self.pending_for(server_name),
+            self.catch_up_since().get(server_name).copied(),
         ))
     }
 }
@@ -387,6 +411,13 @@ mod tests {
         outbound
             .record_failure("both.example", "HTTP 500", u64::MAX / 2)
             .unwrap();
+        // And `catching.example` overflowed its queue: it is in catch-up mode.
+        outbound
+            .mark_catch_up(
+                "catching.example",
+                crate::outbound_store::CATCH_UP_REQUESTED,
+            )
+            .unwrap();
         let sender = Arc::new(FederationSender::with_store(
             client,
             "us.example",
@@ -400,8 +431,11 @@ mod tests {
             all.iter()
                 .map(|row| row.server_name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["both.example", "queued.example"]
+            vec!["both.example", "catching.example", "queued.example"]
         );
+        let catching = &all[1];
+        assert!(catching.catch_up_since.is_some(), "{catching:?}");
+        assert!(all[0].catch_up_since.is_none() && all[2].catch_up_since.is_none());
         let queued = source
             .get_destination("queued.example")
             .await

@@ -1274,6 +1274,10 @@ pub fn build_mount<B: KvBackend + 'static>(
         server_name.clone(),
         hs_federation::sender::SenderConfig {
             store_rescan_interval,
+            max_queued_pdus_per_destination: usize::try_from(
+                config.federation.max_queued_pdus_per_destination,
+            )
+            .unwrap_or(usize::MAX),
             ..hs_federation::sender::SenderConfig::for_client(&client)
         },
         outbound_store,

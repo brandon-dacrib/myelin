@@ -148,6 +148,7 @@
         "trust_os_root_store": false,
         "client_timeout": "30s",
         "max_retry_backoff": "1h",
+        "max_queued_pdus_per_destination": 10000,
         "allow_public_rooms_over_federation": false,
         "allow_device_name_lookup_over_federation": false
       }
@@ -1372,6 +1373,13 @@
           "description": "Cap on the exponential backoff between retries of a failed\nfederation destination. Corresponds to Synapse's\n`destination_min_retry_interval` family, simplified to one ceiling.",
           "$ref": "#/$defs/Duration",
           "default": "1h"
+        },
+        "max_queued_pdus_per_destination": {
+          "description": "How many events the outbound queue holds for one destination before it is dropped and\nthe destination, once it answers again, is caught up with the latest event of each room\nit is behind in instead (it fetches the rest itself). Bounds what a server that is down\nfor days costs this one's database. Corresponds to Synapse's catch-up mode\n(`destination_rooms`), which Synapse enters on the first failure; Synapse has no\nsetting for it. At least 1.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 10000
         },
         "allow_public_rooms_over_federation": {
           "description": "Advertise this room's public directory over federation. Corresponds\nto Synapse's `allow_public_rooms_over_federation`.",

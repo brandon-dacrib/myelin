@@ -25,10 +25,17 @@
 //! # What a lost update means
 //!
 //! The update stream is a `tokio::sync::broadcast` channel: a consumer that falls too far behind
-//! is told how many updates it missed (`RecvError::Lagged`) and gets nothing else. The sender has
-//! no catch-up (see `hs_federation::sender`'s module docs), so a missed update is a local event
-//! that remote servers are never sent. It is logged at `warn`, with the count, saying exactly
-//! that.
+//! is told how many updates it missed (`RecvError::Lagged`) and gets nothing else. A missed
+//! update is a local event the sender was never handed, so it moved no room's position and the
+//! sender's catch-up does not know of it either (see `hs_federation::sender`'s module docs): a
+//! remote server receives it only as an ancestor of a later event, which it fetches itself. It
+//! is logged at `warn`, with the count, saying exactly that.
+//!
+//! # Catch-up
+//!
+//! A destination that was down for longer than its queue holds is caught up from the rooms
+//! (`hs_federation::sender`'s "Catch-up"): [`RoomCatchUp`] is the [`CatchUpSource`] the sender
+//! asks for each room's latest event, installed by [`OutboundFederation::start`].
 //!
 //! # In a cluster
 //!
@@ -47,14 +54,15 @@ use std::sync::Arc;
 
 use hs_cluster::ownership::{Ownership, OwnershipEvent};
 use hs_cluster::types::{ShardKind, ShardLayout};
-use hs_federation::sender::{FederationSender, SendGate};
+use hs_federation::sender::{CatchUpSource, FederationSender, SendGate};
 use hs_kv::KvBackend;
 use hs_model::Event;
 use hs_room::RoomError;
 use hs_room::actor::RoomActor;
 use hs_room::protocol::RoomUpdate;
 use hs_room::registry::RoomRegistry;
-use ruma::{OwnedServerName, ServerName};
+use hs_room::timeline::Direction;
+use ruma::{OwnedServerName, RoomId, ServerName};
 use serde_json::Value;
 use tokio::sync::broadcast::error::RecvError;
 
@@ -107,6 +115,10 @@ impl OutboundFederation {
         let updates = rooms.subscribe_global();
         let ownership_events = ownership.subscribe();
         sender.set_gate(Arc::new(ShardGate::new(ownership, layout)));
+        sender.install_catch_up_source(Arc::new(RoomCatchUp::new(
+            rooms.clone(),
+            own_server_name.clone(),
+        )));
         resume_logged(&sender);
         let task =
             tokio::spawn(follow(rooms, sender.clone(), own_server_name, updates)).abort_handle();
@@ -207,8 +219,8 @@ async fn follow<B: KvBackend + 'static>(
                 tracing::warn!(
                     missed,
                     "outbound federation fell behind the room update stream: the skipped \
-                     updates' local events will NOT be sent to remote servers (the sender has no \
-                     catch-up yet; see hs_federation::sender)"
+                     updates' local events will NOT be sent to remote servers (they reach one \
+                     only as ancestors of a later event; see hs_federation::sender)"
                 );
             }
             Err(RecvError::Closed) => return,
@@ -276,6 +288,88 @@ fn remote_servers_for<B: KvBackend>(
     }
     servers.remove(own_server_name.as_str());
     Ok(servers.into_iter().collect())
+}
+
+/// How far back [`RoomCatchUp`] looks for this server's latest event in a room whose forward
+/// extremities are all remote.
+const CATCH_UP_SCAN: usize = 200;
+
+/// The sender's [`CatchUpSource`] over the room registry: for a room a destination is behind in,
+/// the latest event this server's own users sent there -- the newest local forward extremity if
+/// there is one (what Synapse prefers too: nothing in the room cites it yet, so the receiver can
+/// fetch everything before it from its `prev_events`), otherwise the newest local event among
+/// the last [`CATCH_UP_SCAN`] -- and nothing if the destination no longer has a user joined.
+pub struct RoomCatchUp<B: KvBackend> {
+    rooms: Arc<RoomRegistry<B>>,
+    own_server_name: OwnedServerName,
+}
+
+impl<B: KvBackend> RoomCatchUp<B> {
+    /// A source over `rooms`, choosing events sent by `own_server_name`'s users.
+    #[must_use]
+    pub fn new(rooms: Arc<RoomRegistry<B>>, own_server_name: OwnedServerName) -> Self {
+        Self {
+            rooms,
+            own_server_name,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<B: KvBackend + 'static> CatchUpSource for RoomCatchUp<B> {
+    async fn latest_pdu(&self, room_id: &str, destination: &str) -> Result<Option<Value>, String> {
+        let room_id = RoomId::parse(room_id).map_err(|e| format!("not a room ID: {e}"))?;
+        let handle = self
+            .rooms
+            .get_or_load(&room_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let own = self.own_server_name.clone();
+        let destination = destination.to_owned();
+        handle
+            .query(move |actor| latest_local_pdu(actor, &own, &destination))
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// See [`RoomCatchUp`].
+fn latest_local_pdu<B: KvBackend>(
+    actor: &RoomActor<B>,
+    own_server_name: &ServerName,
+    destination: &str,
+) -> Result<Option<Value>, RoomError> {
+    let still_joined = actor.joined_members()?.iter().any(|member| {
+        member.header().state_key.as_deref().and_then(server_of) == Some(destination)
+    });
+    if !still_joined {
+        return Ok(None);
+    }
+    let is_local = |event: &Event| event.header().sender.server_name() == own_server_name;
+    let extremity = actor
+        .forward_extremity_ids()
+        .into_iter()
+        .filter_map(|(event_id, _)| {
+            let event = actor.event_by_id(&event_id)?;
+            let position = actor.timeline_position(&event_id)?;
+            is_local(event).then_some((position, event))
+        })
+        .max_by_key(|(position, _)| *position)
+        .map(|(_, event)| event);
+    let latest = match extremity {
+        Some(event) => Some(event),
+        None => actor
+            .paginate(None, Direction::Backward, CATCH_UP_SCAN)
+            .0
+            .into_iter()
+            .find(|event| is_local(event)),
+    };
+    latest
+        .map(|event| {
+            serde_json::from_slice(event.canonical_bytes())
+                .map_err(|e| RoomError::Internal(format!("stored event is not JSON: {e}")))
+        })
+        .transpose()
 }
 
 /// The server-name half of a Matrix user ID (`@user:server` -> `server`).

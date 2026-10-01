@@ -19,6 +19,10 @@ fn default_max_retry_backoff() -> Duration {
     Duration::from_mins(60)
 }
 
+const fn default_max_queued_pdus_per_destination() -> u32 {
+    10_000
+}
+
 fn default_ip_range_blocklist() -> Vec<String> {
     vec![
         "127.0.0.0/8".into(),
@@ -121,6 +125,15 @@ pub struct FederationConfig {
     #[serde(default = "default_max_retry_backoff")]
     pub max_retry_backoff: Duration,
 
+    /// How many events the outbound queue holds for one destination before it is dropped and
+    /// the destination, once it answers again, is caught up with the latest event of each room
+    /// it is behind in instead (it fetches the rest itself). Bounds what a server that is down
+    /// for days costs this one's database. Corresponds to Synapse's catch-up mode
+    /// (`destination_rooms`), which Synapse enters on the first failure; Synapse has no
+    /// setting for it. At least 1.
+    #[serde(default = "default_max_queued_pdus_per_destination")]
+    pub max_queued_pdus_per_destination: u32,
+
     /// Advertise this room's public directory over federation. Corresponds
     /// to Synapse's `allow_public_rooms_over_federation`.
     #[serde(default)]
@@ -145,6 +158,7 @@ impl Default for FederationConfig {
             trust_os_root_store: false,
             client_timeout: default_client_timeout(),
             max_retry_backoff: default_max_retry_backoff(),
+            max_queued_pdus_per_destination: default_max_queued_pdus_per_destination(),
             allow_public_rooms_over_federation: false,
             allow_device_name_lookup_over_federation: false,
         }
@@ -210,6 +224,12 @@ impl Validate for FederationConfig {
         if self.client_timeout.is_zero() {
             errors.push(format!("{prefix}.client_timeout"), "must be greater than 0");
         }
+        if self.max_queued_pdus_per_destination == 0 {
+            errors.push(
+                format!("{prefix}.max_queued_pdus_per_destination"),
+                "must be at least 1",
+            );
+        }
     }
 }
 
@@ -259,6 +279,19 @@ mod tests {
         let mut errors = ValidationErrors::new();
         cfg.validate("federation", &mut errors);
         assert_eq!(errors.0[0].path, "federation.custom_ca_certificates[0]");
+    }
+
+    #[test]
+    fn a_zero_queue_bound_is_rejected() {
+        let mut cfg = FederationConfig::default();
+        assert_eq!(cfg.max_queued_pdus_per_destination, 10_000);
+        cfg.max_queued_pdus_per_destination = 0;
+        let mut errors = ValidationErrors::new();
+        cfg.validate("federation", &mut errors);
+        assert_eq!(
+            errors.0[0].path,
+            "federation.max_queued_pdus_per_destination"
+        );
     }
 
     #[test]

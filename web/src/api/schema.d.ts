@@ -2797,6 +2797,11 @@ export interface components {
             valid?: boolean;
         };
         Destination: {
+            /**
+             * Format: date-time
+             * @description When the destination's outbound queue overflowed (or catch-up was otherwise asked for) and it went into catch-up mode; null when it is not catching up. While set, nothing more is queued for it, and once it answers it is sent the latest event of each room it is behind in.
+             */
+            catch_up_since?: string | null;
             /** Format: date-time */
             failing_since?: string | null;
             /** Format: date-time */

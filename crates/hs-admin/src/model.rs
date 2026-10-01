@@ -719,6 +719,11 @@ pub struct AdminDestination {
     pub retry_interval_ms: Option<u64>,
     pub pending_pdu_count: u64,
     pub pending_edu_count: u64,
+    /// When the destination went into catch-up mode (its queue overflowed, or catch-up was
+    /// asked for); `None` while it is not catching up. See `hs_federation::sender`'s
+    /// "Catch-up".
+    #[serde(default)]
+    pub catch_up_since: Option<String>,
 }
 
 /// The OpenAPI `AppService` schema: one row of `GET /appservices` and the body of every
