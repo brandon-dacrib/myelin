@@ -58,7 +58,7 @@ export function MediaPage() {
     (id: string) => setFollowed((ids) => ids.filter((i) => i !== id)),
     [],
   );
-  const canRead = hasScope("admin:read");
+  const canRead = hasScope("moderation:read");
 
   const filters: MediaListFilters = {
     q: search.q,
@@ -170,7 +170,7 @@ export function MediaPage() {
     return (
       <div className="p-6">
         <h1 className="text-xl text-text">Media</h1>
-        <ForbiddenState scope="admin:read" />
+        <ForbiddenState scope="moderation:read" />
       </div>
     );
   }
