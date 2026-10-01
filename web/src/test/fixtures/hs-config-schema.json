@@ -292,7 +292,7 @@
           "x-applies": "bootstrap"
         },
         "public_baseurl": {
-          "description": "The externally reachable base URL for clients, if different from\n`https://{server_name}`. Corresponds to Synapse's `public_baseurl`.",
+          "description": "The address clients reach this server at (`https://matrix.example.org`), when it is not\n`https://` plus the server name. Clients find it through the `.well-known` document this\nserver serves when it is set, and links this server hands out use it. Corresponds to\nSynapse's `public_baseurl`.",
           "type": [
             "string",
             "null"
@@ -316,7 +316,7 @@
           "x-applies": "bootstrap"
         },
         "admin_contact": {
-          "description": "Contact address advertised for abuse reports and shown to operators\nof other servers. Corresponds to Synapse's `admin_contact`.",
+          "description": "An address (`mailto:abuse@example.org`) for people and other servers' operators to report\nabuse to. Nothing publishes it yet. Corresponds to Synapse's `admin_contact`.",
           "type": [
             "string",
             "null"
@@ -325,7 +325,7 @@
           "x-applies": "hot"
         },
         "report_stats": {
-          "description": "Whether this server opts in to the anonymised statistics-reporting\nendpoint. Corresponds to Synapse's `report_stats`.",
+          "description": "Whether to send anonymous usage statistics to the Matrix.org Foundation, as Synapse can.\nNothing sends them yet, so this has no effect. Corresponds to Synapse's `report_stats`.",
           "type": "boolean",
           "default": false,
           "x-applies": "hot"
@@ -668,13 +668,13 @@
           "x-applies": "restart"
         },
         "max_upload_size": {
-          "description": "Maximum accepted upload size. Corresponds to Synapse's\n`max_upload_size`.",
+          "description": "The largest file a person may upload (`50M`, `1G`). Clients read it and refuse bigger\nfiles before sending them. Larger allows videos and archives at the cost of storage.\nCorresponds to Synapse's `max_upload_size`.",
           "$ref": "#/$defs/ByteSize",
           "default": "50M",
           "x-applies": "hot"
         },
         "thumbnail_sizes": {
-          "description": "Thumbnail sizes to pre-generate/serve on demand. Corresponds to\nSynapse's `thumbnail_sizes`.",
+          "description": "The thumbnail sizes this server makes of uploaded images, which clients show in timelines\nand room lists. A client asking for another size gets the nearest. Corresponds to\nSynapse's `thumbnail_sizes`.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/ThumbnailSize"
@@ -709,13 +709,13 @@
           "x-applies": "hot"
         },
         "url_preview_enabled": {
-          "description": "Enable `GET /_matrix/media/*/preview_url`. Corresponds to Synapse's\n`url_preview_enabled`.",
+          "description": "Whether this server fetches web pages to show a preview (title, description, image) of a\nlink someone posts. Off by default: the server then visits every link people share,\nwhich reveals to those sites that someone here posted them. Corresponds to Synapse's\n`url_preview_enabled`.",
           "type": "boolean",
           "default": false,
           "x-applies": "hot"
         },
         "url_preview_ip_range_blocklist": {
-          "description": "IP ranges URL previews must not fetch from (SSRF protection).\nCorresponds to Synapse's `url_preview_ip_range_blacklist`.",
+          "description": "Addresses link previews may never fetch from, so a posted link cannot make this server\nreach its own private network (server-side request forgery). The default blocks every\nprivate and loopback range. Corresponds to Synapse's `url_preview_ip_range_blacklist`.",
           "type": "array",
           "items": {
             "type": "string"
@@ -734,7 +734,7 @@
           "x-applies": "hot"
         },
         "remote_media_retention": {
-          "description": "How long to keep cached copies of remote media. `None` means keep\nforever. Corresponds to Synapse's\n`media_retention.remote_media_lifetime`.",
+          "description": "How long to keep copies of other servers' media. Nothing evicts remote media yet, so\nthis setting has no effect. Unset means keep forever. Corresponds to Synapse's\n`media_retention.remote_media_lifetime`.",
           "anyOf": [
             {
               "$ref": "#/$defs/Duration"
@@ -1327,7 +1327,7 @@
       "type": "object",
       "properties": {
         "enabled": {
-          "description": "Master switch for outbound and inbound federation traffic.\nCorresponds to Synapse's `federation_domain_whitelist` being\nunset/set combined with the general notion of \"federation off\".",
+          "description": "Whether this server talks to other Matrix servers at all. Off, its users can only talk to\neach other: no joining rooms elsewhere, no messages from other servers. Corresponds to\nSynapse's `federation_domain_whitelist` set to an empty list.",
           "type": "boolean",
           "default": true,
           "x-applies": "restart"
@@ -1394,13 +1394,13 @@
           "x-applies": "restart"
         },
         "client_timeout": {
-          "description": "Per-request timeout for outbound federation HTTP calls. Corresponds\nto Synapse's `federation_client_timeout`.",
+          "description": "How long this server waits for another server to answer one request before giving up\nand counting it as a failure. Too short fails slow but working servers; too long ties\nup a sender on a server that is gone. Corresponds to Synapse's\n`federation_client_timeout`.",
           "$ref": "#/$defs/Duration",
           "default": "30s",
           "x-applies": "restart"
         },
         "max_retry_backoff": {
-          "description": "Cap on the exponential backoff between retries of a failed\nfederation destination. Corresponds to Synapse's\n`destination_min_retry_interval` family, simplified to one ceiling.",
+          "description": "The longest this server waits between attempts to reach a server that keeps failing.\nThe wait doubles after each failure up to this; Reset backoff on the destination's page\ntries at once. Corresponds to Synapse's `destination_min_retry_interval` family,\nsimplified to one ceiling.",
           "$ref": "#/$defs/Duration",
           "default": "1h",
           "x-applies": "restart"
@@ -1414,7 +1414,7 @@
           "x-applies": "restart"
         },
         "allow_public_rooms_over_federation": {
-          "description": "Advertise this room's public directory over federation. Corresponds\nto Synapse's `allow_public_rooms_over_federation`.",
+          "description": "Whether other servers may read this server's public room directory, so their users can\nfind this server's public rooms by browsing it. Off by default, as in Synapse.\nCorresponds to Synapse's `allow_public_rooms_over_federation`.",
           "type": "boolean",
           "default": false,
           "x-applies": "hot"
@@ -1429,17 +1429,17 @@
       "additionalProperties": false
     },
     "RateLimitConfig": {
-      "description": "All configured rate-limit buckets.",
+      "description": "Rate limits: how fast one user, address or server may do each costly thing before requests\nare refused with `429` and a time to wait. Defaults are Synapse's.",
       "type": "object",
       "properties": {
         "enabled": {
-          "description": "Master switch; when false, no limiter runs (tests and benchmarking\nonly — never recommended in production).",
+          "description": "Whether any rate limit is enforced. Leave it on: switched off, nothing stops one account\nor address from flooding rooms, guessing passwords or registering accounts in bulk. It\nexists for test harnesses and benchmarks that send far faster than people do.",
           "type": "boolean",
           "default": true,
           "x-applies": "hot"
         },
         "message": {
-          "description": "Per-user event sending: messages, state and redactions. Corresponds to Synapse's\n`rc_message`. A `per_second` of `0` limits nobody. Appservices that registered with\n`rate_limited: false` are exempt.",
+          "description": "How fast one user may send events: messages, room settings (state) and redactions,\ncounted per sender. An administrator can give one user other limits on their user page.\nCorresponds to Synapse's `rc_message`. Bridges that\nregistered with `rate_limited: false` are exempt.",
           "$ref": "#/$defs/RateLimitBucket",
           "default": {
             "per_second": 0.2,
@@ -1448,7 +1448,7 @@
           "x-applies": "hot"
         },
         "registration": {
-          "description": "`POST /register`. Corresponds to Synapse's `rc_registration`.",
+          "description": "How fast accounts may be created from one client address (`POST /register`). Counted when\nan account is actually made, so a sign-up that fails a step costs nothing. Keeps a script\nfrom registering accounts in bulk when registration is open. Bridges are exempt.\nCorresponds to Synapse's `rc_registration`.",
           "$ref": "#/$defs/RateLimitBucket",
           "default": {
             "per_second": 0.17,
@@ -1457,7 +1457,7 @@
           "x-applies": "hot"
         },
         "login": {
-          "description": "`POST /login`. Corresponds to Synapse's `rc_login.address`.",
+          "description": "How fast sign-in attempts may come from one client address (`POST /login`): the guard\nagainst password guessing. The address is the first one a proxy in front of the server\nforwards, so set the listener's `x_forwarded` behind a public proxy. Bridges are exempt.\nCorresponds to Synapse's `rc_login.address`.",
           "$ref": "#/$defs/RateLimitBucket",
           "default": {
             "per_second": 0.17,
@@ -1466,7 +1466,7 @@
           "x-applies": "hot"
         },
         "joins_local": {
-          "description": "Local room joins. Corresponds to Synapse's `rc_joins.local`.",
+          "description": "How fast one user may join rooms this server already takes part in. Joins are cheap here,\nso the limit only stops a script joining hundreds of rooms at once. Corresponds to\nSynapse's `rc_joins.local`.",
           "$ref": "#/$defs/RateLimitBucket",
           "default": {
             "per_second": 0.1,
@@ -1475,7 +1475,7 @@
           "x-applies": "hot"
         },
         "joins_remote": {
-          "description": "Joins to rooms on remote servers. Corresponds to Synapse's\n`rc_joins.remote`.",
+          "description": "How fast one user may join rooms on other servers. Each such join fetches the room's state\nover federation, which can take this server minutes and a lot of memory for a large\nroom, so this limit is the strictest. Corresponds to Synapse's `rc_joins.remote`.",
           "$ref": "#/$defs/RateLimitBucket",
           "default": {
             "per_second": 0.01,
@@ -1484,7 +1484,7 @@
           "x-applies": "hot"
         },
         "admin_redaction": {
-          "description": "Admin-triggered redactions. Corresponds to Synapse's\n`rc_admin_redaction`.",
+          "description": "How fast a server administrator's redactions may go, in place of the message limit, so\nthat removing a spammer's messages is not throttled like ordinary sending. Corresponds to\nSynapse's `rc_admin_redaction`.",
           "$ref": "#/$defs/RateLimitBucket",
           "default": {
             "per_second": 1.0,
@@ -1493,7 +1493,7 @@
           "x-applies": "hot"
         },
         "federation": {
-          "description": "Inbound federation transactions per origin server. Corresponds to\nSynapse's `rc_federation`.",
+          "description": "How fast one other server may send transactions to this one (`PUT /send`), counted per\norigin server. A server catching up after an outage sends in bursts; too low a limit\nslows how soon its users' messages arrive here. Corresponds to Synapse's\n`rc_federation`.",
           "$ref": "#/$defs/RateLimitBucket",
           "default": {
             "per_second": 10.0,
@@ -1502,7 +1502,7 @@
           "x-applies": "hot"
         },
         "third_party_id_validation": {
-          "description": "`POST /account/3pid/*/requestToken`. Corresponds to Synapse's\n`rc_3pid_validation`.",
+          "description": "How fast email and phone verification codes may be requested\n(`POST /account/3pid/*/requestToken`). Not used yet: this server sends no verification\ncodes. Corresponds to Synapse's `rc_3pid_validation`.",
           "$ref": "#/$defs/RateLimitBucket",
           "default": {
             "per_second": 0.003,
@@ -1518,12 +1518,12 @@
       "type": "object",
       "properties": {
         "per_second": {
-          "description": "Steady-state rate, in actions per second. May be fractional (e.g.\n`0.17` is roughly one every six seconds, Synapse's `rc_message`\ndefault).",
+          "description": "How fast the bucket refills, in actions per second, once its burst is spent. May be\nfractional: `0.2` is one every five seconds, `0.01` one every hundred seconds. Lower is\nstricter; `0` switches this one limit off.",
           "type": "number",
           "format": "double"
         },
         "burst_count": {
-          "description": "Bucket size: how many actions may happen back-to-back before the\nsteady-state rate applies.",
+          "description": "How many actions may happen back to back before the refill rate applies. A person rarely\ndoes more than a few at once, so a small burst stops scripts without anyone noticing it.\nAt least 1.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0
@@ -1536,11 +1536,11 @@
       ]
     },
     "AuthConfig": {
-      "description": "Authentication, session and registration settings.",
+      "description": "Who can sign up and how people sign in: registration, passwords, tokens and other sign-in\nservices.",
       "type": "object",
       "properties": {
         "enable_registration": {
-          "description": "Allow `POST /register`. Corresponds to Synapse's\n`enable_registration`.",
+          "description": "Whether anyone may create an account on this server from a client (`POST /register`).\nOff by default: accounts are then made by an administrator or with a registration token\nor invite link (Settings). Turned on, anyone who can reach the server can sign up, so\npair it with registration tokens or expect spam accounts. Corresponds to Synapse's\n`enable_registration`.",
           "type": "boolean",
           "default": false,
           "x-applies": "hot"
@@ -1561,13 +1561,13 @@
           "x-applies": "hot"
         },
         "registration_shared_secret": {
-          "description": "Inline shared secret for the `/_synapse/mk_admin_user`-equivalent\nshared-secret registration protocol (see `hs-compat`). Prefer\n`registration_shared_secret_file`. Corresponds to Synapse's\n`registration_shared_secret`.",
+          "description": "A secret that lets a tool create accounts, administrators included, without signing in\n(the shared-secret registration that `hs register` and Synapse's `register_new_matrix_user`\nuse). Anyone holding it can make an administrator, so leave it empty unless a script needs\nit. Prefer `registration_shared_secret_file`. Corresponds to Synapse's\n`registration_shared_secret`.",
           "$ref": "#/$defs/SecretString",
           "default": null,
           "x-applies": "hot"
         },
         "registration_shared_secret_file": {
-          "description": "Path to a file containing the shared-secret-registration secret.",
+          "description": "Path to a file holding the shared-secret registration secret, read in place of\n`registration_shared_secret` so the secret stays out of the database.",
           "type": [
             "string",
             "null"
@@ -1582,19 +1582,19 @@
           "x-applies": "hot"
         },
         "enable_legacy_login": {
-          "description": "Serve the legacy `/login` and user-interactive-auth flows in\naddition to the native OAuth 2.0 issuer. Needed for older clients,\nbridges and `m.login.application_service`.",
+          "description": "Whether to serve the classic Matrix sign-in (`/login` and user-interactive auth) beside\nthe OAuth 2.0 issuer. Every client today, and bridges, sign in this way. Nothing reads\nthis setting yet: the classic sign-in is always served.",
           "type": "boolean",
           "default": true,
           "x-applies": "restart"
         },
         "session_secret": {
-          "description": "Inline key signing issued access/refresh tokens and session\ncookies. Prefer `session_secret_file`. Corresponds to Synapse's\n`macaroon_secret_key`.",
+          "description": "The key that signs session cookies and OAuth state. Nothing reads this setting yet.\nPrefer `session_secret_file`. Corresponds to Synapse's `macaroon_secret_key`.",
           "$ref": "#/$defs/SecretString",
           "default": null,
           "x-applies": "restart"
         },
         "session_secret_file": {
-          "description": "Path to a file containing the session-signing secret.",
+          "description": "Path to a file holding the session-signing key, read in place of `session_secret`.",
           "type": [
             "string",
             "null"
@@ -1603,13 +1603,13 @@
           "x-applies": "restart"
         },
         "access_token_lifetime": {
-          "description": "Access token lifetime. Corresponds to Synapse's\n`access_token_lifetime` (native OAuth tokens; legacy non-refreshable\ntokens are unaffected, matching Synapse's own carve-out).",
+          "description": "How long an access token from the OAuth issuer works before the client must refresh it.\nShorter limits the damage of a leaked token; clients refresh on their own, so people do\nnot notice. Tokens from the classic sign-in that cannot be refreshed are not affected,\nas in Synapse. Corresponds to Synapse's `access_token_lifetime`.",
           "$ref": "#/$defs/Duration",
           "default": "1h",
           "x-applies": "hot"
         },
         "refresh_token_lifetime": {
-          "description": "Refresh token lifetime; `None` means refresh tokens do not expire.\nCorresponds to Synapse's `refreshable_access_token_lifetime`\nfamily.",
+          "description": "How long a refresh token works: after it, a device that has not been used must sign in\nagain. Unset, refresh tokens never expire. Corresponds to Synapse's\n`refreshable_access_token_lifetime` family.",
           "anyOf": [
             {
               "$ref": "#/$defs/Duration"
@@ -1622,7 +1622,7 @@
           "x-applies": "hot"
         },
         "password": {
-          "description": "Password login settings.",
+          "description": "Password sign-in: whether it is offered, the pepper mixed into hashes, and what a new\npassword must contain.",
           "$ref": "#/$defs/PasswordConfig",
           "default": {
             "enabled": true,
@@ -1638,7 +1638,7 @@
           }
         },
         "oidc_providers": {
-          "description": "Upstream OIDC providers.",
+          "description": "Other sign-in services people may use instead of a password here (\"Sign in with Google\",\na company Keycloak or Okta), each registered with the provider first. Empty by default.\nCorresponds to Synapse's `oidc_providers`.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/OidcProviderConfig"
@@ -1647,7 +1647,7 @@
           "x-applies": "restart"
         },
         "mas_delegation": {
-          "description": "When set, delegate to Matrix Authentication Service instead of\nrunning the native OAuth issuer.",
+          "description": "Hand sign-in to a separate Matrix Authentication Service (MAS) instead of this server's\nown OAuth issuer. Unset by default, which is right unless MAS is already deployed.\nCorresponds to Synapse's `experimental_features.msc3861`.",
           "anyOf": [
             {
               "$ref": "#/$defs/MasDelegationConfig"
@@ -1667,19 +1667,19 @@
       "type": "object",
       "properties": {
         "enabled": {
-          "description": "Allow password login at all. Corresponds to Synapse's\n`password_config.enabled`.",
+          "description": "Whether people may sign in with a password. Nothing reads this setting yet: password\nsign-in is always offered, so changing it has no effect. Corresponds to Synapse's\n`password_config.enabled`.",
           "type": "boolean",
           "default": true,
           "x-applies": "restart"
         },
         "pepper": {
-          "description": "Inline pepper mixed into password hashes. Prefer `pepper_file`.\nCorresponds to Synapse's `password_config.pepper`.",
+          "description": "A secret mixed into every password hash, so a copy of the database alone is not enough to\nguess passwords from. Set it once and keep it: changing or losing it makes every existing\npassword stop working. Migrating from Synapse, set the same value Synapse had. Prefer\n`pepper_file`. Corresponds to Synapse's `password_config.pepper`.",
           "$ref": "#/$defs/SecretString",
           "default": null,
           "x-applies": "hot"
         },
         "pepper_file": {
-          "description": "Path to a file containing the pepper.",
+          "description": "Path to a file holding the pepper, read in place of `pepper` so the secret stays out of\nthe database and its backups. Changing or losing it makes every existing password stop\nworking, as for `pepper`.",
           "type": [
             "string",
             "null"
@@ -1688,7 +1688,7 @@
           "x-applies": "hot"
         },
         "policy": {
-          "description": "Complexity requirements. Corresponds to Synapse's\n`password_config.policy`.",
+          "description": "What a new password must contain. Checked when a password is set or changed, never\nagainst passwords people already have. Corresponds to Synapse's\n`password_config.policy`.",
           "$ref": "#/$defs/PasswordPolicy",
           "default": {
             "minimum_length": 8,
@@ -1707,29 +1707,29 @@
       "type": "object",
       "properties": {
         "minimum_length": {
-          "description": "Minimum length.",
+          "description": "The fewest characters a new password may have. Length matters far more than character\nclasses; at least 1.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0,
           "default": 8
         },
         "require_digit": {
-          "description": "Require at least one digit.",
+          "description": "Whether a new password must contain a digit (0-9).",
           "type": "boolean",
           "default": false
         },
         "require_symbol": {
-          "description": "Require at least one symbol.",
+          "description": "Whether a new password must contain a symbol (a character that is not a letter or a\ndigit).",
           "type": "boolean",
           "default": false
         },
         "require_uppercase": {
-          "description": "Require at least one uppercase letter.",
+          "description": "Whether a new password must contain an uppercase letter.",
           "type": "boolean",
           "default": false
         },
         "require_lowercase": {
-          "description": "Require at least one lowercase letter.",
+          "description": "Whether a new password must contain a lowercase letter.",
           "type": "boolean",
           "default": false
         }
@@ -1753,20 +1753,20 @@
           "default": null
         },
         "issuer": {
-          "description": "The provider's issuer URL (used for discovery).",
+          "description": "The provider's issuer URL, from which this server discovers its endpoints and keys\n(`https://accounts.google.com`, `https://keycloak.example.org/realms/main`).",
           "type": "string"
         },
         "client_id": {
-          "description": "OAuth client ID registered with the provider.",
+          "description": "The client ID the provider gave this server when it was registered there.",
           "type": "string"
         },
         "client_secret": {
-          "description": "Inline client secret. Prefer `client_secret_file`.",
+          "description": "The client secret the provider gave this server. Prefer `client_secret_file`.",
           "$ref": "#/$defs/SecretString",
           "default": null
         },
         "client_secret_file": {
-          "description": "Path to a file containing the client secret.",
+          "description": "Path to a file holding the client secret, read in place of `client_secret`.",
           "type": [
             "string",
             "null"
@@ -1774,7 +1774,7 @@
           "default": null
         },
         "scopes": {
-          "description": "OAuth scopes to request.",
+          "description": "The OAuth scopes asked of the provider at sign-in. `openid` is required; `profile`\nbrings the person's name, `email` their address.",
           "type": "array",
           "items": {
             "type": "string"
@@ -1797,7 +1797,7 @@
       "type": "object",
       "properties": {
         "endpoint": {
-          "description": "MAS's internal endpoint for introspection and provisioning calls.",
+          "description": "The URL at which this server reaches MAS to check tokens and provision accounts: MAS's\ninternal address, not the one people sign in at.",
           "type": "string"
         },
         "shared_secret": {
@@ -1806,7 +1806,7 @@
           "default": null
         },
         "shared_secret_file": {
-          "description": "Path to a file containing the shared secret.",
+          "description": "Path to a file holding the shared secret, read in place of `shared_secret`.",
           "type": [
             "string",
             "null"
@@ -1824,7 +1824,7 @@
       "type": "object",
       "properties": {
         "enabled": {
-          "description": "Master switch for appservice transaction delivery.",
+          "description": "Whether events are delivered to bridges and other appservices. Nothing reads this\nsetting yet: delivery is always on, and a bridge is paused on its own page instead.",
           "type": "boolean",
           "default": true,
           "x-applies": "restart"
@@ -1839,7 +1839,7 @@
           "x-applies": "bootstrap"
         },
         "tracking_failure_threshold": {
-          "description": "Consecutive delivery failures to one appservice before it is marked\nunhealthy and moved to backlog-only delivery.",
+          "description": "How many deliveries in a row may fail before a bridge is marked unhealthy and events for\nit are kept in its backlog, to be replayed when it is back, instead of being retried one\nby one. Lower notices a dead bridge sooner; higher rides out a bridge that restarts\noften. At least 1.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0,
@@ -1850,11 +1850,11 @@
       "additionalProperties": false
     },
     "TelemetryConfig": {
-      "description": "Telemetry: metrics, tracing, logging and error reporting.",
+      "description": "Telemetry: what the server tells an operator about itself -- metrics, traces, logs and\nerror reports.",
       "type": "object",
       "properties": {
         "metrics": {
-          "description": "Prometheus metrics.",
+          "description": "Prometheus metrics: whether `/metrics` is served, and under which names.",
           "$ref": "#/$defs/MetricsConfig",
           "default": {
             "enabled": false,
@@ -1863,7 +1863,7 @@
           "x-applies": "restart"
         },
         "tracing": {
-          "description": "OpenTelemetry tracing.",
+          "description": "OpenTelemetry tracing: whether requests are traced, how many, and where traces go.",
           "$ref": "#/$defs/TracingConfig",
           "default": {
             "enabled": false,
@@ -1873,7 +1873,7 @@
           "x-applies": "restart"
         },
         "logging": {
-          "description": "Structured logging.",
+          "description": "Logging: how much is logged, and as text or JSON lines.",
           "$ref": "#/$defs/LoggingConfig",
           "default": {
             "level": "info",
@@ -1881,7 +1881,7 @@
           }
         },
         "sentry": {
-          "description": "Sentry error reporting; absent disables it.",
+          "description": "Sentry error reporting. Unset by default, which sends nothing anywhere.",
           "anyOf": [
             {
               "$ref": "#/$defs/SentryConfig"
@@ -1897,16 +1897,16 @@
       "additionalProperties": false
     },
     "MetricsConfig": {
-      "description": "Prometheus metrics.",
+      "description": "Prometheus metrics: counters and timings a monitoring system scrapes from `/metrics`.",
       "type": "object",
       "properties": {
         "enabled": {
-          "description": "Serve `/metrics` on a listener with the `metrics` resource.",
+          "description": "Whether to serve `/metrics` (on a listener that has the `metrics` resource) for Prometheus\nor a compatible scraper. Costs nearly nothing; leave it on. Off, there is no way to see\nthe server's load, queues or errors over time.",
           "type": "boolean",
           "default": false
         },
         "synapse_compat_names": {
-          "description": "Additionally export Synapse-named metrics (`synapse_*`) alongside\nthe native `hs_*` ones, for dashboards built against Synapse.",
+          "description": "Also export metrics under Synapse's names (`synapse_*`) beside this server's own `hs_*`\nones, so Grafana dashboards built for Synapse keep working after a migration. Doubles\nthe series scraped for those metrics.",
           "type": "boolean",
           "default": true
         }
@@ -1914,16 +1914,16 @@
       "additionalProperties": false
     },
     "TracingConfig": {
-      "description": "OpenTelemetry distributed tracing.",
+      "description": "OpenTelemetry tracing: a timeline of each request across this server's parts and replicas,\nsent to a collector such as Jaeger or Tempo.",
       "type": "object",
       "properties": {
         "enabled": {
-          "description": "Emit spans at all.",
+          "description": "Whether to send traces. Off by default; turn it on with a collector to send them to, to\nfind where slow requests spend their time. Sending costs a little CPU and network per\nsampled request.",
           "type": "boolean",
           "default": false
         },
         "otlp_endpoint": {
-          "description": "OTLP collector endpoint. Required when `enabled` is true.",
+          "description": "The OTLP collector traces are sent to (`http://otel-collector:4317`). Required when\ntracing is on.",
           "type": [
             "string",
             "null"
@@ -1931,7 +1931,7 @@
           "default": null
         },
         "sample_ratio": {
-          "description": "Fraction of traces sampled, `0.0` to `1.0`.",
+          "description": "The share of requests traced, from `0.0` (none) to `1.0` (every one). A small share is\nenough to find slow paths on a busy server and keeps the cost down.",
           "type": "number",
           "format": "double",
           "default": 0.1
@@ -1940,7 +1940,7 @@
       "additionalProperties": false
     },
     "LoggingConfig": {
-      "description": "Structured logging.",
+      "description": "Logging: what the server writes to its standard output.",
       "type": "object",
       "properties": {
         "level": {
@@ -1989,16 +1989,16 @@
       ]
     },
     "SentryConfig": {
-      "description": "Sentry error reporting.",
+      "description": "Sentry error reporting: errors and panics sent to a Sentry project, with their context.",
       "type": "object",
       "properties": {
         "dsn": {
-          "description": "Inline DSN. Prefer `dsn_file`.",
+          "description": "The Sentry project's DSN (the URL Sentry gives a project), which turns reporting on.\nPrefer `dsn_file`.",
           "$ref": "#/$defs/SecretString",
           "default": null
         },
         "dsn_file": {
-          "description": "Path to a file containing the DSN.",
+          "description": "Path to a file holding the DSN, read in place of `dsn`.",
           "type": [
             "string",
             "null"
@@ -2006,7 +2006,7 @@
           "default": null
         },
         "environment": {
-          "description": "Environment tag attached to events.",
+          "description": "The environment each report is tagged with (`production`, `staging`), to tell\ndeployments apart in one Sentry project.",
           "type": "string",
           "default": "production"
         }
@@ -2014,7 +2014,7 @@
       "additionalProperties": false
     },
     "ClusterConfig": {
-      "description": "Cluster topology and ownership tuning.",
+      "description": "Running as several replicas: how work is split between them and how fast a lost replica's\nwork moves to the others.",
       "type": "object",
       "properties": {
         "single_node": {
@@ -2024,7 +2024,7 @@
           "x-applies": "bootstrap"
         },
         "room_shards": {
-          "description": "Number of room ownership shards. Fixed at cluster creation.",
+          "description": "How many parts rooms are split into for sharing between replicas. Fixed when the\nserver is first set up: changing it later would move every room at once. More parts\nspread rooms more evenly over many replicas.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0,
@@ -2032,7 +2032,7 @@
           "x-applies": "restart"
         },
         "user_shards": {
-          "description": "Number of user-session ownership shards. Fixed at cluster creation.",
+          "description": "How many parts users' sessions are split into for sharing between replicas. Fixed when\nthe server is first set up, like `room_shards`.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0,
@@ -2052,13 +2052,13 @@
           "x-applies": "bootstrap"
         },
         "heartbeat_interval": {
-          "description": "How often a replica renews its liveness heartbeat.",
+          "description": "How often each replica tells the others it is alive. Shorter notices a lost replica\nsooner, at the cost of more writes to the database; keep it well under `lease_ttl`.",
           "$ref": "#/$defs/Duration",
           "default": "2s",
           "x-applies": "restart"
         },
         "lease_ttl": {
-          "description": "How long a lease survives without a heartbeat before another\nreplica may claim ownership.",
+          "description": "How long a replica may go without a heartbeat before the others take over its rooms and\nusers. Shorter recovers sooner from a crash; too short and a replica that only paused\n(a long garbage collection, a busy node) loses its work for nothing.",
           "$ref": "#/$defs/Duration",
           "default": "10s",
           "x-applies": "restart"

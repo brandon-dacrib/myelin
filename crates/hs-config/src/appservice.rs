@@ -28,7 +28,8 @@ fn default_tracking_failure_threshold() -> u32 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppservicesConfig {
-    /// Master switch for appservice transaction delivery.
+    /// Whether events are delivered to bridges and other appservices. Nothing reads this
+    /// setting yet: delivery is always on, and a bridge is paused on its own page instead.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Registration YAML files to import into the appservice registry, once each. Corresponds to
@@ -39,8 +40,10 @@ pub struct AppservicesConfig {
     /// in the bootstrap file or the environment, never stored in the database.
     #[serde(default)]
     pub registration_files: Vec<PathBuf>,
-    /// Consecutive delivery failures to one appservice before it is marked
-    /// unhealthy and moved to backlog-only delivery.
+    /// How many deliveries in a row may fail before a bridge is marked unhealthy and events for
+    /// it are kept in its backlog, to be replayed when it is back, instead of being retried one
+    /// by one. Lower notices a dead bridge sooner; higher rides out a bridge that restarts
+    /// often. At least 1.
     #[serde(default = "default_tracking_failure_threshold")]
     pub tracking_failure_threshold: u32,
 }

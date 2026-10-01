@@ -22,15 +22,18 @@ fn default_environment() -> String {
     "production".to_owned()
 }
 
-/// Prometheus metrics.
+/// Prometheus metrics: counters and timings a monitoring system scrapes from `/metrics`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
-    /// Serve `/metrics` on a listener with the `metrics` resource.
+    /// Whether to serve `/metrics` (on a listener that has the `metrics` resource) for Prometheus
+    /// or a compatible scraper. Costs nearly nothing; leave it on. Off, there is no way to see
+    /// the server's load, queues or errors over time.
     #[serde(default)]
     pub enabled: bool,
-    /// Additionally export Synapse-named metrics (`synapse_*`) alongside
-    /// the native `hs_*` ones, for dashboards built against Synapse.
+    /// Also export metrics under Synapse's names (`synapse_*`) beside this server's own `hs_*`
+    /// ones, so Grafana dashboards built for Synapse keep working after a migration. Doubles
+    /// the series scraped for those metrics.
     #[serde(default = "default_true")]
     pub synapse_compat_names: bool,
 }
@@ -44,17 +47,22 @@ impl Default for MetricsConfig {
     }
 }
 
-/// OpenTelemetry distributed tracing.
+/// OpenTelemetry tracing: a timeline of each request across this server's parts and replicas,
+/// sent to a collector such as Jaeger or Tempo.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TracingConfig {
-    /// Emit spans at all.
+    /// Whether to send traces. Off by default; turn it on with a collector to send them to, to
+    /// find where slow requests spend their time. Sending costs a little CPU and network per
+    /// sampled request.
     #[serde(default)]
     pub enabled: bool,
-    /// OTLP collector endpoint. Required when `enabled` is true.
+    /// The OTLP collector traces are sent to (`http://otel-collector:4317`). Required when
+    /// tracing is on.
     #[serde(default)]
     pub otlp_endpoint: Option<String>,
-    /// Fraction of traces sampled, `0.0` to `1.0`.
+    /// The share of requests traced, from `0.0` (none) to `1.0` (every one). A small share is
+    /// enough to find slow paths on a busy server and keeps the cost down.
     #[serde(default = "default_sample_ratio")]
     pub sample_ratio: f64,
 }
@@ -89,7 +97,7 @@ fn default_log_level() -> LogLevel {
     LogLevel::Info
 }
 
-/// Structured logging.
+/// Logging: what the server writes to its standard output.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
@@ -114,35 +122,38 @@ impl Default for LoggingConfig {
     }
 }
 
-/// Sentry error reporting.
+/// Sentry error reporting: errors and panics sent to a Sentry project, with their context.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SentryConfig {
-    /// Inline DSN. Prefer `dsn_file`.
+    /// The Sentry project's DSN (the URL Sentry gives a project), which turns reporting on.
+    /// Prefer `dsn_file`.
     #[serde(default)]
     pub dsn: SecretString,
-    /// Path to a file containing the DSN.
+    /// Path to a file holding the DSN, read in place of `dsn`.
     #[serde(default)]
     pub dsn_file: Option<PathBuf>,
-    /// Environment tag attached to events.
+    /// The environment each report is tagged with (`production`, `staging`), to tell
+    /// deployments apart in one Sentry project.
     #[serde(default = "default_environment")]
     pub environment: String,
 }
 
-/// Telemetry: metrics, tracing, logging and error reporting.
+/// Telemetry: what the server tells an operator about itself -- metrics, traces, logs and
+/// error reports.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
-    /// Prometheus metrics.
+    /// Prometheus metrics: whether `/metrics` is served, and under which names.
     #[serde(default)]
     pub metrics: MetricsConfig,
-    /// OpenTelemetry tracing.
+    /// OpenTelemetry tracing: whether requests are traced, how many, and where traces go.
     #[serde(default)]
     pub tracing: TracingConfig,
-    /// Structured logging.
+    /// Logging: how much is logged, and as text or JSON lines.
     #[serde(default)]
     pub logging: LoggingConfig,
-    /// Sentry error reporting; absent disables it.
+    /// Sentry error reporting. Unset by default, which sends nothing anywhere.
     #[serde(default)]
     pub sentry: Option<SentryConfig>,
 }

@@ -106,7 +106,8 @@ impl Default for MeshConfig {
     }
 }
 
-/// Cluster topology and ownership tuning.
+/// Running as several replicas: how work is split between them and how fast a lost replica's
+/// work moves to the others.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
@@ -115,20 +116,25 @@ pub struct ClusterConfig {
     /// --single-node`.
     #[serde(default = "default_true")]
     pub single_node: bool,
-    /// Number of room ownership shards. Fixed at cluster creation.
+    /// How many parts rooms are split into for sharing between replicas. Fixed when the
+    /// server is first set up: changing it later would move every room at once. More parts
+    /// spread rooms more evenly over many replicas.
     #[serde(default = "default_shard_count")]
     pub room_shards: u32,
-    /// Number of user-session ownership shards. Fixed at cluster creation.
+    /// How many parts users' sessions are split into for sharing between replicas. Fixed when
+    /// the server is first set up, like `room_shards`.
     #[serde(default = "default_shard_count")]
     pub user_shards: u32,
     /// Internal replica-to-replica mesh.
     #[serde(default)]
     pub mesh: MeshConfig,
-    /// How often a replica renews its liveness heartbeat.
+    /// How often each replica tells the others it is alive. Shorter notices a lost replica
+    /// sooner, at the cost of more writes to the database; keep it well under `lease_ttl`.
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: Duration,
-    /// How long a lease survives without a heartbeat before another
-    /// replica may claim ownership.
+    /// How long a replica may go without a heartbeat before the others take over its rooms and
+    /// users. Shorter recovers sooner from a crash; too short and a replica that only paused
+    /// (a long garbage collection, a busy node) loses its work for nothing.
     #[serde(default = "default_lease_ttl")]
     pub lease_ttl: Duration,
 }

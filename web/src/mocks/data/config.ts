@@ -1065,6 +1065,8 @@ const settingInfos = [
     ...BOOTSTRAP_SETTINGS,
     // A hot setting inside a section that is not hot throughout is worth saying so about.
     ...HOT_SETTINGS.filter((pointer) => !RELOADABLE.has(pointer.split("/")[1])),
+    // Like the server, a row for every classified setting, each saying when it applies.
+    ...[...SETTING_APPLIES.keys()].filter((pointer) => pointer.split("/").length > 2),
   ]),
 ]
   .sort()
@@ -1085,6 +1087,66 @@ const settingInfos = [
       editable: origin !== "environment" && !bootstrap,
     };
   });
+
+/**
+ * Every setting's doc comment in the real schema, by JSON Pointer. The mock's own schema is
+ * smaller and shaped for its fixtures, but its words should be the server's: the Rust doc
+ * comments are where every explanation an operator reads is written (decision: the owner's
+ * "well explained in the UI" rule, 2026-10-01), so the mock takes them from the fixture rather
+ * than keeping copies that drift.
+ */
+const REAL_DESCRIPTIONS: ReadonlyMap<string, string> = (() => {
+  const out = new Map<string, string>();
+  const schema = realSchema as unknown as Record<string, unknown>;
+  const realDefs = (schema.$defs ?? {}) as Record<string, Record<string, unknown>>;
+  const walk = (node: unknown, pointer: string, seen: string[]): void => {
+    if (typeof node !== "object" || node === null) return;
+    const record = node as Record<string, unknown>;
+    if (pointer && typeof record.description === "string" && !out.has(pointer)) {
+      out.set(pointer, record.description.replace(/\s+/g, " ").trim());
+    }
+    const ref = typeof record.$ref === "string" ? record.$ref.replace("#/$defs/", "") : null;
+    if (ref && !seen.includes(ref)) walk(realDefs[ref], pointer, [...seen, ref]);
+    for (const keyword of ["anyOf", "oneOf", "allOf"]) {
+      const branches = record[keyword];
+      if (Array.isArray(branches)) branches.forEach((b) => walk(b, pointer, seen));
+    }
+    const children = record.properties;
+    if (typeof children === "object" && children !== null) {
+      for (const [key, child] of Object.entries(children)) walk(child, `${pointer}/${key}`, seen);
+    }
+  };
+  for (const [key, child] of Object.entries((schema.properties ?? {}) as object)) {
+    walk(child, `/${key}`, []);
+  }
+  return out;
+})();
+
+/** Puts the real schema's words on the mock's settings, wherever both have the setting. */
+function adoptRealDescriptions(): void {
+  // Only a property's own node takes the real words: a `$ref`'s target is the type's doc and a
+  // variant's node is that variant's, both shared or distinct from the setting's.
+  const walk = (
+    node: JsonSchemaNode | undefined,
+    pointer: string,
+    seen: string[],
+    own: boolean,
+  ): void => {
+    if (!node) return;
+    const real = REAL_DESCRIPTIONS.get(pointer);
+    if (own && real && node.description !== undefined) node.description = real;
+    const ref = node.$ref?.replace("#/$defs/", "");
+    if (ref && !seen.includes(ref)) walk(defs[ref], pointer, [...seen, ref], false);
+    for (const branch of [...(node.anyOf ?? []), ...(node.oneOf ?? [])]) {
+      walk(branch, pointer, seen, false);
+    }
+    for (const [key, child] of Object.entries(node.properties ?? {})) {
+      walk(child, `${pointer}/${key}`, seen, true);
+    }
+  };
+  for (const [key, child] of Object.entries(properties)) walk(child, `/${key}`, [], true);
+}
+adoptRealDescriptions();
 
 /** The document `GET /config/schema` answers (`components.schemas.ConfigSchema`). */
 export const configSchemaDocument = {

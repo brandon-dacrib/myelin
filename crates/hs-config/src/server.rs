@@ -20,8 +20,10 @@ pub struct ServerConfig {
     /// one.
     pub server_name: String,
 
-    /// The externally reachable base URL for clients, if different from
-    /// `https://{server_name}`. Corresponds to Synapse's `public_baseurl`.
+    /// The address clients reach this server at (`https://matrix.example.org`), when it is not
+    /// `https://` plus the server name. Clients find it through the `.well-known` document this
+    /// server serves when it is set, and links this server hands out use it. Corresponds to
+    /// Synapse's `public_baseurl`.
     #[serde(default)]
     pub public_baseurl: Option<String>,
 
@@ -45,13 +47,13 @@ pub struct ServerConfig {
     #[serde(default = "default_signing_key_path")]
     pub signing_key_path: PathBuf,
 
-    /// Contact address advertised for abuse reports and shown to operators
-    /// of other servers. Corresponds to Synapse's `admin_contact`.
+    /// An address (`mailto:abuse@example.org`) for people and other servers' operators to report
+    /// abuse to. Nothing publishes it yet. Corresponds to Synapse's `admin_contact`.
     #[serde(default)]
     pub admin_contact: Option<String>,
 
-    /// Whether this server opts in to the anonymised statistics-reporting
-    /// endpoint. Corresponds to Synapse's `report_stats`.
+    /// Whether to send anonymous usage statistics to the Matrix.org Foundation, as Synapse can.
+    /// Nothing sends them yet, so this has no effect. Corresponds to Synapse's `report_stats`.
     #[serde(default)]
     pub report_stats: bool,
 

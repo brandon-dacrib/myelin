@@ -3,10 +3,11 @@
 //! `rc_joins`, `rc_admin_redaction`, `rc_federation`). Hot-reloadable (see
 //! [`crate::reload`]): a change applies to the running server at once.
 //!
-//! Enforced today: `message`, per sender, on sending an event, setting state and redacting
-//! (`429 M_LIMIT_EXCEEDED` with `retry_after_ms`); an administrator's per-user override
-//! replaces it for that user. The other buckets are accepted and kept but nothing enforces them
-//! yet.
+//! Every bucket is enforced (decision 0016's 2026-10-01 amendment): a request over its limit is
+//! refused with `429 M_LIMIT_EXCEEDED` and `retry_after_ms`, which clients wait out and retry.
+//! `message` is counted per sender (an administrator's per-user override replaces it for that
+//! user), `login` and `registration` per client address, the joins per user, `federation` per
+//! origin server. In a cluster every bucket is counted by each replica on its own.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -30,12 +31,13 @@ use crate::error::{Validate, ValidationErrors};
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitBucket {
-    /// Steady-state rate, in actions per second. May be fractional (e.g.
-    /// `0.17` is roughly one every six seconds, Synapse's `rc_message`
-    /// default).
+    /// How fast the bucket refills, in actions per second, once its burst is spent. May be
+    /// fractional: `0.2` is one every five seconds, `0.01` one every hundred seconds. Lower is
+    /// stricter; `0` switches this one limit off.
     pub per_second: f64,
-    /// Bucket size: how many actions may happen back-to-back before the
-    /// steady-state rate applies.
+    /// How many actions may happen back to back before the refill rate applies. A person rarely
+    /// does more than a few at once, so a small burst stops scripts without anyone noticing it.
+    /// At least 1.
     pub burst_count: u32,
 }
 
@@ -115,57 +117,73 @@ partial_bucket! {
     partial_third_party_id_validation => default_third_party_id_validation,
 }
 
-/// All configured rate-limit buckets.
+/// Rate limits: how fast one user, address or server may do each costly thing before requests
+/// are refused with `429` and a time to wait. Defaults are Synapse's.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitConfig {
-    /// Master switch; when false, no limiter runs (tests and benchmarking
-    /// only — never recommended in production).
+    /// Whether any rate limit is enforced. Leave it on: switched off, nothing stops one account
+    /// or address from flooding rooms, guessing passwords or registering accounts in bulk. It
+    /// exists for test harnesses and benchmarks that send far faster than people do.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Per-user event sending: messages, state and redactions. Corresponds to Synapse's
-    /// `rc_message`. A `per_second` of `0` limits nobody. Appservices that registered with
-    /// `rate_limited: false` are exempt.
+    /// How fast one user may send events: messages, room settings (state) and redactions,
+    /// counted per sender. An administrator can give one user other limits on their user page.
+    /// Corresponds to Synapse's `rc_message`. Bridges that
+    /// registered with `rate_limited: false` are exempt.
     #[serde(default = "default_message", deserialize_with = "partial_message")]
     pub message: RateLimitBucket,
-    /// `POST /register`. Corresponds to Synapse's `rc_registration`.
+    /// How fast accounts may be created from one client address (`POST /register`). Counted when
+    /// an account is actually made, so a sign-up that fails a step costs nothing. Keeps a script
+    /// from registering accounts in bulk when registration is open. Bridges are exempt.
+    /// Corresponds to Synapse's `rc_registration`.
     #[serde(
         default = "default_registration",
         deserialize_with = "partial_registration"
     )]
     pub registration: RateLimitBucket,
-    /// `POST /login`. Corresponds to Synapse's `rc_login.address`.
+    /// How fast sign-in attempts may come from one client address (`POST /login`): the guard
+    /// against password guessing. The address is the first one a proxy in front of the server
+    /// forwards, so set the listener's `x_forwarded` behind a public proxy. Bridges are exempt.
+    /// Corresponds to Synapse's `rc_login.address`.
     #[serde(default = "default_login", deserialize_with = "partial_login")]
     pub login: RateLimitBucket,
-    /// Local room joins. Corresponds to Synapse's `rc_joins.local`.
+    /// How fast one user may join rooms this server already takes part in. Joins are cheap here,
+    /// so the limit only stops a script joining hundreds of rooms at once. Corresponds to
+    /// Synapse's `rc_joins.local`.
     #[serde(
         default = "default_joins_local",
         deserialize_with = "partial_joins_local"
     )]
     pub joins_local: RateLimitBucket,
-    /// Joins to rooms on remote servers. Corresponds to Synapse's
-    /// `rc_joins.remote`.
+    /// How fast one user may join rooms on other servers. Each such join fetches the room's state
+    /// over federation, which can take this server minutes and a lot of memory for a large
+    /// room, so this limit is the strictest. Corresponds to Synapse's `rc_joins.remote`.
     #[serde(
         default = "default_joins_remote",
         deserialize_with = "partial_joins_remote"
     )]
     pub joins_remote: RateLimitBucket,
-    /// Admin-triggered redactions. Corresponds to Synapse's
-    /// `rc_admin_redaction`.
+    /// How fast a server administrator's redactions may go, in place of the message limit, so
+    /// that removing a spammer's messages is not throttled like ordinary sending. Corresponds to
+    /// Synapse's `rc_admin_redaction`.
     #[serde(
         default = "default_admin_redaction",
         deserialize_with = "partial_admin_redaction"
     )]
     pub admin_redaction: RateLimitBucket,
-    /// Inbound federation transactions per origin server. Corresponds to
-    /// Synapse's `rc_federation`.
+    /// How fast one other server may send transactions to this one (`PUT /send`), counted per
+    /// origin server. A server catching up after an outage sends in bursts; too low a limit
+    /// slows how soon its users' messages arrive here. Corresponds to Synapse's
+    /// `rc_federation`.
     #[serde(
         default = "default_federation",
         deserialize_with = "partial_federation"
     )]
     pub federation: RateLimitBucket,
-    /// `POST /account/3pid/*/requestToken`. Corresponds to Synapse's
-    /// `rc_3pid_validation`.
+    /// How fast email and phone verification codes may be requested
+    /// (`POST /account/3pid/*/requestToken`). Not used yet: this server sends no verification
+    /// codes. Corresponds to Synapse's `rc_3pid_validation`.
     #[serde(
         default = "default_third_party_id_validation",
         deserialize_with = "partial_third_party_id_validation"

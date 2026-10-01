@@ -33,18 +33,24 @@ fn default_minimum_password_length() -> u32 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PasswordConfig {
-    /// Allow password login at all. Corresponds to Synapse's
+    /// Whether people may sign in with a password. Nothing reads this setting yet: password
+    /// sign-in is always offered, so changing it has no effect. Corresponds to Synapse's
     /// `password_config.enabled`.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Inline pepper mixed into password hashes. Prefer `pepper_file`.
-    /// Corresponds to Synapse's `password_config.pepper`.
+    /// A secret mixed into every password hash, so a copy of the database alone is not enough to
+    /// guess passwords from. Set it once and keep it: changing or losing it makes every existing
+    /// password stop working. Migrating from Synapse, set the same value Synapse had. Prefer
+    /// `pepper_file`. Corresponds to Synapse's `password_config.pepper`.
     #[serde(default)]
     pub pepper: SecretString,
-    /// Path to a file containing the pepper.
+    /// Path to a file holding the pepper, read in place of `pepper` so the secret stays out of
+    /// the database and its backups. Changing or losing it makes every existing password stop
+    /// working, as for `pepper`.
     #[serde(default)]
     pub pepper_file: Option<PathBuf>,
-    /// Complexity requirements. Corresponds to Synapse's
+    /// What a new password must contain. Checked when a password is set or changed, never
+    /// against passwords people already have. Corresponds to Synapse's
     /// `password_config.policy`.
     #[serde(default)]
     pub policy: PasswordPolicy,
@@ -65,19 +71,21 @@ impl Default for PasswordConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PasswordPolicy {
-    /// Minimum length.
+    /// The fewest characters a new password may have. Length matters far more than character
+    /// classes; at least 1.
     #[serde(default = "default_minimum_password_length")]
     pub minimum_length: u32,
-    /// Require at least one digit.
+    /// Whether a new password must contain a digit (0-9).
     #[serde(default)]
     pub require_digit: bool,
-    /// Require at least one symbol.
+    /// Whether a new password must contain a symbol (a character that is not a letter or a
+    /// digit).
     #[serde(default)]
     pub require_symbol: bool,
-    /// Require at least one uppercase letter.
+    /// Whether a new password must contain an uppercase letter.
     #[serde(default)]
     pub require_uppercase: bool,
-    /// Require at least one lowercase letter.
+    /// Whether a new password must contain a lowercase letter.
     #[serde(default)]
     pub require_lowercase: bool,
 }
@@ -106,17 +114,19 @@ pub struct OidcProviderConfig {
     /// `idp_name`.
     #[serde(default)]
     pub idp_name: Option<String>,
-    /// The provider's issuer URL (used for discovery).
+    /// The provider's issuer URL, from which this server discovers its endpoints and keys
+    /// (`https://accounts.google.com`, `https://keycloak.example.org/realms/main`).
     pub issuer: String,
-    /// OAuth client ID registered with the provider.
+    /// The client ID the provider gave this server when it was registered there.
     pub client_id: String,
-    /// Inline client secret. Prefer `client_secret_file`.
+    /// The client secret the provider gave this server. Prefer `client_secret_file`.
     #[serde(default)]
     pub client_secret: SecretString,
-    /// Path to a file containing the client secret.
+    /// Path to a file holding the client secret, read in place of `client_secret`.
     #[serde(default)]
     pub client_secret_file: Option<PathBuf>,
-    /// OAuth scopes to request.
+    /// The OAuth scopes asked of the provider at sign-in. `openid` is required; `profile`
+    /// brings the person's name, `email` their address.
     #[serde(default = "default_oidc_scopes")]
     pub scopes: Vec<String>,
 }
@@ -131,22 +141,27 @@ fn default_oidc_scopes() -> Vec<String> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MasDelegationConfig {
-    /// MAS's internal endpoint for introspection and provisioning calls.
+    /// The URL at which this server reaches MAS to check tokens and provision accounts: MAS's
+    /// internal address, not the one people sign in at.
     pub endpoint: String,
     /// Inline shared secret authenticating this server to MAS. Prefer
     /// `shared_secret_file`.
     #[serde(default)]
     pub shared_secret: SecretString,
-    /// Path to a file containing the shared secret.
+    /// Path to a file holding the shared secret, read in place of `shared_secret`.
     #[serde(default)]
     pub shared_secret_file: Option<PathBuf>,
 }
 
-/// Authentication, session and registration settings.
+/// Who can sign up and how people sign in: registration, passwords, tokens and other sign-in
+/// services.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
-    /// Allow `POST /register`. Corresponds to Synapse's
+    /// Whether anyone may create an account on this server from a client (`POST /register`).
+    /// Off by default: accounts are then made by an administrator or with a registration token
+    /// or invite link (Settings). Turned on, anyone who can reach the server can sign up, so
+    /// pair it with registration tokens or expect spam accounts. Corresponds to Synapse's
     /// `enable_registration`.
     #[serde(default)]
     pub enable_registration: bool,
@@ -170,13 +185,15 @@ pub struct AuthConfig {
     /// `id_server`, which Synapse does not restrict.
     #[serde(default)]
     pub identity_servers: Vec<String>,
-    /// Inline shared secret for the `/_synapse/mk_admin_user`-equivalent
-    /// shared-secret registration protocol (see `hs-compat`). Prefer
-    /// `registration_shared_secret_file`. Corresponds to Synapse's
+    /// A secret that lets a tool create accounts, administrators included, without signing in
+    /// (the shared-secret registration that `hs register` and Synapse's `register_new_matrix_user`
+    /// use). Anyone holding it can make an administrator, so leave it empty unless a script needs
+    /// it. Prefer `registration_shared_secret_file`. Corresponds to Synapse's
     /// `registration_shared_secret`.
     #[serde(default)]
     pub registration_shared_secret: SecretString,
-    /// Path to a file containing the shared-secret-registration secret.
+    /// Path to a file holding the shared-secret registration secret, read in place of
+    /// `registration_shared_secret` so the secret stays out of the database.
     #[serde(default)]
     pub registration_shared_secret_file: Option<PathBuf>,
     /// Let the user directory (`POST /user_directory/search`, the box a client's invite dialog
@@ -189,37 +206,41 @@ pub struct AuthConfig {
     /// Synapse's `user_directory.search_all_users`.
     #[serde(default)]
     pub user_directory_search_all_users: bool,
-    /// Serve the legacy `/login` and user-interactive-auth flows in
-    /// addition to the native OAuth 2.0 issuer. Needed for older clients,
-    /// bridges and `m.login.application_service`.
+    /// Whether to serve the classic Matrix sign-in (`/login` and user-interactive auth) beside
+    /// the OAuth 2.0 issuer. Every client today, and bridges, sign in this way. Nothing reads
+    /// this setting yet: the classic sign-in is always served.
     #[serde(default = "default_true")]
     pub enable_legacy_login: bool,
-    /// Inline key signing issued access/refresh tokens and session
-    /// cookies. Prefer `session_secret_file`. Corresponds to Synapse's
-    /// `macaroon_secret_key`.
+    /// The key that signs session cookies and OAuth state. Nothing reads this setting yet.
+    /// Prefer `session_secret_file`. Corresponds to Synapse's `macaroon_secret_key`.
     #[serde(default)]
     pub session_secret: SecretString,
-    /// Path to a file containing the session-signing secret.
+    /// Path to a file holding the session-signing key, read in place of `session_secret`.
     #[serde(default)]
     pub session_secret_file: Option<PathBuf>,
-    /// Access token lifetime. Corresponds to Synapse's
-    /// `access_token_lifetime` (native OAuth tokens; legacy non-refreshable
-    /// tokens are unaffected, matching Synapse's own carve-out).
+    /// How long an access token from the OAuth issuer works before the client must refresh it.
+    /// Shorter limits the damage of a leaked token; clients refresh on their own, so people do
+    /// not notice. Tokens from the classic sign-in that cannot be refreshed are not affected,
+    /// as in Synapse. Corresponds to Synapse's `access_token_lifetime`.
     #[serde(default = "default_access_token_lifetime")]
     pub access_token_lifetime: Duration,
-    /// Refresh token lifetime; `None` means refresh tokens do not expire.
-    /// Corresponds to Synapse's `refreshable_access_token_lifetime`
-    /// family.
+    /// How long a refresh token works: after it, a device that has not been used must sign in
+    /// again. Unset, refresh tokens never expire. Corresponds to Synapse's
+    /// `refreshable_access_token_lifetime` family.
     #[serde(default = "default_refresh_token_lifetime")]
     pub refresh_token_lifetime: Option<Duration>,
-    /// Password login settings.
+    /// Password sign-in: whether it is offered, the pepper mixed into hashes, and what a new
+    /// password must contain.
     #[serde(default)]
     pub password: PasswordConfig,
-    /// Upstream OIDC providers.
+    /// Other sign-in services people may use instead of a password here ("Sign in with Google",
+    /// a company Keycloak or Okta), each registered with the provider first. Empty by default.
+    /// Corresponds to Synapse's `oidc_providers`.
     #[serde(default)]
     pub oidc_providers: Vec<OidcProviderConfig>,
-    /// When set, delegate to Matrix Authentication Service instead of
-    /// running the native OAuth issuer.
+    /// Hand sign-in to a separate Matrix Authentication Service (MAS) instead of this server's
+    /// own OAuth issuer. Unset by default, which is right unless MAS is already deployed.
+    /// Corresponds to Synapse's `experimental_features.msc3861`.
     #[serde(default)]
     pub mas_delegation: Option<MasDelegationConfig>,
 }

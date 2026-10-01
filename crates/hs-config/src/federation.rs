@@ -41,9 +41,9 @@ fn default_ip_range_blocklist() -> Vec<String> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FederationConfig {
-    /// Master switch for outbound and inbound federation traffic.
-    /// Corresponds to Synapse's `federation_domain_whitelist` being
-    /// unset/set combined with the general notion of "federation off".
+    /// Whether this server talks to other Matrix servers at all. Off, its users can only talk to
+    /// each other: no joining rooms elsewhere, no messages from other servers. Corresponds to
+    /// Synapse's `federation_domain_whitelist` set to an empty list.
     #[serde(default = "default_true")]
     pub enabled: bool,
 
@@ -114,14 +114,17 @@ pub struct FederationConfig {
     #[serde(default)]
     pub trust_os_root_store: bool,
 
-    /// Per-request timeout for outbound federation HTTP calls. Corresponds
-    /// to Synapse's `federation_client_timeout`.
+    /// How long this server waits for another server to answer one request before giving up
+    /// and counting it as a failure. Too short fails slow but working servers; too long ties
+    /// up a sender on a server that is gone. Corresponds to Synapse's
+    /// `federation_client_timeout`.
     #[serde(default = "default_client_timeout")]
     pub client_timeout: Duration,
 
-    /// Cap on the exponential backoff between retries of a failed
-    /// federation destination. Corresponds to Synapse's
-    /// `destination_min_retry_interval` family, simplified to one ceiling.
+    /// The longest this server waits between attempts to reach a server that keeps failing.
+    /// The wait doubles after each failure up to this; Reset backoff on the destination's page
+    /// tries at once. Corresponds to Synapse's `destination_min_retry_interval` family,
+    /// simplified to one ceiling.
     #[serde(default = "default_max_retry_backoff")]
     pub max_retry_backoff: Duration,
 
@@ -134,8 +137,9 @@ pub struct FederationConfig {
     #[serde(default = "default_max_queued_pdus_per_destination")]
     pub max_queued_pdus_per_destination: u32,
 
-    /// Advertise this room's public directory over federation. Corresponds
-    /// to Synapse's `allow_public_rooms_over_federation`.
+    /// Whether other servers may read this server's public room directory, so their users can
+    /// find this server's public rooms by browsing it. Off by default, as in Synapse.
+    /// Corresponds to Synapse's `allow_public_rooms_over_federation`.
     #[serde(default)]
     pub allow_public_rooms_over_federation: bool,
 

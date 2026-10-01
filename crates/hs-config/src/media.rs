@@ -146,24 +146,29 @@ pub struct MediaConfig {
     /// the object-store cache layer).
     #[serde(default)]
     pub storage: MediaStorageBackend,
-    /// Maximum accepted upload size. Corresponds to Synapse's
-    /// `max_upload_size`.
+    /// The largest file a person may upload (`50M`, `1G`). Clients read it and refuse bigger
+    /// files before sending them. Larger allows videos and archives at the cost of storage.
+    /// Corresponds to Synapse's `max_upload_size`.
     #[serde(default = "default_max_upload_size")]
     pub max_upload_size: ByteSize,
-    /// Thumbnail sizes to pre-generate/serve on demand. Corresponds to
+    /// The thumbnail sizes this server makes of uploaded images, which clients show in timelines
+    /// and room lists. A client asking for another size gets the nearest. Corresponds to
     /// Synapse's `thumbnail_sizes`.
     #[serde(default = "default_thumbnail_sizes")]
     pub thumbnail_sizes: Vec<ThumbnailSize>,
-    /// Enable `GET /_matrix/media/*/preview_url`. Corresponds to Synapse's
+    /// Whether this server fetches web pages to show a preview (title, description, image) of a
+    /// link someone posts. Off by default: the server then visits every link people share,
+    /// which reveals to those sites that someone here posted them. Corresponds to Synapse's
     /// `url_preview_enabled`.
     #[serde(default)]
     pub url_preview_enabled: bool,
-    /// IP ranges URL previews must not fetch from (SSRF protection).
-    /// Corresponds to Synapse's `url_preview_ip_range_blacklist`.
+    /// Addresses link previews may never fetch from, so a posted link cannot make this server
+    /// reach its own private network (server-side request forgery). The default blocks every
+    /// private and loopback range. Corresponds to Synapse's `url_preview_ip_range_blacklist`.
     #[serde(default = "default_preview_blocklist")]
     pub url_preview_ip_range_blocklist: Vec<String>,
-    /// How long to keep cached copies of remote media. `None` means keep
-    /// forever. Corresponds to Synapse's
+    /// How long to keep copies of other servers' media. Nothing evicts remote media yet, so
+    /// this setting has no effect. Unset means keep forever. Corresponds to Synapse's
     /// `media_retention.remote_media_lifetime`.
     #[serde(default = "default_remote_media_retention")]
     pub remote_media_retention: Option<Duration>,
