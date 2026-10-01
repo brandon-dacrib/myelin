@@ -24,19 +24,7 @@ administration in the web UI, explained there.
 refresh, and the `.gitattributes` union merge for `docs/next-steps.md`, `docs/status/*.md` and
 `CHANGELOG.md` (every conflict there had been keep-both).
 
-**Ten branches are unmerged (12 at 18:10; `config-hot` and `complement-remeasure` landed since), all pushed, all with status entries and a paragraph below.** A
-merge-queue process started at 16:30 (`nohup tools/merge-queue.sh ...`, log in the session's
-scratchpad as `merge-batch10.log`) is still running the rest of its list -- `federation-sytest`,
-`admin-scopes` (gate started 18:22), `boot-time`, `room-cluster-small` -- one 60–80
-minute gate each (`web-admin-ui` was left with a `serve.rs` conflict); **check `git branch -r --no-merged origin/main` first thing**, since it may
-have merged some of them by then. Two things it will get wrong, which the next coordinator
-corrects: (a) `agent/cluster-create-room-flake` passed its gate at 17:20 but was left because
-`main` moved with a README commit (the script counts anything outside `docs/` as code) -- it
-has not merged, so `main` still has the `cluster_create_room` race that fails three gates in
-four on a loaded machine; **merge it first** (`tools/merge-queue.sh agent/cluster-create-room-flake`,
-with the six `HS_*_TEST_POSTGRES_*` variables; the trust anchor is the test CA, see below), then
-everything else; (b) `federation-sytest` is superseded by `federation-sytest-2`, which carries
-its commits -- merge `-2` and delete `-1`.
+**Seven branches are unmerged at 19:05 (12 at 18:10), all pushed, all finished, all with status entries and a paragraph below; no queue is running and the lock is free.** The create-room race that failed three gates in four is fixed on `main` (`0e4169f`), so gates should pass again. Two notes: (a) `agent/cluster-create-room-flake` and `agent/federation-sytest` are redundant (the first is on `main` under another hash, the second is carried by `federation-sytest-2`) -- delete both after `-2` merges; (b) `admin-scopes` passed its gate and only needs re-queuing.
 
 **The order that avoids conflicts:** `tools/merge-queue.sh agent/admin-scopes agent/federation-sytest-2 agent/room-id-uniqueness agent/sytest-client agent/rfc-0018` (with the six `HS_*_TEST_POSTGRES_*` variables; the trust anchor is the test CA, see below), then `web-admin-ui` once someone rebases it onto `main` keeping `main`'s `crates/hs-cli/src/serve.rs` where they differ. `room-id-uniqueness` will need `crates/hs-room/src/metrics.rs` resolved keep-both against `room-cluster-small`'s metric, and `sytest-client` has its own fix for the same room-id collision (keep `room-id-uniqueness`'s transactional claim). Sytest after all of them: federation 73/105 and client-server 362/543 were measured on the branches separately; the combined number is unmeasured. Three agents were still working when this session stopped and their
 branches hold whatever they had pushed: `rfc-0018` (done, see its row), `sytest-client` (done, see its row), `complement-remeasure` (3 commits, docs only: csapi and federation
