@@ -434,7 +434,7 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   by relevance or most recent first, a page at a time, with the messages around each result.
   The index lives in the server's own store and survives a restart without re-reading anything;
   a message is found the moment after it is sent. Verified against the real binary with two
-  users and three rooms, across a restart. Not yet: history fetched from other servers after
+  users and three rooms, across a restart, and by Complement's `TestSearch` (all six subtests). Not yet: history fetched from other servers after
   joining is not searchable, and words are not stemmed.
 - Sync: `/sync` v2 with filters that honour event-type and sender rules, lazy-loaded members, room
   summaries with heroes, typing, presence, read receipts and `m.fully_read`, to-device messages,

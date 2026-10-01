@@ -66,13 +66,22 @@ admin API's room long tail).
 >   the restart (nothing indexed again), and that message is found first.
 > - **How to verify.** `cargo test -p hs-room --test search`; `cargo test -p hs-room --lib
 >   search`; `cargo test -p hs-cli --test search`.
+> - **Complement.** `TestSearch` 0/1 → 1/1, all six subtests (search by body, context around a
+>   result, back-pagination of twenty results by tens, an upgraded room and its predecessor,
+>   redacted events left out under `rank` and `recent`), three runs in a row. Image
+>   `complement-hs-search:c232d51` from `tests/complement/build.sh` (`DOCKER_BUILDKIT=0`), run
+>   with `DOCKER_HOST` at OrbStack's socket and `go test -run '^TestSearch$' ./tests/csapi/`.
+>   Reading the test before running it found two things the scenario tests had not: Complement
+>   searches the moment after sending (so a search now brings its rooms' index up to date first)
+>   and expects a `next_batch` on every full page; both were changed before the image was built.
 > - **Cluster mode.** The index is in the shared store, so it is one index for every replica;
 >   each replica indexes the rooms whose shard it owns. Not yet run with two replicas.
 > - **Left.** Backfilled history and a rejoin's gap are not indexed (the cursor only moves
 >   forward); no stemming, and a script without spaces is matched by the start of a run only; a
 >   word with more than 50,000 postings reads the first 50,000 (`count` a lower bound, logged);
 >   `include_profile` is the member's current profile, not the one at the event; no two-replica
->   run; Element Web not yet tried in a browser.
+>   run; Element Web not yet tried in a browser (no Element image on this machine, and Docker Hub
+>   pulls fail in agent sessions).
 
 > **2026-09-30, session 14: a version-12 room is built by the owner of its shard** (branch
 > `agent/room-gaps`, commit 691060e; known gap "A v12 room's id cannot be pre-assigned" closed;
