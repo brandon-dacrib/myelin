@@ -550,22 +550,22 @@ async fn send_rejects_a_new_event_whose_auth_events_do_not_authorize_it() {
     assert_eq!(status, StatusCode::OK, "{response}");
     let pdus = response["pdus"].as_object().unwrap();
     assert_eq!(pdus.len(), 1);
-    let (_, result) = pdus.iter().next().unwrap();
-    let error = result.get("error").and_then(Value::as_str).unwrap_or("");
-    // This PDU is correctly hashed and signed, so it gets past `verify_pdu` -- and then fails for
-    // the right reason. It cites no `m.room.create` in its `auth_events` (it cites nothing at
-    // all), so the auth rules refuse it. Before `RoomActor::accept_remote_event` existed this
-    // test asserted a "cannot yet persist" message instead, because nothing downstream of
-    // verification ran at all; that wall is gone, and what a bad event now meets is the real
-    // rules.
-    assert!(
-        error.contains("m.room.create") || error.contains("auth"),
-        "expected an authorization failure naming what was wrong, got: {response}"
+    let event_id = hs_model::Event::parse(&pdu, ruma::RoomVersionId::V11)
+        .unwrap()
+        .event_id()
+        .to_string();
+    // This PDU is correctly hashed and signed, so it gets past `verify_pdu` -- and then the auth
+    // rules refuse it: it cites no `m.room.create` in its `auth_events` (it cites nothing at
+    // all). A rejected event was received and processed, so `/send` answers `{}` for it, as the
+    // spec and Synapse do (until 2026-10-01 this answered an error, which Sytest's federation
+    // client reads as a failed delivery) -- and it is not stored: `/event` does not find it.
+    assert_eq!(
+        response["pdus"][event_id.as_str()],
+        serde_json::json!({}),
+        "{response}"
     );
-    assert!(
-        !error.contains("cannot yet persist"),
-        "the persistence gap is closed; this message should no longer appear: {response}"
-    );
+    let (status, fetched) = harness.signed_get(&format!("/event/{event_id}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{fetched}");
 }
 
 #[tokio::test]
