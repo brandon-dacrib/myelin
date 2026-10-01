@@ -6,10 +6,10 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 
 ## Resume here: 2026-09-30, end of day
 
-**Where `main` is.** `083b58e` plus this document, **2,446 Rust tests**, gate green with both
+**Where `main` is.** `611ea59` plus this document, **2,453 Rust tests**, gate green with both
 PostgreSQL servers (plain and TLS) in use; CI green again at `a01c1e0` after a red evening (the
-two races below); one branch open, `agent/federation-catchup` (the next gap, done and waiting to merge); one
-worktree (`merge-queue`).
+two races below); the demo runs `sha-a01c1e0`; one branch open, `agent/backfill-state` (the next
+gap, in progress); one worktree (`merge-queue`).
 The gate's six `HS_*_TEST_POSTGRES_*` variables have their recipe at the top of
 `crates/hs-kv/tests/postgres_tls.rs`; the two containers are `hs-admin-followups-gate-pg` on
 :5462 and `hs-merge-queue-pg-tls` on :5463, password `hspg`. The running TLS container's
@@ -94,8 +94,8 @@ hub wait that runs out is a `warn` line now. Left: merge it, and watch the next 
    - ~~"A rejoined room's gap is never filled"~~ done on `agent/rejoin-gap` (paragraph below).
    - "The state at a backfilled event is walked, not asked for" (`hs-room`): `/state_ids` and an
      auth check on backfilled events; closes the two together.
-   - ~~"A destination down for longer than its queue is not caught up" (`hs-federation`)~~: done
-     on `agent/federation-catchup` (see below).
+   - ~~"A destination down for longer than its queue is not caught up" (`hs-federation`)~~: merged
+     as `611ea59` (see below).
    - "A requester with no device never records a feed cursor" (`hs-user`): small; some
      appservice callers.
    - "A room alias in `/join/{alias}` is not shard-gated" (`hs-cli`): small.
@@ -122,7 +122,7 @@ without its own script releasing the lock leaves `.git/myelin-merge.lock` behind
 running `cargo` processes, then `rmdir` it.
 
 **A destination down for longer than its queue is caught up from the rooms**
-(`agent/federation-catchup`, not yet merged; status 06 session 15; known gap closed). The
+(`agent/federation-catchup` → `611ea59`, 2,453 Rust tests; status 06 session 15; known gap closed). The
 sender had no queue bound at all. Each destination's queue now holds
 `federation.max_queued_pdus_per_destination` (10,000 by default); past that the destination is
 in catch-up mode and, once it answers, gets the latest local event of each room it is behind in
