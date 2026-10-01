@@ -2,9 +2,123 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
-Last updated: 2026-09-30 (session 12: the history between a leave and a rejoin, below). Before
-that, 2026-09-30 (session 11: the client space hierarchy) and 2026-09-28 (session 10: the admin
-API's room long tail).
+Last updated: 2026-09-30 (session 13: the state at backfilled history is asked for, and every
+backfilled event is authorized, below). Before that, 2026-09-30 (session 12: the history between
+a leave and a rejoin; session 11: the client space hierarchy) and 2026-09-28 (session 10: the
+admin API's room long tail).
+
+> **2026-09-30, session 13: the state at a backfilled event is asked for, not walked** (branch
+> `agent/backfill-state`; known gap "The state at a backfilled event is walked, not asked for"
+> closed). Both kinds of backfill -- history before the oldest held event (session 9) and the
+> history in a rejoin's gap (session 12) -- computed the state at each fetched event by walking
+> back from a held snapshot, so a key set before the fetched batch read as unset (or, in a gap,
+> as it was at the leave), and **no authorization ran on a backfilled event at all**. An outlier
+> the batch placed (a join snapshot's state event) kept the outlier's meaningless state:
+> `state_at_event` answered just the event itself.
+>
+> - **One path for both kinds (`crate::actor::history`, new).** `RoomActor::accept_history(kind,
+>   events, Option<FetchedState>)` with `backfill::HistoryKind::{BeforeOldest, Gap { top }}`
+>   selects the batch (the rules each kind had: one copy per ID, this room, not in the
+>   timeline, not newer than the event it sits below; for a gap, nothing no deeper than
+>   `below`), works out the state at each event, authorizes each, and places what passes.
+>   `accept_backfilled_events` and `accept_gap_events` are now the walked special case of it
+>   (no fetched state), so their callers and tests are unchanged.
+> - **The state, asked for.** `RoomActor::plan_history(kind, &events)` names the oldest event
+>   that would be placed and the `auth_events` the batch cites that are neither held nor in it
+>   (`backfill::HistoryPlan`). `hs_cli::backfill::FederationBackfill` asks the server that sent
+>   the batch `GET /state_ids/{roomId}?event_id=<oldest>`, fetches what that names (the state,
+>   its auth chain, the batch's missing auth events) and this server does not hold with
+>   `GET /event/{eventId}` (8 at a time, at most 50), each verified as an inbound PDU and checked
+>   to be the event asked for; when a tenth or more of it is missing (Synapse's rule) or more
+>   than 50, one `GET /state/{roomId}` instead, which is also the fallback when `/state_ids`
+>   fails. `accept_history` stores the fetched events as outliers, each authorized first
+>   against its own `auth_events` (one that fails, or whose auth events are out of reach, is
+>   dropped and so is its place in the state), takes the state before the oldest event from the
+>   IDs, and derives the state before every later event forward: each accepted state event of
+>   the batch, in topological order, is applied over it. A fetched state with no create event
+>   (an empty answer, everything failing verification) is set aside and the batch is walked,
+>   rather than every event being refused on the other server's mistake. When neither request
+>   is answered the walk is used as before; the outcome says which (`StateSource`).
+> - **Authorization, as for an inbound event.** Every event of the batch is checked with
+>   `hs_state::auth` exactly as `accept_remote_event` checks one: `check_auth_events_selection`,
+>   `check_event_auth` against the state its `auth_events` imply (resolved from held events,
+>   fetched ones and the batch's earlier accepted events), and, when the state was fetched,
+>   `check_event_auth` against the derived state before it. One that fails is **not stored**
+>   (logged at `warn` with the reason, counted) and the state derived for later events does not
+>   include it; a gap no longer counts it as missing (`RoomActor::rejected_history`, in memory).
+>   With a fetched state, an `auth_events` entry nobody could supply rejects the event; with a
+>   walked one, whose inexactness would reject on its own, only the `auth_events` checks run and
+>   an event whose auth events are out of reach is placed unchecked (counted), as before.
+> - **A placed outlier answers its own state.** `place_history` now writes the
+>   `state_snapshots` row for an outlier it places too, and keeps the root of "that state plus
+>   the outlier" in `RoomActor::placed_outlier_roots` (rebuilt on load from the row): every read
+>   of the state after an event goes through `RoomActor::root_after`, which answers that root
+>   for such an event and the store's `state_at` otherwise (`state_at_event`, `/context`,
+>   visibility, `was_joined_at`, `state_view` over prev events, the walk's starting point). The
+>   store cannot take an event twice, so the outlier's own store entry is left as it was. The
+>   walk's start also benefited: a batch whose oldest event was a placed outlier used to start
+>   the next walk from the empty state.
+> - **The server side, two bugs with no row.** `GET /_matrix/federation/v1/state_ids` answered
+>   **two empty lists for every room of version 3 or later**: `hs_cli::federation` read
+>   `event_id` back out of each rendered PDU, which those versions do not carry. And both `/state`
+>   and `/state_ids` answered the state *after* the event; the spec's "state at the event" (and
+>   Synapse's `get_state_ids_for_pdu`) is the state *before* it, which differs whenever the event
+>   is a state event. Both fixed: the new `RoomActor::state_before_event` (explicit snapshot where
+>   the event has one; else the resolved state after its `prev_events`; `None` for an unplaced
+>   outlier, `404` as in Synapse), and the IDs taken from the events.
+> - **Observability.** One `info` line per batch in `hs-cli` (room, server, kind, `from`,
+>   received, unverifiable, added, rejected, unchecked, `state=state_fetched|state_walked`,
+>   state events stored, gap closed); `warn` per rejected event (event, sender, type, reason), when
+>   a server cannot answer `/state_ids` or `/state`, when fetched events fail, and when a fetched
+>   state is set aside. Two new counters beside `hs_room_backfilled_events_total{kind}`:
+>   `hs_room_backfill_batches_total{kind,outcome}` (`outcome` `state_fetched` or `state_walked`)
+>   and `hs_room_backfill_rejected_events_total{kind,outcome}` (`outcome` `rejected_auth`).
+> - **Tests**, each failing without its fix (checked by mutation). `crates/hs-room/tests/
+>   backfill_state.rs` (new, 5): a batch whose oldest event (mallory's leave) is after a topic
+>   set before the batch and replaced inside it -- with the fetched state the first topic is at
+>   that event and the state at every placed event equals the resident's, the walk (shown for
+>   contrast) has no topic there, and a reload keeps it; a batch with two forged messages, eve's
+>   (never joined; refused by its `auth_events`) and mallory's after her leave citing her old
+>   join (allowed by its `auth_events`, refused by the fetched state before it) -- both refused,
+>   neither stored, the rest the resident's timeline with the resident's state, and walked
+>   only eve's refused; a placed outlier's `state_at_event` is the room's state there, not
+>   itself, after a reload too (fails with `root_after` ignoring the placed roots); a fetched
+>   state without a create event is set aside; `state_before_event` leaves the event out.
+>   `crates/hs-room/tests/rejoin_gap.rs` (+1): a gap filled with the fetched state has the
+>   resident's state at every event. `crates/hs-cli/tests/federation_two_servers.rs` (+1, two
+>   real servers): alice sets a topic, sends ten messages, sets a second topic and sends 95
+>   more; bob joins from B and pages back once; B's `/context` on the tenth message (inside the
+>   fetched batch, before the second topic) shows "first topic", exactly as A's does, and
+>   `hs_room_backfill_batches_total{kind="before_oldest",outcome="state_fetched"}` counted it
+>   (fails with the fetch switched off: no topic). `crates/hs-cli/tests/federation_reads.rs`:
+>   `/state` at the create event is empty, and `/state_ids` names the same events as `/state`
+>   with IDs, not including the event asked about. `hs-federation`'s client: a unit test of
+>   `state_ids`, `room_state` and `event` against a stand-in.
+> - **How to verify.** `cargo test -p hs-room --test backfill_state --test backfill --test
+>   rejoin_gap`, `cargo test -p hs-cli --test federation_two_servers --test federation_reads`,
+>   `cargo test -p hs-federation --lib state_ids_state_and_event`.
+> - **Checks run:** `cargo fmt --all --check`, `cargo clippy -p hs-room -p hs-cli -p
+>   hs-federation --all-targets -- -D warnings`, `cargo test -p hs-room`, `cargo test -p hs-cli
+>   --test federation_two_servers --test federation_reads`, `cargo test -p hs-federation --lib`.
+>   Complement not run (optional for this change; the two-server test is the Myelin-to-Myelin
+>   case `TestMessagesOverFederation` exercises).
+> - **Interfaces provided (new).** `hs_room::backfill::{HistoryKind, HistoryPlan, FetchedState,
+>   StateSource, HistoryOutcome}`; `RoomActor::{plan_history, accept_history, events_not_held,
+>   state_before_event}` and `RoomActorHandle::{plan_history, accept_history}`. Unchanged:
+>   the `Backfill` trait, `accept_backfilled_events`, `accept_gap_events`. From `hs-federation`
+>   (status 06): `FederationClient::{state_ids, room_state, event}`.
+> - **Decisions.** The state is asked at the *oldest* event of a batch only, and derived forward
+>   inside it (linear within a batch, as the brief asked); a fork inside one batch is not
+>   resolved. Fetched state events are trusted as the server's answer once their signatures and
+>   their own `auth_events` check out -- the same trust as a `send_join` snapshot; nothing
+>   re-resolves the state from the batch's `prev_events`. A rejected backfilled event is not
+>   stored at all, matching `accept_remote_event`'s hard rejection (no rejected-flag storage).
+> - **Left.** Within a batch the derivation is linear: an event on a forked branch gets the
+>   state of the topological line, not a resolution of its own `prev_events`. A placed outlier
+>   keeps its outlier flag (so its visibility is still judged by current membership). Placed
+>   outliers from before this change have no `state_snapshots` row and still answer only
+>   themselves until re-placed. `rejected_history` is in memory: after a reload a gap that
+>   cites a rejected event asks for it once more.
 
 > **2026-09-30, session 12: a rejoined room's gap is filled** (branch `agent/rejoin-gap`; known
 > gap "A rejoined room's gap is never filled" closed). Bob on B leaves alice's room on A, alice

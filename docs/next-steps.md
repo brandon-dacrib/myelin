@@ -9,7 +9,7 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 **Where `main` is.** `611ea59` plus this document, **2,453 Rust tests**, gate green with both
 PostgreSQL servers (plain and TLS) in use; CI green again at `a01c1e0` after a red evening (the
 two races below); the demo runs `sha-a01c1e0`; one branch open, `agent/backfill-state` (the next
-gap, in progress); one worktree (`merge-queue`).
+gap, done and pushed, waiting for the merge queue; paragraph below); one worktree (`merge-queue`).
 The gate's six `HS_*_TEST_POSTGRES_*` variables have their recipe at the top of
 `crates/hs-kv/tests/postgres_tls.rs`; the two containers are `hs-admin-followups-gate-pg` on
 :5462 and `hs-merge-queue-pg-tls` on :5463, password `hspg`. The running TLS container's
@@ -92,8 +92,8 @@ hub wait that runs out is a `warn` line now. Left: merge it, and watch the next 
 3. **Next known gaps, one agent at a time**, in this suggested order (each is a row in the table
    at the bottom; pick one that does not touch crates another running agent is in):
    - ~~"A rejoined room's gap is never filled"~~ done on `agent/rejoin-gap` (paragraph below).
-   - "The state at a backfilled event is walked, not asked for" (`hs-room`): `/state_ids` and an
-     auth check on backfilled events; closes the two together.
+   - ~~"The state at a backfilled event is walked, not asked for"~~ done on
+     `agent/backfill-state` (paragraph below).
    - ~~"A destination down for longer than its queue is not caught up" (`hs-federation`)~~: merged
      as `611ea59` (see below).
    - "A requester with no device never records a feed cursor" (`hs-user`): small; some
@@ -170,7 +170,30 @@ rename made while bob was out, read back in order, then the 120 from before his 
 to the create event; the test fails with the fill switched off). Complement's `TestMessagesOverFederation` went from 0/1 (the re-joining subtest failing) to 1/1, all three subtests, three runs in a row; the federation membership set is unchanged at 16/18 (96/98), the two NoCreators races. New
 counter `hs_room_backfilled_events_total{kind}` (`before_oldest`, `rejoin_gap`). Left: a forward
 page does not fill a gap; a state event the rejoin brought as an outlier keeps an outlier's
-state; the state at gap events is walked, not asked for (the next queue item covers both kinds).
+state; the state at gap events is walked, not asked for (the next queue item covers both kinds;
+done on `agent/backfill-state`, below).
+
+**The state at backfilled history is asked for, and every backfilled event is authorized**
+(`agent/backfill-state`, not merged yet; merge commit not yet known; status 04 session 13;
+known gap "The state at a backfilled event is walked, not asked for" closed). Both kinds of
+backfill -- history before the oldest held event and a rejoin's gap -- now go through
+`RoomActor::accept_history`: `hs_cli::backfill` asks the server that sent the batch
+`/state_ids` at its oldest event (`RoomActor::plan_history` names it), fetches what is not held
+with `/event` (or everything with `/state` when a tenth or more is missing, or when `/state_ids`
+fails), and the room actor stores those as outliers, derives the state at every later event
+forward, and authorizes each event with `hs_state::auth` against its `auth_events` and the
+state before it; one that fails is not stored and is counted. An outlier the batch places now
+answers the state computed for it, not itself. Two server-side bugs with no row were found and
+fixed in `hs_cli::federation`: `/state_ids` answered two empty lists for every room of version
+3 or later (it read `event_id` out of PDUs that do not carry one), and `/state` and
+`/state_ids` answered the state *after* the event rather than before it. New client calls
+`FederationClient::{state_ids, room_state, event}` (status 06). Counters
+`hs_room_backfill_batches_total{kind,outcome}` and
+`hs_room_backfill_rejected_events_total{kind,outcome}`; one `info` line per batch. Verified by
+`crates/hs-room/tests/backfill_state.rs` (5), one more in `rejoin_gap.rs`, and a two-server test
+in `federation_two_servers.rs` (a topic set before the fetched batch is in B's `/context` state;
+fails with the fetch switched off). Left: within one batch the derivation is linear; the walk
+stays the fallback when the sender cannot answer; Complement not rerun for it.
 
 ## Earlier on 2026-09-30: the merges, in order
 
@@ -1670,7 +1693,7 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 |---|---|---|
 | ~~A local user's join to a restricted room is refused~~ | `hs-room` | **Closed** (cafb74d): `RoomActor::restricted_join` names the authoriser, and the join goes through another server when nobody here may invite; `federation_membership.rs::a_local_user_joins_a_restricted_room_without_naming_an_authoriser`. Complement's `TestRestrictedRooms*` not re-measured yet |
 | ~~A rejoined room's gap is never filled~~ | `hs-room`, `hs-cli` | **Closed** 2026-09-30 (`agent/rejoin-gap`, status 04 session 12): a rejoin through another server whose `prev_events` are not held opens a gap of 2^24 reserved positions below it (`hs_room::actor::gaps`, keyspace `room_timeline_gaps`); a backward `/messages` page stops there, `Backfill::fill_gap` fetches `/backfill` from the events the gap lacks, and `RoomActor::accept_gap_events` places them between the leave and the rejoin in the resident's order -- published nowhere, skipped by `events_after`, durable across reload. Two real servers: 130 messages and a rename made while bob was out read back in order, then the history from before. Counter `hs_room_backfilled_events_total{kind}`. Complement `TestMessagesOverFederation` 0/1 (2 of 3 subtests) → 1/1 (3 of 3); the federation membership set unchanged at 16/18. Left: a forward page does not fill a gap; a state event the rejoin brought as an outlier keeps an outlier's state; in a forked room an event concurrent with the leave and no deeper than it is left out |
-| The state at a backfilled event is walked, not asked for | `hs-room` | exact while the history is linear and the previous event for each reverted key is within reach; a key set before the fetched history reads as unset until that history arrives; no auth check runs on backfilled events (both before the oldest held event and, since 2026-09-30, in a rejoin's gap, where an unset key falls back to the state at the leave) |
+| ~~The state at a backfilled event is walked, not asked for~~ | `hs-room`, `hs-cli`, `hs-federation` | **Closed** 2026-09-30 (`agent/backfill-state`, status 04 session 13): both kinds of backfill go through `RoomActor::accept_history`; `hs_cli::backfill` asks the server that sent a batch for the state at its oldest event (`/state_ids`, then `/event` for what is not held, `/state` when much is missing or `/state_ids` fails; new `FederationClient::{state_ids, room_state, event}`), the state at every later event is derived forward, and every backfilled event is authorized at its position with `hs_state::auth` (`auth_events`, and the fetched state before it); one that fails is not stored. A placed outlier answers the state computed at placement. Found on the way: this server's own `/state_ids` answered empty lists for every room of version 3+, and `/state`/`/state_ids` answered the state after the event, not before; both fixed. Counters `hs_room_backfill_batches_total{kind,outcome=state_fetched|state_walked}`, `hs_room_backfill_rejected_events_total{kind,outcome=rejected_auth}`. Two real servers: a topic set before the fetched batch is in B's `/context` state at a batch event. Left: within one batch the derivation is linear (a fork inside a batch is not resolved); the walk remains the fallback when the sender cannot answer |
 | ~~A destination down for longer than its queue is not caught up from the room~~ | `hs-federation`, `hs-cli`, `hs-config`, `hs-admin` | **Closed** 2026-09-30 (`agent/federation-catchup`, status 06 session 15): there was no bound at all -- every PDU for a dead destination was queued, forever. Now a destination's queue holds `federation.max_queued_pdus_per_destination` (default 10,000); the PDU that finds it full puts the destination in catch-up mode, after which each PDU only moves its room's queued position (`(destination, room)` queued and sent positions, Synapse's `destination_rooms`). Once the destination answers, the worker drops the queue and sends the latest local event of every room it is behind in (oldest room first, fifty a transaction, recomputed before each attempt, only rooms where it still has a member joined); the receiver fetches the rest itself. Logged entering and leaving, counted in `hs_federation_catch_up_*`, shown as `catch_up_since` in the admin API's destination row. `hs-cli/tests/federation_catch_up.rs`: two real binaries, B stopped, eight messages against a bound of three, B back, bob's history has all eight in order. Left: an event the feeder never handed to the sender (a lagged update stream, a crash between persisting and queueing) moves no position and is still only fetched as an ancestor; the web interface does not show `catch_up_since` yet; no two-replica run of catch-up |
 | ~~EDUs are dropped for a destination another replica sends for~~ | `hs-federation`, `hs-cli` | **Closed** (`da97adc`, merged 2026-09-30): an EDU taken by a replica that does not send for its destination is forwarded over the mesh to the one that does; `hs-cli/tests/cluster_edus.rs` runs two replicas on PostgreSQL. Not yet watched on the cluster. Before that: single-node was complete: typing, receipts, presence, device lists, signing-key updates and to-device cross servers both ways (e4543e4, 649302e, `hs-cli/tests/federation_edus.rs`); in cluster mode `FederationSender::enqueue_edu` drops an EDU whose destination shard another replica owns, so it needs a mesh forward to the owner (status 06, twelfth session) |
 | ~~Invites, leaves and knocks over federation are seams~~ | `hs-federation` | **Closed** (e6d4a71, 249fcee, ea990cb): `transport/membership.rs` serves make/send leave, make/send knock and invite v1/v2, and `hs-cli/tests/federation_membership.rs` drives each between two servers. Not yet measured against Complement |

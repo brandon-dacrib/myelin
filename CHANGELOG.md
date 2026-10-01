@@ -397,6 +397,15 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   arriving in the next incremental sync. Not done: the gap left by leaving a room and rejoining
   it later (history is fetched before the *oldest* held event, not into the middle), and the
   state at a backfilled event is walked, not asked for (`/state_ids`).
+- **Fetched history has the sending server's state, and is authorized** (2026-09-30). The
+  state at a backfilled batch is asked of the server that sent it (`/state_ids` at the oldest
+  event, `/event` or `/state` for what is not held) and derived forward through the batch, so a
+  topic or membership set long before the fetched history is there at every event; every
+  backfilled event is checked with the same auth rules as an inbound one, and one they refuse
+  is not stored. This server's own `/state_ids` answered empty for every room of version 3 or
+  later and both state endpoints answered the state after the event instead of before it; both
+  fixed. Verified with two real servers: B's `/context` state at a fetched message shows a topic
+  set before anything B fetched.
 - The joining side sends `?ver=` with every supported room version, which Synapse requires
   before it will hand out a join template, and carries the user's profile on the join.
 - **Event signing was wrong from the beginning and is fixed.** The spec signs the *redacted* form

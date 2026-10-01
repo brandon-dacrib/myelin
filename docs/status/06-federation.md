@@ -2284,6 +2284,16 @@ this track can fix (`crates/hs-http/**` is out of this session's ownership).
   `crate::outbound_store::{CatchUpMark, Enqueued, RoomBehind}`. `OutboundStore::enqueue` and
   `ack` changed signature (room, bound; sent positions); nothing outside this crate implements
   the trait.
+- **`FederationClient::{state_ids, room_state, event}`** (2026-09-30, added by track 04's
+  `agent/backfill-state`): the outbound halves of `GET /state_ids/{roomId}?event_id=` (returns
+  `(pdu_ids, auth_chain_ids)`), `GET /state/{roomId}?event_id=` (returns `(pdus, auth_chain)`,
+  unverified) and `GET /event/{eventId}` (the first PDU, unverified). `hs_cli::backfill` is the
+  caller: the state at the oldest event of a backfilled batch. Unit-tested in `client.rs`
+  (`state_ids_state_and_event_read_their_answers`). The serving side changed with it, in
+  `hs_cli::federation::RegistryRoomSource`: `/state` and `/state_ids` now answer the state
+  *before* the event (the spec's and Synapse's meaning; it was the state after), and
+  `/state_ids` takes its IDs from the events -- it answered two empty lists for every room of
+  version 3 or later, whose PDUs carry no `event_id`.
 - **`crate::metrics::{EduMetrics, EduOutcome}`** (2026-09-28): `EduMetrics::register(&mut
   prometheus_client::registry::Registry)` (call through `hs_telemetry::metrics::Metrics::
   with_registry`), `record_sent(edu_type)`, `record_received(edu_type, EduOutcome)`;
