@@ -2,6 +2,55 @@
 
 Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-admin`, `hs-modules`, `hs-identity`, `hs-http` (shared with 07 and 14).
 
+## 2026-10-01: every operation enforces the scope the document gives it
+
+Branch `agent/admin-scopes`. Handlers check their scope inline, so `operations.json` alone
+never proved what the router enforces. `crates/hs-admin/tests/scope_contract.rs` now asks the
+real router, for each of the 154 authenticated operations, with a token holding exactly the
+documented scope (must not be refused `403 insufficient-scope`) and one holding every scope that
+does not satisfy it (must be refused, naming the documented scope); a second test checks
+`operations.json` against `openapi.yaml`'s `security`, operation by operation (they agreed).
+Before the fix it failed on 28 operations, every one fixed toward the document:
+
+- **26 bridge operations** enforced `admin:*` where the document says `bridges:*`: the 13
+  `appservices.*` besides `logins` (reads `bridges:read`; create, update, delete, pause,
+  resume, ping, replay, rotate-tokens `bridges:write`; the registration export, which carries
+  the tokens, `bridges:write` as documented, it was `admin:read`), the 3 `bridge_types.*`
+  (render `bridges:write`), `bridge_deployments.target`, the 4 `bridge_offerings.*` and the 5
+  `bridge_instances.*`.
+- **`users.logout`** enforced `admin:write`; the document (and RFC 0004 section 8.2) says
+  `moderation:write`.
+- **`rooms.purge_history`** read and validated its body before checking the scope, so a caller
+  without `moderation:write` got a `400` describing a valid purge instead of the `403`. The
+  scope check now comes first.
+
+No document change was needed: no mutating operation is documented under a `:read` scope
+(`config.validate` is a dry run). `require_scope` now logs each refusal at `info` with the
+principal, the scope required and the scopes held; refusals per route are already counted by
+`hs_http_requests_total{route,status="403"}`, so no new metric. The web app's sidebar gated
+Rooms and Media on `admin:read` (the document: `moderation:read`) and Migration on `admin:write`
+(`migration.get` is `admin:read`); fixed, and the Media page's own gate with it.
+`web/src/components/shell/nav.test.ts` holds every gated section to its landing operation's
+scope in `operations.json`.
+
+**Not shown on the real binary: a token with only `bridges:read`.** The `hs` binary has one
+admin credential, a Matrix access token of a user with the administrator flag, which
+`hs_auth::admin_verifier::AdminTokenVerifier` grants `admin:read` and `admin:write`; nothing
+mints a narrower one (RFC 0004 section 8.1's OAuth issuer, client credentials and CLI service
+accounts are not built). `crates/hs-cli/tests/admin_scopes.rs` boots the binary and checks what
+can be checked there: the served document gives the bridge listings `bridges:read` and
+`users.list` `admin:read`, `/me` holds exactly `admin:read` and `admin:write`, the
+administrator is served all four bridge listings and `users.list`, and a non-administrator's
+token is `401` on all of them. Scoped tokens are the gap that makes these scopes matter outside
+tests.
+
+Also noted, not changed (the document is stricter than RFC 0004 section 8.2, which is safe):
+`users.deactivate`, `users.reactivate`, `users.reset_password` and `rooms.join` are
+`admin:write` in the document where the RFC lists them under `moderation:write`.
+
+Verify: `cargo test -p hs-admin --test scope_contract`; `cargo test -p hs-cli --test
+admin_scopes`; in `web/`, `npx vitest run src/components/shell/nav.test.ts`.
+
 ## 2026-10-01: `appservices.logins`, who has signed in to a bridge (by track 11)
 
 Branch `agent/bridge-logins`. One additive operation, `GET /appservices/{id}/logins?user_id=`
@@ -15,7 +64,8 @@ with `error` set (as `appservices.ping` reports an unreachable bridge). `BridgeT
 implementation had to change; the in-memory one answers from `with_logins`. The handler
 enforces `bridges:read`, as the document says; the older `appservices.*` read handlers still
 enforce `admin:read` (which implies it), so a token with only `bridges:read` is refused by
-them, a mismatch with the document noted here and not changed. Coverage **161 of 161**. Details
+them, a mismatch with the document noted here and not changed (fixed the same day by
+`agent/admin-scopes`, above). Coverage **161 of 161**. Details
 in `docs/status/11-appservices-and-bridges.md` (2026-10-01).
 
 ## 2026-09-29: admin integration complete

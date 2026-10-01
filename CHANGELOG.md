@@ -31,6 +31,11 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   served and written to. A room is copied a page at a time, and each room's events per second,
   bytes per second and the server's peak memory are logged and in `/metrics`; one room of
   100,000 events and 2,000 members was measured (`docs/status/13-config-compat-and-migration.md`).
+- **Every admin API operation enforces the scope its OpenAPI document gives it** (2026-10-01):
+  26 bridge operations took `admin:*` instead of `bridges:*` and `users.logout` `admin:write`
+  instead of `moderation:write`; a test now asks the router about all 154 authenticated
+  operations. The interface shows Rooms and Media to `moderation:read`. No token narrower than
+  `admin:read`+`admin:write` can be minted yet, so this matters once scoped tokens exist.
 - **The chart install is a CD gate.** CD installs the Helm chart on a kind cluster with the
   freshly built amd64 image, waits for Ready, reads the setup link from the pod log, checks
   `/health/ready` and the management interface through a port-forward, and creates the first

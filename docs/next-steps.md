@@ -139,6 +139,21 @@ keep their layout and are read as before. `listening` now carries `boot_ms`, `co
 `crates/hs-cli/src/{cli,serve,bootstrap}.rs` in a few lines (a `boot_metric` field and
 `ServeHandle::record_boot`), so expect a small rebase against the serve-runtime branch. Status 01
 has the table and the tests. Not yet run in a container or on the cluster.
+**Branch `agent/admin-scopes` (2026-10-01, track 15; not merged by its agent; for the merge
+queue): every admin API operation enforces the scope the document gives it.** 28 did not: 26
+bridge operations enforced `admin:*` where the document says `bridges:*` (the mismatch
+`agent/bridge-logins` noted), `users.logout` `admin:write` instead of `moderation:write`, and
+`rooms.purge_history` validated its body before its scope. All fixed toward the document;
+`crates/hs-admin/tests/scope_contract.rs` asks the real router about all 154 authenticated
+operations with an exact-scope and a not-enough token, and checks `operations.json` against
+`openapi.yaml`. The sidebar now shows Rooms and Media to `moderation:read` and Migration to
+`admin:read`, held to `operations.json` by `web/src/components/shell/nav.test.ts`. Real binary:
+`crates/hs-cli/tests/admin_scopes.rs`. **Left:** the `hs` binary cannot mint a token narrower
+than `admin:read`+`admin:write` (RFC 0004 section 8.1's OAuth issuer, client credentials and
+CLI service accounts are unbuilt), so a `bridges:read`-only token is proved against the router,
+not the binary; that is the next piece of work for scopes to mean anything to an operator.
+Touches `hs-admin` (`router.rs`, `rooms.rs`, `auth.rs`) and `web/src/components/shell/nav.ts`,
+`web/src/pages/media/MediaPage.tsx`. Status 15 (2026-10-01).
 
 **Branch `agent/platform-gaps` (2026-10-01, track 12; not merged when written): four
 platform gap rows closed by running them.** The operator ran against a real API server for the
@@ -2038,6 +2053,7 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | The Synapse importer has only met a small Synapse | `hs-compat`, `hs-cli` | **Mostly closed** (`agent/importer-gaps`, 2026-10-01, status 13): a room is copied a page of `batch_size` events at a time (the next read while one is written), and each room's and the copy's events/s, bytes/s and peak memory are logged and exported (`hs_migration_events_read_total`, `hs_migration_room_seconds`, `hs_migration_peak_rss_bytes`, ...). Measured on one room of 100,000 events and 2,000 members (`hs-compat/tests/fixtures/synapse-big`): the rooms stream in 40 and 59 s (the room itself 32 and 35 s, 3,135 and 2,876 events/s, peak 260 MiB) against 69 and 79 s for the whole-room importer run straight after each, whose memory grew with the room (586 MiB at its least-pressured). Left: every run was on the owner's desktop deep in swap under other agents' load, so the times vary two- to eight-fold between runs of the same binary -- measure again on a quiet machine; the room actor still holds every event of a room in memory (`RoomActor::events`), so a room's import is bounded by the room, not by the importer; no `hs import` command line |
 | Sytest never run | `tests/sytest` | CPAN dependencies absent |
 | `cargo fuzz` never executed | `fuzz/` | no nightly toolchain |
+| No admin token narrower than full access can be minted | `hs-auth`, `hs-admin`, `hs-cli` | Open (found 2026-10-01, `agent/admin-scopes`): the only admin API credential is a Matrix token of a user with the administrator flag, granted `admin:read`+`admin:write`; RFC 0004 section 8.1's OAuth issuer, client-credentials grant and CLI service accounts are unbuilt. The six scopes are enforced exactly as documented (`hs-admin/tests/scope_contract.rs`) and the interface gates on them, but no operator can hand a bridge team a `bridges:read` token or a moderator a `moderation:*` one |
 
 ## Conventions worth keeping
 
