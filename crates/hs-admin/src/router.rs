@@ -2260,7 +2260,7 @@ async fn users_devices_delete(
     }
 }
 
-/// `POST /api/v1/users/{user_id}/logout` (`admin:write`): signs the user out everywhere.
+/// `POST /api/v1/users/{user_id}/logout` (`moderation:write`): signs the user out everywhere.
 /// Answers with the user, as the contract says, so the page can redraw from it.
 async fn users_logout(
     State(state): State<AdminState>,
@@ -2272,7 +2272,7 @@ async fn users_logout(
     match require_scope(
         state.verifier.as_ref(),
         authorization_header(&headers),
-        Some(Scope::AdminWrite),
+        Some(Scope::ModerationWrite),
     )
     .await
     {
@@ -2615,7 +2615,7 @@ async fn bridge_types_list(
     match require_scope(
         state.verifier.as_ref(),
         authorization_header(&headers),
-        Some(Scope::AdminRead),
+        Some(Scope::BridgesRead),
     )
     .await
     {
@@ -2641,7 +2641,7 @@ async fn bridge_types_get(
     match require_scope(
         state.verifier.as_ref(),
         authorization_header(&headers),
-        Some(Scope::AdminRead),
+        Some(Scope::BridgesRead),
     )
     .await
     {
@@ -2659,7 +2659,7 @@ async fn bridge_types_get(
     }
 }
 
-/// `POST /api/v1/bridge-types/{type}/render` (`admin:write`, since it mints tokens): the
+/// `POST /api/v1/bridge-types/{type}/render` (`bridges:write`, since it mints tokens): the
 /// wizard's choices, as a registration and the files to run the bridge with.
 async fn bridge_types_render(
     State(state): State<AdminState>,
@@ -2671,7 +2671,7 @@ async fn bridge_types_render(
     match require_scope(
         state.verifier.as_ref(),
         authorization_header(&headers),
-        Some(Scope::AdminWrite),
+        Some(Scope::BridgesWrite),
     )
     .await
     {
@@ -2702,7 +2702,7 @@ async fn bridge_types_render(
 
 // -------------------------------------------------------------------------------------------
 // bridge offerings and instances (RFC 0017), over `crate::bridge_offerings::BridgeOfferingSource`.
-// Reads need `admin:read`; writes `admin:write` (the files carry tokens), audited and published.
+// Reads need `bridges:read`; writes `bridges:write` (the files carry tokens), audited and published.
 // -------------------------------------------------------------------------------------------
 
 /// Runs `f` against the bridge offering source once the scope is checked, turning its result
@@ -2774,7 +2774,7 @@ async fn bridge_deployments_target(
         &state,
         &headers,
         "/api/v1/bridge-deployment-target",
-        Scope::AdminRead,
+        Scope::BridgesRead,
         None,
         StatusCode::OK,
         |s| async move { Ok(Some(s.target().await)) },
@@ -2788,7 +2788,7 @@ async fn bridge_offerings_list(State(state): State<AdminState>, headers: HeaderM
         &state,
         &headers,
         "/api/v1/bridge-offerings",
-        Scope::AdminRead,
+        Scope::BridgesRead,
         None,
         StatusCode::OK,
         |s| async move {
@@ -2810,7 +2810,7 @@ async fn bridge_offerings_get(
         &state,
         &headers,
         &instance,
-        Scope::AdminRead,
+        Scope::BridgesRead,
         None,
         StatusCode::OK,
         |s| async move { not_found_if_none(s.get(&t).await?) },
@@ -2845,7 +2845,7 @@ async fn bridge_offerings_put(
         &state,
         &headers,
         &instance,
-        Scope::AdminWrite,
+        Scope::BridgesWrite,
         Some(("bridge_offerings.put", "bridge_offering.updated", target)),
         StatusCode::OK,
         |s| async move { Ok(Some(s.put(&t, request).await?)) },
@@ -2871,7 +2871,7 @@ async fn bridge_offerings_delete(
         &state,
         &headers,
         &instance,
-        Scope::AdminWrite,
+        Scope::BridgesWrite,
         Some(("bridge_offerings.delete", "bridge_offering.deleted", target)),
         StatusCode::NO_CONTENT,
         |s| async move {
@@ -2893,7 +2893,7 @@ async fn bridge_instances_list(
         &state,
         &headers,
         &instance,
-        Scope::AdminRead,
+        Scope::BridgesRead,
         None,
         StatusCode::OK,
         |s| async move {
@@ -2915,7 +2915,7 @@ async fn bridge_instances_get(
         &state,
         &headers,
         &instance,
-        Scope::AdminRead,
+        Scope::BridgesRead,
         None,
         StatusCode::OK,
         |s| async move { not_found_if_none(s.instance(&t, &user).await?) },
@@ -2935,7 +2935,7 @@ async fn bridge_instances_put(
         &state,
         &headers,
         &instance,
-        Scope::AdminWrite,
+        Scope::BridgesWrite,
         Some(("bridge_instances.put", "bridge_instance.requested", target)),
         StatusCode::OK,
         |s| async move { Ok(Some(s.put_instance(&t, &user).await?)) },
@@ -2955,7 +2955,7 @@ async fn bridge_instances_delete(
         &state,
         &headers,
         &instance,
-        Scope::AdminWrite,
+        Scope::BridgesWrite,
         Some(("bridge_instances.delete", "bridge_instance.deleted", target)),
         StatusCode::NO_CONTENT,
         |s| async move {
@@ -2967,7 +2967,7 @@ async fn bridge_instances_delete(
 }
 
 /// `POST /api/v1/bridge-offerings/{type}/instances/{user_id}/files`: tokens included, so
-/// `admin:write`, and audited like a registration export.
+/// `bridges:write`, and audited like a registration export.
 async fn bridge_instances_files(
     State(state): State<AdminState>,
     headers: HeaderMap,
@@ -2979,7 +2979,7 @@ async fn bridge_instances_files(
         &state,
         &headers,
         &instance,
-        Scope::AdminWrite,
+        Scope::BridgesWrite,
         Some((
             "bridge_instances.files",
             "bridge_instance.files_rendered",
@@ -2993,9 +2993,10 @@ async fn bridge_instances_files(
 
 // -------------------------------------------------------------------------------------------
 // appservices (bridges): the thirteen `appservices.*` operations, over
-// `crate::sources::AppserviceDirectory`. Reads need `admin:read`; everything that changes the
-// registry, or makes the server do something (a ping, a replay), needs `admin:write`, writes one
-// audit entry and publishes one event.
+// `crate::sources::AppserviceDirectory`. Reads need `bridges:read`, except the registration
+// export, which carries the bridge's tokens and so needs `bridges:write`; everything that changes
+// the registry, or makes the server do something (a ping, a replay), needs `bridges:write`, writes
+// one audit entry and publishes one event.
 // -------------------------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -3016,7 +3017,7 @@ async fn appservices_list(
     match require_scope(
         state.verifier.as_ref(),
         authorization_header(&headers),
-        Some(Scope::AdminRead),
+        Some(Scope::BridgesRead),
     )
     .await
     {
@@ -3061,7 +3062,7 @@ async fn appservices_get(
     match require_scope(
         state.verifier.as_ref(),
         authorization_header(&headers),
-        Some(Scope::AdminRead),
+        Some(Scope::BridgesRead),
     )
     .await
     {
@@ -3097,7 +3098,7 @@ async fn appservices_health(
     match require_scope(
         state.verifier.as_ref(),
         authorization_header(&headers),
-        Some(Scope::AdminRead),
+        Some(Scope::BridgesRead),
     )
     .await
     {
@@ -3172,7 +3173,7 @@ async fn appservices_backlog(
     match require_scope(
         state.verifier.as_ref(),
         authorization_header(&headers),
-        Some(Scope::AdminRead),
+        Some(Scope::BridgesRead),
     )
     .await
     {
@@ -3198,7 +3199,8 @@ async fn appservices_backlog(
 }
 
 /// `GET /api/v1/appservices/{id}/registration`: the registration file, as YAML unless the
-/// caller asks for JSON. It carries both tokens; that is what a registration file is.
+/// caller asks for JSON. It carries both tokens; that is what a registration file is, and why it
+/// needs `bridges:write` rather than `bridges:read`.
 async fn appservices_registration(
     State(state): State<AdminState>,
     headers: HeaderMap,
@@ -3208,7 +3210,7 @@ async fn appservices_registration(
     match require_scope(
         state.verifier.as_ref(),
         authorization_header(&headers),
-        Some(Scope::AdminRead),
+        Some(Scope::BridgesWrite),
     )
     .await
     {
@@ -3241,7 +3243,7 @@ async fn appservices_registration(
     }
 }
 
-/// `POST /api/v1/appservices` (`admin:write`): registers a bridge. `201` with the appservice.
+/// `POST /api/v1/appservices` (`bridges:write`): registers a bridge. `201` with the appservice.
 async fn appservices_create(
     State(state): State<AdminState>,
     headers: HeaderMap,
@@ -3251,7 +3253,7 @@ async fn appservices_create(
     match require_scope(
         state.verifier.as_ref(),
         authorization_header(&headers),
-        Some(Scope::AdminWrite),
+        Some(Scope::BridgesWrite),
     )
     .await
     {
@@ -3317,7 +3319,7 @@ async fn appservices_create(
     }
 }
 
-/// `PATCH /api/v1/appservices/{id}` (`admin:write`): an RFC 7396 merge patch to the
+/// `PATCH /api/v1/appservices/{id}` (`bridges:write`): an RFC 7396 merge patch to the
 /// registration.
 async fn appservices_update(
     State(state): State<AdminState>,
@@ -3329,7 +3331,7 @@ async fn appservices_update(
     match require_scope(
         state.verifier.as_ref(),
         authorization_header(&headers),
-        Some(Scope::AdminWrite),
+        Some(Scope::BridgesWrite),
     )
     .await
     {
@@ -3387,7 +3389,7 @@ async fn appservices_update(
     }
 }
 
-/// `DELETE /api/v1/appservices/{id}` (`admin:write`): `204`. The bridge's tokens stop working
+/// `DELETE /api/v1/appservices/{id}` (`bridges:write`): `204`. The bridge's tokens stop working
 /// at once; its users stay, as ordinary accounts nothing can sign in to.
 async fn appservices_delete(
     State(state): State<AdminState>,
@@ -3398,7 +3400,7 @@ async fn appservices_delete(
     match require_scope(
         state.verifier.as_ref(),
         authorization_header(&headers),
-        Some(Scope::AdminWrite),
+        Some(Scope::BridgesWrite),
     )
     .await
     {
@@ -3484,7 +3486,7 @@ async fn appservice_action(
     match require_scope(
         state.verifier.as_ref(),
         authorization_header(headers),
-        Some(Scope::AdminWrite),
+        Some(Scope::BridgesWrite),
     )
     .await
     {

@@ -1261,6 +1261,12 @@ pub(crate) async fn purge_history(
 ) -> Response {
     let instance = format!("{}/purge-history", room_path(&room_id));
     let op = "rooms.purge_history";
+    // The scope check (in `begin_task`) comes before the body is read, so a caller without
+    // `moderation:write` learns that, not what a valid purge request looks like.
+    let start = match begin_task(&state, &headers, &room_id, &body, op, &instance).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
     let request: PurgeBody = match crate::router::parse_optional_json(&body) {
         Ok(r) => r,
         Err(p) => return p.with_instance(instance).into_response(),
@@ -1285,10 +1291,6 @@ pub(crate) async fn purge_history(
         .with_instance(instance)
         .into_response();
     }
-    let start = match begin_task(&state, &headers, &room_id, &body, op, &instance).await {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
     let purge = PurgeHistoryRequest {
         before_ts,
         before_event_id: request.before_event_id.clone(),

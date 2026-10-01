@@ -113,6 +113,14 @@ pub async fn require_scope(
     if let Some(required) = required
         && !principal.has_scope(required)
     {
+        // Per route, refusals are already counted (`hs_http_requests_total{route, status="403"}`);
+        // this line says who was refused and what they held, which a counter cannot.
+        tracing::info!(
+            principal = %principal.id,
+            required = required.as_str(),
+            held = ?principal.scopes.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            "admin API request refused: the token lacks the operation's scope"
+        );
         return ScopeDecision::InsufficientScope(
             hs_http::Problem::insufficient_scope()
                 .with_detail(format!(
