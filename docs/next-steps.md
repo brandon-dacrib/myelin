@@ -170,6 +170,18 @@ was deep in swap. Touches `hs-user` (`UserStore::import_filter`, `SessionHub::im
 the migration is built. Adds `libc` to the workspace dependencies. Gate run for `hs-compat`,
 `hs-cli` (migration), `hs-user`, `hs-room` clippy; not the full workspace gate.
 
+**Branch `agent/complement-remeasure` (2026-10-01, track 14; docs only, for the merge queue):
+Complement re-measured on `main` at `2a0b362`, both whole packages twice.** csapi **343 / 384,
+82 / 106** (340 and 81 in the second run), from 317 and 78 on 2026-09-26: `TestSearch`,
+`TestMessagesOverFederation`, `TestServerNotices`, `TestDeviceListUpdates` now pass. Federation
+**225 / 314, 50 / 90** (224 and 49), from 75 / 250 and 14 / 88: 36 tests FAIL -> PASS, none
+lost. The `TestThreadsEndpoint` row is graded: it held, but two other tests moved between the
+identical runs, each with a new row (`/joined_rooms` misses a room created a millisecond
+earlier, `hs-user`; a NoCreators test race). New baselines in
+`docs/status/complement-{csapi,federation}-results.txt`; README's measurement rows updated; status
+14 session 6 and status 06 have the names. Complement's config already switches rate limits off,
+so `agent/config-hot` should not move these numbers.
+
 **What was done today, in one breath:** the two branches left over from 2026-09-29 merged
 (federation leftovers, the two-pod cluster fix); Complement remeasured and a state-resolution
 tie-break bug found and fixed; then eight known gaps closed one agent at a time -- PostgreSQL
