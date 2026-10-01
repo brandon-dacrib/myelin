@@ -97,6 +97,22 @@ fn requesting_server(headers: &axum::http::HeaderMap) -> Result<String, Box<Matr
         })
 }
 
+/// The spec's `Transaction` shape that `GET /event/{eventId}` and `GET /backfill/{roomId}`
+/// answer with: `origin` (this server), `origin_server_ts` (now) and `pdus`. Until 2026-10-01
+/// both answered `{"pdus": [...]}` alone, and Sytest's `32room-getevent.pl` and
+/// `34room-backfill.pl` (which read `origin` and `origin_server_ts` off the body) failed.
+fn transaction_body(own_server_name: &str, pdus: Vec<serde_json::Value>) -> serde_json::Value {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    serde_json::json!({
+        "origin": own_server_name,
+        "origin_server_ts": now_ms,
+        "pdus": pdus,
+    })
+}
+
 fn room_source_error_to_response(err: RoomSourceError) -> MatrixError {
     match err {
         RoomSourceError::RoomNotFound | RoomSourceError::NotFound => {
@@ -310,7 +326,9 @@ async fn get_event(
         Err(e) => return (*e).into_response(),
     };
     match state.rooms.get_event_by_id(&event_id, &requester).await {
-        Ok((_room_id, event)) => axum::Json(serde_json::json!({ "pdus": [event] })).into_response(),
+        Ok((_room_id, event)) => {
+            axum::Json(transaction_body(&state.own_server_name, vec![event])).into_response()
+        }
         Err(e) => room_source_error_to_response(e).into_response(),
     }
 }
@@ -431,7 +449,7 @@ async fn backfill(
         .backfill(&room_id, &params.from, limit, &requester)
         .await
     {
-        Ok(pdus) => axum::Json(serde_json::json!({ "pdus": pdus })).into_response(),
+        Ok(pdus) => axum::Json(transaction_body(&state.own_server_name, pdus)).into_response(),
         Err(e) => room_source_error_to_response(e).into_response(),
     }
 }
@@ -618,6 +636,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// `/event` and `/backfill` answer the spec's `Transaction`: `origin`, `origin_server_ts`
+    /// and `pdus`. Both answered `pdus` alone before 2026-10-01 (Sytest: "Expected a
+    /// 'origin_server_ts' key", "Expected a 'origin' key").
+    #[tokio::test]
+    async fn event_and_backfill_answer_a_transaction_from_this_server() {
+        for uri in ["/event/$e1", "/backfill/!r:example.org?v=$e1&limit=5"] {
+            let path = uri.split('?').next().unwrap();
+            let header = signed_header("member.example.org", "GET", path);
+            let response = app_with_room()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(AUTHORIZATION, header)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["origin"], "us.example.org", "{uri}: {body}");
+            assert!(
+                body["origin_server_ts"].as_u64().is_some_and(|ts| ts > 0),
+                "{uri}: {body}"
+            );
+            assert!(body["pdus"].is_array(), "{uri}: {body}");
+        }
     }
 
     #[tokio::test]
