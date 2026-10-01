@@ -70,6 +70,27 @@ pub type OutlierKey = (hs_model::RoomSn, hs_model::EventSn);
 /// for every ordinary event.
 pub type StateSnapshotKey = (hs_model::RoomSn, hs_model::EventSn);
 
+/// `(RoomSn, top) -> TimelineGapRecord` (JSON): a stretch of timeline positions reserved below
+/// the event at position `top` for history this server was not in the room for. Written in the
+/// same transaction as that event -- an event taken with an explicit state (a rejoin through
+/// another server, an invite while out) whose `prev_events` are not all in the timeline -- and
+/// kept for good: the positions it reserves are history, never news (see
+/// `crate::actor::RoomActor::accept_gap_events`).
+pub type TimelineGapKey = (hs_model::RoomSn, i64);
+
+/// The value of a [`TimelineGapKey`] row. Where the gap has been filled to and what it still
+/// lacks are derived from the timeline itself on load, so a crash between placing a batch and
+/// rewriting this row loses nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TimelineGapRecord {
+    /// The newest timeline position held when the gap opened (the leave, usually). The gap's
+    /// positions are strictly between this and the row's `top`.
+    pub below: i64,
+    /// Nothing more will be fetched for this gap: the events it lacked are all held, the server
+    /// asked had nothing more, or its reserved positions ran out.
+    pub closed: bool,
+}
+
 /// Encodes a list of `EventSn`s as the value of a [`StateSnapshotKey`] row: each as 8 bytes
 /// big-endian, concatenated, in the order given.
 #[must_use]
@@ -180,6 +201,9 @@ pub struct Tables<B: KvBackend> {
     /// `(RoomSn, EventSn) -> [EventSn; n]`: the explicit state a timeline event was fed to the
     /// state store with. See [`StateSnapshotKey`].
     pub state_snapshots: TypedKeyspace<B::Keyspace, StateSnapshotKey>,
+    /// `(RoomSn, top) -> TimelineGapRecord`: positions reserved below an event for the history
+    /// this server missed while out of the room. See [`TimelineGapKey`].
+    pub timeline_gaps: TypedKeyspace<B::Keyspace, TimelineGapKey>,
 }
 
 impl<B: KvBackend> Tables<B> {
@@ -204,6 +228,7 @@ impl<B: KvBackend> Tables<B> {
             blocked_rooms: TypedKeyspace::new(backend.keyspace("room_blocked")?),
             outliers: TypedKeyspace::new(backend.keyspace("room_outliers")?),
             state_snapshots: TypedKeyspace::new(backend.keyspace("room_state_snapshots")?),
+            timeline_gaps: TypedKeyspace::new(backend.keyspace("room_timeline_gaps")?),
         })
     }
 }

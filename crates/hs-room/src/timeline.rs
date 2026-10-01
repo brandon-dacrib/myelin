@@ -3,12 +3,23 @@
 //! A room's timeline position (`room_pos`, `PLAN.md` section 6.2) is a room-local, monotonically
 //! increasing `i64` assigned by the room's own actor at persist time: positive and increasing for
 //! events the room actor originates or accepts live, negative and decreasing for events inserted
-//! by backfill (older than anything the room actor had when backfill started). A
+//! by backfill (older than anything the room actor had when backfill started), and -- for the
+//! history between a leave and a rejoin through another server -- positive and decreasing
+//! inside a gap of [`TIMELINE_GAP_SPAN`] positions reserved below the rejoin
+//! (`crate::actor::gaps`). A
 //! [`PaginationToken`] is just an opaque wrapper around one such position plus a direction, which
 //! is all `/messages`, `/context` and `/relations` need to say "continue from here".
 
 use std::fmt;
 use std::str::FromStr;
+
+/// How many positions are reserved below an event that follows a stretch of history this
+/// server was not in the room for (a rejoin through another server): the most events
+/// `crate::actor::RoomActor::accept_gap_events` can place between the leave and the rejoin.
+/// Positions are an `i64` and only ever compared, so the jump costs nothing; 2^24 (16.7
+/// million) missed events per rejoin is more than any room has, and leaves room for 2^29
+/// rejoins before a position stops being exact in a JavaScript number.
+pub const TIMELINE_GAP_SPAN: i64 = 1 << 24;
 
 /// Which way a `/messages`-style pagination token continues from its position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

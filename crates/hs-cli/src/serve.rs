@@ -1073,6 +1073,8 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // Writes refused, swallowed or throttled because an administrator suspended, shadow-banned
     // or rate-limited the account (decision 0014).
     metrics.with_registry(hs_room::moderation::register_metrics);
+    // History fetched from other servers into rooms' timelines (`crate::backfill`).
+    metrics.with_registry(crate::backfill::register_metrics);
 
     // The first HTTP client is built in here (the ping transport); the roots are ready by now
     // on any machine that is not very slow, and on one that is, waiting beats blocking.

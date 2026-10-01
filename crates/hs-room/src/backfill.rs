@@ -20,6 +20,11 @@
 //! When nothing implements it -- a server with federation off, this crate's own tests -- a room's
 //! history is exactly what this server holds, as before.
 //!
+//! The same hook fills the *other* place history goes missing: the middle of the timeline,
+//! between a leave and a rejoin through another server ([`Backfill::fill_gap`], [`GapAnchor`],
+//! `crate::actor::gaps`). A backward page that reaches such a gap asks for it before walking on
+//! into what was held before the leave.
+//!
 //! [`RoomActor::history_before_oldest`]: crate::actor::RoomActor::history_before_oldest
 //! [`RoomActor::backfill_anchor`]: crate::actor::RoomActor::backfill_anchor
 //! [`RoomActor::accept_backfilled_events`]: crate::actor::RoomActor::accept_backfilled_events
@@ -59,4 +64,45 @@ pub trait Backfill: Send + Sync {
     /// [`RoomError::BackfillFailed`] if no server could be reached or answered sensibly;
     /// whatever storing the batch can fail with.
     async fn backfill(&self, room_id: &RoomId) -> Result<usize, RoomError>;
+
+    /// Asks a server in `room_id` for one batch of the history missing from the gap below
+    /// timeline position `top` (what happened between a leave and the rejoin at `top`;
+    /// `crate::actor::gaps`), verifies it, and stores it through
+    /// `RoomActor::accept_gap_events`. Returns how many events were newly placed: `0` when
+    /// there is no open gap there, nobody else is in the room to ask, or the answer held
+    /// nothing new (which closes the gap). The default does nothing and returns `0`, for an
+    /// implementation that only fetches history before the oldest held event.
+    ///
+    /// # Errors
+    /// [`RoomError::BackfillFailed`] if no server could be reached or answered sensibly;
+    /// whatever storing the batch can fail with.
+    async fn fill_gap(&self, room_id: &RoomId, top: i64) -> Result<usize, RoomError> {
+        let _ = (room_id, top);
+        Ok(0)
+    }
+}
+
+/// What an implementation of [`Backfill::fill_gap`] needs to fill a gap in the middle of a
+/// room's timeline -- the history between a leave and a rejoin through another server
+/// (`crate::actor::gaps`). Produced by `crate::actor::RoomActor::gap_anchor`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GapAnchor {
+    /// The position of the event the gap sits below (the rejoin): what identifies the gap to
+    /// `crate::actor::RoomActor::accept_gap_events`.
+    pub top: i64,
+    /// Events the gap lacks, which its events cite as `prev_events`: what a `/backfill` request
+    /// names as `v`. The answer is these events and what came before them.
+    pub from: Vec<OwnedEventId>,
+    /// Servers in the room other than this one, most promising first, as for
+    /// [`BackfillAnchor::servers`].
+    pub servers: Vec<String>,
+}
+
+/// What `crate::actor::RoomActor::accept_gap_events` did with one batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GapFill {
+    /// How many events were newly placed in the gap, placed outliers included.
+    pub added: usize,
+    /// Whether the gap is closed now: nothing more will be fetched for it.
+    pub closed: bool,
 }

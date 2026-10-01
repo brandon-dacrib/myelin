@@ -17,9 +17,19 @@
 //! for the same fetch -- a client reading backwards -- and it goes through the room actor's
 //! history path rather than the ancestor-resolution one, because the events are not there to
 //! authorize something newer; they are the history itself.
+//!
+//! The second kind of fetch, [`hs_room::backfill::Backfill::fill_gap`], is the history between a
+//! leave and a rejoin through another server: a gap in the *middle* of the timeline
+//! (`hs_room::actor::gaps`). The same endpoint, asked from the events the gap lacks
+//! (`RoomActor::gap_anchor`), the same verification, and `RoomActor::accept_gap_events`, which
+//! places the batch inside the gap.
+//!
+//! Every batch is logged at `info` (room, server, how many events came and how many were placed)
+//! and counted in `hs_room_backfilled_events_total{kind}` (`kind` is `before_oldest` or
+//! `rejoin_gap`), registered by [`register_metrics`].
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use hs_federation::client::FederationClient;
@@ -29,6 +39,8 @@ use hs_kv::KvBackend;
 use hs_room::RoomError;
 use hs_room::identity::HomeserverIdentity;
 use hs_room::registry::RoomRegistry;
+use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
 use ruma::{OwnedRoomId, RoomId};
 
 /// How many events one `/backfill` request asks for. The most this server's own side of that
@@ -37,6 +49,37 @@ use ruma::{OwnedRoomId, RoomId};
 /// `/messages` page of more than this comes back short and with an `end`, and the next page
 /// fetches the next batch.
 pub const BATCH: usize = 100;
+
+/// The `kind` label of `hs_room_backfilled_events_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+struct BackfilledLabels {
+    kind: &'static str,
+}
+
+/// Process-wide, like the other counters registered into each server's registry: a counter is
+/// only an atomic.
+static BACKFILLED: LazyLock<Family<BackfilledLabels, Counter>> = LazyLock::new(Family::default);
+
+fn count_backfilled(kind: &'static str, added: usize) {
+    BACKFILLED
+        .get_or_create(&BackfilledLabels { kind })
+        .inc_by(u64::try_from(added).unwrap_or(u64::MAX));
+}
+
+/// Registers `hs_room_backfilled_events_total{kind}` into `registry`: events fetched from
+/// another server and placed in a room's timeline as history, by where they went --
+/// `before_oldest` (before the oldest event held, a room joined elsewhere) or `rejoin_gap` (the
+/// history between a leave and a rejoin).
+pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
+    // Registered without `_total`: the text encoder appends it.
+    registry.register(
+        "hs_room_backfilled_events",
+        "Events fetched from another server and placed in a room's timeline as history, by \
+         kind: before_oldest (before the oldest event held), rejoin_gap (between a leave and a \
+         rejoin)",
+        BACKFILLED.clone(),
+    );
+}
 
 /// The `hs serve` implementation of [`hs_room::backfill::Backfill`]. See the module docs.
 pub struct FederationBackfill<B: KvBackend> {
@@ -128,6 +171,7 @@ impl<B: KvBackend + 'static> hs_room::backfill::Backfill for FederationBackfill<
                 }
             }
             let added = handle.accept_backfilled_events(events).await?;
+            count_backfilled("before_oldest", added);
             tracing::info!(
                 %room_id,
                 destination,
@@ -138,6 +182,68 @@ impl<B: KvBackend + 'static> hs_room::backfill::Backfill for FederationBackfill<
                 "fetched the room's earlier history"
             );
             return Ok(added);
+        }
+        Err(RoomError::BackfillFailed(last_error.unwrap_or_else(|| {
+            "no server to ask: the only candidates were this one".to_owned()
+        })))
+    }
+
+    async fn fill_gap(&self, room_id: &RoomId, top: i64) -> Result<usize, RoomError> {
+        let handle = self.rooms.get_or_load(room_id).await?;
+        let lock = self.room_lock(room_id).await;
+        let _guard = lock.lock().await;
+
+        // Read after taking the lock: a batch another request just placed moves the anchor, or
+        // closes the gap.
+        let Some(anchor) = handle.query(move |actor| actor.gap_anchor(top)).await else {
+            return Ok(0);
+        };
+        if anchor.servers.is_empty() {
+            tracing::debug!(%room_id, top, "a timeline gap is open, but nobody else is in the room to ask");
+            return Ok(0);
+        }
+        let room_version = handle.query(|actor| actor.room_version().clone()).await;
+        let own_name = self.identity.server_name.as_str();
+        let from: Vec<String> = anchor.from.iter().map(ToString::to_string).collect();
+
+        let mut last_error: Option<String> = None;
+        for destination in anchor.servers.iter().filter(|s| s.as_str() != own_name) {
+            let pdus = match self
+                .client
+                .backfill(destination, room_id.as_str(), &from, BATCH)
+                .await
+            {
+                Ok(pdus) => pdus,
+                Err(error) => {
+                    tracing::warn!(%room_id, destination, %error, "a server could not be asked for the history between a leave and a rejoin");
+                    last_error = Some(format!("{destination}: {error}"));
+                    continue;
+                }
+            };
+            let mut events = Vec::with_capacity(pdus.len());
+            let mut unverifiable = 0usize;
+            for raw in &pdus {
+                match verify_pdu(raw, &room_version, &self.key_cache).await {
+                    Ok(event) => events.push(event),
+                    Err(error) => {
+                        unverifiable += 1;
+                        tracing::debug!(%room_id, destination, %error, "dropping a gap event that does not verify");
+                    }
+                }
+            }
+            let fill = handle.accept_gap_events(top, events).await?;
+            count_backfilled("rejoin_gap", fill.added);
+            tracing::info!(
+                %room_id,
+                destination,
+                top,
+                received = pdus.len(),
+                unverifiable,
+                added = fill.added,
+                closed = fill.closed,
+                "fetched the room's history from while this server was out of it"
+            );
+            return Ok(fill.added);
         }
         Err(RoomError::BackfillFailed(last_error.unwrap_or_else(|| {
             "no server to ask: the only candidates were this one".to_owned()

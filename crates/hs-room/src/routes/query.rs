@@ -469,31 +469,77 @@ pub async fn get_messages<B: KvBackend + 'static>(
         }
         Err(e) => return Err(e),
     };
-    let (mut start, mut chunk, mut end, wants_backfill) =
-        messages_page(&handle, from, direction, limit, requester.clone(), false).await?;
-
-    // The page reached the oldest event this server holds, and the room's history goes on
-    // before it (a room joined elsewhere, whose earlier history is on the resident): fetch one
-    // batch of it (`crate::backfill`) and page again, now with a continuation token if there is
-    // still more. A fetch that adds nothing -- nobody to ask, nobody answering -- leaves the
-    // first page as it was, with no `end`: the client stops here, and its next look at the room
-    // tries again, rather than being handed the same token forever while a peer is down.
-    if wants_backfill && let Some(hook) = state.rooms.backfill_hook() {
-        match hook.backfill(&room_id).await {
-            Ok(added) if added > 0 => {
-                (start, chunk, end, _) =
-                    messages_page(&handle, from, direction, limit, requester, true).await?;
+    // A backward page can reach two places where the room's history goes on but this server
+    // does not hold it: the oldest event held, in a room joined elsewhere whose earlier history
+    // is on the resident; and an open gap in the middle of the timeline, the history between a
+    // leave and a rejoin through another server. Either way one batch is fetched
+    // (`crate::backfill`) and the page is read again -- at most one fetch of each kind per
+    // request, so a request costs at most two round trips to other servers.
+    //
+    // At the oldest held event, a fetch that adds nothing -- nobody to ask, nobody answering --
+    // leaves the first page as it was, with no `end`: the client stops here, and its next look
+    // at the room tries again, rather than being handed the same token forever while a peer is
+    // down. At a gap, a fetch that adds nothing reads on across the gap instead, so the client
+    // still reaches what was held before the leave.
+    let hook = state.rooms.backfill_hook().cloned();
+    let mut stop_at_gaps = hook.is_some();
+    let mut older_fetched = false;
+    let mut older_tried = false;
+    let mut gap_tried = false;
+    let page = loop {
+        let page = messages_page(
+            &handle,
+            from,
+            direction,
+            limit,
+            requester.clone(),
+            older_fetched,
+            stop_at_gaps,
+        )
+        .await?;
+        let Some(hook) = hook.as_ref() else {
+            break page;
+        };
+        match page.wants {
+            Wants::Nothing => break page,
+            Wants::Older if older_tried => break page,
+            Wants::Older => {
+                older_tried = true;
+                match hook.backfill(&room_id).await {
+                    Ok(added) if added > 0 => older_fetched = true,
+                    Ok(_) => break page,
+                    Err(error) => {
+                        tracing::warn!(
+                            %room_id,
+                            %error,
+                            "could not fetch the room's earlier history; answering from what is held"
+                        );
+                        break page;
+                    }
+                }
             }
-            Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(
-                    %room_id,
-                    %error,
-                    "could not fetch the room's earlier history; answering from what is held"
-                );
+            Wants::Gap(_) if gap_tried => break page,
+            Wants::Gap(top) => {
+                gap_tried = true;
+                match hook.fill_gap(&room_id, top).await {
+                    Ok(added) if added > 0 => {}
+                    Ok(_) => stop_at_gaps = false,
+                    Err(error) => {
+                        tracing::warn!(
+                            %room_id,
+                            top,
+                            %error,
+                            "could not fetch the history between a leave and a rejoin; reading on past it"
+                        );
+                        stop_at_gaps = false;
+                    }
+                }
             }
         }
-    }
+    };
+    let MessagesPage {
+        start, chunk, end, ..
+    } = page;
     // `end` is left out, not `null`, when there is nothing further: the spec's signal for "you
     // have reached the start of the room", and the one a paginating client stops on.
     let mut body = json!({"start": start, "chunk": chunk});
@@ -503,12 +549,34 @@ pub async fn get_messages<B: KvBackend + 'static>(
     Ok(Json(body).into_response())
 }
 
-/// One page of `GET /messages`, rendered for `requester`: `(start, chunk, end,
-/// wants_backfill)`. `wants_backfill` is true when a backward page reached the oldest event this
-/// server holds and the room's history continues before it
-/// (`RoomActor::history_before_oldest`). Until `after_backfill` says the caller has fetched
-/// that history and is paging again, such a page carries no `end`: with nothing to fetch it
-/// from, the oldest held event *is* the end for this server.
+/// What a `/messages` page says should be fetched before it is final.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wants {
+    /// Nothing: the page is what this server can answer.
+    Nothing,
+    /// The room's history from before the oldest event held (`RoomActor::backfill_anchor`).
+    Older,
+    /// The history missing from the open timeline gap below this position
+    /// (`RoomActor::gap_anchor`).
+    Gap(i64),
+}
+
+/// One page of `GET /messages`, rendered for a requester.
+struct MessagesPage {
+    start: String,
+    chunk: Vec<serde_json::Value>,
+    end: Option<String>,
+    wants: Wants,
+}
+
+/// One page of `GET /messages`, rendered for `requester`, with what it [`Wants`] fetched. A
+/// backward page that reached the oldest event this server holds while the room's history
+/// continues before it (`RoomActor::history_before_oldest`) wants [`Wants::Older`]; until
+/// `after_backfill` says the caller has fetched that history and is paging again, such a page
+/// carries no `end`: with nothing to fetch it from, the oldest held event *is* the end for this
+/// server. With `stop_at_gaps`, a backward page stops at an open gap in the middle of the
+/// timeline (`RoomActor::paginate_page`) and wants [`Wants::Gap`], with an `end` naming the
+/// boundary; without it, it reads across gaps.
 async fn messages_page<B: KvBackend + 'static>(
     handle: &crate::actor::RoomActorHandle<B>,
     from: Option<PaginationToken>,
@@ -516,7 +584,8 @@ async fn messages_page<B: KvBackend + 'static>(
     limit: usize,
     requester: hs_auth::requester::Requester,
     after_backfill: bool,
-) -> Result<(String, Vec<serde_json::Value>, Option<String>, bool), RoomError> {
+    stop_at_gaps: bool,
+) -> Result<MessagesPage, RoomError> {
     handle
         .query(move |actor| -> Result<_, RoomError> {
             // The entry gate: forgetting, or never having had a membership record in a
@@ -528,11 +597,22 @@ async fn messages_page<B: KvBackend + 'static>(
                     "you aren't a member of the room".into(),
                 ));
             }
-            let page = actor.paginate_page(from, direction, limit);
-            let wants_backfill = direction == Direction::Backward
-                && page.reached_edge
-                && actor.history_before_oldest();
-            let end = if wants_backfill && !after_backfill {
+            let page = if stop_at_gaps {
+                actor.paginate_page(from, direction, limit)
+            } else {
+                actor.paginate_page_across_gaps(from, direction, limit)
+            };
+            let wants = match page.gap {
+                Some(top) => Wants::Gap(top),
+                None if direction == Direction::Backward
+                    && page.reached_edge
+                    && actor.history_before_oldest() =>
+                {
+                    Wants::Older
+                }
+                None => Wants::Nothing,
+            };
+            let end = if wants == Wants::Older && !after_backfill {
                 None
             } else {
                 page.next
@@ -562,12 +642,12 @@ async fn messages_page<B: KvBackend + 'static>(
                     )
                 })
                 .collect::<Vec<_>>();
-            Ok((
-                start_token.to_string(),
+            Ok(MessagesPage {
+                start: start_token.to_string(),
                 chunk,
-                end.map(|t| t.to_string()),
-                wants_backfill,
-            ))
+                end: end.map(|t| t.to_string()),
+                wants,
+            })
         })
         .await
 }

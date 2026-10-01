@@ -20,8 +20,9 @@
 //! # Deleting a room
 //!
 //! [`RoomActor::delete_everything`] removes every row this crate keeps for the room (events,
-//! timeline, extremities, outliers, snapshots, relations, aliases, directory entry, the joined-by
-//! index and the room's metadata, which is what makes it "not found" afterwards), in batches, and
+//! timeline, timeline gaps, extremities, outliers, snapshots, relations, aliases, directory
+//! entry, the joined-by index and the room's metadata, which is what makes it "not found"
+//! afterwards), in batches, and
 //! marks the actor deleted so a handle somebody still holds cannot write into it. The block row is
 //! kept on purpose: a blocked, deleted room stays blocked. The state store's rows are
 //! content-addressed and shared between rooms, so they are left; nothing reaches them without the
@@ -416,6 +417,7 @@ impl<B: KvBackend> RoomActor<B> {
         delete_range(&backend, &tables.extremities_bwd, prefix(&room))?;
         delete_range(&backend, &tables.outliers, prefix(&room))?;
         delete_range(&backend, &tables.state_snapshots, prefix(&room))?;
+        delete_range(&backend, &tables.timeline_gaps, prefix(&room))?;
         delete_range(&backend, &tables.relations, prefix(&room))?;
         delete_range(&backend, &tables.room_aliases, prefix(&room))?;
         transact(&backend, TransactConfig::default(), |txn| {
@@ -437,6 +439,7 @@ impl<B: KvBackend> RoomActor<B> {
         .map_err(RoomError::from)?;
 
         self.timeline.clear();
+        self.gaps.clear();
         self.forward_extremities.clear();
         self.relations_by_target.clear();
         Ok(removed)
