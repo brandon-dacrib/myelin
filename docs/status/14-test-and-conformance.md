@@ -1,5 +1,18 @@
 # 14 Test and conformance (integration lead): status
 
+## Session 6 (2026-10-01, branch `agent/complement-remeasure`): Complement re-measured on `main`
+
+**In progress.** Both whole packages, twice each, from one image built from `main` at
+`2a0b362`, compared by name with `tools/complement_triage.py` against the 2026-09-26 baselines
+(csapi run 12, federation run 7, both `63c226f`).
+
+| Run | Package | Assertions | Top-level | Against 09-26 |
+|---|---|---|---|---|
+| csapi 1 | `tests/csapi/...` | 343 / 384 | 82 / 106 | `TestDeviceListUpdates`, `TestMessagesOverFederation`, `TestSearch`, `TestServerNotices` FAIL -> PASS; nothing PASS -> FAIL |
+| federation 1 | `tests` | running | | |
+| csapi 2 | | | | |
+| federation 2 | | | | |
+
 ## 2026-10-01: two browser-suite flakes were the harness (branch `agent/web-gaps`)
 
 Both fixes are in `web/`'s Playwright harness, not in the server; status 16 has the detail. The
