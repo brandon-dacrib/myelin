@@ -126,6 +126,99 @@ later event is authorized here as it was there.
 
 **Shared dependencies added:** `libc = "0.2"` in `[workspace.dependencies]` (already in the lock,
 transitively), used by `hs-compat` for `getrusage`.
+## 2026-10-01: every setting says when it applies, and most apply at once (`agent/config-hot`)
+
+Closes the known gap "Only some settings hot-apply" and the admin item "the rate-limit buckets
+other than messages are unenforced". Decision 0016 is amended with the details.
+
+**Done.**
+
+- **One classification.** `crates/hs-config/src/reload.rs`: `SETTINGS` gives every setting a
+  kind (`Applies::{Bootstrap, Hot, Restart}`) and its reader; `HOT_SETTINGS`,
+  `RELOADABLE_SECTIONS` (now: every *administered* setting hot -- `server`, `rate_limits`,
+  `migration`), `applies(pointer)` and `hot_settings_changed` derive from it. The test
+  `every_setting_in_the_schema_is_classified_exactly_once` walks the derived schema
+  (`crates/hs-config/src/schema.rs::field_pointers`, through `$ref`, optional structures and
+  enum variants) and fails naming any setting not covered exactly once; another requires the
+  bootstrap entries to equal `bootstrap::BOOTSTRAP_SETTINGS`.
+- **Published.** `hs_config::schema::json_schema()` adds `"x-applies"` to each classified
+  property; the admin API serves it (`hs-admin/src/config_schema.rs`), adds `applies` to every
+  `ConfigSettingInfo` and derives `reloadable` from it (OpenAPI updated, web client regenerated).
+  `docs/config.md` (regenerated) has an Applies column with each reader. The web fixture is the
+  annotated schema; the interface's mock (`web/src/mocks/data/config.ts`) reads hot and bootstrap
+  settings from its `x-applies` instead of a copied list. The real pages already read
+  `reloadable` per setting from the API.
+- **`hs_config::Live<T>`** (`crates/hs-config/src/live.rs`): the shared replaceable value hot
+  readers hold.
+- **Counts: 7 bootstrap, 39 hot, 25 restart.**
+  - Bootstrap: `server.server_name`, `server.signing_key_path`, `listeners`, `storage`,
+    `cluster.single_node`, `cluster.mesh`, `appservices.registration_files`.
+  - Hot (reader): `server.public_baseurl` (client `.well-known`, the recovery link, bridge
+    files), `server.well_known_server`, `server.unstable_features` (`/versions`),
+    `media.max_upload_size`, `thumbnail_sizes`, `url_preview_enabled`,
+    `url_preview_ip_range_blocklist`, `url_preview_timeout`, `url_preview_max_fetch_size`,
+    `url_preview_cache_lifetime` (`MediaRepository::set_config`); `federation.domain_allowlist`,
+    `ip_range_blocklist`, `ip_range_allowlist` (as before), `allow_public_rooms_over_federation`,
+    `allow_device_name_lookup_over_federation` (`InboundPolicy`); all nine `rate_limits`
+    settings; `auth.enable_registration`, `registration_shared_secret(_file)`,
+    `user_directory_search_all_users`, `access_token_lifetime`, `refresh_token_lifetime`,
+    `password.pepper(_file)`, `password.policy` (`AuthState::set_config`);
+    `appservices.tracking_failure_threshold` (`Registry::set_failure_threshold`, which nothing
+    set at all before); `telemetry.logging.level` (as before); `migration.synapse` (as before).
+  - Restart: `media.storage`, `media.scanning`, `media.allow_legacy_unauthenticated_media` (the
+    legacy routes are mounted or not); `federation.enabled`, `verify_certificates`,
+    `custom_ca_certificates`, `trust_os_root_store`, `client_timeout`, `max_retry_backoff`,
+    `max_queued_pdus_per_destination`; `auth.enable_legacy_login`, `session_secret(_file)`,
+    `password.enabled`, `oidc_providers`, `mas_delegation`; `appservices.enabled`;
+    `telemetry.metrics`, `tracing`, `logging.json`, `sentry`; `cluster.room_shards`,
+    `user_shards`, `heartbeat_interval`, `lease_ttl`.
+  - Read by nothing at all (found while classifying; no row before): `server.admin_contact`,
+    `server.report_stats`, `media.remote_media_retention` (nothing evicts remote media),
+    `rate_limits.third_party_id_validation` (no requestToken route) -- hot;
+    `auth.enable_legacy_login`, `auth.password.enabled`, `auth.session_secret`,
+    `appservices.enabled` -- restart.
+- **Every rate-limit bucket is enforced** with `hs_http::buckets::TokenBuckets` (limit swapped
+  live, what a key has left kept and clamped): `login` (per client address; appservice logins
+  exempt), `registration` (checked on every request, taken when an account is made),
+  `joins_local`/`joins_remote` (per user), `admin_redaction` (a server administrator's
+  redactions instead of the message limit), `federation` (inbound `PUT /send`, per origin). The
+  client address is `hs_http::buckets::ClientIp`: the first `X-Forwarded-For` address from an
+  `x_forwarded` listener or a loopback/private peer, else the peer; a loopback peer forwarding
+  nothing is not limited per address. Listeners serve with `ConnectInfo`.
+- **Observability.** `hs_rate_limited_total{bucket}`; `hs_config_settings_applied_total{setting,
+  outcome}` beside `hs_config_reloads_total{section,outcome}`; one log line per applied setting
+  ("configuration setting applied to the running server", `setting=<pointer>`) and one per
+  section applier ("the auth settings are now in force", ...).
+
+**Verify.**
+
+```sh
+cargo test -p hs-config            # the schema walk, the annotations, Live
+cargo test -p hs-http -p hs-auth -p hs-federation -p hs-admin -p hs-media -p hs-appservice
+cargo test -p hs-cli --test config_hot --test config_reload   # the real binary
+cd web && npm run check && npm run test:e2e
+```
+
+`config_hot.rs` (real binary) lowers `login`, `registration`, `joins_local` and
+`admin_redaction` and gets `429` on the next request over each; switches the user directory to
+search everybody and finds a user it could not; switches registration off and is refused; lowers
+the upload limit and gets `413` (and `m.upload.size` follows); sets `public_baseurl` and the
+client `.well-known` appears -- each with `reloaded_sections: [section]` and nothing waiting for a
+restart, and every one of those assertions fails on `main` before this branch.
+
+**Left.** In cluster mode every bucket is per replica (as `message`). No `invites` or media-upload
+bucket exists in the schema (Synapse's `rc_invites`, `rc_media_create`); presence, push gateway,
+retention defaults and trusted key servers have no setting at all yet. The settings read by
+nothing above. `allow_legacy_unauthenticated_media` could become hot with a per-request gate in
+front of always-mounted legacy routes.
+
+**Decisions made.** Unread settings are classified by where their reader would live (data read
+per use: hot; built at startup: restart). A loopback peer that forwards nothing is not limited
+per address, and a private or loopback peer's `X-Forwarded-For` is believed without
+`x_forwarded` (decision 0016, amendment point 6). Registration is counted when an account is
+made, not per UIA round (as Synapse). `RELOADABLE_SECTIONS` ignores bootstrap settings.
+
+**Shared dependencies added.** `prometheus-client` (already a workspace dependency) to `hs-http`.
 
 ## 2026-09-29: configuration history and hot reload merged
 

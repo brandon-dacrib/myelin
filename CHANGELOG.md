@@ -499,6 +499,16 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   stops where it was then; a 300-event writer racing a syncing device repeated 159 before and
   none now (2026-09-30). Members of a room that crossed the fan-out threshold used to be left
   "cold" and hear nothing more from it; fixed the same day.
+- **Every setting says when a change applies, and most apply at once** (2026-10-01). The
+  Configuration section, the admin API (`applies` per setting) and `docs/config.md` give each of
+  the 71 settings as bootstrap (7), hot (39) or restart (25), from one table a test keeps
+  complete. Newly applied on the running server: every rate limit -- login and registration per
+  client address, joins per user, administrators' redactions and inbound federation per origin
+  are now enforced at all -- registration on or off, the user directory's search-everyone switch,
+  token lifetimes and the password policy, the media upload limit, URL previews and thumbnail
+  sizes, the `.well-known` documents and public base URL, `/versions`' unstable features, and
+  two federation switches. Verified on the real binary by changing each through the admin API
+  and seeing the next request answered under it.
 - **Configuration history, revert and hot reload.** The section page shows each setting's old
   and new values and who changed it, with a revert; message rate limits, the federation allow
   and block lists and the log level apply on the running server, and a save says what applied

@@ -131,6 +131,21 @@ source directory, `.../scratchpad/pgtls/ca.crt`, next to the `server.crt` it ser
 `server.crt` instead, the two `postgres_tls` tests fail with `UnknownIssuer` and the gate is
 red for nothing.
 
+**Branch `agent/config-hot` (2026-10-01, track 13; not merged when written): every setting
+says when it applies, and most apply at once.** Branched from `agent/cli-small-gaps`. One table
+(`hs_config::reload::SETTINGS`) classifies all 71 settings -- 7 bootstrap, 39 hot, 25 restart --
+and a schema-walking test fails on a new one left out; the admin API (`applies` per setting),
+the schema (`x-applies`), `docs/config.md` and the interface's mock all read it. Newly hot:
+every rate-limit bucket, which are now all enforced (login and registration per client address,
+joins per user, administrators' redactions, inbound federation per origin), the `auth`
+settings a running server can swap (`hs_config::Live`), the media upload limit, previews and
+thumbnails, the `server` documents and links, two federation flags and the appservice failure
+threshold. `hs-cli/tests/config_hot.rs` (real binary) changes each through the admin API and
+sees it take effect; new series `hs_rate_limited_total{bucket}` and
+`hs_config_settings_applied_total{setting,outcome}`. Decision 0016 amended; status 13 has the
+lists. Touches `hs-http`, `hs-auth`, `hs-room` (join and redaction limits), `hs-federation`,
+`hs-media`, `hs-appservice`, `hs-bridges`, `hs-admin`, `hs-cli` (`serve.rs`) and `web/`.
+
 **Branch `agent/platform-gaps` (2026-10-01, track 12; not merged when written): four
 platform gap rows closed by running them.** The operator ran against a real API server for the
 first time (kind): `deploy/operator/ci/kind-smoke.sh` drives a `Bridge` and a single-node
@@ -297,7 +312,8 @@ hub wait that runs out is a `warn` line now. Left: merge it, and watch the next 
    device lists, key counts and to-device; signing in is what is left before an encrypted
    message crosses a bridge (`docs/bridges/mautrix.md`).
 6. **Admin, unchanged from 2026-09-29:** cross-section validation, an assisted storage-backend
-   migration, the rate-limit buckets other than messages, message buckets per replica.
+   migration, message buckets per replica. (The rate-limit buckets other than messages are
+   enforced since `agent/config-hot`; every bucket is per replica.)
 
 **Four small gaps closed on `agent/cli-small-gaps` (not merged yet; one commit per row).** The
 setup link without `public_baseurl` names the listener it really has and the log says the host
@@ -555,8 +571,8 @@ builds `ghcr.io/brandon-dacrib/myelin:sha-a5ee260...` from this `main`; the step
 the federation rebase is gone too.
 
 **For the next admin work,** unchanged from 2026-09-29: cross-section validation and an assisted
-storage-backend migration remain open; rate-limit buckets other than messages are unenforced,
-and message buckets are per replica.
+storage-backend migration remain open; every rate-limit bucket is enforced since
+`agent/config-hot` (2026-10-01), and every bucket, messages included, is per replica.
 
 ## 2026-09-29 wrap-up: the admin branches
 
@@ -1940,7 +1956,7 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | ~~Federation media fetch broken~~ | `hs-media` | **Closed** 2026-09-28 (status 09, session 6). Both directions work. A client's download or thumbnail of another server's media is fetched over the signed `/_matrix/federation/v1/media/download`, with the redirect form and the legacy `/_matrix/media/v3/download` fallback. It is then served from the held copy, even with the origin down; the copy honors quarantine and the admin purge. This server's own media is served to other servers as `multipart/mixed`. `hs-cli/tests/federation_media.rs` covers this with two servers and a stand-in origin. Not yet checked against a real Synapse |
 | ~~The client `/hierarchy` endpoint is unimplemented~~ | `hs-room`, `hs-federation`, `hs-cli` | **Closed** 2026-09-30 (`agent/hierarchy`, status 04 session 11): `GET /_matrix/client/v1/rooms/{roomId}/hierarchy` walks `m.space.child` depth-first in the spec's order, filters each room by the spec's visibility list, asks a child's `via` servers over federation `/hierarchy` (whose answer is now spec-shaped) and honours `suggested_only`, `limit`, `max_depth` and expiring `from` tokens. Complement: the five space tests (`TestRestrictedRoomsSpacesSummary{Local,Federation}`, `TestClientSpacesSummary`, `TestClientSpacesSummaryJoinRules`, `TestFederatedClientSpaces`) went from 0/5 to 5/5 (10/10 with subtests). Left: no rate limit and no answer cache on the endpoint; in cluster mode a child owned by another replica is read on the root's owner, as the admin hierarchy does |
 | ~~`/search` unimplemented~~ | `hs-room` | **Closed** 2026-10-01 (`agent/room-gaps`, status 04 session 15, decision 0021): `POST /search` (`room_events`) reads an inverted index in the server's own store (keyspace `room_search`: postings by word, field, room and position; a cursor per room) over message bodies, room names and topics, fed from the room stream with per-room cursors so a restart neither replays nor misses, swept every 30 s, and brought up to date for the rooms a search reads. Every hit is checked against its room (still there, still matching, the filter, history visibility at the event); `rank`/`recent`, `next_batch`, `count`, `highlights`, `event_context`, `include_state`, `groupings`. Verified against the real binary (`hs-cli/tests/search.rs`, two users, three rooms, a restart); Complement `TestSearch` 0/1 → 1/1 (six of six subtests). In a cluster the index is shared through the store and each replica indexes the rooms it owns; two real replicas on PostgreSQL each find the messages of all forty rooms in `cluster_create_room.rs`. Left: backfilled history and a rejoin's gap are not indexed; no stemming; a word with more than 50,000 postings is read in part; Element Web not tried in a browser |
-| Only some settings hot-apply | `hs-config`, `hs-cli` | since `12a19eb` (2026-09-29) message rate limits, the federation allow and block lists and the log level apply on the running server, and a save or revert says what applied and what waits for a restart; every other setting still needs the restart it announces (RFC 0016; decision 0016 says which setting applies where) |
+| ~~Only some settings hot-apply~~ | `hs-config`, `hs-cli` | **Closed** 2026-10-01 (`agent/config-hot`, status 13): every setting is classified in `hs_config::reload::SETTINGS` -- 7 bootstrap, 39 hot, 25 restart -- and a test walking the schema fails on an unclassified one; the schema carries it as `x-applies`, `GET /config/schema` as each setting's `applies`, `docs/config.md` as an Applies column, and the interface's mock reads it from the schema. Hot now: every `rate_limits` bucket (all enforced), `auth` registration/directory/token lifetimes/password policy and pepper/shared secret, `media` upload limit, URL previews and thumbnail sizes, `server` well-known, unstable features and public base URL, the federation publicRooms and device-name flags, the appservice failure threshold. `hs-cli/tests/config_hot.rs` changes each through the admin API on the real binary and sees it take effect. What still needs a restart: `media.storage`, `media.scanning`, `media.allow_legacy_unauthenticated_media`; `federation.enabled`, `verify_certificates`, `custom_ca_certificates`, `trust_os_root_store`, `client_timeout`, `max_retry_backoff`, `max_queued_pdus_per_destination`; `auth.session_secret`, `oidc_providers`, `mas_delegation` (and the unread `enable_legacy_login`, `password.enabled`); `appservices.enabled` (unread); `telemetry.metrics`, `tracing`, `logging.json`, `sentry`; `cluster.room_shards`, `user_shards`, `heartbeat_interval`, `lease_ttl`. Read by nothing at all: `server.admin_contact`, `report_stats`, `media.remote_media_retention`, `rate_limits.third_party_id_validation` (decision 0016's amendment) |
 | ~~One `/api/v1` fetch fails under the full `e2e-real` suite~~ | `web` (`e2e-real` harness, not the dev proxy) | **Closed** 2026-10-01 (`agent/web-gaps`, status 16): the request was the sign-in's `GET /api/v1/me` in `real-server.spec.ts`'s `beforeEach`, and the test aborted it: the old `beforeEach` asserted `toHaveURL(/admin/)`, true the instant "Sign in" is clicked, so the body's `page.goto` navigated while `/me` was in flight (Playwright's status `-1`) and the new page had no session; alone `/me` won the race, in the full suite on a cold dev server it lost. Reproduced by delaying `/me` 1.5 s with `page.route` (old `beforeEach` fails with the same `-1`, today's passes); `307e5d5` had already replaced the assertion, and every `e2e-real` sign-in waits for the session. The full suite also found a second race of the same shape, fixed: the Statistics test read `/statistics/overview` and then expected the page to match, across the overview's one-minute recount (`Accounts35` vs `33`). Before: 4 of 5 full runs green; after: 5 of 5 in a row, 22/22 each |
 | ~~CI does not run the Playwright suite~~ | `.github` | **Closed** 2026-09-30 (`agent/ci-web`): `ci.yml` has a `web` job that runs `npm run check` (lint, types, 443 unit tests, build) and the mock-backed Playwright suite with Chromium, required by `ci-ok`; the report is uploaded when a run fails. First run green in 4m47s. Until then CI ran no web checks at all; two browser tests once failed for an unknown length of time before anybody noticed (fixed 2026-09-21) |
 | ~~Receipts and presence in memory~~ | `hs-user` | **Closed** (e808bac, 51ba7bd): the `hs_user.receipts` and `hs_user.presence` keyspaces; `e2e.rs::receipts_and_presence_are_still_there_after_a_restart_of_the_real_binary` |
