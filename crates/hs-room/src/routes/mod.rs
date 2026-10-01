@@ -134,6 +134,11 @@ pub fn router<B: KvBackend + 'static>() -> (axum::Router<RoomState<B>>, RouteMan
             query::get_messages::<B>,
             matrix_client("getRoomEvents"),
         )
+        .get(
+            "/rooms/{roomId}/initialSync",
+            query::get_room_initial_sync::<B>,
+            matrix_client("roomInitialSync"),
+        )
         .post(
             "/rooms/{roomId}/join",
             membership::post_join::<B>,

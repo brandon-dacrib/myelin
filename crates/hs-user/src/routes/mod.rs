@@ -5,6 +5,7 @@
 //! `hs-cli` needs to actually mount this.
 
 pub mod account_data;
+pub mod events;
 pub mod filter;
 pub mod presence;
 pub mod receipts;
@@ -22,7 +23,8 @@ fn matrix_client(operation_id: &str) -> RouteMeta {
     RouteMeta::new(Surface::MatrixClient, AuthKind::Matrix).with_operation_id(operation_id)
 }
 
-/// This crate's endpoints and their `routes.json` manifest: `/sync`, `/joined_rooms`, account
+/// This crate's endpoints and their `routes.json` manifest: `/sync`, the deprecated `/events`
+/// and `/initialSync` (`events`), `/joined_rooms`, account
 /// data (global and room-scoped), filters, typing, presence and read receipts (`m.receipt` and
 /// `m.fully_read`).
 ///
@@ -41,6 +43,16 @@ pub fn router<B: KvBackend + 'static, R: RoomSource<B> + 'static>()
 -> (axum::Router<UserState<B, R>>, RouteManifest) {
     Builder::new()
         .get("/sync", sync::get_sync::<B, R>, matrix_client("sync"))
+        .get(
+            "/events",
+            events::get_events::<B, R>,
+            matrix_client("getEvents"),
+        )
+        .get(
+            "/initialSync",
+            events::get_initial_sync::<B, R>,
+            matrix_client("initialSync"),
+        )
         .get(
             "/joined_rooms",
             rooms::get_joined_rooms::<B, R>,

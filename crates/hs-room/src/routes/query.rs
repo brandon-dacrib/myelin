@@ -1,5 +1,6 @@
 //! State, event, member and timeline queries: `GET /rooms/{roomId}/state(...)`,
-//! `/event/{eventId}`, `/context/{eventId}`, `/members`, `/joined_members`, `/messages`.
+//! `/event/{eventId}`, `/context/{eventId}`, `/members`, `/joined_members`, `/messages`, and the
+//! deprecated `/initialSync`.
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -549,6 +550,111 @@ pub async fn get_messages<B: KvBackend + 'static>(
     Ok(Json(body).into_response())
 }
 
+/// Query parameters for `GET /rooms/{roomId}/initialSync`.
+#[derive(Debug, Default, Deserialize)]
+pub struct RoomInitialSyncQuery {
+    /// How many of the newest events `messages` carries; defaults to 10, capped at 1000.
+    pub limit: Option<usize>,
+}
+
+/// `GET /rooms/{roomId}/initialSync` (deprecated, but the spec's guest access module still lists
+/// it, and Sytest reads rooms through it): one room as a client first sees it -- the requester's
+/// `membership`, the room's `state` as the requester may see it (as of their leaving, for a
+/// departed member), the newest `messages` in chronological order with `start`/`end`
+/// pagination tokens (`start` pages backwards with `/messages`), and whether the room is in the
+/// directory (`visibility`). `presence`, `receipts` and `account_data` are empty: `/sync` is
+/// where a client reads those.
+///
+/// Who may call it is who may read the room with `/messages`: a member, a past member, or anybody
+/// at all for a `world_readable` room; anyone else gets `403`.
+pub async fn get_room_initial_sync<B: KvBackend + 'static>(
+    State(state): State<RoomState<B>>,
+    Path(room_id): Path<String>,
+    Query(query): Query<RoomInitialSyncQuery>,
+    RoomRequester(requester): RoomRequester,
+) -> Result<Response, RoomError> {
+    let room_id = parse_room_id(&room_id)?;
+    let limit = query.limit.unwrap_or(10).min(1000);
+    let handle = match state.rooms.get_or_load(&room_id).await {
+        Ok(handle) => handle,
+        Err(RoomError::RoomNotFound(_)) => {
+            return Err(RoomError::Forbidden(
+                "you aren't a member of the room".into(),
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    let page = messages_page(
+        &handle,
+        None,
+        Direction::Backward,
+        limit,
+        requester.clone(),
+        false,
+        false,
+    )
+    .await?;
+    let reader = requester.user_id.clone();
+    let (membership, state_events) = handle
+        .query(move |actor| -> Result<_, RoomError> {
+            let membership = actor
+                .state_event_for_reader(&reader, "m.room.member", reader.as_str())?
+                .and_then(|e| {
+                    e.json()
+                        .get("content")
+                        .and_then(hs_model::canonical::CanonicalJsonValue::as_object)
+                        .and_then(|c| c.get("membership"))
+                        .and_then(hs_model::canonical::CanonicalJsonValue::as_str)
+                        .map(str::to_owned)
+                });
+            let state_events = actor
+                .full_state_for_reader(&reader)?
+                .unwrap_or_default()
+                .into_iter()
+                .map(|e| {
+                    attach_replaced_state(
+                        client_event_json(e),
+                        actor.replaced_state_for(e, &reader).as_ref(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            Ok((membership, state_events))
+        })
+        .await?;
+    let visibility = if state.rooms.is_directory_public(&room_id)? {
+        "public"
+    } else {
+        "private"
+    };
+    let MessagesPage {
+        start,
+        mut chunk,
+        end,
+        ..
+    } = page;
+    // A backward page is newest first; a client reads `messages` oldest first.
+    chunk.reverse();
+    let mut messages = json!({"chunk": chunk, "end": start});
+    if let Some(older) = end {
+        messages["start"] = serde_json::Value::String(older);
+    } else {
+        messages["start"] = messages["end"].clone();
+    }
+    let mut body = json!({
+        "room_id": room_id,
+        "messages": messages,
+        "state": state_events,
+        "presence": [],
+        "receipts": [],
+        "account_data": [],
+        "visibility": visibility,
+    });
+    if let Some(membership) = membership {
+        body["membership"] = serde_json::Value::String(membership);
+    }
+    Ok(Json(body).into_response())
+}
+
 /// What a `/messages` page says should be fetched before it is final.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Wants {
@@ -966,5 +1072,87 @@ mod tests {
         let total = handle.query(|actor| actor.events_after(0, 100).len()).await;
         assert_eq!(seen, total);
         assert_eq!(pages, total.div_ceil(2));
+    }
+
+    /// `GET /rooms/{roomId}/initialSync`: a member sees their membership, the room's state and
+    /// its newest messages oldest first; a stranger may read a `world_readable` room the same
+    /// way, with no membership, and is refused any other room.
+    #[tokio::test]
+    async fn room_initial_sync_answers_members_and_world_readable_strangers_only() {
+        let state = app();
+        let alice = user_id!("@alice:hs1");
+        let stranger = user_id!("@stranger:hs1");
+        let handle = state
+            .rooms
+            .create_room(
+                alice.to_owned(),
+                crate::actor::CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|actor| actor.room_id().to_owned()).await;
+        for (at, text) in [(2, "one"), (3, "two"), (4, "three")] {
+            handle
+                .send_event(
+                    alice.to_owned(),
+                    "m.room.message".to_owned(),
+                    None,
+                    json!({"msgtype": "m.text", "body": text}),
+                    None,
+                    at,
+                )
+                .await
+                .unwrap();
+        }
+        let initial_sync = |who: &ruma::UserId, limit: usize| {
+            get_room_initial_sync::<MemoryBackend>(
+                State(state.clone()),
+                Path(room_id.to_string()),
+                Query(RoomInitialSyncQuery { limit: Some(limit) }),
+                requester(who),
+            )
+        };
+
+        let body = json_body(initial_sync(alice, 2).await.unwrap()).await;
+        assert_eq!(body["room_id"], room_id.as_str());
+        assert_eq!(body["membership"], "join");
+        let texts: Vec<&str> = body["messages"]["chunk"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["content"]["body"].as_str())
+            .collect();
+        assert_eq!(texts, vec!["two", "three"]);
+        assert!(body["messages"]["start"].is_string());
+        assert!(body["messages"]["end"].is_string());
+        assert!(
+            body["state"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["type"] == "m.room.create")
+        );
+
+        let err = initial_sync(stranger, 10).await.unwrap_err();
+        assert!(matches!(err, RoomError::Forbidden(_)), "{err}");
+
+        handle
+            .send_event(
+                alice.to_owned(),
+                "m.room.history_visibility".to_owned(),
+                Some(String::new()),
+                json!({"history_visibility": "world_readable"}),
+                None,
+                9,
+            )
+            .await
+            .unwrap();
+        let body = json_body(initial_sync(stranger, 10).await.unwrap()).await;
+        assert!(body.get("membership").is_none(), "{body}");
+        assert!(!body["state"].as_array().unwrap().is_empty());
     }
 }
