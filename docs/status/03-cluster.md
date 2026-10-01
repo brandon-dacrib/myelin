@@ -1,5 +1,52 @@
 ## 2026-09-30: two known gaps closed (branch `agent/cluster-gaps`)
 
+**The last replica of a cluster no longer waits out its drain deadline.** `Drainable::drain`
+released every shard and then waited, up to the deadline less the safety margin (18 s of
+`hs serve`'s 20), for each to show a new owner, even with nobody to be one. Now it first asks
+the registry whether any other replica is live and hashable (not draining, not judged dead by
+this observer's own failure detector, the same judgement `tick` makes). With none, it releases
+every shard in one store transaction with its fencing epoch advanced
+(`ClusterStore::release_shards_fenced`: ownerless, at a later epoch, so a fence handed out
+before the drain fails, as when a peer takes a lost replica's shards) and returns. During the
+wait the check is repeated every `min(heartbeat_interval, 250 ms)`: a peer that dies mid-drain
+stops the wait once it is judged dead, and one that appears resumes it. No tick runs between
+the decision and the release (`tick_lock`), so a tick cannot release the shards first without
+advancing their epochs. `DrainReport::released_at_once` counts them (also included in
+`released_unclaimed`, so `hs serve`'s "cluster drain complete" line is unchanged), the drain
+logs "no other replica is live to take this replica's shards: releasing them at once" and
+"drain released shards at once ... released_at_once=N", and
+`hs_cluster_drain_released_at_once_total` counts them. Found on the way: `release` counted a
+shard as released (and lowered `hs_cluster_owned_shards`) even when a tick had released it
+first; it now counts only a shard it held.
+
+- `ownership::tests::a_lone_replica_drains_in_well_under_a_second` (real clock, the 20 s
+  deadline `hs serve` uses): took 18.0 s on the old behaviour.
+- `ownership::tests::drain_releases_every_owned_shard` now also asserts `released_at_once`,
+  that it took under 0.5 s of its 3 s, the advanced epochs and that an old fence fails.
+- `ownership::tests::a_drain_does_not_wait_for_a_peer_that_is_draining_too` and
+  `a_drain_stops_waiting_once_its_only_peer_is_judged_dead` (the peer's task aborted, its row
+  left Active). All four fail on the old behaviour; `chaos.rs`'s
+  `drain_hands_off_to_a_live_peer_before_stopping` and the administrator-drain test still pass.
+- `crates/hs-cli/tests/cluster_admin.rs` (two real `hs serve` on PostgreSQL 17) now stops B
+  while A is live (B waits for A, and does not log the at-once line), then stops A, the last
+  replica, and asserts it logs the at-once line and stops in under 10 s. Measured from
+  `SIGTERM` to process exit, against a private `postgres:17` on :5471 (the gate's :5462 was
+  under the merge lock) with the machine at a load average of 15-24: **before, 18.17 s**
+  (always-wait behaviour; the test fails on the missing log line); **after, 0.20, 0.65, 0.92, 0.95
+  and 3.17 s** in five runs, the drain itself 0.13-1.6 s for 121-137 shards. A first version
+  released one shard per transaction and took 0.9-13.5 s of drain under the same load, which
+  is why the release is now one transaction. In one of those runs the single-node test in
+  the same file timed out waiting for its embedded-storage boot (no `setup_link=` in 120 s at
+  load ~17), which does not touch the drain; the cold-boot gap is already a row.
+
+Noticed, not changed: an ordinary `release_shard` (a handoff to a live peer, or convergence)
+leaves the epoch as it was, so between the release and the next acquisition a fence the old
+owner still holds passes `Fence::check` against the ownerless row. The next acquisition
+advances the epoch, so a stale write can land only while nobody owns the shard; the new owner
+reads the store after it acquires. Advancing the epoch on every release would close that
+window; it changes `store::tests::acquire_then_release_round_trips_epoch`'s stated contract,
+so it is left for a decision.
+
 **`heartbeat_seq` is a counter, not the wall clock.** Peers judge a replica alive by seeing
 its `heartbeat_seq` change (RFC 0001 section 4). It was the wall clock in milliseconds, so two
 heartbeats in one millisecond (or a clock stepped back) read as no progress, i.e. death. Now
@@ -78,7 +125,7 @@ every commit takes 20 ms, so converging 17 shards is longer than the 150 ms leas
 two-process test passed 10 of 10 runs against PostgreSQL 17 with no shard lost; `hs-cluster`'s
 `mesh_handoff` (5) and `chaos` (4) tests pass too.
 
-Noticed, not changed: a replica shutting down with no live peer still waits out its whole drain
+Noticed, not changed (closed 2026-09-30, above): a replica shutting down with no live peer still waits out its whole drain
 deadline (18 s in this test) for someone to claim its shards (`released_unclaimed=137`).
 
 **Still not done: the two-pod run on the cluster with the handoff fix.** It needs `kubectl` to

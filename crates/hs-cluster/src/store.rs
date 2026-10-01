@@ -476,6 +476,65 @@ impl<B: KvBackend> ClusterStore<B> {
         })
         .map_err(ClusterError::Store)
     }
+
+    /// Releases `shard` and advances its epoch, as a peer taking it from a lost owner would:
+    /// a fence issued to `me` for it fails from now on, even though nobody has acquired it.
+    /// What a draining replica does when no other replica is live to claim its shards.
+    ///
+    /// Applies when `me` at `my_generation` owns the shard or nobody does (it may already have
+    /// been released without the epoch advancing). Returns `false`, changing nothing, when
+    /// another replica owns it.
+    ///
+    /// # Errors
+    /// Returns a store error.
+    pub fn release_shard_fenced(
+        &self,
+        shard: ShardId,
+        me: &ReplicaId,
+        my_generation: Generation,
+    ) -> Result<bool, ClusterError> {
+        self.release_shards_fenced(&[shard], me, my_generation)
+            .map(|released| released.first().copied().unwrap_or(false))
+    }
+
+    /// [`ClusterStore::release_shard_fenced`] for many shards in one transaction, answering
+    /// for each in order. One transaction rather than one per shard: on PostgreSQL under load
+    /// a transaction can take tens of milliseconds, and the last replica of a cluster
+    /// releasing hundreds of shards one at a time spent seconds of its shutdown doing it.
+    ///
+    /// # Errors
+    /// Returns a store error; then nothing was released.
+    pub fn release_shards_fenced(
+        &self,
+        shards: &[ShardId],
+        me: &ReplicaId,
+        my_generation: Generation,
+    ) -> Result<Vec<bool>, ClusterError> {
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let mut out = Vec::with_capacity(shards.len());
+            for shard in shards {
+                let key = shard_key(*shard);
+                let current = match txn.get(&self.shards, &key)? {
+                    None => ShardRecord::initial(),
+                    Some(bytes) => decode_kv::<ShardRecord>("ShardRecord", &bytes)?,
+                };
+                let mine_or_nobodys = match &current.owner {
+                    None => true,
+                    Some((owner, generation)) => owner == me && *generation == my_generation,
+                };
+                if mine_or_nobodys {
+                    let released = ShardRecord {
+                        epoch: current.epoch.next(),
+                        owner: None,
+                    };
+                    txn.put(&self.shards, &key, &encode(&released))?;
+                }
+                out.push(mine_or_nobodys);
+            }
+            Ok(out)
+        })
+        .map_err(ClusterError::Store)
+    }
 }
 
 fn parse_shard_key(rest: &str) -> Option<ShardId> {
@@ -616,6 +675,46 @@ mod tests {
             Epoch(2),
             "release must not change the epoch"
         );
+    }
+
+    #[test]
+    fn a_fenced_release_advances_the_epoch_unless_another_replica_owns_the_shard() {
+        let s = store();
+        let shard = ShardId::new(ShardKind::Room, 1);
+        let me = ReplicaId::new("hs-0");
+        let held = s
+            .acquire_shard(shard, &me, Generation(1), |_| false)
+            .unwrap()
+            .unwrap();
+        assert!(s.release_shard_fenced(shard, &me, Generation(1)).unwrap());
+        let row = s.get_shard(shard).unwrap();
+        assert_eq!(row.owner, None);
+        assert_eq!(row.epoch, held.epoch.next());
+        // Already ownerless: advanced again (harmless; epochs only need to grow).
+        assert!(s.release_shard_fenced(shard, &me, Generation(1)).unwrap());
+        assert_eq!(s.get_shard(shard).unwrap().epoch, held.epoch.next().next());
+        // Owned by somebody else: left alone.
+        let other = ReplicaId::new("hs-1");
+        let theirs = s
+            .acquire_shard(shard, &other, Generation(1), |_| false)
+            .unwrap()
+            .unwrap();
+        assert!(!s.release_shard_fenced(shard, &me, Generation(1)).unwrap());
+        assert_eq!(s.get_shard(shard).unwrap(), theirs);
+
+        // Many at once, answered in order.
+        let mine = ShardId::new(ShardKind::Room, 2);
+        let held = s
+            .acquire_shard(mine, &me, Generation(1), |_| false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            s.release_shards_fenced(&[shard, mine], &me, Generation(1))
+                .unwrap(),
+            vec![false, true]
+        );
+        assert_eq!(s.get_shard(shard).unwrap(), theirs);
+        assert_eq!(s.get_shard(mine).unwrap().epoch, held.epoch.next());
     }
 
     #[test]

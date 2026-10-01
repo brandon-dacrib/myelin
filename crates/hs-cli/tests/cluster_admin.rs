@@ -5,7 +5,9 @@
 //! - Two replicas on one PostgreSQL (runs when a PostgreSQL server is reachable, and prints a
 //!   skip message otherwise): drain one through the other, follow the task until it owns
 //!   nothing, see that it stays drained across a restart, undrain it and see it take shards
-//!   back. Start a server and run it with:
+//!   back; then stop B (it waits for A to take its shards) and A, the last replica, which
+//!   releases its shards at once rather than waiting out its drain deadline. Start a server and
+//!   run it with:
 //!
 //! ```sh
 //! docker run --rm -d --name hs-cluster-admin-pg -e POSTGRES_PASSWORD=hspg \
@@ -614,12 +616,43 @@ async fn a_replica_drained_through_another_hands_off_every_shard_stays_drained_a
     .await;
     assert_eq!(audit["items"].as_array().unwrap().len(), 1, "{audit}");
 
+    // B stops while A is live: it waits for A to take its shards, as a drain should.
     let log_b = hs_b.stop();
     assert!(log_b.contains("drain was withdrawn"), "{log_b}");
+    assert!(!log_b.contains(RELEASED_AT_ONCE), "{log_b}");
     let log_a = hs_a.drain_log();
     assert!(
         log_a.contains("an administrator asked a replica to drain"),
         "{log_a}"
     );
-    hs_a.stop();
+
+    // A is now the last replica. Stopping it, nobody can take its shards, so it releases
+    // them at once instead of waiting out its whole drain deadline (18 s of `hs serve`'s 20)
+    // for a claim that cannot come.
+    eventually(
+        Duration::from_secs(60),
+        "B to be gone from the registry",
+        || {
+            let (client, a, token, id_b) = (&client, &a, &token, &id_b);
+            async move {
+                let listed = replicas(client, a, token).await;
+                find(&listed, id_b).is_none().then_some(())
+            }
+        },
+    )
+    .await;
+    let stopping = Instant::now();
+    let log_a = hs_a.stop();
+    let took = stopping.elapsed();
+    eprintln!("the last replica stopped in {took:?}");
+    let at_once = log_a.lines().find(|l| l.contains(RELEASED_AT_ONCE));
+    eprintln!("its drain said: {at_once:?}");
+    assert!(at_once.is_some(), "{log_a}");
+    assert!(
+        took < Duration::from_secs(10),
+        "the last replica took {took:?} to stop"
+    );
 }
+
+/// What a draining replica logs when nobody is live to take its shards.
+const RELEASED_AT_ONCE: &str = "drain released shards at once";

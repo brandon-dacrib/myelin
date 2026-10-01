@@ -31,6 +31,15 @@ a room that went hot left "cold"). Federation's targeted Complement set went 14/
 the two left are a race in the tests themselves. Nine stale worktrees (190 GB) removed. Every
 paragraph below gives the commit, the status file and what is left.
 
+**Branch `agent/cluster-gaps` (not merged by its agent; for the merge queue): two `hs-cluster`
+gaps closed.** The last replica of a cluster stopping no longer waits out its drain deadline
+for a claim that cannot come (it releases its shards at once with their epochs advanced;
+`cluster_admin.rs`'s last replica stops in 0.2-3.2 s instead of 18.2 s), and
+`heartbeat_seq` is a counter that a restart continues instead of the wall clock in
+milliseconds. Touches only `crates/hs-cluster/` and `crates/hs-cli/tests/cluster_admin.rs`;
+new series `hs_cluster_heartbeat_seq` and `hs_cluster_drain_released_at_once_total`. Details in
+`docs/status/03-cluster.md` (2026-09-30).
+
 **Evening, 2026-09-30: `main` has not built since `d6b3cd7`, and the demo is behind.** Every CD run
 after `d6b3cd7` (17:07) failed at "require green ci" because CI's amd64 `test` job failed one of
 two real-binary tests on the loaded runner, each a server race rather than test noise:
@@ -1716,7 +1725,7 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | The release binaries job's web build has never run | `.github` | it only runs on a `v*` tag; the image path is verified, this one is not |
 | The `main` chart needs `--devel`, and a first tag hides it until Chart.yaml's version moves on | `.github`, `deploy/helm` | pre-releases sort below the release they precede; bump `version` in Chart.yaml right after tagging |
 | ~~An install from a chart before 2026-09-26's label fix cannot be upgraded in place~~ | `deploy/helm` | **Closed** 2026-09-30 (status 12): the demo was the only such install; it had its one `kubectl delete statefulset myelin-hs --cascade=orphan` (pod and claim kept, signing key unchanged) and has been upgraded twice since (revisions 5 and 6) with no manual step. The note stays in status 12 for anyone with an install made before that day |
-| A clustered replica shutting down with no live peer waits out its whole drain deadline | `hs-cluster` | nobody can claim its shards, but `Drainable::drain` still waits for a new owner of each until the deadline (18 s in `cluster_admin.rs`); it should stop waiting when no hashable peer is live |
+| ~~A clustered replica shutting down with no live peer waits out its whole drain deadline~~ | `hs-cluster` | **Closed** 2026-09-30 (`agent/cluster-gaps`, status 03): `Drainable::drain` waits for a new owner only while another replica is live and hashable (rechecked during the wait); with none it releases every shard in one transaction with its fencing epoch advanced and returns, logging "drain released shards at once" and counting `hs_cluster_drain_released_at_once_total`. `cluster_admin.rs`'s last replica now stops in 0.2-3.2 s (18.2 s before, on the same PostgreSQL); `ownership::tests::a_lone_replica_drains_in_well_under_a_second` took 18.0 s on the old behaviour. Before: nobody could claim its shards, but the drain waited for a new owner of each until the deadline |
 | Two pods on the cluster have not run with the handoff fix | `deploy/helm`, desktop | two pods ran on 2026-09-28 with an image from before decision 0017 (a request mid-handoff got a `503`); the fixed image, `rolling.py` during its upgrade and `failover.py` need `kubectl`, which agent sessions cannot reach; "Where this stopped" at the top has the steps |
 | A room alias in `/join/{alias}` or `/knock/{alias}` is not shard-gated | `hs-cli` | the alias resolves inside the handler; ids in `/join/{roomId}`, `/knock/{roomId}` and `/rooms/{roomId}/...` are gated |
 | A v12 room's id cannot be pre-assigned | `hs-room` | the id derives from the create event's hash; RFC 0019 describes the retry the handler should do and it is not implemented |

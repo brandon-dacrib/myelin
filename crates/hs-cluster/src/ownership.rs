@@ -105,7 +105,13 @@ pub struct DrainReport {
     pub handed_off: usize,
     /// Shards released but with no confirmed new owner before the deadline (still correct: a
     /// live peer acquires them on its next tick, so nothing is lost, only latency).
+    /// Includes the [`DrainReport::released_at_once`] ones.
     pub released_unclaimed: usize,
+    /// Of `released_unclaimed`, the shards the drain did not wait for at all, because no other
+    /// replica was live and hashable to claim them (the last replica of a cluster stopping, or
+    /// every other one draining too). They were released with their fencing epoch advanced,
+    /// as a lost replica's would be when a peer takes them.
+    pub released_at_once: usize,
     /// How long the drain took.
     pub elapsed: Duration,
 }
@@ -137,7 +143,9 @@ pub trait Drainable: Send + Sync {
     /// Whether this replica is ready to serve.
     fn ready(&self) -> Readiness;
     /// Runs the graceful handoff sequence (RFC 0001 section 10), releasing every owned shard and
-    /// nudging its desired owner, up to `deadline`.
+    /// nudging its desired owner, up to `deadline`. It waits for a new owner only while some
+    /// other replica is live and hashable to be one; with none, it returns as soon as the
+    /// shards are released ([`DrainReport::released_at_once`]).
     async fn drain(&self, deadline: Duration) -> DrainReport;
 }
 
@@ -431,48 +439,8 @@ impl<B: KvBackend> KvOwnership<B> {
         let replicas = tokio::task::spawn_blocking(move || store.list_replicas()).await;
         let Ok(Ok(replicas)) = replicas else { return };
 
-        let self_heartbeat_fresh = self
-            .last_heartbeat_ok
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .map(|t| t.elapsed() <= self.config.heartbeat_interval * 2)
-            .unwrap_or(false);
-
-        let mut live: Vec<ReplicaId> = Vec::new();
-        {
-            let mut peers = self
-                .peers
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let now = Instant::now();
-            let seen: std::collections::HashSet<_> =
-                replicas.iter().map(|r| r.id.clone()).collect();
-            for rec in &replicas {
-                let entry = peers.entry(rec.id.clone()).or_insert_with(|| PeerLiveness {
-                    last_seq: rec.heartbeat_seq,
-                    last_change: now,
-                });
-                if entry.last_seq != rec.heartbeat_seq {
-                    entry.last_seq = rec.heartbeat_seq;
-                    entry.last_change = now;
-                }
-            }
-            peers.retain(|id, _| seen.contains(id) || *id == self.me);
-            for rec in &replicas {
-                if !rec.state.is_hashable() {
-                    continue;
-                }
-                let dead = rec.id != self.me
-                    && self_heartbeat_fresh
-                    && peers
-                        .get(&rec.id)
-                        .map(|p| p.last_change.elapsed() >= self.config.lease_ttl)
-                        .unwrap_or(false);
-                if !dead {
-                    live.push(rec.id.clone());
-                }
-            }
-        }
+        let self_heartbeat_fresh = self.self_heartbeat_fresh();
+        let live = self.observe_live(&replicas, self_heartbeat_fresh);
         self.metrics.set_live_replicas(live.len() as u64);
         if let Some(age) = *self
             .last_heartbeat_ok
@@ -483,6 +451,76 @@ impl<B: KvBackend> KvOwnership<B> {
         }
 
         self.converge(&live, self_heartbeat_fresh, started).await;
+    }
+
+    /// Whether this replica's own last successful heartbeat is recent enough for it to judge
+    /// others dead (RFC 0001 section 4): otherwise a store stall looks like everyone else dying.
+    fn self_heartbeat_fresh(&self) -> bool {
+        self.last_heartbeat_ok
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map(|t| t.elapsed() <= self.config.heartbeat_interval * 2)
+            .unwrap_or(false)
+    }
+
+    /// Folds one read of the registry into this observer's view of each replica's liveness
+    /// (observed change of `heartbeat_seq` on this observer's monotonic clock, RFC 0001 section
+    /// 4) and returns the replicas that take part in hashing: hashable, and not judged dead. A
+    /// peer is judged dead only when `self_heartbeat_fresh`. Synchronous, so the lock guard it
+    /// takes is never held across an `.await`.
+    fn observe_live(
+        &self,
+        replicas: &[ReplicaRecord],
+        self_heartbeat_fresh: bool,
+    ) -> Vec<ReplicaId> {
+        let mut live: Vec<ReplicaId> = Vec::new();
+        let mut peers = self
+            .peers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        let seen: std::collections::HashSet<_> = replicas.iter().map(|r| r.id.clone()).collect();
+        for rec in replicas {
+            let entry = peers.entry(rec.id.clone()).or_insert_with(|| PeerLiveness {
+                last_seq: rec.heartbeat_seq,
+                last_change: now,
+            });
+            if entry.last_seq != rec.heartbeat_seq {
+                entry.last_seq = rec.heartbeat_seq;
+                entry.last_change = now;
+            }
+        }
+        peers.retain(|id, _| seen.contains(id) || *id == self.me);
+        for rec in replicas {
+            if !rec.state.is_hashable() {
+                continue;
+            }
+            let dead = rec.id != self.me
+                && self_heartbeat_fresh
+                && peers
+                    .get(&rec.id)
+                    .map(|p| p.last_change.elapsed() >= self.config.lease_ttl)
+                    .unwrap_or(false);
+            if !dead {
+                live.push(rec.id.clone());
+            }
+        }
+        live
+    }
+
+    /// Whether some other replica is live and hashable, so could claim a shard this replica
+    /// releases. A replica that is itself draining (shutting down or drained by an
+    /// administrator) cannot. If the registry cannot be read the answer is `true`: not knowing
+    /// is a reason to keep waiting, as a drain always did, not to stop.
+    async fn a_peer_could_claim(&self) -> bool {
+        let store = self.store.clone();
+        let Ok(Ok(replicas)) = tokio::task::spawn_blocking(move || store.list_replicas()).await
+        else {
+            return true;
+        };
+        self.observe_live(&replicas, self.self_heartbeat_fresh())
+            .iter()
+            .any(|id| *id != self.me)
     }
 
     /// Moves this replica's holdings toward what rendezvous hashing over `live` wants, and
@@ -633,10 +671,48 @@ impl<B: KvBackend> KvOwnership<B> {
         let result =
             tokio::task::spawn_blocking(move || store.release_shard(shard, &me, generation)).await;
         if matches!(result, Ok(Ok(()))) {
-            self.owned
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&shard);
+            self.forget_released(shard);
+        }
+    }
+
+    /// Releases `shard` with its epoch advanced ([`ClusterStore::release_shard_fenced`]): for a
+    /// drain with nobody to hand off to. Returns `Some(true)` if the row is now ownerless at
+    /// the new epoch, `Some(false)` if another replica owns it, `None` on a store error.
+    async fn release_fenced(&self, shard: ShardId) -> Option<bool> {
+        self.release_all_fenced(vec![shard])
+            .await
+            .and_then(|released| released.first().copied())
+    }
+
+    /// [`Self::release_fenced`] for many shards, in one store transaction
+    /// ([`ClusterStore::release_shards_fenced`]); `None` (nothing released) on a store error.
+    async fn release_all_fenced(&self, shards: Vec<ShardId>) -> Option<Vec<bool>> {
+        let store = self.store.clone();
+        let me = self.me.clone();
+        let generation = self.generation;
+        let (shards, result) = tokio::task::spawn_blocking(move || {
+            let result = store.release_shards_fenced(&shards, &me, generation);
+            (shards, result)
+        })
+        .await
+        .ok()?;
+        let ownerless = result.ok()?;
+        for shard in &shards {
+            self.forget_released(*shard);
+        }
+        Some(ownerless)
+    }
+
+    /// Takes a released `shard` out of the held set, counted and announced as
+    /// [`OwnershipEvent::Released`]. A shard not held (already released) is left alone.
+    fn forget_released(&self, shard: ShardId) {
+        let was_held = self
+            .owned
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&shard)
+            .is_some();
+        if was_held {
             self.metrics
                 .record_ownership_change(shard.kind.as_str(), ChurnReason::Release);
             let _ = self.events.send(OwnershipEvent::Released(shard));
@@ -757,23 +833,61 @@ impl<B: KvBackend> Drainable for KvOwnership<B> {
         Readiness::Ready
     }
 
+    /// Releases every shard and waits, up to `deadline` less the handoff safety margin, for each
+    /// to show a new owner -- but only while some other replica is live and hashable to be
+    /// that owner. With nobody (the last replica of a cluster stopping, or every other one
+    /// draining too), the shards are released at once with their epochs advanced and the drain
+    /// returns without waiting; it is checked again during the wait, so a peer that dies
+    /// mid-drain stops the wait and one that appears resumes it. Until 2026-09-30 the last
+    /// replica waited out the whole deadline (18 s under `hs serve`) for a claim that could
+    /// not come.
     async fn drain(&self, deadline: Duration) -> DrainReport {
         let start = Instant::now();
+        let deadline_at = start + deadline.saturating_sub(self.config.handoff.safety_margin);
+
+        // No tick runs while this replica announces that it is draining and decides whether
+        // anybody could take its shards, nor (when nobody could) while it releases them: a
+        // tick that saw `draining` would release them too, without advancing their epochs.
+        let ticks_held = self.tick_lock.lock().await;
         self.draining.store(true, Ordering::SeqCst);
         // Announce immediately: my heartbeat row flips to `Draining`, which excludes me from
         // every peer's next hash (RFC 0001 section 10 step 1).
         let row = self.heartbeat_row(ReplicaState::Draining);
+        let seq = row.heartbeat_seq;
         let store = self.store.clone();
-        let _ = tokio::task::spawn_blocking(move || store.heartbeat(&row)).await;
-        self.nudge();
-
-        let deadline = deadline.saturating_sub(self.config.handoff.safety_margin);
-        let deadline_at = start + deadline;
+        if matches!(
+            tokio::task::spawn_blocking(move || store.heartbeat(&row)).await,
+            Ok(Ok(()))
+        ) {
+            *self
+                .last_heartbeat_ok
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+            self.metrics.set_heartbeat_seq(seq);
+        }
+        let mut claimant = self.a_peer_could_claim().await;
+        let mut checked_at = Instant::now();
+        let ticks_held = if claimant {
+            drop(ticks_held);
+            self.nudge();
+            None
+        } else {
+            tracing::info!(
+                replica = %self.me,
+                owned = self.owned_count(),
+                "no other replica is live to take this replica's shards: releasing them at \
+                 once, with their epochs advanced, instead of waiting for a new owner"
+            );
+            Some(ticks_held)
+        };
 
         // Release every shard we hold, in parallel batches (RFC 0001 section 10 step 3). Each
         // release also nudges the convergence loop of any replica that later notices via
         // `nudge()`; the mesh server wires the `/mesh/v1/released` HTTP nudge for real peers.
         let mut released_shards: Vec<ShardId> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        // Released with the epoch advanced and nobody owning them.
+        let mut fenced = std::collections::HashSet::new();
         loop {
             let owned: Vec<ShardId> = self
                 .owned
@@ -785,24 +899,74 @@ impl<B: KvBackend> Drainable for KvOwnership<B> {
             if owned.is_empty() || Instant::now() >= deadline_at {
                 break;
             }
-            let batch: Vec<_> = owned
-                .into_iter()
-                .take(self.config.handoff.parallelism.max(1))
-                .collect();
-            let mut handles = Vec::new();
-            for shard in &batch {
-                handles.push(self.release(*shard));
+            let batch: Vec<_> = if claimant {
+                owned
+                    .into_iter()
+                    .take(self.config.handoff.parallelism.max(1))
+                    .collect()
+            } else {
+                // Nobody to hand off to, so nobody to contend with: all of them, in one
+                // store transaction.
+                owned
+            };
+            if claimant {
+                futures::future::join_all(batch.iter().map(|shard| self.release(*shard))).await;
+            } else if let Some(results) = self.release_all_fenced(batch.clone()).await {
+                for (shard, ownerless) in batch.iter().zip(results) {
+                    if ownerless {
+                        fenced.insert(*shard);
+                    }
+                }
             }
-            futures::future::join_all(handles).await;
-            released_shards.extend(batch);
+            released_shards.extend(batch.into_iter().filter(|s| seen.insert(*s)));
         }
+        drop(ticks_held);
 
         // Step 4: wait (up to what is left of the deadline) for each released shard to show a
-        // new owner, so the report distinguishes a clean handoff from one that ran out of time.
+        // new owner, so the report distinguishes a clean handoff from one that ran out of time
+        // -- for as long as anybody could be that owner.
+        let check_every = self
+            .config
+            .heartbeat_interval
+            .min(Duration::from_millis(250));
         let mut handed_off = 0usize;
         let mut released_unclaimed = 0usize;
+        let mut released_at_once = 0usize;
         for shard in &released_shards {
             loop {
+                if checked_at.elapsed() >= check_every {
+                    let now = self.a_peer_could_claim().await;
+                    checked_at = Instant::now();
+                    if now != claimant {
+                        if now {
+                            tracing::info!(
+                                replica = %self.me,
+                                "a replica that can take this replica's shards appeared \
+                                 mid-drain: waiting for it to claim them"
+                            );
+                        } else {
+                            tracing::info!(
+                                replica = %self.me,
+                                "no other replica is live any more to take this replica's \
+                                 shards: no longer waiting for a new owner"
+                            );
+                        }
+                        claimant = now;
+                    }
+                }
+                if !claimant {
+                    let ownerless = if fenced.contains(shard) {
+                        Some(true)
+                    } else {
+                        self.release_fenced(*shard).await
+                    };
+                    match ownerless {
+                        Some(true) => released_at_once += 1,
+                        Some(false) => handed_off += 1,
+                        None => released_unclaimed += 1,
+                    }
+                    break;
+                }
                 let store = self.store.clone();
                 let s = *shard;
                 let row = tokio::task::spawn_blocking(move || store.get_shard(s)).await;
@@ -818,14 +982,23 @@ impl<B: KvBackend> Drainable for KvOwnership<B> {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }
+        if released_at_once > 0 {
+            self.metrics
+                .record_drain_released_at_once(released_at_once as u64);
+            tracing::info!(
+                replica = %self.me,
+                released_at_once,
+                handed_off,
+                elapsed = ?start.elapsed(),
+                "drain released shards at once: no other replica was live to claim them, \
+                 so it did not wait out its deadline"
+            );
+        }
+        released_unclaimed += released_at_once;
         // Anything still marked owned (release itself failed, e.g. a store error) counts as
         // unclaimed too -- it is left `owner == me` in the store, which is safe (a live peer
         // will not acquire it while this row exists) but not a clean handoff.
-        released_unclaimed += self
-            .owned
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len();
+        released_unclaimed += self.owned_count();
 
         // Deregister: remove our row entirely so we are not even counted as `Draining` overhead.
         // The heartbeat loop is stopped first, with no tick in flight (`tick_lock`): a tick
@@ -842,6 +1015,7 @@ impl<B: KvBackend> Drainable for KvOwnership<B> {
         DrainReport {
             handed_off,
             released_unclaimed,
+            released_at_once,
             elapsed: start.elapsed(),
         }
     }
@@ -968,6 +1142,11 @@ mod tests {
             "the solo replica never acquired every shard"
         );
         let total = mgr.layout().all_shards().count();
+        let held: Vec<(ShardId, Epoch)> = mgr
+            .layout()
+            .all_shards()
+            .map(|s| (s, mgr.fence(s).unwrap().epoch.unwrap()))
+            .collect();
         let report = mgr.drain(Duration::from_secs(5)).await;
         // Solo replica: every shard is released (nothing left `owner == me`), but none is
         // "handed off" in the report's sense, because there is no peer to claim it -- that is
@@ -979,9 +1158,140 @@ mod tests {
             "every shard should have been released"
         );
         assert_eq!(report.handed_off, 0, "no peer exists to hand off to");
-        for shard in mgr.layout().all_shards() {
+        // ... and with nobody to claim them, released at once rather than waited for until
+        // the deadline (three seconds here: five less the two-second safety margin).
+        assert_eq!(report.released_at_once, total, "{report:?}");
+        assert!(
+            report.elapsed < Duration::from_millis(500),
+            "a lone replica waited {:?} for a claim that could not come",
+            report.elapsed
+        );
+        assert_eq!(
+            mgr.metrics().snapshot().drain_released_at_once,
+            total as u64
+        );
+        // Fenced as a lost replica's shards would be: ownerless, at a later epoch, so a fence
+        // this replica handed out before the drain no longer passes.
+        let store = ClusterStore::open(backend).unwrap();
+        for (shard, epoch) in held {
             assert!(!mgr.is_mine(shard));
+            let row = store.get_shard(shard).unwrap();
+            assert_eq!(row.owner, None, "{shard}");
+            assert!(
+                row.epoch > epoch,
+                "{shard} released without its epoch advancing"
+            );
+            let stale = Fence::clustered(shard, epoch);
+            assert!(
+                stale
+                    .check(&store.backend().snapshot(), store.shard_keyspace())
+                    .is_err()
+            );
         }
+    }
+
+    /// Polls `condition` on the real clock every 10 ms for up to five seconds.
+    async fn real_time_until(mut condition: impl FnMut() -> bool) -> bool {
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < until {
+            if condition() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        condition()
+    }
+
+    /// The last replica of a cluster stopping (what `hs serve` does on `SIGTERM`, with its
+    /// 20 s deadline) returns in well under a second on the real clock. It used to wait out
+    /// the whole deadline less the safety margin, 18 s, for a claim that could not come.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lone_replica_drains_in_well_under_a_second() {
+        let (mgr, _handle) = KvOwnership::start(config("hs-0"), MemoryBackend::new())
+            .await
+            .unwrap();
+        assert!(
+            real_time_until(|| mgr.layout().all_shards().all(|s| mgr.is_mine(s))).await,
+            "the solo replica never acquired every shard"
+        );
+        let started = std::time::Instant::now();
+        let report = mgr.drain(Duration::from_secs(20)).await;
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_secs(1),
+            "the last replica took {took:?} to drain"
+        );
+        assert_eq!(report.released_at_once, mgr.layout().all_shards().count());
+    }
+
+    /// A peer that is itself draining cannot take anything, so it is no reason to wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_does_not_wait_for_a_peer_that_is_draining_too() {
+        let backend = MemoryBackend::new();
+        let (a, _ha) = KvOwnership::start(config("hs-0"), backend.clone())
+            .await
+            .unwrap();
+        let (b, _hb) = KvOwnership::start(config("hs-1"), backend.clone())
+            .await
+            .unwrap();
+        let store = ClusterStore::open(backend).unwrap();
+        store
+            .request_drain(
+                &ReplicaId::new("hs-1"),
+                &crate::types::DrainRequest {
+                    requested_unix_ms: 1,
+                    requested_by: "@ops:example.org".into(),
+                    task_id: None,
+                },
+            )
+            .unwrap();
+        let layout = a.layout();
+        assert!(
+            settle_until(Duration::from_millis(60), 400, || {
+                layout.all_shards().all(|s| a.is_mine(s) && !b.is_mine(s))
+            })
+            .await,
+            "hs-0 never took every shard from the drained hs-1"
+        );
+        let report = a.drain(Duration::from_secs(10)).await;
+        assert_eq!(report.handed_off, 0);
+        assert_eq!(report.released_at_once, layout.all_shards().count());
+        assert!(report.elapsed < Duration::from_millis(500), "{report:?}");
+    }
+
+    /// A drain that starts with a live peer waits for it; when that peer then dies (its
+    /// heartbeats stop, its row stays), the drain stops waiting once it is judged dead rather
+    /// than at the deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drain_stops_waiting_once_its_only_peer_is_judged_dead() {
+        let backend = MemoryBackend::new();
+        let (a, _ha) = KvOwnership::start(config("hs-0"), backend.clone())
+            .await
+            .unwrap();
+        let (b, hb) = KvOwnership::start(config("hs-1"), backend.clone())
+            .await
+            .unwrap();
+        let layout = a.layout();
+        assert!(
+            real_time_until(|| layout.all_shards().all(|s| a.is_mine(s) != b.is_mine(s))
+                && layout.all_shards().any(|s| a.is_mine(s)))
+            .await,
+            "the two replicas never partitioned the shard space"
+        );
+        let a_owned = layout.all_shards().filter(|s| a.is_mine(*s)).count();
+        // hs-1's process dies: no more heartbeats, no drain, its row left behind.
+        hb.abort();
+        let _ = hb.await;
+        let started = std::time::Instant::now();
+        let report = a.drain(Duration::from_secs(10)).await;
+        let took = started.elapsed();
+        assert_eq!(report.handed_off, 0, "{report:?}");
+        assert_eq!(report.released_at_once, a_owned, "{report:?}");
+        // About one lease (150 ms) after hs-1's last heartbeat; the deadline was eight seconds.
+        assert!(
+            took < Duration::from_secs(4),
+            "the drain waited {took:?} for a dead peer"
+        );
     }
 
     /// Two heartbeats in the same millisecond are two steps of progress. When `heartbeat_seq`
