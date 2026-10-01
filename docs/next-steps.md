@@ -6,9 +6,26 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 
 ## Resume here: 2026-09-30, end of day
 
-**Where `main` is.** `ed3ad77` plus this document, **2,461 Rust tests**, gate green with both
-PostgreSQL servers (plain and TLS) in use; CI green again at `a01c1e0` after a red evening (the
-two races below); the demo runs `sha-a01c1e0`. **The night of 2026-09-30 is an all-gaps run**
+**Where `main` is.** `2a0b362` plus this document, **2,534 Rust tests**, gate green with both
+PostgreSQL servers (plain and TLS) in use; the demo runs `sha-a01c1e0` (the `sha-025ef65`
+image is built; the roll waits on the Local Network permission, below). **CI on `main` is red
+since `627fab0`** for one reason: GitHub's `stable` Rust moved past the desktop's 1.98 and
+deprecates `AtomicUsize::fetch_update`, which `-D warnings` turns into a clippy failure in
+`hs-federation`'s sender; the one-line fix is `agent/ci-clippy`, which has twice fallen to the
+`cluster_create_room` race below in its gate. **Merged tonight so far, in order:** `ci-flakes`
+`a01c1e0`, `rejoin-gap` `083b58e`, `federation-catchup` `611ea59`, `backfill-state` `ed3ad77`,
+`cluster-gaps` `9cde6e9`, `user-gaps` `dfae9a3`, `platform-gaps` `4d869a2`, `web-gaps`
+`45f560a`, `room-gaps` `5d17e4c`, `bridge-logins` `025ef65`, `cli-small-gaps` `4edbee0`,
+`test-infra-gaps` `c11668a`, `importer-gaps` `2a0b362`. **Blocking every gate right now:**
+`crates/hs-cli/tests/cluster_create_room.rs::every_v12_room_is_built_by_the_owner_of_its_shard_
+whichever_replica_took_the_request` (on `main` since `5d17e4c`) fails three gates in four on the
+loaded machine, two ways: "two replicas never settled sharing the room shards" (all four room
+shards on one replica), and a `createRoom` answered `M_UNKNOWN fenced: this replica no longer
+owns shard room/1` when ownership moved between placement and persistence. The room agent is
+fixing both on `agent/cluster-create-room-flake` (server: a create fenced after placement is
+retried or forwarded; test: wait for convergence); it merges first, then the branches it
+blocked (`ci-clippy`, `boot-time`, `config-hot`, `admin-scopes`, `web-admin-ui`,
+`room-cluster-small`). **The night of 2026-09-30 is an all-gaps run**
 (the owner: "go all night, close all remaining gaps"): several agents at once in disjoint crates,
 merged serially; the branches open at any moment are `git branch -r --no-merged origin/main`,
 each with a paragraph below, and each is merged as it reports. One worktree (`merge-queue`).
@@ -33,7 +50,7 @@ built the web interface, embedded it and booted). `main`'s chart now outlives a 
 without a Chart.yaml bump (`deploy/helm/hs/ci/chart-version.sh`). Status 12 has all of it.
 Left: the `Homeserver`'s cluster mode and drain on a cluster, and a real `v*` tag.
 
-**Branch `agent/importer-gaps` (2026-10-01, night, status 13): the Synapse importer's two rows.**
+**Branch `agent/importer-gaps` → `2a0b362`, 2,534 Rust tests (2026-10-01, night, status 13): the Synapse importer's two rows.**
 The importer now copies end-to-end keys (device, one-time, fallback), cross-signing with its
 signatures, key backups, push rules, pushers, filters, receipts and rooms joined over federation,
 each verified and served by the real binary (`cargo test -p hs-cli --test migration`, 2 tests;
