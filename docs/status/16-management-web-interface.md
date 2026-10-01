@@ -1,6 +1,26 @@
 # 16. Management web interface: status
 
-Last updated: 2026-09-29 (admin integration complete).
+Last updated: 2026-10-01 (two known gaps in the browser suites; branch `agent/web-gaps`).
+
+## 2026-10-01: two known gaps in the browser suites (branch `agent/web-gaps`)
+
+**`e2e/configuration.spec.ts` failed once in 112 runs: not reproduced in 150 more, under load;
+the next occurrence is captured.** The mock-backed spec (five tests) was run as
+`HS_E2E_PORT=4391 npx playwright test e2e/configuration.spec.ts --repeat-each=50 --trace
+retain-on-failure` three times in a row, at the project's default worker count (half the
+cores), on 2026-10-01 00:01-00:26 EDT while several Rust builds ran on the machine: **150 runs of
+the spec, 750 of 750 tests passed** (8.8, 7.8 and 7.2 minutes), at a one-minute load average of
+23 to 37 on 12 cores (mean 30, sampled every 30 s). With nothing to chase, the config now makes
+sure the next failure leaves its error behind, in CI too (`web/playwright.config.ts`):
+
+- `trace: "retain-on-failure-and-retries"`, not `"on-first-retry"`. The old mode traced only the
+  retry, which for a rare flake is the attempt that *passed*; now every attempt is traced and
+  the trace of a failing attempt (and of its retries) is kept. Failure screenshots too.
+- `failOnFlakyTests` in CI. With `retries: 2`, a test that failed and then passed left the job
+  green, and `ci.yml` uploads `playwright-report/` only `if: failure()`, so the trace would never
+  have reached anyone. Now a flaky test fails the job and the report (traces embedded under
+  `data/`) is uploaded. Checked with a throwaway spec that fails on its first attempt only:
+  `CI=1 npx playwright test` exits 1, "1 flaky", and the report holds both attempts' traces.
 
 ## 2026-09-29: admin interface integration complete
 
