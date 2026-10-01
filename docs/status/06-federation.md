@@ -1,5 +1,100 @@
 # 06 Federation: status
 
+## Fifteenth session (2026-09-30): a destination down past its queue is caught up from the rooms
+
+**Branch:** `agent/federation-catchup` (not merged). Closes the known gap "A destination down
+for longer than its queue is not caught up from the room".
+
+**What was actually true before.** The gap row said PDUs were not queued for a destination
+"already known failing". No such path existed: `FederationSender::enqueue_pdu` wrote every PDU
+for every destination, failing or not, and **the queue had no bound at all**. A destination
+down for a week grew `hs_federation.outbound_queue` by a week of events, and the worker then
+replayed all of it, fifty at a time, in order. What *was* lost was only what never reached the
+sender (the feeder's lagged update stream, a crash between persisting and queueing).
+
+**What changed.**
+
+- `hs_federation::outbound_store`: four new keyspaces. `outbound_lengths` (a per-destination
+  `atomic_add` counter kept in the same transactions that add and remove rows, counted once at
+  open for a store written before it existed); `outbound_room_queued` and `outbound_room_sent`
+  (`(destination, room_id) -> seq`: the newest PDU meant for, and accepted by, the destination
+  in that room -- Synapse's `destination_rooms` plus `last_successful_stream_ordering`, per
+  room); `outbound_catch_up` (`CatchUpMark`: since, reason, the sequence number it was set at).
+  `OutboundStore::enqueue` now takes the room and the bound and returns `Enqueued` (queued /
+  newly catching up / already catching up); `ack` records sent positions in the same
+  transaction; new `catch_up_mark(s)`, `mark_catch_up`, `note_queued`, `rooms_behind`,
+  `record_sent`, `finish_catch_up` (clears the mark only if no room is behind, in one SSI
+  transaction, so a racing enqueue is either seen as behind or queued normally).
+- `hs_federation::sender`: `SenderConfig::max_queued_pdus_per_destination`
+  (`DEFAULT_MAX_QUEUED_PDUS_PER_DESTINATION` = 10,000). The PDU that finds a queue full marks
+  the destination; from then on PDUs for it only move room positions. The worker sees the mark
+  at the top of its loop or between attempts at its head transaction (`Delivery::Superseded`),
+  drops the queue in batches of 500 (noting each row's room as behind), then loops: wait out the
+  persisted backoff, compute the rooms behind (oldest queued position first, fifty), ask the new
+  `CatchUpSource` trait for each room's latest event, make **one** attempt (`Mode::CatchUp`;
+  recomputed before the next, so what goes out when the destination returns is what is latest
+  then), record the sent positions; when nothing is behind, `finish_catch_up`. EDUs are not
+  part of catch-up and go out after it. `resume` starts workers for marked destinations even
+  with an empty queue. `FederationSender::{install_catch_up_source, install_catch_up_metrics,
+  mark_for_catch_up, catch_up_marks}`.
+- `hs_federation::metrics::CatchUpMetrics`: `hs_federation_catch_up_started_total{reason}`,
+  `_completed_total`, `_rooms_total`, `hs_federation_outbound_pdus_dropped_total`; no
+  destination label (unbounded). `info` logs "destination entering catch-up" (reason, queued
+  when marked) and "destination caught up; leaving catch-up" (`rooms`, `events_sent`,
+  `elapsed_ms`).
+- `hs-config`: `federation.max_queued_pdus_per_destination` (u32, default 10,000, at least 1);
+  `docs/config.md` regenerated, the web's schema fixture regenerated.
+- `hs-cli`: `federation_sender::RoomCatchUp` (the `CatchUpSource` over the room registry: the
+  newest local forward extremity, else the newest local event among the last 200, nothing if the
+  destination has no member joined), installed by `OutboundFederation::start`; `build_mount`
+  passes the bound; `serve.rs` registers the catch-up metrics next to the EDU ones.
+- `hs-admin`: `AdminDestination::catch_up_since` (OpenAPI `Destination.catch_up_since`,
+  nullable date-time, additive; `web/src/api/schema.d.ts` edited by hand in the generator's
+  shape). `DestinationStoreSource` lists marked destinations and fills the field.
+
+**Verified.**
+
+- `cargo test -p hs-federation` (184 + doc): new
+  `sender::tests::a_destination_down_past_its_queue_bound_gets_each_rooms_latest_event_then_its_queue`
+  (five events in two rooms against a bound of three, destination refusing connections; the
+  queue is dropped, `!b` moves on while it is down, and when it comes up it gets exactly
+  `[!a's latest, !b's latest]` in one transaction, then the next event alone; metrics text
+  checked), `sender::tests::a_destination_marked_before_a_restart_is_caught_up_by_the_next_sender`
+  (KV store, mark survives, a room the destination left is skipped),
+  `outbound_store::tests::a_full_queue_marks_its_destination_and_positions_say_which_rooms_are_behind`
+  (both stores), `outbound_store::tests::a_queue_from_before_lengths_were_kept_is_counted_at_open`,
+  and the admin-source test extended for `catch_up_since`. The first fails with the bound
+  disabled (`left: 5, right: 3` at the queue-length assertion).
+- `cargo test -p hs-cli --test federation_catch_up`: two real binaries over TLS; B (process and
+  proxy) stopped; alice sends eight messages against `max_queued_pdus_per_destination: 3`; A's
+  admin row shows `catch_up_since`, `failing_since` and nothing pending; B restarts over its data
+  directory; bob's `/sync` gets the eighth, A logs `rooms=1 events_sent=1` leaving catch-up, the
+  row clears, bob's `/messages` has all eight in order (B fetched the seven from A), and a
+  ninth message goes the ordinary way. 22-30 s. With the bound disabled it fails after 60 s at
+  the admin row (`"pending_pdu_count":8,"catch_up_since":null`).
+- `cargo test -p hs-cli --test federation_sender` (new
+  `catch_up_sends_the_latest_local_event_and_nothing_after_the_destination_left`),
+  `--test federation_restart`, `--test federation_two_servers`, `--test federation_edus`: pass.
+- `cargo test -p hs-admin`, `cargo test -p hs-config --lib federation` and the
+  `web_schema_fixture` test: pass. `cargo clippy -p hs-federation -p hs-cli -p hs-admin -p
+  hs-config --all-targets -- -D warnings`, `cargo fmt --all --check`: clean. Not run: the
+  workspace gate and `npm run check` (the web change is one optional generated field).
+
+**Left.**
+
+- An event the feeder never handed to the sender (`RecvError::Lagged`, a crash between
+  persisting and queueing) moves no room position, so catch-up does not know of it; it reaches a
+  destination only as an ancestor of a later event. Closing it needs the feeder to say which
+  rooms it lost (or a per-room "last event handed over" cursor), then
+  `FederationSender::mark_for_catch_up` plus `note_queued` does the rest.
+- The web interface does not show `catch_up_since` (track 16; the field is in the generated
+  types).
+- Catch-up in a cluster has not been run on two replicas: marks and positions are in the shared
+  store and only the destination's shard owner has a worker, so it should hold, but nobody has
+  watched it.
+- The per-destination room position rows are never pruned (one pair per room ever shared with a
+  destination, as Synapse's `destination_rooms`).
+
 ## Fourteenth session (2026-09-30): Complement remeasured, and a state-resolution tie-break
 
 **Branch state:** `agent/federation-complement`, on top of `agent/federation-leftovers` at
@@ -2181,6 +2276,14 @@ this track can fix (`crates/hs-http/**` is out of this session's ownership).
 
 ## Interfaces provided
 
+- **Catch-up** (2026-09-30, fifteenth session): `crate::sender::CatchUpSource`
+  (`async fn latest_pdu(&self, room_id, destination) -> Result<Option<Value>, String>`; `hs-cli`'s
+  `federation_sender::RoomCatchUp` implements it), `FederationSender::{install_catch_up_source,
+  install_catch_up_metrics, mark_for_catch_up, catch_up_marks}`,
+  `SenderConfig::max_queued_pdus_per_destination`, `crate::metrics::CatchUpMetrics`,
+  `crate::outbound_store::{CatchUpMark, Enqueued, RoomBehind}`. `OutboundStore::enqueue` and
+  `ack` changed signature (room, bound; sent positions); nothing outside this crate implements
+  the trait.
 - **`crate::metrics::{EduMetrics, EduOutcome}`** (2026-09-28): `EduMetrics::register(&mut
   prometheus_client::registry::Registry)` (call through `hs_telemetry::metrics::Metrics::
   with_registry`), `record_sent(edu_type)`, `record_received(edu_type, EduOutcome)`;
@@ -2314,6 +2417,15 @@ this track can fix (`crates/hs-http/**` is out of this session's ownership).
 
 ## Decisions made
 
+- **Catch-up follows Synapse, with a durable queue in front of it** (2026-09-30). Synapse
+  drops its in-memory queue and enters catch-up on the first failure; this server keeps its
+  durable queue up to a bound (`federation.max_queued_pdus_per_destination`, 10,000) and only
+  past it drops the queue and catches up from the rooms, so a short outage is still replayed
+  event by event and a long one costs bounded storage. Positions are the store's own sequence
+  numbers, per (destination, room). The catch-up event is the latest *local* one, preferring a
+  forward extremity; rooms where the destination has no member joined are skipped. Catch-up
+  transactions are attempted once each and recomputed after a failure, not retried as they
+  were.
 New this (eighth) session:
 
 - **In memory first, persistence next.** The brief asked for the sender that makes "a local event

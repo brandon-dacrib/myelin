@@ -8,7 +8,7 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 
 **Where `main` is.** `083b58e` plus this document, **2,446 Rust tests**, gate green with both
 PostgreSQL servers (plain and TLS) in use; CI green again at `a01c1e0` after a red evening (the
-two races below); one branch open, `agent/federation-catchup` (the next gap, in progress); one
+two races below); one branch open, `agent/federation-catchup` (the next gap, done and waiting to merge); one
 worktree (`merge-queue`).
 The gate's six `HS_*_TEST_POSTGRES_*` variables have their recipe at the top of
 `crates/hs-kv/tests/postgres_tls.rs`; the two containers are `hs-admin-followups-gate-pg` on
@@ -94,8 +94,8 @@ hub wait that runs out is a `warn` line now. Left: merge it, and watch the next 
    - ~~"A rejoined room's gap is never filled"~~ done on `agent/rejoin-gap` (paragraph below).
    - "The state at a backfilled event is walked, not asked for" (`hs-room`): `/state_ids` and an
      auth check on backfilled events; closes the two together.
-   - "A destination down for longer than its queue is not caught up" (`hs-federation`): Synapse's
-     `destination_rooms` catch-up.
+   - ~~"A destination down for longer than its queue is not caught up" (`hs-federation`)~~: done
+     on `agent/federation-catchup` (see below).
    - "A requester with no device never records a feed cursor" (`hs-user`): small; some
      appservice callers.
    - "A room alias in `/join/{alias}` is not shard-gated" (`hs-cli`): small.
@@ -120,6 +120,18 @@ running** -- a hand-run of the `hs-kv` conformance tests during a gate exhausted
 100 connections and failed that gate's two-replica test with an empty log; (b) a gate that stops
 without its own script releasing the lock leaves `.git/myelin-merge.lock` behind -- check for
 running `cargo` processes, then `rmdir` it.
+
+**A destination down for longer than its queue is caught up from the rooms**
+(`agent/federation-catchup`, not yet merged; status 06 session 15; known gap closed). The
+sender had no queue bound at all. Each destination's queue now holds
+`federation.max_queued_pdus_per_destination` (10,000 by default); past that the destination is
+in catch-up mode and, once it answers, gets the latest local event of each room it is behind in
+(per-room queued and sent positions in the store, Synapse's `destination_rooms`) and fetches
+the rest itself. Logs, `hs_federation_catch_up_*` counters and the admin API's `catch_up_since`
+show it. Verified by two sender unit tests and `crates/hs-cli/tests/federation_catch_up.rs`
+(two real binaries, B stopped, eight messages against a bound of three; all eight reach bob in
+order). Left: events the feeder never handed over are still not re-derived, and the web does not
+show `catch_up_since`.
 
 **Appservices are sent ephemeral data** (`agent/as-ephemeral` → `dce1ffb`, 2,436 Rust tests;
 status 11; decision 0019; known gap "Appservice delivery carries events only"
@@ -1621,7 +1633,8 @@ What a room joined elsewhere still lacks, in the order a user would notice:
   and do not send, and an idle worker rescans the store every ten seconds in cluster mode
   (scripted ownership in a unit test; a real two-replica handoff has not been watched). What
   survives is what was queued; a destination that was down for longer than the queue is not
-  caught up from the room (Synapse's `destination_rooms` is the next step). The admin API's
+  caught up from the room (Synapse's `destination_rooms` is the next step; done 2026-09-30, see
+  the known-gaps table). The admin API's
   destination row merges the client's connection-level record with the sender's persisted
   retry state, and `reset` clears both; the row has no field for the persisted `last_error`
   yet (track 15).
@@ -1658,7 +1671,7 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | ~~A local user's join to a restricted room is refused~~ | `hs-room` | **Closed** (cafb74d): `RoomActor::restricted_join` names the authoriser, and the join goes through another server when nobody here may invite; `federation_membership.rs::a_local_user_joins_a_restricted_room_without_naming_an_authoriser`. Complement's `TestRestrictedRooms*` not re-measured yet |
 | ~~A rejoined room's gap is never filled~~ | `hs-room`, `hs-cli` | **Closed** 2026-09-30 (`agent/rejoin-gap`, status 04 session 12): a rejoin through another server whose `prev_events` are not held opens a gap of 2^24 reserved positions below it (`hs_room::actor::gaps`, keyspace `room_timeline_gaps`); a backward `/messages` page stops there, `Backfill::fill_gap` fetches `/backfill` from the events the gap lacks, and `RoomActor::accept_gap_events` places them between the leave and the rejoin in the resident's order -- published nowhere, skipped by `events_after`, durable across reload. Two real servers: 130 messages and a rename made while bob was out read back in order, then the history from before. Counter `hs_room_backfilled_events_total{kind}`. Complement `TestMessagesOverFederation` 0/1 (2 of 3 subtests) → 1/1 (3 of 3); the federation membership set unchanged at 16/18. Left: a forward page does not fill a gap; a state event the rejoin brought as an outlier keeps an outlier's state; in a forked room an event concurrent with the leave and no deeper than it is left out |
 | The state at a backfilled event is walked, not asked for | `hs-room` | exact while the history is linear and the previous event for each reverted key is within reach; a key set before the fetched history reads as unset until that history arrives; no auth check runs on backfilled events (both before the oldest held event and, since 2026-09-30, in a rejoin's gap, where an unset key falls back to the state at the leave) |
-| A destination down for longer than its queue is not caught up from the room | `hs-federation` | what was queued survives a restart and is sent; what was never queued because the destination was already known failing is not re-derived (Synapse's `destination_rooms`) |
+| ~~A destination down for longer than its queue is not caught up from the room~~ | `hs-federation`, `hs-cli`, `hs-config`, `hs-admin` | **Closed** 2026-09-30 (`agent/federation-catchup`, status 06 session 15): there was no bound at all -- every PDU for a dead destination was queued, forever. Now a destination's queue holds `federation.max_queued_pdus_per_destination` (default 10,000); the PDU that finds it full puts the destination in catch-up mode, after which each PDU only moves its room's queued position (`(destination, room)` queued and sent positions, Synapse's `destination_rooms`). Once the destination answers, the worker drops the queue and sends the latest local event of every room it is behind in (oldest room first, fifty a transaction, recomputed before each attempt, only rooms where it still has a member joined); the receiver fetches the rest itself. Logged entering and leaving, counted in `hs_federation_catch_up_*`, shown as `catch_up_since` in the admin API's destination row. `hs-cli/tests/federation_catch_up.rs`: two real binaries, B stopped, eight messages against a bound of three, B back, bob's history has all eight in order. Left: an event the feeder never handed to the sender (a lagged update stream, a crash between persisting and queueing) moves no position and is still only fetched as an ancestor; the web interface does not show `catch_up_since` yet; no two-replica run of catch-up |
 | ~~EDUs are dropped for a destination another replica sends for~~ | `hs-federation`, `hs-cli` | **Closed** (`da97adc`, merged 2026-09-30): an EDU taken by a replica that does not send for its destination is forwarded over the mesh to the one that does; `hs-cli/tests/cluster_edus.rs` runs two replicas on PostgreSQL. Not yet watched on the cluster. Before that: single-node was complete: typing, receipts, presence, device lists, signing-key updates and to-device cross servers both ways (e4543e4, 649302e, `hs-cli/tests/federation_edus.rs`); in cluster mode `FederationSender::enqueue_edu` drops an EDU whose destination shard another replica owns, so it needs a mesh forward to the owner (status 06, twelfth session) |
 | ~~Invites, leaves and knocks over federation are seams~~ | `hs-federation` | **Closed** (e6d4a71, 249fcee, ea990cb): `transport/membership.rs` serves make/send leave, make/send knock and invite v1/v2, and `hs-cli/tests/federation_membership.rs` drives each between two servers. Not yet measured against Complement |
 | ~~Federation media fetch broken~~ | `hs-media` | **Closed** 2026-09-28 (status 09, session 6). Both directions work. A client's download or thumbnail of another server's media is fetched over the signed `/_matrix/federation/v1/media/download`, with the redirect form and the legacy `/_matrix/media/v3/download` fallback. It is then served from the held copy, even with the origin down; the copy honors quarantine and the admin purge. This server's own media is served to other servers as `multipart/mixed`. `hs-cli/tests/federation_media.rs` covers this with two servers and a stand-in origin. Not yet checked against a real Synapse |

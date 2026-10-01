@@ -312,9 +312,16 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   API still showing the destination failing since the same moment with one pending event,
   the port opened, and the message arriving in the recipient's `/sync` exactly once. In
   cluster mode only the replica that owns a destination's shard sends to it; the others queue
-  and do not send (scripted ownership in a test; not yet watched on a cluster). What was
-  never queued, because the destination was already known to be failing, is still not
-  caught up from the room afterwards.
+  and do not send (scripted ownership in a test; not yet watched on a cluster).
+- **A server down for longer than its queue holds is caught up from the rooms.** Each
+  destination's outbound queue is bounded (`federation.max_queued_pdus_per_destination`,
+  10,000); past that it is dropped and, once the destination answers, it is sent the latest
+  event of each room it is behind in and fetches the rest itself, as Synapse does. Before
+  this the queue had no bound. Logged, counted (`hs_federation_catch_up_*`) and shown in the
+  admin API as `catch_up_since`. Verified 2026-09-30 with two real binaries over TLS: the
+  receiving server stopped, eight messages sent against a bound of three, the server started
+  again, and all eight in the recipient's history in order. An event the sender was never
+  handed (a lagged update stream) is still reached only as an ancestor of a later one.
 - Inbound transactions (`PUT /send/{txnId}`): content hashes and signatures verified against the
   *sender's* server, the spec's 50 PDU / 100 EDU limits enforced, processed in order, idempotent by
   transaction id.
