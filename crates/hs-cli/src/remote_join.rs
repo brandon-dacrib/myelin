@@ -88,7 +88,7 @@ impl<B: KvBackend + 'static> FederationRemoteJoin<B> {
                     };
                     if matches!(
                         mapped,
-                        RoomError::Forbidden(_) | RoomError::RemoteRefused { .. }
+                        RoomError::Forbidden(_) | RoomError::RemoteRefused(_)
                     ) {
                         return Err(mapped);
                     }
@@ -185,7 +185,7 @@ impl<B: KvBackend + 'static> FederationRemoteJoin<B> {
                 // only for failures that are about the server, not the room.
                 if matches!(
                     mapped,
-                    RoomError::Forbidden(_) | RoomError::RemoteRefused { .. }
+                    RoomError::Forbidden(_) | RoomError::RemoteRefused(_)
                 ) {
                     Err(JoinAttempt::Fatal(mapped))
                 } else {
@@ -234,12 +234,12 @@ fn map_outbound_error(error: &OutboundJoinError) -> RoomError {
                 .remove("error")
                 .and_then(|v| v.as_str().map(str::to_owned))
                 .unwrap_or_else(|| error.to_string());
-            RoomError::RemoteRefused {
+            RoomError::RemoteRefused(Box::new(hs_room::error::RemoteRefusal {
                 status: *status,
                 errcode,
                 error: message,
                 extra,
-            }
+            }))
         }
         other => RoomError::RemoteJoinFailed(other.to_string()),
     }

@@ -7500,7 +7500,10 @@ mod tests {
             actor.accept_remote_event(redaction).unwrap(),
             RemoteEventOutcome::Stored(_)
         ));
-        assert_eq!(actor.redactions_of(&message_id), [redaction_id.clone()]);
+        assert_eq!(
+            actor.redactions_of(&message_id),
+            std::slice::from_ref(&redaction_id)
+        );
 
         let room_id = actor.room_id().to_owned();
         drop(actor);
@@ -7510,7 +7513,7 @@ mod tests {
                 .expect("the room was persisted");
         assert_eq!(
             actor.redactions_of(&message_id),
-            [redaction_id.clone()],
+            std::slice::from_ref(&redaction_id),
             "the redaction still waits after a reload"
         );
 

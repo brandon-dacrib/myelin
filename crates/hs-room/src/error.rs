@@ -127,17 +127,8 @@ pub enum RoomError {
     /// `M_INCOMPATIBLE_ROOM_VERSION`'s `room_version` -- as Synapse does. Until 2026-10-01 it was
     /// a `502 M_UNKNOWN` naming the other server's answer in its text (Sytest's "Outbound
     /// federation passes make_join failures through to the client").
-    #[error("{error}")]
-    RemoteRefused {
-        /// The other server's HTTP status, a `4xx`.
-        status: u16,
-        /// The other server's `errcode`.
-        errcode: String,
-        /// The other server's `error`, or a description when it gave none.
-        error: String,
-        /// Every other field of the other server's error body.
-        extra: serde_json::Map<String, serde_json::Value>,
-    },
+    #[error("{}", .0.error)]
+    RemoteRefused(Box<RemoteRefusal>),
     /// [`crate::backfill::Backfill`]: a room's history from before the oldest event this server
     /// holds could not be fetched: no server in the room could be reached, or none answered with
     /// a usable batch. `502 M_UNKNOWN` like [`RoomError::RemoteJoinFailed`], though
@@ -168,6 +159,19 @@ pub enum RoomError {
     /// to wait.
     #[error("too many events; try again in {0} ms")]
     LimitExceeded(u64),
+}
+
+/// Another server's own client error, as [`RoomError::RemoteRefused`] passes it through.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteRefusal {
+    /// The other server's HTTP status, a `4xx`.
+    pub status: u16,
+    /// The other server's `errcode`.
+    pub errcode: String,
+    /// The other server's `error`, or a description when it gave none.
+    pub error: String,
+    /// Every other field of the other server's error body.
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl RoomError {
@@ -250,19 +254,17 @@ impl RoomError {
                 MatrixErrorCode::Other("M_MISSING_PREV_EVENTS".to_owned()),
                 self.to_string(),
             ),
-            Self::RemoteRefused {
-                status,
-                errcode,
-                error,
-                extra,
-            } => {
-                let status = axum::http::StatusCode::from_u16(*status)
+            Self::RemoteRefused(refusal) => {
+                let status = axum::http::StatusCode::from_u16(refusal.status)
                     .ok()
                     .filter(axum::http::StatusCode::is_client_error)
                     .unwrap_or(axum::http::StatusCode::BAD_REQUEST);
-                let mut matrix =
-                    MatrixError::custom(status, MatrixErrorCode::Other(errcode.clone()), error);
-                matrix.extra.extend(extra.clone());
+                let mut matrix = MatrixError::custom(
+                    status,
+                    MatrixErrorCode::Other(refusal.errcode.clone()),
+                    &refusal.error,
+                );
+                matrix.extra.extend(refusal.extra.clone());
                 matrix
             }
             Self::RemoteJoinFailed(_) | Self::BackfillFailed(_) => MatrixError::custom(
