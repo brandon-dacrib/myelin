@@ -555,7 +555,23 @@ impl RoomDataSource for InMemoryRoomSource {
         let Some(room) = self.rooms.get(room_id) else {
             return Vec::new();
         };
+        // `joined_servers`, plus the server of every member the fixture's state has joined: the
+        // real adapter answers from the joined members, so a fixture whose creator is joined has
+        // the creator's server in the room without saying so twice.
         let mut servers = room.joined_servers.clone();
+        servers.extend(room.state.iter().filter_map(|event| {
+            let joined = event.get("type").and_then(Value::as_str) == Some("m.room.member")
+                && event
+                    .get("content")
+                    .and_then(|c| c.get("membership"))
+                    .and_then(Value::as_str)
+                    == Some("join");
+            joined
+                .then(|| event.get("state_key").and_then(Value::as_str))
+                .flatten()
+                .and_then(|user| user.split_once(':'))
+                .map(|(_, server)| server.to_owned())
+        }));
         servers.sort();
         servers.dedup();
         servers

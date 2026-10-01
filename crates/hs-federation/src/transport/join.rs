@@ -64,8 +64,17 @@ async fn make_join(
     Query(pairs): Query<Vec<(String, String)>>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    if let Err(err) = requesting_server(&headers) {
-        return (*err).into_response();
+    let origin = match requesting_server(&headers) {
+        Ok(origin) => origin,
+        Err(err) => return (*err).into_response(),
+    };
+    // A server asks for its own users' joins only, as `make_leave` and `make_knock` already
+    // insisted: a template for another server's user -- this server's own, say -- is a join that
+    // server could never sign. Sytest's "Inbound /v1/make_join rejects remote attempts to join
+    // local users to rooms" got a template until 2026-10-01.
+    if let Err(e) = join::check_user_is_from_origin(&user_id, &origin) {
+        tracing::info!(%room_id, %user_id, %origin, "refused a make_join for a user of another server");
+        return join_error_response(&e);
     }
     let mut versions: Vec<String> = pairs
         .into_iter()
@@ -175,6 +184,9 @@ async fn send_join(
 pub(super) fn join_error_response(e: &JoinError) -> Response {
     match e {
         JoinError::RoomNotFound => MatrixError::not_found("unknown room").into_response(),
+        JoinError::NotInRoom => {
+            MatrixError::not_found("not an active room on this server").into_response()
+        }
         JoinError::IncompatibleRoomVersion { room_version } => {
             // The spec's `M_INCOMPATIBLE_ROOM_VERSION` names the room's version, so the
             // joining server can tell its user which version it lacks.
@@ -285,6 +297,18 @@ mod tests {
                 room_version: Some("11".to_owned()),
                 extremities: vec![("$create".to_owned(), 1)],
                 state: vec![create.clone(), power_levels.clone(), join_rules.clone()],
+                join_auth_chain: vec![create.clone(), power_levels.clone(), join_rules.clone()],
+                joined_servers: vec!["resident.example.org".to_owned()],
+                ..FakeRoom::default()
+            },
+        );
+        // The same room after every user of this server has left it.
+        rooms.insert_room(
+            "!left:resident.example.org",
+            FakeRoom {
+                room_version: Some("11".to_owned()),
+                extremities: vec![("$create".to_owned(), 1)],
+                state: vec![create.clone(), power_levels.clone(), join_rules.clone()],
                 join_auth_chain: vec![create, power_levels, join_rules],
                 ..FakeRoom::default()
             },
@@ -362,6 +386,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn make_join_status(origin: &str, uri: &str) -> (StatusCode, Value) {
+        let app = build()
+            .with_state(state_with_room())
+            .layer(axum::Extension(ctx()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        signed_header(origin, "GET", uri),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// A server asks `make_join` for its own users only. Asking for a user of this server (or
+    /// any other) was answered with a template until 2026-10-01 (Sytest's "Inbound
+    /// /v1/make_join rejects remote attempts to join local users to rooms").
+    #[tokio::test]
+    async fn make_join_for_a_user_of_another_server_is_forbidden() {
+        let (status, body) = make_join_status(
+            "remote.example.org",
+            "/make_join/!r:resident.example.org/@alice:resident.example.org?ver=11",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["errcode"], "M_FORBIDDEN");
+    }
+
+    /// A room no user of this server is joined to any more is not one it sponsors joins to:
+    /// `404 M_NOT_FOUND`, as Synapse ("Not an active room on this server"). A template was
+    /// handed out until 2026-10-01 (Sytest's "Inbound /make_join rejects attempts to join rooms
+    /// where all users have left").
+    #[tokio::test]
+    async fn make_join_for_a_room_this_server_has_left_is_not_found() {
+        let (status, body) = make_join_status(
+            "remote.example.org",
+            "/make_join/!left:resident.example.org/@bob:remote.example.org?ver=11",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["errcode"], "M_NOT_FOUND");
     }
 
     #[tokio::test]

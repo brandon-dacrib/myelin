@@ -77,6 +77,11 @@ pub enum JoinError {
     /// rules allow, or none of its users there may invite. The spec's
     /// `400 M_UNABLE_TO_AUTHORISE_JOIN`, which tells the joining server to ask another resident.
     UnableToAuthorise(String),
+    /// The room is known here but no user of this server is joined to it any more: this server
+    /// cannot vouch for the room's current state and will never hear of the events that follow
+    /// a join it sponsored. `404 M_NOT_FOUND`, as Synapse answers `make_join` for a room it has
+    /// left ("Not an active room on this server").
+    NotInRoom,
     Store(String),
 }
 
@@ -101,6 +106,7 @@ impl std::fmt::Display for JoinError {
             ),
             Self::NotAuthorized(e) => write!(f, "not authorized: {e}"),
             Self::UnableToAuthorise(e) => write!(f, "cannot authorise the join: {e}"),
+            Self::NotInRoom => write!(f, "not an active room on this server"),
             Self::Store(e) => write!(f, "{e}"),
         }
     }
@@ -383,6 +389,25 @@ fn now_ms() -> i64 {
     .unwrap_or(0)
 }
 
+/// Whether `user_id` is a user of `origin`, the server asking for a membership template for them:
+/// a server may only ask on behalf of its own users, since only it can sign their membership
+/// event. Compares the whole server name, port included.
+///
+/// # Errors
+/// [`JoinError::SenderServerMismatch`] (`403 M_FORBIDDEN`) when the user is on another server,
+/// [`JoinError::MalformedUserId`] when `user_id` is not a user ID at all.
+pub fn check_user_is_from_origin(user_id: &str, origin: &str) -> Result<(), JoinError> {
+    let user = UserId::parse(user_id).map_err(|e| JoinError::MalformedUserId(e.to_string()))?;
+    if user.server_name().as_str() == origin {
+        Ok(())
+    } else {
+        Err(JoinError::SenderServerMismatch {
+            sender_server: user.server_name().to_string(),
+            origin: origin.to_owned(),
+        })
+    }
+}
+
 /// Builds an unsigned join event template for `user_id` to join `room_id`, against this server's
 /// current state. `supported_versions` is the requester's `?ver=` list (empty means "no
 /// preference stated", which every version satisfies, matching the spec's default).
@@ -453,6 +478,22 @@ pub async fn make_membership(
 
     let user = UserId::parse(user_id).map_err(|e| JoinError::MalformedUserId(e.to_string()))?;
     let parsed_room_id = RoomId::parse(room_id).map_err(|_| JoinError::RoomNotFound)?;
+
+    // A room everybody here has left is still known (its events are kept), but this server is no
+    // longer a resident: its state may be stale and it would never hear of what follows the
+    // join. Synapse answers `404 M_NOT_FOUND` ("Not an active room on this server"), as Sytest's
+    // "Inbound /make_join rejects attempts to join rooms where all users have left" expects; a
+    // template was handed out until 2026-10-01.
+    if handshake == Handshake::Join
+        && !rooms
+            .member_servers(room_id)
+            .await
+            .iter()
+            .any(|server| server == own_server_name)
+    {
+        tracing::info!(%room_id, %user_id, "refused a make_join for a room no user of this server is in");
+        return Err(JoinError::NotInRoom);
+    }
 
     let extremities = rooms
         .forward_extremities(room_id)
@@ -655,10 +696,30 @@ pub async fn send_membership(
         .ok_or_else(|| JoinError::UnsupportedRoomVersion(room_version_str.clone()))?;
 
     let authorising = authorise_with.map(|_| own_server_name);
+    // A membership event not signed as it must be is the room refusing it (`403 M_FORBIDDEN`,
+    // as Synapse answers and Sytest's "Inbound /v1/send_join rejects incorrectly-signed joins"
+    // expects); one that does not parse is a bad request. Both were `400 M_BAD_JSON` until
+    // 2026-10-01.
     let mut event = verify_pdu_to_authorise(signed_event, &room_version, key_cache, authorising)
         .await
-        .map_err(|e| JoinError::MalformedEvent(e.to_string()))?;
+        .map_err(|e| {
+            if e.unsigned {
+                JoinError::NotAuthorized(e.to_string())
+            } else {
+                JoinError::MalformedEvent(e.to_string())
+            }
+        })?;
 
+    // Whose event it is comes first: a server submits its own users' membership events only, and
+    // one replaying another server's is refused (`403`) before anything else is said about it
+    // (Sytest's "Inbound /v1/send_join rejects joins from other servers").
+    let sender_server = event.header().sender.server_name().as_str().to_owned();
+    if sender_server != origin {
+        return Err(JoinError::SenderServerMismatch {
+            sender_server: sender_server.to_owned(),
+            origin: origin.to_owned(),
+        });
+    }
     if event.event_id().as_str() != event_id {
         return Err(JoinError::MalformedEvent(
             "event id in the request path does not match the submitted event".to_owned(),
@@ -692,13 +753,6 @@ pub async fn send_membership(
         .and_then(CanonicalJsonValue::as_str);
     if event_room_id != Some(room_id) {
         return Err(JoinError::RoomIdMismatch);
-    }
-    let sender_server = event.header().sender.server_name().as_str().to_owned();
-    if sender_server != origin {
-        return Err(JoinError::SenderServerMismatch {
-            sender_server: sender_server.to_owned(),
-            origin: origin.to_owned(),
-        });
     }
 
     let state = rooms.state_for_join(room_id).await.map_err(source_err)?;
@@ -1637,6 +1691,73 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, JoinError::SenderServerMismatch { .. }));
+
+        // Replayed under a path naming another event: still the server mismatch, said first.
+        let err = send_join(
+            &rooms,
+            &sink,
+            &cache,
+            &room_id,
+            "$some-other-event",
+            &signed,
+            "impersonator.example.org",
+            "resident.example.org",
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, JoinError::SenderServerMismatch { .. }),
+            "{err}"
+        );
+    }
+
+    /// A join that is not signed, or signed with a signature that does not verify, is the room
+    /// refusing it -- `403 M_FORBIDDEN` (`JoinError::NotAuthorized`), as Synapse answers and
+    /// Sytest's "Inbound /v1/send_join rejects incorrectly-signed joins" expects. It was
+    /// `400 M_BAD_JSON` until 2026-10-01.
+    #[tokio::test]
+    async fn send_join_refuses_an_unsigned_or_badly_signed_join_as_forbidden() {
+        let (rooms, room_id, _) = room_with_creator();
+        let dir = tempfile::tempdir().unwrap();
+        let keys = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
+        let doc = build_server_key_response("joiner.example.org", &keys, &[], 3600).unwrap();
+        let cache = RemoteKeyCache::new(Box::new(FixedFetcher(doc)) as Box<dyn KeyServerFetcher>);
+        let mut signed = sign_member_event(
+            &keys,
+            &room_id,
+            "@bob:joiner.example.org",
+            vec![Value::String("$creatorjoin".to_owned())],
+            vec![],
+            5,
+        );
+        let event_id = hs_model::Event::parse(&signed, RoomVersionId::V11)
+            .unwrap()
+            .event_id()
+            .to_string();
+        let sink = StaticWriteSink::new(Vec::new(), "unused");
+        for signatures in [
+            serde_json::json!({}),
+            serde_json::json!({"joiner.example.org": {keys.primary().key_id(): "A".repeat(86)}}),
+        ] {
+            signed["signatures"] = signatures;
+            let err = send_join(
+                &rooms,
+                &sink,
+                &cache,
+                &room_id,
+                &event_id,
+                &signed,
+                "joiner.example.org",
+                "resident.example.org",
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, JoinError::NotAuthorized(_)), "{err}");
+        }
     }
 
     #[tokio::test]
