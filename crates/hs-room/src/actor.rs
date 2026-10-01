@@ -33,6 +33,15 @@ pub mod admin_ops;
 pub mod gaps;
 mod history;
 
+/// How many new room IDs [`RoomActor::create_placed`] tries per room shard before giving up on
+/// placing a room on this replica. With `n` room shards a replica that owns even one of them
+/// fails to place an ID within `16n` attempts with probability `(1 - 1/n)^(16n)`, below `e^-16`
+/// (one in nine million); with the share an ordinary member of a cluster owns, never in
+/// practice. An attempt is a hash and a signature, so the bound is about 4,096 of them, well
+/// under a second, at the default 256 room shards. A replica that owns no room shard at all
+/// runs out every time, which is what the bound is for.
+pub const MAX_ID_ATTEMPTS_PER_SHARD: u32 = 16;
+
 fn to_kv(e: hs_tables::keyspace::TableError) -> hs_kv::KvError {
     match e {
         hs_tables::keyspace::TableError::Kv(kv) => kv,
@@ -424,11 +433,71 @@ impl<B: KvBackend> RoomActor<B> {
         creation_content: serde_json::Value,
         now_ms: i64,
     ) -> Result<Self, RoomError> {
+        Self::create_placed(
+            backend,
+            tables,
+            identity,
+            Some(room_id),
+            room_version,
+            creator,
+            creation_content,
+            now_ms,
+            None,
+        )
+    }
+
+    /// [`RoomActor::create`], placed on this replica's own room shards when `fencing` is given
+    /// (clustered mode; RFC 0019, decision 0020).
+    ///
+    /// The room's ID must hash to a room shard this replica owns, or the room's first actor is
+    /// built, and its first events written, somewhere other than where every later request for
+    /// it is routed. How the ID is made to land here depends on the room version:
+    ///
+    /// - **Opaque IDs (versions 1-11).** A `room_id` the caller chose is used as given: it is
+    ///   the pre-assigned ID `hs-cli`'s shard gate already checked, or a caller's own (an
+    ///   upgrade's replacement room). With none, a fresh `!random:server` is minted until one
+    ///   hashes to an owned shard.
+    /// - **Hash-derived IDs (version 12+).** The ID is the create event's reference hash, so no
+    ///   ID can be chosen ahead of the event, and `room_id` is ignored. The create event is
+    ///   rebuilt with its `origin_server_ts` one millisecond earlier each time until its ID
+    ///   hashes to an owned shard.
+    ///
+    /// Each attempt is a hash and a signature, no I/O, and about as many attempts as there are
+    /// replicas are expected. They are bounded by [`MAX_ID_ATTEMPTS_PER_SHARD`] times the number
+    /// of room shards; running out (a replica that owns no room shard at all) is
+    /// [`RoomError::Fenced`], a `503` the client retries. The fence is installed on the new
+    /// actor before its create event is persisted, so the whole creation burst is fenced like
+    /// every later write. The attempts taken are observed in `hs_room_create_room_id_attempts`.
+    ///
+    /// # Errors
+    /// As [`RoomActor::create`], plus [`RoomError::Fenced`] when no ID could be placed here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_placed(
+        backend: B,
+        tables: Tables<B>,
+        identity: HomeserverIdentity,
+        room_id: Option<OwnedRoomId>,
+        room_version: RoomVersionId,
+        creator: OwnedUserId,
+        creation_content: serde_json::Value,
+        now_ms: i64,
+        fencing: Option<Arc<crate::fencing::RoomFencing<B>>>,
+    ) -> Result<Self, RoomError> {
         let rules = room_version::rules_for(&room_version)
             .ok_or_else(|| RoomError::UnsupportedRoomVersion(room_version.as_str().to_owned()))?;
 
         let store = ProductionStateStore::open(room_version.clone(), backend.clone())
             .map_err(|e| RoomError::State(e.to_string()))?;
+
+        let owned_here = |id: &RoomId| {
+            fencing
+                .as_deref()
+                .is_none_or(|f| f.ownership.is_mine(f.layout.room_shard(id.as_str())))
+        };
+        let max_attempts = fencing.as_deref().map_or(1, |f| {
+            MAX_ID_ATTEMPTS_PER_SHARD.saturating_mul(f.layout.rooms.max(1))
+        });
+        let hash_based = rules.room_id_format == RoomIdFormat::V2HashBased;
 
         let empty_events: HashMap<EventSn, Event> = HashMap::new();
         let empty_view = RoomStateView {
@@ -436,36 +505,72 @@ impl<B: KvBackend> RoomActor<B> {
             root: store.empty_root(),
             bodies: EventMap(&empty_events),
         };
-        let room_id_arg: Option<&RoomId> = if rules.room_id_format == RoomIdFormat::V2HashBased {
-            None
-        } else {
-            Some(&room_id)
+        let build = |room_id_arg: Option<&RoomId>, ts: i64| {
+            pipeline::build_and_authorize(
+                &room_version,
+                &rules,
+                room_id_arg,
+                &identity.server_name,
+                &identity.signing_key,
+                ts,
+                &[],
+                &empty_view,
+                NewEvent {
+                    event_type: "m.room.create".to_owned(),
+                    state_key: Some(String::new()),
+                    sender: creator.clone(),
+                    content: creation_content.clone(),
+                    redacts: None,
+                },
+            )
         };
-        let create_event = pipeline::build_and_authorize(
-            &room_version,
-            &rules,
-            room_id_arg,
-            &identity.server_name,
-            &identity.signing_key,
-            now_ms,
-            &[],
-            &empty_view,
-            NewEvent {
-                event_type: "m.room.create".to_owned(),
-                state_key: Some(String::new()),
-                sender: creator,
-                content: creation_content,
-                redacts: None,
-            },
-        )?;
 
-        let final_room_id = if rules.room_id_format == RoomIdFormat::V2HashBased {
-            let hash = create_event.reference_hash().map_err(RoomError::from)?;
-            let hash_b64 = hs_model::hash::encode_reference_hash(&hash, &rules);
-            ruma::RoomId::new_v2(&hash_b64).map_err(|e| RoomError::Internal(e.to_string()))?
-        } else {
-            room_id
+        let mut attempts: u32 = 0;
+        let (final_room_id, create_event) = loop {
+            attempts += 1;
+            if hash_based {
+                // Earlier rather than later: the create event must not look newer than the
+                // creator's join and the preset's state, which are stamped `now_ms`.
+                let ts = now_ms.saturating_sub(i64::from(attempts - 1));
+                let event = build(None, ts)?;
+                let hash = event.reference_hash().map_err(RoomError::from)?;
+                let hash_b64 = hs_model::hash::encode_reference_hash(&hash, &rules);
+                let id = ruma::RoomId::new_v2(&hash_b64)
+                    .map_err(|e| RoomError::Internal(e.to_string()))?;
+                if owned_here(&id) {
+                    break (id, event);
+                }
+            } else if let Some(chosen) = &room_id {
+                break (chosen.clone(), build(Some(chosen), now_ms)?);
+            } else {
+                let id = RoomId::new_v1(&identity.server_name);
+                if owned_here(&id) {
+                    let event = build(Some(&id), now_ms)?;
+                    break (id, event);
+                }
+            }
+            if attempts >= max_attempts {
+                crate::metrics::observe_create_room_id_attempts(attempts);
+                tracing::warn!(
+                    attempts,
+                    room_version = %room_version,
+                    "no new room id hashed to a room shard this replica owns; refusing the \
+                     create so that the client retries (decision 0020)"
+                );
+                return Err(RoomError::Fenced(format!(
+                    "no new room id hashed to a room shard this replica owns after {attempts} \
+                     attempts"
+                )));
+            }
         };
+        crate::metrics::observe_create_room_id_attempts(attempts);
+        if attempts > 1 {
+            tracing::debug!(
+                room_id = %final_room_id,
+                attempts,
+                "placed a new room's id on a room shard this replica owns"
+            );
+        }
 
         let room_sn = Self::intern_room(&backend, &tables, &final_room_id)?;
         let mut actor = Self::new_shell(
@@ -478,6 +583,7 @@ impl<B: KvBackend> RoomActor<B> {
             rules,
             store,
         );
+        actor.set_fencing(fencing);
         actor.persist(create_event)?;
         Ok(actor)
     }
@@ -3011,17 +3117,30 @@ impl<B: KvBackend> RoomActor<B> {
         request: CreateRoomRequest,
         now_ms: i64,
     ) -> Result<Self, RoomError> {
+        Self::create_room_placed(backend, tables, identity, creator, request, now_ms, None)
+    }
+
+    /// [`RoomActor::create_room`] with the room's ID placed on a room shard this replica owns
+    /// and the creation burst fenced, when `fencing` is given: see
+    /// [`RoomActor::create_placed`]. What [`crate::registry::RoomRegistry::create_room`] calls.
+    ///
+    /// # Errors
+    /// As [`RoomActor::create_room`] and [`RoomActor::create_placed`].
+    pub fn create_room_placed(
+        backend: B,
+        tables: Tables<B>,
+        identity: HomeserverIdentity,
+        creator: OwnedUserId,
+        request: CreateRoomRequest,
+        now_ms: i64,
+        fencing: Option<Arc<crate::fencing::RoomFencing<B>>>,
+    ) -> Result<Self, RoomError> {
         let room_version = request
             .room_version
             .clone()
             .unwrap_or_else(|| RoomVersionId::try_from("11").expect("11 is a known room version"));
         let rules = room_version::rules_for(&room_version)
             .ok_or_else(|| RoomError::UnsupportedRoomVersion(room_version.as_str().to_owned()))?;
-
-        let room_id = request
-            .room_id
-            .clone()
-            .unwrap_or_else(|| RoomId::new_v1(&identity.server_name));
 
         let mut creation_content = request.creation_content.clone();
         if !creation_content.is_object() {
@@ -3043,15 +3162,16 @@ impl<B: KvBackend> RoomActor<B> {
             }
         }
 
-        let mut actor = Self::create(
+        let mut actor = Self::create_placed(
             backend,
             tables,
             identity,
-            room_id,
+            request.room_id.clone(),
             room_version,
             creator.clone(),
             creation_content,
             now_ms,
+            fencing,
         )?;
 
         let member_content = |user: &UserId| {

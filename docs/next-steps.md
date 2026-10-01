@@ -241,6 +241,19 @@ in `federation_two_servers.rs` (a topic set before the fetched batch is in B's `
 fails with the fetch switched off). Left: within one batch the derivation is linear; the walk
 stays the fallback when the sender cannot answer; Complement not rerun for it.
 
+**A version-12 room is built by the owner of its shard** (`agent/room-gaps`, not merged yet;
+status 04 session 14; decision 0020; known gap "A v12 room's id cannot be pre-assigned"
+closed; completes RFC 0019). A version-12 room's id is its create event's hash, so the shard
+gate's pre-assigned id was ignored and the room was built wherever the gate sent the request.
+`RoomActor::create_placed` now rebuilds the create event (one millisecond earlier each time)
+until the id hashes to a shard the building replica owns, bounded at 16 attempts per room
+shard, `503` when it owns none; a self-minted opaque id is placed the same way, and the
+creation burst is fenced. `hs_room_create_room_id_attempts` counts the attempts. Verified by
+four unit tests in `hs_room::fencing` (three fail with placement off) and
+`crates/hs-cli/tests/cluster_create_room.rs` (two real replicas on PostgreSQL, forty rooms).
+Found with no row, and added to the table: upgrading a room *to* version 12 leaves a tombstone
+naming a room that never exists.
+
 ## Earlier on 2026-09-30: the merges, in order
 
 **Nothing is unmerged.** `git branch -r --no-merged origin/main` is empty. The two branches the
@@ -1763,7 +1776,8 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | ~~A clustered replica shutting down with no live peer waits out its whole drain deadline~~ | `hs-cluster` | **Closed** 2026-09-30 (`agent/cluster-gaps`, status 03): `Drainable::drain` waits for a new owner only while another replica is live and hashable (rechecked during the wait); with none it releases every shard in one transaction with its fencing epoch advanced and returns, logging "drain released shards at once" and counting `hs_cluster_drain_released_at_once_total`. `cluster_admin.rs`'s last replica now stops in 0.2-3.2 s (18.2 s before, on the same PostgreSQL); `ownership::tests::a_lone_replica_drains_in_well_under_a_second` took 18.0 s on the old behaviour. Before: nobody could claim its shards, but the drain waited for a new owner of each until the deadline |
 | Two pods on the cluster have not run with the handoff fix | `deploy/helm`, desktop | two pods ran on 2026-09-28 with an image from before decision 0017 (a request mid-handoff got a `503`); the fixed image, `rolling.py` during its upgrade and `failover.py` need `kubectl`, which agent sessions cannot reach; "Where this stopped" at the top has the steps |
 | A room alias in `/join/{alias}` or `/knock/{alias}` is not shard-gated | `hs-cli` | the alias resolves inside the handler; ids in `/join/{roomId}`, `/knock/{roomId}` and `/rooms/{roomId}/...` are gated |
-| A v12 room's id cannot be pre-assigned | `hs-room` | the id derives from the create event's hash; RFC 0019 describes the retry the handler should do and it is not implemented |
+| ~~A v12 room's id cannot be pre-assigned~~ | `hs-room` | **Closed** 2026-09-30 (`agent/room-gaps`, status 04 session 14, decision 0020): `RoomActor::create_placed` rebuilds a version-12 create event, one millisecond earlier each time, until its hash-derived id lands on a room shard the building replica owns (bounded at 16 per shard; `503` when it owns none), mints a self-chosen opaque id the same way, and fences the creation burst. `hs_room_create_room_id_attempts` on `/metrics`. `crates/hs-cli/tests/cluster_create_room.rs`: two real replicas on PostgreSQL, twenty version-12 rooms through each, each replica built exactly the rooms whose shard it owns. Before: the id was the hash of whatever the gate's replica built, owned there only by chance |
+| Upgrading a room to version 12 leaves a tombstone pointing nowhere | `hs-room` | found 2026-09-30 by reading the code: `/rooms/{roomId}/upgrade` mints the replacement's opaque id first so the tombstone can name it, and a version-12 create ignores a chosen id; the replacement must be created first and the tombstone sent after (as MSC4291 rooms require) |
 | ~~Per-replica settings are seeded into the shared database~~ | `hs-config`, `hs-cli` | **Closed** (a3126df): `hs_config::bootstrap::BOOTSTRAP_SETTINGS` (storage, listeners, server name, signing key path, cluster mesh, ...) stay in each replica's file and environment; seeding strips them, boot purges old copies, and the admin API refuses writes to them |
 | A non-owner replica reloads a whole room per event to answer `/sync` | `hs-user`, `hs-room` | correct, and 25 ms for a small room; RFC 0018 asks `hs-room` for an incremental catch-up |
 | ~~Typing, receipts and presence do not cross replicas~~ | `hs-user` | **Closed** (9c011ce, decision 0018): the `user.wake` batch a room owner already sends every live replica now carries an `ephemeral` list -- typing whole (each replica expires it on its own clock), receipts and presence as a hint to forget the cached room or user and reread the store -- from whichever replica took the change. `crates/hs-cli/tests/cluster_ephemeral.rs` (two real `hs serve` on PostgreSQL): typing, a receipt, a later receipt with the cache warm, and presence, each way, 5 of 5 runs; `hs_cluster_ephemeral_updates_total{kind,direction}` agrees on both ends. Before: typing was each replica's memory; receipts and presence were durable, but a replica read a room's receipts from the store once and then served its cache, so a user on replica B did not see typing, or a later receipt, from a user on A |

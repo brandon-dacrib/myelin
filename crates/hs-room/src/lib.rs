@@ -42,6 +42,7 @@ pub mod hierarchy;
 pub mod history_visibility;
 pub mod identity;
 pub mod membership;
+pub mod metrics;
 pub mod moderation;
 pub mod persist;
 pub mod pipeline;

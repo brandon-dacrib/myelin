@@ -1073,6 +1073,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // Writes refused, swallowed or throttled because an administrator suspended, shadow-banned
     // or rate-limited the account (decision 0014).
     metrics.with_registry(hs_room::moderation::register_metrics);
+    // How many room ids a creation built before one hashed to a shard this replica owns
+    // (decision 0020), and the room-event search index.
+    metrics.with_registry(hs_room::metrics::register_metrics);
     // History fetched from other servers into rooms' timelines (`crate::backfill`).
     metrics.with_registry(crate::backfill::register_metrics);
 

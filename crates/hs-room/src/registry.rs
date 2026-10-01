@@ -369,8 +369,11 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
         let backend = self.backend.clone();
         let tables = self.tables.clone();
         let identity = self.identity.clone();
+        let fencing = self.fencing.get().cloned();
         let actor = tokio::task::spawn_blocking(move || {
-            RoomActor::create_room(backend, tables, identity, creator, request, now_ms)
+            RoomActor::create_room_placed(
+                backend, tables, identity, creator, request, now_ms, fencing,
+            )
         })
         .await
         .expect("room creation task panicked")?;

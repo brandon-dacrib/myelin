@@ -2,10 +2,57 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
-Last updated: 2026-09-30 (session 13: the state at backfilled history is asked for, and every
-backfilled event is authorized, below). Before that, 2026-09-30 (session 12: the history between
-a leave and a rejoin; session 11: the client space hierarchy) and 2026-09-28 (session 10: the
-admin API's room long tail).
+Last updated: 2026-09-30 (session 14: a new room's id is placed on a shard the replica building
+it owns, version 12 included, below). Before that, 2026-09-30 (session 13: the state at
+backfilled history is asked for; session 12: the history between a leave and a rejoin;
+session 11: the client space hierarchy) and 2026-09-28 (session 10: the admin API's room long
+tail).
+
+> **2026-09-30, session 14: a version-12 room is built by the owner of its shard** (branch
+> `agent/room-gaps`; known gap "A v12 room's id cannot be pre-assigned" closed; decision 0020;
+> completes RFC 0019). From room version 12 the room id is the create event's hash, so the
+> shard gate's pre-assigned id was ignored and the room was built -- and its create event,
+> creator's join and preset state written, unfenced -- on whichever replica the gate chose,
+> while every later request went to the owner of the shard the hash happened to land on.
+>
+> - **The retry RFC 0019 named.** `RoomActor::create_placed` (what `create` and the new
+>   `create_room_placed` call; `RoomRegistry::create_room` passes the installed `RoomFencing`)
+>   builds the create event, derives the id and, while `ownership.is_mine(layout.room_shard(id))`
+>   is false, rebuilds it with `origin_server_ts` one millisecond earlier. Bounded at
+>   `MAX_ID_ATTEMPTS_PER_SHARD` (16) times the room shard count; running out (a replica owning
+>   no room shard) is `RoomError::Fenced`, `503`. An opaque id the handler mints itself (no
+>   pre-assigned one: admin-created and server-notices rooms) is minted again until it lands
+>   here; a caller's own id (the gate's, an upgrade's) is used as given.
+> - **The creation burst is fenced.** The fence is installed before the create event is
+>   persisted; it used to be installed by the registry only after `create_room` had written
+>   the whole burst.
+> - **Observability.** `hs_room_create_room_id_attempts` (histogram, new module
+>   `hs_room::metrics`, registered by `hs-cli`); `debug` when more than one attempt was needed,
+>   `warn` when the bound ran out. `hs-cli`'s gate logs a hash-derived id that lands on an owned
+>   shard at `debug` instead of warning that the handler ignored the pre-assigned id.
+> - **Tests**, each failing with the placement switched off (checked: three of the four fail;
+>   the fourth, the no-shard refusal, passes either way because the fence refuses the write).
+>   `crates/hs-room/src/fencing.rs`: a version-12 create whose first id (computed by a create
+>   without placement, ids being deterministic) hashes to the one shard of four this replica
+>   does not own is rebuilt onto an owned one, its create event at most a few milliseconds
+>   earlier, and takes a write; the registry places twenty version-12 rooms on the one owned
+>   shard; a minted opaque id lands on the owned shard twenty times out of twenty and a chosen
+>   one is kept (and fenced); a replica owning no room shard refuses. `crates/hs-cli/tests/
+>   cluster_create_room.rs` (new; two `hs serve` processes of the real binary on PostgreSQL,
+>   so that each has its own `/metrics`): twenty version-12 rooms created through each replica;
+>   each replica's `hs_room_create_room_id_attempts_count` equals the number of rooms whose
+>   shard it owns, and every room takes a message through the replica that did not build it.
+>   Passed in 230 s on a loaded machine; with placement switched off the first create whose
+>   hash lands elsewhere is refused by the (now earlier) fence, `503 fenced`.
+> - **How to verify.** `cargo test -p hs-room --lib fencing`;
+>   `HS_CLUSTER_TEST_POSTGRES_DSN=postgres://postgres:hspg@127.0.0.1:5462/postgres cargo test -p
+>   hs-cli --test cluster_create_room`.
+> - **Interfaces provided (new).** `RoomActor::{create_placed, create_room_placed}`,
+>   `hs_room::actor::MAX_ID_ATTEMPTS_PER_SHARD`, `hs_room::metrics::register_metrics`.
+> - **Left, and found with no row.** Upgrading a room *to* version 12 is broken independently:
+>   `/rooms/{roomId}/upgrade` mints the replacement room's opaque id first so that the
+>   tombstone can name it, and a version-12 create ignores it, so the tombstone points at a room
+>   that never exists. Added to the known gaps.
 
 > **2026-09-30, session 13: the state at a backfilled event is asked for, not walked** (branch
 > `agent/backfill-state`; known gap "The state at a backfilled event is walked, not asked for"

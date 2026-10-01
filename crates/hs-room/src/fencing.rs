@@ -248,4 +248,232 @@ mod tests {
             .expect_err("no fence at all must reject the write, not pass silently");
         assert!(matches!(err, RoomError::Fenced(_)), "got {err:?}");
     }
+
+    /// A scripted [`Ownership`]: this replica owns exactly the room shards in `owned` (an inert
+    /// fence for each, so writes to them pass) and nothing else.
+    struct OwnsShards {
+        me: ReplicaId,
+        owned: Vec<u32>,
+    }
+
+    impl Ownership for OwnsShards {
+        fn me(&self) -> &ReplicaId {
+            &self.me
+        }
+
+        fn owner_of(&self, shard: ShardId) -> Option<ReplicaId> {
+            if self.is_mine(shard) {
+                Some(self.me.clone())
+            } else {
+                Some(ReplicaId::new("elsewhere"))
+            }
+        }
+
+        fn is_mine(&self, shard: ShardId) -> bool {
+            shard.kind == hs_cluster::ShardKind::Room && self.owned.contains(&shard.index)
+        }
+
+        fn fence(&self, shard: ShardId) -> Option<Fence> {
+            self.is_mine(shard).then(|| Fence::inert(shard))
+        }
+
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<OwnershipEvent> {
+            tokio::sync::broadcast::channel(1).1
+        }
+
+        fn shard_map(&self) -> tokio::sync::watch::Receiver<Arc<ShardMap>> {
+            tokio::sync::watch::channel(Arc::new(ShardMap::default())).1
+        }
+    }
+
+    const LAYOUT: hs_cluster::ShardLayout = hs_cluster::ShardLayout::small(4);
+
+    fn owning(backend: &MemoryBackend, owned: Vec<u32>) -> Arc<RoomFencing<MemoryBackend>> {
+        Arc::new(RoomFencing {
+            ownership: Arc::new(OwnsShards {
+                me: ReplicaId::new("hs-a"),
+                owned,
+            }),
+            layout: LAYOUT,
+            cluster_store: ClusterStore::open(backend.clone()).unwrap(),
+        })
+    }
+
+    fn v12() -> CreateRoomRequest {
+        CreateRoomRequest {
+            room_version: Some(ruma::RoomVersionId::try_from("12").unwrap()),
+            ..CreateRoomRequest::default()
+        }
+    }
+
+    fn create_ts(actor: &crate::actor::RoomActor<MemoryBackend>) -> i64 {
+        actor
+            .state_event("m.room.create", "")
+            .unwrap()
+            .expect("a created room has a create event")
+            .json()
+            .get("origin_server_ts")
+            .and_then(|v| match v {
+                hs_model::canonical::CanonicalJsonValue::Integer(i) => Some(*i),
+                _ => None,
+            })
+            .expect("a create event has an integer origin_server_ts")
+    }
+
+    /// RFC 0019's retry for hash-derived ids: a version-12 room whose first create event hashes
+    /// to a room shard another replica owns is rebuilt, one millisecond earlier at a time, until
+    /// its id lands on a shard this replica owns -- and the room then works under that id.
+    /// Before the retry existed the room was created under the first id, on the wrong replica.
+    #[test]
+    fn a_v12_create_whose_first_id_hashes_elsewhere_is_rebuilt_until_it_lands_here() {
+        const NOW: i64 = 1_700_000_000_000;
+        let alice = user_id!("@alice:hs1").to_owned();
+        let unplaced = |backend: MemoryBackend| {
+            crate::actor::RoomActor::create_room(
+                backend.clone(),
+                Tables::open(&backend).unwrap(),
+                HomeserverIdentity::for_tests("hs1"),
+                alice.clone(),
+                v12(),
+                NOW,
+            )
+            .unwrap()
+            .room_id()
+            .to_owned()
+        };
+        // A hash-derived id is a function of the create event alone, so the first attempt's id
+        // is known ahead: the one a create with no placement at all produces.
+        let first = unplaced(MemoryBackend::new());
+        assert_eq!(
+            first,
+            unplaced(MemoryBackend::new()),
+            "v12 ids are deterministic"
+        );
+        let foreign = LAYOUT.room_shard(first.as_str()).index;
+        let owned: Vec<u32> = (0..LAYOUT.rooms).filter(|i| *i != foreign).collect();
+
+        let backend = MemoryBackend::new();
+        let mut actor = crate::actor::RoomActor::create_room_placed(
+            backend.clone(),
+            Tables::open(&backend).unwrap(),
+            HomeserverIdentity::for_tests("hs1"),
+            alice.clone(),
+            v12(),
+            NOW,
+            Some(owning(&backend, owned.clone())),
+        )
+        .expect("a replica owning three of four shards places a room on one of them");
+
+        let placed = actor.room_id().to_owned();
+        assert_ne!(placed, first, "the first id hashed to a foreign shard");
+        assert!(
+            owned.contains(&LAYOUT.room_shard(placed.as_str()).index),
+            "{placed} must hash to a shard this replica owns"
+        );
+        let ts = create_ts(&actor);
+        assert!(
+            ts < NOW && ts > NOW - i64::from(crate::actor::MAX_ID_ATTEMPTS_PER_SHARD * 4),
+            "the create event moved earlier, within the bound: {ts}"
+        );
+        actor
+            .send_event(
+                alice,
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"msgtype": "m.text", "body": "hi"}),
+                None,
+                NOW + 1,
+            )
+            .expect("the placed room takes writes under its fence");
+    }
+
+    /// The same placement through the registry `/createRoom` calls, once `hs-cli` has installed
+    /// fencing: every one of twenty version-12 rooms lands on the one shard of four this
+    /// replica owns.
+    #[tokio::test]
+    async fn the_registry_places_every_v12_room_on_an_owned_shard() {
+        let backend = MemoryBackend::new();
+        let registry = crate::registry::RoomRegistry::open(
+            backend.clone(),
+            HomeserverIdentity::for_tests("hs1"),
+        )
+        .unwrap();
+        registry.install_fencing(owning(&backend, vec![2]));
+        for i in 0..20 {
+            let handle = registry
+                .create_room(
+                    user_id!("@alice:hs1").to_owned(),
+                    v12(),
+                    1_700_000_000_000 + i,
+                )
+                .await
+                .unwrap();
+            let room_id = handle.query(|a| a.room_id().to_owned()).await;
+            assert_eq!(LAYOUT.room_shard(room_id.as_str()).index, 2, "{room_id}");
+        }
+    }
+
+    /// An opaque id the handler mints itself (no pre-assigned one: an admin-created room, a
+    /// server-notices room) is minted again until it hashes to an owned shard; one the caller
+    /// chose (the gate's pre-assigned id) is used as given.
+    #[test]
+    fn an_opaque_id_is_minted_on_an_owned_shard_and_a_chosen_one_is_kept() {
+        for _ in 0..20 {
+            let backend = MemoryBackend::new();
+            let actor = crate::actor::RoomActor::create_room_placed(
+                backend.clone(),
+                Tables::open(&backend).unwrap(),
+                HomeserverIdentity::for_tests("hs1"),
+                user_id!("@alice:hs1").to_owned(),
+                CreateRoomRequest::default(),
+                1,
+                Some(owning(&backend, vec![1])),
+            )
+            .unwrap();
+            assert_eq!(LAYOUT.room_shard(actor.room_id().as_str()).index, 1);
+        }
+
+        let chosen = ruma::RoomId::new_v1(ruma::server_name!("hs1"));
+        let elsewhere: Vec<u32> = (0..LAYOUT.rooms)
+            .filter(|i| *i != LAYOUT.room_shard(chosen.as_str()).index)
+            .collect();
+        let backend = MemoryBackend::new();
+        // The create event of a chosen id on a shard not owned here is still fenced like every
+        // write, so nothing is persisted: the chosen id is not replaced by another.
+        let err = crate::actor::RoomActor::create_room_placed(
+            backend.clone(),
+            Tables::open(&backend).unwrap(),
+            HomeserverIdentity::for_tests("hs1"),
+            user_id!("@alice:hs1").to_owned(),
+            CreateRoomRequest {
+                room_id: Some(chosen.clone()),
+                ..CreateRoomRequest::default()
+            },
+            1,
+            Some(owning(&backend, elsewhere)),
+        )
+        .err()
+        .expect("a chosen id on a foreign shard is fenced, not swapped for another");
+        assert!(matches!(err, RoomError::Fenced(_)), "got {err:?}");
+    }
+
+    /// A replica that owns no room shard at all cannot place a room anywhere: the bounded retry
+    /// runs out and the create is refused (`503`, which the client retries), rather than
+    /// spinning or building the room on a shard somebody else owns.
+    #[test]
+    fn a_replica_owning_no_room_shard_refuses_the_create() {
+        let backend = MemoryBackend::new();
+        let err = crate::actor::RoomActor::create_room_placed(
+            backend.clone(),
+            Tables::open(&backend).unwrap(),
+            HomeserverIdentity::for_tests("hs1"),
+            user_id!("@alice:hs1").to_owned(),
+            v12(),
+            1_700_000_000_000,
+            Some(owning(&backend, Vec::new())),
+        )
+        .err()
+        .expect("no owned shard, no room");
+        assert!(matches!(err, RoomError::Fenced(_)), "got {err:?}");
+    }
 }

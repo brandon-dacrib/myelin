@@ -931,6 +931,15 @@ impl RoomShardGate {
             Some(id) if id == preassigned => {
                 tracing::debug!(room_id = %id, "created a room under its pre-assigned id");
             }
+            Some(id) if self.ownership.is_mine(self.layout.room_shard(&id)) => {
+                // A room version whose id is the create event's hash (12+): the handler rebuilt
+                // the create event until its id landed on a shard this replica owns (decision
+                // 0020), so the pre-assigned id was only ever the routing choice.
+                tracing::debug!(
+                    room_id = %id,
+                    "created a room under a hash-derived id on a shard this replica owns"
+                );
+            }
             Some(id) => {
                 let shard = self.layout.room_shard(&id);
                 let mine = self.ownership.is_mine(shard);
