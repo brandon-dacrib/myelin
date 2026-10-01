@@ -59,7 +59,7 @@ included) matched:
 
 1. **`TestRoomState`**, csapi, PASS then FAIL. One subtest, `GET /joined_rooms lists
    newly-created room`: `apidoc_room_state_test.go:187: failed to find room with id`. The test
-   creates a room and asks `GET /joined_rooms` at once (here 1 ms apart). `hs_user::routes::rooms::get_joined_rooms`
+   creates a room and asks `GET /joined_rooms` the moment `createRoom` returns. `hs_user::routes::rooms::get_joined_rooms`
    lists the user store's membership records, which the session hub writes off the registry's
    stream a moment after the room accepted the join, and it does not wait for the hub
    (`SessionHub::settle_before_read`, as `/sync` does and as `/typing` and `/receipt` were made
@@ -67,7 +67,7 @@ included) matched:
    a client that creates a room and lists its rooms can be told it is not in it.
 2. **`TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11`**, federation, PASS then
    FAIL, at `restricted_rooms_test.go:554` (the sync for charlie's join authorised by bob times
-   out): charlie's join through hs2 was answered `403` 12 ms after alice's power-levels change,
+   out): charlie's join through hs2 was answered `403` about 15 ms after alice's power-levels change was accepted on hs1,
    which hs2 had not received yet. The test race of status 06 session 14, item 3. Its three
    siblings sit on the same helper and the same race: `TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11`
    and `TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12` failed in both runs,
