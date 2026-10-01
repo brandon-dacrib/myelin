@@ -1636,6 +1636,10 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         cluster_store: hs_cluster::store::ClusterStore::open(backend.clone())
             .map_err(|e| ServeError::Sessions(Box::new(e)))?,
     }));
+    // The room-event search index behind `POST /search` (decision 0021): caught up in the
+    // background from each room's cursor, then fed by the room stream. After the fencing above,
+    // so that in a cluster it indexes only the rooms this replica owns.
+    tokio::spawn(hs_room::search::run_indexer(rooms.clone()));
 
     let ready = Arc::new(AtomicBool::new(true));
     let unstable_features = Arc::new(versions::load_unstable_features(

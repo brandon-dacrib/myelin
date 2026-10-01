@@ -53,6 +53,7 @@ pub mod remote_join;
 pub mod reports;
 pub mod retention;
 pub mod routes;
+pub mod search;
 pub mod state;
 pub mod timeline;
 

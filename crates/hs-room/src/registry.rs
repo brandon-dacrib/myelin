@@ -139,6 +139,8 @@ pub struct RoomRegistry<B: KvBackend> {
     reports: crate::reports::ReportStore<B>,
     /// The per-user rate-limit overrides' token buckets (`crate::moderation`).
     send_limiter: crate::moderation::SendLimiter,
+    /// The room-event search index (`crate::search`), in this registry's store.
+    search: crate::search::SearchIndex<B>,
 }
 
 impl<B: KvBackend + 'static> RoomRegistry<B> {
@@ -149,6 +151,7 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     pub fn open(backend: B, identity: HomeserverIdentity) -> Result<Self, hs_kv::KvError> {
         let tables = Tables::open(&backend)?;
         let reports = crate::reports::ReportStore::open(backend.clone())?;
+        let search = crate::search::SearchIndex::open(backend.clone(), tables.clone())?;
         // Sized to absorb a burst from many rooms at once without stalling any room actor: a
         // `broadcast` send never blocks, it drops the oldest item and reports `Lagged` to the
         // slow receiver, which the consumer must handle (`hs_user::hub`'s watcher does).
@@ -175,7 +178,53 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             server_notices_user: OnceLock::new(),
             reports,
             send_limiter: crate::moderation::SendLimiter::new(),
+            search,
         })
+    }
+
+    /// The room-event search index (`crate::search`).
+    #[must_use]
+    pub fn search_index(&self) -> &crate::search::SearchIndex<B> {
+        &self.search
+    }
+
+    /// Whether this replica owns `room_id`'s shard: always, when no cluster fencing is installed
+    /// (single-node mode, or a caller that never wired `hs-cluster` in).
+    #[must_use]
+    pub fn owns_room(&self, room_id: &ruma::RoomId) -> bool {
+        self.fencing
+            .get()
+            .is_none_or(|f| f.ownership.is_mine(f.layout.room_shard(room_id.as_str())))
+    }
+
+    /// Runs `f` over `room_id`'s actor for a read. On the replica that owns the room that is the
+    /// resident actor (loaded if need be); on another replica it is a fresh load of what the
+    /// shared store holds, not kept resident, since nothing here would keep it current.
+    ///
+    /// # Errors
+    /// [`RoomError::RoomNotFound`] if the room does not exist, or whatever loading it can return.
+    pub async fn read_room<T, F>(&self, room_id: &ruma::RoomId, f: F) -> Result<T, RoomError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&RoomActor<B>) -> T + Send + 'static,
+    {
+        if self.owns_room(room_id) {
+            let handle = self.get_or_load(room_id).await?;
+            return Ok(handle.query(f).await);
+        }
+        let (backend, tables, identity) = (
+            self.backend.clone(),
+            self.tables.clone(),
+            self.identity.clone(),
+        );
+        let room_id = room_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let actor = RoomActor::load(backend, tables, identity, &room_id)?
+                .ok_or_else(|| RoomError::RoomNotFound(room_id.to_string()))?;
+            Ok(f(&actor))
+        })
+        .await
+        .map_err(|e| RoomError::Internal(format!("room read task failed: {e}")))?
     }
 
     /// This server's name.

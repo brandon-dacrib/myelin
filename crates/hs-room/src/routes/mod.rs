@@ -15,6 +15,7 @@ pub mod redact;
 pub mod relations;
 pub mod render;
 pub mod report;
+pub mod search;
 pub mod send_state;
 pub mod threads;
 pub mod upgrade;
@@ -235,6 +236,7 @@ pub fn router<B: KvBackend + 'static>() -> (axum::Router<RoomState<B>>, RouteMan
             hierarchy::get_hierarchy::<B>,
             matrix_client("getSpaceHierarchy"),
         )
+        .post("/search", search::post_search::<B>, matrix_client("search"))
         .post(
             "/rooms/{roomId}/upgrade",
             upgrade::post_upgrade::<B>,

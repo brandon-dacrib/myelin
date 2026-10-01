@@ -33,6 +33,9 @@ pub mod admin_ops;
 pub mod gaps;
 mod history;
 
+/// Timeline events with their room-local positions, as [`RoomActor::events_around`] answers.
+pub type PositionedEvents<'a> = Vec<(i64, &'a Event)>;
+
 /// How many new room IDs [`RoomActor::create_placed`] tries per room shard before giving up on
 /// placing a room on this replica. With `n` room shards a replica that owns even one of them
 /// fails to place an ID within `16n` attempts with probability `(1 - 1/n)^(16n)`, below `e^-16`
@@ -194,7 +197,7 @@ pub struct Page<'a> {
 /// mirrored onto the top level by some senders). Used only to populate
 /// [`hs_state::auth::IncomingEvent::redacts`] for the pre-v3 special-case redaction check
 /// (`hs_state::auth::check_room_redaction`); every other check ignores this field entirely.
-fn extract_redacts(event: &Event) -> Option<OwnedEventId> {
+pub(crate) fn extract_redacts(event: &Event) -> Option<OwnedEventId> {
     let top = event
         .json()
         .get("redacts")
@@ -4304,6 +4307,45 @@ impl<B: KvBackend> RoomActor<B> {
             }
         }
         out
+    }
+
+    /// The timeline event at room-local position `pos`, unless there is none or it was purged:
+    /// what a search hit (`crate::search`), which is a position, reads back.
+    #[must_use]
+    pub fn event_at(&self, pos: i64) -> Option<&Event> {
+        let sn = self.timeline.get(&pos)?;
+        if self.purged.contains(sn) {
+            return None;
+        }
+        self.events.get(sn)
+    }
+
+    /// Up to `before` timeline events older than position `pos` (nearest first) and up to
+    /// `after` newer ones (nearest first), each with its position: a search result's
+    /// `event_context`. Purged events are left out.
+    #[must_use]
+    pub fn events_around(
+        &self,
+        pos: i64,
+        before: usize,
+        after: usize,
+    ) -> (PositionedEvents<'_>, PositionedEvents<'_>) {
+        let older = self
+            .timeline
+            .range(..pos)
+            .rev()
+            .filter(|(_, sn)| !self.purged.contains(*sn))
+            .filter_map(|(p, sn)| Some((*p, self.events.get(sn)?)))
+            .take(before)
+            .collect();
+        let newer = self
+            .timeline
+            .range((std::ops::Bound::Excluded(pos), std::ops::Bound::Unbounded))
+            .filter(|(_, sn)| !self.purged.contains(*sn))
+            .filter_map(|(p, sn)| Some((*p, self.events.get(sn)?)))
+            .take(after)
+            .collect();
+        (older, newer)
     }
 
     /// The user IDs joined to this room as of immediately after `event`: the room's membership
