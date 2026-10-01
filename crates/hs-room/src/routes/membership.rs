@@ -1103,6 +1103,76 @@ mod tests {
         );
     }
 
+    /// Sytest's "Guest users can send messages to guest_access rooms if joined": what a guest
+    /// says in a room it joined is the newest event its creator pages back to.
+    #[tokio::test]
+    async fn a_joined_guests_message_is_the_newest_event_the_room_shows() {
+        let state = state(None);
+        let alice_id = UserId::parse("@alice:hs1").unwrap().to_owned();
+        let handle = state
+            .rooms
+            .create_room(
+                alice_id.clone(),
+                crate::actor::CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|actor| actor.room_id().to_owned()).await;
+        handle
+            .send_event(
+                alice_id.clone(),
+                "m.room.guest_access".to_owned(),
+                Some(String::new()),
+                json!({"guest_access": "can_join"}),
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        post_join::<MemoryBackend>(
+            State(state.clone()),
+            Path(room_id.to_string()),
+            RawQuery(None),
+            guest(),
+            PermissiveJson(json!({})),
+        )
+        .await
+        .unwrap();
+        let sent = handle
+            .send_event_txn(
+                UserId::parse("@guest:hs1").unwrap().to_owned(),
+                None,
+                "t1".to_owned(),
+                "m.room.message".to_owned(),
+                json!({"msgtype": "m.text", "body": "sup"}),
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        let response = crate::routes::query::get_messages::<MemoryBackend>(
+            State(state.clone()),
+            Path(room_id.to_string()),
+            axum::extract::Query(crate::routes::query::MessagesQuery {
+                from: None,
+                dir: None,
+                limit: Some(1),
+            }),
+            alice(),
+        )
+        .await
+        .unwrap();
+        let body = body_json(response).await;
+        assert_eq!(
+            body["chunk"][0]["event_id"],
+            sent.event_id().as_str(),
+            "{body}"
+        );
+    }
+
     /// A guest joined through another server to a room that does not let guests in leaves it
     /// again and is refused, like a room held here.
     #[tokio::test]

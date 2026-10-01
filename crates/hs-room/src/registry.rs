@@ -862,6 +862,60 @@ mod tests {
         )
     }
 
+    /// A room ID is the create event's hash from room version 12, so one user creating two rooms
+    /// with the same request in the same millisecond derived one ID twice, and the second room
+    /// was written over the first (Sytest's "GET /publicRooms lists rooms": two of its five rooms
+    /// came back with one ID and each other's settings). Each creation gets a room of its own.
+    #[tokio::test]
+    async fn two_identical_creations_in_one_millisecond_make_two_rooms() {
+        let registry = registry();
+        let alice = user_id!("@alice:registry.test");
+        let mut rooms = Vec::new();
+        for topic in ["first", "second", "third"] {
+            let handle = registry
+                .create_room(
+                    alice.to_owned(),
+                    CreateRoomRequest {
+                        room_version: Some(ruma::RoomVersionId::V12),
+                        ..Default::default()
+                    },
+                    7,
+                )
+                .await
+                .expect("create should succeed");
+            handle
+                .send_event(
+                    alice.to_owned(),
+                    "m.room.topic".to_owned(),
+                    Some(String::new()),
+                    serde_json::json!({"topic": topic}),
+                    None,
+                    8,
+                )
+                .await
+                .unwrap();
+            rooms.push(handle.query(|a| a.room_id().to_owned()).await);
+        }
+        let distinct: std::collections::HashSet<_> = rooms.iter().collect();
+        assert_eq!(distinct.len(), 3, "{rooms:?}");
+        for (room_id, topic) in rooms.iter().zip(["first", "second", "third"]) {
+            let handle = registry.get_or_load(room_id).await.unwrap();
+            let held = handle
+                .query(|a| {
+                    a.state_event("m.room.topic", "")
+                        .unwrap()
+                        .and_then(|e| e.json().get("content").cloned())
+                        .and_then(|c| {
+                            c.as_object()
+                                .and_then(|o| o.get("topic"))
+                                .and_then(|t| t.as_str().map(str::to_owned))
+                        })
+                })
+                .await;
+            assert_eq!(held.as_deref(), Some(topic));
+        }
+    }
+
     /// The fan-in hook of `docs/rfcs/0012-room-registry-global-updates.md`: a subscriber taken out
     /// before any room exists sees a newly created room, without holding that room's handle.
     #[tokio::test]
