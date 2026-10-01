@@ -40,10 +40,10 @@ use hs_http::body::PermissiveJson;
 /// is otherwise closed.
 fn registration_flows(state: &AuthState, token_only: bool) -> Vec<AuthFlow> {
     let mut required = Vec::new();
-    if state.config.registration_requires_token || token_only {
+    if state.config.get().registration_requires_token || token_only {
         required.push(AuthType::RegistrationToken);
     }
-    if state.config.terms_enabled {
+    if state.config.get().terms_enabled {
         required.push(AuthType::Terms);
     }
     if required.is_empty() {
@@ -76,7 +76,12 @@ async fn verify_stage(
         AuthData::Dummy(_) => true,
         AuthData::Terms(_) => true,
         AuthData::RegistrationToken(t) => {
-            if state.config.valid_registration_tokens.contains(&t.token) {
+            if state
+                .config
+                .get()
+                .valid_registration_tokens
+                .contains(&t.token)
+            {
                 true
             } else if let Some(session_id) = session_id {
                 let reserved = state
@@ -85,7 +90,7 @@ async fn verify_stage(
                         &t.token,
                         session_id,
                         state.now_ms(),
-                        state.config.uia_session_timeout_ms,
+                        state.config.get().uia_session_timeout_ms,
                     )
                     .await?;
                 if reserved {
@@ -111,11 +116,11 @@ const REGISTRATION_TOKEN_KEY: &str = "registration_token";
 /// off, a registration that presents nothing is refused outright unless this holds, so a closed
 /// server with no invitations out looks exactly as closed as it did before tokens existed.
 async fn any_token_usable(state: &AuthState) -> Result<bool, MatrixError> {
-    if !state.config.valid_registration_tokens.is_empty() {
+    if !state.config.get().valid_registration_tokens.is_empty() {
         return Ok(true);
     }
     let now = state.now_ms();
-    let timeout = state.config.uia_session_timeout_ms;
+    let timeout = state.config.get().uia_session_timeout_ms;
     Ok(state
         .registration_tokens
         .list()
@@ -134,14 +139,14 @@ pub async fn get_registration_token_validity(
     let token = query
         .get("token")
         .ok_or_else(|| MatrixError::missing_param("Missing token"))?;
-    let valid = if state.config.valid_registration_tokens.contains(token) {
+    let valid = if state.config.get().valid_registration_tokens.contains(token) {
         true
     } else {
         state
             .registration_tokens
             .get(token)
             .await?
-            .is_some_and(|t| t.usable(state.now_ms(), state.config.uia_session_timeout_ms))
+            .is_some_and(|t| t.usable(state.now_ms(), state.config.get().uia_session_timeout_ms))
     };
     Ok(Json(json!({ "valid": valid })))
 }
@@ -219,6 +224,7 @@ pub async fn post_register(
     State(state): State<AuthState>,
     Query(query): Query<HashMap<String, String>>,
     headers: axum::http::HeaderMap,
+    client: hs_http::buckets::ClientIp,
     PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, MatrixError> {
     // An appservice's own registration flow, before anything else: it has nothing in common
@@ -232,15 +238,35 @@ pub async fn post_register(
         return register_appservice_user(&state, &query, &headers, &body).await;
     }
     let kind = query.get("kind").map(String::as_str).unwrap_or("user");
-    if kind == "guest" {
-        return register_guest(&state, &body).await;
-    }
-    if kind != "user" {
+    if kind != "guest" && kind != "user" {
         return Err(MatrixError::invalid_param(format!(
             "Unknown registration kind '{kind}'"
         )));
     }
-    register_user(&state, &body).await
+    // `rate_limits.registration`, per client address, as Synapse's `rc_registration`: every
+    // request is refused while the address's bucket is empty, but only a request that makes an
+    // account takes from it -- a person's user-interactive auth takes two or three rounds.
+    let address = client.key();
+    if let Some(address) = &address {
+        state
+            .limits
+            .registration
+            .check_now(address)
+            .map_err(MatrixError::limit_exceeded)?;
+    }
+    let response = if kind == "guest" {
+        register_guest(&state, &body).await?
+    } else {
+        register_user(&state, &body).await?
+    };
+    if response.status() == StatusCode::OK
+        && let Some(address) = &address
+    {
+        // Already checked above; a race with another request from the same address can only
+        // have emptied the bucket, which the next request will be refused for.
+        let _ = state.limits.registration.take_now(address);
+    }
+    Ok(response)
 }
 
 /// `POST /register` with `type: m.login.application_service`: an appservice creating one of its
@@ -254,7 +280,7 @@ async fn register_appservice_user(
     let bearer = crate::middleware::bearer_token(headers)?;
     let token = match (bearer, query.get("access_token")) {
         (Some(token), _) => token,
-        (None, Some(token)) if state.config.accept_legacy_query_param_token => token.clone(),
+        (None, Some(token)) if state.config.get().accept_legacy_query_param_token => token.clone(),
         _ => return Err(MatrixError::missing_token()),
     };
     let Some(appservice) = state.appservices.lookup_by_token(&token).await else {
@@ -304,7 +330,7 @@ async fn register_appservice_user(
 }
 
 async fn register_guest(state: &AuthState, body: &Value) -> Result<Response, MatrixError> {
-    if !state.config.guest_registration_enabled {
+    if !state.config.get().guest_registration_enabled {
         return Err(MatrixError::forbidden("Guest access is disabled"));
     }
     let user_id = fresh_user_id(state).await?;
@@ -339,7 +365,7 @@ async fn register_user(state: &AuthState, body: &Value) -> Result<Response, Matr
     // presents one, or continues a session that may already hold one, goes on to the token
     // flow; anything else is refused as before, unless a token is out there to be used, in
     // which case the flows are offered so that a client can ask its user for it.
-    let token_only = !state.config.registration_enabled;
+    let token_only = !state.config.get().registration_enabled;
     if token_only {
         let presenting =
             submitted_type == Some(AuthType::RegistrationToken) || session_id_param.is_some();
@@ -350,7 +376,7 @@ async fn register_user(state: &AuthState, body: &Value) -> Result<Response, Matr
 
     let password_raw = body.get("password").and_then(Value::as_str);
     if let Some(pw) = password_raw {
-        state.config.password_policy.validate(pw)?;
+        state.config.get().password_policy.validate(pw)?;
     }
 
     // Per the spec's rationale for excluding upper-case from the user ID grammar
@@ -400,7 +426,7 @@ async fn register_user(state: &AuthState, body: &Value) -> Result<Response, Matr
                 state.store.as_ref(),
                 session_id_param,
                 state.now_ms(),
-                state.config.uia_session_timeout_ms,
+                state.config.get().uia_session_timeout_ms,
             )
             .await?,
         )
@@ -420,7 +446,7 @@ async fn register_user(state: &AuthState, body: &Value) -> Result<Response, Matr
         submitted_type,
         stage_ok,
         state.now_ms(),
-        state.config.uia_session_timeout_ms,
+        state.config.get().uia_session_timeout_ms,
     )
     .await?;
 
@@ -548,6 +574,7 @@ mod tests {
             State(state),
             Query(HashMap::new()),
             axum::http::HeaderMap::new(),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -563,6 +590,7 @@ mod tests {
             State(state),
             Query(HashMap::new()),
             axum::http::HeaderMap::new(),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -587,6 +615,7 @@ mod tests {
             State(state),
             Query(HashMap::new()),
             axum::http::HeaderMap::new(),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -603,6 +632,7 @@ mod tests {
             State(state.clone()),
             Query(HashMap::new()),
             axum::http::HeaderMap::new(),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body.clone()),
         )
         .await
@@ -612,6 +642,7 @@ mod tests {
             State(state),
             Query(HashMap::new()),
             axum::http::HeaderMap::new(),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -635,6 +666,7 @@ mod tests {
             State(state.clone()),
             Query(HashMap::new()),
             axum::http::HeaderMap::new(),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -648,6 +680,7 @@ mod tests {
             State(state),
             Query(HashMap::new()),
             axum::http::HeaderMap::new(),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -667,6 +700,7 @@ mod tests {
             State(state.clone()),
             Query(HashMap::new()),
             axum::http::HeaderMap::new(),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -873,6 +907,7 @@ mod tests {
             State(state),
             Query(HashMap::new()),
             axum::http::HeaderMap::new(),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -893,6 +928,7 @@ mod tests {
             State(state),
             Query(HashMap::new()),
             axum::http::HeaderMap::new(),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -914,6 +950,7 @@ mod tests {
             State(state),
             Query(query),
             axum::http::HeaderMap::new(),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(json!({})),
         )
         .await
@@ -934,6 +971,7 @@ mod tests {
             State(state),
             Query(query),
             axum::http::HeaderMap::new(),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(json!({})),
         )
         .await
@@ -950,6 +988,7 @@ mod tests {
             State(state.clone()),
             Query(HashMap::new()),
             axum::http::HeaderMap::new(),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -1008,6 +1047,7 @@ mod tests {
                 State(state.clone()),
                 Query(HashMap::new()),
                 axum::http::HeaderMap::new(),
+                hs_http::buckets::ClientIp(None),
                 PermissiveJson(body),
             )
             .await
@@ -1034,6 +1074,7 @@ mod tests {
             State(state),
             Query(HashMap::new()),
             axum::http::HeaderMap::new(),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -1062,6 +1103,7 @@ mod tests {
             State(state.clone()),
             Query(HashMap::new()),
             axum::http::HeaderMap::new(),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(first),
         )
         .await
@@ -1077,6 +1119,7 @@ mod tests {
             State(state),
             Query(HashMap::new()),
             axum::http::HeaderMap::new(),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(second),
         )
         .await
@@ -1105,6 +1148,7 @@ mod tests {
             State(state),
             Query(HashMap::new()),
             axum::http::HeaderMap::new(),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -1133,7 +1177,7 @@ mod tests {
         );
         AuthState {
             appservices: std::sync::Arc::new(registry),
-            config: std::sync::Arc::new(AuthConfig {
+            config: hs_config::Live::new(AuthConfig {
                 registration_enabled: false,
                 ..AuthConfig::default()
             }),
@@ -1169,6 +1213,7 @@ mod tests {
             State(state.clone()),
             Query(HashMap::new()),
             bearer("as_secret"),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -1180,6 +1225,7 @@ mod tests {
             State(state.clone()),
             Query(HashMap::new()),
             bearer("as_secret"),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -1202,6 +1248,7 @@ mod tests {
             State(state.clone()),
             Query(HashMap::new()),
             bearer("as_secret"),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -1216,6 +1263,7 @@ mod tests {
             State(state.clone()),
             Query(HashMap::new()),
             bearer("as_secret"),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -1228,6 +1276,7 @@ mod tests {
             State(state.clone()),
             Query(HashMap::new()),
             axum::http::HeaderMap::new(),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body.clone()),
         )
         .await
@@ -1237,6 +1286,7 @@ mod tests {
             State(state),
             Query(HashMap::new()),
             bearer("not_an_as_token"),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await

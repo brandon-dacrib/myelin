@@ -318,6 +318,7 @@ impl RecoverySource for AdministratorRecovery {
 
         self.state
             .config
+            .get()
             .password_policy
             .validate(&request.password)
             .map_err(|e| RecoveryError::Invalid {

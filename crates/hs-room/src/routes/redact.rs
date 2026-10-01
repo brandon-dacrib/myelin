@@ -54,7 +54,7 @@ pub async fn put_redact<B: KvBackend + 'static>(
             return Err(RoomError::UserSuspended);
         }
     }
-    crate::moderation::check_send_limit(&state, &requester).await?;
+    crate::moderation::check_redaction_limit(&state, &requester).await?;
     if requester.shadow_banned {
         crate::moderation::note_shadowed(&requester, "redact");
         return Ok(Json(json!({"event_id": crate::moderation::shadow_event_id()})).into_response());

@@ -77,7 +77,7 @@ pub async fn post_user_directory_search(
     // an error, never a reason to show everybody.
     let visible = match state.user_directory_visibility() {
         // An operator's explicit choice to let everybody find everybody.
-        Some(_) if state.config.user_directory_search_all_users => None,
+        Some(_) if state.config.get().user_directory_search_all_users => None,
         Some(visibility) => Some(visibility.visible_to(&requester.user_id).await.map_err(|e| {
             tracing::error!(error = %e, "could not work out who the user directory may show");
             MatrixError::internal()

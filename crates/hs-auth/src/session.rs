@@ -68,10 +68,14 @@ pub async fn create_session(
         (
             Some(rt),
             Some(rt_hash),
-            Some(state.config.refreshable_access_token_ttl_ms),
+            Some(state.config.get().refreshable_access_token_ttl_ms),
         )
     } else {
-        (None, None, state.config.nonrefreshable_access_token_ttl_ms)
+        (
+            None,
+            None,
+            state.config.get().nonrefreshable_access_token_ttl_ms,
+        )
     };
 
     state
@@ -96,8 +100,12 @@ pub async fn create_session(
                 access_token_hash: access_hash,
                 used: false,
                 replaced_by: None,
-                expires_at_ms: state.config.refresh_token_ttl_ms.map(|ms| now + ms),
-                ultimate_session_expiry_ms: state.config.session_lifetime_ms.map(|ms| now + ms),
+                expires_at_ms: state.config.get().refresh_token_ttl_ms.map(|ms| now + ms),
+                ultimate_session_expiry_ms: state
+                    .config
+                    .get()
+                    .session_lifetime_ms
+                    .map(|ms| now + ms),
             })
             .await?;
     }

@@ -116,8 +116,9 @@ pub struct Registry<B: KvBackend> {
     server_name: OwnedServerName,
     identity_checker: Arc<dyn ExternalIdentityChecker>,
     /// Consecutive failures before an appservice is reported `down` rather than `degraded`
-    /// (`hs-config`'s `AppservicesConfig::tracking_failure_threshold`).
-    pub failure_threshold: u32,
+    /// (`hs-config`'s `AppservicesConfig::tracking_failure_threshold`). Atomic so a running
+    /// server can change it ([`Registry::set_failure_threshold`]).
+    failure_threshold: std::sync::atomic::AtomicU32,
 }
 
 impl<B: KvBackend> Registry<B> {
@@ -132,7 +133,7 @@ impl<B: KvBackend> Registry<B> {
             clock: Arc::new(SystemClock),
             server_name: server_name.to_owned(),
             identity_checker: Arc::new(NoExternalUsers),
-            failure_threshold: 50,
+            failure_threshold: std::sync::atomic::AtomicU32::new(50),
         })
     }
 
@@ -153,9 +154,23 @@ impl<B: KvBackend> Registry<B> {
 
     /// Sets the consecutive-failure threshold used by [`Registry::health`].
     #[must_use]
-    pub fn with_failure_threshold(mut self, threshold: u32) -> Self {
-        self.failure_threshold = threshold;
+    pub fn with_failure_threshold(self, threshold: u32) -> Self {
+        self.set_failure_threshold(threshold);
         self
+    }
+
+    /// Replaces the consecutive-failure threshold [`Registry::health`] reports against, from now
+    /// on.
+    pub fn set_failure_threshold(&self, threshold: u32) {
+        self.failure_threshold
+            .store(threshold, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The consecutive-failure threshold in force.
+    #[must_use]
+    pub fn failure_threshold(&self) -> u32 {
+        self.failure_threshold
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The underlying store, for the scheduler and other crate-internal callers.
@@ -381,7 +396,7 @@ impl<B: KvBackend> Registry<B> {
             .ok_or_else(|| AppserviceError::NotFound(id.to_string()))?;
         let health_row = self.store.health(id)?;
         Ok(Health {
-            status: compute_status(row.paused, &health_row, self.failure_threshold),
+            status: compute_status(row.paused, &health_row, self.failure_threshold()),
             last_ping_at_ms: health_row.last_ping_at_ms,
             last_error: health_row.last_error,
             consecutive_failures: health_row.consecutive_failures,

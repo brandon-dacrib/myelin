@@ -35,6 +35,12 @@ async fn send(
         }
     };
 
+    // `rate_limits.federation`, per origin server (`X-Matrix` has verified it by now).
+    if let Err(retry_after_ms) = state.policy.transactions.take_now(&origin) {
+        tracing::debug!(%origin, retry_after_ms, "an origin is over the inbound transaction limit");
+        return MatrixError::rate_limited(retry_after_ms).into_response();
+    }
+
     let parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => return MatrixError::bad_json("invalid transaction body").into_response(),
@@ -114,8 +120,7 @@ mod tests {
             own_server_name: std::sync::Arc::from("us.example.org"),
             rooms: std::sync::Arc::new(rooms),
             queries: std::sync::Arc::new(InMemoryQuerySource::default()),
-            allow_public_rooms_over_federation: false,
-            allow_device_name_lookup_over_federation: false,
+            policy: crate::transport::InboundPolicy::new(false, false),
             write_sink: std::sync::Arc::new(StaticWriteSink::new(Vec::new(), "not supported yet")),
             transactions: std::sync::Arc::new(InMemoryTransactionStore::new()),
             ancestor_fetcher: None,
@@ -173,6 +178,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// `rate_limits.federation`, set on the shared policy as a running server does when it
+    /// changes: an origin over it is answered `429`, another origin is not.
+    #[tokio::test]
+    async fn an_origin_over_the_transaction_limit_is_refused_and_others_are_not() {
+        let state = state();
+        let app = build().with_state(state.clone());
+        let send = |origin: &'static str, txn: &'static str| {
+            app.clone().oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/send/{txn}"))
+                    .header(axum::http::header::AUTHORIZATION, signed_header(origin))
+                    .body(Body::from(r#"{"pdus": [], "edus": []}"#))
+                    .unwrap(),
+            )
+        };
+        assert_eq!(
+            send("a.example.org", "1").await.unwrap().status(),
+            StatusCode::OK
+        );
+        state
+            .policy
+            .clone()
+            .transactions
+            .set_limit(Some(hs_http::buckets::BucketLimit {
+                per_second: 0.001,
+                burst_count: 1,
+            }));
+        assert_eq!(
+            send("a.example.org", "2").await.unwrap().status(),
+            StatusCode::OK
+        );
+        let refused = send("a.example.org", "3").await.unwrap();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            send("b.example.org", "1").await.unwrap().status(),
+            StatusCode::OK
+        );
+        // The two flags are shared the same way.
+        state.policy.clone().set_allow_public_rooms(true);
+        assert!(state.policy.allow_public_rooms());
     }
 
     #[tokio::test]

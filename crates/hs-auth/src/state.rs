@@ -8,7 +8,7 @@ use ruma::UserId;
 use crate::appservice::{AppserviceRegistry, InMemoryAppserviceRegistry};
 use crate::clock::{Clock, SystemClock};
 use crate::config::AuthConfig;
-use crate::ratelimit::{InMemoryRateLimiter, RateLimiter};
+use crate::ratelimit::{InMemoryRateLimiter, RateLimiter, ServerLimits};
 use crate::registration_tokens::{InMemoryRegistrationTokens, RegistrationTokenStore};
 use crate::store::AuthStore;
 use crate::store::memory::InMemoryAuthStore;
@@ -62,8 +62,18 @@ pub struct AuthState {
     pub appservices: Arc<dyn AppserviceRegistry>,
     /// Rate limiting, keyed per endpoint by whatever the handler considers "one entity".
     pub rate_limiter: Arc<dyn RateLimiter>,
-    /// Day-one configuration.
-    pub config: Arc<AuthConfig>,
+    /// This crate's configuration, read through a [`hs_config::Live`] cell so a running server
+    /// can replace it (`enable_registration`, the password policy, token lifetimes, ...): every
+    /// clone of this state shares the cell, and a handler sees a change on its next
+    /// `config.get()`. The server name in it never changes (it is bootstrap).
+    pub config: hs_config::Live<AuthConfig>,
+    /// The server-wide `rate_limits.*` buckets this crate and the crates that embed this state
+    /// enforce (`login`, `registration`, joins, administrators' redactions). Limit nothing until
+    /// a server sets them (`hs serve` does, from the configuration, and again on every change).
+    pub limits: Arc<ServerLimits>,
+    /// This server's name, copied out of [`AuthConfig::server_name`] when the state is built so
+    /// [`AuthState::server_name`] can lend it.
+    pub(crate) server_name: ruma::OwnedServerName,
     /// The time source, overridden in tests.
     pub clock: Arc<dyn Clock>,
     /// The registration tokens `/register`'s `m.login.registration_token` stage accepts, and the
@@ -99,7 +109,9 @@ impl AuthState {
             store: Arc::new(InMemoryAuthStore::new()),
             appservices: Arc::new(InMemoryAppserviceRegistry::new()),
             rate_limiter: Arc::new(InMemoryRateLimiter::unlimited()),
-            config: Arc::new(AuthConfig::default()),
+            config: hs_config::Live::new(AuthConfig::default()),
+            limits: Arc::new(ServerLimits::default()),
+            server_name: AuthConfig::default().server_name,
             clock: Arc::new(SystemClock),
             registration_tokens: Arc::new(InMemoryRegistrationTokens::new()),
             device_list_notifier: Arc::new(OnceLock::new()),
@@ -111,7 +123,8 @@ impl AuthState {
     #[must_use]
     pub fn in_memory_with_config(config: AuthConfig) -> Self {
         Self {
-            config: Arc::new(config),
+            server_name: config.server_name.clone(),
+            config: hs_config::Live::new(config),
             ..Self::in_memory()
         }
     }
@@ -129,7 +142,8 @@ impl AuthState {
     pub fn with_store(store: Arc<dyn AuthStore>, config: AuthConfig) -> Self {
         Self {
             store,
-            config: Arc::new(config),
+            server_name: config.server_name.clone(),
+            config: hs_config::Live::new(config),
             ..Self::in_memory()
         }
     }
@@ -168,7 +182,15 @@ impl AuthState {
     /// This homeserver's configured server name.
     #[must_use]
     pub fn server_name(&self) -> &ruma::ServerName {
-        &self.config.server_name
+        &self.server_name
+    }
+
+    /// Replaces this state's configuration for every clone of it, keeping the server name (which
+    /// is fixed for the life of a database). What a running server calls when an administrator
+    /// changes an `auth` setting.
+    pub fn set_config(&self, mut config: AuthConfig) {
+        config.server_name = self.server_name.clone();
+        self.config.set(config);
     }
 
     /// Installs the [`DeviceListChangeNotifier`] `crate::routes::devices`' rename/delete/bulk
@@ -228,7 +250,10 @@ mod tests {
     fn in_memory_state_is_cloneable_and_usable() {
         let state = AuthState::in_memory();
         let cloned = state.clone();
-        assert_eq!(state.config.server_name, cloned.config.server_name);
+        assert_eq!(
+            state.config.get().server_name,
+            cloned.config.get().server_name
+        );
     }
 
     #[test]
@@ -242,5 +267,19 @@ mod tests {
         };
         let state = AuthState::with_store(store, config);
         assert_eq!(state.server_name(), "with-store.example.org");
+    }
+
+    #[test]
+    fn a_new_config_reaches_every_clone_and_keeps_the_server_name() {
+        let state = AuthState::in_memory();
+        let clone = state.clone();
+        assert!(clone.config.get().registration_enabled);
+        state.set_config(AuthConfig {
+            registration_enabled: false,
+            server_name: ruma::server_name!("elsewhere.example").to_owned(),
+            ..AuthConfig::default()
+        });
+        assert!(!clone.config.get().registration_enabled);
+        assert_eq!(clone.config.get().server_name, "example.org");
     }
 }

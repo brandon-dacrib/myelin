@@ -43,9 +43,19 @@ struct ReloadLabels {
     outcome: &'static str,
 }
 
+/// The labels of `hs_config_settings_applied_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+struct SettingLabels {
+    setting: &'static str,
+    outcome: &'static str,
+}
+
 /// Process-wide, like the other counters registered into each server's registry: a counter is
 /// only an atomic, and the appliers run far from any registry.
 static RELOADS: LazyLock<Family<ReloadLabels, Counter>> = LazyLock::new(Family::default);
+
+/// Per hot setting (`hs_config::reload::HOT_SETTINGS`, a bounded set of label values).
+static SETTINGS_APPLIED: LazyLock<Family<SettingLabels, Counter>> = LazyLock::new(Family::default);
 
 fn count(section: &str, outcome: &'static str) {
     RELOADS
@@ -54,6 +64,25 @@ fn count(section: &str, outcome: &'static str) {
             outcome,
         })
         .inc();
+}
+
+/// Logs and counts one changed hot setting's fate.
+fn note_setting(setting: &'static str, outcome: &'static str, reason: Option<&str>) {
+    SETTINGS_APPLIED
+        .get_or_create(&SettingLabels { setting, outcome })
+        .inc();
+    match outcome {
+        "applied" => tracing::info!(
+            setting,
+            "configuration setting applied to the running server"
+        ),
+        _ => tracing::warn!(
+            setting,
+            outcome,
+            reason = reason.unwrap_or("nothing in this process re-reads it"),
+            "configuration setting changed but not applied; the old value stays in force"
+        ),
+    }
 }
 
 /// Registers `hs_config_reloads_total{section,outcome}` into `registry`.
@@ -65,6 +94,12 @@ pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
          outcome: applied, failed (the old value stays in force), unwired (nothing in this \
          process re-reads it)",
         RELOADS.clone(),
+    );
+    registry.register(
+        "hs_config_settings_applied",
+        "Hot configuration settings that changed, by setting (a JSON Pointer from \
+         hs_config::reload::SETTINGS) and outcome: applied, failed or unwired",
+        SETTINGS_APPLIED.clone(),
     );
 }
 
@@ -150,9 +185,7 @@ impl LiveConfig {
             return false;
         };
         let inner = self.lock();
-        hs_config::reload::HOT_SETTINGS
-            .iter()
-            .any(|pointer| inner.running.pointer(pointer) != next.pointer(pointer))
+        !hs_config::reload::hot_settings_changed(&inner.running, &next).is_empty()
     }
 
     /// Takes `new` on: every section in which a hot setting differs from what is in force has
@@ -172,18 +205,22 @@ impl LiveConfig {
         };
 
         let mut inner = self.lock();
+        let changed_settings = hs_config::reload::hot_settings_changed(&inner.running, &next);
         let mut changed: Vec<&'static str> = Vec::new();
-        for pointer in hs_config::reload::HOT_SETTINGS {
-            if inner.running.pointer(pointer) != next.pointer(pointer)
-                && let Some(section) = hs_config::reload::SECTION_NAMES
-                    .iter()
-                    .copied()
-                    .find(|name| hs_config::document::section_of(pointer) == Some(*name))
+        for pointer in &changed_settings {
+            if let Some(section) = hs_config::reload::section_name(pointer)
                 && !changed.contains(&section)
             {
                 changed.push(section);
             }
         }
+        let settings_of = |section: &'static str| -> Vec<&'static str> {
+            changed_settings
+                .iter()
+                .copied()
+                .filter(|pointer| hs_config::reload::section_name(pointer) == Some(section))
+                .collect()
+        };
 
         let mut applied = Applied {
             requires_restart,
@@ -201,11 +238,17 @@ impl LiveConfig {
                 Ok(()) => {
                     tracing::info!(section, "configuration section reloaded");
                     count(section, "applied");
+                    settings_of(section)
+                        .into_iter()
+                        .for_each(|setting| note_setting(setting, "applied", None));
                     applied.reloaded.push(section.to_owned());
                 }
                 Err(Some(reason)) => {
                     tracing::warn!(section, %reason, "configuration section could not be reloaded; the old value stays in force");
                     count(section, "failed");
+                    settings_of(section)
+                        .into_iter()
+                        .for_each(|setting| note_setting(setting, "failed", Some(&reason)));
                     keep_running(&inner.running, &mut next, section);
                     applied.failed.push((section.to_owned(), reason));
                 }
@@ -215,6 +258,9 @@ impl LiveConfig {
                         "configuration section changed, but nothing in this process re-reads it; it takes effect at the next restart"
                     );
                     count(section, "unwired");
+                    settings_of(section)
+                        .into_iter()
+                        .for_each(|setting| note_setting(setting, "unwired", None));
                     keep_running(&inner.running, &mut next, section);
                     if !applied.requires_restart.iter().any(|s| s == section) {
                         applied.requires_restart.push(section.to_owned());
@@ -230,7 +276,7 @@ impl LiveConfig {
 /// Puts `section`'s hot settings in `next` back to what `running` has, so a change that did not
 /// take is seen as a change again next time.
 fn keep_running(running: &Value, next: &mut Value, section: &str) {
-    for pointer in hs_config::reload::HOT_SETTINGS {
+    for pointer in hs_config::reload::HOT_SETTINGS.iter() {
         if hs_config::document::section_of(pointer) != Some(section) {
             continue;
         }
@@ -254,6 +300,19 @@ pub fn message_limit(
             burst_count: config.message.burst_count,
         },
     )
+}
+
+/// The limit one `rate_limits` bucket says is in force: `bucket` while `rate_limits.enabled`, and
+/// none otherwise (a rate of `0` is none too, which [`hs_http::buckets::TokenBuckets`] decides).
+#[must_use]
+pub fn bucket_limit(
+    config: &hs_config::RateLimitConfig,
+    bucket: &hs_config::ratelimit::RateLimitBucket,
+) -> Option<hs_http::buckets::BucketLimit> {
+    config.enabled.then_some(hs_http::buckets::BucketLimit {
+        per_second: bucket.per_second,
+        burst_count: bucket.burst_count,
+    })
 }
 
 #[cfg(test)]

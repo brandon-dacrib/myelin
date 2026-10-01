@@ -216,8 +216,8 @@ fn build_router<B: KvBackend>(
     mounts: Mounts<B>,
     metrics: Arc<Metrics>,
     ready: Arc<AtomicBool>,
-    unstable_features: Arc<BTreeMap<String, bool>>,
-    well_known: crate::well_known::WellKnown,
+    unstable_features: hs_config::Live<BTreeMap<String, bool>>,
+    well_known: hs_config::Live<crate::well_known::WellKnown>,
     cluster: &crate::cluster::ClusterHandles,
 ) -> (Router, RouteManifest) {
     let auth_router = hs_auth::routes::router().with_state(auth.clone());
@@ -841,10 +841,10 @@ pub fn route_manifest() -> RouteManifest {
         throwaway_mounts(),
         Arc::new(Metrics::new()),
         Arc::new(AtomicBool::new(true)),
-        Arc::new(BTreeMap::new()),
+        hs_config::Live::default(),
         // Routes are registered unconditionally; whether a `.well-known` document is *served* or
         // 404s is a runtime decision inside the handler, so the manifest is the same either way.
-        crate::well_known::WellKnown::default(),
+        hs_config::Live::default(),
         &cluster,
     );
     manifest
@@ -1290,6 +1290,10 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         Arc::new(hs_auth::registration_tokens::TablesRegistrationTokens::open(backend.clone())?),
     );
 
+    // The server-wide `rate_limits.*` buckets every auth, room and media route checks (all but
+    // `message` and `federation`, wired below), set now and again on every change.
+    auth_state.limits.apply(&config.rate_limits);
+
     let identity = crate::identity::load_or_generate(&config)?;
     // Kept for the recovery source below, which needs the key's public half after `identity`
     // itself has been handed to the federation layer.
@@ -1316,6 +1320,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             .map_err(|e| ServeError::Audit(e.to_string()))?,
     );
     let appservices = crate::appservices::load(&config.appservices, backend.clone(), &server_name)?;
+    appservices
+        .registry
+        .set_failure_threshold(config.appservices.tracking_failure_threshold);
     components.watch("audit log", &audit);
     components.watch("appservice registry", &appservices.registry);
     crate::appservices::audit_imports(audit.as_ref(), &appservices.imports)
@@ -1340,16 +1347,40 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         .send_limiter()
         .set_server_limit(crate::live_config::message_limit(&config.rate_limits));
     metrics.with_registry(crate::live_config::register_metrics);
+    metrics.with_registry(hs_http::buckets::register_metrics);
     if let Some(live) = &options.live_config {
         let rooms = rooms.clone();
+        let limits = auth_state.limits.clone();
         live.on_change("rate_limits", move |config| {
             let limit = crate::live_config::message_limit(&config.rate_limits);
             rooms.send_limiter().set_server_limit(limit);
+            limits.apply(&config.rate_limits);
             tracing::info!(
                 per_second = limit.map(|l| l.per_second),
                 burst_count = limit.map(|l| l.burst_count),
-                "the server-wide send limit is now in force"
+                enabled = config.rate_limits.enabled,
+                "the server-wide rate limits are now in force"
             );
+            Ok(())
+        });
+        // Registration, the user directory, token lifetimes, the password policy and pepper,
+        // and the shared registration secret: every auth route reads them through the state's
+        // live configuration, shared by every clone of it (the room, media and e2e states'
+        // too).
+        let auth = auth_state.clone();
+        live.on_change("auth", move |config| {
+            let new = hs_auth::config::AuthConfig::try_from(config).map_err(|e| e.to_string())?;
+            tracing::info!(
+                registration_enabled = new.registration_enabled,
+                user_directory_search_all_users = new.user_directory_search_all_users,
+                "the auth settings are now in force"
+            );
+            auth.set_config(new);
+            Ok(())
+        });
+        let registry = appservices.registry.clone();
+        live.on_change("appservices", move |config| {
+            registry.set_failure_threshold(config.appservices.tracking_failure_threshold);
             Ok(())
         });
         if options.migration_configs.is_some() {
@@ -1391,6 +1422,20 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         options.media_scanning_config.as_deref(),
         &metrics,
     )?;
+    if let Some(live) = &options.live_config {
+        // The upload limit, URL previews and the thumbnail table: read by the repository on
+        // every operation. (Storage and scanning are built once; they wait for a restart.)
+        let repository = media_state.repository.clone();
+        live.on_change("media", move |config| {
+            repository.set_config(config.media.clone());
+            tracing::info!(
+                max_upload_size = config.media.max_upload_size.as_u64(),
+                url_preview_enabled = config.media.url_preview_enabled,
+                "the media settings are now in force"
+            );
+            Ok(())
+        });
+    }
 
     // Where long-running work reports, for the admin API's Tasks page. Opened before anything
     // that might run such work; what a previous run of this process left unfinished is marked
@@ -1486,12 +1531,33 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             options.federation_scheme,
         )?;
         let mut mount = mount;
+        // `rate_limits.federation`: inbound transactions per origin server.
+        let inbound = mount.state.policy.clone();
+        inbound
+            .transactions
+            .set_limit(crate::live_config::bucket_limit(
+                &config.rate_limits,
+                &config.rate_limits.federation,
+            ));
         // Who this server may federate with: the client checks both lists on every request, so
-        // an operator's change is in force for the next one.
+        // an operator's change is in force for the next one. The same for what the inbound
+        // routes allow, and how fast an origin may send.
         if let Some(live) = &options.live_config {
+            let policy = inbound.clone();
+            live.on_change("rate_limits", move |config| {
+                policy
+                    .transactions
+                    .set_limit(crate::live_config::bucket_limit(
+                        &config.rate_limits,
+                        &config.rate_limits.federation,
+                    ));
+                Ok(())
+            });
             let client = mount.client.clone();
             live.on_change("federation", move |config| {
                 let federation = &config.federation;
+                inbound.set_allow_public_rooms(federation.allow_public_rooms_over_federation);
+                inbound.set_allow_device_names(federation.allow_device_name_lookup_over_federation);
                 client
                     .domain_policy()
                     .set(federation.domain_allowlist.clone());
@@ -1893,7 +1959,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     tokio::spawn(hs_room::search::run_indexer(rooms.clone()));
 
     let ready = Arc::new(AtomicBool::new(true));
-    let unstable_features = Arc::new(versions::load_unstable_features(
+    let unstable_features = hs_config::Live::new(versions::load_unstable_features(
         &config.server.unstable_features,
         options.capabilities_config.as_deref(),
     )?);
@@ -1912,13 +1978,14 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         );
     }
 
+    let well_known = hs_config::Live::new(well_known);
     let (app, manifest) = build_router(
         auth_state,
         mounts,
         metrics,
         ready.clone(),
-        unstable_features,
-        well_known,
+        unstable_features.clone(),
+        well_known.clone(),
         &cluster_handles,
     );
 
@@ -1970,19 +2037,26 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
                      serving plaintext. Terminate TLS at a reverse proxy in front of this listener."
                 );
             }
-            listeners.push((tcp, actual_addr));
+            listeners.push((tcp, actual_addr, listener_cfg.x_forwarded));
         }
     }
 
-    let addrs: Vec<SocketAddr> = listeners.iter().map(|(_, addr)| *addr).collect();
+    let addrs: Vec<SocketAddr> = listeners.iter().map(|(_, addr, _)| *addr).collect();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let mut tasks = tokio::task::JoinSet::new();
-    for (tcp, addr) in listeners {
-        let app = app.clone();
+    for (tcp, addr, x_forwarded) in listeners {
+        // A listener behind a proxy (`x_forwarded`) has its `X-Forwarded-For` believed when a
+        // per-address rate limit asks who the client is (`hs_http::buckets::ClientIp`).
+        let app = if x_forwarded {
+            app.clone()
+                .layer(Extension(hs_http::buckets::TrustForwardedFor))
+        } else {
+            app.clone()
+        };
         let mut shutdown_rx = shutdown_rx.clone();
         tasks.spawn(async move {
-            let result = axum::serve(tcp, app.into_make_service())
+            let result = axum::serve(tcp, app.into_make_service_with_connect_info::<SocketAddr>())
                 .with_graceful_shutdown(async move {
                     let _ = shutdown_rx.changed().await;
                 })
@@ -2003,6 +2077,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         });
     }
     let ownership = cluster.ownership().clone();
+    let bridges = bridge_manager.clone();
     let bridge_manager = bridge_manager.start(&format!("http://{loopback}"), move || {
         ownership.is_mine(hs_cluster::ShardId::GLOBAL)
     });
@@ -2012,6 +2087,28 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // is fine, and `hs register --admin` remains a way in.
     // The recovery link `hs recover` is handed is rooted the same way, at the same moment.
     recovery.set_link_base(link_base(config.server.public_baseurl.as_deref(), &addrs));
+    // The `server` settings, all read per request: the .well-known documents, /versions'
+    // unstable features, the recovery link's root and the address rendered into a bridge's files.
+    // (The first-run setup link is offered once, below, with the value in force now.)
+    if let Some(live) = &options.live_config {
+        let recovery = recovery.clone();
+        let addrs = addrs.clone();
+        let capabilities_config = options.capabilities_config.clone();
+        live.on_change("server", move |config| {
+            let features = versions::load_unstable_features(
+                &config.server.unstable_features,
+                capabilities_config.as_deref(),
+            )
+            .map_err(|e| e.to_string())?;
+            unstable_features.set(features);
+            well_known.set(crate::well_known::WellKnown::from_config(config));
+            let public = config.server.public_baseurl.as_deref();
+            recovery.set_link_base(link_base(public, &addrs));
+            bridges.set_public_base_url(public.unwrap_or(""));
+            tracing::info!(public_baseurl = ?public, "the server settings are now in force");
+            Ok(())
+        });
+    }
     let setup_link = match setup.offer().await {
         Ok(token) => {
             token.map(|token| setup_link(config.server.public_baseurl.as_deref(), &addrs, &token))

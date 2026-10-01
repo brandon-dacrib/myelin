@@ -1298,10 +1298,10 @@ pub fn build_mount<B: KvBackend + 'static>(
             ServerQuerySource::new(auth, e2e.store.clone(), rooms.clone(), server_name.clone())
                 .with_keys(e2e),
         ),
-        allow_public_rooms_over_federation: config.federation.allow_public_rooms_over_federation,
-        allow_device_name_lookup_over_federation: config
-            .federation
-            .allow_device_name_lookup_over_federation,
+        policy: hs_federation::transport::InboundPolicy::new(
+            config.federation.allow_public_rooms_over_federation,
+            config.federation.allow_device_name_lookup_over_federation,
+        ),
         write_sink: Arc::new(RegistryWriteSink::new(rooms.clone())),
         transactions: Arc::new(hs_federation::inbound::InMemoryTransactionStore::new()),
         // The same client this mount uses for every other outbound call: `FederationClient`
@@ -1472,8 +1472,7 @@ pub fn manifest_only_mount() -> (
         own_server_name: Arc::from("routes-manifest.invalid"),
         rooms: Arc::new(hs_federation::room_source::InMemoryRoomSource::new()),
         queries: Arc::new(hs_federation::transport::InMemoryQuerySource::default()),
-        allow_public_rooms_over_federation: false,
-        allow_device_name_lookup_over_federation: false,
+        policy: hs_federation::transport::InboundPolicy::new(false, false),
         write_sink: Arc::new(hs_federation::inbound::StaticWriteSink::new(
             Vec::new(),
             "manifest-only mount",

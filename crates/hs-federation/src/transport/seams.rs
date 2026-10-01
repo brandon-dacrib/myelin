@@ -97,8 +97,7 @@ mod tests {
             own_server_name: Arc::from("us.example.org"),
             rooms: Arc::new(InMemoryRoomSource::new()),
             queries: Arc::new(InMemoryQuerySource::default()),
-            allow_public_rooms_over_federation: false,
-            allow_device_name_lookup_over_federation: false,
+            policy: crate::transport::InboundPolicy::new(false, false),
             write_sink: Arc::new(crate::inbound::StaticWriteSink::new(
                 Vec::new(),
                 "not supported",

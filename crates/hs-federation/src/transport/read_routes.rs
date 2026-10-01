@@ -180,7 +180,7 @@ async fn user_devices(
     // and Synapse answers with the names left out when the option is off, as this does.
     match state.queries.devices(&user_id).await {
         Some(mut v) => {
-            if !state.allow_device_name_lookup_over_federation
+            if !state.policy.allow_device_names()
                 && let Some(devices) = v.get_mut("devices").and_then(|d| d.as_array_mut())
             {
                 for device in devices {
@@ -207,7 +207,7 @@ async fn public_rooms(
     State(state): State<FederationState>,
     Query(params): Query<PublicRoomsParams>,
 ) -> Response {
-    if !state.allow_public_rooms_over_federation {
+    if !state.policy.allow_public_rooms() {
         return MatrixError::forbidden("public room directory is disabled").into_response();
     }
     let limit = params
@@ -539,8 +539,7 @@ mod tests {
             own_server_name: Arc::from("us.example.org"),
             rooms: Arc::new(rooms),
             queries: Arc::new(InMemoryQuerySource::default()),
-            allow_public_rooms_over_federation: true,
-            allow_device_name_lookup_over_federation: true,
+            policy: crate::transport::InboundPolicy::new(true, true),
             write_sink: Arc::new(crate::inbound::StaticWriteSink::new(
                 Vec::new(),
                 "not supported",
@@ -562,8 +561,7 @@ mod tests {
             own_server_name: Arc::from("us.example.org"),
             rooms: Arc::new(InMemoryRoomSource::new()),
             queries: Arc::new(InMemoryQuerySource::default()),
-            allow_public_rooms_over_federation: false,
-            allow_device_name_lookup_over_federation: false,
+            policy: crate::transport::InboundPolicy::new(false, false),
             write_sink: Arc::new(crate::inbound::StaticWriteSink::new(
                 Vec::new(),
                 "not supported",
@@ -651,8 +649,7 @@ mod tests {
             own_server_name: Arc::from("us.example.org"),
             rooms: Arc::new(rooms),
             queries: Arc::new(InMemoryQuerySource::default()),
-            allow_public_rooms_over_federation: false,
-            allow_device_name_lookup_over_federation: false,
+            policy: crate::transport::InboundPolicy::new(false, false),
             write_sink: Arc::new(crate::inbound::StaticWriteSink::new(
                 Vec::new(),
                 "not supported",

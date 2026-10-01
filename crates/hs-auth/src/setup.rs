@@ -138,6 +138,7 @@ impl SetupSource for FirstRunSetup {
         let user_id = self.user_id_for(&request.username)?;
         self.state
             .config
+            .get()
             .password_policy
             .validate(&request.password)
             .map_err(|e| SetupError::Invalid {

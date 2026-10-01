@@ -585,6 +585,7 @@ impl UserDirectory for AuthStoreUserDirectory {
         };
         state
             .config
+            .get()
             .password_policy
             .validate(password)
             .map_err(|e| SourceError::InvalidField {
@@ -767,7 +768,12 @@ impl UserDirectory for AuthStoreUserDirectory {
         }
         // The server's own password policy, the same one `/register` and a self-service change
         // apply; an administrator gets its reasons beside the field.
-        if let Err(e) = state.config.password_policy.validate(&request.password) {
+        if let Err(e) = state
+            .config
+            .get()
+            .password_policy
+            .validate(&request.password)
+        {
             return Err(SourceError::InvalidField {
                 pointer: "/password",
                 detail: e.message().to_owned(),

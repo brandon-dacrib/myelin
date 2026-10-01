@@ -100,9 +100,12 @@ pub struct ContentBytes {
 pub struct MediaRepository<B: KvBackend> {
     object_store: Arc<dyn ObjectStore>,
     metadata: MetadataStore<B>,
-    config: Arc<MediaConfig>,
+    /// The `media` settings in force, replaceable while the server runs
+    /// ([`MediaRepository::set_config`]): every upload, remote fetch and preview reads it anew.
+    config: hs_config::Live<MediaConfig>,
     policy: Arc<dyn UploadPolicy>,
-    thumbnail_policy: ThumbnailPolicy,
+    /// Replaced with `config` (its `thumbnail_sizes`), so the size table is in force at once.
+    thumbnail_policy: hs_config::Live<ThumbnailPolicy>,
     decode_limits: DecodeLimits,
     /// This homeserver's own name (used as `server_name` for locally uploaded media).
     server_name: String,
@@ -137,9 +140,9 @@ impl<B: KvBackend> MediaRepository<B> {
         Self {
             object_store,
             metadata,
-            config,
+            config: hs_config::Live::from_arc(config),
             policy,
-            thumbnail_policy,
+            thumbnail_policy: hs_config::Live::new(thumbnail_policy),
             decode_limits: DecodeLimits::default(),
             server_name,
             clock: Arc::new(now_ms),
@@ -162,6 +165,23 @@ impl<B: KvBackend> MediaRepository<B> {
         (self.clock)()
     }
 
+    /// Replaces the `media` settings this repository reads per operation, for every clone of it:
+    /// the upload limit, URL previews (on or off, the blocklist, timeout, size and cache
+    /// lifetime) and the thumbnail size table. The storage backend and scanning are built once
+    /// and are not changed by this.
+    pub fn set_config(&self, config: MediaConfig) {
+        let mut thumbnails = (*self.thumbnail_policy.get()).clone();
+        thumbnails.configured_sizes = config.thumbnail_sizes.clone();
+        self.thumbnail_policy.set(thumbnails);
+        self.config.set(config);
+    }
+
+    /// The `media` settings in force.
+    #[must_use]
+    pub fn config(&self) -> Arc<MediaConfig> {
+        self.config.get()
+    }
+
     /// This homeserver's own server name (the `server_name` recorded for anything uploaded
     /// through [`MediaRepository::upload`] or [`MediaRepository::create_reservation`]).
     #[must_use]
@@ -173,7 +193,7 @@ impl<B: KvBackend> MediaRepository<B> {
     /// capability.
     #[must_use]
     pub fn max_upload_size(&self) -> u64 {
-        self.config.max_upload_size.as_u64()
+        self.config.get().max_upload_size.as_u64()
     }
 
     /// A synchronous upload (`POST .../upload`): generates a new media ID, checks size and quota,
@@ -375,7 +395,7 @@ impl<B: KvBackend> MediaRepository<B> {
     }
 
     fn check_size(&self, len: u64) -> Result<(), MediaError> {
-        let limit = self.config.max_upload_size.as_u64();
+        let limit = self.config.get().max_upload_size.as_u64();
         if len > limit {
             return Err(MediaError::TooLarge { limit });
         }
@@ -741,11 +761,10 @@ impl<B: KvBackend> MediaRepository<B> {
         origin: &str,
         media_id: &MediaId,
     ) -> Result<MediaRecord, MediaError> {
+        let config = self.config.get();
         let limits = RemoteFetchLimits {
-            max_bytes: self.config.max_upload_size.as_u64(),
-            redirect_policy: PreviewIpPolicy::from_cidrs(
-                &self.config.url_preview_ip_range_blocklist,
-            ),
+            max_bytes: config.max_upload_size.as_u64(),
+            redirect_policy: PreviewIpPolicy::from_cidrs(&config.url_preview_ip_range_blocklist),
             redirect_timeout: Duration::from_secs(60),
         };
         let started = Instant::now();
@@ -864,7 +883,7 @@ impl<B: KvBackend> MediaRepository<B> {
         height: u32,
         method: ThumbnailMethod,
     ) -> Result<(ThumbnailRecord, Bytes), MediaError> {
-        if !self.thumbnail_policy.allows(width, height, method) {
+        if !self.thumbnail_policy.get().allows(width, height, method) {
             return Err(MediaError::UnsupportedThumbnail);
         }
         let media_id = parse_media_id(&record.media_id)?;
@@ -1093,7 +1112,7 @@ impl<B: KvBackend> MediaRepository<B> {
             &self.metadata,
             &self.object_store,
             &self.server_name,
-            &self.config,
+            &self.config.get(),
             self.now_ms(),
             url,
         )

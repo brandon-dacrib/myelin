@@ -91,7 +91,7 @@ pub(crate) async fn extract_token(
             "Mixing Authorization headers and access_token query parameters.",
         )),
         (Some(token), None) => Ok(token),
-        (None, Some(token)) if state.config.accept_legacy_query_param_token => Ok(token),
+        (None, Some(token)) if state.config.get().accept_legacy_query_param_token => Ok(token),
         _ => Err(MatrixError::missing_token()),
     }
 }

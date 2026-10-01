@@ -104,7 +104,13 @@ fn with_cors(response: Response) -> Response {
 }
 
 /// `GET /.well-known/matrix/server` — federation delegation, or 404 when not configured.
-pub async fn get_server(axum::Extension(well_known): axum::Extension<WellKnown>) -> Response {
+///
+/// Reads the documents through a [`hs_config::Live`] cell, so a change to
+/// `server.well_known_server` or `server.public_baseurl` is served on the next request.
+pub async fn get_server(
+    axum::Extension(well_known): axum::Extension<hs_config::Live<WellKnown>>,
+) -> Response {
+    let well_known = well_known.get();
     match &well_known.server {
         Some(delegate) => with_cors(Json(json!({ "m.server": delegate })).into_response()),
         None => not_found(),
@@ -112,7 +118,10 @@ pub async fn get_server(axum::Extension(well_known): axum::Extension<WellKnown>)
 }
 
 /// `GET /.well-known/matrix/client` — client discovery, or 404 when `public_baseurl` is unset.
-pub async fn get_client(axum::Extension(well_known): axum::Extension<WellKnown>) -> Response {
+pub async fn get_client(
+    axum::Extension(well_known): axum::Extension<hs_config::Live<WellKnown>>,
+) -> Response {
+    let well_known = well_known.get();
     match &well_known.client_base_url {
         Some(base_url) => {
             with_cors(Json(json!({ "m.homeserver": { "base_url": base_url } })).into_response())
@@ -134,7 +143,7 @@ mod tests {
         axum::Router::new()
             .route("/.well-known/matrix/server", get(get_server))
             .route("/.well-known/matrix/client", get(get_client))
-            .layer(Extension(well_known))
+            .layer(Extension(hs_config::Live::new(well_known)))
     }
 
     async fn body_json(response: Response) -> serde_json::Value {

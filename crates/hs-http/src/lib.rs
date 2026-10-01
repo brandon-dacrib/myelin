@@ -14,9 +14,12 @@
 //! - [`cors`]: the admin API's CORS layer.
 //! - [`listener`]: TCP, TLS and unix-socket listener configuration.
 //! - [`ratelimit`]: the `RateLimiter` trait every listener enforces against.
+//! - [`buckets`]: the server-wide `rate_limits.*` token buckets, whose limit changes while the
+//!   server runs, and the client address the per-address ones are keyed by.
 //! - [`time`]: RFC 3339 timestamp formatting at millisecond precision.
 
 pub mod body;
+pub mod buckets;
 pub mod client;
 pub mod cors;
 pub mod error;

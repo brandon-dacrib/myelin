@@ -39,12 +39,12 @@ async fn verify(
         AuthData::Password(p) => {
             let user = state.store.get_user(&requester.user_id).await?;
             match user.and_then(|u| u.password_hash) {
-                Some(hash) => {
-                    Ok(
-                        password::verify_password(&p.password, &hash, &state.config.bcrypt_pepper)
-                            .unwrap_or(false),
-                    )
-                }
+                Some(hash) => Ok(password::verify_password(
+                    &p.password,
+                    &hash,
+                    &state.config.get().bcrypt_pepper,
+                )
+                .unwrap_or(false)),
                 None => Ok(false),
             }
         }
@@ -88,7 +88,7 @@ pub async fn run(
         submitted_type,
         stage_ok,
         state.now_ms(),
-        state.config.uia_session_timeout_ms,
+        state.config.get().uia_session_timeout_ms,
     )
     .await?;
 

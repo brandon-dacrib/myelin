@@ -48,7 +48,7 @@ pub async fn get_login_types(State(state): State<AuthState>) -> Json<Value> {
         json!({"type": "m.login.password"}),
         json!({"type": "m.login.token"}),
     ];
-    if state.config.shared_secret_auth_secret.is_some() {
+    if state.config.get().shared_secret_auth_secret.is_some() {
         flows.push(json!({"type": SHARED_SECRET_AUTH_LOGIN_TYPE}));
     }
     Json(json!({ "flows": flows }))
@@ -59,6 +59,7 @@ pub async fn post_login(
     State(state): State<AuthState>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
+    client: hs_http::buckets::ClientIp,
     PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, MatrixError> {
     let device_id: Option<OwnedDeviceId> = body
@@ -81,6 +82,18 @@ pub async fn post_login(
             "Invalid or missing login type",
         )
     })?;
+
+    // `rate_limits.login`, per client address, as Synapse's `rc_login.address`: every attempt
+    // takes from the bucket, except an appservice logging in one of its own users.
+    if !matches!(login_info, LoginInfo::ApplicationService(_))
+        && let Some(address) = client.key()
+    {
+        state
+            .limits
+            .login
+            .take_now(&address)
+            .map_err(MatrixError::limit_exceeded)?;
+    }
 
     let user_id = if login_info.login_type() == SHARED_SECRET_AUTH_LOGIN_TYPE {
         resolve_shared_secret_auth_login(&state, &login_info.data()).await?
@@ -179,7 +192,7 @@ async fn resolve_password_login(
     let Some(hash) = &record.password_hash else {
         return Err(MatrixError::forbidden(INVALID_USERNAME_OR_PASSWORD));
     };
-    let ok = password::verify_password(&p.password, hash, &state.config.bcrypt_pepper)
+    let ok = password::verify_password(&p.password, hash, &state.config.get().bcrypt_pepper)
         .map_err(|_| MatrixError::forbidden(INVALID_USERNAME_OR_PASSWORD))?;
     if !ok {
         return Err(MatrixError::forbidden(INVALID_USERNAME_OR_PASSWORD));
@@ -254,7 +267,8 @@ async fn resolve_shared_secret_auth_login(
     state: &AuthState,
     data: &serde_json::Map<String, Value>,
 ) -> Result<OwnedUserId, MatrixError> {
-    let Some(secret) = state.config.shared_secret_auth_secret.as_deref() else {
+    let config = state.config.get();
+    let Some(secret) = config.shared_secret_auth_secret.as_deref() else {
         return Err(MatrixError::new(
             StatusCode::BAD_REQUEST,
             ErrCode::Unrecognized,
@@ -379,11 +393,47 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// `rate_limits.login` is per client address, and a request with no address (this host's own
+    /// tooling) is not limited.
+    #[tokio::test]
+    async fn the_login_limit_is_per_client_address() {
+        let state = state_with_password_user(user_id!("@alice:example.org"), "hunter2").await;
+        state
+            .limits
+            .login
+            .set_limit(Some(hs_http::buckets::BucketLimit {
+                per_second: 0.001,
+                burst_count: 1,
+            }));
+        let login = |address: Option<&str>| {
+            let state = state.clone();
+            let address = address.map(|a| a.parse().unwrap());
+            async move {
+                let body = json!({"type": "m.login.password", "identifier": {"type": "m.id.user", "user": "alice"}, "password": "hunter2"});
+                post_login(
+                    State(state),
+                    HeaderMap::new(),
+                    Query(HashMap::new()),
+                    hs_http::buckets::ClientIp(address),
+                    PermissiveJson(body),
+                )
+                .await
+            }
+        };
+        assert!(login(Some("203.0.113.1")).await.is_ok());
+        let refused = login(Some("203.0.113.1")).await.unwrap_err();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(login(Some("203.0.113.2")).await.is_ok());
+        assert!(login(None).await.is_ok());
+        assert!(login(None).await.is_ok());
     }
 
     #[tokio::test]
@@ -394,6 +444,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -412,6 +463,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -427,6 +479,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -442,6 +495,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -457,6 +511,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -473,6 +528,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -503,6 +559,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -536,6 +593,7 @@ mod tests {
             State(state.clone()),
             HeaderMap::new(),
             Query(HashMap::new()),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body.clone()),
         )
         .await
@@ -546,6 +604,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -617,6 +676,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -646,6 +706,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await
@@ -671,6 +732,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Query(HashMap::new()),
+            hs_http::buckets::ClientIp(None),
             PermissiveJson(body),
         )
         .await

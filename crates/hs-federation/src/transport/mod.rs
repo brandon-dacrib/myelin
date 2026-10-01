@@ -40,8 +40,10 @@ pub struct FederationState {
     pub own_server_name: Arc<str>,
     pub rooms: Arc<dyn RoomDataSource>,
     pub queries: Arc<dyn FederationQuerySource>,
-    pub allow_public_rooms_over_federation: bool,
-    pub allow_device_name_lookup_over_federation: bool,
+    /// What the routes allow and how fast an origin may send: settings a running server
+    /// replaces when they change (`federation.allow_public_rooms_over_federation`,
+    /// `federation.allow_device_name_lookup_over_federation`, `rate_limits.federation`).
+    pub policy: InboundPolicy,
     /// Applies an already-verified inbound event (`/send`'s PDUs, and a validated `send_join`
     /// submission) to a room this server hosts. See `crate::inbound`'s module doc for what this
     /// can and cannot promise today.
@@ -70,6 +72,57 @@ pub struct FederationState {
     /// Where `/send`'s EDUs go once validated (`crate::edu::InboundEduSink`). `None` drops them,
     /// which is what every handler test that does not care about EDUs wants.
     pub edu_sink: Option<Arc<dyn crate::edu::InboundEduSink>>,
+}
+
+/// The inbound settings [`FederationState`] reads on every request, shared by every clone so a
+/// running server can change them ([`InboundPolicy::set_allow_public_rooms`] and friends).
+#[derive(Clone, Debug)]
+pub struct InboundPolicy {
+    allow_public_rooms: Arc<std::sync::atomic::AtomicBool>,
+    allow_device_names: Arc<std::sync::atomic::AtomicBool>,
+    /// `rate_limits.federation`: inbound transactions (`PUT /send`), per origin server.
+    /// Limits nothing until set.
+    pub transactions: Arc<hs_http::buckets::TokenBuckets>,
+}
+
+impl InboundPolicy {
+    /// A policy allowing what the two flags say, with no transaction limit.
+    #[must_use]
+    pub fn new(allow_public_rooms: bool, allow_device_names: bool) -> Self {
+        Self {
+            allow_public_rooms: Arc::new(allow_public_rooms.into()),
+            allow_device_names: Arc::new(allow_device_names.into()),
+            transactions: Arc::new(hs_http::buckets::TokenBuckets::new("federation")),
+        }
+    }
+
+    /// Whether `GET /publicRooms` answers other servers
+    /// (`federation.allow_public_rooms_over_federation`).
+    #[must_use]
+    pub fn allow_public_rooms(&self) -> bool {
+        self.allow_public_rooms
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether device display names are given to other servers
+    /// (`federation.allow_device_name_lookup_over_federation`).
+    #[must_use]
+    pub fn allow_device_names(&self) -> bool {
+        self.allow_device_names
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Replaces [`Self::allow_public_rooms`] for every clone.
+    pub fn set_allow_public_rooms(&self, allow: bool) {
+        self.allow_public_rooms
+            .store(allow, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Replaces [`Self::allow_device_names`] for every clone.
+    pub fn set_allow_device_names(&self, allow: bool) {
+        self.allow_device_names
+            .store(allow, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 fn matrix_federation(operation_id: &str) -> RouteMeta {
@@ -183,8 +236,7 @@ mod tests {
             own_server_name: Arc::from("us.example.org"),
             rooms: Arc::new(InMemoryRoomSource::new()),
             queries: Arc::new(InMemoryQuerySource::default()),
-            allow_public_rooms_over_federation: true,
-            allow_device_name_lookup_over_federation: true,
+            policy: crate::transport::InboundPolicy::new(true, true),
             write_sink: Arc::new(crate::inbound::StaticWriteSink::new(
                 Vec::new(),
                 "not supported",

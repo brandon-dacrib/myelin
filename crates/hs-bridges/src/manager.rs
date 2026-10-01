@@ -83,8 +83,10 @@ pub struct BridgeManager<B: KvBackend> {
     directory: Arc<dyn AppserviceDirectory>,
     runtime: Option<Arc<dyn Runtime>>,
     pub(crate) server_name: String,
-    /// How a bridge that runs elsewhere reaches this server: its public base URL.
-    public_base_url: String,
+    /// How a bridge that runs elsewhere reaches this server: its public base URL. Replaced when
+    /// `server.public_baseurl` changes ([`BridgeManager::set_public_base_url`]); files rendered
+    /// from then on carry the new one.
+    public_base_url: std::sync::RwLock<String>,
     loopback: OnceLock<String>,
     pub(crate) client: OnceLock<MatrixClient>,
     wake: tokio::sync::Notify,
@@ -100,6 +102,16 @@ impl<B: KvBackend> std::fmt::Debug for BridgeManager<B> {
 }
 
 impl<B: KvBackend + 'static> BridgeManager<B> {
+    /// Replaces the public base URL a bridge that runs elsewhere is given (`""`: none), for every
+    /// file rendered from now on.
+    pub fn set_public_base_url(&self, public_base_url: &str) {
+        *self
+            .public_base_url
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            public_base_url.trim_end_matches('/').to_owned();
+    }
+
     /// A manager over `backend`'s tables, registering through `directory`, running instances on
     /// `runtime` (none: they all run elsewhere).
     ///
@@ -117,7 +129,9 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             directory,
             runtime,
             server_name: server_name.to_owned(),
-            public_base_url: public_base_url.trim_end_matches('/').to_owned(),
+            public_base_url: std::sync::RwLock::new(
+                public_base_url.trim_end_matches('/').to_owned(),
+            ),
             loopback: OnceLock::new(),
             client: OnceLock::new(),
             wake: tokio::sync::Notify::new(),
@@ -356,10 +370,15 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
     /// than being empty).
     fn homeserver_address(&self, offering: &OfferingRow) -> String {
         let outside = || {
-            if self.public_base_url.is_empty() {
+            let public = self
+                .public_base_url
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if public.is_empty() {
                 self.loopback.get().cloned().unwrap_or_default()
             } else {
-                self.public_base_url.clone()
+                public
             }
         };
         match (&self.runtime, offering.runtime.as_str()) {

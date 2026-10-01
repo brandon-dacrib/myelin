@@ -253,7 +253,7 @@ async fn lowering_the_send_limit_through_the_admin_api_limits_the_next_message_w
         updated["last_reloaded_at"].is_string(),
         "the section says when it was last reloaded: {updated}"
     );
-    hs.wait_for("the server-wide send limit is now in force");
+    hs.wait_for("the server-wide rate limits are now in force");
     let reloaded = hs.wait_for("configuration section reloaded");
     assert!(reloaded.contains("rate_limits"), "{reloaded}");
 
@@ -323,9 +323,11 @@ async fn lowering_the_send_limit_through_the_admin_api_limits_the_next_message_w
             StatusCode::OK,
         )
         .await;
+    // `server.public_baseurl` is hot (read per request), so only the federation timeout
+    // already saved is pending.
     assert_eq!(
         report["requires_restart"],
-        json!(["server", "federation"]),
+        json!(["federation"]),
         "{report}"
     );
     let reload = ops

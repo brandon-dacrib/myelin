@@ -97,9 +97,78 @@ impl RateLimiter for InMemoryRateLimiter {
     }
 }
 
+/// The server-wide `rate_limits.*` buckets enforced by this crate's routes and by the crates
+/// whose state embeds [`crate::state::AuthState`] (`hs-room`): one
+/// [`hs_http::buckets::TokenBuckets`] per configured bucket, each of which a running server
+/// re-points when its setting changes. All limit nothing until set.
+///
+/// `message` is not here: `hs_room::moderation::SendLimiter` enforces it alongside
+/// administrators' per-user overrides. `federation` is not here either: the federation
+/// transport, which does not see this state, holds its own.
+#[derive(Debug)]
+pub struct ServerLimits {
+    /// `rate_limits.login`: `POST /login`, per client address.
+    pub login: hs_http::buckets::TokenBuckets,
+    /// `rate_limits.registration`: accounts made through `POST /register`, per client address.
+    pub registration: hs_http::buckets::TokenBuckets,
+    /// `rate_limits.joins_local`: joins to rooms this server already hosts, per user.
+    pub joins_local: hs_http::buckets::TokenBuckets,
+    /// `rate_limits.joins_remote`: joins made through another server, per user.
+    pub joins_remote: hs_http::buckets::TokenBuckets,
+    /// `rate_limits.admin_redaction`: redactions by a server administrator, per user, in place of
+    /// the message limit (as Synapse's `rc_admin_redaction`).
+    pub admin_redaction: hs_http::buckets::TokenBuckets,
+}
+
+impl Default for ServerLimits {
+    fn default() -> Self {
+        Self {
+            login: hs_http::buckets::TokenBuckets::new("login"),
+            registration: hs_http::buckets::TokenBuckets::new("registration"),
+            joins_local: hs_http::buckets::TokenBuckets::new("joins_local"),
+            joins_remote: hs_http::buckets::TokenBuckets::new("joins_remote"),
+            admin_redaction: hs_http::buckets::TokenBuckets::new("admin_redaction"),
+        }
+    }
+}
+
+impl ServerLimits {
+    /// Sets every bucket from the configuration's `rate_limits`: each bucket's own limit while
+    /// `rate_limits.enabled`, and no limit at all otherwise.
+    pub fn apply(&self, config: &hs_config::RateLimitConfig) {
+        let limit = |bucket: &hs_config::ratelimit::RateLimitBucket| {
+            config.enabled.then_some(hs_http::buckets::BucketLimit {
+                per_second: bucket.per_second,
+                burst_count: bucket.burst_count,
+            })
+        };
+        self.login.set_limit(limit(&config.login));
+        self.registration.set_limit(limit(&config.registration));
+        self.joins_local.set_limit(limit(&config.joins_local));
+        self.joins_remote.set_limit(limit(&config.joins_remote));
+        self.admin_redaction
+            .set_limit(limit(&config.admin_redaction));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_limits_follow_the_configuration_and_its_master_switch() {
+        let limits = ServerLimits::default();
+        assert!(limits.login.limit().is_none(), "unlimited until set");
+        let mut config = hs_config::RateLimitConfig::default();
+        config.login.burst_count = 1;
+        limits.apply(&config);
+        assert_eq!(limits.login.limit().unwrap().burst_count, 1);
+        assert!(limits.login.take("a", 0).is_ok());
+        assert!(limits.login.take("a", 0).is_err());
+        config.enabled = false;
+        limits.apply(&config);
+        assert!(limits.login.take("a", 0).is_ok());
+    }
 
     #[test]
     fn burst_allows_that_many_requests_immediately() {

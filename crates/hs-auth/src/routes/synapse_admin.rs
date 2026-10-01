@@ -67,7 +67,7 @@ async fn get_register_nonce(
     State(state): State<AuthState>,
     Extension(registry): Extension<SharedNonceRegistry>,
 ) -> Result<Json<Value>, MatrixError> {
-    if state.config.registration_shared_secret.is_none() {
+    if state.config.get().registration_shared_secret.is_none() {
         return Err(MatrixError::feature_not_configured());
     }
     let nonce = registry
@@ -82,7 +82,7 @@ async fn post_register(
     Extension(registry): Extension<SharedNonceRegistry>,
     PermissiveJson(body): PermissiveJson<Value>,
 ) -> Result<Response, MatrixError> {
-    let Some(secret) = state.config.registration_shared_secret.clone() else {
+    let Some(secret) = state.config.get().registration_shared_secret.clone() else {
         return Err(MatrixError::feature_not_configured());
     };
 
@@ -97,7 +97,7 @@ async fn post_register(
             .map_err(map_registration_error)?;
     }
 
-    state.config.password_policy.validate(&req.password)?;
+    state.config.get().password_policy.validate(&req.password)?;
 
     // Lower-case only for the `UserId` we actually create/look up, exactly as `routes::
     // register.rs::register_user` does for `POST /register` -- see that function's doc comment

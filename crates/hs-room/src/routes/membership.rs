@@ -301,9 +301,10 @@ async fn act_join<B: KvBackend + 'static>(
     state: &RoomState<B>,
     room_id: &str,
     mut via: Vec<String>,
-    sender: ruma::OwnedUserId,
+    requester: &hs_auth::requester::Requester,
     body: &Value,
 ) -> Result<Response, RoomError> {
+    let sender = requester.user_id.clone();
     let room_id = parse_room_id(room_id)?;
     let content = extra(state, Action::Join, &sender, body).await;
     match state.rooms.get_or_load(&room_id).await {
@@ -338,6 +339,7 @@ async fn act_join<B: KvBackend + 'static>(
                         }
                     }
                 }
+                crate::moderation::check_join_limit(state, requester, true)?;
                 let joined = remote.join(&sender, &room_id, &via, content).await?;
                 return Ok(Json(json!({ "room_id": joined })).into_response());
             }
@@ -372,6 +374,7 @@ async fn act_join<B: KvBackend + 'static>(
                                     }
                                 }
                                 tracing::info!(%room_id, user = %sender, "no user of this server may authorise the restricted join; joining through another server");
+                                crate::moderation::check_join_limit(state, requester, true)?;
                                 let joined =
                                     remote.join(&sender, &room_id, &through, content).await?;
                                 return Ok(Json(json!({ "room_id": joined })).into_response());
@@ -380,6 +383,7 @@ async fn act_join<B: KvBackend + 'static>(
                     }
                 }
             }
+            crate::moderation::check_join_limit(state, requester, false)?;
             handle
                 .membership(sender.clone(), Action::Join, sender, content, now_ms())
                 .await?;
@@ -401,6 +405,7 @@ async fn act_join<B: KvBackend + 'static>(
             if via.is_empty() {
                 return Err(RoomError::RoomNotFound(room_id.to_string()));
             }
+            crate::moderation::check_join_limit(state, requester, true)?;
             let joined = remote.join(&sender, &room_id, &via, content).await?;
             Ok(Json(json!({ "room_id": joined })).into_response())
         }
@@ -476,7 +481,7 @@ pub async fn post_join<B: KvBackend + 'static>(
 ) -> Result<Response, RoomError> {
     crate::moderation::refuse_if_suspended(&requester)?;
     let via = requested_via(raw_query.as_deref());
-    act_join(&state, &room_id, via, requester.user_id, &body).await
+    act_join(&state, &room_id, via, &requester, &body).await
 }
 
 /// `POST /join/{roomIdOrAlias}`. An alias on another server is resolved through that server's
@@ -515,7 +520,7 @@ pub async fn post_join_by_id_or_alias<B: KvBackend + 'static>(
             },
         }
     };
-    act_join(&state, room_id.as_str(), via, requester.user_id, &body).await
+    act_join(&state, room_id.as_str(), via, &requester, &body).await
 }
 
 /// `POST /rooms/{roomId}/leave`.

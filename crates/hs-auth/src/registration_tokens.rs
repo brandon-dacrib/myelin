@@ -419,7 +419,7 @@ impl AdminRegistrationTokens {
         Self {
             store: state.registration_tokens.clone(),
             clock: state.clock.clone(),
-            session_timeout_ms: state.config.uia_session_timeout_ms,
+            session_timeout_ms: state.config.get().uia_session_timeout_ms,
         }
     }
 

@@ -301,6 +301,71 @@ pub(crate) async fn check_send_limit<B: KvBackend + 'static>(
         })
 }
 
+/// `rate_limits.joins_local` or `rate_limits.joins_remote` (`remote`: the join goes through
+/// another server), per user, for one join about to be made: the server-wide buckets in
+/// [`hs_auth::ratelimit::ServerLimits`], whose limits a running server replaces when they change.
+/// An appservice the registry exempts from rate limiting is never limited here.
+///
+/// # Errors
+/// [`RoomError::LimitExceeded`] when the user's bucket is empty.
+pub(crate) fn check_join_limit<B: KvBackend + 'static>(
+    state: &RoomState<B>,
+    requester: &Requester,
+    remote: bool,
+) -> Result<(), RoomError> {
+    if requester
+        .appservice
+        .as_ref()
+        .is_some_and(|a| !a.rate_limited)
+    {
+        return Ok(());
+    }
+    let limits = &state.auth.limits;
+    let buckets = if remote {
+        &limits.joins_remote
+    } else {
+        &limits.joins_local
+    };
+    buckets
+        .take_now(requester.user_id.as_str())
+        .map_err(RoomError::LimitExceeded)
+}
+
+/// The limit on one redaction about to be sent: a server administrator's redactions are under
+/// `rate_limits.admin_redaction` (as Synapse's `rc_admin_redaction`) unless an administrator
+/// gave them an override; everybody else's under the send limit ([`check_send_limit`]).
+///
+/// # Errors
+/// As [`check_send_limit`].
+pub(crate) async fn check_redaction_limit<B: KvBackend + 'static>(
+    state: &RoomState<B>,
+    requester: &Requester,
+) -> Result<(), RoomError> {
+    if !requester.is_admin
+        || requester
+            .appservice
+            .as_ref()
+            .is_some_and(|a| !a.rate_limited)
+    {
+        return check_send_limit(state, requester).await;
+    }
+    let record = state
+        .auth
+        .store
+        .get_user(&requester.user_id)
+        .await
+        .map_err(|e| RoomError::Internal(format!("reading the sender's account: {e}")))?;
+    if record.is_some_and(|r| r.rate_limit_override.is_some()) {
+        return check_send_limit(state, requester).await;
+    }
+    state
+        .auth
+        .limits
+        .admin_redaction
+        .take_now(requester.user_id.as_str())
+        .map_err(RoomError::LimitExceeded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

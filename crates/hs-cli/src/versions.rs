@@ -152,11 +152,11 @@ pub fn load_unstable_features(
 /// every other route (see `crate::serve::build_router`), with the actual value injected as an
 /// outer layer once after the router is built.
 pub async fn get_versions(
-    Extension(features): Extension<std::sync::Arc<BTreeMap<String, bool>>>,
+    Extension(features): Extension<hs_config::Live<BTreeMap<String, bool>>>,
 ) -> Json<VersionsResponse> {
     Json(VersionsResponse {
         versions: supported_versions(),
-        unstable_features: (*features).clone(),
+        unstable_features: (*features.get()).clone(),
     })
 }
 

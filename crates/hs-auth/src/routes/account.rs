@@ -32,7 +32,7 @@ pub async fn post_account_password(
         .get("new_password")
         .and_then(Value::as_str)
         .ok_or_else(|| MatrixError::missing_param("Missing new_password"))?;
-    state.config.password_policy.validate(new_password)?;
+    state.config.get().password_policy.validate(new_password)?;
 
     if let Some(response) = reauth::run(&state, &requester, &body).await? {
         return Ok(response);
@@ -144,7 +144,7 @@ pub async fn get_account_3pid(
 
 /// `GET /password_policy`: unauthenticated, so clients can show requirements before registration.
 pub async fn get_password_policy(State(state): State<AuthState>) -> Json<Value> {
-    Json(state.config.password_policy.to_response_json())
+    Json(state.config.get().password_policy.to_response_json())
 }
 
 #[cfg(test)]
