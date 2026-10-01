@@ -17,16 +17,154 @@ export const MIGRATION_STATUS_META: Record<MigrationPhase, { label: string; stat
     aborted: { label: "Aborted", status: "warning" },
   };
 
-/** What each stream copies, in the operator's words. */
-export const STREAM_LABELS: Record<string, string> = {
-  users: "Accounts",
-  devices: "Devices",
-  access_tokens: "Sessions (access tokens)",
-  account_data: "Account data and room tags",
-  rooms: "Rooms",
-  events: "Room events",
-  media: "Media",
+/** One stream of a migration, in the operator's words. */
+export interface StreamInfo {
+  label: string;
+  /** One line: what it copies, and what that keeps working for people. */
+  explanation: string;
+}
+
+/**
+ * What each stream copies (`hs_compat::migration::Stream`, `MigrationStatus.streams[].name`), in
+ * the order a migration copies them: each stream's rows refer only to rows of the streams
+ * before it. `docs/compat/synapse-migration-runbook.md`'s "What moves" says the same table by
+ * table.
+ */
+export const STREAMS: Record<string, StreamInfo> = {
+  users: {
+    label: "Accounts",
+    explanation:
+      "Every account with its password hash, administrator and deactivated flags, display name and avatar: people sign in with the passwords they have.",
+  },
+  devices: {
+    label: "Devices",
+    explanation: "Each account's signed-in devices, with their names and when they were last seen.",
+  },
+  access_tokens: {
+    label: "Sessions (access tokens)",
+    explanation:
+      "The tokens signed-in apps hold, so nobody has to sign in again after the cutover.",
+  },
+  account_data: {
+    label: "Account data and room tags",
+    explanation:
+      "Each account's settings stored on the server: favourites and other room tags, ignored people, direct-message lists.",
+  },
+  e2e_keys: {
+    label: "Device encryption keys",
+    explanation:
+      "Each device's identity keys, unclaimed one-time keys and fallback key: other people's apps find the same keys, so nobody has to verify anybody again.",
+  },
+  cross_signing: {
+    label: "Cross-signing keys",
+    explanation:
+      "Each account's master, self-signing and user-signing keys with their signatures: verified devices and verified people stay verified.",
+  },
+  key_backups: {
+    label: "Key backups",
+    explanation:
+      "Server-side backups of message keys, under the same version numbers: encrypted history stays readable on a new sign-in.",
+  },
+  push_rules: {
+    label: "Notification rules (push rules)",
+    explanation:
+      "Each account's own notification rules and its changes to the default ones: people are notified about what they chose.",
+  },
+  pushers: {
+    label: "Phones to notify (pushers)",
+    explanation:
+      "Where each account's notifications are sent, so phones keep being notified without opening the app.",
+  },
+  filters: {
+    label: "Sync filters",
+    explanation:
+      "The filters apps registered, under the ids Synapse gave them, so an app's next sync works unchanged.",
+  },
+  rooms: {
+    label: "Rooms",
+    explanation:
+      "Every room this server's users created or joined, with every event since they joined, replayed in order through this server's own checks; aliases and the public directory too. A room joined on another server starts from the join.",
+  },
+  receipts: {
+    label: "Read receipts",
+    explanation: "Who has read up to where, public and private, so unread counts stay right.",
+  },
+  media: {
+    label: "Media",
+    explanation:
+      "Files uploaded here, under the same mxc:// addresses, with their contents when Synapse's media store is mounted.",
+  },
+  // Before 2026-10-01 a server copied room events as a stream of their own.
+  events: {
+    label: "Room events",
+    explanation: "The messages and other events of each room.",
+  },
 };
+
+/** What each stream copies, by wire name; kept for the places that need only the label. */
+export const STREAM_LABELS: Record<string, string> = Object.fromEntries(
+  Object.entries(STREAMS).map(([name, info]) => [name, info.label]),
+);
+
+/** A stream's label; a stream this build does not know is named in words, never by wire name. */
+export function streamLabel(name: string | null | undefined): string {
+  if (!name) return "Unknown";
+  if (STREAMS[name]) return STREAMS[name].label;
+  if (name === "migration") return "Migration";
+  const words = name.replaceAll("_", " ");
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+/** One thing a migration leaves behind, and why. */
+export interface NotMoved {
+  title: string;
+  detail: string;
+}
+
+/**
+ * What a migration does not copy, from the runbook's "What does not move"
+ * (`docs/compat/synapse-migration-runbook.md`), so an operator knows before starting.
+ */
+export const WHAT_DOES_NOT_MOVE: readonly NotMoved[] = [
+  {
+    title: "History from before a join on another server",
+    detail:
+      "For a room hosted on another server, only what Synapse held from its users' join onwards is copied; this server fetches older history from the other servers when someone scrolls back, as Synapse did. A room Synapse is still joining is skipped until Synapse has finished, and a room people were only invited to, or have all left, is skipped and logged: they join it again after the cutover.",
+  },
+  {
+    title: "Other servers' media",
+    detail:
+      "Synapse's cache of other servers' files is left behind on purpose: this server fetches each again the first time someone opens it.",
+  },
+  {
+    title: "Presence",
+    detail: "Who is online is how people are right now; it starts again as they come back.",
+  },
+  {
+    title: "Receipts in threads",
+    detail:
+      "Read receipts inside threads are left out and logged: this server keeps one receipt per person and type in a room.",
+  },
+  {
+    title: "Turned-off pushers and retired push rules",
+    detail:
+      "Pushers turned off in Synapse are left out, as are push rules of kinds this server does not have and changes to default rules the specification has retired; each is logged.",
+  },
+  {
+    title: "Room keys deleted from a backup after the copy",
+    detail:
+      "The cutover's last pass adds and updates backed-up room keys but does not delete them, so a key deleted in Synapse in between stays here.",
+  },
+  {
+    title: "Rejected events and outliers",
+    detail: "Events Synapse rejected or held outside a room's history stay out of it here too.",
+  },
+  {
+    title: "Bridges",
+    detail:
+      "Appservice registrations are not read from Synapse's database. Add each bridge in Bridges, or list its registration file in the bootstrap file's appservices.registration_files.",
+  },
+];
 
 /** How far a stream has got, `null` before it has been counted. */
 export function streamFraction(stream: MigrationStream): number | null {

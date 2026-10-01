@@ -25,7 +25,9 @@ import { toast } from "@/components/ui/toast/toast-store";
 import { hasScope } from "@/lib/auth";
 import {
   MIGRATION_STATUS_META,
-  STREAM_LABELS,
+  STREAMS,
+  WHAT_DOES_NOT_MOVE,
+  streamLabel,
   formatDuration,
   streamFraction,
 } from "@/lib/migration";
@@ -297,7 +299,10 @@ function SourceForm({ source, onDone }: { source: SynapseSource | null; onDone: 
             />
           )}
         </Field>
-        <Field label="Rows per batch" hint="Each batch is a point the copy can pause at.">
+        <Field
+          label="Rows per batch"
+          hint="How many rows are read from Synapse at a time; each batch is a point the copy can pause at and restart from. Default 500. Larger copies a little faster but pauses less promptly and holds more in memory."
+        >
           {(p) => (
             <Input
               {...p}
@@ -343,7 +348,7 @@ function CopyStep({ status, sourceSet }: { status: MigrationStatus; sourceSet: b
       {phase === "idle" || phase === "failed" || phase === "aborted" ? (
         <p className="text-sm text-text-muted">
           {phase === "idle"
-            ? "Accounts with their password hashes, devices and access tokens (so nobody has to sign in again), account data, rooms with their whole history, and media. Nothing is written to Synapse."
+            ? "Accounts with their password hashes, devices and sessions (so nobody has to sign in again), encryption keys and key backups (so nobody has to verify again), notification settings, rooms with their history, and media. Nothing is written to Synapse."
             : phase === "aborted"
               ? "The migration was aborted. What was copied stays; starting again carries on from it."
               : "The copy stopped on an error. Starting it again carries on from where it stopped."}
@@ -363,6 +368,7 @@ function CopyStep({ status, sourceSet }: { status: MigrationStatus; sourceSet: b
           )}
         </p>
       )}
+      <WhatMoves open={phase === "idle"} />
       {streams.length > 0 && (
         <>
           {phase === "copying" && (
@@ -405,6 +411,15 @@ function CopyStep({ status, sourceSet }: { status: MigrationStatus; sourceSet: b
           )}
         </div>
       )}
+      {canWrite && (phase === "copying" || phase === "paused") && (
+        <p className="text-xs text-text-muted">
+          {phase === "copying"
+            ? "Pause stops the copy after the batch in hand, and Resume carries on from there; Synapse is not affected either way. "
+            : "Paused between two batches: Resume carries on from there. "}
+          Abort gives the migration up; what was copied stays, and starting again carries on from
+          it.
+        </p>
+      )}
       {!sourceSet && phase === "idle" && (
         <p className="text-sm text-text-muted">Point at Synapse first (step 1).</p>
       )}
@@ -443,16 +458,25 @@ function StreamsTable({ streams }: { streams: MigrationStream[] }) {
             <tr key={s.name} className="border-b border-border last:border-0">
               <th scope="row" className="py-2 text-left font-normal text-text">
                 <div className="flex items-center gap-2">
-                  {STREAM_LABELS[s.name ?? ""] ?? s.name}
+                  {streamLabel(s.name)}
                   {s.done && (
                     <Badge status="success" hideIcon>
                       Done
                     </Badge>
                   )}
                 </div>
+                {STREAMS[s.name ?? ""] && (
+                  <p className="mt-0.5 max-w-xl text-xs text-text-muted">
+                    {STREAMS[s.name ?? ""].explanation}
+                  </p>
+                )}
                 {!s.done && fraction != null && (
                   <div className="mt-1 max-w-48">
-                    <TaskProgressBar fraction={fraction} label={`${s.name} progress`} compact />
+                    <TaskProgressBar
+                      fraction={fraction}
+                      label={`${streamLabel(s.name)} progress`}
+                      compact
+                    />
                   </div>
                 )}
               </th>
@@ -480,7 +504,56 @@ function StreamsTable({ streams }: { streams: MigrationStream[] }) {
           );
         })}
       </tbody>
+      <caption className="caption-bottom pt-2 text-left text-xs text-text-muted">
+        Not copied: rows left out on purpose, each named in the log with why (a hidden device, a
+        receipt in a thread). Failed: rows that could not be copied; the log says why, and starting
+        again retries them. Rate: rows a second over the stream&apos;s latest run.
+      </caption>
     </table>
+  );
+}
+
+/**
+ * What a migration copies and what it leaves behind, before anything starts: the streams in
+ * copy order with what each keeps working, and the runbook's "What does not move".
+ */
+export function WhatMoves({ open }: { open: boolean }) {
+  return (
+    <details className="rounded-md border border-border bg-surface-sunken p-3" open={open}>
+      <summary className="cursor-pointer text-sm font-medium text-text">
+        What is copied, and what is not
+      </summary>
+      <div className="mt-3 grid gap-6 lg:grid-cols-2">
+        <section aria-labelledby="what-moves-heading">
+          <h3 id="what-moves-heading" className="text-sm font-medium text-text">
+            Copied, in this order
+          </h3>
+          <ol className="mt-2 flex list-decimal flex-col gap-1.5 pl-5 text-sm">
+            {Object.entries(STREAMS)
+              .filter(([name]) => name !== "events")
+              .map(([name, info]) => (
+                <li key={name}>
+                  <span className="text-text">{info.label}</span>
+                  <span className="text-text-muted">: {info.explanation}</span>
+                </li>
+              ))}
+          </ol>
+        </section>
+        <section aria-labelledby="what-stays-heading">
+          <h3 id="what-stays-heading" className="text-sm font-medium text-text">
+            Not copied
+          </h3>
+          <ul className="mt-2 flex list-disc flex-col gap-1.5 pl-5 text-sm">
+            {WHAT_DOES_NOT_MOVE.map((item) => (
+              <li key={item.title}>
+                <span className="text-text">{item.title}</span>
+                <span className="text-text-muted">: {item.detail}</span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      </div>
+    </details>
   );
 }
 
@@ -583,7 +656,7 @@ function VerifyStep({ status }: { status: MigrationStatus }) {
                 return (
                   <tr key={s.name} className="border-b border-border align-top last:border-0">
                     <th scope="row" className="py-2 text-left font-normal">
-                      {STREAM_LABELS[s.name ?? ""] ?? s.name}
+                      {streamLabel(s.name)}
                     </th>
                     <td className={"py-2 text-right tabular-nums" + (ok ? "" : " text-danger")}>
                       {(s.target_count ?? 0).toLocaleString()} /{" "}
@@ -622,6 +695,15 @@ function VerifyStep({ status }: { status: MigrationStatus }) {
         >
           {report ? "Verify again" : "Verify"}
         </Button>
+      )}
+      {hasScope("admin:write") && !allowed && phase !== "verifying" && (
+        <p className="text-xs text-text-muted">
+          {phase === "copying"
+            ? "Verifying is possible once the copy is paused or has finished."
+            : phase === "cutting_over"
+              ? "The cutover verifies as its last step."
+              : "Verifying is possible once something has been copied."}
+        </p>
       )}
       {verify.isError && <MutationError error={verify.error} action="verify" />}
     </Step>
@@ -806,7 +888,7 @@ function LogSection() {
                   }
                   className="shrink-0 self-start"
                 >
-                  {entry.stream}
+                  {streamLabel(entry.stream)}
                 </Badge>
                 <span className="flex-1 text-text">{entry.message}</span>
                 <span className="shrink-0 text-text-muted">

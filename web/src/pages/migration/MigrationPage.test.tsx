@@ -45,6 +45,21 @@ async function pointAtSynapse(user: ReturnType<typeof userEvent.setup>) {
 }
 
 describe("Migration", () => {
+  it("says what is copied and what is not before anything starts", async () => {
+    open();
+    const summary = await screen.findByText("What is copied, and what is not");
+    const details = summary.closest("details")!;
+    expect(details).toHaveAttribute("open");
+    const moves = within(within(details).getByRole("region", { name: "Copied, in this order" }));
+    expect(moves.getAllByRole("listitem")).toHaveLength(13);
+    expect(moves.getByText("Sessions (access tokens)")).toBeInTheDocument();
+    const stays = within(within(details).getByRole("region", { name: "Not copied" }));
+    expect(stays.getByText("Other servers' media")).toBeInTheDocument();
+    expect(stays.getByText("Presence")).toBeInTheDocument();
+    expect(stays.getByText("Receipts in threads")).toBeInTheDocument();
+    expect(stays.getByText("Bridges")).toBeInTheDocument();
+  });
+
   it("walks from pointing at Synapse through copying and verifying to cutover", async () => {
     const user = userEvent.setup();
     const patches = recordPosts("/config/migration");
@@ -87,6 +102,20 @@ describe("Migration", () => {
     const copied = screen.getByRole("table", { name: "What has been copied" });
     expect(within(copied).getByText("Accounts")).toBeInTheDocument();
     expect(within(copied).getByText("1,240")).toBeInTheDocument();
+    // The streams added on 2026-10-01 are named in words, each with what it keeps working.
+    for (const label of [
+      "Device encryption keys",
+      "Cross-signing keys",
+      "Key backups",
+      "Notification rules (push rules)",
+      "Phones to notify (pushers)",
+      "Sync filters",
+      "Read receipts",
+    ]) {
+      expect(within(copied).getByText(label)).toBeInTheDocument();
+    }
+    expect(within(copied).getByText(/encrypted history stays readable/)).toBeInTheDocument();
+    expect(within(copied).queryByText("e2e_keys")).not.toBeInTheDocument();
 
     // Verify: a task, then the findings.
     await user.click(screen.getByRole("button", { name: "Verify" }));

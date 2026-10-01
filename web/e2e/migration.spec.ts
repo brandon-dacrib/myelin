@@ -17,6 +17,12 @@ test("a migration from Synapse, from the source to the cutover", async ({ page }
     page.getByRole("heading", { name: "Migration from Synapse", level: 1 }),
   ).toBeVisible();
   await expect(page.getByRole("button", { name: "Start copying" })).toBeDisabled();
+  // Before anything starts, the page says what is copied and what is not (the runbook's lists).
+  const notCopied = page.getByRole("region", { name: "Not copied" });
+  await expect(notCopied.getByText("Other servers' media", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("region", { name: "Copied, in this order" }).getByText("Key backups"),
+  ).toBeVisible();
   await expectNoAxeViolations(page, "migration, nothing set");
 
   const form = page.getByRole("form", { name: "Synapse source" });
@@ -36,6 +42,9 @@ test("a migration from Synapse, from the source to the cutover", async ({ page }
   await expect(page.getByText("Ready for cutover", { exact: true })).toBeVisible({
     timeout: 20_000,
   });
+  await expect(
+    page.getByRole("table", { name: "What has been copied" }).getByText("Device encryption keys"),
+  ).toBeVisible();
   await page.getByRole("button", { name: "Verify" }).click();
   await expect(page.getByText("Everything matches")).toBeVisible({ timeout: 10_000 });
   await expectNoAxeViolations(page, "migration, verified");

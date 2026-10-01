@@ -17,14 +17,23 @@ const COPY_MS = 6_000;
 const STEP_MS = 1_500;
 const OPERATOR = "@admin:example.org";
 
+/** Rows per stream, in the order `hs_compat::migration::Stream::ALL` copies them. */
 const TOTALS: Record<string, number> = {
   users: 1_240,
   devices: 3_115,
   access_tokens: 2_890,
   account_data: 5_402,
+  e2e_keys: 2_977,
+  cross_signing: 1_088,
+  key_backups: 612,
+  push_rules: 1_236,
+  pushers: 1_301,
+  filters: 4_455,
   rooms: 318,
+  receipts: 22_964,
   media: 7_730,
 };
+const STREAM_COUNT = Object.keys(TOTALS).length;
 
 interface State {
   status: NonNullable<MigrationStatus["status"]>;
@@ -103,11 +112,11 @@ function advance(now = Date.now()) {
     state.verification = {
       passed: true,
       checked_at: new Date(now).toISOString(),
-      streams: [...Object.keys(TOTALS), "events"].map((name) => ({
+      streams: Object.keys(TOTALS).map((name) => ({
         name,
-        source_count: TOTALS[name] ?? 48_311,
-        target_count: TOTALS[name] ?? 48_311,
-        skipped_count: name === "rooms" ? 4 : 0,
+        source_count: TOTALS[name],
+        target_count: TOTALS[name],
+        skipped_count: name === "rooms" ? 4 : name === "receipts" ? 12 : 0,
         sampled: 25,
         mismatches: [],
       })),
@@ -160,13 +169,19 @@ export function migrationStatus(): MigrationStatus {
     streams: started
       ? Object.entries(TOTALS).map(([name, total], i) => {
           // Streams go one after another.
-          const share = Math.min(1, Math.max(0, f * 6 - i));
+          const share = Math.min(1, Math.max(0, f * STREAM_COUNT - i));
           return {
             name,
             copied_count: Math.round(total * share),
             total_count: share > 0 || f > 0 ? total : null,
             rate_per_second: state.status === "copying" && share > 0 && share < 1 ? 420 : 0,
-            skipped_count: name === "rooms" ? Math.round(4 * share) : 0,
+            // Rooms only invited to, and receipts in threads, are left out on purpose.
+            skipped_count:
+              name === "rooms"
+                ? Math.round(4 * share)
+                : name === "receipts"
+                  ? Math.round(12 * share)
+                  : 0,
             failed_count: 0,
             done: share >= 1,
           };
