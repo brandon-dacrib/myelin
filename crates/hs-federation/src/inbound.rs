@@ -38,18 +38,36 @@ pub const MAX_EDUS_PER_TRANSACTION: usize = 100;
 
 /// Why [`verify_pdu`] rejected a PDU.
 #[derive(Debug, Clone)]
-pub struct PduError(pub String);
+pub struct PduError {
+    /// What failed, for logs and error bodies.
+    pub message: String,
+    /// The PDU is not signed as it must be: no signature from a server that must sign it, that
+    /// server's key cannot be found, or the signature does not verify. An endpoint answering for
+    /// one PDU (`send_join`) answers this `403 M_FORBIDDEN`, as Synapse does, and anything else
+    /// (a PDU that does not parse) `400`.
+    pub unsigned: bool,
+}
 
 impl std::fmt::Display for PduError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
 impl std::error::Error for PduError {}
 
 fn reject(message: impl Into<String>) -> PduError {
-    PduError(message.into())
+    PduError {
+        message: message.into(),
+        unsigned: false,
+    }
+}
+
+fn unsigned(message: impl Into<String>) -> PduError {
+    PduError {
+        message: message.into(),
+        unsigned: true,
+    }
 }
 
 /// Finds the key ID `server_name` signed `object` under, if any -- there may be several (key
@@ -85,15 +103,15 @@ fn content_hash_matches(event: &Event) -> bool {
     declared == hs_model::hash::content_hash_base64(event.json())
 }
 
-/// Parses, hash-checks and signature-verifies one PDU against the room version it claims. On
-/// success, returns the parsed [`Event`] -- callers still owe it an authorization check
-/// (`crate::join` does this for `send_join`; `/send`'s own PDUs are not authorized against room
-/// state this session, see the module doc) before treating it as accepted.
+/// Parses, signature-verifies and hash-checks one PDU against the room version it claims. On
+/// success, returns the parsed [`Event`] -- in its redacted form when its content hash does not
+/// match, as the spec has it -- and callers still owe it an authorization check (`crate::join`
+/// does this for `send_join`; `/send`'s own PDUs are not authorized against room state this
+/// session, see the module doc) before treating it as accepted.
 ///
 /// # Errors
-/// Returns [`PduError`] if the PDU is malformed, oversized, has a content hash that does not match
-/// its declared one, is not signed by its sender's server, or that server's key cannot be resolved
-/// or does not verify.
+/// Returns [`PduError`] if the PDU is malformed, oversized, is not signed by its sender's server,
+/// or that server's key cannot be resolved or does not verify.
 pub async fn verify_pdu(
     raw: &Value,
     room_version: &RoomVersionId,
@@ -118,12 +136,6 @@ pub async fn verify_pdu_to_authorise(
     let event = Event::parse(raw, room_version.clone())
         .map_err(|e| reject(format!("malformed event: {e}")))?;
 
-    if !content_hash_matches(&event) {
-        return Err(reject(
-            "content hash does not match the event's declared hashes.sha256",
-        ));
-    }
-
     // Per the spec ("Validating hashes and signatures on received events", server-server API):
     // "the event is redacted following the redaction algorithm, and the resultant object is
     // checked for signatures ... Note that this step should succeed whether we have been sent
@@ -144,6 +156,28 @@ pub async fn verify_pdu_to_authorise(
         && Some(authoriser.as_str()) != own_server_name
     {
         verify_server_signature(&event, &authoriser, key_cache).await?;
+    }
+    // Then the content hash: "If the hash check fails, the event is redacted before processing
+    // further" (the same spec section). The signatures cover the redacted form, so an event
+    // whose content was stripped or changed on the way -- a server serving one it redacted, as
+    // Synapse and this server do -- is still the event its sender signed, and is taken in its
+    // redacted form, not refused. Until 2026-10-01 it was refused ("content hash does not
+    // match"; Sytest's "Inbound federation can receive redacted events").
+    if !content_hash_matches(&event) {
+        tracing::info!(
+            event_id = %event.event_id(),
+            sender = %event.header().sender,
+            "a received event's content does not match its hash; taking it redacted"
+        );
+        let redacted = event
+            .redacted_json()
+            .map_err(|e| reject(format!("could not redact an event whose hash fails: {e}")))?;
+        let value: Value =
+            serde_json::from_slice(&CanonicalJsonValue::Object(redacted).to_canonical_bytes())
+                .map_err(|e| reject(format!("could not redact an event whose hash fails: {e}")))?;
+        let redacted = Event::parse(&value, room_version.clone())
+            .map_err(|e| reject(format!("the redacted event does not parse: {e}")))?;
+        return Ok(redacted);
     }
     Ok(event)
 }
@@ -198,21 +232,21 @@ pub async fn verify_server_signature(
     })?;
 
     let key_id = signature_key_id(&redacted, server)
-        .ok_or_else(|| reject(format!("no signature from {server}")))?;
+        .ok_or_else(|| unsigned(format!("no signature from {server}")))?;
 
     let signed_at = u64::try_from(event.header().origin_server_ts).unwrap_or(0);
     let verifying_key = key_cache
         .get_valid_at(server, &key_id, signed_at)
         .await
         .map_err(|e| {
-            reject(format!(
+            unsigned(format!(
                 "key lookup for {server}/{key_id} failed: {}",
                 key_lookup_reason(&e)
             ))
         })?;
 
     hs_model::signing::verify_object(&redacted, server, &key_id, &verifying_key)
-        .map_err(|_| reject(format!("signature from {server}/{key_id} does not verify")))
+        .map_err(|_| unsigned(format!("signature from {server}/{key_id} does not verify")))
 }
 
 fn key_lookup_reason(e: &KeyLookupError) -> String {
@@ -406,7 +440,8 @@ impl TransactionStore for InMemoryTransactionStore {
 ///
 /// EDUs are parsed for structural validity ([`crate::edu::parse_edu`]) and each valid one is
 /// handed to `edu_sink` after the PDUs, in order (`None`: they are dropped, as before any sink
-/// existed). A malformed EDU is logged and skipped; it never fails the transaction.
+/// existed), less what the rooms' server ACLs deny `origin` ([`crate::acl::filter_edu`]: typing
+/// and receipts). A malformed EDU is logged and skipped; it never fails the transaction.
 ///
 /// # Errors
 /// Returns [`TransactionError::TooManyPdus`]/[`TransactionError::TooManyEdus`] if the transaction
@@ -569,7 +604,10 @@ pub async fn process_transaction(
     for edu in &edus {
         match crate::edu::parse_edu(edu) {
             Ok(edu) => {
-                if let Some(sink) = edu_sink {
+                if let Some(sink) = edu_sink
+                    && let Some(edu) =
+                        crate::acl::filter_edu(rooms, origin, edu, &mut acl_verdicts).await
+                {
                     sink.receive_edu(origin, edu).await;
                 }
             }
@@ -716,20 +754,35 @@ mod tests {
         assert_eq!(event.header().event_type, "m.room.message");
     }
 
-    /// **Mutation test 1** (see the status file): a tampered body must fail verification. If this
-    /// ever passes, `verify_pdu`'s signature check is not doing anything.
+    /// A body changed after signing fails the content hash, and the event is taken in its
+    /// redacted form -- the spec's "if the hash check fails, the event is redacted before
+    /// processing further" -- keeping its ID (the signatures and the reference hash cover the
+    /// redacted form). It was refused until 2026-10-01 (Sytest's "Inbound federation can receive
+    /// redacted events"). That the signature check itself bites is
+    /// `verify_pdu_rejects_a_tampered_signature_with_hash_intact`.
     #[tokio::test]
-    async fn verify_pdu_rejects_a_tampered_body() {
+    async fn verify_pdu_takes_an_event_whose_hash_fails_redacted() {
         let dir = tempfile::tempdir().unwrap();
         let keys = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
         let cache = key_cache(&keys, "origin.example.org");
         let mut raw = signed_event(&keys, "!r:origin.example.org", "@alice:origin.example.org");
+        let original_id = Event::parse(&raw, RoomVersionId::V11)
+            .unwrap()
+            .event_id()
+            .to_owned();
         raw["content"]["body"] = serde_json::json!("tampered");
 
-        let err = verify_pdu(&raw, &RoomVersionId::V11, &cache)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("hash"));
+        let event = verify_pdu(&raw, &RoomVersionId::V11, &cache).await.unwrap();
+        assert_eq!(event.event_id(), &*original_id);
+        assert_eq!(
+            event.json().get("content"),
+            Some(&CanonicalJsonValue::Object(Default::default())),
+            "taken redacted: a message keeps no content"
+        );
+
+        // Changed *and* re-signed by nobody: a stripped signature still fails.
+        raw["signatures"] = serde_json::json!({});
+        assert!(verify_pdu(&raw, &RoomVersionId::V11, &cache).await.is_err());
     }
 
     /// Isolates the signature check from the content-hash check (unlike
@@ -1096,5 +1149,115 @@ mod tests {
                 ("origin.example.org", "m.presence"),
             ]
         );
+    }
+
+    /// A room's server ACL applies to the EDUs that name it (MSC4163, as Synapse): a typing
+    /// notice for a room that denies the sending server is dropped, and so is that room's part
+    /// of a receipt EDU, while another room's receipts and an EDU naming no room pass. Both
+    /// reached the sink until 2026-10-01.
+    #[tokio::test]
+    async fn typing_and_receipts_for_a_room_whose_acl_denies_the_origin_are_dropped() {
+        #[derive(Default)]
+        struct Recording(Mutex<Vec<crate::edu::Edu>>);
+        #[async_trait]
+        impl crate::edu::InboundEduSink for Recording {
+            async fn receive_edu(&self, _origin: &str, edu: crate::edu::Edu) {
+                self.0.lock().unwrap().push(edu);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let keys = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
+        let cache = key_cache(&keys, "origin.example.org");
+        let mut rooms = InMemoryRoomSource::new();
+        rooms.insert_room(
+            "!banned:us.example.org",
+            FakeRoom {
+                room_version: Some("11".to_owned()),
+                state: vec![serde_json::json!({
+                    "event_id": "$acl", "type": "m.room.server_acl", "state_key": "",
+                    "room_id": "!banned:us.example.org", "sender": "@admin:us.example.org",
+                    "content": {"allow": ["*"], "deny": ["origin.example.org"]},
+                })],
+                ..FakeRoom::default()
+            },
+        );
+        rooms.insert_room(
+            "!open:us.example.org",
+            FakeRoom {
+                room_version: Some("11".to_owned()),
+                ..FakeRoom::default()
+            },
+        );
+        let receipt = |room: &str| {
+            serde_json::json!({"m.read": {"@alice:origin.example.org": {
+                "event_ids": ["$e"], "data": {"ts": 1}}}})
+            .as_object()
+            .map(|r| (room.to_owned(), serde_json::Value::Object(r.clone())))
+            .unwrap()
+        };
+        let receipts: serde_json::Map<String, Value> = [
+            receipt("!banned:us.example.org"),
+            receipt("!open:us.example.org"),
+        ]
+        .into_iter()
+        .collect();
+        let body = serde_json::json!({"pdus": [], "edus": [
+            {"edu_type": "m.typing", "content": {"room_id": "!banned:us.example.org",
+                "user_id": "@alice:origin.example.org", "typing": true}},
+            {"edu_type": "m.typing", "content": {"room_id": "!open:us.example.org",
+                "user_id": "@alice:origin.example.org", "typing": true}},
+            {"edu_type": "m.receipt", "content": receipts},
+            {"edu_type": "m.receipt", "content": {"!banned:us.example.org":
+                receipt("x").1}},
+            {"edu_type": "m.presence", "content": {"push": []}},
+        ]});
+        let typing_before = crate::metrics::acl_refusals("typing");
+        let receipts_before = crate::metrics::acl_refusals("receipt");
+        let edus = Recording::default();
+        process_transaction(
+            "origin.example.org",
+            "txn-edu-acl",
+            &body,
+            &rooms,
+            &StaticWriteSink::new(Vec::new(), "not supported"),
+            &cache,
+            &InMemoryTransactionStore::new(),
+            None,
+            &crate::backfill::BackfillLimits::default(),
+            Some(&edus),
+        )
+        .await
+        .unwrap();
+        let received = edus.0.lock().unwrap().clone();
+        let summary: Vec<(String, Value)> = received
+            .iter()
+            .map(|edu| {
+                let what = match edu.edu_type.as_str() {
+                    "m.typing" => edu.content["room_id"].clone(),
+                    "m.receipt" => serde_json::json!(
+                        edu.content.as_object().unwrap().keys().collect::<Vec<_>>()
+                    ),
+                    _ => Value::Null,
+                };
+                (edu.edu_type.clone(), what)
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    "m.typing".to_owned(),
+                    serde_json::json!("!open:us.example.org")
+                ),
+                (
+                    "m.receipt".to_owned(),
+                    serde_json::json!(["!open:us.example.org"])
+                ),
+                ("m.presence".to_owned(), Value::Null),
+            ]
+        );
+        assert!(crate::metrics::acl_refusals("typing") > typing_before);
+        assert!(crate::metrics::acl_refusals("receipt") >= receipts_before + 2);
     }
 }

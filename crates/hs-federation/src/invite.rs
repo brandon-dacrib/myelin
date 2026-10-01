@@ -476,11 +476,20 @@ mod tests {
         assert!(f.sink.0.lock().unwrap().is_empty());
     }
 
+    /// An invite whose signature does not verify is refused. One whose content was changed after
+    /// it was signed -- its hash fails, its signature over the redacted form holds -- is taken
+    /// redacted, as the spec has every received event taken (`crate::inbound::verify_pdu`).
     #[tokio::test]
-    async fn a_tampered_invite_does_not_verify() {
+    async fn a_tampered_invite_does_not_verify_and_a_changed_one_is_taken_redacted() {
         let f = fixture();
         let mut raw = signed_invite(&f.inviter_keys, "@bob:invitee.example.org", "invite");
-        raw["content"]["displayname"] = json!("changed after signing");
+        for signature in raw["signatures"]["inviter.example.org"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+        {
+            *signature = json!("A".repeat(86));
+        }
         let err = receive_invite(
             &f.handling,
             &f.cache,
@@ -495,5 +504,22 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, InviteError::Malformed(_)), "{err}");
+
+        let mut raw = signed_invite(&f.inviter_keys, "@bob:invitee.example.org", "invite");
+        raw["content"]["displayname"] = json!("changed after signing");
+        let cosigned = receive_invite(
+            &f.handling,
+            &f.cache,
+            "invitee.example.org",
+            "inviter.example.org",
+            "!r:inviter.example.org",
+            &event_id_of(&raw),
+            "11",
+            &raw,
+            &[],
+        )
+        .await
+        .expect("an invite whose content changed is taken redacted");
+        assert_eq!(cosigned["content"], json!({"membership": "invite"}));
     }
 }

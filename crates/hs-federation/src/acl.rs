@@ -131,6 +131,72 @@ pub async fn check_origin(
     }
 }
 
+/// The room-scoped EDUs of a `/send` transaction under the rooms' server ACLs, as Synapse applies
+/// them (MSC4163): an `m.typing` for a room whose ACL denies `origin` is dropped, and so is each
+/// room's part of an `m.receipt` (the EDU itself when no room is left). Every other EDU type
+/// names no room and passes. `verdicts` caches one [`check_origin`] per room for the
+/// transaction, shared with its PDUs. Each refusal is counted
+/// (`hs_federation_acl_refusals_total{endpoint="typing"|"receipt"}`) and logged; until
+/// 2026-10-01 a banned server's typing notices and receipts reached clients.
+pub async fn filter_edu(
+    rooms: &dyn crate::room_source::RoomDataSource,
+    origin: &str,
+    mut edu: crate::edu::Edu,
+    verdicts: &mut std::collections::HashMap<String, Result<(), String>>,
+) -> Option<crate::edu::Edu> {
+    async fn allowed(
+        rooms: &dyn crate::room_source::RoomDataSource,
+        origin: &str,
+        room_id: &str,
+        verdicts: &mut std::collections::HashMap<String, Result<(), String>>,
+    ) -> bool {
+        if let Some(verdict) = verdicts.get(room_id) {
+            return verdict.is_ok();
+        }
+        let verdict = check_origin(rooms, room_id, origin).await;
+        let ok = verdict.is_ok();
+        verdicts.insert(room_id.to_owned(), verdict);
+        ok
+    }
+    match edu.edu_type.as_str() {
+        "m.typing" => {
+            let room_id = edu
+                .content
+                .get("room_id")
+                .and_then(serde_json::Value::as_str)?
+                .to_owned();
+            if allowed(rooms, origin, &room_id, verdicts).await {
+                Some(edu)
+            } else {
+                crate::metrics::record_acl_refusal("typing");
+                tracing::info!(
+                    origin,
+                    room_id,
+                    "dropped a typing notice: the room's server ACL denies the sending server"
+                );
+                None
+            }
+        }
+        "m.receipt" => {
+            let by_room = edu.content.as_object_mut()?;
+            let room_ids: Vec<String> = by_room.keys().cloned().collect();
+            for room_id in room_ids {
+                if !allowed(rooms, origin, &room_id, verdicts).await {
+                    by_room.remove(&room_id);
+                    crate::metrics::record_acl_refusal("receipt");
+                    tracing::info!(
+                        origin,
+                        room_id,
+                        "dropped a room's receipts: the room's server ACL denies the sending server"
+                    );
+                }
+            }
+            (!by_room.is_empty()).then_some(edu)
+        }
+        _ => Some(edu),
+    }
+}
+
 /// The `endpoint` label of `hs_federation_acl_refusals_total` for a matched route path
 /// (`/make_join/{roomId}/{userId}` is `make_join`): the path's first segment when it is one of
 /// the federation API's room-scoped endpoints, `other` otherwise, so the label set stays fixed

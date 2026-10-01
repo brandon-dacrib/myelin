@@ -352,15 +352,17 @@ pub fn record_notary_answer(answered: bool) {
 /// Registers the transport's counters into `registry` (the shared one, in `hs serve`):
 ///
 /// - `hs_federation_acl_refusals_total{endpoint}`: requests (for `/send`, PDUs) from a server a
-///   room's `m.room.server_acl` denies, refused with `403 M_FORBIDDEN`.
+///   room's `m.room.server_acl` denies, refused with `403 M_FORBIDDEN`; and, under
+///   `endpoint="typing"` and `endpoint="receipt"`, typing notices and rooms' receipts from such a
+///   server dropped from a transaction (`crate::acl::filter_edu`).
 /// - `hs_federation_notary_queries_total{outcome}`: servers asked about through
 ///   `/_matrix/key/v2/query`, `answered` or `none` (nothing held and the server unreachable).
 pub fn register_transport_metrics(registry: &mut Registry) {
     // Registered without `_total`: the text encoder appends it.
     registry.register(
         "hs_federation_acl_refusals",
-        "Federation requests (for /send, PDUs) refused because the room's server ACL denies the \
-         requesting server, by endpoint",
+        "Federation requests (for /send, PDUs; typing and receipt EDUs) refused because the \
+         room's server ACL denies the requesting server, by endpoint",
         ACL_REFUSALS.clone(),
     );
     registry.register(
