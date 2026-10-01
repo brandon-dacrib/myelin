@@ -1,0 +1,5 @@
+# Hand-over and status prose is appended to by several agents at once; a conflict there is
+# always "keep both sides" (the merge queue resolved every one that way on 2026-09-30/10-01).
+docs/next-steps.md merge=union
+docs/status/*.md merge=union
+CHANGELOG.md merge=union
