@@ -133,8 +133,9 @@ hub wait that runs out is a `warn` line now. Left: merge it, and watch the next 
      `agent/user-gaps` (paragraph below), with the hot-room and user-directory rows.
    - "A room alias in `/join/{alias}` is not shard-gated" (`hs-cli`): small.
    - "Setup link assumes `localhost:<bound port>`" (`hs-cli`): small.
-   - "`/search` unimplemented" (`hs-room`): large; needs a cross-room index (tantivy exists in
-     `hs-tables`); Element's search box is the visible consequence.
+   - ~~"`/search` unimplemented" (`hs-room`)~~ done on `agent/room-gaps` (paragraph below);
+     the brief's "tantivy exists in `hs-tables`" was wrong, the index is in the store
+     (decision 0021).
    - "A non-owner replica reloads a whole room per event to answer `/sync`" (RFC 0018): the
      biggest cluster-performance item; after the two-pod run says what the latency is.
 4. **The two test races Complement still fails** (`TestRestrictedRoomsLocalJoinNoCreators
@@ -241,7 +242,7 @@ in `federation_two_servers.rs` (a topic set before the fetched batch is in B's `
 fails with the fetch switched off). Left: within one batch the derivation is linear; the walk
 stays the fallback when the sender cannot answer; Complement not rerun for it.
 
-**A version-12 room is built by the owner of its shard** (`agent/room-gaps`, not merged yet;
+**A version-12 room is built by the owner of its shard** (`agent/room-gaps` at `312caba`, not merged yet;
 status 04 session 14; decision 0020; known gap "A v12 room's id cannot be pre-assigned"
 closed; completes RFC 0019). A version-12 room's id is its create event's hash, so the shard
 gate's pre-assigned id was ignored and the room was built wherever the gate sent the request.
@@ -253,6 +254,22 @@ four unit tests in `hs_room::fencing` (three fail with placement off) and
 `crates/hs-cli/tests/cluster_create_room.rs` (two real replicas on PostgreSQL, forty rooms).
 Found with no row, and added to the table: upgrading a room *to* version 12 leaves a tombstone
 naming a room that never exists.
+
+**`POST /search` works** (`agent/room-gaps`, not merged yet; status 04 session 15; decision
+0021; known gap "`/search` unimplemented" closed). Element's search box answered `404`. The
+index is an inverted index in the server's own store (keyspace `room_search`), not `tantivy`,
+which nothing in the workspace depended on: postings by word, field, room and timeline
+position over message bodies, room names and topics; one transaction writes a page of events,
+their postings and the room's cursor, so a restart neither replays nor misses; the room stream
+is the doorbell, every owned room is swept every 30 s, and a search first brings the rooms it
+reads up to date, so a message is found the moment after it is sent. The route checks every hit
+against its room (still there, still matching, the filter, history visibility at the event) and
+answers `rank`/`recent`, `next_batch`, `count`, `highlights`, `event_context`, `include_state`
+and `groupings`. Metrics `hs_room_search_*` (documents, rooms behind, indexing delay, search
+latency). Verified by `crates/hs-room/tests/search.rs` (3) and `crates/hs-cli/tests/search.rs`
+(the real binary: two users, three rooms, then a restart that indexes nothing again).
+Complement `TestSearch` not yet measured. Left: backfilled history is not indexed, no stemming, no two-replica run,
+Element Web not tried in a browser.
 
 ## Earlier on 2026-09-30: the merges, in order
 
@@ -1758,7 +1775,7 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | ~~Invites, leaves and knocks over federation are seams~~ | `hs-federation` | **Closed** (e6d4a71, 249fcee, ea990cb): `transport/membership.rs` serves make/send leave, make/send knock and invite v1/v2, and `hs-cli/tests/federation_membership.rs` drives each between two servers. Not yet measured against Complement |
 | ~~Federation media fetch broken~~ | `hs-media` | **Closed** 2026-09-28 (status 09, session 6). Both directions work. A client's download or thumbnail of another server's media is fetched over the signed `/_matrix/federation/v1/media/download`, with the redirect form and the legacy `/_matrix/media/v3/download` fallback. It is then served from the held copy, even with the origin down; the copy honors quarantine and the admin purge. This server's own media is served to other servers as `multipart/mixed`. `hs-cli/tests/federation_media.rs` covers this with two servers and a stand-in origin. Not yet checked against a real Synapse |
 | ~~The client `/hierarchy` endpoint is unimplemented~~ | `hs-room`, `hs-federation`, `hs-cli` | **Closed** 2026-09-30 (`agent/hierarchy`, status 04 session 11): `GET /_matrix/client/v1/rooms/{roomId}/hierarchy` walks `m.space.child` depth-first in the spec's order, filters each room by the spec's visibility list, asks a child's `via` servers over federation `/hierarchy` (whose answer is now spec-shaped) and honours `suggested_only`, `limit`, `max_depth` and expiring `from` tokens. Complement: the five space tests (`TestRestrictedRoomsSpacesSummary{Local,Federation}`, `TestClientSpacesSummary`, `TestClientSpacesSummaryJoinRules`, `TestFederatedClientSpaces`) went from 0/5 to 5/5 (10/10 with subtests). Left: no rate limit and no answer cache on the endpoint; in cluster mode a child owned by another replica is read on the root's owner, as the admin hierarchy does |
-| `/search` unimplemented | `hs-room` | needs a cross-room index the actor model has no place for |
+| ~~`/search` unimplemented~~ | `hs-room` | **Closed** 2026-10-01 (`agent/room-gaps`, status 04 session 15, decision 0021): `POST /search` (`room_events`) reads an inverted index in the server's own store (keyspace `room_search`: postings by word, field, room and position; a cursor per room) over message bodies, room names and topics, fed from the room stream with per-room cursors so a restart neither replays nor misses, swept every 30 s, and brought up to date for the rooms a search reads. Every hit is checked against its room (still there, still matching, the filter, history visibility at the event); `rank`/`recent`, `next_batch`, `count`, `highlights`, `event_context`, `include_state`, `groupings`. Verified against the real binary (`hs-cli/tests/search.rs`, two users, three rooms, a restart). In a cluster the index is shared through the store and each replica indexes the rooms it owns; never run with two replicas. Left: backfilled history and a rejoin's gap are not indexed; no stemming; a word with more than 50,000 postings is read in part; Element Web not tried in a browser |
 | Only some settings hot-apply | `hs-config`, `hs-cli` | since `12a19eb` (2026-09-29) message rate limits, the federation allow and block lists and the log level apply on the running server, and a save or revert says what applied and what waits for a restart; every other setting still needs the restart it announces (RFC 0016; decision 0016 says which setting applies where) |
 | ~~One `/api/v1` fetch fails under the full `e2e-real` suite~~ | `web` (`e2e-real` harness, not the dev proxy) | **Closed** 2026-10-01 (`agent/web-gaps`, status 16): the request was the sign-in's `GET /api/v1/me` in `real-server.spec.ts`'s `beforeEach`, and the test aborted it: the old `beforeEach` asserted `toHaveURL(/admin/)`, true the instant "Sign in" is clicked, so the body's `page.goto` navigated while `/me` was in flight (Playwright's status `-1`) and the new page had no session; alone `/me` won the race, in the full suite on a cold dev server it lost. Reproduced by delaying `/me` 1.5 s with `page.route` (old `beforeEach` fails with the same `-1`, today's passes); `307e5d5` had already replaced the assertion, and every `e2e-real` sign-in waits for the session. The full suite also found a second race of the same shape, fixed: the Statistics test read `/statistics/overview` and then expected the page to match, across the overview's one-minute recount (`Accounts35` vs `33`). Before: 4 of 5 full runs green; after: 5 of 5 in a row, 22/22 each |
 | ~~CI does not run the Playwright suite~~ | `.github` | **Closed** 2026-09-30 (`agent/ci-web`): `ci.yml` has a `web` job that runs `npm run check` (lint, types, 443 unit tests, build) and the mock-backed Playwright suite with Chromium, required by `ci-ok`; the report is uploaded when a run fails. First run green in 4m47s. Until then CI ran no web checks at all; two browser tests once failed for an unknown length of time before anybody noticed (fixed 2026-09-21) |

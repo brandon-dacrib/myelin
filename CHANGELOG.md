@@ -429,6 +429,13 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   a client that paginates "until no `end` is returned" reads as a token and starts over. Found
   when Complement's `TestMessagesOverFederation`, joining over federation for the first time,
   did exactly that for thirty minutes.
+- **Search works** (2026-10-01): `POST /search` finds messages, room names and topics in the
+  rooms a user is joined to, only where the room's history visibility lets them see the event,
+  by relevance or most recent first, a page at a time, with the messages around each result.
+  The index lives in the server's own store and survives a restart without re-reading anything;
+  a message is found the moment after it is sent. Verified against the real binary with two
+  users and three rooms, across a restart. Not yet: history fetched from other servers after
+  joining is not searchable, and words are not stemmed.
 - Sync: `/sync` v2 with filters that honour event-type and sender rules, lazy-loaded members, room
   summaries with heroes, typing, presence, read receipts and `m.fully_read`, to-device messages,
   device lists, one-time-key counts, and push rules as account data.

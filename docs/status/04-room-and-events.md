@@ -2,15 +2,81 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
-Last updated: 2026-09-30 (session 14: a new room's id is placed on a shard the replica building
-it owns, version 12 included, below). Before that, 2026-09-30 (session 13: the state at
-backfilled history is asked for; session 12: the history between a leave and a rejoin;
-session 11: the client space hierarchy) and 2026-09-28 (session 10: the admin API's room long
-tail).
+Last updated: 2026-10-01 (session 15: `POST /search`, below). Before that, 2026-09-30 (session
+14: a new room's id is placed on a shard the replica building it owns, version 12 included;
+session 13: the state at backfilled history is asked for; session 12: the history between a
+leave and a rejoin; session 11: the client space hierarchy) and 2026-09-28 (session 10: the
+admin API's room long tail).
+
+> **2026-10-01, session 15: `POST /search` finds room events** (branch `agent/room-gaps`; known
+> gap "`/search` unimplemented" closed; decision 0021). Element's search box answered
+> `404 M_UNRECOGNIZED`; it needed a cross-room index the actor model had no place for. The
+> brief's premise that `tantivy` was already in `hs-tables` was wrong: nothing in the workspace
+> depends on it. The index is built in the store instead.
+>
+> - **The index (`hs_room::search`, new).** One keyspace, `room_search`: postings
+>   `p <word> 0 <field> <room_sn> <pos>` -> `<origin_server_ts> <word count>`, a record per
+>   indexed event of its postings (`d`), a cursor per room (`c`) and a document count (`n`).
+>   Words are lower-cased runs of letters and digits (at most 64 characters, 128 distinct words
+>   an event); fields are `content.body` of `m.room.message`, `content.name` of `m.room.name`,
+>   `content.topic` of `m.room.topic`. A query word matches every indexed word it prefixes;
+>   every word must match; rank is `(1 + ln tf) * ln(1 + N / df)` summed. An
+>   `m.room.redaction` takes its target's postings out. `SearchIndex::{open, room_sn, cursor,
+>   documents, index_page, query}`; the registry owns one (`RoomRegistry::search_index`).
+> - **Kept current (`hs_room::search::run_indexer`, spawned by `hs serve` after fencing is
+>   installed).** A page of 32 events, its postings and the room's cursor are one transaction;
+>   the global stream is a doorbell (a burst in one room is one read); at start, after a lagged
+>   stream and every 30 s every owned room's head is compared with its cursor -- the first start
+>   indexes everything held that way, in the background. An event already indexed is not written
+>   again, so two replicas across a handoff count it once. A search first brings each room it
+>   reads (and owns) up to its head: a message is found the moment after it is sent.
+> - **The route (`hs_room::routes::search::post_search`, `POST /search` in this crate's
+>   router).** Rooms are those the requester is joined to now, narrowed by `filter.rooms`/
+>   `not_rooms`. Every hit is read back from its room: still there and not purged, still matching
+>   (`search::event_matches`), passing `senders`/`not_senders`/`types`/`not_types` (trailing `*`
+>   wildcards), and visible to the requester at the event (`RoomActor::event_visible_to`, as
+>   `/messages` and `/context`). `order_by` `rank` (default) or `recent`; `filter.limit` (default
+>   10, at most 100); `next_batch` names the last result's place in the order and a full page
+>   always has one; `count` is every visible match; `highlights` the indexed words matched;
+>   `event_context` (`before_limit`/`after_limit`, default 5, `include_profile` from the room's
+>   current member events, `start`/`end` as `/messages` tokens); `include_state` (the room's state
+>   as the requester may read it); `groupings` by `room_id` and `sender`. `400` for no
+>   `search_term`, an unknown key or `order_by`, a bad `next_batch`. New `RoomActor::{event_at,
+>   events_around}`, `RoomRegistry::{owns_room, read_room}` (a room another replica owns is read
+>   by a fresh load, not kept resident).
+> - **Observability.** `hs_room_search_indexed_events_total`, `hs_room_search_index_documents`,
+>   `hs_room_search_rooms_behind` (the progress gauge of a catch-up),
+>   `hs_room_search_index_delay_seconds` (event timestamp to indexed: the lag) and
+>   `hs_room_search_duration_seconds`; `info` when a catch-up starts (rooms, positions behind,
+>   why) and ends (events, documents, elapsed); `warn` for a room that cannot be indexed; `debug`
+>   per search.
+> - **Tests.** `crates/hs-room/tests/search.rs` (3, the scenario router): bob finds the two
+>   messages after his join in a `joined`-visibility room and his own room's message and name,
+>   not alice's message from before his join nor her own room; `recent` and `rank` order; keys,
+>   `filter.rooms`, a prefix, two words; pages of one; context with profiles, state and grouping;
+>   a redacted message no longer found; `400` for a bad `order_by` -- fails with the visibility
+>   check removed (checked). The index resumes from its cursors: two messages written with no
+>   indexer running are indexed by a new registry's indexer, and nothing twice. A message is
+>   found the moment after it is sent with no indexer at all, and a full page has a
+>   `next_batch` (both added for Complement's `TestSearch`). `hs_room::search` unit tests:
+>   tokenizer, key encodings, idempotent pages, prefix intersection, rooms and fields.
+>   `crates/hs-cli/tests/search.rs` (the real `hs` binary, embedded store): two users, three
+>   rooms, the same visibility, order, paging, context and room filter; then a restart over the
+>   data directory -- `hs_room_search_indexed_events_total` is 1 after a message written after
+>   the restart (nothing indexed again), and that message is found first.
+> - **How to verify.** `cargo test -p hs-room --test search`; `cargo test -p hs-room --lib
+>   search`; `cargo test -p hs-cli --test search`.
+> - **Cluster mode.** The index is in the shared store, so it is one index for every replica;
+>   each replica indexes the rooms whose shard it owns. Not yet run with two replicas.
+> - **Left.** Backfilled history and a rejoin's gap are not indexed (the cursor only moves
+>   forward); no stemming, and a script without spaces is matched by the start of a run only; a
+>   word with more than 50,000 postings reads the first 50,000 (`count` a lower bound, logged);
+>   `include_profile` is the member's current profile, not the one at the event; no two-replica
+>   run; Element Web not yet tried in a browser.
 
 > **2026-09-30, session 14: a version-12 room is built by the owner of its shard** (branch
-> `agent/room-gaps`; known gap "A v12 room's id cannot be pre-assigned" closed; decision 0020;
-> completes RFC 0019). From room version 12 the room id is the create event's hash, so the
+> `agent/room-gaps`, commit 312caba; known gap "A v12 room's id cannot be pre-assigned" closed;
+> decision 0020; completes RFC 0019). From room version 12 the room id is the create event's hash, so the
 > shard gate's pre-assigned id was ignored and the room was built -- and its create event,
 > creator's join and preset state written, unfenced -- on whichever replica the gate chose,
 > while every later request went to the owner of the shard the hash happened to land on.
