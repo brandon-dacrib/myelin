@@ -50,7 +50,7 @@ what spreads that work.
 | Cheaper fan-out to a huge room | an event in a room of ten thousand members costs ten thousand recipients' worth of push and sync work, on that room's owner, however many replicas there are |
 | Faster single requests | a request for a room another replica owns pays one mesh hop. Latency does not go down with N; it goes up by that hop when the client happens to hit a non-owner |
 | Federation bandwidth to one peer | one destination's queue lives on one shard |
-| Cheaper reads of a room from a replica that does not own it | such a replica reads the room through a snapshot it reloads from the store whenever the owner has written (`hs_user::cluster::RoomMirror`). Today that reload is the whole room, O(room size) per new event, in every room a replica has sessions in but does not own; the incremental catch-up is RFC 0018. Until then, a cluster's `/sync` costs more store reads per event than a single node's |
+| Free reads of a room from a replica that does not own it | such a replica reads the room through a copy (`hs_user::cluster::RoomMirror`) that it loads once and then advances by reading only the store's rows past it (RFC 0018, decision 0022): a few point reads per new event, whatever the room's size, in every room a replica has readers in but does not own, plus a whole reload when the owner rewrites the room (backfill, a purge). The copy also costs the room's size in memory on each such replica (at most 1,024 copies) |
 | Cheaper typing, receipts and presence with more replicas | every change is sent to every live replica in the wake batch (decision 0018): typing whole, receipts and presence as a hint to reread the store. O(replicas) small messages per change, coalesced per peer, and each replica keeps a copy of every typing entry |
 
 ## The same thing in Synapse's terms
@@ -81,9 +81,9 @@ clients. As of 2026-09-26:
   within the same 500 ms budget the single-replica read-your-writes wait has, to have received
   that peer's wakes up to it: 160 of 160 sends through one replica were in the very next
   `timeout=0` sync on the other. A replica reads a room it does not own through a snapshot
-  checked against the store's head on every access. What is *not* built: the user-session
-  *owner* of `PLAN.md` 5.4 (no `/sync` is forwarded; there is no per-user shard in use), the
-  incremental catch-up that would make a non-owner's reads cheap (RFC 0018). Typing, receipts
+  checked against the store's head on every access and caught up from the rows past it
+  (RFC 0018, since 2026-10-01). What is *not* built: the user-session *owner* of `PLAN.md` 5.4
+  (no `/sync` is forwarded; there is no per-user shard in use). Typing, receipts
   and presence cross replicas since 2026-09-30 (decision 0018; two real processes on
   PostgreSQL, `crates/hs-cli/tests/cluster_ephemeral.rs`). Two pods have still not done this: the
   run was two processes on one host over a plain (non-TLS) mesh. Release build, same host: a
@@ -126,8 +126,9 @@ In order, each a transcript in `docs/status/`:
    Element.
 2. ~~The user session owner: `/sync` routed to, or woken by, the right replica, so a client can
    connect to any pod and see every room.~~ Done as "woken by", as two processes on one host
-   (2026-09-27); a client may reach any replica. Left: the same on two pods, and the cost of a
-   non-owner's room reads (RFC 0018) once the loadgen slope below says it matters.
+   (2026-09-27); a client may reach any replica. A non-owner's room reads are incremental since
+   2026-10-01 (RFC 0018). Left: the same on two pods, and the owner's per-member fan-out writes
+   (`docs/next-steps.md`, known gaps), which the three-replica measurement found to dominate.
 3. `hs-loadgen` against one replica, then two, then three, on the same PostgreSQL: connected
    users and active rooms at a fixed sync p99. The slope of that line is the number this
    document is really about, and it does not exist yet.

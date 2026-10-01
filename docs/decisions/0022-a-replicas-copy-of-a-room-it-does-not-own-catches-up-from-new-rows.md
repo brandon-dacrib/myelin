@@ -45,10 +45,14 @@ left open how a copy learns that something other than an append happened.
   the owner either, and the copy then matches the owner.
 - **The wake is the trigger.** `RoomWake::room_pos` already carries the owner's head after the
   update (a batch keeps the highest per room), so no field was added: the receiving hub calls
-  `RoomMirror::prefetch(room, room_pos)` for each room in a batch, before it wakes the users the
-  batch names, and a copy already at or past that position reads nothing
-  (`hs_user_mirror_wakes_covered_total`). A room with no copy here is not loaded by a wake.
-  The durable-head check on every read stays: the store is the truth, the wake a doorbell.
+  `RoomMirror::prefetch(room, room_pos)` for each room in a batch, each as a task of its own,
+  and waits for them at most 250 ms before it wakes the users the batch names; a copy already at
+  or past that position reads nothing (`hs_user_mirror_wakes_covered_total`). The bound matters:
+  the first version awaited the catch-ups inline, and a catch-up that turned into a whole
+  reload of a big room held the peer's mesh request past its two-second deadline, which
+  cancelled the request, the reload and the wakes with it. A room with no copy here is not
+  loaded by a wake. The durable-head check on every read stays: the store is the truth, the
+  wake a doorbell.
 - **Bounds.** Copies are dropped after ten minutes unread (unchanged), and a mirror holds at most
   1,024 (`DEFAULT_MAX_MIRRORED_ROOMS`; the least recently read is dropped first). A copy holds
   the whole room in memory, as the owner's resident actor does.

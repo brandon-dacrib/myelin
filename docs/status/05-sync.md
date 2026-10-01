@@ -1,8 +1,123 @@
 # 05 Sync: status
 
-Last updated: 2026-09-30, 23:25 EDT (session 11: three known gaps and a hot-room bug. Session 10,
-session 9, session 8, session 7 and the integration note follow; sessions 1-6 are preserved
-unchanged further down.)
+Last updated: 2026-10-01 (session 12: RFC 0018, a non-owner's room copy catches up instead of
+reloading. Session 11, session 10, session 9, session 8, session 7 and the integration note
+follow; sessions 1-6 are preserved unchanged further down.)
+
+## Session 12 (2026-10-01, branch `agent/rfc-0018`): a replica that does not own a room reads only its new events
+
+Closes the known gap "A non-owner replica reloads a whole room per event to answer `/sync`"
+(RFC 0018, now implemented; decision 0022). Joint with track 04: the catch-up itself is in
+`hs-room`.
+
+**What it was.** A replica answers `/sync` for rooms it does not own through
+`cluster::RoomMirror`, a read-only `RoomActor`. Every time the store's timeline head moved past
+it, the mirror ran `RoomActor::load` again: the whole room, per event, on every replica with a
+reader in the room.
+
+**What it is now.**
+
+- `hs_room::actor::catch_up` (new module): `RoomActor::catch_up` reads only the `room_timeline`
+  rows past the actor's own head and absorbs them in order exactly as `load` does (body and
+  flags, state fed to the state store -- so membership and history visibility apply event by
+  event -- relations), then re-reads the forward extremities. Everything is checked before
+  anything is absorbed; when the copy cannot be advanced from new rows it answers
+  `CatchUp::Reload(reason)` and changes nothing.
+- A per-room **rewrite counter** (`room_rewrites`, `(RoomSn,) -> i64`), bumped in the same
+  transaction by every write that changes rows a copy may already hold: outliers, history placed
+  below the head (backfill, a gap filled), a gap closed, a purge, pruned extremities. A copy
+  whose counter is behind reloads (`rewritten`); so does one that finds a position missing
+  (`position_gap`), a new event with an explicit state (`explicit_state`, a rejoin through
+  another server), an unexpected row, or a deleted room (`gone`).
+- **Redactions** are applied by the copy: it re-reads the target's stored row when it absorbs
+  the redaction, and re-checks a target not yet flagged (the owner rewrites the row a moment
+  after the redaction event) on later catch-ups, at most 16 times.
+- `RoomMirror` loads a room once, then catches it up; a reload is an `info`/`warn` line with the
+  reason. It holds at most 1,024 copies (least recently read dropped; `with_max_rooms`) besides
+  the ten-minute idle sweep. A copy is advanced in place, so a reader holding its handle sees the
+  room move on, as on the owner.
+- **The wake triggers it.** `RoomWake::room_pos` already is the owner's head after the update; the
+  receiving hub runs `RoomMirror::prefetch(room, room_pos)` for each room in a batch as tasks,
+  waits for them at most 250 ms, then wakes that batch's users; a copy at or past the position
+  reads nothing. (Awaiting them inline, as the first version did, let a whole reload of a big
+  room hold the peer's mesh request past its 2 s deadline; the request was cancelled, and the
+  reload and the wakes with it.) The durable-head check on every read stays.
+- **Observability:** `hs_user_mirror_rooms`, `hs_user_mirror_catchup_events_total`,
+  `hs_user_mirror_full_reloads_total{reason}` (`first_read`, `rewritten`, `position_gap`,
+  `explicit_state`, `unexpected_row`, `regressed`, `error`, `incremental_off`),
+  `hs_user_mirror_catchup_duration_seconds{kind=incremental|full}`,
+  `hs_user_mirror_wakes_covered_total` (new `hs_user::metrics`, registered by `hs-cli`).
+- **Escape hatch:** `HS_SYNC_MIRROR_FULL_RELOAD=1` in a replica's environment turns catch-up off
+  (as before; a `warn` at startup). Also the measurement's baseline.
+
+**Tests.** `hs-room`: `actor::catch_up::tests` (five: only the new rows, ending identical to a
+fresh load in timeline, state, extremities and every user's visibility; visibility and
+membership changes in one batch applied in order; a redaction now or on a later catch-up; a
+never-flagged target given up on; a purge, a missing position and a deletion each answer
+`Reload` and change nothing). `hs-user` (`cluster::two_replica_tests`, two hubs on one store):
+`a_second_wake_for_a_mirrored_room_reads_only_the_new_positions` (the mirror's loader count stays
+1 across two wakes; 3 new events then 5 caught up),
+`a_visibility_change_mid_stream_is_honoured_on_the_other_replica` (bob on B is not sent what
+came before his join into a `joined` room, nor what came after his leave, and every change
+reached B by catch-up), `a_rewrite_on_the_owner_makes_the_copy_reload`,
+`the_mirror_holds_at_most_its_bound_of_rooms`, and the old reload test rewritten for in-place
+catch-up. With catch-up off (the old behaviour) the first two fail: loader count 4 against 1,
+and 7 whole loads against 1.
+
+**Measured** (`crates/hs-cli/tests/cluster_mirror.rs`, new: three real `hs serve` on one
+PostgreSQL 17; A owns the rooms; B1 runs with `HS_SYNC_MIRROR_FULL_RELOAD=1`, B2 as shipped; bob
+long-polls on B1 and carol on B2 while alice sends through A, so both see the same events at
+the same time). Debug build on the shared desktop at load 15-20, so absolute numbers are
+inflated; the ratio is the point. Mirror work per event is the
+`hs_user_mirror_catchup_duration_seconds` sum over the phase divided by the messages:
+
+| Room | B1, whole reload (before) | B2, incremental (after) |
+|---|---|---|
+| small (3 members, ~10 events), 20 messages | 551 ms/event | 70 ms/event |
+| 300 messages, 33 members, 20 messages | 3,526 ms/event | 86 ms/event |
+
+B2 loaded no room whole in either phase and its cost per event barely moves with the room's
+size; B1's grows with it.
+
+**The 2,000-event rooms (release build, PostgreSQL with `fsync=off`).** A whole load of the
+room on a non-owner -- what every new event cost it before -- took 26 s and 39 s for 2,000
+messages and 300 members (two runs; B1's `first_read`, the small room's load is milliseconds),
+and 22 s for 2,000 messages and 50 members.
+The full 100-message phase in the 300-member room could not be run on this machine: the owner's
+hub (the fan-out gap below) needed about a minute per update once 300 members had joined, five
+hours for the joins alone. MEASURE-BIG
+
+**Write-to-woken-sync latency** was the same on B1 and B2 (p50 2.6-2.8 s in the small room, 14 s
+in the 33-member room): what dominates it on this machine is the owner's session hub, not the
+reader. **Found with no row:** the owner's hub writes each update's membership records and feed
+entries one member at a time, two store round trips each (`hub::apply_room_update`), so a room's
+updates cost the owner O(members) sequential PostgreSQL round trips; with 30 members on the
+loaded desktop the hub ran minutes behind the room, and a reader's own join reached its records
+only when the hub got there. Added to the known-gaps table. (Session 7's ~150 ms was a release
+build on an idle machine; this run is not comparable to it.)
+
+**Also learned on the way** (test harness, not server): `createRoom` places a room on whichever
+replica owns its minted id's shard, so the test makes rooms until A owns one; with 500 ms
+heartbeats and 3 s leases a loaded machine moved shards mid-test, so it uses 2 s and 30 s.
+
+**Left.** `RoomRegistry::read_room` (search on a non-owner) still loads a room whole per
+request; it could use the mirror. A future path that rewrites a room's existing rows must bump
+the rewrite counter (decision 0022 says so). The two-pod run has not seen this yet.
+
+**Files.** `crates/hs-room/src/actor/catch_up.rs` (new), `crates/hs-room/src/actor.rs`,
+`crates/hs-room/src/actor/{admin_ops,gaps}.rs`, `crates/hs-room/src/persist.rs`,
+`crates/hs-user/src/{cluster,hub,metrics,lib}.rs`, `crates/hs-user/Cargo.toml`
+(`prometheus-client`, already a workspace dependency), `crates/hs-cli/src/{sync_cluster,serve}.rs`,
+`crates/hs-cli/tests/cluster_mirror.rs` (new).
+
+**Verify.** `cargo test -p hs-room --lib catch_up`; `cargo test -p hs-user --lib cluster`;
+`HS_CLUSTER_TEST_POSTGRES_DSN=... cargo test -p hs-cli --test cluster_mirror -- --nocapture`
+(defaults are a quick 150-message, 10-member room; the sizes above and below are set with
+`HS_MIRROR_BENCH_EVENTS`, `HS_MIRROR_BENCH_MEMBERS`, `HS_MIRROR_BENCH_MESSAGES`).
+
+**Decisions made.** Decision 0022 (the rewrite counter rather than enumerating changes;
+redactions applied by the copy; the wake's existing `room_pos` as the head; 1,024 copies; the
+escape hatch).
 
 ## Session 11 (2026-09-30, branch `agent/user-gaps`): three known gaps, and hot rooms that repeated themselves
 

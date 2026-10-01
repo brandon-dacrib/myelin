@@ -620,6 +620,10 @@ async fn settled_token(
             .iter()
             .all(|r| initial["rooms"]["join"][*r].is_object())
         {
+            // A reader whose first sync comes after the owner caught up has the marker already.
+            if bodies(&initial, marker_room).iter().any(|b| b == marker) {
+                return Ok(next_batch(&initial));
+            }
             break next_batch(&initial);
         }
         if Instant::now() >= deadline {

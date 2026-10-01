@@ -167,6 +167,19 @@ test -p hs-cluster` and `cargo test -p hs-room` pass.
 **How to verify.** `cargo test -p hs-cluster`; with a PostgreSQL of your own,
 `HS_CLUSTER_TEST_POSTGRES_DSN=postgres://postgres:hspg@127.0.0.1:5477/postgres cargo test -p
 hs-cli --test cluster_admin --test cluster_create_room`.
+## 2026-10-01: a non-owner's room reads are incremental (branch `agent/rfc-0018`, tracks 05 and 04)
+
+Not a change to `hs-cluster`, but to what a cluster costs: a replica answering `/sync` for a
+room another replica owns no longer reloads the whole room from the store per event. Its copy
+(`hs_user::cluster::RoomMirror`) is advanced by `hs_room::actor::RoomActor::catch_up`, which
+reads only the timeline rows past it; a per-room rewrite counter (`room_rewrites`) tells it when
+something other than an append happened (backfill, purge, outliers, ...) and it then reloads,
+logged with the reason. The `user.wake` batch's existing `room_pos` drives it: a copy is caught
+up before the long-polls the wake is for are woken. RFC 0018, decision 0022, status 05 session
+12 (with a three-replica measurement in `crates/hs-cli/tests/cluster_mirror.rs`). Two things
+for this track from that test: on a loaded machine, 500 ms heartbeats with 3 s leases moved
+shards in the middle of the run (the test uses 2 s / 30 s), and right after the last replica of
+three turns `active` shards are still moving for several seconds.
 
 ## 2026-09-30: two known gaps closed (branch `agent/cluster-gaps`)
 
