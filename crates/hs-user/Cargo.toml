@@ -19,6 +19,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
+# Added session 12 (track 05): the room mirror's metrics (`crate::metrics`, decision 0022).
+prometheus-client = { workspace = true }
 hs-model = { path = "../hs-model" }
 hs-kv = { path = "../hs-kv" }
 hs-tables = { path = "../hs-tables" }

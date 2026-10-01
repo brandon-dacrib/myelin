@@ -527,7 +527,8 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     }
 
     /// Takes one peer's [`WakeBatch`]: applies its typing, receipt and presence updates
-    /// ([`SessionHub::apply_ephemeral`]), wakes every user its wakes name, then records the
+    /// ([`SessionHub::apply_ephemeral`]), advances this replica's copies of the rooms its wakes
+    /// name ([`RoomMirror::prefetch`]), wakes every user its wakes name, then records the
     /// sender's consumed mark for [`SessionHub::settle_before_read`]. In that order, so a
     /// `/sync` released by the mark cannot run before the wake that goes with it. Called by the
     /// mesh's peer handler in `hs-cli`; in tests, directly.
@@ -542,6 +543,16 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         );
         for update in batch.ephemeral {
             self.apply_ephemeral(&batch.from, update).await;
+        }
+        // The copies of the rooms that moved are advanced before anyone is woken, so the
+        // long-polls released below read them current rather than each paying for the catch-up
+        // (decision 0022). A room this replica owns is never in the mirror.
+        if let Some(link) = self.cluster.get() {
+            for wake in &batch.wakes {
+                if !link.cluster.owns_room(&wake.room_id) {
+                    link.mirror.prefetch(&wake.room_id, wake.room_pos).await;
+                }
+            }
         }
         for wake in &batch.wakes {
             for user in &wake.users {

@@ -5708,6 +5708,12 @@ impl<B: KvBackend> RoomActorHandle<B> {
         }
     }
 
+    /// Whether `self` and `other` are handles to the same actor (not merely the same room).
+    #[must_use]
+    pub fn same_actor(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Subscribes to the room's publish stream (`crate::protocol::RoomUpdate`).
     pub async fn subscribe(&self) -> tokio::sync::broadcast::Receiver<RoomUpdate> {
         self.inner.lock().await.subscribe()

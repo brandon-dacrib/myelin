@@ -26,7 +26,9 @@
 //! - [`stamp`]: [`stamp::Stamps`], the restart-safe change counter the three share.
 //! - [`cluster`]: [`cluster::SessionCluster`], what `/sync` needs from other replicas (the
 //!   wake and read-your-writes across replicas), and [`cluster::RoomMirror`], the read-only
-//!   snapshot a replica reads a room it does not own through.
+//!   copy a replica reads a room it does not own through, kept current by incremental
+//!   catch-up (decision 0022).
+//! - [`metrics`]: the room mirror's metrics (`hs_user_mirror_*`).
 //! - [`sync`]: `/sync` v2's response construction, full and incremental.
 //! - [`routes`]: the client-server HTTP endpoints (`/sync`, `/joined_rooms`, `/publicRooms`,
 //!   account data), as a router fragment (`routes::router`), following the same shape
@@ -44,6 +46,7 @@ pub mod edu;
 pub mod error;
 pub mod filter;
 pub mod hub;
+pub mod metrics;
 pub mod presence;
 pub mod receipts;
 pub mod room_source;

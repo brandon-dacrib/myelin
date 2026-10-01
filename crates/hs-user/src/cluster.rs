@@ -21,9 +21,12 @@
 //!   its feed entries are durable, so when the batch has arrived the entries are readable.
 //! - **The mirror.** A replica must not read a room it does not own through its own registry:
 //!   that actor would be a stale copy, never told about the owner's writes. [`RoomMirror`] is a
-//!   read-only [`RoomActor::load`] snapshot per room, checked against the store's durable
-//!   timeline head on every access and reloaded when the store is ahead. The store is the source
-//!   of truth; the wake is only the doorbell, the same rule `hs-appservice`'s pump follows.
+//!   read-only copy per room, loaded once with [`RoomActor::load`], checked against the store's
+//!   durable timeline head on every access and, when the store is ahead, advanced by reading
+//!   only the rows past it ([`RoomActor::catch_up`]; RFC 0018, decision 0022). A wake for a
+//!   copied room advances the copy before the long-polls it wakes read it, and a wake the copy
+//!   already covers costs nothing. The store is the source of truth; the wake is only the
+//!   doorbell, the same rule `hs-appservice`'s pump follows.
 //! - **Typing, receipts and presence.** None of the three is on the registry stream, so the wake
 //!   above never carries them, and each replica's registries (`crate::typing`,
 //!   `crate::receipts`, `crate::presence`) are its own memory. A replica that changes one of
@@ -41,10 +44,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use hs_kv::KvBackend;
 use hs_room::RoomError;
+use hs_room::actor::catch_up::CatchUp;
 use hs_room::actor::{RoomActor, RoomActorHandle};
 use hs_room::identity::HomeserverIdentity;
 use hs_room::persist::{Tables, TimelineKey};
@@ -111,7 +116,9 @@ impl EphemeralUpdate {
 pub struct RoomWake {
     /// The room that changed.
     pub room_id: OwnedRoomId,
-    /// The room-local position of the update.
+    /// The room-local position of the update: the owner's timeline head once it had written
+    /// it, and so how far a receiver's copy of the room must read ([`RoomMirror::prefetch`]).
+    /// A batch carrying several wakes for one room keeps the highest.
     pub room_pos: i64,
     /// `hs_room::protocol::RoomUpdate::global_seq` on the sender's registry stream; `0` for a
     /// re-read after falling behind, which carries no number.
@@ -268,23 +275,65 @@ pub trait SessionCluster: Send + Sync {
 
 struct MirrorEntry<B: KvBackend> {
     handle: RoomActorHandle<B>,
-    /// The room-local head this snapshot was loaded at.
+    /// The newest timeline position the copy holds.
     head: i64,
+    /// The last catch-up left redaction targets whose stored row did not say `redacted` yet,
+    /// so the next read catches up even if the store's head has not moved.
+    pending_redactions: bool,
     last_used: Instant,
 }
 
-/// Read-only snapshots of rooms this replica does not own, each reloaded from the store
-/// whenever the store's durable timeline head is past the snapshot's. See the module docs.
+/// How many rooms a [`RoomMirror`] holds copies of at most, unless told otherwise
+/// ([`RoomMirror::with_max_rooms`]). Past it, the copy read longest ago is dropped. A copy holds
+/// the whole room in memory, as a resident room on its owner does.
+pub const DEFAULT_MAX_MIRRORED_ROOMS: usize = 1024;
+
+/// What a [`RoomMirror`] has done since it was opened. For tests and diagnostics; the same
+/// numbers go to `/metrics` (`crate::metrics`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MirrorStats {
+    /// Whole-room loads: a first read, and every reload.
+    pub full_loads: u64,
+    /// Incremental catch-ups that read at least one new event.
+    pub catch_ups: u64,
+    /// Events those catch-ups absorbed.
+    pub caught_up_events: u64,
+}
+
+#[derive(Default)]
+struct StatCounters {
+    full_loads: AtomicU64,
+    catch_ups: AtomicU64,
+    caught_up_events: AtomicU64,
+}
+
+/// Read-only copies of rooms this replica does not own, each brought up to the store's durable
+/// timeline head on every access. See the module docs.
 ///
-/// A reload is a full [`RoomActor::load`]: correct, and O(room size) per new event in a room
-/// this replica does not own but has sessions reading. An incremental catch-up is `hs-room`'s
-/// to add (`docs/rfcs/0018-room-actor-catch-up.md`); until then this is the documented cost of
-/// reading a room from a replica that is not its owner.
+/// A copy is built once by [`RoomActor::load`] and then advanced by [`RoomActor::catch_up`],
+/// which reads only the timeline rows past it (`docs/rfcs/0018-room-actor-catch-up.md`,
+/// decision 0022): the cost of a new event on a replica that does not own the room is that
+/// event's, not the room's. A copy that cannot be advanced that way -- the room's records were
+/// rewritten (a purge, backfill, new outliers), a position is missing, the store's head went
+/// backwards -- is loaded again whole, and that is logged with the reason. A wake for a copied
+/// room ([`RoomMirror::prefetch`]) advances the copy before the long-polls it wakes read it.
+///
+/// A copy is advanced in place: a reader holding its handle sees the room move on between two
+/// reads, exactly as a reader of the owner's resident actor does.
+///
+/// Copies idle longer than the sweeper's limit are dropped ([`RoomMirror::evict_idle`]), and at
+/// most [`DEFAULT_MAX_MIRRORED_ROOMS`] are held.
 pub struct RoomMirror<B: KvBackend> {
     backend: B,
     tables: Tables<B>,
     identity: HomeserverIdentity,
     rooms: Mutex<HashMap<OwnedRoomId, MirrorEntry<B>>>,
+    max_rooms: usize,
+    /// When false, every move of the store's head loads the room again whole: what this mirror
+    /// did before decision 0022. Kept as an operator's escape hatch (`hs-cli` sets it from
+    /// `HS_SYNC_MIRROR_FULL_RELOAD`) and as the baseline of the cost measurement.
+    incremental: AtomicBool,
+    stats: StatCounters,
 }
 
 impl<B: KvBackend + 'static> RoomMirror<B> {
@@ -299,29 +348,166 @@ impl<B: KvBackend + 'static> RoomMirror<B> {
             tables,
             identity,
             rooms: Mutex::new(HashMap::new()),
+            max_rooms: DEFAULT_MAX_MIRRORED_ROOMS,
+            incremental: AtomicBool::new(true),
+            stats: StatCounters::default(),
         })
     }
 
-    /// The snapshot of `room_id`, reloaded first if the store's head has moved past it.
+    /// This mirror, holding copies of at most `max_rooms` rooms (at least one).
+    #[must_use]
+    pub fn with_max_rooms(mut self, max_rooms: usize) -> Self {
+        self.max_rooms = max_rooms.max(1);
+        self
+    }
+
+    /// Turns incremental catch-up off (`false`: every move of the store's head reloads the room
+    /// whole, as before decision 0022) or back on.
+    pub fn set_incremental(&self, incremental: bool) {
+        self.incremental.store(incremental, Ordering::Relaxed);
+    }
+
+    /// What this mirror has done since it was opened.
+    #[must_use]
+    pub fn stats(&self) -> MirrorStats {
+        MirrorStats {
+            full_loads: self.stats.full_loads.load(Ordering::Relaxed),
+            catch_ups: self.stats.catch_ups.load(Ordering::Relaxed),
+            caught_up_events: self.stats.caught_up_events.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The copy of `room_id`, brought up to the store's durable head first.
     ///
     /// # Errors
     /// Returns [`RoomError::RoomNotFound`] if the room does not exist, or any error
     /// [`RoomActor::load`] can return.
     pub async fn get_or_load(&self, room_id: &RoomId) -> Result<RoomActorHandle<B>, RoomError> {
-        let durable = self.durable_head(room_id).await?;
-        let Some(durable) = durable else {
+        let Some(durable) = self.durable_head(room_id).await? else {
+            self.forget(room_id).await;
             return Err(RoomError::RoomNotFound(room_id.to_string()));
         };
+        self.advance(room_id, Some(durable)).await
+    }
+
+    /// Advances the copy of `room_id`, if this mirror holds one, to at least `room_pos` -- the
+    /// position a wake from the room's owner names (`RoomWake::room_pos`, the owner's head after
+    /// the update) -- so that the long-polls the wake is about read a current copy. A wake the
+    /// copy already covers reads nothing. A room this mirror holds no copy of is left alone:
+    /// nobody here has read it lately. Failures are logged at `debug` and leave the next read
+    /// to try again.
+    pub async fn prefetch(&self, room_id: &RoomId, room_pos: i64) {
         {
-            let mut rooms = self.rooms.lock().await;
-            if let Some(entry) = rooms.get_mut(room_id)
-                && entry.head >= durable
-            {
-                entry.last_used = Instant::now();
-                return Ok(entry.handle.clone());
+            let rooms = self.rooms.lock().await;
+            match rooms.get(room_id) {
+                None => return,
+                Some(entry) if entry.head >= room_pos && !entry.pending_redactions => {
+                    crate::metrics::count_wake_covered();
+                    return;
+                }
+                Some(_) => {}
             }
         }
+        if let Err(error) = self.advance(room_id, None).await {
+            tracing::debug!(%room_id, room_pos, %error, "room mirror could not catch up on a wake");
+        }
+    }
 
+    /// Brings the copy of `room_id` up to the store. `durable` is the store's head when the
+    /// caller has read it; `None` means "catch up regardless".
+    async fn advance(
+        &self,
+        room_id: &RoomId,
+        durable: Option<i64>,
+    ) -> Result<RoomActorHandle<B>, RoomError> {
+        let handle = {
+            let mut rooms = self.rooms.lock().await;
+            let Some(entry) = rooms.get_mut(room_id) else {
+                drop(rooms);
+                return self.load_whole(room_id, "first_read").await;
+            };
+            entry.last_used = Instant::now();
+            let held = entry.head;
+            if let Some(durable) = durable
+                && durable < held
+            {
+                // The store went backwards under the copy: not something an owner's appends do.
+                // Whatever happened, the store is the truth.
+                rooms.remove(room_id);
+                crate::metrics::set_mirror_rooms(rooms.len());
+                drop(rooms);
+                tracing::warn!(
+                    %room_id,
+                    held,
+                    durable,
+                    reason = "regressed",
+                    "room mirror reloads a room whole: the store's head is behind its copy"
+                );
+                return self.load_whole(room_id, "regressed").await;
+            }
+            if durable.is_some_and(|d| held >= d) && !entry.pending_redactions {
+                return Ok(entry.handle.clone());
+            }
+            entry.handle.clone()
+        };
+        if !self.incremental.load(Ordering::Relaxed) {
+            return self.load_whole(room_id, "incremental_off").await;
+        }
+
+        let started = std::time::Instant::now();
+        match handle.catch_up().await {
+            Ok(CatchUp::Advanced {
+                events,
+                pending_redactions,
+            }) => {
+                let head = handle.query(RoomActor::read_position).await;
+                let elapsed = started.elapsed();
+                if events > 0 {
+                    crate::metrics::observe_catch_up(events, elapsed);
+                    self.stats.catch_ups.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .caught_up_events
+                        .fetch_add(events as u64, Ordering::Relaxed);
+                    tracing::trace!(%room_id, events, head, ?elapsed, "room mirror caught up");
+                }
+                let mut rooms = self.rooms.lock().await;
+                if let Some(entry) = rooms.get_mut(room_id)
+                    && entry.handle.same_actor(&handle)
+                {
+                    entry.head = entry.head.max(head);
+                    entry.pending_redactions = pending_redactions > 0;
+                }
+                Ok(handle)
+            }
+            Ok(CatchUp::Reload(why)) => {
+                tracing::info!(
+                    %room_id,
+                    reason = why.reason(),
+                    detail = %why,
+                    "room mirror reloads a room whole: its copy cannot be caught up from new rows"
+                );
+                self.load_whole(room_id, why.reason()).await
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %room_id,
+                    %error,
+                    reason = "error",
+                    "room mirror catch-up failed; reloading the room whole"
+                );
+                self.load_whole(room_id, "error").await
+            }
+        }
+    }
+
+    /// Loads `room_id` whole and makes it the copy -- unless, for a first read, a copy at least
+    /// as fresh appeared while this one was loading.
+    async fn load_whole(
+        &self,
+        room_id: &RoomId,
+        reason: &'static str,
+    ) -> Result<RoomActorHandle<B>, RoomError> {
+        let started = std::time::Instant::now();
         let backend = self.backend.clone();
         let tables = self.tables.clone();
         let identity = self.identity.clone();
@@ -329,38 +515,83 @@ impl<B: KvBackend + 'static> RoomMirror<B> {
         let loaded =
             tokio::task::spawn_blocking(move || RoomActor::load(backend, tables, identity, &owned))
                 .await
-                .map_err(|e| RoomError::Internal(format!("room mirror load task failed: {e}")))??;
-        let Some(actor) = loaded else {
-            return Err(RoomError::RoomNotFound(room_id.to_string()));
+                .map_err(|e| RoomError::Internal(format!("room mirror load task failed: {e}")))?;
+        let actor = match loaded {
+            Ok(Some(actor)) => actor,
+            Ok(None) => {
+                self.forget(room_id).await;
+                return Err(RoomError::RoomNotFound(room_id.to_string()));
+            }
+            Err(error) => {
+                self.forget(room_id).await;
+                return Err(error);
+            }
         };
-        let head = actor.head_update().map_or(0, |u| u.room_pos);
+        let head = actor.read_position();
         let handle = RoomActorHandle::new(actor);
-        tracing::debug!(%room_id, head, "room mirror loaded a room this replica does not own");
+        let elapsed = started.elapsed();
+        crate::metrics::observe_full_reload(reason, elapsed);
+        self.stats.full_loads.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            %room_id,
+            head,
+            reason,
+            ?elapsed,
+            "room mirror loaded a room this replica does not own"
+        );
 
+        let entry = MirrorEntry {
+            handle: handle.clone(),
+            head,
+            pending_redactions: false,
+            last_used: Instant::now(),
+        };
         let mut rooms = self.rooms.lock().await;
-        match rooms.entry(room_id.to_owned()) {
-            std::collections::hash_map::Entry::Occupied(mut slot) if slot.get().head >= head => {
-                // Somebody reloaded a snapshot at least this fresh while this one was loading;
-                // theirs stays, this one is dropped unused.
+        let handle = match rooms.entry(room_id.to_owned()) {
+            std::collections::hash_map::Entry::Occupied(mut slot)
+                if reason == "first_read" && slot.get().head >= head =>
+            {
                 slot.get_mut().last_used = Instant::now();
-                Ok(slot.get().handle.clone())
+                slot.get().handle.clone()
             }
             std::collections::hash_map::Entry::Occupied(mut slot) => {
-                slot.insert(MirrorEntry {
-                    handle: handle.clone(),
-                    head,
-                    last_used: Instant::now(),
-                });
-                Ok(handle)
+                slot.insert(entry);
+                handle
             }
             std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(MirrorEntry {
-                    handle: handle.clone(),
-                    head,
-                    last_used: Instant::now(),
-                });
-                Ok(handle)
+                slot.insert(entry);
+                handle
             }
+        };
+        Self::bound(&mut rooms, self.max_rooms);
+        crate::metrics::set_mirror_rooms(rooms.len());
+        Ok(handle)
+    }
+
+    /// Drops the copies read longest ago until at most `max_rooms` are left.
+    fn bound(rooms: &mut HashMap<OwnedRoomId, MirrorEntry<B>>, max_rooms: usize) {
+        while rooms.len() > max_rooms {
+            let Some(oldest) = rooms
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(room_id, _)| room_id.clone())
+            else {
+                break;
+            };
+            rooms.remove(&oldest);
+            tracing::debug!(
+                room_id = %oldest,
+                max_rooms,
+                "room mirror dropped its least recently read copy"
+            );
+        }
+    }
+
+    /// Drops the copy of `room_id`, if there is one.
+    async fn forget(&self, room_id: &RoomId) {
+        let mut rooms = self.rooms.lock().await;
+        if rooms.remove(room_id).is_some() {
+            crate::metrics::set_mirror_rooms(rooms.len());
         }
     }
 
@@ -393,17 +624,18 @@ impl<B: KvBackend + 'static> RoomMirror<B> {
         .map_err(|e| RoomError::Internal(format!("room mirror head task failed: {e}")))?
     }
 
-    /// Drops every snapshot idle longer than `max_idle`; returns how many. Called by the sweeper
+    /// Drops every copy idle longer than `max_idle`; returns how many. Called by the sweeper
     /// [`crate::hub::SessionHub::install_cluster`] spawns, and directly by tests.
     pub async fn evict_idle(&self, max_idle: Duration) -> usize {
         let mut rooms = self.rooms.lock().await;
         let before = rooms.len();
         let now = Instant::now();
         rooms.retain(|_, entry| now.duration_since(entry.last_used) < max_idle);
+        crate::metrics::set_mirror_rooms(rooms.len());
         before - rooms.len()
     }
 
-    /// How many snapshots are resident right now. For tests and diagnostics.
+    /// How many copies are resident right now. For tests and diagnostics.
     pub async fn resident_count(&self) -> usize {
         self.rooms.lock().await.len()
     }
@@ -1272,8 +1504,248 @@ mod two_replica_tests {
         assert!(a.hub.owns_room(&room_id));
     }
 
+    /// Sends `count` messages from `sender` through the owner's registry.
+    async fn say(a: &Replica, room_id: &RoomId, sender: &UserId, count: usize, ts: i64) {
+        let handle = a.registry.get_or_load(room_id).await.unwrap();
+        for i in 0..count {
+            handle
+                .send_event(
+                    sender.to_owned(),
+                    "m.room.message".to_owned(),
+                    None,
+                    json!({"msgtype": "m.text", "body": format!("#{i}")}),
+                    None,
+                    ts + i as i64,
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The bug RFC 0018 describes: every new event in a room B does not own made B load the
+    /// whole room again. Now B loads it once, and each wake after that reads only the new
+    /// positions -- counted by the mirror's own loader and catch-up counters. Without the
+    /// incremental catch-up (`set_incremental(false)`, what the mirror did before) the loader
+    /// count is 3, not 1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_wake_for_a_mirrored_room_reads_only_the_new_positions() {
+        let (a, b) = two_replicas(Duration::ZERO);
+        let (room_id, alice, _bob) = room_with_alice_and_bob(&a).await;
+
+        b.mirror.get_or_load(&room_id).await.unwrap();
+        assert_eq!(b.mirror.stats().full_loads, 1, "the first read loads");
+
+        say(&a, &room_id, &alice, 3, 10).await;
+        // Whether the wake's prefetch or this read did the catching up, it read three events.
+        let copy = b.mirror.get_or_load(&room_id).await.unwrap();
+        assert_eq!(
+            b.mirror.stats(),
+            MirrorStats {
+                full_loads: 1,
+                catch_ups: b.mirror.stats().catch_ups,
+                caught_up_events: 3,
+            },
+            "a wake for a mirrored room must not load it again"
+        );
+
+        say(&a, &room_id, &alice, 2, 20).await;
+        let again = b.mirror.get_or_load(&room_id).await.unwrap();
+        assert!(again.same_actor(&copy), "the copy is advanced in place");
+        let stats = b.mirror.stats();
+        assert_eq!(stats.full_loads, 1, "{stats:?}");
+        assert_eq!(stats.caught_up_events, 5, "{stats:?}");
+        assert_eq!(
+            again.query(RoomActor::read_position).await,
+            a.registry
+                .get_or_load(&room_id)
+                .await
+                .unwrap()
+                .query(RoomActor::read_position)
+                .await,
+            "the copy is at the owner's head"
+        );
+
+        // A wake the copy already covers reads nothing.
+        b.mirror.prefetch(&room_id, 1).await;
+        assert_eq!(b.mirror.stats(), stats);
+    }
+
+    /// History visibility and membership changes that reach B's copy in one catch-up are
+    /// honoured in order: bob, joining a `joined`-visibility room after a message, is not sent
+    /// it on B; after he leaves, he is not sent what follows. And all of it came through
+    /// catch-up, not a reload.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_visibility_change_mid_stream_is_honoured_on_the_other_replica() {
+        let (a, b) = two_replicas(Duration::ZERO);
+        let alice = user_id!("@alice:cluster.test").to_owned();
+        let bob = user_id!("@bob:cluster.test").to_owned();
+        let handle = a
+            .registry
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|actor| actor.room_id().to_owned()).await;
+        a.hub
+            .wait_for_consumed(a.registry.global_published_seq(), Duration::from_secs(5))
+            .await;
+        // Alice's session on B loads B's copy of the room.
+        let (initial, _) = build(&b.hub, &b.e2e, &alice, params(None, Duration::ZERO))
+            .await
+            .unwrap();
+        assert!(initial["rooms"]["join"][room_id.as_str()].is_object());
+        let (_, bob_token) = build(&b.hub, &b.e2e, &bob, params(None, Duration::ZERO))
+            .await
+            .unwrap();
+        let loads = b.mirror.stats().full_loads;
+
+        handle
+            .send_event(
+                alice.clone(),
+                "m.room.history_visibility".to_owned(),
+                Some(String::new()),
+                json!({"history_visibility": "joined"}),
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        let send = |body: &'static str, ts: i64| {
+            let (handle, alice) = (handle.clone(), alice.clone());
+            async move {
+                handle
+                    .send_event(
+                        alice,
+                        "m.room.message".to_owned(),
+                        None,
+                        json!({"msgtype": "m.text", "body": body}),
+                        None,
+                        ts,
+                    )
+                    .await
+                    .unwrap()
+                    .event_id()
+                    .to_string()
+            }
+        };
+        let before_join = send("before bob", 11).await;
+        handle
+            .membership(bob.clone(), Action::Join, bob.clone(), json!({}), 12)
+            .await
+            .unwrap();
+        let while_joined = send("while bob is here", 13).await;
+        a.hub
+            .wait_for_consumed(a.registry.global_published_seq(), Duration::from_secs(5))
+            .await;
+
+        let (response, bob_token) = build(
+            &b.hub,
+            &b.e2e,
+            &bob,
+            params(Some(bob_token), Duration::ZERO),
+        )
+        .await
+        .unwrap();
+        let seen = timeline_event_ids(&response, &room_id);
+        assert!(seen.contains(&while_joined), "{response}");
+        assert!(
+            !seen.contains(&before_join),
+            "sent before bob joined a `joined` room: {response}"
+        );
+
+        handle
+            .membership(bob.clone(), Action::Leave, bob.clone(), json!({}), 14)
+            .await
+            .unwrap();
+        let after_leave = send("after bob left", 15).await;
+        a.hub
+            .wait_for_consumed(a.registry.global_published_seq(), Duration::from_secs(5))
+            .await;
+        let (response, _) = build(
+            &b.hub,
+            &b.e2e,
+            &bob,
+            params(Some(bob_token), Duration::ZERO),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !response.to_string().contains(&after_leave),
+            "sent after bob left: {response}"
+        );
+
+        // The copy B answered from: the owner's view of every event, for bob.
+        let copy = b.mirror.get_or_load(&room_id).await.unwrap();
+        let visible = |event_id: String| {
+            let bob = bob.clone();
+            copy.query(move |actor| {
+                let event_id = ruma::EventId::parse(event_id).unwrap();
+                actor
+                    .event_visible_to(actor.event_by_id(&event_id).unwrap(), &bob)
+                    .unwrap()
+            })
+        };
+        assert!(!visible(before_join).await);
+        assert!(visible(while_joined).await);
+        assert!(!visible(after_leave).await);
+        let stats = b.mirror.stats();
+        assert_eq!(
+            stats.full_loads, loads,
+            "every change reached B's copy by catch-up, none by a reload: {stats:?}"
+        );
+        assert!(stats.caught_up_events >= 6, "{stats:?}");
+    }
+
+    /// A purge on the owner rewrites rows B's copy already read: the copy is loaded again whole
+    /// rather than left showing purged events.
     #[tokio::test]
-    async fn the_mirror_reloads_a_room_only_when_the_store_is_ahead_of_its_snapshot() {
+    async fn a_rewrite_on_the_owner_makes_the_copy_reload() {
+        let (a, b) = two_replicas(Duration::ZERO);
+        let (room_id, alice, _bob) = room_with_alice_and_bob(&a).await;
+        say(&a, &room_id, &alice, 3, 10).await;
+        b.mirror.get_or_load(&room_id).await.unwrap();
+        let loads = b.mirror.stats().full_loads;
+
+        let owner = a.registry.get_or_load(&room_id).await.unwrap();
+        owner
+            .administer(|actor| {
+                let plan = actor.purge_plan(Some(100), None, true).unwrap();
+                actor.purge_positions(&plan.positions).unwrap()
+            })
+            .await;
+        say(&a, &room_id, &alice, 1, 200).await;
+        b.mirror.get_or_load(&room_id).await.unwrap();
+        assert_eq!(b.mirror.stats().full_loads, loads + 1);
+    }
+
+    #[tokio::test]
+    async fn the_mirror_holds_at_most_its_bound_of_rooms() {
+        let backend = MemoryBackend::new();
+        let a = replica(&backend, "a#1", true, Duration::ZERO);
+        let mirror = RoomMirror::open(
+            backend.clone(),
+            HomeserverIdentity::for_tests("cluster.test"),
+        )
+        .unwrap()
+        .with_max_rooms(1);
+        let (first, _, _) = room_with_alice_and_bob(&a).await;
+        let (second, _, _) = room_with_alice_and_bob(&a).await;
+        mirror.get_or_load(&first).await.unwrap();
+        mirror.get_or_load(&second).await.unwrap();
+        assert_eq!(mirror.resident_count().await, 1);
+        // The one dropped is the one read longest ago, and comes back on the next read.
+        mirror.get_or_load(&first).await.unwrap();
+        assert_eq!(mirror.stats().full_loads, 3);
+    }
+
+    #[tokio::test]
+    async fn the_mirror_catches_up_a_room_only_when_the_store_is_ahead_of_its_copy() {
         let (a, b) = two_replicas(Duration::ZERO);
         let (room_id, alice, _bob) = room_with_alice_and_bob(&a).await;
 
@@ -1291,7 +1763,7 @@ mod two_replica_tests {
                 .unwrap()
                 .room_pos,
             head_before,
-            "nothing changed, so the same snapshot serves"
+            "nothing changed, so the same copy serves"
         );
 
         let handle = a.registry.get_or_load(&room_id).await.unwrap();
@@ -1313,15 +1785,10 @@ mod two_replica_tests {
             .unwrap()
             .room_pos;
         assert!(head_after > head_before, "{head_after} <= {head_before}");
-        // The old handle is the old snapshot: a reader holding it sees the room as it was.
-        assert_eq!(
-            first
-                .query(|actor| actor.head_update())
-                .await
-                .unwrap()
-                .room_pos,
-            head_before
-        );
+        // The copy is advanced in place: a reader holding the handle sees the room move on, as a
+        // reader of the owner's resident actor does.
+        assert!(fresh.same_actor(&first));
+        assert_eq!(b.mirror.stats().full_loads, 1);
 
         assert_eq!(b.mirror.resident_count().await, 1);
         assert_eq!(b.mirror.evict_idle(Duration::ZERO).await, 1);

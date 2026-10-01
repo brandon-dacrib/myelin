@@ -2798,6 +2798,7 @@ dependencies = [
  "hs-room",
  "hs-tables",
  "hs-testkit",
+ "prometheus-client",
  "proptest",
  "rand 0.9.5",
  "ruma 0.15.1",

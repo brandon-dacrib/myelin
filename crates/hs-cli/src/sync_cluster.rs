@@ -338,6 +338,10 @@ impl<B: KvBackend + 'static, R: hs_user::room_source::RoomSource<B> + 'static> P
     }
 }
 
+/// The environment variable that, set to anything but empty or `0`, turns the room mirror's
+/// incremental catch-up off (decision 0022): a diagnostic and an escape hatch, not a setting.
+pub const FULL_RELOAD_ENV: &str = "HS_SYNC_MIRROR_FULL_RELOAD";
+
 /// Makes `hub` cluster-aware over `handles`' mesh: installs the [`MeshSessionCluster`] and a
 /// [`RoomMirror`] on the hub, and this replica's [`SessionPeerHandler`] on the handles, for
 /// [`crate::cluster::ClusterHandles::spawn_mesh`] to serve; registers this module's counters
@@ -367,6 +371,17 @@ pub fn install<B: KvBackend + 'static>(
         metrics.clone(),
     ));
     let mirror = Arc::new(RoomMirror::open(backend, identity)?);
+    // The escape hatch decision 0022 keeps: rooms another replica owns are loaded whole again
+    // on every new event, as before incremental catch-up. Also the baseline the cost
+    // measurement in `tests/cluster_mirror.rs` compares against.
+    if std::env::var_os(FULL_RELOAD_ENV).is_some_and(|v| !v.is_empty() && v != "0") {
+        mirror.set_incremental(false);
+        tracing::warn!(
+            env = FULL_RELOAD_ENV,
+            "room mirror catch-up is off: rooms this replica does not own are reloaded whole \
+             on every new event"
+        );
+    }
     hub.install_cluster(cluster, mirror);
     handles.add_peer_handler(
         "user.",
