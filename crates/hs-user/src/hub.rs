@@ -449,6 +449,70 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         }
     }
 
+    /// Whether `user_id` is a joined member of `room_id`, as the room itself has committed it --
+    /// the gate for setting typing state and posting receipts (`crate::routes::typing`,
+    /// `crate::routes::receipts`).
+    ///
+    /// The store's membership record is the cheap answer and the usual one, but it is written by
+    /// this hub off the registry's global stream, a moment *after* the room accepted the event.
+    /// A client that creates or joins a room and sets typing in the same breath used to be told
+    /// it was not a member (`403`), which is what failed CI on a loaded runner. So a record that
+    /// does not say `join` is not the last word: the room's own current state is asked next
+    /// (what the join wrote, the instant it was accepted), and, should that be a replica's mirror
+    /// that is itself a moment behind, this hub then waits -- as `/sync` does
+    /// ([`SessionHub::settle_before_read`]), and for at most `at_most` -- to have consumed
+    /// everything published before the call, and reads the record again. A room that cannot be
+    /// loaded (it does not exist, or was deleted) has no joined members.
+    ///
+    /// # Errors
+    /// Returns [`UserError`] on a store failure, or a room failure other than the room not
+    /// existing.
+    pub async fn is_joined(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+        at_most: Duration,
+    ) -> Result<bool, UserError> {
+        let store_says_joined = |record: Option<crate::store::MembershipRecord>| {
+            record.is_some_and(|m| m.membership == "join")
+        };
+        if store_says_joined(self.store.get_membership(user_id, room_id).await?) {
+            return Ok(true);
+        }
+        match self.room(room_id).await {
+            Ok(handle) => {
+                let user = user_id.to_owned();
+                let joined = handle
+                    .query(move |actor| {
+                        actor
+                            .state_event("m.room.member", user.as_str())
+                            .map(|event| event.and_then(membership_of).as_deref() == Some("join"))
+                    })
+                    .await?;
+                if joined {
+                    tracing::debug!(
+                        %user_id,
+                        %room_id,
+                        "membership not yet in the store; the room says joined"
+                    );
+                    return Ok(true);
+                }
+            }
+            Err(error) if error.is_room_not_found() => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        self.settle_before_read(at_most).await;
+        let joined = store_says_joined(self.store.get_membership(user_id, room_id).await?);
+        if joined {
+            tracing::debug!(
+                %user_id,
+                %room_id,
+                "membership reached the store after waiting for the session hub"
+            );
+        }
+        Ok(joined)
+    }
+
     /// Takes one peer's [`WakeBatch`]: applies its typing, receipt and presence updates
     /// ([`SessionHub::apply_ephemeral`]), wakes every user its wakes name, then records the
     /// sender's consumed mark for [`SessionHub::settle_before_read`]. In that order, so a
@@ -663,7 +727,19 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             return;
         }
         let mut rx = self.consumed.subscribe();
-        let _ = tokio::time::timeout(at_most, rx.wait_for(|consumed| *consumed >= seq)).await;
+        if tokio::time::timeout(at_most, rx.wait_for(|consumed| *consumed >= seq))
+            .await
+            .is_err()
+        {
+            // The read goes ahead from before the caller's own writes: worth an operator's
+            // attention, since it means the hub is far behind the rooms.
+            tracing::warn!(
+                waited_for = seq,
+                consumed = *self.consumed.borrow(),
+                waited_ms = u64::try_from(at_most.as_millis()).unwrap_or(u64::MAX),
+                "the session hub did not catch up with the room stream in time; reading anyway"
+            );
+        }
     }
 
     /// Tells every `/sync` that is waiting for news to answer now, with whatever it has, and

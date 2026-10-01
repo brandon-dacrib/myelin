@@ -106,6 +106,14 @@ impl From<crate::store::StoreError> for UserError {
 }
 
 impl UserError {
+    /// Whether this is a room that does not exist (any more): never created, or deleted and
+    /// purged by an administrator. `/sync` and the hub's fan-out treat such a room as gone, not
+    /// as a failure -- a user's records can outlive the room they describe.
+    #[must_use]
+    pub fn is_room_not_found(&self) -> bool {
+        matches!(self, Self::Room(hs_room::RoomError::RoomNotFound(_)))
+    }
+
     /// Maps to the Matrix client-server error shape.
     #[must_use]
     pub fn to_matrix_error(&self) -> MatrixError {

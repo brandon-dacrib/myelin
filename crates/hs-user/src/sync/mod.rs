@@ -114,7 +114,7 @@ pub const DEFAULT_TIMELINE_LIMIT: usize = 10;
 /// when the request arrived (`SessionHub::wait_for_consumed`). Normally nothing: the hub is a
 /// few microseconds behind. Long enough to cover a busy moment; short enough that a hub that
 /// has really fallen behind does not take every sync down with it.
-const READ_YOUR_WRITES_WAIT: Duration = Duration::from_millis(500);
+pub(crate) const READ_YOUR_WRITES_WAIT: Duration = Duration::from_millis(500);
 
 /// The most to-device messages a single `/sync` response will carry for one device. Matches this
 /// crate's `DEFAULT_TIMELINE_LIMIT`-adjacent philosophy of a bounded response; a device with more

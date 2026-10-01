@@ -16,6 +16,7 @@ use crate::error::UserError;
 use crate::receipts::ReceiptKind;
 use crate::room_source::RoomSource;
 use crate::state::{UserRequester, UserState};
+use crate::sync::READ_YOUR_WRITES_WAIT;
 
 fn parse_room_id(raw: &str) -> Result<ruma::OwnedRoomId, UserError> {
     RoomId::parse(raw)
@@ -44,11 +45,13 @@ async fn require_joined<B: KvBackend + 'static, R: RoomSource<B> + 'static>(
     user_id: &ruma::UserId,
     room_id: &RoomId,
 ) -> Result<(), UserError> {
-    let membership = state.hub.store().get_membership(user_id, room_id).await?;
-    if !matches!(
-        membership.as_ref().map(|m| m.membership.as_str()),
-        Some("join")
-    ) {
+    // Not the store's record alone: a join the room has already accepted may not be in it yet
+    // (`SessionHub::is_joined`).
+    if !state
+        .hub
+        .is_joined(user_id, room_id, READ_YOUR_WRITES_WAIT)
+        .await?
+    {
         return Err(UserError::Forbidden(
             "must be a joined member of the room to publish a receipt".to_owned(),
         ));
@@ -245,6 +248,69 @@ mod tests {
             },
             room_id,
         )
+    }
+
+    /// The typing race (`crate::routes::typing`'s
+    /// `a_join_the_hub_has_not_consumed_yet_still_lets_the_member_type`) for receipts and read
+    /// markers: a room the client has just created, with nothing yet consuming its stream, takes
+    /// a receipt and a fully-read marker from its creator.
+    #[tokio::test]
+    async fn a_join_the_hub_has_not_consumed_yet_still_takes_receipts() {
+        let store: crate::store::DynUserStore =
+            Arc::new(TablesUserStore::open(MemoryBackend::new()).unwrap());
+        let e2e: Arc<dyn hs_e2e::store::E2eStore> =
+            Arc::new(hs_e2e::store::tables::TablesE2eStore::open(MemoryBackend::new()).unwrap());
+        let hub = Arc::new(SessionHub::new(
+            store,
+            registry("receipts.test"),
+            usize::MAX,
+        ));
+        let alice = user_id!("@alice:receipts.test").to_owned();
+        let handle: RoomActorHandle<MemoryBackend> = hub
+            .rooms()
+            .create_room(alice.clone(), CreateRoomRequest::default(), 1)
+            .await
+            .expect("create room");
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        assert!(
+            hub.store()
+                .get_membership(&alice, &room_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the premise: the store has not been told of the creator's join"
+        );
+        let state = UserState {
+            auth: AuthState::in_memory(),
+            hub,
+            e2e,
+        };
+        let response = post_receipt(
+            State(state.clone()),
+            Path((
+                room_id.to_string(),
+                "m.read".to_owned(),
+                "$e1:receipts.test".to_owned(),
+            )),
+            UserRequester(Requester::for_user(alice.clone())),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let response = post_read_markers(
+            State(state),
+            Path(room_id.to_string()),
+            UserRequester(Requester::for_user(alice.clone())),
+            PermissiveJson(ReadMarkersBody {
+                fully_read: Some("$e1:receipts.test".to_owned()),
+                read: None,
+                read_private: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
     }
 
     #[tokio::test]

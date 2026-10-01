@@ -14,6 +14,7 @@ use serde_json::json;
 use crate::error::UserError;
 use crate::room_source::RoomSource;
 use crate::state::{UserRequester, UserState};
+use crate::sync::READ_YOUR_WRITES_WAIT;
 
 /// The default timeout Synapse itself falls back to if a client omits the field, even though the
 /// spec marks it required -- matches real-world client behavior this server should tolerate
@@ -62,15 +63,13 @@ pub async fn put_typing<B: KvBackend + 'static, R: RoomSource<B> + 'static>(
             "cannot set another user's typing state".to_owned(),
         ));
     }
-    let membership = state
+    // Not the store's record alone: a join the room has already accepted may not be in it yet
+    // (`SessionHub::is_joined`).
+    if !state
         .hub
-        .store()
-        .get_membership(&requester.user_id, &room_id)
-        .await?;
-    if !matches!(
-        membership.as_ref().map(|m| m.membership.as_str()),
-        Some("join")
-    ) {
+        .is_joined(&requester.user_id, &room_id, READ_YOUR_WRITES_WAIT)
+        .await?
+    {
         return Err(UserError::Forbidden(
             "must be a joined member of the room to set a typing notification".to_owned(),
         ));
@@ -192,6 +191,115 @@ mod tests {
             State(state),
             Path((room_id.to_string(), carol.to_string())),
             UserRequester(Requester::for_user(carol.to_owned())),
+            PermissiveJson(TypingBody {
+                typing: true,
+                timeout: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.into_response().status(),
+            axum::http::StatusCode::FORBIDDEN
+        );
+    }
+
+    /// What failed CI on a loaded runner: a client joins (or creates) a room and sets typing in
+    /// the same breath, before the session hub has written the join into the store. The room has
+    /// accepted the join, so the member may type. Here nothing consumes the room stream at all,
+    /// which is that moment held open: the store has no record of either user.
+    #[tokio::test]
+    async fn a_join_the_hub_has_not_consumed_yet_still_lets_the_member_type() {
+        let store: crate::store::DynUserStore =
+            Arc::new(TablesUserStore::open(MemoryBackend::new()).unwrap());
+        let e2e: Arc<dyn hs_e2e::store::E2eStore> =
+            Arc::new(hs_e2e::store::tables::TablesE2eStore::open(MemoryBackend::new()).unwrap());
+        let hub = Arc::new(SessionHub::new(store, registry("typing.test"), usize::MAX));
+        let alice = user_id!("@alice:typing.test").to_owned();
+        let bob = user_id!("@bob:typing.test").to_owned();
+        let handle: RoomActorHandle<MemoryBackend> = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .expect("create room");
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        handle
+            .membership(
+                bob.clone(),
+                hs_room::membership::Action::Join,
+                bob.clone(),
+                serde_json::json!({}),
+                2,
+            )
+            .await
+            .expect("bob joins");
+        for user in [&alice, &bob] {
+            assert!(
+                hub.store()
+                    .get_membership(user, &room_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the premise: the store has not been told of {user}'s join"
+            );
+        }
+        let state = UserState {
+            auth: AuthState::in_memory(),
+            hub,
+            e2e,
+        };
+
+        for user in [&alice, &bob] {
+            let response = put_typing(
+                State(state.clone()),
+                Path((room_id.to_string(), user.to_string())),
+                UserRequester(Requester::for_user(user.clone())),
+                PermissiveJson(TypingBody {
+                    typing: true,
+                    timeout: Some(30_000),
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{user} was refused: {e}"));
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+        }
+        let (users, _) = state.hub.typing_users(&room_id).await;
+        assert_eq!(users.len(), 2, "{users:?}");
+
+        // And somebody the room has never seen is still refused.
+        let carol = user_id!("@carol:typing.test");
+        let err = put_typing(
+            State(state),
+            Path((room_id.to_string(), carol.to_string())),
+            UserRequester(Requester::for_user(carol.to_owned())),
+            PermissiveJson(TypingBody {
+                typing: true,
+                timeout: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.into_response().status(),
+            axum::http::StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn typing_in_a_room_that_does_not_exist_is_forbidden() {
+        let (state, _room_id) = test_state().await;
+        let alice = user_id!("@alice:typing.test");
+        let err = put_typing(
+            State(state),
+            Path(("!nowhere:typing.test".to_string(), alice.to_string())),
+            UserRequester(Requester::for_user(alice.to_owned())),
             PermissiveJson(TypingBody {
                 typing: true,
                 timeout: None,
