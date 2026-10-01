@@ -78,6 +78,18 @@ pub type StateSnapshotKey = (hs_model::RoomSn, hs_model::EventSn);
 /// `crate::actor::RoomActor::accept_gap_events`).
 pub type TimelineGapKey = (hs_model::RoomSn, i64);
 
+/// `(RoomSn,) -> i64` (8 bytes big-endian, an `hs_kv` counter): how many times the room's
+/// records were changed by something other than appending a timeline event at its head --
+/// outliers added, history placed below the head (backfill, a gap filled), a gap closed, events
+/// purged, forward extremities pruned. A reader that holds a copy of the room and advances it
+/// by reading only the timeline rows past its own head
+/// ([`crate::actor::RoomActor::catch_up`], `docs/rfcs/0018-room-actor-catch-up.md`) compares
+/// this counter with the value it loaded at, and reloads the room whole when it moved: those
+/// changes are the ones such a reader cannot see in new timeline rows. Absent means zero.
+/// Redactions are not counted: they arrive as a timeline event, which the reader applies
+/// itself (decision 0022).
+pub type RoomRewriteKey = (hs_model::RoomSn,);
+
 /// The value of a [`TimelineGapKey`] row. Where the gap has been filled to and what it still
 /// lacks are derived from the timeline itself on load, so a crash between placing a batch and
 /// rewriting this row loses nothing.
@@ -204,6 +216,9 @@ pub struct Tables<B: KvBackend> {
     /// `(RoomSn, top) -> TimelineGapRecord`: positions reserved below an event for the history
     /// this server missed while out of the room. See [`TimelineGapKey`].
     pub timeline_gaps: TypedKeyspace<B::Keyspace, TimelineGapKey>,
+    /// `(RoomSn,) -> i64`: how many times the room's records were rewritten other than by an
+    /// append at the head. See [`RoomRewriteKey`].
+    pub rewrites: TypedKeyspace<B::Keyspace, RoomRewriteKey>,
 }
 
 impl<B: KvBackend> Tables<B> {
@@ -229,6 +244,7 @@ impl<B: KvBackend> Tables<B> {
             outliers: TypedKeyspace::new(backend.keyspace("room_outliers")?),
             state_snapshots: TypedKeyspace::new(backend.keyspace("room_state_snapshots")?),
             timeline_gaps: TypedKeyspace::new(backend.keyspace("room_timeline_gaps")?),
+            rewrites: TypedKeyspace::new(backend.keyspace("room_rewrites")?),
         })
     }
 }

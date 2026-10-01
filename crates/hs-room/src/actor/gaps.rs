@@ -360,7 +360,8 @@ impl<B: KvBackend> RoomActor<B> {
             self.tables
                 .timeline_gaps
                 .put(txn, &(room_sn, top), &bytes)
-                .map_err(to_kv)
+                .map_err(to_kv)?;
+            super::catch_up::bump_rewrites(&self.tables, txn, room_sn)
         })
         .map_err(RoomError::from)
     }

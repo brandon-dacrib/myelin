@@ -30,6 +30,7 @@ use crate::relations;
 use crate::timeline::{Direction, PaginationToken};
 
 pub mod admin_ops;
+pub mod catch_up;
 pub mod gaps;
 mod history;
 #[cfg(test)]
@@ -412,6 +413,14 @@ pub struct RoomActor<B: KvBackend> {
     /// is history this server already had under another implementation; announcing it would
     /// send it to other servers again, deliver it to bridges again, and wake every client.
     quiet: bool,
+    /// The room's rewrite counter ([`crate::persist::RoomRewriteKey`]) as [`RoomActor::load`]
+    /// read it: what [`RoomActor::catch_up`] compares the store's with. Meaningless on the
+    /// owner, which never catches up.
+    rewrites_seen: i64,
+    /// Redaction targets [`RoomActor::catch_up`] absorbed a redaction for before the target's
+    /// stored row said `redacted`, with how many catch-ups have re-checked each since
+    /// (`catch_up`'s module docs).
+    pending_redactions: HashMap<EventSn, u32>,
 }
 
 impl<B: KvBackend> RoomActor<B> {
@@ -703,6 +712,8 @@ impl<B: KvBackend> RoomActor<B> {
             global: None,
             fencing: None,
             quiet: false,
+            rewrites_seen: 0,
+            pending_redactions: HashMap::new(),
         }
     }
 
@@ -794,6 +805,7 @@ impl<B: KvBackend> RoomActor<B> {
             rules,
             store,
         );
+        actor.rewrites_seen = catch_up::read_rewrites(&actor.tables, &snapshot, room_sn)?;
 
         // Decodes one persisted row back into an `Event`, with the processing flags it was
         // stored with (`redacted`, `outlier`, ...) restored -- `Event::parse` starts every event
@@ -2145,6 +2157,7 @@ impl<B: KvBackend> RoomActor<B> {
                         .map_err(to_kv)?;
                     sns.push(event_sn);
                 }
+                catch_up::bump_rewrites(&self.tables, txn, room_sn)?;
                 self.fence_check(txn, &fence_failure)?;
                 Ok(sns)
             })
@@ -2371,6 +2384,7 @@ impl<B: KvBackend> RoomActor<B> {
                             .map_err(to_kv)?;
                     }
                 }
+                catch_up::bump_rewrites(&self.tables, txn, room_sn)?;
                 self.fence_check(txn, &fence_failure)?;
                 Ok(sns)
             })
@@ -5888,6 +5902,18 @@ impl<B: KvBackend> RoomActorHandle<B> {
     {
         self.with_actor(move |actor| actor.import_remote_join(state, auth_chain, join_event))
             .await
+    }
+
+    /// [`RoomActor::catch_up`] through the handle: advances a read-only copy of a room another
+    /// replica owns by reading only the store's rows past it.
+    ///
+    /// # Errors
+    /// See [`RoomActor::catch_up`].
+    pub async fn catch_up(&self) -> Result<catch_up::CatchUp, RoomError>
+    where
+        B: 'static,
+    {
+        self.with_actor(RoomActor::catch_up).await
     }
 
     /// [`RoomActor::apply_redaction`] through the handle, for an imported `m.room.redaction`

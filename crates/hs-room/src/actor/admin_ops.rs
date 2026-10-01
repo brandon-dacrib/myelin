@@ -169,7 +169,7 @@ impl<B: KvBackend> RoomActor<B> {
                         .map_err(to_kv)?;
                 }
             }
-            Ok(())
+            super::catch_up::bump_rewrites(&self.tables, txn, room_sn)
         })
         .map_err(RoomError::from)?;
         let purged = rewrites.len() as u64;
@@ -254,7 +254,7 @@ impl<B: KvBackend> RoomActor<B> {
                     .delete(txn, &(room_sn, *sn))
                     .map_err(to_kv)?;
             }
-            Ok(())
+            super::catch_up::bump_rewrites(&self.tables, txn, room_sn)
         })
         .map_err(RoomError::from)?;
         for (_, sn) in &dropped {
@@ -434,6 +434,7 @@ impl<B: KvBackend> RoomActor<B> {
                     .map_err(to_kv)?;
             }
             tables.public_rooms.delete(txn, &room).map_err(to_kv)?;
+            tables.rewrites.delete(txn, &room).map_err(to_kv)?;
             tables.room_meta.delete(txn, &room).map_err(to_kv)
         })
         .map_err(RoomError::from)?;
