@@ -10,7 +10,12 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 PostgreSQL servers (plain and TLS) in use, **nothing unmerged**, one worktree (`merge-queue`).
 The gate's six `HS_*_TEST_POSTGRES_*` variables have their recipe at the top of
 `crates/hs-kv/tests/postgres_tls.rs`; the two containers are `hs-admin-followups-gate-pg` on
-:5462 and `hs-merge-queue-pg-tls` on :5463, password `hspg`.
+:5462 and `hs-merge-queue-pg-tls` on :5463, password `hspg`. The running TLS container's
+certificate is **signed by a test CA** (`CN=hs test ca`), not self-signed as the recipe
+shows, so the two `_TLS_CERT` variables must name that CA's PEM (the container's bind mount
+source directory, `.../scratchpad/pgtls/ca.crt`, next to the `server.crt` it serves); given
+`server.crt` instead, the two `postgres_tls` tests fail with `UnknownIssuer` and the gate is
+red for nothing.
 
 **What was done today, in one breath:** the two branches left over from 2026-09-29 merged
 (federation leftovers, the two-pod cluster fix); Complement remeasured and a state-resolution
