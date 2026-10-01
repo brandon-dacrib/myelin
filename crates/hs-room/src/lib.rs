@@ -55,6 +55,7 @@ pub mod retention;
 pub mod routes;
 pub mod search;
 pub mod state;
+pub mod third_party_invite;
 pub mod timeline;
 
 pub use error::RoomError;

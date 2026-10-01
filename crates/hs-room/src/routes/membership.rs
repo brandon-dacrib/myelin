@@ -315,6 +315,16 @@ async fn act_join<B: KvBackend + 'static>(
         // from its members when guest access is withdrawn.
         content["kind"] = Value::String("guest".to_owned());
     }
+    // `third_party_signed`: the joiner claims a third-party invitation; it becomes an invite
+    // first (`crate::third_party_invite::exchange`), as Synapse does, and the join follows it.
+    if let Some(signed) = body.get("third_party_signed") {
+        if signed.get("mxid").and_then(Value::as_str) != Some(sender.as_str()) {
+            return Err(RoomError::Forbidden(
+                "third_party_signed names somebody else".into(),
+            ));
+        }
+        crate::third_party_invite::exchange(state, &room_id, signed).await?;
+    }
     let joined = join_room(state, &room_id, via, requester, content).await?;
     if requester.is_guest {
         refuse_guest_where_guests_may_not_join(state, requester, &room_id).await?;
@@ -692,6 +702,13 @@ pub async fn post_invite<B: KvBackend + 'static>(
     // A shadow-banned inviter is told the invitation was sent; nobody is invited.
     if requester.shadow_banned {
         crate::moderation::note_shadowed(&requester, "invite");
+        return Ok(Json(json!({})).into_response());
+    }
+    // An invite by email address (or another third-party identifier) rather than by user ID.
+    // Without this, the body's missing `user_id` made it an invite of the inviter themselves.
+    if crate::third_party_invite::is_third_party(&body) {
+        let room_id = parse_room_id(&room_id)?;
+        crate::third_party_invite::invite(&state, &room_id, &requester.user_id, &body).await?;
         return Ok(Json(json!({})).into_response());
     }
     let target = target_user(&body, &requester.user_id)?;

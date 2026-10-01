@@ -160,6 +160,16 @@ pub struct AuthConfig {
     /// `allow_guest_access`.
     #[serde(default)]
     pub allow_guest_access: bool,
+    /// Identity servers this server may use to invite people by email address, as `host` or
+    /// `host:port` (for example `vector.im` or `matrix.org`). When somebody invites an email
+    /// address, this server asks the identity server their client names who owns it -- and,
+    /// if nobody does yet, asks it to keep the invitation and email them. Only servers listed
+    /// here are ever contacted, so a client cannot make this server send requests anywhere it
+    /// likes. Empty by default: inviting by email address is then refused, and inviting by
+    /// Matrix user ID works as always. Corresponds to Synapse's trust in the client-named
+    /// `id_server`, which Synapse does not restrict.
+    #[serde(default)]
+    pub identity_servers: Vec<String>,
     /// Inline shared secret for the `/_synapse/mk_admin_user`-equivalent
     /// shared-secret registration protocol (see `hs-compat`). Prefer
     /// `registration_shared_secret_file`. Corresponds to Synapse's
@@ -219,6 +229,7 @@ impl Default for AuthConfig {
         Self {
             enable_registration: false,
             allow_guest_access: false,
+            identity_servers: Vec::new(),
             user_directory_search_all_users: false,
             registration_shared_secret: SecretString::default(),
             registration_shared_secret_file: None,
@@ -264,6 +275,15 @@ impl Validate for AuthConfig {
             }
             if p.client_id.trim().is_empty() {
                 errors.push(format!("{path}.client_id"), "must not be empty");
+            }
+        }
+        for (i, server) in self.identity_servers.iter().enumerate() {
+            let server = server.trim();
+            if server.is_empty() || server.contains('/') || server.contains("://") {
+                errors.push(
+                    format!("{prefix}.identity_servers[{i}]"),
+                    "must be a host name, optionally with :port, such as vector.im",
+                );
             }
         }
         if let Some(mas) = &self.mas_delegation

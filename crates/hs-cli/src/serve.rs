@@ -240,6 +240,26 @@ fn build_router<B: KvBackend>(
     let alias_resolver: Arc<dyn crate::cluster::AliasResolver> =
         Arc::new(crate::cluster::RoomAliasResolver::new(&mounts.room));
     let (room_router, room_manifest) = hs_room::routes::router::<B>();
+    // An identity server's report that an invited address has been bound
+    // (`crate::identity_service::on_bind`): unauthenticated, as the spec has it, so outside the
+    // `X-Matrix` layer of the federation router, whose seam for the path it shadows.
+    let onbind_meta = || {
+        RouteMeta::new(Surface::MatrixFederation, AuthKind::None)
+            .with_operation_id("onBindThirdPartyIdentifier")
+    };
+    let (onbind_router, onbind_manifest) = Builder::<RoomState<B>>::new()
+        .put(
+            "/onbind",
+            crate::identity_service::on_bind::<B>,
+            onbind_meta(),
+        )
+        .post(
+            "/onbind",
+            crate::identity_service::on_bind::<B>,
+            onbind_meta(),
+        )
+        .build();
+    let onbind_router = onbind_router.with_state(mounts.room.clone());
     let room_router = room_router.with_state(mounts.room);
     let room_routes = room_manifest.routes;
 
@@ -430,6 +450,13 @@ fn build_router<B: KvBackend>(
                 media_federation_manifest.routes,
             );
     }
+    // Mounted with federation off too: a third-party invite in a room of this server's own
+    // users needs nothing from other servers.
+    builder = builder.merge_router(
+        "/_matrix/federation/v1/3pid",
+        onbind_router,
+        onbind_manifest.routes,
+    );
 
     if legacy_media_enabled {
         // MSC2246's async upload splits across two prefixes: `create` reserves a content URI under
@@ -1360,6 +1387,14 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     metrics.with_registry(crate::live_config::register_metrics);
     metrics.with_registry(hs_http::buckets::register_metrics);
     metrics.with_registry(hs_auth::guest::register_metrics);
+    metrics.with_registry(hs_room::third_party_invite::register_metrics);
+    // Third-party invites reach only the identity servers `auth.identity_servers` names; the
+    // client is installed whatever the list says, so adding one applies at once.
+    let identity_service = Arc::new(
+        crate::identity_service::HttpIdentityService::new(config.auth.identity_servers.clone())
+            .map_err(|e| ServeError::Sessions(Box::new(e)))?,
+    );
+    rooms.install_identity_service(identity_service.clone());
     if let Some(live) = &options.live_config {
         let rooms = rooms.clone();
         let limits = auth_state.limits.clone();
@@ -1389,6 +1424,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
                 "the auth settings are now in force"
             );
             auth.set_config(new);
+            identity_service.set_allowed(config.auth.identity_servers.clone());
             Ok(())
         });
         let registry = appservices.registry.clone();

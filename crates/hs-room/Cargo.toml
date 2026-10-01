@@ -38,6 +38,9 @@ hs-cluster = { path = "../hs-cluster" }
 
 [dev-dependencies]
 proptest.workspace = true
+# `crate::third_party_invite`'s tests sign an identity server's `signed` block.
+ed25519-dalek.workspace = true
+base64.workspace = true
 tower = { workspace = true, features = ["util"] }
 hs-testkit = { path = "../hs-testkit" }
 # `hs-testkit`'s `FakeClock` calls `tokio::time::advance`, which needs tokio's `test-util`

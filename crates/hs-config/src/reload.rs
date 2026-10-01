@@ -275,6 +275,10 @@ pub const SETTINGS: &[Setting] = &[
         "POST /register?kind=guest reads it per request",
     ),
     hot(
+        "/auth/identity_servers",
+        "a third-party invite reads it per request",
+    ),
+    hot(
         "/auth/registration_shared_secret",
         "shared-secret registration and login read it per request",
     ),

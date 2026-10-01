@@ -40,14 +40,8 @@ pub(super) fn add_routes(builder: Builder<FederationState>) -> Builder<Federatio
         "/exchange_third_party_invite/{roomId}",
         "federationExchangeThirdPartyInvite"
     );
-    // `PUT`, not `POST`: `third_party_invite.yaml`'s `onBindThirdPartyIdentifier` is a PUT, and a
-    // seam registered under the wrong method is a 404 to the only caller that would ever use it.
-    builder = seam!(
-        builder,
-        Method::PUT,
-        "/3pid/onbind",
-        "federationThreepidOnbind"
-    );
+    // `/3pid/onbind` is real, and not here: an identity server calls it unauthenticated, so it is
+    // mounted outside this router's `X-Matrix` layer (`hs-cli`'s `identity_service::on_bind`).
     builder = seam!(
         builder,
         Method::GET,

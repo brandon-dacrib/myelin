@@ -138,6 +138,10 @@ pub enum RoomError {
     /// `users.suspend`), and this write is one suspension blocks. `403 M_USER_SUSPENDED`.
     #[error("your account is suspended; you can read and leave rooms, but not send")]
     UserSuspended,
+    /// A third-party invite this server will not make: no identity server it may use, or the
+    /// one named is not among them. `403 M_THREEPID_DENIED`.
+    #[error("{0}")]
+    ThreepidDenied(String),
     /// A guest account asked for something guests may not do here. `403
     /// M_GUEST_ACCESS_FORBIDDEN`.
     #[error("guests may not do this; register a full account first")]
@@ -188,6 +192,11 @@ impl RoomError {
             ),
             Self::Forbidden(msg) => MatrixError::forbidden(msg.clone()),
             Self::RoomBlocked(_) => MatrixError::forbidden(self.to_string()),
+            Self::ThreepidDenied(msg) => MatrixError::custom(
+                axum::http::StatusCode::FORBIDDEN,
+                MatrixErrorCode::ThreepidDenied,
+                msg.clone(),
+            ),
             Self::GuestAccessForbidden => MatrixError::custom(
                 axum::http::StatusCode::FORBIDDEN,
                 MatrixErrorCode::GuestAccessForbidden,

@@ -249,6 +249,22 @@ pub async fn post_create_room<B: KvBackend + 'static>(
         }
     }
 
+    // `invite_3pid`: each address is invited as `POST /invite` with an address would
+    // (`crate::third_party_invite`). Like the invitations above, one that fails is logged and the
+    // room is still made.
+    for entry in body
+        .get("invite_3pid")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Err(error) =
+            crate::third_party_invite::invite(&state, &room_id, &requester.user_id, entry).await
+        {
+            tracing::warn!(%room_id, %error, "createRoom could not send a third-party invite");
+        }
+    }
+
     // `visibility` controls only the published room directory (`GET /publicRooms`), orthogonal to
     // `preset`'s join-rule/history-visibility/guest-access defaults -- see this crate's status
     // file for why these are two independent request fields, not one.

@@ -98,7 +98,7 @@ sub start
 
 # The native configuration (crates/hs-config) for one Sytest homeserver. The settings that
 # differ from the defaults are the ones Sytest's Synapse configuration (Synapse.pm) also changes:
-# open registration, guest access, the shared secret `reg_secret`, no rate limits, no IP-range blocklists (every
+# open registration, guest access, Sytest's identity server, the shared secret `reg_secret`, no rate limits, no IP-range blocklists (every
 # server is on localhost), public rooms over federation, and the appservice registrations Sytest
 # writes for server 0.
 sub _get_config
@@ -125,6 +125,8 @@ sub _get_config
       auth => {
          enable_registration        => JSON::true,
          allow_guest_access         => JSON::true,
+         # Sytest's identity server listens on localhost, on a port chosen per run.
+         identity_servers           => [ "localhost", "127.0.0.1" ],
          enable_legacy_login        => JSON::true,
          registration_shared_secret => "reg_secret",
       },
@@ -195,7 +197,11 @@ sub _start_hs
    $output->diag( "Starting myelin hs-$idx: $cmd" );
 
    return $self->_start_process_and_await_connectable(
-      setup        => [ env => { %ENV, RUST_LOG => $ENV{MYELIN_RUST_LOG} // "info" } ],
+      # Sytest's fake identity server has a self-signed certificate with no subjectAltName,
+      # which no verifying client accepts; this test-only switch is how Synapse's
+      # `use_insecure_ssl_client_just_for_testing_do_not_use` is spelt here.
+      setup        => [ env => { %ENV, RUST_LOG => $ENV{MYELIN_RUST_LOG} // "info",
+                                 HS_TEST_INSECURE_IDENTITY_SERVER_TLS => "1" } ],
       command      => [ "/bin/sh", "-c", $cmd ],
       connect_host => "127.0.0.1",
       connect_port => $self->unsecure_port,

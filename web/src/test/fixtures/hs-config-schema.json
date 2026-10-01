@@ -200,6 +200,7 @@
       "default": {
         "enable_registration": false,
         "allow_guest_access": false,
+        "identity_servers": [],
         "registration_shared_secret": null,
         "registration_shared_secret_file": null,
         "user_directory_search_all_users": false,
@@ -1548,6 +1549,15 @@
           "description": "Let people use this server without an account: a client can ask for a guest session\n(`POST /register?kind=guest`) and gets a temporary account with no password. A guest can\nread rooms whose history is world-readable, join rooms whose guest access is set to \"can\njoin\", talk there, and later turn the guest account into a full one by choosing a\nusername and password. Guests cannot create rooms, invite people or upload files. Off by\ndefault: most servers only want people with accounts. Turning it off again stops new\nguest sessions; guests who already have one keep it. Corresponds to Synapse's\n`allow_guest_access`.",
           "type": "boolean",
           "default": false,
+          "x-applies": "hot"
+        },
+        "identity_servers": {
+          "description": "Identity servers this server may use to invite people by email address, as `host` or\n`host:port` (for example `vector.im` or `matrix.org`). When somebody invites an email\naddress, this server asks the identity server their client names who owns it -- and,\nif nobody does yet, asks it to keep the invitation and email them. Only servers listed\nhere are ever contacted, so a client cannot make this server send requests anywhere it\nlikes. Empty by default: inviting by email address is then refused, and inviting by\nMatrix user ID works as always. Corresponds to Synapse's trust in the client-named\n`id_server`, which Synapse does not restrict.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
           "x-applies": "hot"
         },
         "registration_shared_secret": {

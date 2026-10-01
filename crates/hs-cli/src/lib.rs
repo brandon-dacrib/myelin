@@ -30,6 +30,7 @@ pub mod generate_config;
 pub mod hash_password;
 pub mod hierarchy;
 pub mod identity;
+pub mod identity_service;
 pub mod live_config;
 pub mod media;
 pub mod metrics_layer;

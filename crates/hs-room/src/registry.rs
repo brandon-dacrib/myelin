@@ -131,6 +131,10 @@ pub struct RoomRegistry<B: KvBackend> {
     /// loads runs with no cluster-fencing check at all -- `RoomActor::persist` behaves exactly as
     /// it did before this hook existed.
     fencing: OnceLock<Arc<crate::fencing::RoomFencing<B>>>,
+    /// See [`crate::third_party_invite::IdentityService`] and
+    /// [`RoomRegistry::install_identity_service`]. Unset (the default until `hs-cli` installs one)
+    /// refuses every third-party invite `M_THREEPID_DENIED`.
+    identity_service: OnceLock<Arc<dyn crate::third_party_invite::IdentityService>>,
     /// See [`RoomRegistry::install_server_notices_user`]. Unset means this server sends no
     /// server notices, and no room is one.
     server_notices_user: OnceLock<ruma::OwnedUserId>,
@@ -176,6 +180,7 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             hierarchy_sessions: crate::hierarchy::PaginationSessions::default(),
             fencing: OnceLock::new(),
             server_notices_user: OnceLock::new(),
+            identity_service: OnceLock::new(),
             reports,
             send_limiter: crate::moderation::SendLimiter::new(),
             search,
@@ -267,6 +272,26 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     #[must_use]
     pub fn global_token_resolver(&self) -> Option<&Arc<dyn GlobalTokenResolver>> {
         self.global_token_resolver.get()
+    }
+
+    /// Installs the identity-server client third-party invites go through
+    /// (`crate::third_party_invite`). Idempotent past the first call, like the other hooks.
+    pub fn install_identity_service(
+        &self,
+        service: Arc<dyn crate::third_party_invite::IdentityService>,
+    ) {
+        if self.identity_service.set(service).is_err() {
+            tracing::warn!(
+                "an identity service was already installed on this room registry; ignoring the \
+                 second install"
+            );
+        }
+    }
+
+    /// The installed [`crate::third_party_invite::IdentityService`], if any.
+    #[must_use]
+    pub fn identity_service(&self) -> Option<&Arc<dyn crate::third_party_invite::IdentityService>> {
+        self.identity_service.get()
     }
 
     /// Installs the hook `crate::routes::query::get_messages` uses to fetch a room's history from
