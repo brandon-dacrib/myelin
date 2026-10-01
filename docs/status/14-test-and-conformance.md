@@ -87,7 +87,7 @@ upload and to-device over federation (4); profile queries over federation (2); s
 remote aliases in Unicode, Complement's appservice user (`401`) (4); and the NoCreators race (2).
 
 **Rate limits.** `tests/complement/startup.sh` writes `rate_limits: {enabled: false}`. On
-`agent/config-hot` (not merged), every new bucket (login, registration, joins local and remote,
+`agent/config-hot` (merged after these runs, as `0d3ff28` and the commits around it), every new bucket (login, registration, joins local and remote,
 admin redaction in `hs_auth::ratelimit::ServerLimits::apply`; federation transactions through
 `live_config::bucket_limit`) is `None` unless `rate_limits.enabled`, so these runs should not
 change when it merges.
